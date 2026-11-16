@@ -826,6 +826,23 @@ impl StreamSource<'_> {
         self.record_gap_inner(reason, &mut ignored).await
     }
 
+    /// Report missing observation coverage without declaring a native outcome
+    /// unknown. Only a canonical gap ACK permits continued admission; an
+    /// unresolved ACK fences the source exactly like an ordinary gap. Existing
+    /// uncertainty is never cleared. Callers must exclude session/turn identity, delivery,
+    /// transport and terminal loss from this path.
+    pub async fn record_coverage_gap(&mut self, reason: &str) -> Result<()> {
+        let mut ignored = None;
+        self.record_gap_inner_until(
+            reason,
+            &mut ignored,
+            (None, None),
+            Instant::now() + EVENT_DEADLINE,
+            false,
+        )
+        .await
+    }
+
     /// Child gap with retained identity: the same gap body is retried until
     /// its canonical ACK establishes the public gap.
     pub async fn record_gap_with_retained(
@@ -920,9 +937,9 @@ impl StreamSource<'_> {
         self.record_gap_inner_until(
             reason,
             retained,
-            None,
-            None,
+            (None, None),
             Instant::now() + EVENT_DEADLINE,
+            true,
         )
         .await
     }
@@ -931,7 +948,7 @@ impl StreamSource<'_> {
     /// separate bounded source-health update.
     pub async fn record_gap_until(&mut self, reason: &str, deadline: Instant) -> Result<()> {
         let mut ignored = None;
-        self.record_gap_inner_until(reason, &mut ignored, None, None, deadline)
+        self.record_gap_inner_until(reason, &mut ignored, (None, None), deadline, true)
             .await
     }
 
@@ -945,7 +962,7 @@ impl StreamSource<'_> {
         deadline: Instant,
     ) -> Result<()> {
         let mut ignored = None;
-        self.record_gap_inner_until(reason, &mut ignored, from, to, deadline)
+        self.record_gap_inner_until(reason, &mut ignored, (from, to), deadline, true)
             .await
     }
 
@@ -953,9 +970,9 @@ impl StreamSource<'_> {
         &mut self,
         reason: &str,
         retained: &mut Option<SourceGap>,
-        from: Option<String>,
-        to: Option<String>,
+        bounds: (Option<String>, Option<String>),
         deadline: Instant,
+        terminal_unknown: bool,
     ) -> Result<()> {
         let had_retained = retained.is_some();
         if had_retained && !self.try_settle_retained_until(retained, deadline).await {
@@ -991,8 +1008,10 @@ impl StreamSource<'_> {
                 format!("{} source already has an unresolved gap", self.harness),
             ));
         }
-        *self.source_unknown = true;
-        *self.gap_reported = true;
+        if terminal_unknown {
+            *self.source_unknown = true;
+            *self.gap_reported = true;
+        }
         let next = self.gap_number.saturating_add(1);
         *self.gap_number = next;
         let gap = SourceGap {
@@ -1009,16 +1028,20 @@ impl StreamSource<'_> {
                 .map(|family| (*family).to_owned())
                 .collect(),
             reason: reason.to_owned(),
-            from,
-            to,
+            from: bounds.0,
+            to: bounds.1,
         };
         let result = self.send_gap_until(&gap, deadline).await;
         match result {
             Ok(ack) if Self::is_canonical_gap_ack(&gap, &ack) => {
-                *self.failure = Some(format!("{reason}; terminal outcome is unknown"));
+                if terminal_unknown {
+                    *self.failure = Some(format!("{reason}; terminal outcome is unknown"));
+                }
                 Ok(())
             }
             Ok(_) | Err(_) => {
+                *self.source_unknown = true;
+                *self.gap_reported = true;
                 *self.writes_blocked = true;
                 *self.failure = Some(format!(
                     "{} source gap acknowledgement is unknown",

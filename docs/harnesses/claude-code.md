@@ -22,6 +22,17 @@ A UUID-stamped input written while a tool turn was busy emitted its exact
 inside the running turn. An idle follow-up emitted its own exact lifecycle
 and terminal. This observation does not establish that every CLI version or
 every busy input will produce that sequence.
+On 2026-11-15, a real 2.1.325 stream-json turn with 129 native `Read` calls
+reproduced the tool telemetry bound: the 129th `tool_result` was reported as
+unknown, and later sends to the session were rejected. The repaired path keeps
+the first 128 tool IDs/names without eviction, suppresses later tool telemetry
+for that turn, and records one acknowledged `tool` coverage gap. An identity
+conflict clears the retained bindings and fences telemetry. These coverage
+gaps do not change the native terminal result or make the session unavailable.
+Unresolved gap or batch acknowledgements, malformed streams, lost send
+associations, and session mismatches remain unknown and block fresh sends.
+This is a bounded live observation of Claude Code 2.1.325, not a guarantee
+about other CLI versions.
 These notes do not establish runtime support or a current license approval.
 Verified live on Claude Code 2.1.278: with
 `--permission-prompt-tool stdio` a tool use arrives as a `control_request`
@@ -45,6 +56,16 @@ Subject is `(canonical CLAUDE_CONFIG_DIR + project/store identity, exact session
 Resume uses that session in a new Eliot generation. Late stream-json records belong to
 the old generation and cannot affect replacement work. Native subagents normally share parent
 environment; no independent Eliot token without actual isolated environment support.
+Sidechain assistant/user frames tagged with `parent_tool_use_id` and `agent_id`
+are discarded before active-turn/session validation, so they cannot be rebound
+to the foreground turn. A pending task notification followed by `system/init`
+marks subsequent assistant/user output as autonomous, even if a foreground
+input has started; suppression remains through the next terminal result because
+the `started` lifecycle can race with autonomous frames. The ambiguous output
+prefix and final text are omitted with a message/tool coverage gap rather than
+attributed to the foreground turn. A task-notification result without a current
+input UUID never settles that turn; with an exact UUID it may settle the
+consumed input, while the autonomous output remains omitted.
 
 ## Transport
 
@@ -153,7 +174,8 @@ the daemon's 30-second command RPC budget, leaving time to return the native
 cause instead of racing the outer timeout. A later exact lifecycle, after its source commit acknowledgement,
 can settle the receiver and retire that slot. Reconcile it before same-command
 replay, fresh input, and snapshot readback, retaining the original command/turn
-binding. A source gap or lost event task still refuses fresh writes. Resolving
+binding. An unresolved source gap or lost event task still refuses fresh writes;
+an acknowledged turn-scoped tool telemetry coverage gap does not. Resolving
 a daemon command alone does not manufacture native evidence or clear an
 unassociated plugin input. After exact late association and turn completion,
 later distinct sends can proceed without restarting the Agent.
@@ -177,21 +199,29 @@ commit as `session.usage` (source `claude:result`). Only genuinely supplied
 nonnegative counters project; missing or wholly malformed usage stays null
 so completion proceeds.
 
-Native tool calls arrive as `assistant` message `tool_use` content blocks
+Native foreground tool calls arrive as `assistant` message `tool_use` content blocks
 (`id` plus tool `name`) with the matching outcome in `user` message
 `tool_result` blocks (`tool_use_id` plus the frame's own `is_error`
 verdict). The adapter commits `tool.started` per `tool_use` block and
 `tool.completed` per matching `tool_result` block, bound to the exact
 turn and generation with the native `tool_use.id` as the item id
 (`status` `completed`, or `error` when `is_error` is true). Only
-main-thread blocks map: subagent-forwarded blocks carrying
-`parent_tool_use_id` stay out, exactly like subagent text. A `tool_result`
-with no known `tool_use` on the turn, or a `tool_use` with no name, is a
-coverage gap, never a guessed tool. Verified against the stream-json
+foreground blocks map into this tool table. Ordinary sidechain assistant/user
+frames carrying `parent_tool_use_id` and `agent_id` stay out, like sidechain
+text. The per-turn hook bound counts all tool IDs observed, not just in-flight
+calls. The adapter retains the first 128 tool IDs/names without eviction,
+fences later tool telemetry for that turn, and records one acknowledged
+`tool`-family coverage gap. An identity conflict clears the retained bindings
+and fences telemetry. A foreground `tool_result` with no known
+`tool_use` before the bound, or a `tool_use` with no name, is a coverage gap,
+never a guessed tool. Acknowledging this telemetry gap leaves the native
+terminal outcome and session availability intact, and later turns may send.
+Verified against the stream-json
 record shapes the installed CLI emits (`--help` stream-json
 `--output-format`/`--input-format` surface; shapes per the Agent SDK
 `ModelUsage` and message `content[]` `tool_use`/`tool_result` docs,
-checked against installed 2.1.325; result-frame capture in
+checked against installed 2.1.325; 129-call reproduction captured 2026-11-16 UTC;
+result-frame capture in
 `plugins/claude/src/events.rs` `result_terminal_completed_settles_success`).
 
 ## Hook tool diagnostics
@@ -213,10 +243,12 @@ unchanged. The wire `HookEvent` request shape is untouched.
 ## Source ownership and recovery
 
 The stream-json stdout stream owns supplied session/turn/message/tool/usage facts.
-Main-thread `assistant` `tool_use` blocks commit `tool.started` and the
-matching main-thread `user` `tool_result` blocks commit `tool.completed`,
+Foreground `assistant` `tool_use` blocks commit `tool.started` and the
+matching foreground `user` `tool_result` blocks commit `tool.completed`,
 each bound to the exact active turn with the native `tool_use.id` as the
-item id (see Native mapping).
+item id (see Native mapping). The 128-ID telemetry fence and its acknowledged
+turn-scoped coverage gap do not alter terminal settlement; unresolved source
+uncertainty still blocks fresh sends.
 A terminal `result` record's `usage` is mapped, when genuinely supplied as
 nonnegative counters, into `turn.completed` `data.usage` at `main_loop_turn`
 scope with `message_id` null: with persistent streaming input it covers only
@@ -240,7 +272,9 @@ blocks by message id.
 Transcript JSONL is later observe/recovery data with file identity/offset where valid,
 not a parallel live producer. No proven replay cursor means gap + exact current
 readback, never full-history republishing. Child completion needs exact tool/task
-provenance, not parent idle. Resumed cumulative cost is session scope, not a turn delta.
+provenance, not parent idle. Background task-notification facts without an exact
+user-message UUID are omitted rather than attributed to the active or most recent
+user turn. Resumed cumulative cost is session scope, not a turn delta.
 
 ## Login
 

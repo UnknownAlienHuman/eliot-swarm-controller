@@ -563,6 +563,13 @@ struct EventProcessor {
     tools_started: HashSet<String>,
     /// Invocations with a committed `tool.completed` in this turn.
     tools_completed: HashSet<String>,
+    /// At most one tool-coverage gap per turn; it does not invalidate the
+    /// separately associated native terminal or future input.
+    tool_coverage_gap_reported: bool,
+    /// A background completion can wake the native main loop without a SEND.
+    /// Its next unassociated init/output is never assigned to a queued input.
+    task_notification_pending: bool,
+    autonomous_output: bool,
     deny_uncertain: HashSet<String>,
     permission_admission_fenced: bool,
     message_seq: u64,
@@ -1081,6 +1088,9 @@ impl EventProcessor {
             tool_names: HashMap::new(),
             tools_started: HashSet::new(),
             tools_completed: HashSet::new(),
+            tool_coverage_gap_reported: false,
+            task_notification_pending: false,
+            autonomous_output: false,
             deny_uncertain: HashSet::new(),
             permission_admission_fenced: false,
             message_seq: 0,
@@ -1401,6 +1411,9 @@ impl EventProcessor {
     fn should_buffer(&self, record: &Value) -> bool {
         let kind = record.get("type").and_then(Value::as_str);
         if kind == Some("assistant") || kind == Some("user") {
+            if self.autonomous_output || !is_main_thread(record) {
+                return false;
+            }
             return !self.status.ready
                 || (self.status.active_turn_id.is_none() && self.pending_turn.is_some());
         }
@@ -1441,6 +1454,13 @@ impl EventProcessor {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        // Sidechains can outlive the parent's turn. Filter before session,
+        // association and tool-table checks, never against a later active turn.
+        if matches!(kind, "assistant" | "user")
+            && (self.autonomous_output || !is_main_thread(&record))
+        {
+            return Ok(());
+        }
         match kind {
             "system" => self.observe_system(&record).await,
             "command_lifecycle" => self.observe_lifecycle(&record).await,
@@ -1477,6 +1497,7 @@ impl EventProcessor {
                     "Claude system record did not belong to the owned session",
                 ));
             }
+            self.observe_task_boundary(record);
             self.retain_init_mcp_servers(record);
             return Ok(());
         }
@@ -1490,6 +1511,20 @@ impl EventProcessor {
         self.status.session_id = Some(session_id.to_owned());
         self.retain_init_mcp_servers(record);
         Ok(())
+    }
+
+    fn observe_task_boundary(&mut self, record: &Value) {
+        match record.get("subtype").and_then(Value::as_str) {
+            Some("task_notification") => self.task_notification_pending = true,
+            Some("init") if self.task_notification_pending => {
+                self.autonomous_output = true;
+                self.task_notification_pending = false;
+                // Until the terminal supplies provenance, even a lifecycle
+                // for a queued input cannot disambiguate this output prefix.
+                self.final_text = None;
+            }
+            _ => {}
+        }
     }
 
     /// Retain the proven MCP surface from the owned session's
@@ -1660,7 +1695,10 @@ impl EventProcessor {
                 return Ok(());
             }
             return self
-                .record_gap("Claude message arrived outside the exact active turn")
+                .record_coverage_gap(
+                    "Claude message arrived outside an associated input; message was not attributed",
+                    &["message"],
+                )
                 .await;
         };
         if is_main_thread_assistant(record) {
@@ -1700,16 +1738,20 @@ impl EventProcessor {
     /// Commit `tool.started` for the main-thread `tool_use` blocks of one
     /// `assistant` record, bound to the exact active turn and generation
     /// with the native `tool_use.id` as the item id. Runs only while the
-    /// id binding is unfenced; a fenced turn keeps the hook-routed facts
-    /// only, never a misbound tool record. Nameless invocations cannot
+    /// id binding is unfenced; a fenced turn reports incomplete coverage,
+    /// never a misbound tool record. Nameless invocations cannot
     /// label a tool record and are reported as one coverage gap.
     async fn observe_tool_uses(&mut self, record: &Value) -> Result<()> {
         if assistant_tool_use_count(record) > assistant_tool_uses(record).len() {
-            self.record_gap("Claude tool use omitted its tool name or id")
+            self.record_tool_coverage_gap("Claude tool use omitted its tool name or id")
                 .await?;
         }
         if self.tool_use_tracking_fenced {
-            return Ok(());
+            return self
+                .record_tool_coverage_gap(
+                    "Claude tool tracking bound or identity conflict fenced this turn",
+                )
+                .await;
         }
         let (Some(command_id), Some(turn_id)) = (
             self.status.active_command_id.clone(),
@@ -1764,11 +1806,22 @@ impl EventProcessor {
                 return Ok(());
             }
             return self
-                .record_gap("Claude tool result arrived outside the exact active turn")
+                .record_tool_coverage_gap(
+                    "Claude tool result arrived outside the exact active turn",
+                )
                 .await;
         };
         if !is_main_thread_user(record) {
             return Ok(());
+        }
+        // Hook identity tracking deliberately clears its bounded tables when
+        // fenced. A legitimate later result cannot consult that erased table.
+        if self.tool_use_tracking_fenced {
+            return self
+                .record_tool_coverage_gap(
+                    "Claude tool tracking bound or identity conflict fenced this turn",
+                )
+                .await;
         }
         let Some(command_id) = self.status.active_command_id.clone() else {
             return self
@@ -1804,7 +1857,7 @@ impl EventProcessor {
             self.commit_event("tool.completed", native_id, data).await?;
         }
         if unknown {
-            self.record_gap("Claude tool result did not match a known tool use")
+            self.record_tool_coverage_gap("Claude tool result did not match a known tool use")
                 .await?;
         }
         Ok(())
@@ -1817,6 +1870,15 @@ impl EventProcessor {
         self.tool_names.clear();
         self.tools_started.clear();
         self.tools_completed.clear();
+    }
+
+    async fn record_tool_coverage_gap(&mut self, reason: &str) -> Result<()> {
+        if self.tool_coverage_gap_reported {
+            return Ok(());
+        }
+        self.record_coverage_gap(reason, &["tool"]).await?;
+        self.tool_coverage_gap_reported = true;
+        Ok(())
     }
 
     fn accumulate_final_text(&mut self, text: &str) {
@@ -1876,8 +1938,8 @@ impl EventProcessor {
                 continue;
             }
             if self.tool_use_turns.len() >= MAX_TOOL_USE_BINDINGS {
-                self.tool_use_turns.clear();
-                self.clear_tool_tracking();
+                // Preserve exact bindings for callbacks already in flight.
+                // Stop admitting new ids; telemetry reports the bounded loss.
                 self.tool_use_tracking_fenced = true;
                 return;
             }
@@ -3031,6 +3093,46 @@ impl EventProcessor {
         if let Some(session_id) = parsed.session_id.as_deref() {
             self.check_session(session_id)?;
         }
+        let omitted_output = self.autonomous_output;
+        self.autonomous_output = false;
+        self.task_notification_pending = false;
+        if parsed
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.kind == "task-notification")
+        {
+            let answers_input = self.status.active_turn_id.as_deref().is_some_and(|turn| {
+                parsed.user_message_uuid.as_deref() == Some(turn)
+                    || parsed.user_message_uuids.iter().any(|uuid| uuid == turn)
+            });
+            // Background task wakeups are native autonomous work, not a SEND
+            // association or a terminal for whichever Eliot turn is current.
+            // Any pre-association message prefix belongs to this wakeup and
+            // must not drain into a later input's lifecycle.
+            if !answers_input {
+                self.buffer.retain(|frame| {
+                    !matches!(
+                        frame.record.get("type").and_then(Value::as_str),
+                        Some("assistant" | "user")
+                    )
+                });
+                self.buffer_bytes = self.buffer.iter().map(|frame| frame.size).sum();
+            }
+            self.record_coverage_gap(
+                "Claude autonomous task-notification output was not attributed to an Eliot input",
+                &["message", "tool"],
+            )
+            .await?;
+            if !answers_input {
+                return Ok(());
+            }
+        } else if omitted_output {
+            self.record_coverage_gap(
+                "Claude output after a task notification had ambiguous input provenance and was omitted",
+                &["message", "tool"],
+            )
+            .await?;
+        }
         if parsed.terminal_reason.trim().is_empty() {
             return self
                 .record_gap("Claude result omitted its terminal reason")
@@ -3135,6 +3237,7 @@ impl EventProcessor {
         self.status.active_command_id = None;
         self.tool_use_turns.clear();
         self.clear_tool_tracking();
+        self.tool_coverage_gap_reported = false;
         self.tool_use_tracking_fenced = false;
         self.publish_now();
         self.commit_event("turn.completed", native_id, data).await?;
@@ -3347,6 +3450,12 @@ impl EventProcessor {
         self.stream_source().record_gap(reason).await
     }
 
+    async fn record_coverage_gap(&mut self, reason: &str, families: &[&str]) -> Result<()> {
+        let mut source = self.stream_source();
+        source.families = families;
+        source.record_coverage_gap(reason).await
+    }
+
     /// The shared stream-commit half of this processor.
     fn stream_source(&mut self) -> StreamSource<'_> {
         StreamSource {
@@ -3525,6 +3634,80 @@ mod tests {
         ] {
             assert!(!is_main_thread_user(&forwarded));
         }
+    }
+
+    #[tokio::test]
+    async fn late_sidechain_records_do_not_touch_a_pending_followup() {
+        let mut processor = ready_processor();
+        let (outcome, _receiver) = oneshot::channel();
+        processor
+            .register_turn("next-command".into(), "next-turn".into(), outcome)
+            .expect("followup registered");
+        // Shape captured from installed 2.1.325: a sidechain can finish
+        // after the parent's terminal and before a followup associates.
+        for record in [
+            json!({"type":"assistant", "parent_tool_use_id":"parent-tool", "agent_id":"child",
+                "message":{"content":[{"type":"tool_use", "id":"child-read", "name":"Read"}]}}),
+            json!({"type":"user", "parent_tool_use_id":"parent-tool", "agent_id":"child",
+                "message":{"content":[{"type":"tool_result", "tool_use_id":"child-read"}]}}),
+        ] {
+            assert!(!processor.should_buffer(&record));
+            processor
+                .process_record(record)
+                .await
+                .expect("sidechain omitted");
+        }
+        assert!(processor.buffer.is_empty());
+        assert!(processor.tool_use_turns.is_empty());
+        assert!(processor.tool_names.is_empty());
+        assert!(processor.status.failure.is_none());
+        assert_eq!(
+            processor.pending_turn.as_ref().unwrap().turn_id,
+            "next-turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_binding_capacity_retains_existing_callback_identities() {
+        let mut processor = ready_processor();
+        for index in 0..=MAX_TOOL_USE_BINDINGS {
+            processor.bind_tool_uses(
+                &json!({"message":{"content":[{
+                    "type":"tool_use", "id":format!("tool-{index}"), "name":"Read"
+                }]}}),
+                "turn-1",
+            );
+        }
+        assert!(processor.tool_use_tracking_fenced);
+        assert_eq!(processor.tool_use_turns.len(), MAX_TOOL_USE_BINDINGS);
+        assert_eq!(processor.tool_use_turns["tool-0"].turn_id, "turn-1");
+        assert!(!processor.tool_use_turns.contains_key("tool-128"));
+        assert!(processor.status.failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn autonomous_wakeup_prefix_does_not_bind_to_a_queued_input() {
+        let mut processor = ready_processor();
+        processor.observe_task_boundary(&json!({"subtype":"task_notification"}));
+        let (outcome, _receiver) = oneshot::channel();
+        processor
+            .register_turn("next-command".into(), "next-turn".into(), outcome)
+            .expect("followup registered");
+        processor.observe_task_boundary(&json!({"subtype":"init"}));
+        let record = json!({"type":"assistant", "parent_tool_use_id":null,
+            "message":{"content":[{"type":"text", "text":"autonomous reply"}]}});
+        assert!(!processor.should_buffer(&record));
+        processor
+            .process_record(record)
+            .await
+            .expect("wakeup omitted");
+        assert!(processor.autonomous_output);
+        assert!(processor.buffer.is_empty());
+        assert!(processor.final_text.is_none());
+        assert_eq!(
+            processor.pending_turn.as_ref().unwrap().turn_id,
+            "next-turn"
+        );
     }
 
     #[test]
