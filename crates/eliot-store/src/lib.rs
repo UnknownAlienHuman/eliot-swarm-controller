@@ -267,10 +267,61 @@ impl Store {
         Self::open_with_observer(path, |_| {})
     }
 
+    /// Verbatim Windows form for database files past the Win32 parse limit.
+    /// SQLite reaches the filesystem through raw Win32 calls without the Rust
+    /// standard library path handling, so prefix here instead of at callers.
+    #[cfg(windows)]
+    fn verbatim_db_path(path: &Path) -> std::path::PathBuf {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let already = wide.len() >= 4
+            && wide[0] == 92
+            && wide[1] == 92
+            && (wide[2] == 63 || wide[2] == 46)
+            && wide[3] == 92;
+        if already {
+            return path.to_path_buf();
+        }
+        let local_disk = path.is_absolute()
+            && matches!(
+                path.components().next(),
+                Some(std::path::Component::Prefix(p))
+                    if matches!(
+                        p.kind(),
+                        std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+                    )
+            );
+        if !local_disk {
+            return path.to_path_buf();
+        }
+        let normalized = match std::path::absolute(path) {
+            Ok(normalized) => normalized,
+            Err(_) => return path.to_path_buf(),
+        };
+        let wide: Vec<u16> = normalized.as_os_str().encode_wide().collect();
+        let already = wide.len() >= 4
+            && wide[0] == 92
+            && wide[1] == 92
+            && (wide[2] == 63 || wide[2] == 46)
+            && wide[3] == 92;
+        if already {
+            return normalized;
+        }
+        let mut prefixed = vec![92u16, 92, 63, 92];
+        let mut wide = wide;
+        prefixed.append(&mut wide);
+        std::path::PathBuf::from(OsString::from_wide(&prefixed))
+    }
+
     pub fn open_with_observer<F>(path: &Path, mut on_phase: F) -> Result<Self>
     where
         F: FnMut(StoreOpenPhase),
     {
+        #[cfg(windows)]
+        let owned_path = Self::verbatim_db_path(path);
+        #[cfg(windows)]
+        let path: &Path = &owned_path;
         let connection = Connection::open(path).map_err(sql_error)?;
         connection
             .busy_timeout(Duration::from_secs(5))
@@ -6349,3 +6400,50 @@ mod resolution_tests;
 
 #[cfg(test)]
 mod goals_tests;
+
+#[cfg(all(test, windows))]
+mod verbatim_db_tests {
+    use super::Store;
+    use std::path::PathBuf;
+
+    #[test]
+    fn verbatim_db_leaves_drive_relative_unchanged() {
+        let input = PathBuf::from("C:eliot.db");
+        assert_eq!(
+            Store::verbatim_db_path(&input),
+            input,
+            "drive-relative must not gain a verbatim prefix"
+        );
+    }
+
+    #[test]
+    fn verbatim_db_normalizes_trailing_dot_component() {
+        let input = PathBuf::from(r"C:\eliot-verbatim-check\folder.\eliot.db");
+        let normalized = std::path::absolute(&input).expect("normalize");
+        assert!(
+            !normalized.to_string_lossy().contains("folder."),
+            "absolute() must normalize folder.: {}",
+            normalized.display()
+        );
+        let out = Store::verbatim_db_path(&input);
+        assert!(
+            !out.to_string_lossy().contains("folder."),
+            "verbatim must not preserve literal folder.: {}",
+            out.display()
+        );
+    }
+
+    #[test]
+    fn verbatim_db_leaves_non_disk_paths_unchanged() {
+        for raw in [r"\\server\share\eliot.db", ":memory:", r"relative\eliot.db"] {
+            let input = PathBuf::from(raw);
+            assert_eq!(
+                Store::verbatim_db_path(&input),
+                input,
+                "{raw} must stay unchanged"
+            );
+        }
+        let verb = PathBuf::from(r"\\?\C:\already\verbatim.db");
+        assert_eq!(Store::verbatim_db_path(&verb), verb);
+    }
+}

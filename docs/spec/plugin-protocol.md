@@ -655,3 +655,30 @@ Native adapters echo turns and emit request callbacks over this same transport
 through their real implementations. Add crash/child/recovery steps with their real caller. Record/replay and common
 conformance are completed in L7, not a separate framework blocking L2. CI never calls a
 model and never runs synthetic/fake executions.
+## Agent skill delivery
+
+The repository owns one Agent Skills source, `skills/eliot-swarm/`
+(`SKILL.md` plus at most `reference.md`), embedded in the binaries with
+`include_str!` ([`eliot_plugin::skill`](../../crates/eliot-plugin/src/skill.rs)).
+The daemon materializes it under the data directory at startup
+(`<data-dir>/skills/`), with a private ACL and atomic replace; the layout
+doubles as a Claude Code plugin directory
+([`eliot_daemon::skill`](../../crates/eliot-daemon/src/skill.rs)).
+Each harness plugin exposes the materialized copy to its Agent sessions
+through that harness's own per-session mechanism ? per-session flags or env
+only, never the user checkout, never global directories. The per-harness
+mechanism is documented in each [harness page](../harnesses/README.md):
+Codex `skills/extraRoots/set`, Claude Code `--plugin-dir`, OpenCode
+per-Agent global skills, Antigravity staged `.agents/skills`, and the Muse
+first-turn fallback below.
+
+Where a harness offers no per-session skill mechanism (Muse `serve` loads
+only the session workspace's skills and rules), the plugin delivers the
+identical text through the launch-time first-turn system context ? the same
+native slot `inject` `next_input` claims occupy. A missing canonical copy
+fails the session start: an Agent must not start believing it has no skill.
+
+Skill content points at the live surface (`api.methods` / `api.help`,
+`swarm <cmd> --help`) and never copies field catalogs. `swarm identity`
+(`api.identity`) answers "which one am I", and `swarm who` marks the
+caller's own row (`is_self`), so an Agent never has to guess its identity.

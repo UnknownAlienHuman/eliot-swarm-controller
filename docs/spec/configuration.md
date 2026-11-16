@@ -11,7 +11,9 @@ Default `%LOCALAPPDATA%\Eliot` or `~/.local/share/eliot`; override with `ELIOT_H
 symlink/reparse roots or unsafe ownership.
 
 On first use, create the directory with a protected current-user ACL before publishing
-private files. An existing unsafe root is refused; never repair ownership, weaken the
+private files. Owner and ACL checks open the root by handle through the verbatim form,
+so roots past the Win32 parse limit keep the same current-user-only protection.
+An existing unsafe root is refused; never repair ownership, weaken the
 check or copy its contents silently. The error offers one explicit command selecting
 a fresh private per-user directory; the desktop offers the same remedy. The user must
 choose it. Existing roots and configuration are not overwritten by bootstrap.
@@ -24,6 +26,13 @@ possibly unsafe default data root. CLI and desktop share resolution order:
 `--data-dir`, `ELIOT_HOME`, selected-root pointer, then the platform default. The
 pointer and target must pass the private-directory checks; failures never silently
 select another root. Selection creates and validates the fresh root before publication.
+
+After acquiring the data-directory lock and before serving, daemon startup
+materializes the bundled `eliot-swarm` Agent skill under `skills/` with a
+private ACL and atomic replace (see [Agent skill
+delivery](plugin-protocol.md#agent-skill-delivery)). Every harness plugin
+reads that copy through its own per-session mechanism; a failure to publish
+fails startup.
 
 Owner CLI callers start their private daemon when needed (`status` remains a read-only
 probe). Agent and Run callers keep their inherited identity and dispatch directly;
@@ -39,6 +48,7 @@ checkout registers that workspace through the same machine-author settings write
   owner.token
   eliot.db, eliot.db-wal, eliot.db-shm
   daemon.lock, daemon.json, logs/daemon.log
+  skills/                daemon-materialized `eliot-swarm` Agent skill (private, rewritten at startup)
   plugins/                 only instantiated plugins
   worktrees/               L3 opt-in workspaces
   services/                managed services, when needed
@@ -323,7 +333,11 @@ outside the repository does not extend the allowed root for `{file=...}` referen
 Parent traversal, symlinks/reparse points, devices and alternate streams are rejected.
 
 Before each spawn, verify the same canonical references, sizes and SHA-256 digests.
-Missing or changed references fail before execution. Do not copy or substitute scripts
+Missing or changed references fail before execution. The workspace root itself must
+be startable as a Windows child-process working directory: roots at or past the
+process-creation limit (259+ characters on the qualification host, os error 267)
+fail the launch with the preserved OS error and no admitted command, before any
+native spawn. Do not copy or substitute scripts
 from the new checkout: file arguments become the admitted absolute paths, while cwd
 is the verified worktree. These checks cover explicit entry files, not imported code or
 an executable-provenance graph. The workspace coordinator owns the committed running
