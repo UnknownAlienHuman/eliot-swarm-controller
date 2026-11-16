@@ -3322,10 +3322,8 @@ impl Router {
         detail: String,
     ) -> eliot_core::api::HarnessQuotaResponse {
         const MAX_DETAIL: usize = 512;
-        let mut note = format!("{checked}; {detail}");
-        if note.len() > MAX_DETAIL {
-            note.truncate(MAX_DETAIL);
-        }
+        // Floor to a character boundary first: byte truncate panics mid-codepoint.
+        let note = eliot_core::bound_chars(&format!("{checked}; {detail}"), MAX_DETAIL);
         eliot_core::api::HarnessQuotaResponse {
             harness: harness.to_owned(),
             scope: scope.to_owned(),
@@ -4917,12 +4915,9 @@ impl Router {
                     .filter(|cause| !cause.trim().is_empty())
             })
             .unwrap_or_else(|| "unknown".to_owned());
-        if reason.len() > 128 {
-            reason.truncate(128);
-            while !reason.is_char_boundary(reason.len()) {
-                reason.pop();
-            }
-        }
+        // Floor to a character boundary first: the old truncate-then-fix-up
+        // ran after the panic. 'bound_chars' never splits UTF-8 mid-codepoint.
+        reason = eliot_core::bound_chars(&reason, 128);
         let resolvable = !agent.observe_only;
         let hint = if resolvable {
             "owner-resolvable with cmd resolve (command) or turn resolve (turn); retained for the record; use --force only for live work".to_owned()
@@ -7125,6 +7120,70 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn quota_unavailable_note_truncation_respects_char_boundary() {
+        // Byte 512 of the note lands inside the Cyrillic tail: the old
+        // byte 'truncate' panicked on this input instead of flooring to
+        // the boundary.
+        let response = Router::quota_unavailable(
+            "harness",
+            "scope",
+            "credential",
+            "checked",
+            "status",
+            "ж".repeat(300),
+        );
+        let note = response.note.expect("quota unavailable carries a note");
+        assert!(note.len() <= 512);
+        assert!(note.starts_with("checked; "));
+        let short = Router::quota_unavailable(
+            "harness",
+            "scope",
+            "credential",
+            "checked",
+            "status",
+            "ok".to_owned(),
+        );
+        assert_eq!(short.note, Some("checked; ok".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn retained_unknown_reason_truncation_respects_char_boundary() {
+        let router = router();
+        let now = now_ms();
+        let attach_id = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, attach_id, detach_id) =
+                fenced_observer_attach(&mut store, "reason-scope", "reason-native", now);
+            close_and_settle_observer_detach(
+                &mut store,
+                &agent,
+                &detach_id,
+                "reason-scope",
+                "reason-native",
+                now,
+            );
+            // Byte 128 of the retained reason lands inside a Cyrillic char: the
+            // old byte 'truncate' panicked here (the boundary fix-up ran after
+            // truncation, too late).
+            let reason = format!("x{}", "ж".repeat(100));
+            store
+                .settle(
+                    &attach_id,
+                    CommandState::Unknown,
+                    Some(json!({"reason": reason})),
+                    now,
+                )
+                .expect("re-settle unknown with a long reason");
+            attach_id
+        };
+        let summary = router
+            .retained_unknown(&attach_id)
+            .await
+            .expect("retained unknown summary");
+        assert!(summary.reason.len() <= 128);
+        assert!(summary.reason.starts_with('x'));
+    }
     #[tokio::test]
     async fn public_emit_cannot_acquire_the_attention_binding() {
         let router = router();

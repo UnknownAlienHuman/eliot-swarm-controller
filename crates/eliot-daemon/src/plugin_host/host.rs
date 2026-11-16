@@ -1586,7 +1586,14 @@ async fn run_agent_inner(
     // values as the native realignment target: the retained session
     // already runs them, so the plugin must prove them instead of
     // reverting to the frozen snapshot.
-    let resume_config = resolve_resume_config(&actor).await;
+    let resume_config = match resolve_resume_config(&actor).await {
+        Ok(resume_config) => resume_config,
+        Err(error) => {
+            let _ = started.send(Err(error));
+            cleanup_startup(&actor, child, &mut event_task, pending_failure, true).await;
+            return;
+        }
+    };
     let (model_override, effort_override, config_revision) = match resume_config {
         Some((model, effort, revision)) => (model, effort, Some(revision)),
         None => (None, None, None),
@@ -3080,25 +3087,32 @@ async fn resolve_send_config(
 /// effective values, so the plugin must realign to them instead of
 /// reverting to the frozen snapshot. `None` on launch, on resumes without
 /// an overlay, and on harnesses that apply overlays per turn at send
-/// time (Codex, Muse); a resolution failure also yields `None`, and the
-/// plugin then keeps the frozen behavior with the readback deciding.
+/// time (Codex, Muse). A resolution failure is a typed startup error: starting
+/// with the frozen values would contradict the explicit overlay inheritance,
+/// so the caller fails startup before any native I/O.
 async fn resolve_resume_config(
     actor: &AgentActorConfig,
-) -> Option<(Option<String>, Option<String>, i64)> {
+) -> Result<Option<(Option<String>, Option<String>, i64)>> {
     if actor.start_command.verb != "resume"
         || !matches!(actor.agent.harness.as_str(), "opencode" | "antigravity")
     {
-        return None;
+        return Ok(None);
     }
-    let state = actor.state.upgrade()?;
+    let Some(state) = actor.state.upgrade() else {
+        return Err(Error::new(
+            "unknown",
+            "plugin host stopped before command resolution",
+        ));
+    };
     let store = state.store.lock().await;
-    let config = store
+    store
         .command_effective_config(
             &actor.start_command.id,
             &["launch", "resume", "send", "configure"],
         )
-        .ok()??;
-    Some((config.model.clone(), config.effort.clone(), config.revision))
+        .map(|config| {
+            config.map(|config| (config.model.clone(), config.effort.clone(), config.revision))
+        })
 }
 
 /// Build the `agent.command` wire params for one dispatched command, relaying
@@ -4188,6 +4202,98 @@ mod tests {
             ),
             "a sibling dir is out of scope"
         );
+    }
+
+    fn resume_actor(
+        state: Weak<HostState>,
+        monitoring: Monitoring,
+        command_id: &str,
+    ) -> AgentActorConfig {
+        let agent = Agent::new("a1", "proj", "opencode", "fake", 0);
+        let command = Command {
+            id: command_id.to_owned(),
+            principal: "owner".to_owned(),
+            method: "command.submit".to_owned(),
+            verb: "resume".to_owned(),
+            target: Some("a1".to_owned()),
+            selector: None,
+            expected_generation: None,
+            generation: Some(1),
+            args: json!({}),
+            state: CommandState::Dispatched,
+            turn_id: None,
+            request_id: None,
+            outcome: None,
+            created_at: 0,
+            updated_at: 0,
+            probe: false,
+            config_revision: 0,
+            config: None,
+        };
+        let capture = eliot_plugin::spawn_stderr(
+            std::io::Cursor::new(Vec::new()),
+            Arc::new(SecretPolicy::default()),
+        );
+        AgentActorConfig {
+            state,
+            monitoring,
+            key: AgentKey {
+                id: "a1".to_owned(),
+                generation: 1,
+            },
+            agent,
+            start_command: command,
+            instance_dir: "synthetic".to_owned(),
+            store_root: PathBuf::from("synthetic-data-root"),
+            plugin_credential: "credential".to_owned(),
+            target_environment: json!({}),
+            source_credentials: Arc::from(["secret".to_owned()]),
+            resume_from: None,
+            source_state: None,
+            stderr: capture.view(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_config_dead_host_state_fails_startup() {
+        let store = Arc::new(AsyncMutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).expect("open store"),
+        ));
+        let monitoring = Monitoring::new(store, Bus::new(16), Arc::new(Mutex::new(HashSet::new())));
+        let actor = resume_actor(Weak::new(), monitoring, "resume-1");
+        let error = resolve_resume_config(&actor)
+            .await
+            .expect_err("dead host state fails startup");
+        assert_eq!(error.code, "unknown");
+    }
+
+    #[tokio::test]
+    async fn resume_config_missing_command_fails_startup() {
+        let store = Arc::new(AsyncMutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).expect("open store"),
+        ));
+        let bus = Bus::new(64);
+        let secrets = Arc::new(Mutex::new(HashSet::new()));
+        let monitoring = Monitoring::new(store.clone(), bus.clone(), secrets.clone());
+        let (progress, _) = watch::channel(0);
+        let host = PluginHost::new(
+            PluginHostOptions::new(
+                PathBuf::from("synthetic-data-root"),
+                "owner-test".to_owned(),
+            ),
+            store.clone(),
+            bus.clone(),
+            secrets,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashSet::new())),
+            progress,
+            monitoring.clone(),
+        );
+        let actor = resume_actor(Arc::downgrade(&host.state), monitoring, "resume-missing");
+        let error = resolve_resume_config(&actor)
+            .await
+            .expect_err("missing resume command fails startup");
+        assert_eq!(error.code, "not_found");
     }
 
     #[test]

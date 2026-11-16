@@ -1346,16 +1346,23 @@ impl Session {
         ));
         // Answer open permission asks `cancelled` best-effort, then close
         // whatever remains: the native session is ending, so no ask may
-        // stay open behind it. Commit failures here are ignored; the
-        // session teardown below still decides the stop.
-        {
+        // stay open behind it. Closing is not best-effort: every retained
+        // ask needs its `request.closed` fact or the Store stales the ask
+        // with no history once `session.ended` publishes, so a closure
+        // failure is terminal for the stop (mirrors Claude `finish_stop`).
+        let closure = {
             let mut state = self.state.lock().await;
             state.stopping = true;
             state.latch_cancellation(&params.command_id, None);
             state
                 .answer_pending_cancelled(&self.client, &params.command_id, None)
                 .await;
-            let _ = state.close_pending_requests(None).await;
+            state.close_pending_requests(None).await
+        };
+        if let Err(error) = closure {
+            let error = self.client.diagnostic_error(error);
+            self.stop = Some((params.command_id.clone(), params.force, Err(error.clone())));
+            return Err(error);
         }
         let result = self
             .terminate(params.force)
