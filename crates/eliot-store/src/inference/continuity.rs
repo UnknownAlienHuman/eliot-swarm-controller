@@ -439,6 +439,31 @@ mod tests {
     }
 
     #[test]
+    fn retention_receipt_count_uses_principal_method_index() {
+        let (store, client, _ids) = seeded_store();
+        let plan: Vec<String> = store
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM writes WHERE principal=?1 AND method=?2",
+            )
+            .unwrap()
+            .query_map(params![owner(&client), RETENTION_METHOD], |row| row.get(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!plan.is_empty());
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("writes_principal_method")),
+            "plan uses the principal/method index: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.contains("SCAN writes")),
+            "plan avoids a full scan: {plan:?}"
+        );
+    }
+
+    #[test]
     fn retention_prunes_only_released_cleaned_prefix_and_reports_gap() {
         let (mut store, client, ids) = seeded_store();
         let request = InferenceRetentionRequest {

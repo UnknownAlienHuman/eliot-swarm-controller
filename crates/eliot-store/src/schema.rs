@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 46;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 47;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1143,6 +1143,18 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 47 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX writes_principal_method ON writes(principal, method);
+                 INSERT INTO schema_migrations(version) VALUES (47);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1157,7 +1169,8 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE artifacts; DROP TABLE cleanup_plans; DELETE FROM schema_migrations WHERE version=46;
+                "DROP INDEX writes_principal_method; DELETE FROM schema_migrations WHERE version=47;
+                DROP TABLE artifacts; DROP TABLE cleanup_plans; DELETE FROM schema_migrations WHERE version=46;
               DROP INDEX commands_turn_unknown;
               DELETE FROM schema_migrations WHERE version=44;
               DROP TRIGGER assignment_commands_insert;
@@ -1230,7 +1243,8 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE artifacts; DROP TABLE cleanup_plans; DELETE FROM schema_migrations WHERE version=46;
+                "DROP INDEX writes_principal_method; DELETE FROM schema_migrations WHERE version=47;
+                DROP TABLE artifacts; DROP TABLE cleanup_plans; DELETE FROM schema_migrations WHERE version=46;
               DROP INDEX commands_turn_unknown;
               DELETE FROM schema_migrations WHERE version=44;
               DROP TRIGGER assignment_commands_insert;
