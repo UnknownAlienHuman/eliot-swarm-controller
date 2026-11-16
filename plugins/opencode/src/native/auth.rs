@@ -114,9 +114,16 @@ pub struct AuthTransfer<'a> {
     pub selector: &'a IntegrationSelector,
     pub workspace: &'a Path,
     /// Extra variables for canonical-store children (list, export) on top
-    /// of inheritance. Normally empty: they must resolve the canonical
-    /// store exactly as the owner's CLI does, with no XDG overrides.
+    /// of inheritance. Normally empty: with the empty per-generation
+    /// `XDG_CONFIG_HOME` below they resolve the canonical data store exactly
+    /// as the owner's CLI does, without loading owner config.
     pub export_environment: &'a [(OsString, OsString)],
+    /// Empty per-generation directory used as `XDG_CONFIG_HOME` for
+    /// canonical-store children (list, export), so owner config, plugins, and
+    /// MCP servers never load during the transfer. The credential store
+    /// itself resolves through the canonical `XDG_DATA_HOME`, which stays
+    /// untouched, so the gate still observes exactly the canonical state.
+    pub canonical_config_home: &'a Path,
     /// Extra variables for isolated-store children (list, import) on top of
     /// inheritance: the same target environment the server receives. The
     /// explicit isolated roots below always win over any same-named entry.
@@ -263,15 +270,30 @@ fn gate(entries: &[ListEntry], selector: &str) -> Gate {
     }
 }
 
-/// Base command for canonical-store children: inherit, plus extras, never
-/// XDG overrides, so the child resolves the owner's store.
+/// Base command for canonical-store children: inherit, plus extras, with
+/// only `XDG_CONFIG_HOME` pointed at the empty per-generation directory so
+/// owner config, plugins, and MCP servers never load during the transfer.
+/// The data home stays canonical, so the child resolves exactly the owner's
+/// credential store.
 fn canonical_command(transfer: &AuthTransfer<'_>) -> Command {
     let mut command = Command::new(transfer.program);
     command
         .current_dir(transfer.workspace)
         .envs(transfer.export_environment.iter().map(|(k, v)| (k, v)))
+        .envs(canonical_env(transfer))
         .kill_on_drop(true);
     command
+}
+
+/// Explicit environment for canonical-store children on top of inheritance
+/// (plus any `export_environment` extras): exactly one override, so owner
+/// config, plugins, and MCP servers never load while the canonical data
+/// home, and therefore the credential store, still resolves by inheritance.
+fn canonical_env(transfer: &AuthTransfer<'_>) -> Vec<(OsString, OsString)> {
+    vec![(
+        OsString::from("XDG_CONFIG_HOME"),
+        transfer.canonical_config_home.as_os_str().to_owned(),
+    )]
 }
 
 /// Base command for isolated-store children: inherit, plus the target
@@ -636,4 +658,33 @@ async fn kill_and_reap(child: &mut Child) -> bool {
     timeout(KILL_GRACE, child.wait())
         .await
         .is_ok_and(|wait| wait.is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Canonical-store children isolate exactly the config home: owner
+    /// config, plugins, and MCP servers never load, while the canonical data
+    /// home (and therefore the credential store) stays inherited.
+    #[test]
+    fn canonical_children_override_only_the_config_home() {
+        let dir = std::env::temp_dir().join("eliot-opencode-auth-test");
+        let selector = IntegrationSelector::new("opencode-go").expect("selector");
+        let transfer = AuthTransfer {
+            program: OsStr::new("opencode"),
+            selector: &selector,
+            workspace: &dir,
+            export_environment: &[],
+            canonical_config_home: &dir,
+            import_environment: &[],
+            isolated_config_home: &dir,
+            isolated_data_home: &dir,
+            reuse_existing: false,
+        };
+        let env = canonical_env(&transfer);
+        assert_eq!(env.len(), 1, "exactly one override: {env:?}");
+        assert_eq!(env[0].0, "XDG_CONFIG_HOME");
+        assert_eq!(env[0].1, dir.as_os_str());
+    }
 }

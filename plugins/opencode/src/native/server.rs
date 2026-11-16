@@ -205,8 +205,10 @@ impl OwnedServer {
 
     /// Write the per-generation config, prepare the selected native
     /// credential in the isolated store, reserve a loopback port, spawn the
-    /// server on the per-Agent store, and wait for readiness. Any failure
-    /// leaves no running child behind. The child inherits the
+    /// server on the per-Agent store, and wait for readiness. Every failure
+    /// from this function happens before any native session or prompt
+    /// exists, so the caller settles it as a definite failed start, never
+    /// unknown. Any failure leaves no running child behind. The child inherits the
     /// daemon-allowlisted plugin environment plus the shared target
     /// environment the host built, the generated password, and the XDG
     /// roots — exactly like the Codex/Muse stdio servers, with no
@@ -214,7 +216,7 @@ impl OwnedServer {
     pub async fn spawn(
         launch: ServerLaunch,
         secrets: &[String],
-        auth_deadline: Instant,
+        envelope: Instant,
     ) -> Result<Self> {
         // OpenCode keeps plugin and session contexts per directory. Use the
         // same server-native spelling for cwd, session location, and HTTP
@@ -228,6 +230,18 @@ impl OwnedServer {
         let config_root = launch.instance_dir.join("config");
         let config_dir = config_root.join("opencode");
         let data_dir = stable_store_dir(&launch.store_root, &launch.agent_id)?;
+        // Empty per-generation directory for canonical-store transfer
+        // children (list, export): pointing their `XDG_CONFIG_HOME` here
+        // keeps owner config, plugins, and MCP servers from loading during
+        // the transfer, while the canonical `XDG_DATA_HOME` still resolves
+        // the true credential store.
+        let canonical_config_dir = launch.instance_dir.join("auth-config");
+        std::fs::create_dir_all(&canonical_config_dir).map_err(|error| {
+            Error::new(
+                "native_spawn",
+                format!("OpenCode per-Agent auth config directory could not be created: {error}"),
+            )
+        })?;
         std::fs::create_dir_all(&config_dir).map_err(|error| {
             Error::new(
                 "native_spawn",
@@ -333,7 +347,7 @@ impl OwnedServer {
                 &config_root,
                 &data_dir,
                 &local.provider_id,
-                auth_deadline,
+                envelope,
             )
             .await?;
         } else {
@@ -349,12 +363,17 @@ impl OwnedServer {
                     selector: &auth.selector,
                     workspace: &launch.workspace,
                     export_environment: &[],
+                    canonical_config_home: &canonical_config_dir,
                     import_environment: &launch.environment,
                     isolated_config_home: &config_root,
                     isolated_data_home: &data_dir,
                     reuse_existing: auth.reuse_existing,
                 },
-                auth_deadline,
+                // The transfer is the known slow pole (three sequential
+                // native CLI children): it shares the whole start envelope
+                // instead of a shorter private budget so loaded cold starts
+                // fail definite, never unknown-by-deadline.
+                envelope,
             )
             .await?;
         }
@@ -434,10 +453,18 @@ impl OwnedServer {
             config_dir,
             data_dir,
         };
-        if let Err(error) = server.await_ready(Instant::now() + READINESS_TIMEOUT).await {
-            server
-                .terminate(true, Instant::now() + READINESS_TIMEOUT)
-                .await?;
+        // Readiness shares the start envelope: a loaded cold start gets the
+        // full 60 s bound, but the whole launch still answers inside the
+        // daemon agent.start budget.
+        let ready_deadline = (Instant::now() + READINESS_TIMEOUT).min(envelope);
+        if let Err(error) = server.await_ready(ready_deadline).await {
+            // Bounded best-effort cleanup: the generation Job reaps anything
+            // left once the daemon retires the plugin on the failed value,
+            // so a wedged child cannot stack another minute here. The
+            // readiness cause is returned, never masked by a cleanup outcome.
+            let _ = server
+                .terminate(true, Instant::now() + Duration::from_secs(10))
+                .await;
             return Err(error);
         }
         Ok(server)
@@ -586,7 +613,13 @@ impl OwnedServer {
     }
 }
 
-const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound for one `serve` readiness wait: poll the real signal (`GET
+/// /api/config` proving the live server is ours) until this deadline. Under
+/// CPU contention a cold `serve` needs well over the old 30 s, so the bound
+/// is 60 s; the caller start envelope still caps the whole launch under the
+/// daemon `agent.start` budget, and a slow start settles as a definite
+/// failed start (no native session exists yet), never `unknown`.
+pub(crate) const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The per-Agent session store: `opencode-{agent_id}/data` next to the
 /// host-owned `store_root` (the old `instance_dir` parent, `{data_root}/plugins`).
