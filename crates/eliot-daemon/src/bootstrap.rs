@@ -21,7 +21,7 @@ pub fn ensure_private_data_dir(path: impl AsRef<Path>) -> Result<PathBuf> {
     crate::platform::data_dir::ensure_private_data_dir(path)
 }
 
-/// Seed installed native-default profiles and one initial default route via
+/// Seed installed native-default profiles and initial default/worker routes via
 /// the unified settings writer. Existing profile and routing choices survive.
 pub(crate) async fn ensure_hot_start(
     data_root: &Path,
@@ -158,8 +158,14 @@ fn ensure_bootstrap_settings(
         .unwrap_or_default();
 
     if read.revision.is_none() && profile_names.is_empty() {
-        let profiles = installed_default_profiles();
+        let mut profiles = installed_default_profiles();
         profile_names = profiles.keys().cloned().collect();
+        let default_profile = bootstrap_default_profile(&profile_names);
+        if let Some(profile) = profiles.get_mut(&default_profile) {
+            profile["child_profiles"] =
+                json!(bootstrap_worker_profiles(&profile_names, &default_profile));
+            profile["control"] = json!("tree");
+        }
         if !profiles.is_empty() {
             sections.insert(Profiles, Value::Object(profiles));
         }
@@ -176,12 +182,20 @@ fn ensure_bootstrap_settings(
             .is_none_or(|profiles| profiles.is_empty())
         && !profile_names.is_empty()
     {
-        let default_profile = if profile_names.iter().any(|name| name == "codex") {
-            "codex".to_owned()
+        let default_profile = bootstrap_default_profile(&profile_names);
+        let workers = bootstrap_worker_profiles(&profile_names, &default_profile);
+        // With only one installed harness the inherited profile still works.
+        let workers = if workers.is_empty() {
+            vec![default_profile.clone()]
         } else {
-            profile_names[0].clone()
+            workers
         };
-        sections.insert(Routing, json!({"default": [default_profile]}));
+        let mut routing = current_routing.clone();
+        routing["default"] = json!([default_profile]);
+        if routing.get("worker").is_none() {
+            routing["worker"] = json!(workers);
+        }
+        sections.insert(Routing, routing);
     }
 
     if sections.is_empty() {
@@ -197,6 +211,23 @@ fn ensure_bootstrap_settings(
         policy,
     )?;
     Ok(())
+}
+
+fn bootstrap_default_profile(names: &[String]) -> String {
+    names
+        .iter()
+        .find(|name| name.as_str() == "codex")
+        .or_else(|| names.first())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn bootstrap_worker_profiles(names: &[String], manager: &str) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| name.as_str() != manager)
+        .cloned()
+        .collect()
 }
 
 fn installed_default_profiles() -> serde_json::Map<String, Value> {
@@ -328,4 +359,55 @@ fn project_id(checkout: &str) -> String {
         let _ = write!(id, "{byte:02x}");
     }
     id
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_bootstrap_grants_only_installed_worker_profiles_and_preserves_edits() {
+        let root = std::env::temp_dir().join(format!("eliot-bootstrap-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let policy = SecretPolicy::default();
+        ensure_bootstrap_settings(&root, &mut store, &policy).unwrap();
+        if root.join("config.toml").is_file() {
+            let source = std::fs::read_to_string(root.join("config.toml")).unwrap();
+            let config: toml::Value = toml::from_str(&source).unwrap();
+            let profiles = config["profiles"].as_table().unwrap();
+            let names = profiles.keys().cloned().collect::<Vec<_>>();
+            let manager = bootstrap_default_profile(&names);
+            let workers = bootstrap_worker_profiles(&names, &manager);
+            assert_eq!(
+                config["routing"]["default"][0].as_str(),
+                Some(manager.as_str())
+            );
+            assert_eq!(profiles[&manager]["control"].as_str(), Some("tree"));
+            let allowed: Vec<String> = profiles[&manager]["child_profiles"]
+                .clone()
+                .try_into()
+                .unwrap();
+            assert_eq!(allowed, workers);
+            let routed: Vec<String> = config["routing"]["worker"].clone().try_into().unwrap();
+            assert_eq!(
+                routed,
+                if workers.is_empty() {
+                    vec![manager]
+                } else {
+                    workers
+                }
+            );
+            // Restart never adds a new grant or overwrites an Owner edit.
+            let edited = "[profiles.only]\nharness='codex'\nchild_profiles=[]\n[routing]\ndefault=['only']\nworker=['only']\n";
+            std::fs::write(root.join("config.toml"), edited).unwrap();
+            ensure_bootstrap_settings(&root, &mut store, &policy).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join("config.toml")).unwrap(),
+                edited
+            );
+        }
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
