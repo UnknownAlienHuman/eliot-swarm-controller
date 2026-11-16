@@ -14898,8 +14898,10 @@ fn new_store_database_files_are_current_user_only() {
     use std::os::unix::fs::PermissionsExt;
 
     // The database file itself carries an explicit 0600 creation mode, so it
-    // is private under any ambient umask. WAL/SHM siblings honor the process
-    // umask the daemon sets at startup (covered by live proof).
+    // is private under any ambient umask. WAL/SHM/journal siblings inherit
+    // the database file's permissions, unadulterated by the umask (SQLite
+    // `src/os_unix.c`: "We want those files to have *exactly* the same
+    // permissions as their original database, unadulterated by the umask.").
     let path = std::env::temp_dir().join(format!("eliot-perms-{}.sqlite", Ulid::new()));
     let store = Store::open(&path).expect("open new Store");
     drop(store);
@@ -14915,6 +14917,22 @@ fn new_store_database_files_are_current_user_only() {
         let _ = fs::remove_file(PathBuf::from(&candidate));
     }
     let _ = fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[test]
+fn memory_sentinel_creates_no_literal_file() {
+    // `:memory:` is the SQLite sentinel, not a filesystem path: opening it
+    // must not create a literal file (the Unix pre-creation path bypasses it).
+    let sentinel = std::env::current_dir().expect("cwd").join(":memory:");
+    let _ = fs::remove_file(&sentinel);
+    let store = Store::open(Path::new(":memory:")).expect("open :memory:");
+    drop(store);
+    assert!(
+        !sentinel.exists(),
+        "`:memory:` must not create a literal file"
+    );
+    let _ = fs::remove_file(&sentinel);
 }
 
 #[test]

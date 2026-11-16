@@ -313,10 +313,16 @@ impl Store {
         #[cfg(windows)]
         let path: &Path = &owned_path;
         #[cfg(unix)]
-        {
-            // Create the database file current-user-only. SQLite's WAL/SHM
-            // siblings honor the process umask the daemon sets at startup;
-            // Windows keeps its ACL checks.
+        if path != Path::new(":memory:") {
+            // Create the database file current-user-only (0600). SQLite's
+            // `-wal`/`-shm`/`-journal` siblings inherit the database file's
+            // permissions, unadulterated by the umask (see `os_unix.c`: "We
+            // want those files to have *exactly* the same permissions as
+            // their original database, unadulterated by the umask.",
+            // https://sqlite.org/src/artifact?ci=trunk&filename=src/os_unix.c);
+            // no process-wide umask is needed. Windows keeps its ACL checks.
+            // The `:memory:` sentinel is not a filesystem path: bypass
+            // pre-creation so no literal file is created.
             use std::os::unix::fs::OpenOptionsExt;
             match std::fs::OpenOptions::new()
                 .write(true)
