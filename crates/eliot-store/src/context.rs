@@ -211,7 +211,7 @@ pub(super) fn claim_next_input_tx(
             };
             let mut candidate = selected.clone();
             candidate.push(item.clone());
-            if combined_send_text_len(&send.args, &candidate)? > MAX_INPUT_BYTES {
+            if combined_send_text_len(&send.args, &candidate)? > MAX_TEXT_BYTES {
                 reject_pending_context(
                     tx,
                     &record,
@@ -421,7 +421,7 @@ impl Store {
             let text_len =
                 text_len.saturating_add(candidate.len().saturating_sub(1).saturating_mul(2));
             let encoded_len = encode_json(&json!({"context": &candidate}))?.len();
-            if text_len > MAX_INPUT_BYTES || encoded_len > MAX_FRAME_BYTES {
+            if text_len > MAX_TEXT_BYTES || encoded_len > MAX_FRAME_BYTES {
                 reject_pending_context(
                     &tx,
                     &record,

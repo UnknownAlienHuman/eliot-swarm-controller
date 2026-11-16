@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use eliot_core::{ProcessIdentity, ProcessRecord, ProcessState};
 use eliot_store::Store;
@@ -120,5 +121,26 @@ fn simulated_process_identity(agent: &str, generation: i64) -> ProcessIdentity {
         host_boot_id: format!("simulated-os-{agent}"),
         pid: 81_001,
         start_time: u64::try_from(generation).expect("positive fixture generation"),
+    }
+}
+
+/// Owned temp-directory fixture: holds one `temp_dir()` subdirectory path
+/// and removes it on drop, so a failed assertion never leaks the fixture
+/// into the shared temp directory. The guard never creates: each test keeps
+/// its own `create_dir`/`create_dir_all` setup (including `create_dir`,
+/// which must observe a missing directory).
+pub(crate) struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    pub(crate) fn own(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }

@@ -146,6 +146,7 @@ mod tests {
     #[test]
     fn assignment_selects_first_markdown_filename_after_cursor() {
         let root = std::env::temp_dir().join(format!("eliot-assignment-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         fs::create_dir(&root).unwrap();
         fs::write(root.join("01-first.md"), "first").unwrap();
         fs::write(root.join("02-second.md"), "second task").unwrap();
@@ -156,12 +157,12 @@ mod tests {
             next_brief(&canonical_root, Some("01-first.md")).unwrap(),
             ("02-second.md".to_owned(), "second task".to_owned())
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn assignment_folder_overflow_fails_closed() {
         let root = std::env::temp_dir().join(format!("eliot-assignment-{}", ulid::Ulid::new()));
+        let _temp_2 = crate::test_support::TempDir::own(root.clone());
         fs::create_dir(&root).unwrap();
         for index in 0..=MAX_BRIEF_ENTRIES {
             fs::write(root.join(format!("{index:03}.md")), "brief").unwrap();
@@ -171,6 +172,5 @@ mod tests {
             next_brief(&canonical_root, None).unwrap_err().code,
             "frame_too_large"
         );
-        fs::remove_dir_all(root).unwrap();
     }
 }

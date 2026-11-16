@@ -1978,6 +1978,7 @@ mod tests {
     #[test]
     fn security_handle_refuses_junction_swapped_in_after_path_check() {
         let base = std::env::temp_dir().join(format!("eliot-junction-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(base.clone());
         std::fs::create_dir_all(&base).expect("base");
         let target = base.join("target");
         let victim = base.join("victim");
@@ -2006,7 +2007,6 @@ mod tests {
         set_test_untrusted_file_acl(&victim, true)
             .expect_err("untrusted ACL through junction must be refused");
         super::validate_private_root(&target).expect("target ACL untouched");
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2102,6 +2102,7 @@ mod heavy_attribution_tests {
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
             .join(format!("eliot-heavy-{}", ulid::Ulid::new()));
+        let _temp_2 = crate::test_support::TempDir::own(scratch_base.clone());
         let src = scratch_base.join("src");
         std::fs::create_dir_all(&src).expect("scratch src");
         std::fs::write(
@@ -2211,6 +2212,5 @@ mod heavy_attribution_tests {
             "one command yields one episode: {categories:?}"
         );
         assert_eq!(merged[0].category, "cargo build");
-        let _ = std::fs::remove_dir_all(&scratch_base);
     }
 }

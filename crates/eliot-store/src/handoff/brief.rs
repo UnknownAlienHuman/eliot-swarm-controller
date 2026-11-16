@@ -41,7 +41,7 @@ pub(super) fn build(
             "[No retained final output; absent or pruned history is not complete history]".into(),
         ),
     };
-    let mut budget = MAX_INPUT_BYTES / 2 - 4096;
+    let mut budget = MAX_TEXT_BYTES / 2 - 4096;
     loop {
         let (task_text, t1) = bounded(&task_text, budget);
         let (output, t2) = bounded(&output, budget);
@@ -61,7 +61,7 @@ pub(super) fn build(
             output
         );
         let frame = json!({"agent_id":request.to,"generation":request.to_generation,"command_id":request.id,"verb":"send","args":{"text":text}});
-        if text.len() <= MAX_INPUT_BYTES && check_rpc_frame("agent.command", &frame).is_ok() {
+        if text.len() <= MAX_TEXT_BYTES && check_rpc_frame("agent.command", &frame).is_ok() {
             return Ok((text, t1 || t2));
         }
         if budget < 1024 {

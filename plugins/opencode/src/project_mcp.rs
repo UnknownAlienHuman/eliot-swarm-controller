@@ -147,14 +147,30 @@ mod tests {
 
     static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
-    fn scratch_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "eliot-opencode-project-mcp-{}-{}",
-            std::process::id(),
-            SCRATCH_SEQ.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
+    /// Owned scratch fixture: the directory is removed on unwind, so a
+    /// failed assertion never leaks it into the shared temp directory.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "eliot-opencode-project-mcp-{}-{}",
+                std::process::id(),
+                SCRATCH_SEQ.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn write_project(dir: &Path, file: &str, text: &str) {
@@ -173,15 +189,16 @@ mod tests {
 
     #[test]
     fn scan_absent_layer_contributes_nothing() {
-        let dir = scratch_dir();
+        let scratch = ScratchDir::new();
+        let dir = scratch.path().to_path_buf();
         let entries = scan_project_mcp(&dir).expect("absent files scan");
         assert!(entries.is_empty());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn scan_reads_documented_shapes_with_jsonc_tolerance() {
-        let dir = scratch_dir();
+        let scratch = ScratchDir::new();
+        let dir = scratch.path().to_path_buf();
         write_project(
             &dir,
             "opencode.jsonc",
@@ -229,7 +246,6 @@ mod tests {
         let error = scan_project_mcp(&dir).expect_err("unparseable project file fails");
         assert_eq!(error.code, "profile_error");
         assert!(error.message.contains("opencode.json"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -279,7 +295,8 @@ mod tests {
     fn trailing_commas_drop_only_before_closers() {
         // The shared Core stripper backs project parsing; spot-check the
         // wiring through one parse plus the unit coverage in eliot-core.
-        let dir = scratch_dir();
+        let scratch = ScratchDir::new();
+        let dir = scratch.path().to_path_buf();
         write_project(
             &dir,
             "opencode.jsonc",
@@ -288,7 +305,6 @@ mod tests {
         let entries = scan_project_mcp(&dir).expect("trailing commas parse");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "a");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -300,11 +316,11 @@ mod tests {
 
     #[test]
     fn oversize_or_unreadable_layer_fails_closed() {
-        let dir = scratch_dir();
+        let scratch = ScratchDir::new();
+        let dir = scratch.path().to_path_buf();
         let big = "x".repeat(MAX_PROJECT_CONFIG_BYTES + 1);
         write_project(&dir, "opencode.json", &big);
         let error = scan_project_mcp(&dir).expect_err("oversize project file fails");
         assert_eq!(error.code, "profile_error");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
