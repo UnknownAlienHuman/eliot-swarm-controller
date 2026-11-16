@@ -126,6 +126,24 @@ const METHODS: &[Method] = &[
     method!("agent.result", AgentResultRequest, AgentResultResponse, false, false, "Read retained turns/results for one Agent.", {"id":"a1","limit":20}),
     method!("agent.processes", AgentProcessesRequest, AgentProcessesResponse, false, false, "Read bounded process observations for one Agent.", {"id":"a1"}),
     method!("agent.stats", AgentStatsRequest, AgentStatsResponse, false, false, "Read sampled Agent statistics with freshness metadata.", {"id":"a1"}),
+    method!(
+        "observe.heavy",
+        ObserveHeavyRequest,
+        ObserveHeavyResponse,
+        false,
+        false,
+        "Read the windowed heavy-work episode rollup per Agent generation.",
+        {}
+    ),
+    method!(
+        "harness.doctor",
+        HarnessDoctorRequest,
+        HarnessDoctorResponse,
+        true,
+        false,
+        "Read installed-vs-verified harness versions and contract markers without launching.",
+        {}
+    ),
     method!("usage.summary", UsageSummaryRequest, UsageSummaryResponse, false, false, "Read bounded usage totals with explicit coverage over one Agent, project or tree scope.", {"agent":"a1"}),
     method!("agent.git", AgentGitRequest, AgentGitResponse, false, false, "Read Git observations for one Agent's workspace.", {"id":"a1"}),
     method!("agent.edits", AgentEditsRequest, AgentEditsResponse, false, false, "Read a bounded page of observed workspace edits.", {"id":"a1","limit":20}),

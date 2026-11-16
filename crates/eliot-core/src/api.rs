@@ -18,6 +18,7 @@ mod mutations;
 mod native_pages;
 mod native_requests;
 mod notify;
+mod observe;
 mod provider;
 mod read_validation;
 mod reads;
@@ -110,6 +111,11 @@ pub use native_pages::{
 };
 pub use native_requests::{AgentDiscoverRequest, AgentHistoryRequest};
 pub use notify::{EmitDefinitionArgs, NotifyDefinitionArgs};
+pub use observe::{
+    DEFAULT_OBSERVE_WINDOW_SECS, DoctorHarnessEntry, HarnessDoctorRequest, HarnessDoctorResponse,
+    HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_DOCTOR_HARNESSES, MAX_HEAVY_EPISODES,
+    MAX_OBSERVE_WINDOW_SECS, ObserveHeavyRequest, ObserveHeavyResponse, SessionGrowthView,
+};
 pub use provider::{
     ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,
     ProviderHoldsRequest, ProviderHoldsResponse,

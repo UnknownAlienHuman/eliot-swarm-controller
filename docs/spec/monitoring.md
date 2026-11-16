@@ -676,3 +676,27 @@ hourly maintenance tick logs one line for the same condition. The drain
 report lists stored unknowns with no live process, turn or reader as
 retained-unresolved — with resolvability and owner action — instead of
 blocking on them; the stored outcome stays `unknown`.
+
+## Heavy work, session growth and harness drift
+
+Three advisory event families name what matters without new native control:
+
+- `activity.heavy`: one event per child-process identity whose wall time, CPU or
+  peak RSS crossed a `daemon.heavy_*` threshold. The commitment keeps the program
+  basename plus one safe subcommand token (for example `cargo-build`), never full
+  argv, paths or environment. Levels stay `debug`/`standard`; the pending log-level
+  integration owns any promotion.
+- `session.growth`: one warning per basis (context occupancy at
+  `daemon.session_growth_ratio_permille`, native session file size at
+  `daemon.session_file_bytes`) with no auto-compact; the warning clears only when
+  the retained signal drops back under threshold.
+- `harness.drift`: one event per harness and installed surface while the installed
+  version or contract marker differs from `VERIFIED_HARNESSES`
+  (`crates/eliot-core/src/observe.rs`). Drift never blocks launch; it annotates
+  `swarm doctor` and the launch flag only.
+
+Readbacks: `observe.heavy` (windowed rollup, also `swarm heavy`), `harness.doctor`
+(per-harness installed vs verified, also `swarm doctor`), `heavy`/`session_growth` on
+`agent.stats`, the `OBS` column of `swarm top`, and the Observe section of the
+desktop Details panel. Readbacks degrade to `None`/quiet text rather than failing
+the view.

@@ -28,3 +28,21 @@ to establish the current path. Full common conformance/recording/platform runs a
 Future APIs/tables from the complete specification are not first-adapter prerequisites.
 The first plugin needs one per-Agent stream; source handoff, discovery, children and
 shared pools enter only with their actual callers.
+
+## Verified versions and `swarm doctor`
+
+`crates/eliot-core/src/observe.rs` pins the verified contract per harness.
+`swarm doctor` compares the live installed version and contract marker against that
+table and reports drift without blocking launch:
+
+| Harness | Verified version | Contract marker |
+| --- | --- | --- |
+| codex | 0.167.1 | app-server schema v2 |
+| claude | 2.1.278 | stream-json records |
+| muse | 1.4.0-R4161.1 | MSP v1 host |
+| opencode | 2.2.7 | native schema |
+| antigravity | 1.5.9 | ACP v1 `7ec5185c.json`, AGY 1.5.2 |
+
+A drifted install still launches; the mismatch is annotated on `swarm doctor`, the
+`harness.drift` event and the launch flag. Historical source-check dates on adapter
+pages are not fresh verification; `swarm doctor` is the live readback.

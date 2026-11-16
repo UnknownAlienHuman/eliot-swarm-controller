@@ -1,7 +1,7 @@
 //! Public Agent/daemon read grammar and pure reply binding checks.
 //! Store authorization and the exact workspace target remain Router decisions.
 
-use super::{GitView, ObservationView, ScriptInterpreter};
+use super::{GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView};
 use crate::{
     Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity, ProcessIdentity,
     ProcessRecord, Result, SessionUsage, TurnOutcome, TurnUsage,
@@ -42,6 +42,14 @@ impl AgentGetRequest {
                 .config
                 .as_ref()
                 .is_some_and(|config| config.validate().is_err())
+            || reply
+                .heavy
+                .as_ref()
+                .is_some_and(|heavy| heavy.validate().is_err())
+            || reply
+                .session_growth
+                .as_ref()
+                .is_some_and(|growth| growth.validate().is_err())
             || reply.source_states.iter().any(|source| {
                 source.agent_id != self.id
                     || source.generation < 0
@@ -257,6 +265,15 @@ pub struct AgentSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_scope: Option<String>,
     pub updated_at: i64,
+    /// Heavy-work rollup for the Agent generation, when at least one heavy
+    /// episode was ever recorded. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy: Option<HeavySummaryView>,
+    /// Live session-growth state for the Agent generation, present exactly
+    /// while the retained signal crosses a configured threshold. Trailing
+    /// field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_growth: Option<SessionGrowthView>,
 }
 
 impl AgentSummary {
@@ -317,6 +334,12 @@ impl AgentSummary {
                 "invalid",
                 "Agent summary observation time is invalid",
             ));
+        }
+        if let Some(heavy) = &self.heavy {
+            heavy.validate()?;
+        }
+        if let Some(growth) = &self.session_growth {
+            growth.validate()?;
         }
         Ok(())
     }
@@ -504,6 +527,14 @@ impl AgentStatsRequest {
                 .session_usage
                 .as_ref()
                 .is_some_and(|usage| usage.validate().is_err())
+            || reply
+                .heavy
+                .as_ref()
+                .is_some_and(|heavy| heavy.validate().is_err())
+            || reply
+                .session_growth
+                .as_ref()
+                .is_some_and(|growth| growth.validate().is_err())
         {
             return Err(invalid_response());
         }
@@ -694,6 +725,15 @@ pub struct AgentGetResponse {
         deserialize_with = "optional_object"
     )]
     pub config: Option<AgentConfigView>,
+    /// Heavy-work rollup for the Agent generation, when at least one heavy
+    /// episode was ever recorded. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy: Option<HeavySummaryView>,
+    /// Live session-growth state for the Agent generation, present exactly
+    /// while the retained signal crosses a configured threshold. Trailing
+    /// field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_growth: Option<SessionGrowthView>,
 }
 
 /// Retained model/effort overlay readback for one Agent generation. The
@@ -823,6 +863,15 @@ pub struct AgentStatsResponse {
     /// committed. Never a turn total and never billing.
     #[serde(default, deserialize_with = "optional_object")]
     pub session_usage: Option<SessionUsage>,
+    /// Heavy-work rollup for the Agent generation, when at least one heavy
+    /// episode was ever recorded. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy: Option<HeavySummaryView>,
+    /// Live session-growth state for the Agent generation, present exactly
+    /// while the retained signal crosses a configured threshold. Trailing
+    /// field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_growth: Option<SessionGrowthView>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2095,6 +2144,8 @@ mod tests {
             source_states: vec![],
             session_usage: None,
             config: None,
+            heavy: None,
+            session_growth: None,
         };
         let wire = serde_json::to_value(&reply).unwrap();
         assert_eq!(wire["id"], "a1");
@@ -2167,6 +2218,8 @@ mod tests {
             usage: None,
             usage_scope: None,
             updated_at: 7,
+            heavy: None,
+            session_growth: None,
         }
     }
 
@@ -2457,6 +2510,8 @@ mod tests {
             generation: 4,
             observation: observation(),
             session_usage: None,
+            heavy: None,
+            session_growth: None,
         };
         let wire = serde_json::to_value(&reply).unwrap();
         assert_eq!(wire["available"], false);
@@ -2724,6 +2779,8 @@ mod tests {
             source_states: vec![source],
             session_usage: None,
             config: None,
+            heavy: None,
+            session_growth: None,
         };
         AgentGetRequest::new("a1")
             .validate_response(&reply)

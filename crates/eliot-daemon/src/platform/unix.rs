@@ -3,7 +3,8 @@
 use super::process_observation::unknown_sample;
 #[cfg(target_os = "linux")]
 use super::process_observation::{
-    LinuxProcessStat, MAX_PROCESS_SAMPLES, SweepEntry, exited_sample, select_sweep_members,
+    CommandClass, LinuxProcessStat, MAX_PROCESS_SAMPLES, SweepEntry, exited_sample,
+    select_sweep_members,
 };
 use eliot_core::{Error, ProcessSample, ProcessSnapshot, Result};
 #[cfg(target_os = "linux")]
@@ -1020,6 +1021,26 @@ fn check_path_components(path: &Path) -> Result<()> {
 
 fn io_error(action: &str, error: std::io::Error) -> Error {
     Error::new("platform_io", format!("{action}: {error}"))
+}
+
+/// Bounded program identity for one Linux process from `/proc/<pid>/cmdline`
+/// (`proc(5)`): argv[0] plus at most one token, classified at read time so
+/// full argv never persists. Missing, unreadable or exited processes fail
+/// closed to None; only the first 64 KiB of cmdline are ever read.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_command_class(pid: u32) -> Option<CommandClass> {
+    if pid == 0 {
+        return None;
+    }
+    let mut body = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    body.truncate(64 * 1024);
+    let args = eliot_core::split_unix_cmdline(&body);
+    let (program, rest) = args.split_first()?;
+    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    Some(CommandClass {
+        category: eliot_core::classify_heavy_command(program, &rest),
+        source: eliot_core::CATEGORY_SOURCE_CMDLINE,
+    })
 }
 
 #[cfg(test)]

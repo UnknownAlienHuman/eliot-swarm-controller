@@ -468,6 +468,24 @@ millisecond value fits in `i64`. This setting only controls when a busy Agent
 with a healthy native source and no known request/tool activity is diagnosed;
 source-health failures are diagnosed promptly regardless of this window.
 
+Observe-what-matters thresholds are optional:
+
+```toml
+[daemon]
+heavy_wall_secs = 30
+heavy_cpu_secs = 60
+heavy_rss_bytes = 1073741824
+session_growth_ratio_permille = 800
+session_file_bytes = 67108864
+```
+
+A child-process tree whose wall time, consumed CPU or peak RSS crosses any one
+heavy threshold closes as one `activity.heavy` event (defaults: 30 s wall, 60 s CPU,
+1 GiB RSS). Session growth warns at 0.8 context occupancy or a 64 MiB native session
+file where the harness exposes a documented size source; there is no auto-compact.
+`swarm doctor` compares live installed harness versions and contract markers against
+the pinned `VERIFIED_HARNESSES` table without blocking launch.
+
 Cloud MCP is disabled when `[cloud_mcp]` is absent. When present, all fields are
 required. The HTTP MCP executable is the running daemon executable (`current_exe`);
 it is not a separate setting. The hostname is a bare DNS host; Eliot constructs

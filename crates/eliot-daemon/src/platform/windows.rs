@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
 use super::process_observation::{
-    MAX_PROCESS_SAMPLES, exited_sample, same_identity, unknown_sample,
+    CommandClass, MAX_PROCESS_SAMPLES, exited_sample, same_identity, unknown_sample,
 };
 use eliot_core::{
     Error, ProcessIdentity, ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result,
@@ -56,7 +56,8 @@ use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, Get
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
     OpenProcess, OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess,
+    WaitForSingleObject,
 };
 
 /// Availability is only a connect hint: another client may win the instance.
@@ -912,7 +913,128 @@ pub(crate) fn recorded_process_alive(pid: u32, start_time: u64) -> Result<bool> 
         Err(error) => Err(error),
     }
 }
+/// ProcessCommandLineInformation class for NtQueryInformationProcess.
+const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
 
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryInformationProcess(
+        ProcessHandle: HANDLE,
+        ProcessInformationClass: u32,
+        ProcessInformation: *mut c_void,
+        ProcessInformationLength: u32,
+        ReturnLength: *mut u32,
+    ) -> i32;
+}
+
+/// Bounded program identity for one process: the image basename plus at most
+/// one subcommand token, classified at read time so full argv never persists.
+///
+/// Microsoft Learn: QueryFullProcessImageNameW for the image (documented,
+/// same query rights the observer already holds); NtQueryInformationProcess
+/// with ProcessCommandLineInformation for the command line (documented entry
+/// point). Access-denied, exited-race and unparseable results fail closed to
+/// the image-only category or to None.
+pub(crate) fn process_command_class(pid: u32) -> Option<CommandClass> {
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: read-only query rights; the wrapper closes the handle.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let process = QueryHandle(process);
+    let image = process_image_basename(process.0).unwrap_or_default();
+    let image_category = eliot_core::classify_heavy_command(&image, &[]);
+    if image_category == "unknown" {
+        return None;
+    }
+    match process_command_line(process.0) {
+        Some(cmdline) => {
+            let args = eliot_core::split_windows_command_line(&cmdline);
+            match args.split_first() {
+                Some((program, rest)) => {
+                    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+                    Some(CommandClass {
+                        category: eliot_core::classify_heavy_command(program, &rest),
+                        source: eliot_core::CATEGORY_SOURCE_CMDLINE,
+                    })
+                }
+                None => Some(CommandClass {
+                    category: image_category,
+                    source: eliot_core::CATEGORY_SOURCE_IMAGE,
+                }),
+            }
+        }
+        None => Some(CommandClass {
+            category: image_category,
+            source: eliot_core::CATEGORY_SOURCE_IMAGE,
+        }),
+    }
+}
+
+fn process_image_basename(process: HANDLE) -> Option<String> {
+    let mut size: u32 = 32_768;
+    let mut name = vec![0u16; size as usize];
+    // SAFETY: the buffer holds size UTF-16 units; the kernel writes at most
+    // size units and reports the count back through size.
+    if unsafe { QueryFullProcessImageNameW(process, 0, name.as_mut_ptr(), &mut size) } == 0 {
+        return None;
+    }
+    String::from_utf16(&name[..size as usize]).ok()
+}
+
+fn process_command_line(process: HANDLE) -> Option<String> {
+    const BUFFER_BYTES: usize = 65_536;
+    let mut buffer = vec![0u8; BUFFER_BYTES];
+    let mut returned: u32 = 0;
+    // SAFETY: the buffer is caller-owned and sized; the kernel fills a
+    // UNICODE_STRING header plus the string bytes inside it.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process,
+            PROCESS_COMMAND_LINE_INFORMATION,
+            buffer.as_mut_ptr() as *mut c_void,
+            BUFFER_BYTES as u32,
+            &mut returned,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let ptr_size = std::mem::size_of::<usize>();
+    let header = 4 + ptr_size;
+    if (returned as usize) > buffer.len() || (returned as usize) < header + 2 {
+        return None;
+    }
+    let length = u16::from_ne_bytes([buffer[0], buffer[1]]) as usize;
+    if length == 0 || !length.is_multiple_of(2) || length > 32_760 {
+        return None;
+    }
+    let mut addr = [0u8; 8];
+    if ptr_size == 8 {
+        addr.copy_from_slice(&buffer[8..16]);
+    } else {
+        addr[..4].copy_from_slice(&buffer[4..8]);
+    }
+    let str_ptr = usize::from_ne_bytes(addr) as *const u16;
+    if str_ptr.is_null() {
+        return None;
+    }
+    let base = buffer.as_ptr() as usize;
+    let addr = str_ptr as usize;
+    // The kernel returns the string inside the caller buffer; anything else
+    // is not a command line.
+    if addr < base || addr + length > base + buffer.len() {
+        return None;
+    }
+    // SAFETY: bounds validated above; the kernel wrote UTF-16 units there.
+    let units = unsafe { std::slice::from_raw_parts(str_ptr, length / 2) };
+    String::from_utf16(units)
+        .ok()
+        .filter(|line| !line.is_empty())
+}
 struct QueryHandle(HANDLE);
 
 // A query-only kernel handle has no thread-affine state. The observer serializes

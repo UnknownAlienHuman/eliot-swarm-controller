@@ -21,6 +21,7 @@ mod ids;
 mod mcp_policy;
 mod native_child;
 mod native_store;
+mod observe;
 mod remote_call;
 mod routing;
 mod secrets;
@@ -48,6 +49,15 @@ pub use native_child::{
     NativeChildActivityState, native_child_families_for_harness,
 };
 pub use native_store::NativeStoreBinding;
+pub use observe::{
+    ACTIVITY_HEAVY_KIND, CATEGORY_SOURCE_CMDLINE, CATEGORY_SOURCE_IMAGE, DEFAULT_HEAVY_CPU_SECS,
+    DEFAULT_HEAVY_RSS_BYTES, DEFAULT_HEAVY_WALL_SECS, DEFAULT_SESSION_FILE_BYTES,
+    DEFAULT_SESSION_GROWTH_RATIO, HARNESS_DRIFT_KIND, HarnessDrift, HeavyEpisode, HeavyThresholds,
+    OBSERVE_LEVEL_DEBUG, OBSERVE_LEVEL_STANDARD, SESSION_GROWTH_KIND, SessionGrowth,
+    SessionGrowthBasis, SessionGrowthThresholds, VERIFIED_HARNESSES, VerifiedHarness,
+    check_harness_drift, classify_heavy_command, compact_hint_for_harness, evaluate_session_growth,
+    split_unix_cmdline, split_windows_command_line, verified_harness,
+};
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
     CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind,

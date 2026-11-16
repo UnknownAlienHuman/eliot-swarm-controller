@@ -248,6 +248,38 @@ pub fn identity_lines(read: &DetailRead) -> Vec<String> {
 }
 
 /// Token usage and cost lines of the detail read.
+/// Heavy-work and session-growth readback for the Agent Details panel.
+/// Only committed rollups render: episode rows show the program basename
+/// recorded at commit time, never full commands or paths.
+pub fn observe_lines(read: &DetailRead) -> Vec<String> {
+    let mut lines = Vec::new();
+    match &read.agent.heavy {
+        Some(heavy) => lines.push(format!(
+            "Heavy: {} episode(s), latest {}, {} cpu ms",
+            heavy.episodes,
+            heavy.latest_category.as_deref().unwrap_or("-"),
+            heavy.total_cpu_ms,
+        )),
+        None => lines.push("Heavy: no heavy episodes recorded".to_owned()),
+    }
+    match &read.agent.session_growth {
+        Some(growth) => lines.push(format!(
+            "Growth{}: {}",
+            growth
+                .basis
+                .as_deref()
+                .map(|basis| format!("[{basis}]"))
+                .unwrap_or_default(),
+            growth
+                .message
+                .as_deref()
+                .unwrap_or("session signal crossed its threshold"),
+        )),
+        None => lines.push("Growth: within thresholds".to_owned()),
+    }
+    lines
+}
+
 pub fn usage_lines(read: &DetailRead) -> Vec<String> {
     let mut lines = Vec::new();
     match &read.usage {
