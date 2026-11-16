@@ -13,6 +13,9 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+# Local time for the sidebar's "older than today" fold; the workspace
+# chrono already resolves with `clock` (no new crate in the lockfile).
+chrono = { workspace = true, features = ["clock"] }
 clap.workspace = true
 eliot-core.workspace = true
 eliot-daemon.workspace = true
@@ -63,6 +66,9 @@ windows-sys = { workspace = true, features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_UI_Shell",
+    # Ctrl+N and Ctrl+K (`shortcuts`): a thread-scoped keyboard hook.
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
     # High Contrast detection (SPI_GETHIGHCONTRAST) for the theme fallback.
     "Win32_UI_Accessibility",
     "Win32_UI_WindowsAndMessaging",

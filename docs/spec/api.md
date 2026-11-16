@@ -434,6 +434,8 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `project.list/get` | owner-only read of registered project authority |
 | `rule.list/get/catch_up` | owner-only paged rule list (state, timer state, canonical definition), one rule read, and finite committed-history catch-up |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
+| `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
+| `models.catalog` | owner-only unified searchable catalogue across every installed harness: versioned per-harness entries with display name, provider, efforts, default and hold/quota availability; `available` requires complete hold readback and affirmative fresh native quota evidence, otherwise `unknown` (or `held` for a known hold); catalogue membership alone proves no availability; aggregate and native-read caches include executable/version identity with bounded TTL and coalesced concurrent callers; optional case-insensitive `query` over id, display name, provider and harness; bounded and paginated |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `config.profiles.read/save` | legacy profile-only read and validated, revision-guarded replacement of the `[profiles.*]` sections of `config.toml` (same writer as `settings.save`) |
 | `settings.read/save` | owner-only unified section read/save, revision CAS, dry run, restart indication and bounded author history; see configuration |
@@ -641,7 +643,14 @@ silently. The selective structural/scope index (`parent`/`root`/`project`)
 leads when several filters are present. Each summary carries identity, state,
 current turn, progress age, the last terminal outcome with its turn and
 retained usage where available, child activity for native observed children,
-and the last controller-observed write time. When the newest terminal turn
+and the last controller-observed write time. It also carries what the Agent is
+for, so a list needs no read per row (the pattern of Codex app-server
+`thread/list`, whose threads carry `name` and a first-message `preview`): the
+Agent `name` when one was set, its frozen `profile` name, and `preview`, the
+first 256 characters ([`AGENT_PREVIEW_CHARS`](../../crates/eliot-core/src/api/agent_views.rs))
+of its oldest retained `send` text, a launch's linked first input included,
+read by one indexed seek per row. Each is omitted when absent; the scope that
+lists a row may already read that command through `command.get`. When the newest terminal turn
 carries no native turn usage, the summary `usage` falls back to the
 generation's latest retained `session.usage` snapshot (cumulative
 input/output/cache counters only, never a derived total) with
@@ -668,6 +677,15 @@ response binding failures remain `unknown`; validate the reply before printing
 it or advancing a cursor. `swarm ls` and `swarm top` render these summaries as
 compact tables by default, labeling the active turn separately from the
 last-terminal outcome/usage and reporting observation data availability only;
+the human-readable STATE cell shows the read-only `activity` value with an
+`observed` marker for native observed children (for example `idle (observed)`),
+while `--json` and `swarm show` keep both the unchanged lifecycle `state`
+(`unknown` for observed rows) and the `activity` object. Fleet `unknown`
+counts bucket by activity, never by raw `state`: controlled Agents count by
+lifecycle state, observed children with `running`/`idle`/`interrupted`
+activity count under that activity, and only observed `unknown`/`lost`
+activity counts as `unknown` (desktop monitor and `daemon.status` consumers
+must use this bucket);
 both tables carry a `USAGE` cell with the native total when supplied,
 otherwise the input+output sum as a fleet signal, suffixed `(t)` for
 turn-backed usage and `(s)` for the session fallback; `--json` keeps

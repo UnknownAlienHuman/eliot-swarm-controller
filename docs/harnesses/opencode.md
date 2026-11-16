@@ -367,3 +367,12 @@ owns an isolated per-Agent config root (`XDG_CONFIG_HOME` /
 `agent_config_json`, `ServerLaunch::native_subagents`) and
 `plugins/opencode/src/host.rs` (`ParsedStart::native_subagents`).
 
+## Access levels (`--access ask|auto`)
+
+Ad-hoc `ask` and `auto` share the native permission-reply surface: permission
+requests stay pending for the Owner (`swarm approve`/`deny`). `full` has no
+verified full-access mapping and refuses with `unsupported` instead of silently
+widening. The level freezes as `access` in the snapshot. Implementation:
+[`crates/eliot-daemon/src/adhoc.rs`](../../crates/eliot-daemon/src/adhoc.rs)
+(`apply_adhoc_access`).
+

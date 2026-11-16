@@ -464,10 +464,24 @@ of the explicitly selected release scope.
       only with the same id, and offers Owner `command.resolve`/`command.cancel`
       for a held or failed brief and an ordinary handoff to finish a switch.
 - [x] **D7 One shell.** The rail of separate screens is replaced by one shell
-      (owner review 2026-11-15, the Codex app as reference). A sidebar holds New
-      task, projects with their Agents nested (manager, then workers, collapsed),
-      Recents (titles from each Agent's first message), a fleet status line that
-      opens the monitor, and Settings. The conversation has a one-line header
+      (owner review 2026-11-15, the Codex app as reference). A sidebar holds
+      Search tasks (Ctrl+K: title, project and harness, through WinUI's
+      AutoSuggestBox), one tonal New task row (Ctrl+N), collapsible projects
+      with their Agents nested (manager, then workers, collapsed), Recents, a
+      calm fleet line that opens the monitor ("6 running"), a separate "N need
+      attention" row that lists only Agents waiting on a request or controlled
+      Agents in `unknown` (observe-only native children never count), and
+      Settings. A project is a repository: checkouts registered with the same
+      Git common directory group under the repository's name, and a task row
+      names its worktree only where the project spans several. Running tasks
+      stay on top, then newest first; stopped tasks last changed before today
+      fold into "Show N older"; a collapsed project shows its running count.
+      Titles come with each `agent.list` page (the first meaningful line of
+      the summary `preview`, Markdown removed, else the name, else
+      `<harness> · <profile>`). Collapsed projects live in memory until
+      `[desktop] collapsed_projects` exists. Reactor 0.100.0 has no key events
+      and no N/K accelerator keys, so the two shortcuts come from a keyboard
+      hook scoped to the window's thread. The conversation has a one-line header
       (title, status dot, details toggle, a "…" menu for Hand off/Switch, Change
       manager, Resume, Detach, Stop and Force stop); coverage, ids and readback
       live in the details panel. One composer carries the project and

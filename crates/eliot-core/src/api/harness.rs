@@ -468,6 +468,243 @@ impl HarnessQuotaResponse {
     }
 }
 
+/// Maximum `models.catalog` query length in bytes.
+pub const MAX_CATALOG_QUERY_BYTES: usize = 128;
+/// Maximum `models.catalog` page size.
+pub const MAX_CATALOG_LIMIT: usize = 100;
+/// Default `models.catalog` page size.
+pub const DEFAULT_CATALOG_LIMIT: usize = 50;
+/// Maximum models returned in one `models.catalog` page is the page limit;
+/// the aggregated catalogue behind the page is bounded by the per-harness cap.
+pub const MAX_CATALOG_MODELS: usize = 1024;
+
+/// Availability of one catalogue model: `available` (provider quota supports
+/// it and no hold covers it), `held` (a provider hold covers its harness
+/// scope) or `unknown` (no hold/quota signal is known).
+pub const CATALOG_AVAILABLE: &str = "available";
+/// See [`CATALOG_AVAILABLE`].
+pub const CATALOG_HELD: &str = "held";
+/// See [`CATALOG_AVAILABLE`].
+pub const CATALOG_UNKNOWN: &str = "unknown";
+
+/// Request for `models.catalog`: one owner-scoped read-only search over every
+/// installed harness catalogue. `query` filters case-insensitively over model
+/// id, display name, provider and harness. `after` is the last returned
+/// `harness:id` cursor of the same selection. Results are bounded and
+/// paginated.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelsCatalogRequest {
+    /// Case-insensitive substring over model id, display name, provider and
+    /// harness (at most 128 bytes). Omitted or empty means no filtering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Continue after the last `harness:id` cursor of the same selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Page size, 1..=100; default 50.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl ModelsCatalogRequest {
+    pub fn effective_limit(&self) -> usize {
+        self.limit.unwrap_or(DEFAULT_CATALOG_LIMIT)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .query
+            .as_deref()
+            .is_some_and(|query| query.len() > MAX_CATALOG_QUERY_BYTES)
+        {
+            return Err(Error::new(
+                "invalid",
+                "catalogue query must be at most 128 bytes",
+            ));
+        }
+        if self.after.as_deref().is_some_and(|after| {
+            after.trim().is_empty() || after.len() > 512 || after.chars().any(char::is_control)
+        }) {
+            return Err(Error::new(
+                "invalid",
+                "catalogue cursor must be a non-empty harness:id of at most 512 bytes",
+            ));
+        }
+        if !(1..=MAX_CATALOG_LIMIT).contains(&self.effective_limit()) {
+            return Err(Error::new(
+                "invalid",
+                "catalogue limit must be from 1 through 100",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_response(&self, reply: &ModelsCatalogResponse) -> Result<()> {
+        if reply.models.len() > self.effective_limit() {
+            return Err(Error::new("invalid", "catalogue page exceeds its limit"));
+        }
+        reply.validate()
+    }
+}
+
+/// One unified catalogue model.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelsCatalogEntry {
+    /// Harness code: codex|claude|muse|opencode|antigravity.
+    pub harness: String,
+    /// Native model id verbatim (`provider/model` for OpenCode).
+    pub id: String,
+    /// Display name (native id verbatim; OpenCode shows the full
+    /// `provider/model` id).
+    pub display_name: String,
+    /// Provider (`openai` for Codex, `anthropic` for Claude, `meta` for Muse,
+    /// the `provider/` prefix for OpenCode, the leading family for
+    /// Antigravity, otherwise the harness code).
+    pub provider: String,
+    /// Supported reasoning efforts or variants, when the harness reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub efforts: Option<Vec<String>>,
+    /// The harness default reasoning effort, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    /// True for the harness native default entry.
+    #[serde(default)]
+    pub default: bool,
+    /// One of `available`, `held` or `unknown`.
+    pub availability: String,
+}
+
+impl ModelsCatalogEntry {
+    pub fn validate(&self) -> Result<()> {
+        validate_harness(&self.harness)?;
+        if self.id.trim().is_empty()
+            || self.id.len() > MAX_HARNESS_MODEL_ID_BYTES
+            || self.id.chars().any(char::is_control)
+        {
+            return Err(Error::new(
+                "invalid",
+                "catalogue model id must be non-empty of at most 256 characters",
+            ));
+        }
+        if self.display_name.trim().is_empty() || self.display_name.len() > 512 {
+            return Err(Error::new(
+                "invalid",
+                "catalogue display name must be non-empty of at most 512 characters",
+            ));
+        }
+        if self.provider.trim().is_empty() || self.provider.len() > 128 {
+            return Err(Error::new(
+                "invalid",
+                "catalogue provider must be non-empty of at most 128 characters",
+            ));
+        }
+        if !matches!(
+            self.availability.as_str(),
+            CATALOG_AVAILABLE | CATALOG_HELD | CATALOG_UNKNOWN
+        ) {
+            return Err(Error::new(
+                "invalid",
+                "catalogue availability must be available, held or unknown",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Response for `models.catalog`.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelsCatalogResponse {
+    /// Every installed harness with its version and status.
+    pub harnesses: Vec<HarnessEntry>,
+    /// The bounded page of unified models, sorted by harness then id.
+    pub models: Vec<ModelsCatalogEntry>,
+    /// Last `harness:id` cursor of this page; absent at the end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    /// Milliseconds since the Unix epoch when the aggregate was completed.
+    pub fetched_at_ms: i64,
+    /// Freshness bound in milliseconds for the aggregate.
+    pub ttl_ms: u64,
+}
+
+impl ModelsCatalogResponse {
+    pub fn validate(&self) -> Result<()> {
+        if self.harnesses.is_empty() || self.harnesses.len() > 16 {
+            return Err(Error::new(
+                "invalid",
+                "catalogue harness list is empty or oversized",
+            ));
+        }
+        if self.models.len() > MAX_CATALOG_MODELS {
+            return Err(Error::new(
+                "invalid",
+                "catalogue model list exceeds 1024 entries",
+            ));
+        }
+        for model in &self.models {
+            model.validate()?;
+        }
+        validate_freshness(self.fetched_at_ms, self.ttl_ms)?;
+        Ok(())
+    }
+}
+
+/// Provider for one catalogue id: OpenCode and Antigravity models carry a
+/// provider prefix or group; Codex is openai, Claude is anthropic, Muse is
+/// meta. Documented in `docs/spec/configuration.md` (access mapping).
+pub fn catalog_provider(harness: &str, id: &str) -> String {
+    if let Some((provider, _)) = id.split_once('/')
+        && !provider.trim().is_empty()
+    {
+        return provider.to_owned();
+    }
+    match harness {
+        "codex" => "openai".to_owned(),
+        "claude" => "anthropic".to_owned(),
+        "muse" => "meta".to_owned(),
+        "antigravity" => id
+            .split(['-', '_'])
+            .next()
+            .filter(|family| !family.trim().is_empty())
+            .unwrap_or("antigravity")
+            .to_owned(),
+        "opencode" => id
+            .split_once('/')
+            .map(|(provider, _)| provider.to_owned())
+            .unwrap_or_else(|| "opencode".to_owned()),
+        _ => harness.to_owned(),
+    }
+}
+
+/// Display name for one catalogue id: the native id verbatim.
+pub fn catalog_display_name(id: &str) -> String {
+    id.to_owned()
+}
+
+/// Cursor for one catalogue entry: `harness:id`.
+pub fn catalog_cursor(harness: &str, id: &str) -> String {
+    format!("{harness}:{id}")
+}
+
+/// Case-insensitive substring match over model id, display name, provider
+/// and harness. An empty query matches everything.
+pub fn catalog_matches(entry: &ModelsCatalogEntry, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_ascii_lowercase();
+    [
+        entry.id.as_str(),
+        entry.display_name.as_str(),
+        entry.provider.as_str(),
+        entry.harness.as_str(),
+    ]
+    .iter()
+    .any(|field| field.to_ascii_lowercase().contains(&query))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +930,123 @@ mod tests {
             "blob": "x".repeat(MAX_HARNESS_QUOTA_DETAILS_BYTES)
         }));
         assert_eq!(oversize.validate().unwrap_err().code, "invalid");
+    }
+
+    fn catalog_entry(harness: &str, id: &str) -> ModelsCatalogEntry {
+        ModelsCatalogEntry {
+            harness: harness.to_owned(),
+            id: id.to_owned(),
+            display_name: catalog_display_name(id),
+            provider: catalog_provider(harness, id),
+            efforts: None,
+            default_effort: None,
+            default: false,
+            availability: CATALOG_UNKNOWN.to_owned(),
+        }
+    }
+
+    #[test]
+    fn catalog_provider_names_each_harness() {
+        assert_eq!(catalog_provider("codex", "gpt-6-luna"), "openai");
+        assert_eq!(catalog_provider("claude", "claude-haiku-5-5"), "anthropic");
+        assert_eq!(catalog_provider("muse", "muse-spark-1.3"), "meta");
+        assert_eq!(
+            catalog_provider("opencode", "opencode/deepseek-v4.1-flash-free"),
+            "opencode"
+        );
+        assert_eq!(catalog_provider("opencode", "deepseek/v4-free"), "deepseek");
+        assert_eq!(
+            catalog_provider("antigravity", "gemini-4-hydrogen-low"),
+            "gemini"
+        );
+    }
+
+    #[test]
+    fn catalog_query_filters_case_insensitively_over_all_fields() {
+        let luna = catalog_entry("codex", "gpt-6-luna");
+        assert!(catalog_matches(&luna, ""));
+        assert!(catalog_matches(&luna, "luna"));
+        assert!(catalog_matches(&luna, "LUNA"));
+        assert!(catalog_matches(&luna, "GPT-6"));
+        assert!(catalog_matches(&luna, "openai"));
+        assert!(catalog_matches(&luna, "OPENAI"));
+        assert!(catalog_matches(&luna, "codex"));
+        assert!(catalog_matches(&luna, "CoDeX"));
+        assert!(!catalog_matches(&luna, "anthropic"));
+        let opencode = catalog_entry("opencode", "opencode/deepseek-v4.1-flash-free");
+        assert!(catalog_matches(&opencode, "deepseek"));
+        assert!(catalog_matches(&opencode, "opencode"));
+        assert!(!catalog_matches(&opencode, "luna"));
+    }
+
+    #[test]
+    fn catalog_request_validates_bounds() {
+        ModelsCatalogRequest {
+            query: None,
+            after: None,
+            limit: None,
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(
+            ModelsCatalogRequest {
+                query: Some("x".repeat(MAX_CATALOG_QUERY_BYTES + 1)),
+                after: None,
+                limit: None,
+            }
+            .validate()
+            .unwrap_err()
+            .code,
+            "invalid"
+        );
+        for limit in [0, MAX_CATALOG_LIMIT + 1] {
+            assert_eq!(
+                ModelsCatalogRequest {
+                    query: None,
+                    after: None,
+                    limit: Some(limit),
+                }
+                .validate()
+                .unwrap_err()
+                .code,
+                "invalid"
+            );
+        }
+        let page = ModelsCatalogResponse {
+            harnesses: vec![HarnessEntry {
+                harness: "codex".to_owned(),
+                installed: true,
+                cmd: None,
+                version: Some("1.0".to_owned()),
+                code: None,
+                error: None,
+                candidates: None,
+            }],
+            models: vec![catalog_entry("codex", "gpt-6-luna")],
+            next: None,
+            fetched_at_ms: 1,
+            ttl_ms: HARNESS_READ_TTL_MS,
+        };
+        ModelsCatalogRequest {
+            query: None,
+            after: None,
+            limit: Some(1),
+        }
+        .validate_response(&page)
+        .unwrap();
+        assert_eq!(
+            ModelsCatalogRequest {
+                query: None,
+                after: None,
+                limit: Some(1),
+            }
+            .validate_response(&ModelsCatalogResponse {
+                models: vec![catalog_entry("codex", "a"), catalog_entry("codex", "b"),],
+                ..page
+            })
+            .unwrap_err()
+            .code,
+            "invalid"
+        );
     }
 }

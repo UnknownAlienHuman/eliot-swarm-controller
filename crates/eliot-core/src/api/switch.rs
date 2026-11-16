@@ -14,6 +14,7 @@ pub struct SwitchLaunch {
     pub effort: Option<String>,
     pub auth: Option<String>,
     pub cmd: Option<String>,
+    pub access: Option<String>,
     /// Omitted uses A's retained workspace. Normal launch canonicalization still applies.
     pub workspace: Option<String>,
     pub worktree: Option<String>,
@@ -24,9 +25,15 @@ impl SwitchLaunch {
     pub fn validate(&self) -> Result<()> {
         if self.profile.is_some() == self.harness.is_some()
             || (self.harness.is_none()
-                && [&self.model, &self.effort, &self.auth, &self.cmd]
-                    .iter()
-                    .any(|value| value.is_some()))
+                && [
+                    &self.model,
+                    &self.effort,
+                    &self.auth,
+                    &self.cmd,
+                    &self.access,
+                ]
+                .iter()
+                .any(|value| value.is_some()))
             || (self.base.is_some() && self.worktree.is_none())
             || [
                 &self.profile,
@@ -35,6 +42,7 @@ impl SwitchLaunch {
                 &self.effort,
                 &self.auth,
                 &self.cmd,
+                &self.access,
                 &self.workspace,
                 &self.worktree,
                 &self.base,
@@ -45,6 +53,14 @@ impl SwitchLaunch {
             return Err(Error::new(
                 "invalid",
                 "switch requires a profile or ad-hoc harness and valid launch selectors",
+            ));
+        }
+        if let Some(access) = self.access.as_deref()
+            && !matches!(access.trim(), "ask" | "auto" | "full")
+        {
+            return Err(Error::new(
+                "invalid",
+                "switch access must be ask, auto or full",
             ));
         }
         Ok(())

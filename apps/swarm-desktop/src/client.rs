@@ -403,35 +403,6 @@ pub async fn agent_sends(data_dir: &Path, agent: &str) -> Result<(Vec<Command>, 
     Ok((reads.into_iter().collect::<Result<_>>()?, omitted))
 }
 
-/// Admission events read to find an Agent's first SEND for its title.
-const FIRST_INPUT_SCAN: usize = 64;
-
-/// The text of an Agent's oldest retained SEND (a launch's linked first
-/// input included), for its title in the sidebar: the first admission
-/// events after the retention floor, then that command's text. `None` when
-/// none is retained.
-pub async fn first_input(data_dir: &Path, agent: &str) -> Result<Option<String>> {
-    let filter = EventsFilter {
-        agents: vec![agent.to_owned()],
-        kinds: crate::handoff::ADMISSION_KINDS.map(str::to_owned).to_vec(),
-        sources: Vec::new(),
-    };
-    let bounds = events_bounds(data_dir, &filter).await?;
-    let page = events_read(data_dir, bounds.pruned_through, FIRST_INPUT_SCAN, &filter).await?;
-    let Some(id) = crate::handoff::send_ids(&page.events, agent)
-        .into_iter()
-        .next()
-    else {
-        return Ok(None);
-    };
-    let command = read_command(data_dir, &id).await?;
-    Ok(command
-        .args
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::to_owned))
-}
-
 /// Owner task transfer to an existing Agent. The same request (id
 /// included) is also the readback: the daemon returns the committed result
 /// and the current brief gate, never a second transfer.
