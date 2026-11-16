@@ -634,7 +634,14 @@ silently. The selective structural/scope index (`parent`/`root`/`project`)
 leads when several filters are present. Each summary carries identity, state,
 current turn, progress age, the last terminal outcome with its turn and
 retained usage where available, child activity for native observed children,
-and the last controller-observed write time. When the newest terminal turn
+and the last controller-observed write time. It also carries what the Agent is
+for, so a list needs no read per row (the pattern of Codex app-server
+`thread/list`, whose threads carry `name` and a first-message `preview`): the
+Agent `name` when one was set, its frozen `profile` name, and `preview`, the
+first 256 characters ([`AGENT_PREVIEW_CHARS`](../../crates/eliot-core/src/api/agent_views.rs))
+of its oldest retained `send` text, a launch's linked first input included,
+read by one indexed seek per row. Each is omitted when absent; the scope that
+lists a row may already read that command through `command.get`. When the newest terminal turn
 carries no native turn usage, the summary `usage` falls back to the
 generation's latest retained `session.usage` snapshot (cumulative
 input/output/cache counters only, never a derived total) with

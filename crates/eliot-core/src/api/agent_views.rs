@@ -12,6 +12,8 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PROCESS_CURSOR_MAX_BYTES: usize = 2_048;
+/// Most characters of [`AgentSummary::preview`].
+pub const AGENT_PREVIEW_CHARS: usize = 256;
 const EDIT_CURSOR_MAX_BYTES: usize = 64 * 1_024;
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +228,14 @@ impl AgentListRequest {
 /// `updated_at` is the last controller-observed write: for detached or
 /// restarted sources it is freshness metadata, not proof of liveness. Full
 /// records stay available through `agent.get`.
+///
+/// `name`, `profile` and `preview` let a list show what the Agent is for
+/// without a read per row (the pattern of Codex app-server `thread/list`,
+/// whose threads carry `name` and a first-message `preview`): the Agent's
+/// name when one was set, its frozen profile name, and the first
+/// [`AGENT_PREVIEW_CHARS`] characters of its oldest retained `send` text (a
+/// launch's linked first input included). Each is absent when the Store has
+/// none; the same scope that lists the row may already read that command.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSummary {
     pub id: String,
@@ -233,6 +243,13 @@ pub struct AgentSummary {
     pub generation: i64,
     pub project: String,
     pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 256))]
+    pub preview: Option<String>,
     pub state: AgentState,
     #[serde(deserialize_with = "nullable")]
     pub parent: Option<String>,
@@ -269,6 +286,19 @@ impl AgentSummary {
         }
         text(&self.project)?;
         text(&self.harness)?;
+        for value in [&self.name, &self.profile, &self.preview]
+            .into_iter()
+            .flatten()
+        {
+            text(value)?;
+        }
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.chars().count() > AGENT_PREVIEW_CHARS)
+        {
+            return Err(Error::new("invalid", "Agent summary preview is too long"));
+        }
         text(&self.root)?;
         crate::parse_agent_id(&self.root)?;
         if let Some(parent) = &self.parent {
@@ -2203,6 +2233,9 @@ mod tests {
             generation: 0,
             project: "p".to_owned(),
             harness: "fake".to_owned(),
+            name: None,
+            profile: None,
+            preview: None,
             state: AgentState::Idle,
             parent: None,
             root: "a1".to_owned(),
@@ -2216,6 +2249,33 @@ mod tests {
             usage_scope: None,
             updated_at: 7,
         }
+    }
+
+    #[test]
+    fn summary_title_sources_are_optional_nonblank_and_bounded() {
+        let mut row = summary();
+        let wire = serde_json::to_value(&row).unwrap();
+        for absent in ["name", "profile", "preview"] {
+            assert!(wire.get(absent).is_none(), "{absent}");
+        }
+        row.name = Some("planner".to_owned());
+        row.profile = Some("codex-lite".to_owned());
+        row.preview = Some("é".repeat(AGENT_PREVIEW_CHARS));
+        row.validate().unwrap();
+        let read: AgentSummary =
+            serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+        assert_eq!(read, row);
+        row.preview = Some("x".repeat(AGENT_PREVIEW_CHARS + 1));
+        assert!(row.validate().is_err());
+        row.preview = Some(
+            " 
+ "
+            .to_owned(),
+        );
+        assert!(row.validate().is_err());
+        row.preview = None;
+        row.name = Some(String::new());
+        assert!(row.validate().is_err());
     }
 
     #[test]

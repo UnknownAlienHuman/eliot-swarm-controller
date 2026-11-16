@@ -58,6 +58,8 @@ impl DesktopApp {
                                 project: String::new(),
                                 parent: row.parent.clone(),
                                 updated_at: 0,
+                                title: row.title.clone(),
+                                native_child: row.activity.is_some(),
                             })
                     });
                 if let Some(agent) = agent {

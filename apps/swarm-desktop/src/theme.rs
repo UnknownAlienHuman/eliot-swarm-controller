@@ -451,6 +451,15 @@ pub mod winui {
             })
         }
 
+        /// The tonal row (New task): primary-container with
+        /// on-primary-container, distinct from the selection's
+        /// secondary-container.
+        pub fn tonal_row(self) -> ResourceOverrides {
+            self.with(|s| {
+                Family::new(Some(s.primary_container), s.on_primary_container).overrides(s)
+            })
+        }
+
         /// A card that is one button (monitor cards): no fill of its own
         /// (the card's container shows through), on-surface state layers.
         pub fn card_button(self) -> ResourceOverrides {
