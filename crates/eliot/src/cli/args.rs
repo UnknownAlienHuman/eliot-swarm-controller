@@ -156,6 +156,8 @@ pub(crate) enum CliCommand {
     Var(VarArgs),
     /// Show current workers and their file areas.
     Who(WhoArgs),
+    /// Read your authenticated identity and allowed scopes.
+    Identity,
     /// Set, list or release advisory work claims.
     Claim(ClaimArgs),
     /// Internal plugin entry point used by the daemon.

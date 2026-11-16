@@ -27,7 +27,7 @@ use std::{
 };
 
 use eliot_core::{Error, Result, SecretPolicy};
-use eliot_plugin::{StderrCapture, session::paths_equal, spawn_stderr};
+use eliot_plugin::{StderrCapture, session::paths_equal, skill, spawn_stderr};
 use tokio::{
     net::TcpListener,
     process::{Child, Command},
@@ -313,6 +313,35 @@ impl OwnedServer {
                 format!("OpenCode per-Agent plugin could not be written: {error}"),
             )
         })?;
+        // Bundled coordination skill: copy the daemon-materialized
+        // canonical files into this isolated root's global skills
+        // directory, so the per-Agent server loads `eliot-swarm` natively
+        // with no project or user file touched. Rewritten verbatim on
+        // every start, like the context-hook plugin above. A missing
+        // canonical copy fails the start: the Agent must not start
+        // believing it has no skill.
+        let skill_dir = config_dir.join("skills").join(skill::SKILL_NAME);
+        std::fs::create_dir_all(&skill_dir).map_err(|error| {
+            Error::new(
+                "native_spawn",
+                format!("OpenCode per-Agent skills directory could not be created: {error}"),
+            )
+        })?;
+        for file in [skill::SKILL_FILE, skill::SKILL_REFERENCE_FILE] {
+            let text = skill::read_skill_file(&skill::skill_dir(&launch.swarm_data_dir).join(file))
+                .map_err(|_| {
+                    Error::new(
+                        "native_spawn",
+                        "OpenCode skill source is unavailable; the daemon did not materialize it",
+                    )
+                })?;
+            std::fs::write(skill_dir.join(file), text).map_err(|error| {
+                Error::new(
+                    "native_spawn",
+                    format!("OpenCode per-Agent skill could not be written: {error}"),
+                )
+            })?;
+        }
         // Credential preparation before `serve` starts, under the exact XDG
         // roots the server will use. Cloud path: the isolated store sees no
         // canonical credential, so the selected integration moves in opaquely

@@ -18,6 +18,7 @@ use crate::chat::{self, Part, PartKind, TurnItem, text_hash};
 use crate::markdown::{Block, Doc, Inline};
 use crate::theme;
 use crate::theme::winui::Palette;
+use crate::ui::tokens;
 
 /// One display block, ready for the UI thread.
 #[derive(Clone)]
@@ -167,39 +168,33 @@ pub struct RowCallbacks {
 }
 
 fn label(text: &str) -> TextBlock {
-    TextBlock::new()
-        .text(text.to_owned())
-        .font_size(theme::type_scale::LABEL_MEDIUM.size)
-        .font_weight(FontWeight::MEDIUM)
-        .opacity(theme::MUTED_OPACITY)
+    crate::m3::secondary(text.to_owned())
 }
 
-/// Message text: M3 body-large.
+/// Message text: body.
 fn body_text(text: &str, foreground: Brush) -> TextBlock {
     TextBlock::new()
         .text(text.to_owned())
-        .font_size(theme::type_scale::BODY_LARGE.size)
+        .font_size(tokens::text::BODY.size)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
         .foreground(foreground)
 }
 
-/// An inline control is pulled back by this so its content lines up with
-/// the text around it (a 32-DIP icon button centres a 16-DIP glyph).
-const INSET: f64 = 8.0;
+/// An inline icon button is pulled back by this so its glyph lines up
+/// with the text around it (a 32-DIP icon button centres a 16-DIP glyph).
+const INSET: f64 = (tokens::height::CONTROL - tokens::icon::ROW) / 2.0;
 
 /// A small icon button for Copy, named for screen readers.
 fn copy_button(name: &str, palette: Palette, callback: impl Fn() + 'static) -> Button {
     crate::m3::icon_button(palette)
-        .width(32.0)
-        .height(32.0)
         .automation_name(name.to_owned())
         .on_click(callback)
 }
 
 /// The glyph of a copy button.
 fn copy_glyph() -> View {
-    crate::m3::icon_sized(crate::m3::glyph::COPY, 16.0)
+    crate::m3::icon(crate::m3::glyph::COPY)
 }
 
 fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) -> Vec<KeyedView> {
@@ -216,35 +211,35 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
             let view: View = match block {
                 RenderedBlock::Rich(text) => RichTextBlock::new()
                     .paragraphs(text.clone())
-                    .font_size(theme::type_scale::BODY_LARGE.size)
+                    .font_size(tokens::text::BODY.size)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true)
                     .into(),
-                RenderedBlock::Heading(level, text) => TextBlock::new()
-                    .text(text.clone())
-                    .font_size(match level {
-                        1 => theme::type_scale::TITLE_LARGE.size,
-                        2 => theme::type_scale::TITLE_MEDIUM.size,
-                        _ => theme::type_scale::TITLE_SMALL.size,
-                    })
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true)
-                    .automation_heading_level(match level {
-                        1 => AutomationHeadingLevel::Level1,
-                        2 => AutomationHeadingLevel::Level2,
-                        _ => AutomationHeadingLevel::Level3,
-                    })
-                    .into(),
+                RenderedBlock::Heading(level, text) => crate::m3::text(
+                    text.clone(),
+                    if *level == 1 {
+                        tokens::text::PAGE_TITLE
+                    } else {
+                        tokens::text::SECTION_TITLE
+                    },
+                )
+                .text_wrapping(TextWrapping::Wrap)
+                .is_text_selection_enabled(true)
+                .automation_heading_level(match level {
+                    1 => AutomationHeadingLevel::Level1,
+                    2 => AutomationHeadingLevel::Level2,
+                    _ => AutomationHeadingLevel::Level3,
+                })
+                .into(),
                 RenderedBlock::Code(code_index, text) => {
                     let copy = callbacks.copy_code.clone();
                     let key = part.key.clone();
                     let code_index = *code_index;
-                    StackPanel::new().spacing(theme::spacing::XS).children((
+                    StackPanel::new().spacing(tokens::spacing::XS).children((
                         Border::new()
                             .background(palette.raised())
-                            .corner_radius(theme::shape::MD)
-                            .padding(Thickness::uniform(theme::spacing::MD))
+                            .corner_radius(tokens::radius::CONTAINER)
+                            .padding(Thickness::uniform(tokens::spacing::MD))
                             .content(
                                 ScrollViewer::new()
                                     .horizontal_scroll_bar_visibility(ScrollBarVisibility::Auto)
@@ -252,7 +247,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                                     .content(
                                         TextBlock::new()
                                             .text(text.clone())
-                                            .font_size(theme::type_scale::BODY_MEDIUM.size)
+                                            .font_size(tokens::text::BODY.size)
                                             .text_wrapping(TextWrapping::NoWrap)
                                             .is_text_selection_enabled(true),
                                     ),
@@ -264,10 +259,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                         .content(copy_glyph()),
                     ))
                 }
-                RenderedBlock::Rule => Border::new()
-                    .height(1.0)
-                    .background(palette.outline_variant())
-                    .into(),
+                RenderedBlock::Rule => crate::m3::divider(palette).into(),
             };
             KeyedView::new(index, view)
         })
@@ -278,7 +270,7 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
 /// group header): the end anchor of the transcript.
 ///
 /// One style for every part, as in a chat: the user's message is a
-/// secondary-container bubble on the right; the answer is plain body-large
+/// secondary-container bubble on the right; the answer is plain body
 /// text on the surface; tool groups are one low-emphasis expandable row;
 /// interim notes and notices are quiet lines; copy is a small icon button.
 fn part_view(
@@ -299,20 +291,14 @@ fn part_view(
     };
     match part.kind {
         PartKind::Input => StackPanel::new()
-            .spacing(2.0)
+            .spacing(tokens::spacing::XS)
             .horizontal_alignment(HorizontalAlignment::Right)
-            .max_width(theme::layout::READING_WIDTH * 0.8)
+            .max_width(tokens::layout::READING_WIDTH * tokens::layout::BUBBLE_SHARE)
             .children((
                 Border::new()
                     .background(palette.bubble())
-                    // M3 large corners, the small one toward the sender.
-                    .corner_radius(CornerRadius::new(
-                        theme::shape::LG,
-                        theme::shape::LG,
-                        theme::shape::XS,
-                        theme::shape::LG,
-                    ))
-                    .padding(Thickness::xy(theme::spacing::MD, 10.0))
+                    .corner_radius(tokens::radius::CONTAINER)
+                    .padding(Thickness::xy(tokens::spacing::INSET, tokens::spacing::SM))
                     .content(body_text(&part.plain, palette.on_bubble())),
                 anchored(copy_button("Copy message", palette, copy_message))
                     .horizontal_alignment(HorizontalAlignment::Right)
@@ -321,7 +307,7 @@ fn part_view(
             )),
         // Interim notes stay quiet.
         PartKind::Progress => StackPanel::new()
-            .spacing(theme::spacing::SM)
+            .spacing(tokens::spacing::SM)
             .opacity(theme::MUTED_OPACITY)
             .keyed_children(block_views(part, callbacks, palette)),
         PartKind::Tools => {
@@ -333,10 +319,10 @@ fn part_view(
             let header = anchored(
                 Button::new()
                     .resource_overrides(palette.icon_button())
-                    .height(36.0),
+                    .height(tokens::height::CONTROL),
             )
             .horizontal_alignment(HorizontalAlignment::Left)
-            .margin(Thickness::new(-12.0, 0.0, 0.0, 0.0))
+            .margin(Thickness::new(-tokens::spacing::INSET, 0.0, 0.0, 0.0))
             .automation_name(format!(
                 "Tool operations: {} ({})",
                 part.plain,
@@ -348,36 +334,29 @@ fn part_view(
             .content(
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
-                    .margin(Thickness::xy(-12.0, 0.0))
+                    .spacing(tokens::spacing::SM)
                     .children((
-                        crate::m3::icon_sized(crate::m3::glyph::TOOLS, 16.0),
-                        TextBlock::new()
-                            .text(part.plain.clone())
-                            .font_size(theme::type_scale::BODY_MEDIUM.size)
-                            .font_weight(FontWeight::NORMAL)
+                        crate::m3::icon(crate::m3::glyph::TOOLS),
+                        crate::m3::body(part.plain.clone())
                             .vertical_alignment(VerticalAlignment::Center),
-                        crate::m3::icon_sized(
-                            if expanded {
-                                crate::m3::glyph::CHEVRON_DOWN
-                            } else {
-                                crate::m3::glyph::CHEVRON_RIGHT
-                            },
-                            10.0,
-                        ),
+                        crate::m3::icon(if expanded {
+                            crate::m3::glyph::CHEVRON_DOWN
+                        } else {
+                            crate::m3::glyph::CHEVRON_RIGHT
+                        }),
                     )),
             );
             if expanded {
-                StackPanel::new().spacing(theme::spacing::XS).children((
+                StackPanel::new().spacing(tokens::spacing::XS).children((
                     header,
                     Border::new()
                         .background(palette.card())
-                        .corner_radius(theme::shape::MD)
-                        .padding(Thickness::uniform(theme::spacing::MD))
+                        .corner_radius(tokens::radius::CONTAINER)
+                        .padding(Thickness::uniform(tokens::spacing::MD))
                         .content(
                             TextBlock::new()
                                 .text(part.detail.join("\n"))
-                                .font_size(theme::type_scale::BODY_SMALL.size)
+                                .font_size(tokens::text::SECONDARY.size)
                                 .text_wrapping(TextWrapping::Wrap)
                                 .is_text_selection_enabled(true)
                                 .opacity(theme::MUTED_OPACITY),
@@ -395,10 +374,10 @@ fn part_view(
             } else {
                 label(&part.label).into()
             };
-            StackPanel::new().spacing(theme::spacing::SM).children((
+            StackPanel::new().spacing(tokens::spacing::SM).children((
                 note,
                 StackPanel::new()
-                    .spacing(theme::spacing::SM)
+                    .spacing(tokens::spacing::SM)
                     .keyed_children(block_views(part, callbacks, palette)),
                 anchored(copy_button("Copy message", palette, copy_message))
                     .horizontal_alignment(HorizontalAlignment::Left)
@@ -406,16 +385,16 @@ fn part_view(
                     .content(copy_glyph()),
             ))
         }
-        PartKind::Working => StackPanel::new().spacing(theme::spacing::XS).children((
+        PartKind::Working => StackPanel::new().spacing(tokens::spacing::XS).children((
             label(&part.label),
             ProgressBar::new()
                 .is_indeterminate(true)
-                .width(160.0)
+                .width(tokens::layout::PROGRESS_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Left),
         )),
         PartKind::Notice => TextBlock::new()
             .text(format!("{} · {}", part.label, part.plain))
-            .font_size(theme::type_scale::BODY_SMALL.size)
+            .font_size(tokens::text::SECONDARY.size)
             .text_wrapping(TextWrapping::Wrap)
             .opacity(theme::MUTED_OPACITY)
             .into(),
@@ -463,8 +442,8 @@ pub fn item_view(
     // still reaches the right edge.
     StackPanel::new()
         .width(width)
-        .spacing(theme::spacing::SM)
-        .margin(Thickness::new(0.0, 0.0, 0.0, theme::spacing::LG))
+        .spacing(tokens::spacing::SM)
+        .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::LG))
         .keyed_children(parts)
 }
 

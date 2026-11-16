@@ -9,6 +9,7 @@ use super::support::{
     Failure, WAIT_POLL_INTERVAL, command_value, mutation_id, print_value, validate_limit,
 };
 use eliot_core::Command as CoreCommand;
+use eliot_core::api::discovery::{IdentityRequest, IdentityResponse};
 use eliot_core::api::{
     ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimReleaseResponse,
     ClaimSetRequest, ClaimSetResponse, CommandChildrenRequest, CommandChildrenResponse,
@@ -378,6 +379,21 @@ pub(crate) async fn run_who(
     json_output: bool,
 ) -> Result<u8, Failure> {
     run_who_command(&data_dir, json_output, project, history).await
+}
+
+pub(crate) async fn run_identity(data_dir: PathBuf, json_output: bool) -> Result<u8, Failure> {
+    let request = IdentityRequest {};
+    request
+        .validate()
+        .map_err(|error| Failure::from_core(error, false))?;
+    let response: IdentityResponse =
+        eliot_daemon::client_call_typed(&data_dir, "api.identity", &request)
+            .await
+            .map_err(|error| Failure::from_core(error, false))?;
+    let value = serde_json::to_value(response)
+        .map_err(|_| Failure::new(4, "api.identity response is invalid"))?;
+    print_value(&value, json_output);
+    Ok(0)
 }
 
 pub(crate) async fn run_claim(

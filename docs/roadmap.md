@@ -357,8 +357,16 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       Qualified 2026-11-14 on Codex, Claude, Muse, OpenCode and Antigravity (release 492640C8).
 - [x] Rules/timers/hot reload, Goal limits, mail/ack, CAS, hierarchy and Git recovery.
       Qualified 2026-11-14 with real Muse Agents on a private daemon.
-- [ ] Windows Job/handles/paths; supported Linux behavior and honest degraded custody;
-      private IPC, credentials, resource bounds and adopted-service isolation.
+- [x] Windows Job/handles/paths, private IPC, credentials and resource bounds.
+      Qualified 2026-11-16 on release DCD64B86 with real Codex/Muse Agents: forced stop
+      and daemon kill leave no process of the Agent tree (tool grandchildren included)
+      and stopping one Agent spares another; only the daemon holds the Store handles;
+      space/non-ASCII workspaces and data roots past MAX_PATH work, while workspace roots
+      at or past the process-creation limit are refused with the OS error; the pipe and
+      data root are current-user-only and inherited ACLs are refused; `pass_env` values
+      never reach the data dir or readbacks; `max_live`, frame and page bounds hold.
+- [ ] Supported Linux behavior and honest degraded custody; adopted-service isolation
+      (with the local adopted backends). Deferred by the owner.
 - [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent,
       2,000-events/s owner run is a release capacity check, not a prerequisite to L2.
 
@@ -421,7 +429,7 @@ of the explicitly selected release scope.
       permissions and approval policy, keeping a value outside the documented set)
       and the source view both edit it. Validate and Save go through
       `settings.save` (D8). An invalid draft is never written and stays in the
-      editor. The section states that running Agents keep their frozen settings. Settings › Automation and scripts lists rules
+      editor. The section states that running Agents keep their frozen settings. Settings › Automation lists rules
       and timers read-only through `rule.list`; no pause or resume operation
       exists. (Refs #407)
 
@@ -456,23 +464,29 @@ of the explicitly selected release scope.
       live in the details panel. One composer carries the project and
       Auto/profile/harness chips, the model-and-effort and access chips, Send,
       and Interrupt/Steer only while a turn runs. Auto is daemon routing (D8).
-      Settings has General, Models and profiles, Routing, Projects, Automation and
-      scripts, Cloud MCP and Advanced, all through one client module
-      (`config_client`). One component system in Material 3
-      components (owner review 2026-11-15: Codex layout, M3 visual language): a
-      navigation drawer with 56-DIP items and a secondary-container active pill,
-      an extended FAB for New task, outlined assist chips, filled/tonal/outlined/
-      text and icon buttons, a segmented button, switches, outlined text fields,
-      exposed dropdown menus, status chips and tonal cards, on the M3 type, shape
-      and state-layer scales. (Refs #407)
+      Settings has General, Models and profiles, Routing, Projects, Automation,
+      Scripts, Cloud MCP and Advanced, all through one client module
+      (`config_client`); while open it replaces the sidebar with its own
+      navigation (a Back row, then the pages) and shows one centred page of at
+      most 840 DIPs with a 200-DIP form label column. One component system at
+      Codex density with Material 3 color roles (owner reviews 2026-11-15 and
+      2026-11-16), every size from one tokens module: corners 8 for controls
+      and row highlights, 12 for containers (cards, menus, Details sections,
+      dialogs), 16 for the composer, a circle only for the icon-only Send;
+      heights 32 for controls and rows, 36 for form rows, 28 for tasks under a
+      project; four type styles (20/600, 14/600, 14/400, 12/400); a 4/8
+      spacing grid; 16/20-DIP icons. One action pattern: filled primary (one
+      per page), outlined secondary, text tertiary, destructive text in the
+      error color. The Details panel has only a close button. (Refs #407)
 - [x] **D8 Settings and routing in the desktop.** Every Settings section reads and
       writes the unified `settings.read/save` (S1) through `config_client`; the
       desktop has no other store. General writes `[desktop]` theme and startup
       ("reopen the last conversation" opens the most recently active Agent).
       Routing edits each role's ordered candidates; Projects edits path, allowed
       profiles and Agent actions; Automation edits assignments ("keep N busy from
-      folder X", S4) above the read-only rules and the scripts; Cloud MCP edits its
-      six fields; Advanced holds every section as JSON and the settings history
+      folder X", S4) above the read-only rules; Scripts edits the script
+      entries; Cloud MCP edits its six fields; Advanced holds every section as
+      JSON and the settings history
       (author, time, sections, revision). Each save shows its result, revision
       and restart need; a fresh read keeps drafts with unsaved edits. Main's
       startup behaviors stay: Owner daemon autostart, the opened checkout's

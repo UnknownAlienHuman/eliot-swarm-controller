@@ -80,6 +80,7 @@ const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub async fn run(path: PathBuf) -> Result<()> {
     let data_dir = DataDir::open(&path)?;
     let daemon_lock = data_dir.acquire_daemon_lock()?;
+    crate::skill::materialize(data_dir.path())?;
     let _log = logging::init(&data_dir, &daemon_lock)?;
     let policy = Arc::new(SecretPolicy::new([data_dir.owner_token()]));
     logging::record(&policy, "daemon.starting", &[], None);

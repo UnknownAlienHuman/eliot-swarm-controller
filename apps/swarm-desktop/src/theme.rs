@@ -1,79 +1,21 @@
-//! Material 3 design tokens for the desktop client.
+//! Material 3 color for the desktop client.
 //!
 //! Color: the M3 color roles generated from one seed by Google's
 //! material-color-utilities (the pinned `material-colors` port, tonal-spot
 //! scheme), the same generator and role set the `gpui-m3` donor uses
 //! (`846e2b83`, `src/theme.rs`: `Scheme::from_seed_variant`). M3 has no
 //! success/warning roles, so status colors take HCT tonal palettes at fixed
-//! hues with the scheme's container/on-container tones. Type follows the M3
-//! type scale and shape the M3 corner scale (both as in that donor file),
-//! taken as DIPs. [`winui`] resolves the roles to WinUI brushes and to the
-//! theme resource keys of the real controls; under Windows High Contrast it
-//! maps nothing, so the system colors apply.
+//! hues with the scheme's container/on-container tones. Shape, height, type
+//! and spacing live in `ui::tokens`, the one size scale. [`winui`] resolves
+//! the roles to WinUI brushes and to the theme resource keys of the real
+//! controls; under Windows High Contrast it maps nothing, so the system
+//! colors apply.
 
 use std::sync::OnceLock;
 
 use material_colors::{
     color::Rgb, hct::Hct, palette::TonalPalette, scheme::variant::SchemeTonalSpot,
 };
-
-/// The 8-point spacing grid in DIPs. `XS` is the one half step, for the
-/// gap between a glyph and its label or between stacked text lines.
-pub mod spacing {
-    pub const XS: f64 = 4.0;
-    pub const SM: f64 = 8.0;
-    pub const MD: f64 = 16.0;
-    pub const LG: f64 = 24.0;
-}
-
-/// The M3 shape scale (corner radii in DIPs).
-pub mod shape {
-    /// Extra small: text fields and menus.
-    pub const XS: f64 = 4.0;
-    /// Small: chips, code blocks, segmented-button joins.
-    pub const SM: f64 = 8.0;
-    /// Medium: cards.
-    pub const MD: f64 = 12.0;
-    /// Large: the extended FAB and message bubbles.
-    pub const LG: f64 = 16.0;
-    /// Extra large: the composer (search-bar style) and dialogs.
-    pub const XL: f64 = 28.0;
-    /// Full: buttons, icon buttons, navigation items and switches. WinUI
-    /// scales radii that exceed half the side down to a pill.
-    pub const FULL: f64 = 28.0;
-}
-
-/// The M3 type scale (size in DIPs, weight). Segoe UI Variable is the
-/// system face (the M3 baseline names Roboto; Windows apps keep the system
-/// face); sizes and weights follow the M3 roles.
-pub mod type_scale {
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct TypeStyle {
-        pub size: f64,
-        pub weight: u16,
-    }
-
-    const fn style(size: f64, weight: u16) -> TypeStyle {
-        TypeStyle { size, weight }
-    }
-
-    /// The empty-state greeting.
-    pub const HEADLINE_SMALL: TypeStyle = style(24.0, 400);
-    /// Settings section titles.
-    pub const TITLE_LARGE: TypeStyle = style(22.0, 400);
-    /// The conversation title, pane titles.
-    pub const TITLE_MEDIUM: TypeStyle = style(16.0, 500);
-    /// Navigation section headers, card and list-item headlines.
-    pub const TITLE_SMALL: TypeStyle = style(14.0, 500);
-    /// Assistant messages.
-    pub const BODY_LARGE: TypeStyle = style(16.0, 400);
-    /// User messages, rows and controls.
-    pub const BODY_MEDIUM: TypeStyle = style(14.0, 400);
-    /// Supporting lines.
-    pub const BODY_SMALL: TypeStyle = style(12.0, 400);
-    /// Chips and status chips.
-    pub const LABEL_MEDIUM: TypeStyle = style(12.0, 500);
-}
 
 /// M3 state-layer opacities of the content color over a container.
 pub mod state {
@@ -88,29 +30,6 @@ pub mod state {
 /// Secondary text lowers emphasis with opacity on the theme text brush, so
 /// High Contrast still resolves the system color.
 pub const MUTED_OPACITY: f64 = 0.72;
-
-/// The one shell: sidebar, conversation, optional right panel.
-pub mod layout {
-    /// The navigation drawer (projects, Agents, recents, settings).
-    pub const SIDEBAR_WIDTH: f64 = 300.0;
-    /// The optional right panel (monitor or Agent details).
-    pub const PANEL_WIDTH: f64 = 360.0;
-    /// The conversation's reading column and the composer.
-    pub const READING_WIDTH: f64 = 760.0;
-    /// M3 common buttons.
-    pub const CONTROL_HEIGHT: f64 = 40.0;
-    /// M3 icon buttons (the target is 40 x 40).
-    pub const ICON_BUTTON: f64 = 40.0;
-    /// M3 chips.
-    pub const CHIP_HEIGHT: f64 = 32.0;
-    /// M3 navigation-drawer items, one-line list items and the FAB.
-    pub const NAV_ITEM_HEIGHT: f64 = 56.0;
-    /// The composer's text field.
-    pub const COMPOSER_FIELD_HEIGHT: f64 = 56.0;
-    /// First window client size in DIPs; the user resizes freely after.
-    pub const WINDOW_WIDTH: f64 = 1440.0;
-    pub const WINDOW_HEIGHT: f64 = 900.0;
-}
 
 /// An opaque sRGB color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,10 +239,11 @@ pub mod winui {
     //! 0.100.0. The color keys are WinUI's own (`microsoft-ui-xaml`
     //! `Button_themeresources.xaml`), so buttons keep their hover, pressed,
     //! disabled and focus states. Shape and padding come from the button's
-    //! style (`app_resources`): WinUI reads a Reactor `Thickness` or
-    //! `CornerRadius` override as zero (observed live), so each family only
-    //! names the key prefix its style's template reads. Under High Contrast
-    //! nothing is overridden and every role resolves to a live system brush.
+    //! style (`app_resources`, from `ui::tokens`): WinUI reads a Reactor
+    //! `Thickness` or `CornerRadius` override as zero (observed live). One
+    //! action pattern: primary filled, secondary outlined, tertiary text,
+    //! destructive text in the error color. Under High Contrast nothing is
+    //! overridden and every role resolves to a live system brush.
     //!
     //! Surfaces are neutral; the primary color marks only the main action
     //! (filled) and the selection (secondary-container). Status colors
@@ -372,7 +292,7 @@ pub mod winui {
             self.role(|s| s.surface, ThemeBrush::SolidBackground)
         }
 
-        /// The navigation drawer and the right panel: one tonal step off
+        /// The sidebar and the right panel: one tonal step off
         /// the surface (surface-container-low).
         pub fn sidebar(self) -> Brush {
             self.role(|s| s.surface_container_low, ThemeBrush::SolidBackground)
@@ -384,7 +304,7 @@ pub mod winui {
             self.role(|s| s.surface_container_low, ThemeBrush::CardBackground)
         }
 
-        /// Cards on the drawer-toned panel (monitor, details):
+        /// Cards on the sidebar-toned panel (monitor, details):
         /// surface-container-high.
         pub fn card_high(self) -> Brush {
             self.role(|s| s.surface_container_high, ThemeBrush::CardBackground)
@@ -417,11 +337,6 @@ pub mod winui {
         /// Hairlines and dividers.
         pub fn outline_variant(self) -> Brush {
             self.role(|s| s.outline_variant, ThemeBrush::CardStroke)
-        }
-
-        /// Outlines of segmented buttons.
-        pub fn outline(self) -> Brush {
-            self.role(|s| s.outline, ThemeBrush::CardStroke)
         }
 
         pub fn primary(self) -> Brush {
@@ -486,20 +401,12 @@ pub mod winui {
             self.status_chip(StatusTone::Attention)
         }
 
-        /// Filled: the one main action of a surface.
+        /// Primary: filled, the one main action of a page (Save).
         pub fn filled(self) -> ResourceOverrides {
             self.with(|s| Family::new(Some(s.primary), s.on_primary).overrides(s))
         }
 
-        /// Filled tonal: a secondary action that should still read as a
-        /// button.
-        pub fn tonal(self) -> ResourceOverrides {
-            self.with(|s| {
-                Family::new(Some(s.secondary_container), s.on_secondary_container).overrides(s)
-            })
-        }
-
-        /// Outlined: a medium-emphasis action beside a filled one.
+        /// Secondary: outlined (Validate, Reload, Duplicate, Add).
         pub fn outlined(self) -> ResourceOverrides {
             self.with(|s| {
                 Family {
@@ -510,9 +417,20 @@ pub mod winui {
             })
         }
 
-        /// Text: the lowest-emphasis action.
+        /// Tertiary: text (Discard, Edit as TOML, Refresh, Hide).
         pub fn text_button(self) -> ResourceOverrides {
             self.with(|s| Family::new(None, s.primary).overrides(s))
+        }
+
+        /// Destructive: a text button in the error color.
+        pub fn destructive(self) -> ResourceOverrides {
+            self.with(|s| Family::new(None, s.error).overrides(s))
+        }
+
+        /// A text button on an error container (the Force stop banner's
+        /// Cancel): on-error-container.
+        pub fn error_text_button(self) -> ResourceOverrides {
+            self.with(|s| Family::new(None, s.on_error_container).overrides(s))
         }
 
         /// A standard icon button: on-surface-variant, no container.
@@ -520,62 +438,9 @@ pub mod winui {
             self.with(|s| Family::new(None, s.on_surface_variant).overrides(s))
         }
 
-        /// A navigation-drawer item: the full-width active-indicator pill in
-        /// secondary-container when selected, on-surface-variant otherwise.
-        pub fn nav_item(self, selected: bool) -> ResourceOverrides {
-            self.with(|s| {
-                if selected {
-                    Family::new(Some(s.secondary_container), s.on_secondary_container)
-                } else {
-                    Family::new(None, s.on_surface_variant)
-                }
-                .overrides(s)
-            })
-        }
-
-        /// The extended FAB: primary-container (its style carries the large
-        /// corner and reads the `AccentButton` keys).
-        pub fn fab(self) -> ResourceOverrides {
-            self.with(|s| {
-                Family {
-                    keys: ACCENT_KEYS,
-                    ..Family::new(Some(s.primary_container), s.on_primary_container)
-                }
-                .overrides(s)
-            })
-        }
-
-        /// A card that is one button (monitor cards): surface-container-high
-        /// with state layers, on the FAB's large-corner style.
-        pub fn card_button(self) -> ResourceOverrides {
-            self.with(|s| {
-                Family {
-                    keys: ACCENT_KEYS,
-                    ..Family::new(Some(s.surface_container_high), s.on_surface)
-                }
-                .overrides(s)
-            })
-        }
-
-        /// An assist chip (outlined) or, when `selected`, a selected filter
-        /// chip in secondary-container.
-        pub fn chip(self, selected: bool) -> ResourceOverrides {
-            self.with(|s| {
-                if selected {
-                    Family::new(Some(s.secondary_container), s.on_secondary_container)
-                } else {
-                    Family {
-                        outline: Some(s.outline_variant),
-                        ..Family::new(None, s.on_surface_variant)
-                    }
-                }
-                .overrides(s)
-            })
-        }
-
-        /// One segment of a segmented button: secondary-container when
-        /// selected, on-surface otherwise, inside the outlined track.
-        pub fn segment(self, selected: bool) -> ResourceOverrides {
+        /// A list or navigation row: the selection in secondary-container,
+        /// on-surface otherwise (state layers on hover and press).
+        pub fn row(self, selected: bool) -> ResourceOverrides {
             self.with(|s| {
                 if selected {
                     Family::new(Some(s.secondary_container), s.on_secondary_container)
@@ -586,15 +451,27 @@ pub mod winui {
             })
         }
 
-        /// A text button on an error container (the Force stop banner's
-        /// Cancel): on-error-container.
-        pub fn error_text_button(self) -> ResourceOverrides {
-            self.with(|s| Family::new(None, s.on_error_container).overrides(s))
+        /// A card that is one button (monitor cards): no fill of its own
+        /// (the card's container shows through), on-surface state layers.
+        pub fn card_button(self) -> ResourceOverrides {
+            self.with(|s| Family::new(None, s.on_surface).overrides(s))
         }
 
-        /// The confirmed destructive action (Force stop): filled in error.
-        pub fn danger(self) -> ResourceOverrides {
-            self.with(|s| Family::new(Some(s.error), s.on_error).overrides(s))
+        /// An assist chip: outlined in outline-variant.
+        pub fn chip(self) -> ResourceOverrides {
+            self.with(|s| {
+                Family {
+                    outline: Some(s.outline_variant),
+                    ..Family::new(None, s.on_surface_variant)
+                }
+                .overrides(s)
+            })
+        }
+
+        /// One segment of a segmented button: secondary-container when
+        /// selected, on-surface otherwise, on the filled track.
+        pub fn segment(self, selected: bool) -> ResourceOverrides {
+            self.row(selected)
         }
 
         fn with(self, build: impl FnOnce(&Scheme) -> ResourceOverrides) -> ResourceOverrides {
@@ -605,11 +482,10 @@ pub mod winui {
         }
     }
 
-    /// The key prefix of WinUI's default button template.
+    /// The key prefix of WinUI's default button template (every family's
+    /// style reads these keys; the hand-off dialog's AccentButtonStyle
+    /// button keeps the application's `AccentButton` theme keys).
     const BUTTON_KEYS: &str = "Button";
-    /// The key prefix of WinUI's AccentButtonStyle template (the FAB and
-    /// card style is based on it).
-    const ACCENT_KEYS: &str = "AccentButton";
 
     /// One button family on WinUI's button keys: an optional container
     /// with M3 state layers of its content color `on`, an optional outline
@@ -618,7 +494,6 @@ pub mod winui {
         fill: Option<Rgb8>,
         on: Rgb8,
         outline: Option<Rgb8>,
-        keys: &'static str,
     }
 
     impl Family {
@@ -627,7 +502,6 @@ pub mod winui {
                 fill,
                 on,
                 outline: None,
-                keys: BUTTON_KEYS,
             }
         }
 
@@ -652,7 +526,7 @@ pub mod winui {
             let disabled_border = self
                 .outline
                 .map_or(clear, |_| layer(s.on_surface, state::DISABLED_CONTAINER));
-            let key = |name: &str| format!("{}{name}", self.keys);
+            let key = |name: &str| format!("{BUTTON_KEYS}{name}");
             let mut r = ResourceOverrides::new()
                 .set(key("Background"), rest)
                 .set(key("BackgroundPointerOver"), hover)
@@ -687,17 +561,15 @@ pub mod winui {
             assert_eq!(palette.error(), Brush::Theme(ThemeBrush::SystemCritical));
             for overrides in [
                 palette.filled(),
-                palette.tonal(),
                 palette.outlined(),
                 palette.text_button(),
+                palette.destructive(),
                 palette.icon_button(),
-                palette.nav_item(true),
-                palette.fab(),
+                palette.row(true),
                 palette.card_button(),
-                palette.chip(false),
+                palette.chip(),
                 palette.segment(true),
                 palette.error_text_button(),
-                palette.danger(),
             ] {
                 assert_eq!(overrides, ResourceOverrides::new());
             }
@@ -722,8 +594,8 @@ pub mod winui {
                     Brush::Solid(color(scheme.secondary_container))
                 );
                 assert_ne!(palette.filled(), ResourceOverrides::new());
-                assert_ne!(palette.nav_item(true), palette.nav_item(false));
-                assert_ne!(palette.chip(true), palette.chip(false));
+                assert_ne!(palette.row(true), palette.row(false));
+                assert_ne!(palette.destructive(), palette.text_button());
             }
             assert_ne!(Palette::new(true, false), Palette::new(false, false));
         }
