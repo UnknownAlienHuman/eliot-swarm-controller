@@ -692,3 +692,15 @@ Turn usage: session input 45,444 + output 209. A follow-up turn ran
 state, proving Agent-scoped access. `muse serve --help` exposes no MCP
 isolation or tool-deferral surface, so both stay unsupported.
 
+## Native subagents (`native_subagents` deny): unsupported
+
+Checked against the installed Muse 1.4.20 binary (`muse --help`,
+`muse serve --help`, and the exported MSP schema
+`muse schema generate-json-schema`, which names native subagent provenance
+`subagentOrigin` / `subagentId` but no disable switch): there is no verified
+per-session switch to turn off native subagents, so
+`native_subagents = "deny"` on a Muse profile is `unsupported` at config
+load (typed, matching the existing pattern for unmapped fields). `allow` is
+accepted and preserves today's behavior. Implementation:
+`crates/eliot-daemon/src/config.rs` (`freeze_native_subagents`).
+

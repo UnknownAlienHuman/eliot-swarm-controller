@@ -351,3 +351,19 @@ called `api.identity` through the `swarm` tool and reported principal
 `agent`. `opencode --help` and `opencode serve --help` expose no
 tool-deferral surface, so deferred loading is unsupported.
 
+## Native subagents (`native_subagents` deny)
+
+Per-session mapping, verified on the installed OpenCode v2.2.7 server
+(`opencode --version` reports v2.2.7): the agent docs allow per-agent
+`tools` / `permission` control with `task` as the subagent tool. The plugin
+owns an isolated per-Agent config root (`XDG_CONFIG_HOME` /
+`XDG_DATA_HOME` under the instance directory; see
+`plugins/opencode/src/native/server.rs`). When the frozen profile carries
+`native_subagents = "deny"` (the default for profiles with a non-empty
+`child_profiles`), the generated isolated `opencode.jsonc` sets
+`permission.task` to `deny`, disabling the task tool for the session.
+`allow` omits the key and preserves today's behavior. Implementation:
+`plugins/opencode/src/native/server.rs` (`native_subagents_permission`,
+`agent_config_json`, `ServerLaunch::native_subagents`) and
+`plugins/opencode/src/host.rs` (`ParsedStart::native_subagents`).
+

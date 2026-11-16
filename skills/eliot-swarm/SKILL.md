@@ -1,6 +1,6 @@
 ---
 name: eliot-swarm
-description: Coordinate with other Swarm agents: identity, mail inbox and ack, who plus advisory work claims, shared variables with CAS, child launch/wait/digest, handoff, and honest unknown results. Use when editing shared areas, contacting another agent, or finishing a delegated task.
+description: Split work and delegate through Swarm children, with identity, mail and ack, who and advisory claims, shared variables with CAS, launch/wait/digest, and honest unknown results. Use whenever splitting work among agents, editing shared areas, contacting another agent, or finishing delegated work.
 ---
 
 # Eliot Swarm coordination
@@ -42,8 +42,18 @@ the new version; never blindly overwrite.
 
 ## Children, waiting and handoff
 
-Launch a child with `command.submit` (`swarm launch`), wait for it with
-`swarm.wait`, and collect its durable result with `swarm.digest`.
+When splitting work among agents, **launch Swarm children**, using
+`command.submit` with verb `launch` (`swarm launch`) and `role: "worker"`
+or an allowed profile. Use different installed harnesses when available;
+the parent's frozen `child_profiles` grants access to their own policies.
+Use `api.help` for launch fields; get allowed profile names from your own
+`agent.get` frozen snapshot, never guess them.
+Do not use native subagents for delegated implementation or shared-file work:
+they bypass Swarm claims, mail and completion tracking. Native subagents are
+fine for private, read-only exploration touching no shared files.
+Give each child disjoint files and require `who`, a claim before editing,
+and mail or an exact ack. Wait with `swarm.wait` or register `swarm.digest`,
+then collect the durable results before integrating.
 Inspect one child with `command.children` (`swarm cmd children`).
 A manager moves task inputs, claims and children with `swarm.handoff`;
 only the owner moves agents (`swarm.reparent`, `swarm.switch`).
