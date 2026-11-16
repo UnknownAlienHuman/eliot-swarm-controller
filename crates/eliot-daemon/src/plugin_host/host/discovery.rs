@@ -133,6 +133,46 @@ impl PluginHost {
             .map_err(|_| Error::new("unavailable", "discovery reader stopped"))?
     }
 
+    /// Archive one terminal Codex native session through the harness's own
+    /// `thread/archive` method. A dedicated metadata reader calls
+    /// `native.archive` with no turn and no inference. Only the codex
+    /// harness documents a native archive surface; every other harness
+    /// stays `unsupported` without spawning a reader, and the caller keeps
+    /// the session. Never deletes raw native store files.
+    pub(crate) async fn archive_native_session(
+        &self,
+        profile: Value,
+        native_ref: &str,
+    ) -> Result<()> {
+        if profile.get("harness").and_then(Value::as_str) != Some("codex") {
+            return Err(Error::new(
+                "unsupported",
+                "native archive needs a codex profile",
+            ));
+        }
+        if native_ref.is_empty()
+            || native_ref.len() > 512
+            || native_ref.chars().any(char::is_control)
+        {
+            return Err(Error::new("invalid", "native session reference is invalid"));
+        }
+        let environment = Value::Object(build_process_environment(&profile)?);
+        let (id, stop_rx, done_tx) = self.register_metadata_reader()?;
+        let host = self.clone();
+        let native_ref = native_ref.to_owned();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let completion = host
+                .read_archive(profile, environment, native_ref, stop_rx)
+                .await;
+            host.finish_metadata_reader(&id, done_tx, completion.cleanup);
+            let _ = reply.send(completion.result);
+        });
+        response
+            .await
+            .map_err(|_| Error::new("unavailable", "archive reader stopped"))?
+    }
+
     pub(crate) async fn profile_store(
         &self,
         profile: Value,
@@ -342,6 +382,112 @@ impl PluginHost {
                 &SecretPolicy::new(secrets.iter()),
                 &error.code,
                 &[("operation", "quota.read")],
+                Some(&error),
+            );
+            error
+        });
+        MetadataRead {
+            result,
+            cleanup: cleanup_state(closure.closed),
+        }
+    }
+
+    async fn read_archive(
+        &self,
+        profile: Value,
+        environment: Value,
+        native_ref: String,
+        mut stop: watch::Receiver<Option<Instant>>,
+    ) -> MetadataRead<()> {
+        if stop.borrow().is_some() {
+            return MetadataRead {
+                result: Err(Error::new(
+                    "cancelled",
+                    "native.archive was cancelled before spawn",
+                )),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        }
+        let Some(harness) = profile["harness"].as_str() else {
+            return MetadataRead {
+                result: Err(Error::new("invalid", "missing harness")),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        };
+        let harness = harness.to_owned();
+        let opened = self
+            .open_reader_with_cleanup(
+                &AgentKey {
+                    id: "native-archive".to_owned(),
+                    generation: 0,
+                },
+                &harness,
+                &profile,
+                &environment,
+                None,
+            )
+            .await;
+        let mut reader = match opened.result {
+            Ok(reader) => reader,
+            Err(error) => {
+                return failed_metadata_open(error, opened.cleanup_confirmed, "native.archive");
+            }
+        };
+        let mut known: Vec<_> = self.state.secrets.lock_recover().iter().cloned().collect();
+        known.extend([self.state.owner_token.clone(), reader.credential.clone()]);
+        let metadata_secrets = metadata_secret_snapshot(&profile, &environment, known);
+        let until = Instant::now() + READER_DEADLINE;
+        let read = async {
+            let manifest = reader.initialize(&harness, until).await?;
+            require_proxy_capability(&profile, &manifest)?;
+            let request = serde_json::json!({"profile": profile, "native_ref": native_ref});
+            let value = reader.client.call("native.archive", request, until).await?;
+            if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
+                return Err(Error::new(
+                    "source_integrity",
+                    "native.archive metadata contains reserved credentials",
+                ));
+            }
+            let archived = value
+                .get("archived")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    Error::new("source_integrity", "native.archive result is malformed")
+                })?;
+            if !archived {
+                return Err(Error::new(
+                    "native_archive_failed",
+                    "native archive did not confirm the thread",
+                ));
+            }
+            Ok(())
+        };
+        let result = tokio::select! {
+            result = tokio::time::timeout_at(until, read) =>
+                result.unwrap_or_else(|_| Err(Error::new("unavailable", "native.archive deadline exceeded"))),
+            _ = stop.changed() => Err(Error::new("cancelled", "native.archive was cancelled")),
+        };
+        let result = result.map_err(|error| {
+            let message = error.message.clone();
+            if message.contains("native.archive") {
+                error
+            } else {
+                error.with_message(format!("native.archive: {message}"))
+            }
+        });
+        let secrets = reader.secrets.clone();
+        let close_until = metadata_reader_close_deadline(&stop);
+        let closure = reader.close_until(self, None, close_until).await;
+        let result = require_reader_cleanup(result, closure.closed, "native.archive");
+        let result = result.map_err(|error| {
+            let error = redact_native_error(
+                error.with_stderr(StderrSource::Plugin, closure.stderr),
+                &secrets,
+            );
+            crate::logging::record(
+                &SecretPolicy::new(secrets.iter()),
+                &error.code,
+                &[("operation", "native.archive")],
                 Some(&error),
             );
             error

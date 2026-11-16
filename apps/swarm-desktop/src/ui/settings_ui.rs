@@ -284,6 +284,9 @@ impl DesktopApp {
                     let request = eliot_core::api::CleanupApplyRequest {
                         id: ulid::Ulid::new().to_string(),
                         plan_id: plan.plan_id,
+                        // The desktop applies local-only deletions; remote
+                        // branch deletion stays an explicit Owner CLI flag.
+                        delete_remote: false,
                     };
                     Message::Settings(SettingsMsg::CleanupApplied(
                         client::block_on(eliot_daemon::client_call_typed(

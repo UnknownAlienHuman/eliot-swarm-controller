@@ -64,15 +64,15 @@ struct RepositoryBinding {
     git_dir: PathBuf,
 }
 
-struct ProcessResult {
-    exit_code: Option<i32>,
-    stdout: Vec<u8>,
-    stderr_len: usize,
+pub(crate) struct ProcessResult {
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr_len: usize,
     #[cfg(test)]
-    stderr: Vec<u8>,
-    quiescent: bool,
-    quiescence_class: Option<&'static str>,
-    interrupted: bool,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) quiescent: bool,
+    pub(crate) quiescence_class: Option<&'static str>,
+    pub(crate) interrupted: bool,
 }
 
 fn quiescence_class_for(result: &Result<bool>) -> Option<&'static str> {
@@ -2887,4 +2887,163 @@ mod tests {
             Some("other")
         );
     }
+}
+
+/// Strict branch names for cleanup transport operations. Mirrors the branch
+/// deletion admissibility rule: no metacharacters, no traversal, no lock
+/// suffixes that git itself would refuse or misread.
+pub(crate) fn valid_cleanup_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && branch.len() <= 256
+        && !branch.contains('\0')
+        && !branch.starts_with('-')
+        && !branch.chars().any(char::is_control)
+        && !branch.contains([' ', '~', '^', ':', '?', '*', '[', '\\'])
+        && !branch.contains("..")
+        && !branch.ends_with('/')
+        && !branch.ends_with(".lock")
+}
+
+fn valid_cleanup_remote(remote: &str) -> bool {
+    !remote.is_empty()
+        && remote.len() <= 128
+        && remote
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+        && !remote.starts_with('-')
+        && !remote.starts_with('.')
+        && !remote.ends_with('.')
+        && !remote.contains("..")
+}
+
+/// One network git operation for cleanup branch verification and deletion.
+pub(crate) enum CleanupTransportOp {
+    /// Update remote-tracking refs for every head, pruning deleted ones.
+    FetchPrune,
+    /// Read the upstream HEAD symref and its object id.
+    ListSymrefHead,
+    /// List the remote branch head, if it still exists.
+    ListHeads,
+    /// Delete the remote branch.
+    PushDelete,
+}
+
+/// Run one cleanup network operation through the same isolated transport as
+/// the approved fetch action: a private view working directory, an isolated
+/// HOME and global config, no credentials, `protocol.allow=never` as the base
+/// with only the endpoint scheme opened, and only file/HTTPS/HTTP/git
+/// transports. `endpoint` is the exact remote URL already read back from
+/// local repository config; `checkout` is any checkout of the target
+/// repository, typically the project root rather than an Agent worktree that
+/// cleanup may already have removed. The repository binding is re-read and
+/// validated before every
+/// operation. Fetch updates only remote-tracking refs under the validated
+/// remote name; the local branch and worktree are never touched.
+pub(crate) async fn run_cleanup_transport(
+    data_root: &Path,
+    checkout: &str,
+    remote: &str,
+    endpoint: &str,
+    branch: Option<&str>,
+    op: CleanupTransportOp,
+    deadline: Instant,
+) -> Result<ProcessResult> {
+    if !valid_cleanup_remote(remote) {
+        return Err(Error::new(
+            "invalid_remote",
+            "cleanup remote name is not admissible",
+        ));
+    }
+    if let Some(branch) = branch
+        && !valid_cleanup_branch(branch)
+    {
+        return Err(Error::new(
+            "invalid_branch",
+            "branch name is not admissible",
+        ));
+    }
+    let protocol = endpoint_protocol(endpoint)?;
+    let native = native_endpoint_argument(endpoint)?;
+    let git = GitProbe::new()?;
+    let checkout = canonical_root(checkout)?;
+    let read_deadline = Instant::now() + GIT_READ_TIME;
+    let git_dir = canonical_root(
+        &read_git_line(
+            &git,
+            &checkout,
+            &["rev-parse", "--absolute-git-dir"],
+            read_deadline,
+        )
+        .await?,
+    )?;
+    let common_dir = canonical_root(
+        &read_git_line(
+            &git,
+            &checkout,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            read_deadline,
+        )
+        .await?,
+    )?;
+    let id = Ulid::new().to_string();
+    let view = private_view_path(data_root, &id)?;
+    create_private_environment_root(&view)?;
+    let environment = create_transport_environment(&view)?;
+    let binding = GitProcessBinding {
+        git_dir,
+        common_dir,
+        work_tree: None,
+        object_directory: None,
+    };
+    let process = git_process_context(
+        &git,
+        &RepositoryBinding {
+            checkout,
+            common_dir: binding.common_dir.clone(),
+            git_dir: binding.git_dir.clone(),
+        },
+        &environment,
+        None,
+        protocol,
+        Some(binding),
+    )
+    .await?;
+    let endpoint_arg = OsString::from(native);
+    let branch_arg = branch.map(OsString::from);
+    let mut argv = Vec::new();
+    match op {
+        CleanupTransportOp::FetchPrune => {
+            argv.push(OsString::from("fetch"));
+            argv.push(OsString::from("--prune"));
+            argv.push(endpoint_arg);
+            argv.push(OsString::from(format!(
+                "+refs/heads/*:refs/remotes/{remote}/*"
+            )));
+        }
+        CleanupTransportOp::ListSymrefHead => {
+            argv.push(OsString::from("ls-remote"));
+            argv.push(OsString::from("--symref"));
+            argv.push(endpoint_arg);
+            argv.push(OsString::from("HEAD"));
+        }
+        CleanupTransportOp::ListHeads => {
+            argv.push(OsString::from("ls-remote"));
+            argv.push(OsString::from("--heads"));
+            argv.push(endpoint_arg);
+            argv.push(
+                branch_arg.ok_or_else(|| Error::new("invalid", "cleanup list needs a branch"))?,
+            );
+        }
+        CleanupTransportOp::PushDelete => {
+            argv.push(OsString::from("push"));
+            argv.push(endpoint_arg);
+            argv.push(OsString::from("--delete"));
+            argv.push(
+                branch_arg.ok_or_else(|| Error::new("invalid", "cleanup delete needs a branch"))?,
+            );
+        }
+    }
+    let result = run_owned_git(&process, &view, &argv, &[], deadline, None).await;
+    cleanup_after_settlement(data_root, &view);
+    result
 }

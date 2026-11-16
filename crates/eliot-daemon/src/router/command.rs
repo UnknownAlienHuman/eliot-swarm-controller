@@ -1431,6 +1431,10 @@ impl Router {
             .await
         {
             let _ = self.settle(id, CommandState::Applied, Some(summary)).await;
+            // Assignment retirement runs inline in this stop worker, never in
+            // a second executor. Best effort: refused items stay registered.
+            self.retire_assignment_cleanup(&agent.id, agent.generation)
+                .await;
             return true;
         }
         let force = dispatched
@@ -1458,9 +1462,15 @@ impl Router {
                     .settle(id, CommandState::Applied, Some(summary))
                     .await
                     .is_some_and(|command| command.state == CommandState::Applied)
-                    && let Some(guard) = force_stop
                 {
-                    guard.finish();
+                    // Assignment retirement runs inline in this stop worker,
+                    // never in a second executor. Best effort: refused items
+                    // stay registered.
+                    self.retire_assignment_cleanup(&agent.id, agent.generation)
+                        .await;
+                    if let Some(guard) = force_stop {
+                        guard.finish();
+                    }
                 }
             }
             Err(error) => {

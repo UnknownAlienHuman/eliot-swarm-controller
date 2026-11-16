@@ -329,6 +329,7 @@ impl CodexPlugin {
             "profile.store" => self.profile_store(&request.params).await,
             "model.list" => self.model_list(&request.params).await,
             "quota.read" => self.quota_read(&request.params).await,
+            "native.archive" => self.native_archive(&request.params).await,
             "agent.attach" => self.attach(&request.params).await,
             "agent.detach" => self.detach(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
@@ -494,6 +495,51 @@ impl CodexPlugin {
         )
         .await?;
         Ok(json!({"details": details}))
+    }
+
+    /// Archive one thread through the documented `thread/archive` method. A
+    /// dedicated reader plugin instance performs the call with no turn and
+    /// no inference; raw session files are never touched. Used by Swarm
+    /// cleanup for terminal Codex Agents; every other harness reports no
+    /// native archive surface and keeps its sessions.
+    async fn native_archive(&self, raw: &Value) -> Result<Value> {
+        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Codex native.archive requires a dedicated reader plugin instance",
+            ));
+        }
+        let profile = raw.get("profile").unwrap_or(raw);
+        if profile.get("harness").and_then(Value::as_str) != Some("codex") {
+            return Err(Error::new(
+                "profile_error",
+                "Codex native.archive received another harness",
+            ));
+        }
+        let native_ref = raw
+            .get("native_ref")
+            .and_then(Value::as_str)
+            .filter(|reference| {
+                !reference.is_empty()
+                    && reference.len() <= 512
+                    && !reference.chars().any(char::is_control)
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "Codex native.archive needs a native session reference",
+                )
+            })?;
+        let (launch, secrets, metadata_secrets) = self.reader_launch(profile, &json!({}))?;
+        crate::discovery::archive_thread(
+            launch,
+            native_ref.to_owned(),
+            &metadata_secrets,
+            &secrets,
+            tokio::time::Instant::now() + crate::discovery::READ_TIMEOUT,
+        )
+        .await?;
+        Ok(json!({"archived": true}))
     }
 
     fn reader_launch(

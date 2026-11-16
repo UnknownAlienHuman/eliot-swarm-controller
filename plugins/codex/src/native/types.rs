@@ -228,6 +228,12 @@ pub(crate) struct NativeThreadListResponse {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeThreadArchiveParams {
+    pub thread_id: String,
+}
+
 /// Deliberately excludes preview, name and turns, even when the native response has them.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -84,8 +84,62 @@ impl Store {
         if count >= 4096 {
             return Err(Error::new("unavailable", "artifact ledger is full"));
         }
-        tx.execute("INSERT OR IGNORE INTO artifacts(id,agent,generation,path,body) VALUES (?1,?2,?3,?4,?5)",params![artifact.id,parse_agent_id(&artifact.agent)?,artifact.generation,artifact.path,encode_json(&artifact)?]).map_err(sql_error)?;
+        let changed = tx.execute("INSERT OR IGNORE INTO artifacts(id,agent,generation,path,body) VALUES (?1,?2,?3,?4,?5)",params![artifact.id,parse_agent_id(&artifact.agent)?,artifact.generation,artifact.path,encode_json(&artifact)?]).map_err(sql_error)?;
+        if changed == 0 && artifact.kind == ArtifactKind::Branch {
+            // Branches move as their agent commits: refresh the tracked tip
+            // so the plan snapshot anchors exactly what apply re-verifies.
+            // Identity, tree and git binding follow the live branch; row id,
+            // creation time and tombstone state stay untouched.
+            let body: Option<String> = tx
+                .query_row(
+                    "SELECT body FROM artifacts WHERE path=?1",
+                    params![artifact.path],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if let Some(body) = body
+                && let Ok(mut stored) = serde_json::from_str::<ArtifactView>(&body)
+                && stored.kind == ArtifactKind::Branch
+            {
+                stored.identity = artifact.identity.clone();
+                stored.tree.clone_from(&artifact.tree);
+                stored.git.clone_from(&artifact.git);
+                tx.execute(
+                    "UPDATE artifacts SET body=?1 WHERE path=?2",
+                    params![encode_json(&stored)?, artifact.path],
+                )
+                .map_err(sql_error)?;
+            }
+        }
         commit_transaction(tx, &self.write_faulted)
+    }
+    /// Registered branch rows for one agent generation, including the
+    /// retained git binding used to re-resolve the live tip after the
+    /// worktree is gone.
+    pub fn registered_branches(
+        &self,
+        agent_id: &str,
+        generation: i64,
+    ) -> Result<Vec<ArtifactView>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT body FROM artifacts WHERE agent=?1 AND generation=?2 AND json_extract(body,'$.kind')='branch' AND json_extract(body,'$.state')='registered'",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![parse_agent_id(agent_id)?, generation], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error)?;
+        let mut out = Vec::new();
+        for body in rows {
+            let artifact: ArtifactView = serde_json::from_str(&body.map_err(sql_error)?)
+                .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
+            out.push(artifact);
+        }
+        Ok(out)
     }
     pub fn cleanup_authorized(&self, principal: &str, artifact: &ArtifactView) -> Result<bool> {
         match parse_sender(principal, "cleanup")? {
@@ -610,6 +664,7 @@ mod tests {
         let request = CleanupApplyRequest {
             id: Ulid::new().to_string(),
             plan_id: plan.plan_id.clone(),
+            delete_remote: false,
         };
         let (_, first, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
         assert!(is_new);
@@ -623,11 +678,13 @@ mod tests {
         let different = CleanupApplyRequest {
             id: Ulid::new().to_string(),
             plan_id: plan.plan_id,
+            delete_remote: false,
         };
         assert!(store.begin_cleanup_apply("owner", &different, now).is_err());
         let other = CleanupApplyRequest {
             id: Ulid::new().to_string(),
             plan_id: other_plan.plan_id,
+            delete_remote: false,
         };
         let (_, result, _) = store.begin_cleanup_apply("owner", &other, now).unwrap();
         assert_eq!(result.items[0].outcome, "skipped");
@@ -637,5 +694,38 @@ mod tests {
         );
         let agent = store.get_agent("a1").unwrap().unwrap();
         assert!(require_no_cleanup_attempt(&store.connection, &agent).is_err());
+    }
+
+    #[test]
+    fn branch_backfill_refreshes_tracked_tip_without_changing_row_identity() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','stopped',1,?1,?1)",[now]).unwrap();
+        let branch = |tip: &str| ArtifactView {
+            id: Ulid::new().to_string(),
+            agent: "a1".to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: vec!["a1:1".to_owned()],
+            path: "C:/repo/.git::refs/heads/k".to_owned(),
+            kind: ArtifactKind::Branch,
+            purpose: "Swarm managed branch".to_owned(),
+            identity: tip.to_owned(),
+            created_at: now,
+            state: "registered".to_owned(),
+            git: None,
+        };
+        store.record_known_artifact(branch("base")).unwrap();
+        store.record_known_artifact(branch("tip")).unwrap();
+        let request = CleanupPlanRequest {
+            scope: CleanupScope::All,
+            project: None,
+            older_than: None,
+        };
+        let (items, truncated) = store.cleanup_inventory("owner", &request).unwrap();
+        assert!(!truncated);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].identity, "tip");
+        assert_eq!(items[0].state, "registered");
     }
 }

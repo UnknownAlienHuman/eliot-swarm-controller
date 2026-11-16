@@ -132,6 +132,11 @@ pub struct CleanupPlan {
 pub struct CleanupApplyRequest {
     pub id: String,
     pub plan_id: String,
+    /// Delete an already-removed branch from its upstream remote as well.
+    /// Owner-only and never automatic: managers and Agents always apply
+    /// local-only deletions.
+    #[serde(default)]
+    pub delete_remote: bool,
 }
 impl CleanupApplyRequest {
     pub fn validate(&self) -> Result<()> {

@@ -451,6 +451,10 @@ alone grants no cleanup authority; project rules with the same name remain separ
 The completion rule stops only that captured Agent/generation,
 releasing native live capacity after custody closes. Native `data.cause` is not a match
 authority. Assigned Agents own one brief; they are retired after their terminal turn.
+When the assignment sets `cleanup_on_retire = true` (default false), the
+applied stop also cleans that Agent's build, temp and managed-worktree
+artifacts inline in the stop worker: same authority check, same quiescence
+gate and guarded deletion, with retained receipts, and no second executor.
 Manual timer runs use the same admission and cursor checks. Multiple firings race
 through the same retained cursor and are serialized by Store's cursor compare-and-swap.
 The ordinary command ID remains the timer child ID, preserving exact same-ID replay.

@@ -37,10 +37,14 @@ pub(crate) async fn run_cleanup(
                 })
                 .map_err(|e| Failure::from_core(e, false))?
         }
-        CleanupCommand::Apply { plan_id } => {
+        CleanupCommand::Apply {
+            plan_id,
+            delete_remote,
+        } => {
             let request = CleanupApplyRequest {
                 id: mutation_id(id)?,
                 plan_id,
+                delete_remote,
             };
             request
                 .validate()

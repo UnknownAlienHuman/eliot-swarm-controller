@@ -1900,6 +1900,7 @@ impl Router {
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
             })?;
+            crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
             let harness = snapshot
                 .get("harness")
                 .and_then(Value::as_str)
@@ -1985,6 +1986,7 @@ impl Router {
                 crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                     std::env::var_os(name)
                 })?;
+                crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
                 let harness = snapshot
                     .get("harness")
                     .and_then(Value::as_str)
@@ -2029,6 +2031,7 @@ impl Router {
                 crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                     std::env::var_os(name)
                 })?;
+                crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
                 let harness = snapshot
                     .get("harness")
                     .and_then(Value::as_str)

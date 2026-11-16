@@ -162,6 +162,8 @@ pub(crate) struct CleanupTree {
     entries: Vec<File>,
     pub(crate) identity: String,
     pub(crate) bytes: u64,
+    // (logical bytes, total links, names seen inside this tree) per identity.
+    shared: std::collections::HashMap<eliot_plugin::FileIdentity, (u64, u64, u64)>,
 }
 
 #[cfg(windows)]
@@ -178,9 +180,18 @@ impl CleanupTree {
             entries: Vec::new(),
             identity,
             bytes: 0,
+            shared: std::collections::HashMap::new(),
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         tree.visit(root, 0, deadline)?;
+        // Shared inodes count once, and only when every link lives inside
+        // this tree; names with surviving outside links free no bytes.
+        tree.bytes = tree
+            .shared
+            .values()
+            .filter(|entry| entry.2 >= entry.1)
+            .try_fold(0u64, |total, entry| total.checked_add(entry.0))
+            .ok_or_else(refused)?;
         Ok(tree)
     }
 
@@ -194,14 +205,23 @@ impl CleanupTree {
             }
             plain(name.to_str().ok_or_else(refused)?)?;
             let child = native::open_cleanup(&directory, &name, is_dir).map_err(|_| refused())?;
-            check(&child, is_dir)?;
+            if is_dir {
+                check(&child, true)?;
+            } else {
+                check_cleanup_file(&child)?;
+            }
             if is_dir {
                 self.visit(child, depth + 1, deadline)?;
             } else {
-                self.bytes = self
-                    .bytes
-                    .checked_add(child.metadata().map_err(io)?.len())
-                    .ok_or_else(refused)?;
+                // Hard links share one identity and every name is deleted by
+                // handle, so deletion never disturbs names outside the tree.
+                let identity = eliot_plugin::file_identity(&child).map_err(|_| refused())?;
+                let links = native::links(&child).map_err(|_| refused())?;
+                let len = child.metadata().map_err(io)?.len();
+                self.shared
+                    .entry(identity)
+                    .and_modify(|slot| slot.2 = slot.2.saturating_add(1))
+                    .or_insert((len, links, 1));
                 self.entries.push(child);
             }
         }
@@ -253,6 +273,34 @@ mod cleanup_tests {
     }
 
     #[test]
+    fn hardlinked_pair_inside_tree_counts_shared_bytes_once() {
+        let root = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("first"), b"1234567").unwrap();
+        std::fs::hard_link(root.join("first"), root.join("second")).unwrap();
+        let tree = CleanupTree::open(&root).unwrap();
+        assert_eq!(tree.bytes, 7);
+        assert_eq!(tree.remove().unwrap(), 7);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn externally_linked_file_removes_names_but_claims_no_bytes() {
+        let parent = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+        let root = parent.join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("inner"), b"1234567").unwrap();
+        std::fs::hard_link(root.join("inner"), parent.join("outer")).unwrap();
+        let tree = CleanupTree::open(&root).unwrap();
+        assert_eq!(tree.bytes, 0);
+        assert_eq!(tree.remove().unwrap(), 0);
+        assert!(!root.exists());
+        assert_eq!(std::fs::read(parent.join("outer")).unwrap(), b"1234567");
+        std::fs::remove_file(parent.join("outer")).unwrap();
+        std::fs::remove_dir(&parent).unwrap();
+    }
+
+    #[test]
     fn nested_tree_deletion_uses_opened_identity_and_counts_bytes() {
         let parent = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
         let root = parent.join("tree");
@@ -289,6 +337,17 @@ fn check(file: &File, directory: bool) -> Result<()> {
         || (!directory && !metadata.is_file())
         || (!directory && native::links(file).map_err(|_| refused())? != 1)
     {
+        return Err(refused());
+    }
+    Ok(())
+}
+
+// Cleanup-tree file check: reparse points stay refused, but hard links are
+// tolerated because every name is opened and deleted by handle. Callers count
+// shared bytes once per identity and only when all links live inside the tree.
+fn check_cleanup_file(file: &File) -> Result<()> {
+    let metadata = file.metadata().map_err(|_| refused())?;
+    if crate::platform::is_reparse_point(&metadata) || !metadata.is_file() {
         return Err(refused());
     }
     Ok(())
@@ -407,7 +466,11 @@ mod native {
         };
         // Deny ordinary file writes while read/revision handles remain open;
         // delete sharing is necessary for atomic replacement of an open entry.
-        let share = if cleanup {
+        // Cleanup file opens share reads and deletes so every hardlink name
+        // of one file can be held at once; writes stay denied.
+        let share = if cleanup && !directory {
+            FILE_SHARE_READ | FILE_SHARE_DELETE
+        } else if cleanup {
             0
         } else if directory {
             FILE_SHARE_READ | FILE_SHARE_WRITE

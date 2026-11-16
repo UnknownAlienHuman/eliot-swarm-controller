@@ -14,7 +14,8 @@ use crate::{
             NativeClientInfo, NativeDiscoveryConfigReadResponse, NativeDiscoverySourceKind,
             NativeDiscoveryStatus, NativeDiscoveryThread, NativeInitializeParams,
             NativeInitializeResponse, NativeModelEntry, NativeModelListParams,
-            NativeModelListResponse, NativeThreadListParams, NativeThreadListResponse,
+            NativeModelListResponse, NativeThreadArchiveParams, NativeThreadListParams,
+            NativeThreadListResponse,
         },
     },
 };
@@ -449,6 +450,59 @@ pub(crate) async fn read_quota(
             ));
         }
         Ok(details)
+    }
+    .await;
+    finish_reader(&mut probe, Some(drainer)).await?;
+    let probe_result = probe_result.map_err(|error| probe.client().diagnostic_error(error));
+    drop(probe);
+    probe_result
+}
+
+/// Archive one thread through the documented app-server `thread/archive`
+/// method, then close the reader. A short-lived initialized reader performs
+/// the call with no turn and no inference; the response only confirms the
+/// archive. Raw session files are never touched: the harness owns the store.
+pub(crate) async fn archive_thread(
+    launch: NativeLaunch,
+    thread_id: String,
+    metadata_secrets: &[String],
+    diagnostic_secrets: &[String],
+    deadline: Instant,
+) -> Result<()> {
+    if thread_id.is_empty() || thread_id.len() > 512 || thread_id.chars().any(char::is_control) {
+        return Err(Error::new(
+            "invalid",
+            "Codex thread archive reference is invalid",
+        ));
+    }
+    let (mut probe, drainer, _initialized) =
+        start_initialized_reader(launch, metadata_secrets, diagnostic_secrets, deadline).await?;
+    let probe_result: Result<()> = async {
+        let client = probe.client();
+        let response = client
+            .call(
+                "thread/archive",
+                serde_json::to_value(NativeThreadArchiveParams { thread_id })
+                    .map_err(|_| invalid_page())?,
+                deadline,
+            )
+            .await
+            .map_err(|error| {
+                let message = error.message.clone();
+                if message.contains("thread/archive") {
+                    error
+                } else {
+                    error.with_message(format!("thread/archive: {message}"))
+                }
+            })?;
+        reject_secrets(&response, metadata_secrets)?;
+        if !response.is_object() {
+            return Err(Error::new(
+                "native_readback",
+                "Codex thread/archive response is malformed",
+            ));
+        }
+        Ok(())
     }
     .await;
     finish_reader(&mut probe, Some(drainer)).await?;

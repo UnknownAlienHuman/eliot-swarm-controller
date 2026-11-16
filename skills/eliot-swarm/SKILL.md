@@ -51,27 +51,33 @@ only the owner moves agents (`swarm.reparent`, `swarm.switch`).
 ## Finishing
 
 Register directories you create for an assignment with `artifact.register`
-(`swarm artifact register <absolute-path> --kind build|data_dir|temp|other
---purpose <short-description>`). Register build targets outside the checkout,
-temporary folders, screenshots and private daemon data directories explicitly.
-The directory must already exist inside your workspace, an Owner-configured
+(`swarm artifact register <absolute-path> --kind build|data_dir|temp|other`
+`--purpose <short-description>`). Register your own `CARGO_TARGET_DIR` when
+it lies outside your checkout, temporary folders, screenshots, and any
+private daemon data directory you start through the `swarm` CLI. The
+directory must already exist inside your workspace, an Owner-configured
 `daemon.artifact_roots` entry, or your generation's private artifact root.
-Never register user/native configuration or stores. Swarm records managed
-worktrees/branches and declared scratch directories from retained launch facts.
+Data directories stay `keep` while a private daemon lock or a live process
+holds them. Never register user/native configuration or stores. Swarm
+records managed worktrees and branches, declared scratch directories, and
+the frozen `CARGO_TARGET_DIR` passed through your profile from retained
+launch facts.
 
 A manager can review its subtree with `cleanup.plan {scope:"self_tree"}`
 (`swarm cleanup plan`), then consume that exact plan with
 `cleanup.apply {id,plan_id}` (`swarm cleanup apply <plan-id>`). Review `keep`
-reasons and sizes. Stop children before cleanup. Preserve an uncertain apply id;
-retry only that identical id/payload to read its retained result. `unknown`
-never authorizes another deletion attempt. The Owner can select `project` or
-`all`; an Agent cannot broaden its cleanup scope. Native stores are never raw
-filesystem cleanup targets. Native archive and branch candidates currently stay
-`keep` until native/archive and fresh-fetch merge checks are connected.
-
-Report your result as your final message. The parent reads it with
-`agent.result` (`swarm result`); a digest may also deliver it to the
-parent mailbox. State plainly what you changed and what remains open.
+reasons and sizes. Stop children before cleanup. Preserve an uncertain apply
+id; retry only that identical id/payload to read its retained result.
+`unknown` never authorizes another deletion attempt. The Owner can select
+`project` or `all`; an Agent cannot broaden its cleanup scope. Native
+stores are never raw filesystem cleanup targets. A terminal Codex session
+is archived through the harness `thread/archive` method at apply; every
+other harness stays `keep(no_native_archive)`. A branch is `safe` only
+after a fresh upstream fetch proves it merged into the upstream default
+with no unpushed commits; apply re-verifies and deletes locally with the
+safe `-d` form. Remote branch deletion is Owner-only
+(`swarm cleanup apply <plan-id> --delete-remote`) and never automatic.
+State plainly what you changed and what remains open.
 
 ## Honest unknown
 

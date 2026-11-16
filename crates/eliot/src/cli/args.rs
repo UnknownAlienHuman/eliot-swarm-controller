@@ -186,6 +186,10 @@ pub(crate) enum CleanupCommand {
     },
     Apply {
         plan_id: String,
+        /// After a local branch is removed, delete it from its upstream
+        /// remote as well. Owner-only; never automatic.
+        #[arg(long)]
+        delete_remote: bool,
     },
 }
 #[derive(Args)]

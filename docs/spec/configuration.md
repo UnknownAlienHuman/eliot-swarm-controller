@@ -8,9 +8,10 @@ these Owner-configured roots, in addition to its workspace and generation's
 private artifact root. Configured roots themselves and user/native configuration
 remain protected. This does not scan or adopt existing unregistered files. See
 [registered artifacts and cleanup](coordination.md#registered-artifacts-and-cleanup-k69).
-The setting is available through the existing Daemon settings section. Cleanup
-after assignment retirement is currently off; no automatic cleanup executor or
-effective opt-in setting is implemented yet.
+The setting is available through the existing Daemon settings section. A folder assignment opts in with `[automation.assignments.<key>] cleanup_on_retire = true`
+(default false): after an applied stop retires its Agent, the existing stop
+worker cleans that Agent's build, temp and managed-worktree artifacts with
+Owner authority and retained receipts. It is not a second executor.
 
 Implement the single global Codex profile first. Project overlays, external plugins,
 services, mail and automation settings appear only with their owning roadmap layer;
@@ -684,7 +685,14 @@ selected by `pass_env` or unset; a selected empty string remains distinct. Prese
 values without trimming or path normalization. Names compare case-insensitively on
 Windows and exactly elsewhere. [Environment construction](../../crates/eliot-daemon/src/plugin_host/host.rs)
 uses these captured inputs instead of looking them up again. This selector capture
-leaves other `pass_env` resolution unchanged.
+leaves other `pass_env` resolution unchanged. When `pass_env` admits the
+literal name `CARGO_TARGET_DIR`, admission also freezes its exact value in
+`profile_snapshot.target_dir` (absolute local path only; skipped otherwise).
+Cleanup backfills that frozen directory as a build artifact when it lies
+outside the Agent workspace and inside a configured artifact root. A shared
+daemon-wide value is exact for every Agent only when every Agent of the
+profile really builds there; per-Agent target directories must be registered
+by the Agent itself through `artifact.register`.
 
 Retained mutation IDs hydrate their stored snapshot before any new capture. Admitted
 selector inputs are frozen at admission and are neither rewritten nor backfilled:
