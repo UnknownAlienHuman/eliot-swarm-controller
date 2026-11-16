@@ -5,13 +5,14 @@ use super::process_observation::{
 };
 use eliot_core::{
     Error, ProcessIdentity, ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result,
+    verbatim_path,
 };
 use eliot_plugin::sync::LockExt;
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
-use std::path::{Component, Path, PathBuf, Prefix};
+use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1847,60 +1848,6 @@ fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
-const VERBATIM_BACKSLASH: u16 = 92;
-const VERBATIM_QUESTION: u16 = 63;
-const VERBATIM_DOT: u16 = 46;
-
-/// Verbatim-prefixed form for file creation and security-handle opens.
-///
-/// Name-based Win32 security queries reject long paths at parse time
-/// (os error 123 on this host), while verbatim creation and handle-based
-/// security calls work at any length the filesystem accepts.
-fn verbatim_path(path: &Path) -> PathBuf {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
-    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    let already = wide.len() >= 4
-        && wide[0] == VERBATIM_BACKSLASH
-        && wide[1] == VERBATIM_BACKSLASH
-        && (wide[2] == VERBATIM_QUESTION || wide[2] == VERBATIM_DOT)
-        && wide[3] == VERBATIM_BACKSLASH;
-    if already {
-        return path.to_path_buf();
-    }
-    let local_disk = path.is_absolute()
-        && matches!(
-            path.components().next(),
-            Some(Component::Prefix(p))
-                if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
-        );
-    if !local_disk {
-        return path.to_path_buf();
-    }
-    let normalized = match std::path::absolute(path) {
-        Ok(normalized) => normalized,
-        Err(_) => return path.to_path_buf(),
-    };
-    let wide: Vec<u16> = normalized.as_os_str().encode_wide().collect();
-    let already = wide.len() >= 4
-        && wide[0] == VERBATIM_BACKSLASH
-        && wide[1] == VERBATIM_BACKSLASH
-        && (wide[2] == VERBATIM_QUESTION || wide[2] == VERBATIM_DOT)
-        && wide[3] == VERBATIM_BACKSLASH;
-    if already {
-        return normalized;
-    }
-    let mut prefixed = vec![
-        VERBATIM_BACKSLASH,
-        VERBATIM_BACKSLASH,
-        VERBATIM_QUESTION,
-        VERBATIM_BACKSLASH,
-    ];
-    let mut wide = wide;
-    prefixed.append(&mut wide);
-    PathBuf::from(OsString::from_wide(&prefixed))
-}
-
 fn verbatim_file_path(path: &Path) -> Vec<u16> {
     verbatim_path(path)
         .as_os_str()
@@ -2009,48 +1956,6 @@ unsafe extern "system" {
 mod tests {
     use super::*;
     use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
-
-    #[test]
-    fn verbatim_leaves_drive_relative_unchanged() {
-        let input = PathBuf::from("C:eliot.db");
-        let wide = verbatim_file_path(&input);
-        let expected: Vec<u16> = input.as_os_str().encode_wide().chain(Some(0)).collect();
-        assert_eq!(
-            wide, expected,
-            "drive-relative must not gain a verbatim prefix"
-        );
-    }
-
-    #[test]
-    fn verbatim_normalizes_trailing_dot_component() {
-        let input = PathBuf::from(r"C:\eliot-verbatim-check\folder.\eliot.db");
-        let normalized = std::path::absolute(&input).expect("normalize");
-        assert!(
-            !normalized.to_string_lossy().contains("folder."),
-            "absolute() must normalize folder.: {}",
-            normalized.display()
-        );
-        let wide = verbatim_file_path(&input);
-        let wide_str = String::from_utf16_lossy(&wide);
-        assert!(
-            !wide_str.contains("folder."),
-            "verbatim must not preserve literal folder.: {wide_str}"
-        );
-    }
-
-    #[test]
-    fn verbatim_leaves_non_disk_paths_unchanged() {
-        for raw in [r"\\server\share\eliot.db", ":memory:", r"relative\eliot.db"] {
-            let input = PathBuf::from(raw);
-            let wide = verbatim_file_path(&input);
-            let expected: Vec<u16> = input.as_os_str().encode_wide().chain(Some(0)).collect();
-            assert_eq!(wide, expected, "{raw} must stay unchanged");
-        }
-        let verb = PathBuf::from(r"\\?\C:\already\verbatim.db");
-        let wide = verbatim_file_path(&verb);
-        let expected: Vec<u16> = verb.as_os_str().encode_wide().chain(Some(0)).collect();
-        assert_eq!(wide, expected, "already-verbatim must stay unchanged");
-    }
 
     #[test]
     fn security_handle_refuses_junction_swapped_in_after_path_check() {

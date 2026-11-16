@@ -26,6 +26,7 @@ mod remote_call;
 mod routing;
 mod secrets;
 mod source_handoff;
+mod verbatim;
 
 pub use agent_start::AgentStartParams;
 pub use canonical::canonical_json_sha256;
@@ -71,6 +72,7 @@ pub use routing::{
 };
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};
+pub use verbatim::verbatim_path;
 
 use crate::api::AgentConfigView;
 use serde::{Deserialize, Serialize};
