@@ -668,10 +668,11 @@ impl DesktopApp {
     /// WinUI 3 shows a ContentDialog in the popup layer, which follows the
     /// application theme, not the window root's RequestedTheme (Reactor
     /// 0.100.0 sets that on the host Grid only and exposes no RequestedTheme
-    /// on ContentDialog). Nothing inside therefore uses the window palette:
-    /// text and controls resolve the dialog's own theme resources, and the
-    /// primary is WinUI's AccentButtonStyle, which `app_resources` maps to
-    /// the M3 filled roles of either theme.
+    /// on ContentDialog). Nothing inside therefore sets palette brushes:
+    /// text and controls resolve the application's resources, which
+    /// `app_resources` writes from the window's scheme (the dialog surface,
+    /// its text, fields and dropdowns), and the primary is WinUI's
+    /// AccentButtonStyle on the M3 filled roles.
     pub(super) fn handoff_dialog(&self, context: &mut ViewContext<Self>) -> View {
         let state = &self.handoff;
         if !state.open {
@@ -1264,7 +1265,7 @@ fn heading(text: &str) -> TextBlock {
 fn small(text: impl Into<String>) -> TextBlock {
     TextBlock::new()
         .text(text.into())
-        .font_size(theme::type_scale::BODY_SMALL.size + 1.0)
+        .font_size(theme::type_scale::BODY_MEDIUM.size)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }

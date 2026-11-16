@@ -170,7 +170,7 @@ fn label(text: &str) -> TextBlock {
     TextBlock::new()
         .text(text.to_owned())
         .font_size(theme::type_scale::LABEL_MEDIUM.size)
-        .font_weight(FontWeight::SEMI_BOLD)
+        .font_weight(FontWeight::MEDIUM)
         .opacity(theme::MUTED_OPACITY)
 }
 

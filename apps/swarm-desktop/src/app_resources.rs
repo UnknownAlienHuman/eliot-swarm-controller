@@ -10,7 +10,8 @@
 //! - **Roles.** WinUI's own keys (`microsoft.windowsappsdk.winui` 2.3.0
 //!   `Themes/generic.xaml`) from the window's scheme: the accent ramp, list
 //!   selection, the text box as an M3 outlined text field, the combo box as
-//!   an M3 exposed dropdown menu, the toggle switch in M3 switch roles, menus
+//!   an M3 exposed dropdown menu, the toggle switch, radio buttons and check
+//!   boxes in M3 selection-control roles, menus
 //!   and combo-box popups on surface-container, the dialog on
 //!   surface-container-high, the tooltip on inverse-surface and the focus
 //!   ring in secondary. WinUI resolves a ThemeResource through the
@@ -101,6 +102,7 @@ pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
     all.extend(text_field(s));
     all.extend(dropdown(s));
     all.extend(switch(s));
+    all.extend(selection_controls(s));
     all.extend(overlays(s));
     all
 }
@@ -480,6 +482,161 @@ fn dropdown(s: &Scheme) -> Vec<(&'static str, Value)> {
             "ComboBoxItemForegroundSelectedPointerOver",
         ],
         opaque(s.on_secondary_container),
+    ));
+    all
+}
+
+/// Radio buttons and check boxes in M3 selection-control roles: an
+/// on-surface-variant ring or box at rest, primary when selected (a primary
+/// ring with a primary dot; a primary box with an on-primary check), the
+/// label in on-surface, disabled at 38% on-surface.
+fn selection_controls(s: &Scheme) -> Vec<(&'static str, Value)> {
+    let disabled = layer(s.on_surface, state::DISABLED_CONTENT);
+    let mut all = vec![
+        ("RadioButtonForegroundDisabled", disabled),
+        ("RadioButtonOuterEllipseStrokeDisabled", disabled),
+        ("RadioButtonOuterEllipseCheckedStrokeDisabled", disabled),
+        ("RadioButtonCheckGlyphFillDisabled", disabled),
+        ("RadioButtonsHeaderForeground", opaque(s.on_surface_variant)),
+        ("CheckBoxForegroundUncheckedDisabled", disabled),
+        ("CheckBoxForegroundCheckedDisabled", disabled),
+        ("CheckBoxForegroundIndeterminateDisabled", disabled),
+        ("CheckBoxCheckBackgroundStrokeUncheckedDisabled", disabled),
+        ("CheckBoxCheckBackgroundFillCheckedDisabled", disabled),
+        ("CheckBoxCheckBackgroundFillIndeterminateDisabled", disabled),
+        (
+            "CheckBoxCheckGlyphForegroundCheckedDisabled",
+            opaque(s.surface),
+        ),
+        (
+            "CheckBoxCheckGlyphForegroundIndeterminateDisabled",
+            opaque(s.surface),
+        ),
+    ];
+    all.extend(every(
+        &[
+            "RadioButtonForeground",
+            "RadioButtonForegroundPointerOver",
+            "RadioButtonForegroundPressed",
+            "CheckBoxForegroundUnchecked",
+            "CheckBoxForegroundUncheckedPointerOver",
+            "CheckBoxForegroundUncheckedPressed",
+            "CheckBoxForegroundChecked",
+            "CheckBoxForegroundCheckedPointerOver",
+            "CheckBoxForegroundCheckedPressed",
+            "CheckBoxForegroundIndeterminate",
+            "CheckBoxForegroundIndeterminatePointerOver",
+            "CheckBoxForegroundIndeterminatePressed",
+        ],
+        opaque(s.on_surface),
+    ));
+    all.extend(every(
+        &[
+            "RadioButtonOuterEllipseStroke",
+            "RadioButtonOuterEllipseStrokePointerOver",
+            "RadioButtonOuterEllipseStrokePressed",
+            "CheckBoxCheckBackgroundStrokeUnchecked",
+            "CheckBoxCheckBackgroundStrokeUncheckedPointerOver",
+            "CheckBoxCheckBackgroundStrokeUncheckedPressed",
+        ],
+        opaque(s.on_surface_variant),
+    ));
+    all.extend(every(
+        &[
+            "RadioButtonOuterEllipseCheckedStroke",
+            "RadioButtonOuterEllipseCheckedStrokePointerOver",
+            "RadioButtonOuterEllipseCheckedStrokePressed",
+            "RadioButtonCheckGlyphFill",
+            "RadioButtonCheckGlyphFillPointerOver",
+            "RadioButtonCheckGlyphFillPressed",
+            "CheckBoxCheckBackgroundStrokeChecked",
+            "CheckBoxCheckBackgroundStrokeCheckedPointerOver",
+            "CheckBoxCheckBackgroundStrokeCheckedPressed",
+            "CheckBoxCheckBackgroundStrokeIndeterminate",
+            "CheckBoxCheckBackgroundStrokeIndeterminatePointerOver",
+            "CheckBoxCheckBackgroundStrokeIndeterminatePressed",
+            "CheckBoxCheckBackgroundFillChecked",
+            "CheckBoxCheckBackgroundFillCheckedPointerOver",
+            "CheckBoxCheckBackgroundFillCheckedPressed",
+            "CheckBoxCheckBackgroundFillIndeterminate",
+            "CheckBoxCheckBackgroundFillIndeterminatePointerOver",
+            "CheckBoxCheckBackgroundFillIndeterminatePressed",
+        ],
+        opaque(s.primary),
+    ));
+    all.extend(every(
+        &[
+            "CheckBoxCheckGlyphForegroundChecked",
+            "CheckBoxCheckGlyphForegroundCheckedPointerOver",
+            "CheckBoxCheckGlyphForegroundCheckedPressed",
+            "CheckBoxCheckGlyphForegroundIndeterminate",
+            "CheckBoxCheckGlyphForegroundIndeterminatePointerOver",
+            "CheckBoxCheckGlyphForegroundIndeterminatePressed",
+        ],
+        opaque(s.on_primary),
+    ));
+    all.extend(every(
+        &[
+            "RadioButtonBackground",
+            "RadioButtonBackgroundPointerOver",
+            "RadioButtonBackgroundPressed",
+            "RadioButtonBackgroundDisabled",
+            "RadioButtonBorderBrush",
+            "RadioButtonBorderBrushPointerOver",
+            "RadioButtonBorderBrushPressed",
+            "RadioButtonBorderBrushDisabled",
+            "RadioButtonOuterEllipseFill",
+            "RadioButtonOuterEllipseFillPointerOver",
+            "RadioButtonOuterEllipseFillPressed",
+            "RadioButtonOuterEllipseFillDisabled",
+            "RadioButtonOuterEllipseCheckedFill",
+            "RadioButtonOuterEllipseCheckedFillPointerOver",
+            "RadioButtonOuterEllipseCheckedFillPressed",
+            "RadioButtonOuterEllipseCheckedFillDisabled",
+            "RadioButtonCheckGlyphStroke",
+            "RadioButtonCheckGlyphStrokePointerOver",
+            "RadioButtonCheckGlyphStrokePressed",
+            "RadioButtonCheckGlyphStrokeDisabled",
+            "RadioButtonCheckGlyphStrokeChecked",
+            "RadioButtonCheckGlyphStrokeCheckedPointerOver",
+            "RadioButtonCheckGlyphStrokeCheckedPressed",
+            "RadioButtonCheckGlyphStrokeCheckedDisabled",
+            "CheckBoxBackgroundUnchecked",
+            "CheckBoxBackgroundUncheckedPointerOver",
+            "CheckBoxBackgroundUncheckedPressed",
+            "CheckBoxBackgroundUncheckedDisabled",
+            "CheckBoxBackgroundChecked",
+            "CheckBoxBackgroundCheckedPointerOver",
+            "CheckBoxBackgroundCheckedPressed",
+            "CheckBoxBackgroundCheckedDisabled",
+            "CheckBoxBackgroundIndeterminate",
+            "CheckBoxBackgroundIndeterminatePointerOver",
+            "CheckBoxBackgroundIndeterminatePressed",
+            "CheckBoxBackgroundIndeterminateDisabled",
+            "CheckBoxBorderBrushUnchecked",
+            "CheckBoxBorderBrushUncheckedPointerOver",
+            "CheckBoxBorderBrushUncheckedPressed",
+            "CheckBoxBorderBrushUncheckedDisabled",
+            "CheckBoxBorderBrushChecked",
+            "CheckBoxBorderBrushCheckedPointerOver",
+            "CheckBoxBorderBrushCheckedPressed",
+            "CheckBoxBorderBrushCheckedDisabled",
+            "CheckBoxBorderBrushIndeterminate",
+            "CheckBoxBorderBrushIndeterminatePointerOver",
+            "CheckBoxBorderBrushIndeterminatePressed",
+            "CheckBoxBorderBrushIndeterminateDisabled",
+            "CheckBoxCheckBackgroundStrokeCheckedDisabled",
+            "CheckBoxCheckBackgroundStrokeIndeterminateDisabled",
+            "CheckBoxCheckBackgroundFillUnchecked",
+            "CheckBoxCheckBackgroundFillUncheckedPointerOver",
+            "CheckBoxCheckBackgroundFillUncheckedPressed",
+            "CheckBoxCheckBackgroundFillUncheckedDisabled",
+            "CheckBoxCheckGlyphForegroundUnchecked",
+            "CheckBoxCheckGlyphForegroundUncheckedPointerOver",
+            "CheckBoxCheckGlyphForegroundUncheckedPressed",
+            "CheckBoxCheckGlyphForegroundUncheckedDisabled",
+        ],
+        clear(s),
     ));
     all
 }

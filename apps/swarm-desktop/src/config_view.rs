@@ -18,7 +18,7 @@ use eliot_core::api::{ProfileSummary, RuleListEntry, TimerSchedule};
 fn small(text: impl Into<String>) -> TextBlock {
     TextBlock::new()
         .text(text.into())
-        .font_size(theme::type_scale::LABEL_MEDIUM.size)
+        .font_size(theme::type_scale::BODY_SMALL.size)
         .text_wrapping(TextWrapping::Wrap)
         .is_text_selection_enabled(true)
 }
