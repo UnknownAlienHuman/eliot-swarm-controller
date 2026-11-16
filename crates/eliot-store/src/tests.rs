@@ -12697,6 +12697,7 @@ fn session_fallback_projects_cumulative_counters_only() {
             amount: Some(0.5),
             unit: Some("usd_estimate".to_owned()),
         }),
+        session_file_bytes: None,
         source: Some("muse:session/tokenUsage".to_owned()),
         observed_at: Some(7),
     };

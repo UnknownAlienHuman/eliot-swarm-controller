@@ -739,6 +739,7 @@ pub(crate) fn session_usage_from_token_usage(
         context_window_tokens: None,
         cumulative_tokens: None,
         cumulative_cost: None,
+        session_file_bytes: None,
         source: None,
         observed_at: None,
     });
@@ -798,6 +799,7 @@ pub(crate) fn session_usage_from_context_usage(
         context_window_tokens: None,
         cumulative_tokens: None,
         cumulative_cost: None,
+        session_file_bytes: None,
         source: None,
         observed_at: None,
     });

@@ -12,6 +12,7 @@ use eliot_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 
 /// Outbound stdin control envelope.
 #[derive(Serialize)]
@@ -329,31 +330,134 @@ pub(crate) fn result_session_tokens(record: &Value) -> Option<SessionTokenTotals
     })
 }
 
+/// Context occupancy sample from a terminal `result` record's `usage`: the
+/// turn's input-side counters (input plus cache creation/read) approximate
+/// the context read for that turn, so the latest sample is the retained
+/// occupancy. Missing or malformed counters leave the sample absent; a
+/// result without any input-side counter contributes no occupancy (the
+/// cumulative `modelUsage` below still maps).
+pub(crate) fn result_context_used(record: &Value) -> Option<i64> {
+    let usage = record.get("usage")?.as_object()?;
+    let mut sum: i128 = 0;
+    let mut supplied = 0;
+    for key in [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ] {
+        if let Some(value) = usage
+            .get(key)
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+        {
+            sum += i128::from(value);
+            supplied += 1;
+        }
+    }
+    if supplied == 0 || sum > i128::from(i64::MAX) {
+        return None;
+    }
+    Some(sum as i64)
+}
+
+/// Model context window from an init or result frame: the installed
+/// stream-json names the capacity `context_window`/`contextWindow` where the
+/// harness reports it. Absent or unusable stays null, never zero or guessed.
+pub(crate) fn frame_context_window(record: &Value) -> Option<i64> {
+    record
+        .get("context_window")
+        .or_else(|| record.get("contextWindow"))
+        .and_then(Value::as_i64)
+        .filter(|window| *window > 0)
+}
+
+/// Config roots that may hold the Claude transcript store: an explicit
+/// `CLAUDE_CONFIG_DIR` first, then the home-derived `.claude` directories.
+/// Only absolute roots are kept; the caller scans them read-only.
+pub(crate) fn transcript_config_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+    {
+        roots.push(dir);
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home.join(".claude"));
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        roots.push(profile.join(".claude"));
+    }
+    roots
+}
+
+/// Maximum project entries scanned for one session transcript.
+pub(crate) const MAX_TRANSCRIPT_PROJECTS: usize = 512;
+
+/// Native transcript size for one session: `<config>/projects/*/<session>.jsonl`.
+/// The project slug is never guessed: the projects directory is scanned
+/// (bounded entries) for the exact session filename and the first hit wins.
+/// Anything unresolvable fails closed to None, never zero.
+pub(crate) fn transcript_bytes_in(roots: &[PathBuf], session_id: &str) -> Option<u64> {
+    if session_id.trim().is_empty() || session_id.len() > 128 {
+        return None;
+    }
+    if session_id
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '/' | '\\'))
+    {
+        return None;
+    }
+    let file_name = format!("{session_id}.jsonl");
+    for root in roots {
+        let entries = std::fs::read_dir(root.join("projects")).ok()?;
+        let mut checked = 0;
+        for entry in entries.flatten() {
+            checked += 1;
+            if checked > MAX_TRANSCRIPT_PROJECTS {
+                break;
+            }
+            if let Ok(meta) = std::fs::metadata(entry.path().join(&file_name))
+                && meta.is_file()
+            {
+                return Some(meta.len());
+            }
+        }
+    }
+    None
+}
+
 /// Extract the session-scoped fact from a terminal `result` record:
 /// cumulative token counters from `modelUsage` plus the cumulative cost
-/// from `total_cost_usd`. With persistent streaming input both are
-/// cumulative for the session (resumed cost included) and estimated, so
-/// they map to a session-scoped snapshot with source `claude:result`,
-/// never to turn expenditure and never converted. Either half may be
-/// absent while the other maps; only when both are absent is there no
-/// session fact, so completion proceeds without one.
+/// from `total_cost_usd`, the occupancy sample from `usage`, and the model
+/// context window where the frame reports it. With persistent streaming input
+/// the cumulative halves are cumulative for the session (resumed cost
+/// included) and estimated, so they map to a session-scoped snapshot with
+/// source `claude:result`, never to turn expenditure and never converted.
+/// Any mapped quarter yields a fact; only when all are absent is there no
+/// session fact, so completion proceeds without one. The transcript file
+/// size is filled by the caller (it needs the retained session id), never
+/// guessed here.
 pub(crate) fn result_session_usage(record: &Value) -> Option<SessionUsage> {
     let cumulative_tokens = result_session_tokens(record);
     let amount = record
         .get("total_cost_usd")
         .and_then(Value::as_f64)
         .filter(|amount| amount.is_finite() && *amount >= 0.0);
-    if cumulative_tokens.is_none() && amount.is_none() {
+    let used = result_context_used(record);
+    let window = frame_context_window(record);
+    if cumulative_tokens.is_none() && amount.is_none() && used.is_none() && window.is_none() {
         return None;
     }
     Some(SessionUsage {
-        context_used_tokens: None,
-        context_window_tokens: None,
+        context_used_tokens: used,
+        context_window_tokens: window,
         cumulative_tokens,
         cumulative_cost: amount.map(|amount| SessionCost {
             amount: Some(amount),
             unit: Some("usd_estimate".to_owned()),
         }),
+        session_file_bytes: None,
         source: Some("claude:result".to_owned()),
         observed_at: None,
     })
@@ -654,6 +758,65 @@ mod tests {
             None
         );
         assert_eq!(result_session_usage(&json!({"total_cost_usd": -0.5})), None);
+    }
+
+    #[test]
+    fn result_occupancy_samples_input_side_counters() {
+        assert_eq!(
+            result_context_used(&json!({"usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 50,
+                "cache_read_input_tokens": 1000,
+                "output_tokens": 20,
+            }})),
+            Some(1150)
+        );
+        // Output alone is not occupancy.
+        assert_eq!(
+            result_context_used(&json!({"usage": {"output_tokens": 20}})),
+            None
+        );
+        assert_eq!(result_context_used(&json!({})), None);
+        assert_eq!(
+            result_context_used(&json!({"usage": {"input_tokens": -1}})),
+            None
+        );
+        // The window comes from the init or result frames, never guessed.
+        assert_eq!(
+            frame_context_window(&json!({"context_window": 200_000})),
+            Some(200_000)
+        );
+        assert_eq!(
+            frame_context_window(&json!({"contextWindow": 100_000})),
+            Some(100_000)
+        );
+        assert_eq!(frame_context_window(&json!({})), None);
+        assert_eq!(frame_context_window(&json!({"context_window": 0})), None);
+        // Occupancy alone yields a session fact.
+        let usage =
+            result_session_usage(&json!({"usage": {"input_tokens": 7}})).expect("occupancy maps");
+        assert_eq!(usage.context_used_tokens, Some(7));
+        assert_eq!(usage.context_window_tokens, None);
+    }
+
+    #[test]
+    fn transcript_scan_finds_the_exact_session_file() {
+        let root = std::env::temp_dir().join(format!("eliot-claude-tx-{}", ulid::Ulid::new()));
+        let project = root.join("projects").join("some-slug");
+        std::fs::create_dir_all(&project).expect("fixture projects");
+        std::fs::write(project.join("other.jsonl"), b"{}").expect("fixture other");
+        std::fs::write(project.join("sess-1.jsonl"), b"{\"a\":1}").expect("fixture session");
+        let roots = vec![root.clone()];
+        assert_eq!(
+            transcript_bytes_in(&roots, "sess-1"),
+            Some(7),
+            "exact session filename wins without guessing the slug"
+        );
+        assert_eq!(transcript_bytes_in(&roots, "missing"), None);
+        assert_eq!(transcript_bytes_in(&roots, "../escape"), None);
+        assert_eq!(transcript_bytes_in(&roots, ""), None);
+        assert_eq!(transcript_bytes_in(&[], "sess-1"), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

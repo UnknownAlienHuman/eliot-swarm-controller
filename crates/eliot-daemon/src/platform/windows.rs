@@ -915,6 +915,14 @@ pub(crate) fn recorded_process_alive(pid: u32, start_time: u64) -> Result<bool> 
 }
 /// ProcessCommandLineInformation class for NtQueryInformationProcess.
 const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+/// ProcessBasicInformation class for NtQueryInformationProcess (parent pid).
+const PROCESS_BASIC_INFORMATION: u32 = 0;
+/// Ancestor depth bound for heavy attribution: the harness wrapper, driver
+/// and compiler sit within a few levels; anything deeper is not one command.
+const HEAVY_ANCESTOR_DEPTH: usize = 8;
+/// Cap on one argv read: only the program plus its first tokens ever matter
+/// downstream, and the full line never persists.
+const MAX_HEAVY_ARGV_TOKENS: usize = 64;
 
 #[link(name = "ntdll")]
 unsafe extern "system" {
@@ -927,6 +935,19 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+/// `PROCESS_BASIC_INFORMATION` prefix for the parent pid read (Microsoft
+/// Learn: NtQueryInformationProcess). Only the inherited pid is used.
+#[repr(C)]
+#[allow(non_snake_case)]
+struct ProcessBasicInformation {
+    ExitStatus: i32,
+    PebBaseAddress: *mut c_void,
+    AffinityMask: usize,
+    BasePriority: i32,
+    UniqueProcessId: usize,
+    InheritedFromUniqueProcessId: usize,
+}
+
 /// Bounded program identity for one process: the image basename plus at most
 /// one subcommand token, classified at read time so full argv never persists.
 ///
@@ -935,7 +956,62 @@ unsafe extern "system" {
 /// with ProcessCommandLineInformation for the command line (documented entry
 /// point). Access-denied, exited-race and unparseable results fail closed to
 /// the image-only category or to None.
-pub(crate) fn process_command_class(pid: u32) -> Option<CommandClass> {
+/// Parent pid for heavy attribution (Microsoft Learn:
+/// NtQueryInformationProcess with ProcessBasicInformation). Exited races and
+/// denied queries fail closed to None; pid 0 is never a parent.
+fn process_parent_pid(process: HANDLE) -> Option<u32> {
+    let mut info = ProcessBasicInformation {
+        ExitStatus: 0,
+        PebBaseAddress: null_mut(),
+        AffinityMask: 0,
+        BasePriority: 0,
+        UniqueProcessId: 0,
+        InheritedFromUniqueProcessId: 0,
+    };
+    let mut returned: u32 = 0;
+    // SAFETY: info is caller-owned and sized; the kernel fills the struct.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process,
+            PROCESS_BASIC_INFORMATION,
+            &mut info as *mut ProcessBasicInformation as *mut c_void,
+            std::mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut returned,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    let parent = u32::try_from(info.InheritedFromUniqueProcessId).ok()?;
+    if parent == 0 {
+        return None;
+    }
+    Some(parent)
+}
+
+/// Bounded argv plus parent pid for one process in a single query handle.
+/// Empty, overlong or unreadable results fail closed to None; the full line
+/// never persists.
+fn query_argv_and_parent(process: HANDLE) -> Option<(Vec<String>, Option<u32>)> {
+    let cmdline = process_command_line(process)?;
+    let mut argv = eliot_core::split_windows_command_line(&cmdline);
+    if argv.is_empty() || argv.len() > MAX_HEAVY_ARGV_TOKENS {
+        return None;
+    }
+    if argv.iter().any(|token| token.len() > 32_768) {
+        return None;
+    }
+    argv.truncate(MAX_HEAVY_ARGV_TOKENS);
+    Some((argv, process_parent_pid(process)))
+}
+
+/// Heavy category for one owned child process: its own argv plus ancestors'
+/// argv (nearest first) resolve through harness plumbing (console hosts,
+/// the shell wrapper) to the program that actually consumed the resources,
+/// via `eliot_core::resolve_heavy_category`. Anything unobservable fails
+/// closed to the image-only category; console-host plumbing with no
+/// meaningful relative yields None so no episode opens on it.
+pub(crate) fn resolve_heavy_category(pid: u32) -> Option<CommandClass> {
     if pid == 0 {
         return None;
     }
@@ -950,27 +1026,62 @@ pub(crate) fn process_command_class(pid: u32) -> Option<CommandClass> {
     if image_category == "unknown" {
         return None;
     }
-    match process_command_line(process.0) {
-        Some(cmdline) => {
-            let args = eliot_core::split_windows_command_line(&cmdline);
-            match args.split_first() {
-                Some((program, rest)) => {
-                    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
-                    Some(CommandClass {
-                        category: eliot_core::classify_heavy_command(program, &rest),
-                        source: eliot_core::CATEGORY_SOURCE_CMDLINE,
-                    })
-                }
-                None => Some(CommandClass {
-                    category: image_category,
-                    source: eliot_core::CATEGORY_SOURCE_IMAGE,
-                }),
-            }
-        }
-        None => Some(CommandClass {
+    let Some(cmdline) = process_command_line(process.0) else {
+        return Some(CommandClass {
             category: image_category,
             source: eliot_core::CATEGORY_SOURCE_IMAGE,
+        });
+    };
+    let mut own = eliot_core::split_windows_command_line(&cmdline);
+    if own.is_empty() || own.len() > MAX_HEAVY_ARGV_TOKENS {
+        return Some(CommandClass {
+            category: image_category,
+            source: eliot_core::CATEGORY_SOURCE_IMAGE,
+        });
+    }
+    own.truncate(MAX_HEAVY_ARGV_TOKENS);
+    let mut ancestors: Vec<Vec<String>> = Vec::new();
+    let mut seen: Vec<u32> = vec![pid];
+    let mut cursor = process_parent_pid(process.0);
+    while let Some(ppid) = cursor {
+        if ancestors.len() >= HEAVY_ANCESTOR_DEPTH || seen.contains(&ppid) || ppid == 0 {
+            break;
+        }
+        seen.push(ppid);
+        // SAFETY: read-only query rights; the wrapper closes the handle.
+        let parent = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, ppid) };
+        if parent.is_null() {
+            break;
+        }
+        let parent = QueryHandle(parent);
+        match query_argv_and_parent(parent.0) {
+            Some((argv, grandparent)) => {
+                ancestors.push(argv);
+                cursor = grandparent;
+            }
+            None => break,
+        }
+    }
+    match eliot_core::resolve_heavy_category(&own, &ancestors) {
+        Some(category) => Some(CommandClass {
+            category,
+            source: eliot_core::CATEGORY_SOURCE_CMDLINE,
         }),
+        None => {
+            let stem = image
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&image)
+                .trim()
+                .to_ascii_lowercase();
+            if eliot_core::CONSOLE_HOST_PROGRAMS.contains(&stem.as_str()) {
+                return None;
+            }
+            Some(CommandClass {
+                category: image_category,
+                source: eliot_core::CATEGORY_SOURCE_IMAGE,
+            })
+        }
     }
 }
 
@@ -1997,5 +2108,182 @@ mod tests {
             "{}",
             error.message
         );
+    }
+}
+
+#[cfg(test)]
+mod heavy_attribution_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    /// Transitive descendants of one root pid from a single Toolhelp
+    /// snapshot. Test-only enumeration: production attribution walks up
+    /// from one child, never scans the host.
+    fn descendant_pids(root: u32) -> Vec<u32> {
+        // SAFETY: snapshot handle closed by the wrapper; entry sized before use.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+        let snapshot = QueryHandle(snapshot);
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        // SAFETY: entry is caller-owned and sized; the kernel fills it.
+        if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
+            return Vec::new();
+        }
+        let mut by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+        loop {
+            by_parent
+                .entry(entry.th32ParentProcessID)
+                .or_default()
+                .push(entry.th32ProcessID);
+            // SAFETY: entry stays caller-owned across the enumeration.
+            if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+                break;
+            }
+        }
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        let mut seen: HashSet<u32> = HashSet::from([root]);
+        while let Some(pid) = stack.pop() {
+            if let Some(children) = by_parent.get(&pid) {
+                for child in children {
+                    if seen.insert(*child) {
+                        out.push(*child);
+                        stack.push(*child);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A real `cargo build` launched through the harness wrapper
+    /// (`powershell -NoProfile -Command cargo build`) must resolve every
+    /// related process to one `cargo build` episode: the wrapper unwraps,
+    /// the compiler attributes to its driver, console plumbing never
+    /// surfaces, and overlapping same-command episodes merge into one.
+    #[test]
+    fn powershell_cargo_build_resolves_to_one_cargo_build_episode() {
+        let scratch_base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("eliot-heavy-{}", ulid::Ulid::new()));
+        let src = scratch_base.join("src");
+        std::fs::create_dir_all(&src).expect("scratch src");
+        std::fs::write(
+            scratch_base.join("Cargo.toml"),
+            "[package]\nname = \"scratch\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .expect("scratch manifest");
+        std::fs::write(
+            src.join("main.rs"),
+            "fn main() { println!(\"scratch\"); }\n",
+        )
+        .expect("scratch main");
+        let target_dir = scratch_base.join("target");
+        let manifest = scratch_base.join("Cargo.toml");
+        let system_root = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+        let shell = system_root
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        assert!(shell.is_file(), "fixture shell must exist");
+        let mut child = std::process::Command::new(&shell)
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(format!(
+                "cargo build --manifest-path \"{}\" --target-dir \"{}\"",
+                manifest.display(),
+                target_dir.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn wrapper");
+        let wrapper = child.id();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut categories: HashMap<u32, (String, &'static str)> = HashMap::new();
+        loop {
+            match child.try_wait().expect("poll wrapper") {
+                Some(_) => break,
+                None if Instant::now() >= deadline => break,
+                None => {}
+            }
+            let mut related = vec![wrapper];
+            related.extend(descendant_pids(wrapper));
+            for pid in related {
+                if let Some(class) = super::resolve_heavy_category(pid) {
+                    categories.insert(pid, (class.category, class.source));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if child.try_wait().expect("poll wrapper").is_none() {
+            let _ = child.kill();
+        }
+        let status = child.wait().expect("reap wrapper");
+        assert!(
+            status.success(),
+            "fixture cargo build must succeed: {categories:?}"
+        );
+        // Image-only resolutions are dying-process artifacts (the command
+        // line is already gone): the monitor classifies once at first
+        // sight, so only cmdline resolutions feed the episode assertion.
+        let cmdline: Vec<&String> = categories
+            .values()
+            .filter_map(|(category, source)| {
+                (*source == eliot_core::CATEGORY_SOURCE_CMDLINE).then_some(category)
+            })
+            .collect();
+        assert!(
+            !cmdline.is_empty(),
+            "no live cmdline resolution among {categories:?}"
+        );
+        assert!(
+            cmdline
+                .iter()
+                .any(|category| category.as_str() == "cargo build"),
+            "no cargo build episode among {categories:?}"
+        );
+        for category in &cmdline {
+            let program = category.split_whitespace().next().unwrap_or("");
+            assert!(
+                !matches!(program, "conhost" | "powershell" | "pwsh" | "cmd"),
+                "plumbing surfaced: {category}"
+            );
+        }
+        let episodes: Vec<eliot_core::HeavyEpisode> = cmdline
+            .into_iter()
+            .enumerate()
+            .map(|(index, category)| eliot_core::HeavyEpisode {
+                category: category.clone(),
+                category_source: "cmdline".to_owned(),
+                started_at: 1_000,
+                ended_at: 31_000 + index as i64,
+                end_source: "observed_exit".to_owned(),
+                duration_ms: 30_000 + index as i64,
+                cpu_ms: 1_000,
+                peak_rss_bytes: 10,
+                exit_code: Some(0),
+            })
+            .collect();
+        let merged = eliot_core::merge_heavy_episodes(episodes);
+        assert_eq!(
+            merged.len(),
+            1,
+            "one command yields one episode: {categories:?}"
+        );
+        assert_eq!(merged[0].category, "cargo build");
+        let _ = std::fs::remove_dir_all(&scratch_base);
     }
 }

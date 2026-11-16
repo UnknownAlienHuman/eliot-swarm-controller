@@ -39,7 +39,7 @@ table and reports drift without blocking launch:
 | --- | --- | --- |
 | codex | 0.167.1 | app-server schema v2 |
 | claude | 2.1.325 | stream-json records |
-| muse | 1.4.0 R4161.1 | MSP v1 host |
+| muse | 1.4.0-R4161.1 | MSP v1 host |
 | opencode | 2.2.7 | native schema |
 | antigravity | 1.5.9 | ACP v1 `7ec5185c.json`, AGY 1.5.2 |
 

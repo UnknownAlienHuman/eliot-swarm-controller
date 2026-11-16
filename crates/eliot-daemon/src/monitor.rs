@@ -1722,8 +1722,27 @@ impl Monitoring {
                 true
             });
         }
-        let mut heavy = Vec::new();
-        for (key, open) in closing {
+        // Hold back closing episodes whose category still has an open episode:
+        // that command is still running, and this tail belongs to its single
+        // episode. Held episodes rejoin the open map with their state intact.
+        let mut ready: Vec<(String, OpenHeavyEpisode)> = Vec::new();
+        {
+            let mut tracker = target.observe.lock_recover();
+            let open_categories: HashSet<String> = tracker
+                .episodes
+                .values()
+                .map(|open| open.category.clone())
+                .collect();
+            for (key, open) in closing {
+                if open_categories.contains(open.category.as_str()) {
+                    tracker.episodes.insert(key, open);
+                } else {
+                    ready.push((key, open));
+                }
+            }
+        }
+        let mut episodes = Vec::with_capacity(ready.len());
+        for (key, open) in ready {
             let end_source = if open.exited {
                 "observed_exit"
             } else {
@@ -1746,10 +1765,16 @@ impl Monitoring {
                 peak_rss_bytes: open.peak_rss_bytes,
                 exit_code: open.exit_code,
             };
-            if episode.crosses(&thresholds.heavy)
-                && target.observe.lock_recover().emitted_heavy.insert(key)
-                && episode.validate().is_ok()
-            {
+            if episode.validate().is_ok() {
+                target.observe.lock_recover().emitted_heavy.insert(key);
+                episodes.push(episode);
+            }
+        }
+        // Overlapping episodes from one command (wrapper, driver, compiler,
+        // console host) merge into one episode per command.
+        let mut heavy = Vec::new();
+        for episode in eliot_core::merge_heavy_episodes(episodes) {
+            if episode.crosses(&thresholds.heavy) {
                 heavy.push(episode);
             }
         }
@@ -1773,10 +1798,14 @@ impl Monitoring {
             };
             target.observe.lock_recover().harness = Some(harness.clone());
             let mut tracker = target.observe.lock_recover();
+            // The retained session snapshot carries the native session file
+            // size where the harness exposes a documented size source
+            // (transcript/rollout scan); absent sizes never warn.
+            let session_bytes = usage.as_ref().and_then(|usage| usage.session_file_bytes);
             match eliot_core::evaluate_session_growth(
                 &harness,
                 usage.as_ref(),
-                None,
+                session_bytes,
                 &thresholds.growth,
             ) {
                 Some(warn) => {
@@ -2033,19 +2062,21 @@ fn apply_sample(open: &mut OpenHeavyEpisode, sample: &ProcessSample, now: i64) {
     }
 }
 
-/// Read-only program identity for one owned child process: image basename
-/// plus at most one subcommand token, classified at read time. The Windows
-/// probe uses `QueryFullProcessImageNameW` plus a best-effort
-/// `NtQueryInformationProcess` command-line read; Linux reads
-/// `/proc/<pid>/cmdline`. Anything unobservable fails closed to `None`.
+/// Read-only program identity for one owned child process: its own argv plus
+/// ancestors' argv resolve through harness plumbing (console hosts, the
+/// shell wrapper) to the program that actually consumed the resources. The
+/// Windows probe uses `QueryFullProcessImageNameW` plus best-effort
+/// `NtQueryInformationProcess` command-line and parent reads; Linux reads
+/// `/proc/<pid>/cmdline` and `/proc/<pid>/stat`. Plumbing alone fails closed
+/// to `None` so no episode opens on it.
 #[cfg(windows)]
 fn command_class_for(pid: u32) -> Option<crate::platform::CommandClass> {
-    crate::platform::windows::process_command_class(pid)
+    crate::platform::windows::resolve_heavy_category(pid)
 }
 
 #[cfg(target_os = "linux")]
 fn command_class_for(pid: u32) -> Option<crate::platform::CommandClass> {
-    crate::platform::unix::process_command_class(pid)
+    crate::platform::unix::resolve_heavy_category(pid)
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
