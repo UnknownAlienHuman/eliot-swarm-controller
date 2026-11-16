@@ -323,11 +323,12 @@ pub(crate) fn adhoc_snapshot(
             ));
         }
     }
-    // Safe defaults shared by every ad-hoc snapshot: inherit-only MCP,
-    // no allow list, no child allow-list (children reuse the parent
-    // snapshot only), empty pass_env, default scratch, and a profile-only
-    // capacity scope. No setup, route, account, proxy, or elevated
-    // permissions are ever frozen here.
+    // Safe defaults shared by every ad-hoc snapshot: an explicit `inherit`
+    // MCP opt-in (ad-hoc spans harnesses without a minimal mapping, so the
+    // new minimal default cannot apply here), no allow list, no child
+    // allow-list (children reuse the parent snapshot only), empty pass_env,
+    // default scratch, and a profile-only capacity scope. No setup, route,
+    // account, proxy, or elevated permissions are ever frozen here.
     snapshot.insert("mcp".to_owned(), Value::String("inherit".to_owned()));
     snapshot.insert("mcp_allow".to_owned(), Value::Array(Vec::new()));
     snapshot.insert("child_profiles".to_owned(), Value::Array(Vec::new()));

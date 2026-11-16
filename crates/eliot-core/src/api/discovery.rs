@@ -72,6 +72,10 @@ pub struct MethodHelpRequest {
     /// Canonical API method, for example mail.send (CLI aliases are not methods).
     #[schemars(length(min = 1, max = 128), pattern(r"\S"), extend("x-maxBytes" = 128, "x-nonBlank" = true))]
     pub method: String,
+    /// When true, include the full request/response JSON Schemas. Default
+    /// compact help carries the request field list, one example and limits.
+    #[serde(default)]
+    pub full: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -142,6 +146,11 @@ pub struct MethodHelpResponse {
     pub method: String,
     pub summary: String,
     pub cli_aliases: Vec<String>,
+    /// Sorted compact request field descriptors (`name (required|optional):
+    /// type [bounds] - documented constraints`), derived from the request
+    /// DTO schema. Compact help carries these instead of the full JSON
+    /// Schemas.
+    pub fields: Vec<String>,
     pub request_schema: Value,
     pub response_schema: Value,
     pub example: Value,

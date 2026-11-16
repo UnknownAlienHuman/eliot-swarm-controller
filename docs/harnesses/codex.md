@@ -115,11 +115,29 @@ Agent generation.
 ### Worker MCP policy
 
 The generated Agent MCP override adds one `mcp_servers.<name>` entry; it does
-not suppress other native servers. Profiles therefore select an explicit
-policy (`mcp = "inherit"` or `"minimal"`, default `inherit`) with an optional
-`mcp_allow` server list, frozen in the profile snapshot. `inherit` keeps the
-additive behavior above. `minimal` starts only Eliot's Agent-scoped server
-plus the explicitly allowed servers:
+not suppress other native servers. Profiles therefore select a policy
+(`mcp = "minimal"` by default, or `"inherit"` as an explicit opt-in) with an
+optional `mcp_allow` server list, frozen in the profile snapshot. `inherit`
+keeps the additive behavior above, except owner Swarm entries: every
+enumerated entry that carries the owner Swarm identity by transport always
+takes a transport-carrying disable in both policies, because a worker that
+talks to the owner's daemon with the owner's identity is an authority leak
+(the owner file-config entry runs plain `swarm mcp` with no
+`--require-agent`). Identity is the transport shape, not the entry name
+(`eliot_core::is_owner_swarm_server`: a swarm executable -- file name
+`swarm`/`swarm.exe` or the controller binary path -- selecting `mcp`
+without `--require-agent`, or a URL on the configured `cloud_mcp`
+hostname): a renamed owner entry is still suppressed, and the exact owner
+names (`eliot_swarm`, `eliot-swarm`) stay covered by synthetic
+transport-carrying stubs as backstop. Swarm names can never be
+allow-listed in any policy, and an allow-listed name that matches the
+identity is rejected before worker spawn (`profile_error`) instead of
+re-admitted: minimal fresh launches reject an allow-listed match when the
+surface is frozen pre-dispatch, and every other path rejects at launch.
+Entries whose argument vector the native layer does not report count as
+unknown and fail closed toward suppression; an absent vector means the
+entry carries no argv. `minimal` starts only Eliot's
+Agent-scoped server plus the explicitly allowed servers:
 
 - For launch, the pre-dispatch `profile.store` reader projects the worker-visible
   `mcp_servers` entries (key plus `command`/`url` transport, except allow-listed
@@ -153,7 +171,10 @@ plus the explicitly allowed servers:
 - After `thread/start` (or `thread/resume`) and before any input, the
   installed `mcpServerStatus/list` inventory is read back scoped to the
   owned thread (`threadId`; names only, secret-checked) and reported as
-  `effective.mcp_servers` with `mcp_servers_verified`. Thread scope is
+  `effective.mcp_servers` with `mcp_servers_verified`. The requested `mcp_allow`
+can never name a Swarm server, so the readback enforcement doubles as the
+authority check: an enabled owner `eliot_swarm` entry would fail `minimal`
+closed. Thread scope is
   required: the installed 0.167.1 schema reports per-thread runtime state,
   and without a loaded thread every entry's status is unavailable, so a
   pre-thread read cannot prove the isolated surface. `minimal` fails closed
@@ -206,7 +227,17 @@ exists in the app-server protocol (v2 schema: `{data: [{name,
 runtimeStatus, ...}], nextCursor}`). The owner's global config is never
 edited and `auth.json` is never copied.
 
-### Minimal-context measurement (2026-11-14)
+### Minimal-context measurement (k61, 2026-11-16, debug build SHA256 EB3EDE59...)
+
+Private daemon, identical trivial turn (`Read question.txt ... reply with
+exactly 42`), model `gpt-6.1-sol`, effort low, approval never. `inherit`
+(explicit): 54,276 turn input tokens; `minimal` (default): 50,148 turn input
+tokens with `effective.mcp_servers` verified as exactly the session-owned
+`eliot_swarm_*` entry (owner `eliot_swarm` absent). A follow-up turn under
+`minimal` called `api.identity` through the `swarm` tool and reported
+principal `agent`. Single samples; prompt caching varied between runs.
+
+## Minimal-context measurement (2026-11-14)
 
 Same trivial prompt (`Reply with exactly 42 and nothing else.`), model
 `gpt-6.1-sol`, effort `low`, per-turn `input_tokens` from the
@@ -587,7 +618,7 @@ Do not make that complete campaign a prerequisite to the first useful file edit.
 
 `swarm launch --harness codex [--model M] [--effort E] --workspace W "prompt"`
 is Owner-only and freezes a profile-equivalent snapshot from safe defaults
-(`workspace-write`, `never`, MCP `inherit`, empty `pass_env`, default scratch,
+(`workspace-write`, `never`, explicit MCP `inherit`, empty `pass_env`, default scratch,
 no child allow-list) plus flags. An omitted `--model` selects the native
 `model/list` default entry (`isDefault`); an omitted `--effort` preserves the
 native default and reports the effective readback. An unavailable requested

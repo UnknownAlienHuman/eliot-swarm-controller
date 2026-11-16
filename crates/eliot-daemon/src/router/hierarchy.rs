@@ -1302,6 +1302,7 @@ mod tests {
                 "harness = \"muse\"\n",
                 "model = \"worker-model\"\n",
                 "cmd = \"C:/Tools/Muse/muse.exe\"\n",
+                "mcp = \"inherit\"\n",
                 "control = \"self\"\n",
                 "permissions = \"workspace-write\"\n",
                 "pass_env = [\"Q06_SHARED\"]\n",

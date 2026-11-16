@@ -1896,6 +1896,7 @@ impl Router {
                 cmd,
                 crate::adhoc::AdhocAuth::Resolve(auth.as_deref()),
             )?;
+            crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
             })?;
@@ -2660,6 +2661,7 @@ impl Router {
                 cmd,
                 crate::adhoc::AdhocAuth::Skip,
             )?;
+            crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
             })?;
