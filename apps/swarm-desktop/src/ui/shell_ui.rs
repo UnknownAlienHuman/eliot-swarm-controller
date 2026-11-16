@@ -49,8 +49,6 @@ pub(super) enum ShellMsg {
     SchemeObserved(ColorScheme),
     /// The window's client size (Reactor `on_window_size`).
     WindowResized(WindowSize),
-    /// The debounced window-size save of this epoch is due.
-    SaveWindow(u64),
     ThemeChosen(ThemeChoice),
     StartupChosen(Startup),
     /// The re-created editors of this re-prime exist: give them their text.
@@ -193,6 +191,7 @@ impl DesktopApp {
                         Ok(selected) => {
                             self.data_dir = Ok(selected.clone());
                             self.startup_error = false;
+                            self.note_window_size();
                             self.alert = None;
                             self.set_status(format!(
                                 "Starting in fresh private directory {}",
@@ -363,20 +362,9 @@ impl DesktopApp {
                     let window = (size.width as u32, size.height as u32);
                     if self.window_size != Some(window) {
                         self.window_size = Some(window);
-                        if self.preferences_loaded {
-                            self.window_epoch += 1;
-                            let epoch = self.window_epoch;
-                            let _task = context.spawn_background(move |cancel| {
-                                let _ = feed::backoff(500, &|| cancel.is_cancelled());
-                                Message::Shell(ShellMsg::SaveWindow(epoch))
-                            });
-                        }
+                        // No write here: the size persists once, at close.
+                        self.note_window_size();
                     }
-                }
-            }
-            ShellMsg::SaveWindow(epoch) => {
-                if epoch == self.window_epoch {
-                    self.save_preferences(context);
                 }
             }
             ShellMsg::HighContrastRead(on) => {
@@ -657,8 +645,11 @@ impl DesktopApp {
             .map(|width| width - theme::layout::SIDEBAR_WIDTH - panel)
     }
 
-    /// Write the theme and window size into `[desktop]`, one write at a
-    /// time (a newer state is written when the running write reports back).
+    /// Write an explicit theme or startup choice into `[desktop]` at once,
+    /// carrying the current window size; one write at a time (a newer state
+    /// is written when the running write reports back). A bare resize never
+    /// writes: the size persists once, at close (see
+    /// [`crate::settings::save_window_on_close`]).
     pub(super) fn save_preferences(&mut self, context: &ComponentContext<Self>) {
         if self.prefs_saving {
             return;
@@ -677,6 +668,14 @@ impl DesktopApp {
             .map_err(|error| error.to_string());
             Message::Shell(ShellMsg::PreferencesSaved(preferences, window, saved))
         });
+    }
+
+    /// Remember the last observed size (and its data directory) for the one
+    /// `[desktop]` write after the window closes.
+    pub(super) fn note_window_size(&mut self) {
+        if let (Ok(data_dir), Some(window)) = (self.data_dir.clone(), self.window_size) {
+            self.close_window.store(data_dir, window);
+        }
     }
 
     /// Start the daemon when needed (Owner only, the sibling `swarm.exe`),
