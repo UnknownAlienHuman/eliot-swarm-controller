@@ -308,6 +308,34 @@ pub async fn save_preferences(
     save(data_dir, &request).await
 }
 
+/// Attempts for the one window-size write at close.
+const CLOSE_SAVE_ATTEMPTS: usize = 4;
+
+/// Persist the last observed window size into `[desktop]` once, at close: a
+/// revision-guarded write only when it differs from the saved value, keeping
+/// the saved theme and startup. A concurrent save (for example an in-flight
+/// choice landing while the window closes) reports `conflict` instead of
+/// clobbering, so retry with a fresh read a few times. Returns whether a
+/// write landed.
+pub async fn save_window_on_close(data_dir: &Path, size: (u32, u32)) -> eliot_core::Result<bool> {
+    for _ in 0..CLOSE_SAVE_ATTEMPTS {
+        let read = read(data_dir).await?;
+        if window(&read) == Some(size) {
+            return Ok(false);
+        }
+        let preferences = Preferences::from_reply(&read);
+        match save_preferences(data_dir, preferences, Some(size)).await {
+            Ok(_) => return Ok(true),
+            Err(error) if error.code == "conflict" => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(eliot_core::Error::new(
+        "conflict",
+        "settings changed while the window size was saved",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -42,6 +42,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use eliot_core::Command;
 use eliot_core::api::{
@@ -185,6 +186,45 @@ enum Message {
     Settings(SettingsMsg),
 }
 
+/// The input to the single desktop window: the workspace plus the shared
+/// slot that remembers the last observed window size for the one `[desktop]`
+/// write after the window closes (windows-reactor 0.100.0 exposes no close
+/// hook: `ViewContext` offers only `on_color_scheme`, `on_window_size`,
+/// `window_title` and `window_visuals`).
+#[derive(Clone)]
+struct DesktopInput {
+    workspace: PathBuf,
+    close_window: CloseWindow,
+}
+
+impl PartialEq for DesktopInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.workspace == other.workspace
+    }
+}
+
+/// What the one write after the window closes carries: the data directory
+/// it belongs to and the last observed size.
+type ClosePayload = Option<(PathBuf, (u32, u32))>;
+
+/// The last observed window size and the data directory it belongs to, for
+/// the one write after the window closes. Shared with [`run`], which
+/// outlives the component.
+#[derive(Clone, Default)]
+struct CloseWindow(Arc<Mutex<ClosePayload>>);
+
+impl CloseWindow {
+    fn store(&self, data_dir: PathBuf, window: (u32, u32)) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some((data_dir, window));
+        }
+    }
+
+    fn load(&self) -> Option<(PathBuf, (u32, u32))> {
+        self.0.lock().ok().and_then(|slot| slot.clone())
+    }
+}
+
 struct DesktopApp {
     /// The checkout the window was opened for (`--workspace` or the working
     /// directory); it is registered through `project.discover` at start.
@@ -206,13 +246,14 @@ struct DesktopApp {
     startup_done: bool,
     /// The window's client width in DIPs, once observed.
     window_width: Option<f64>,
-    /// The client size to save in `[desktop]`, once at least 640 x 480.
+    /// The client size for the one `[desktop]` write at close, once at
+    /// least 640 x 480.
     window_size: Option<(u32, u32)>,
     /// The saved window size, applied to the window's first size.
     preferred_window: Option<(u32, u32)>,
-    /// Tags one debounced window-size save; an older one is dropped.
-    window_epoch: u64,
-    /// `[desktop]` was read: size changes may be written back.
+    /// The last observed size for the one `[desktop]` write at close.
+    close_window: CloseWindow,
+    /// `[desktop]` was read.
     preferences_loaded: bool,
     /// False for the one render after the screen tree is re-created: the
     /// multi-line editors are then created empty (see `reprime_fields`).
@@ -439,13 +480,13 @@ fn submit_note(reply: &CommandSubmitResponse) -> String {
 }
 
 impl Component for DesktopApp {
-    type Input = PathBuf;
+    type Input = DesktopInput;
     type Message = Message;
 
-    fn create(input: &PathBuf, context: &ComponentContext<Self>) -> Self {
+    fn create(input: &DesktopInput, context: &ComponentContext<Self>) -> Self {
         let data_dir = client::data_dir().map_err(|error| error.to_string());
         let mut app = Self {
-            opened_workspace: input.clone(),
+            opened_workspace: input.workspace.clone(),
             data_dir,
             status: "Connecting to the daemon…".to_owned(),
             alert: None,
@@ -456,8 +497,8 @@ impl Component for DesktopApp {
             startup_done: false,
             window_width: None,
             window_size: None,
+            close_window: input.close_window.clone(),
             preferred_window: None,
-            window_epoch: 0,
             preferences_loaded: false,
             fields_primed: true,
             prime_epoch: 0,
@@ -490,7 +531,7 @@ impl Component for DesktopApp {
                 titles_inflight: false,
             },
             launch: launch_ui::LaunchState {
-                workspace: input.to_string_lossy().into_owned(),
+                workspace: input.workspace.to_string_lossy().into_owned(),
                 ..Default::default()
             },
             chat: chat_ui::ChatState {
@@ -555,14 +596,28 @@ impl Component for DesktopApp {
         }
     }
 
-    fn view(&self, _input: &PathBuf, context: &mut ViewContext<Self>) -> View {
+    fn view(&self, _input: &DesktopInput, context: &mut ViewContext<Self>) -> View {
         self.renders.set(self.renders.get() + 1);
         self.shell_view(context)
     }
 }
 
 /// Run the single desktop window. Blocks while the WinUI message loop runs;
-/// closing the window disconnects the UI, never the Agent.
+/// closing the window disconnects the UI, never the Agent. Afterwards the
+/// last observed window size persists once into `[desktop]`, only when it
+/// differs from the saved value.
 pub fn run(workspace: PathBuf) -> Result<(), String> {
-    App::run_component::<DesktopApp>(workspace).map_err(|error| error.to_string())
+    let close_window = CloseWindow::default();
+    let result = App::run_component::<DesktopApp>(DesktopInput {
+        workspace,
+        close_window: close_window.clone(),
+    })
+    .map_err(|error| error.to_string());
+    if let Some((data_dir, window)) = close_window.load()
+        && let Err(error) =
+            client::block_on(crate::settings::save_window_on_close(&data_dir, window))
+    {
+        eprintln!("swarm-desktop: window size not saved: {error}");
+    }
+    result
 }
