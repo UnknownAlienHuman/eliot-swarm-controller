@@ -124,6 +124,7 @@ struct RouterInner {
     unknown_causes: Mutex<HashMap<String, String>>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
     catalog_cache: Mutex<catalog::CatalogCache>,
+    profile_cache: Mutex<crate::config::ProfileCache>,
     catalog_aggregate_lock: AsyncMutex<()>,
     var_writes: Mutex<coordination::VarWriteQueue>,
     var_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
@@ -257,6 +258,7 @@ impl Router {
                 unknown_causes: Mutex::new(HashMap::new()),
                 rule_definitions: Mutex::new(HashMap::new()),
                 catalog_cache: Mutex::new(catalog::CatalogCache::default()),
+                profile_cache: Mutex::new(crate::config::ProfileCache::default()),
                 catalog_aggregate_lock: AsyncMutex::new(()),
                 var_writes: Mutex::new(coordination::VarWriteQueue::default()),
                 var_worker: AsyncMutex::new(None),
@@ -1708,7 +1710,11 @@ impl Router {
         } else if request.verb == "attach" {
             normalize_attach(&request)?;
             if !self.hydrate_retained_attach(&mut request).await?
-                && let Err(error) = freeze_attach_profile(&self.inner.data_root, &mut request)
+                && let Err(error) = freeze_attach_profile(
+                    &self.inner.profile_cache,
+                    &self.inner.data_root,
+                    &mut request,
+                )
                 && !self.hydrate_retained_attach(&mut request).await?
             {
                 return Err(error);
@@ -2076,7 +2082,7 @@ impl Router {
                         ),
                     ));
                 }
-                let mut snapshot = crate::config::resolve_profile(&self.inner.data_root, name)?;
+                let mut snapshot = self.resolve_profile_cached(name)?;
                 crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                     std::env::var_os(name)
                 })?;
@@ -2107,8 +2113,7 @@ impl Router {
                     Some(_) => required_text(&request.args, "profile")?.to_owned(),
                     None => required_text(&request.args, "profile")?.to_owned(),
                 };
-                let mut snapshot =
-                    crate::config::resolve_profile(&self.inner.data_root, &profile_name)?;
+                let mut snapshot = self.resolve_profile_cached(&profile_name)?;
                 crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                     std::env::var_os(name)
                 })?;
@@ -2628,7 +2633,7 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
-        let mut profile = crate::config::resolve_profile(&self.inner.data_root, &request.profile)?;
+        let mut profile = self.resolve_profile_cached(&request.profile)?;
         crate::config::capture_native_store_inputs(&mut profile, |name| std::env::var_os(name))?;
         if request
             .harness
@@ -2867,7 +2872,7 @@ impl Router {
         live_antigravity: bool,
     ) -> Result<(Option<Value>, String)> {
         if let Some(name) = profile {
-            let mut snapshot = crate::config::resolve_profile(&self.inner.data_root, name)?;
+            let mut snapshot = self.resolve_profile_cached(name)?;
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
             })?;
@@ -5666,10 +5671,24 @@ fn normalize_attach(request: &SubmitCommand) -> Result<()> {
     Ok(())
 }
 
-fn freeze_attach_profile(data_root: &std::path::Path, request: &mut SubmitCommand) -> Result<()> {
+impl Router {
+    fn resolve_profile_cached(&self, name: &str) -> Result<Value> {
+        crate::config::resolve_profile_cached(
+            &self.inner.profile_cache,
+            &self.inner.data_root,
+            name,
+        )
+    }
+}
+
+fn freeze_attach_profile(
+    cache: &Mutex<crate::config::ProfileCache>,
+    data_root: &std::path::Path,
+    request: &mut SubmitCommand,
+) -> Result<()> {
     let profile_name = required_text(&request.args, "profile")?;
     let harness = required_text(&request.args, "harness")?.to_owned();
-    let mut snapshot = crate::config::resolve_profile(data_root, profile_name)?;
+    let mut snapshot = crate::config::resolve_profile_cached(cache, data_root, profile_name)?;
     if snapshot.get("harness").and_then(Value::as_str) != Some(harness.as_str()) {
         return Err(Error::new(
             "invalid",

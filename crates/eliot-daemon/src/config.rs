@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 pub(crate) mod profiles_edit;
 pub(crate) mod settings;
 
@@ -1262,15 +1263,96 @@ fn has_git_remote_helper_delimiter(endpoint: &str) -> bool {
         .is_some_and(|delimiter| endpoint.find("://").is_none_or(|scheme| delimiter < scheme))
 }
 
+/// Test-only uncached entry point: a fresh cache per call behaves like a cold
+/// router on its first launch, so existing tests keep asserting launch
+/// behavior without touching router state.
+#[cfg(test)]
 pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Value> {
+    let cache = Mutex::new(ProfileCache::default());
+    resolve_profile_cached(&cache, data_root, name)
+}
+/// Validated profile snapshot cache keyed by file content revision.
+///
+/// The router holds one of these (never a global). Launch admission still
+/// resolves per launch, but file reads plus full validation run once per
+/// content revision: any byte change re-validates, errors stay typed.
+#[derive(Default)]
+pub(crate) struct ProfileCache {
+    cached: Option<CachedProfileConfig>,
+}
+struct CachedProfileConfig {
+    revision: Option<String>,
+    source: String,
+    config: Option<FileConfig>,
+    snapshots: HashMap<String, Value>,
+}
+/// Router launch-admission entry point: reuse the validated snapshot when the
+/// file revision matches, otherwise re-read, re-validate and re-cache.
+/// A missing file caches the miss until it appears; parse failures are never
+/// cached, so the next launch re-validates the same bytes identically.
+pub(crate) fn resolve_profile_cached(
+    cache: &Mutex<ProfileCache>,
+    data_root: &Path,
+    name: &str,
+) -> core::Result<Value> {
     validate_profile_name(name)?;
-    let Some((config, source)) = read_config(data_root)? else {
+    let current_source = read_config_source(data_root)?;
+    let current_revision = current_source.as_deref().map(profiles_edit::revision_of);
+    {
+        let guard = cache
+            .lock()
+            .map_err(|_| core::Error::new("internal", "profile cache poisoned"))?;
+        if let Some(cached) = guard.cached.as_ref()
+            && cached.revision == current_revision
+        {
+            if let Some(hit) = cached.snapshots.get(name) {
+                return Ok(hit.clone());
+            }
+            if let (Some(config), source) = (cached.config.as_ref(), cached.source.as_str()) {
+                return resolve_profile_in(config, source, name);
+            }
+            return Err(core::Error::new(
+                "profile_error",
+                format!("config.toml: profiles.{name}: profile not found"),
+            ));
+        }
+    }
+    let Some(source) = current_source else {
+        let mut guard = cache
+            .lock()
+            .map_err(|_| core::Error::new("internal", "profile cache poisoned"))?;
+        guard.cached = Some(CachedProfileConfig {
+            revision: None,
+            source: String::new(),
+            config: None,
+            snapshots: HashMap::new(),
+        });
         return Err(core::Error::new(
             "profile_error",
             format!("config.toml: profiles.{name}: profile not found"),
         ));
     };
-    resolve_profile_in(&config, &source, name)
+    let config = parse_config(&source)?;
+    let snapshot = resolve_profile_in(&config, &source, name)?;
+    let mut guard = cache
+        .lock()
+        .map_err(|_| core::Error::new("internal", "profile cache poisoned"))?;
+    match guard.cached.as_mut() {
+        Some(cached) if cached.revision == current_revision => {
+            cached.snapshots.insert(name.to_owned(), snapshot.clone());
+        }
+        _ => {
+            let mut snapshots = HashMap::new();
+            snapshots.insert(name.to_owned(), snapshot.clone());
+            guard.cached = Some(CachedProfileConfig {
+                revision: current_revision,
+                source,
+                config: Some(config),
+                snapshots,
+            });
+        }
+    }
+    Ok(snapshot)
 }
 
 /// Launch-time profile resolution over already parsed source text. The same
@@ -3785,6 +3867,23 @@ mod tests {
             let error = load_daemon_config(&fixture.root).unwrap_err();
             assert_eq!(error.code, "profile_error", "source: {source}");
         }
+    }
+
+    #[test]
+    fn profile_cache_reuses_revision_and_revalidates_on_edit() {
+        let fixture = AutomationConfigFixture::new();
+        fixture.write("[profiles.solo]\nharness = \"codex\"\nmodel = \"m1\"\n");
+        let cache = Mutex::new(ProfileCache::default());
+        let first = resolve_profile_cached(&cache, &fixture.root, "solo").unwrap();
+        assert_eq!(first.get("model").and_then(Value::as_str), Some("m1"));
+        let second = resolve_profile_cached(&cache, &fixture.root, "solo").unwrap();
+        assert_eq!(first, second);
+        fixture.write("[profiles.solo]\nharness = \"codex\"\nmodel = \"m2\"\n");
+        let third = resolve_profile_cached(&cache, &fixture.root, "solo").unwrap();
+        assert_eq!(third.get("model").and_then(Value::as_str), Some("m2"));
+        fixture.write("[profiles.solo]\nharness = \"nope\"\nmodel = \"m2\"\n");
+        let error = resolve_profile_cached(&cache, &fixture.root, "solo").unwrap_err();
+        assert_eq!(error.code, "unsupported");
     }
 
     #[test]
