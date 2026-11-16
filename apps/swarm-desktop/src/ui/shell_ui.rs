@@ -1,11 +1,14 @@
-//! The one shell: the sidebar (New task, projects with their Agents nested,
-//! Recents, the fleet status and Settings), the main area (one
-//! conversation or the Settings page) and the optional right panel (the
-//! monitor or the open Agent's details).
+//! The one shell: the sidebar (Search tasks, New task, collapsible
+//! projects with their Agents nested, Recents, the fleet status and
+//! Settings), the main area (one conversation or the Settings page) and the
+//! optional right panel (the monitor or the open Agent's details).
+
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 
 use super::*;
-use crate::nav::{Branch, Row, Section};
+use crate::nav::{Branch, Checkout, Fleet, Row, Section, Shown};
 use crate::settings::{Startup, ThemeChoice};
+use crate::shortcuts::Shortcut;
 use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
 
@@ -38,8 +41,28 @@ pub(super) enum ShellMsg {
     AgentsLoaded(u64, bool, Fallible<AgentPage>),
     /// A sidebar row: open this Agent's conversation.
     AgentOpened(UiAgent),
-    /// A project row: a new task in this checkout.
+    /// A project's new-task button: a new task in this checkout.
     ProjectPicked(String),
+    /// A project row: collapse or expand the project (its section key).
+    ProjectToggled(String),
+    /// A project's "Show N older" row: unfold or fold its older tasks.
+    OlderToggled(String),
+    /// The attention row: list only the Agents that need attention, or all.
+    AttentionToggled,
+    /// The search box's text (typed, or a suggestion WinUI wrote into it).
+    SearchChanged(String),
+    /// A search suggestion chosen (clicked, or reached with the arrows).
+    SearchChosen(String),
+    /// Ctrl+N or Ctrl+K.
+    Shortcut(Shortcut),
+    /// Try focusing the search box again (tries left): WinUI refused it,
+    /// as it does right after the window is activated, or the box did not
+    /// exist yet (Settings were open).
+    FocusSearch(u8),
+    /// Wait, then send [`ShellMsg::FocusSearch`] with these tries.
+    FocusSearchLater(u8),
+    /// The shortcut watcher stopped (window closing): nothing to do.
+    ShortcutsEnded,
     RefreshRequested,
     NewTask,
     MoreAgentsRequested,
@@ -67,8 +90,6 @@ pub(super) enum ShellMsg {
         Option<(u32, u32)>,
         Fallible<eliot_core::api::SettingsSaveResponse>,
     ),
-    /// Titles read from first messages (`None`: no retained input).
-    TitlesLoaded(Vec<(String, Option<String>)>),
     AlertDismissed,
     /// Re-read the listed Agents (states, Recents order).
     ListTick,
@@ -84,8 +105,11 @@ const PRIME_RETRY_MS: u64 = 16;
 const SIDEBAR_PADDING: f64 = tokens::spacing::SM;
 /// Rows in Recents.
 const RECENTS: usize = 8;
-/// Titles read per background batch.
-const TITLE_BATCH: usize = 24;
+/// Focus attempts for Ctrl+K, and the wait between them.
+const SEARCH_FOCUS_TRIES: u8 = 3;
+const SEARCH_FOCUS_RETRY_MS: u64 = 100;
+/// How long the shortcut watcher waits before checking for cancellation.
+const SHORTCUT_POLL_MS: u64 = 500;
 /// The sidebar's states and Recents follow the daemon at this cadence.
 const LIST_REFRESH_MS: u64 = 10_000;
 
@@ -133,9 +157,32 @@ pub(super) struct ShellState {
     /// Tags agent-list loads; a reply for an older request is dropped.
     pub(super) list_epoch: u64,
     pub(super) pending_select: Option<UiAgent>,
-    /// Titles from first messages; `None` once read without one.
-    pub(super) titles: HashMap<String, Option<String>>,
-    pub(super) titles_inflight: bool,
+    /// Section keys of collapsed projects, in memory for now: k76a adds
+    /// `[desktop] collapsed_projects`, written from
+    /// [`DesktopApp::collapsed_projects_changed`].
+    pub(super) collapsed: HashSet<String>,
+    /// Section keys whose older stopped tasks are unfolded.
+    pub(super) unfolded: HashSet<String>,
+    /// The list shows only the Agents that need attention.
+    pub(super) attention_only: bool,
+    pub(super) search: Search,
+    pub(super) search_ref: ElementRef<AutoSuggestBox>,
+    /// Ctrl+N and Ctrl+K from the window's keyboard hook.
+    pub(super) shortcuts: Option<Arc<Mutex<Receiver<Shortcut>>>>,
+}
+
+/// The sidebar search: what the box shows, what was typed and the
+/// suggestions it offers.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Search {
+    /// The box's text as WinUI last reported it (typed, or a suggestion it
+    /// wrote in while the arrows move). The box is controlled: a render
+    /// that left its text unset cleared it (observed live).
+    pub(super) text: String,
+    /// The typed query the list and the suggestions follow.
+    pub(super) query: String,
+    /// `(label, Agent id)` per suggestion ([`nav::search`]).
+    pub(super) results: Vec<(String, String)>,
 }
 
 impl DesktopApp {
@@ -250,12 +297,13 @@ impl DesktopApp {
                             self.open_conversation(&agent, context);
                         }
                         self.open_startup_conversation(context);
-                        self.load_titles(context);
+                        self.refresh_search();
                     }
                     Err(error) => self.alert(format!("Agents not read: {error}")),
                 }
             }
             ShellMsg::AgentOpened(agent) => {
+                self.chat.opened_from_search = false;
                 if self.main != Main::Conversation {
                     self.main = Main::Conversation;
                     self.reprime_fields(context);
@@ -293,7 +341,6 @@ impl DesktopApp {
                     Err(error) => Branch::Failed(error),
                 };
                 self.nav.branches.insert(id, branch);
-                self.load_titles(context);
             }
             ShellMsg::RefreshRequested => {
                 if let Ok(data_dir) = self.data_dir.clone() {
@@ -350,7 +397,9 @@ impl DesktopApp {
                 self.appearance.dark = scheme == ColorScheme::Dark;
                 self.appearance.high_contrast = crate::accessibility::high_contrast_on();
                 if self.palette() != before {
-                    // The palette-keyed tree is rebuilt with new controls.
+                    // The palette-keyed tree is rebuilt with new controls
+                    // (an empty search box among them).
+                    self.nav.search = Search::default();
                     self.apply_scheme();
                     self.reprime_fields(context);
                 }
@@ -409,11 +458,58 @@ impl DesktopApp {
                     self.load_settings(context);
                 }
             }
-            ShellMsg::TitlesLoaded(titles) => {
-                self.nav.titles_inflight = false;
-                self.nav.titles.extend(titles);
-                self.load_titles(context);
+            ShellMsg::ProjectToggled(key) => {
+                if !self.nav.collapsed.remove(&key) {
+                    self.nav.collapsed.insert(key);
+                }
+                self.collapsed_projects_changed();
             }
+            ShellMsg::OlderToggled(key) => {
+                if !self.nav.unfolded.remove(&key) {
+                    self.nav.unfolded.insert(key);
+                }
+            }
+            ShellMsg::AttentionToggled => self.nav.attention_only = !self.nav.attention_only,
+            ShellMsg::SearchChanged(text) => {
+                self.nav.search.text = text.clone();
+                // WinUI writes the suggestion reached with the arrows into
+                // the box: that is not a new query.
+                if !self
+                    .nav
+                    .search
+                    .results
+                    .iter()
+                    .any(|(label, _)| *label == text)
+                {
+                    self.nav.search.query = text;
+                    self.refresh_search();
+                }
+            }
+            ShellMsg::SearchChosen(label) => {
+                let chosen = self
+                    .nav
+                    .search
+                    .results
+                    .iter()
+                    .find(|(shown, _)| *shown == label)
+                    .and_then(|(_, id)| self.find_agent(id))
+                    .cloned();
+                if let Some(agent) = chosen {
+                    self.nav.selection.select_agent(Some(agent.id.clone()));
+                    self.shell_update(ShellMsg::AgentOpened(agent), context);
+                    self.chat.opened_from_search = true;
+                }
+            }
+            ShellMsg::Shortcut(shortcut) => {
+                match shortcut {
+                    Shortcut::NewTask => self.new_task(context),
+                    Shortcut::Search => self.focus_search(SEARCH_FOCUS_TRIES, context),
+                }
+                self.watch_shortcuts(context);
+            }
+            ShellMsg::FocusSearch(tries) => self.focus_search(tries, context),
+            ShellMsg::FocusSearchLater(tries) => self.focus_search_later(tries, context),
+            ShellMsg::ShortcutsEnded => {}
             ShellMsg::AlertDismissed => self.alert = None,
             ShellMsg::ListTick => {
                 // Only the first page is re-read; pages added with "Show
@@ -532,64 +628,104 @@ impl DesktopApp {
         }
     }
 
-    /// Read titles of shown Agents that have none yet, one batch at a time.
-    fn load_titles(&mut self, context: &ComponentContext<Self>) {
-        if self.nav.titles_inflight {
-            return;
-        }
-        let Ok(data_dir) = self.data_dir.clone() else {
-            return;
-        };
+    /// The registered checkouts with their repositories, for grouping.
+    pub(super) fn checkouts(&self) -> Vec<Checkout> {
+        self.nav
+            .projects
+            .iter()
+            .map(|project| Checkout {
+                path: project.workspace.clone(),
+                common_dir: project.common_dir.clone(),
+            })
+            .collect()
+    }
+
+    /// The listed or fetched Agent with this id.
+    fn find_agent(&self, id: &str) -> Option<&UiAgent> {
         let branch_children = self.nav.branches.values().flat_map(|branch| match branch {
             Branch::Loaded { children, .. } => children.as_slice(),
             _ => &[],
         });
-        let mut missing: Vec<String> = Vec::new();
-        for agent in self.nav.agents.iter().chain(branch_children) {
-            if !self.nav.titles.contains_key(&agent.id) && !missing.contains(&agent.id) {
-                missing.push(agent.id.clone());
-            }
-            if missing.len() == TITLE_BATCH {
-                break;
-            }
+        self.nav
+            .agents
+            .iter()
+            .chain(branch_children)
+            .find(|agent| agent.id == id)
+    }
+
+    /// The title of `agent` as its summary gave it, else the monitor's,
+    /// else its id (an Agent on no page read yet).
+    pub(super) fn agent_title(&self, agent: &str) -> String {
+        if let Some(found) = self.find_agent(agent) {
+            return found.title.clone();
         }
-        if missing.is_empty() {
+        self.monitor
+            .data
+            .rows
+            .iter()
+            .find(|row| row.id == agent)
+            .map_or_else(|| agent.to_owned(), |row| row.title.clone())
+    }
+
+    /// Recompute the search suggestions from the listed Agents.
+    fn refresh_search(&mut self) {
+        self.nav.search.results =
+            nav::search(&self.nav.agents, &self.checkouts(), &self.nav.search.query);
+    }
+
+    /// Put the keyboard in the search box; from Settings, close them first.
+    /// A refused or unbound focus is tried again, `tries` times in all.
+    fn focus_search(&mut self, tries: u8, context: &ComponentContext<Self>) {
+        if self.main != Main::Conversation {
+            self.main = Main::Conversation;
+            self.reprime_fields(context);
+        }
+        let Some(left) = tries.checked_sub(1) else {
             return;
+        };
+        let later = context.sender();
+        let accepted = self.nav.search_ref.request_focus_result(move |result| {
+            if !matches!(result, Ok(true)) && left > 0 {
+                let _ = later.send(Message::Shell(ShellMsg::FocusSearchLater(left)));
+            }
+        });
+        if !accepted && left > 0 {
+            self.focus_search_later(left, context);
         }
-        self.nav.titles_inflight = true;
-        let _task = context.spawn_background(move |_| {
-            let titles = client::block_on(async {
-                futures_util::stream::iter(missing)
-                    .map(|id| {
-                        let data_dir = data_dir.clone();
-                        async move {
-                            // A failed read leaves the id as the title; it
-                            // is not retried in a loop.
-                            let title = client::first_input(&data_dir, &id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .and_then(|text| nav::title(&text));
-                            (id, title)
-                        }
-                    })
-                    .buffer_unordered(client::MAX_CONCURRENT_READS)
-                    .collect::<Vec<_>>()
-                    .await
-            });
-            Message::Shell(ShellMsg::TitlesLoaded(titles))
+    }
+
+    fn focus_search_later(&self, tries: u8, context: &ComponentContext<Self>) {
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let _ = feed::backoff(SEARCH_FOCUS_RETRY_MS, &cancelled);
+            Message::Shell(ShellMsg::FocusSearch(tries))
         });
     }
 
-    /// The conversation title of `agent`: its first message, else its id.
-    pub(super) fn agent_title(&self, agent: &str) -> String {
-        self.nav
-            .titles
-            .get(agent)
-            .cloned()
-            .flatten()
-            .unwrap_or_else(|| agent.to_owned())
+    /// Wait for the next Ctrl+N or Ctrl+K on a worker.
+    pub(super) fn watch_shortcuts(&self, context: &ComponentContext<Self>) {
+        let Some(chords) = self.nav.shortcuts.clone() else {
+            return;
+        };
+        let _task = context.spawn_background(move |cancel| {
+            let Ok(chords) = chords.lock() else {
+                return Message::Shell(ShellMsg::ShortcutsEnded);
+            };
+            loop {
+                match chords.recv_timeout(std::time::Duration::from_millis(SHORTCUT_POLL_MS)) {
+                    Ok(chord) => return Message::Shell(ShellMsg::Shortcut(chord)),
+                    Err(RecvTimeoutError::Timeout) if !cancel.is_cancelled() => {}
+                    // Window closing or hook gone: nothing more to deliver.
+                    Err(_) => return Message::Shell(ShellMsg::ShortcutsEnded),
+                }
+            }
+        });
     }
+
+    /// The collapsed projects changed. They live in memory until k76a's
+    /// `[desktop] collapsed_projects` exists; that change writes them here
+    /// through the settings writer, as the window size is.
+    fn collapsed_projects_changed(&self) {}
 
     /// Reactor 0.100.0 creates a TextBox with `Text` before `AcceptsReturn`,
     /// and a TextBox that is still single-line keeps only the first line of
@@ -863,10 +999,12 @@ impl DesktopApp {
         Grid::new().keyed_children(vec![KeyedView::new(palette_key.to_owned(), window)])
     }
 
-    /// The sidebar at Codex density: the app name, a New task row, the
-    /// projects (32-DIP rows) with their tasks nested (28-DIP rows indented
-    /// 24 DIPs), Recents, then the fleet status and Settings rows at the
-    /// bottom. Section labels are secondary text at the rows' content inset.
+    /// The sidebar at Codex density (owner review 2026-11-16, the Codex
+    /// and OpenCode sidebars as references): the app name, Search tasks
+    /// (Ctrl+K), the one tonal New task row (Ctrl+N), the projects
+    /// (collapsible 32-DIP rows) with their tasks nested (28-DIP rows
+    /// indented 24 DIPs), Recents, then the fleet line, the attention row
+    /// and Settings at the bottom. Section labels are secondary text.
     fn sidebar_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let pad = SIDEBAR_PADDING;
         let header = m3::section_title("Eliot Swarm")
@@ -878,54 +1016,102 @@ impl DesktopApp {
                 0.0,
             ))
             .vertical_alignment(VerticalAlignment::Center);
-        let new_task_selected = self.main == Main::Conversation && self.chat.convo.is_none();
-        let new_task = m3::row(palette, false)
+        let search = AutoSuggestBox::new()
+            .element_ref(&self.nav.search_ref)
+            .placeholder_text("Search tasks (Ctrl+K)")
+            .text(self.nav.search.text.clone())
+            .items_source(
+                self.nav
+                    .search
+                    .results
+                    .iter()
+                    .map(|(label, _)| label.clone()),
+            )
+            .on_text_changed(context.callback(|text| Message::Shell(ShellMsg::SearchChanged(text))))
+            .on_suggestion_chosen(
+                context.callback(|label| Message::Shell(ShellMsg::SearchChosen(label))),
+            )
+            .automation_name("Search tasks")
+            .height(tokens::height::CONTROL)
             .grid_row(1)
+            .margin(Thickness::new(pad, tokens::spacing::XS, pad, 0.0));
+        let new_task = m3::tonal_row(palette)
+            .grid_row(2)
             .margin(Thickness::new(pad, tokens::spacing::XS, pad, 0.0))
-            .automation_name("New task")
+            .automation_name("New task (Ctrl+N)")
             .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
-            .content(m3::icon_label(m3::glyph::NEW_TASK, "New task"));
+            .content(m3::row_content(
+                Some(m3::glyph::NEW_TASK),
+                "New task",
+                "",
+                m3::secondary("Ctrl+N")
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .into(),
+            ));
 
+        let fleet = Fleet::of(&self.nav.agents);
+        let attention = self.nav.attention_only && fleet.attention > 0;
+        let query = self.nav.search.query.trim().to_owned();
+        let checkouts = self.checkouts();
+        let keep = |agent: &UiAgent| {
+            (!attention || agent.needs_attention())
+                && (query.is_empty()
+                    || nav::matches(agent, &nav::project_of(&agent.project, &checkouts), &query))
+        };
+        let filtered = attention || !query.is_empty();
+        let shown = Shown {
+            branches: &self.nav.branches,
+            expanded: &self.nav.expanded,
+            collapsed: &self.nav.collapsed,
+            unfolded: &self.nav.unfolded,
+            today_start: today_start_ms(),
+            only: filtered.then_some(&keep as &dyn Fn(&UiAgent) -> bool),
+        };
+        let sections = nav::sections(&self.nav.agents, &checkouts, &shown);
+
+        let caption = if attention {
+            "Need attention"
+        } else if filtered {
+            "Matching tasks"
+        } else {
+            "Projects"
+        };
         let mut items: Vec<KeyedView> = vec![KeyedView::new(
-            "projects-caption",
-            section_label("Projects"),
+            format!("caption:{caption}"),
+            section_label(caption),
         )];
-        let registered: Vec<(String, String)> = self
-            .nav
-            .projects
-            .iter()
-            .map(|project| (project.workspace.clone(), project.name.clone()))
-            .collect();
-        let rows = nav::rows(
-            &self.nav.agents,
-            &self.nav.branches,
-            &self.nav.expanded,
-            true,
-            &|label| nav::project_name(label, &registered),
-        );
-        let sections = nav::sections(rows, &registered);
-        if sections.is_empty() {
+        if attention {
             items.push(KeyedView::new(
-                "no-projects",
-                quiet_row(
-                    if self.nav.agents_loading {
-                        "Loading…"
-                    } else {
-                        "No projects yet"
-                    },
-                    0.0,
-                ),
+                "show-all",
+                m3::sub_row(palette, false)
+                    .automation_name("Show all tasks")
+                    .on_click(context.message(Message::Shell(ShellMsg::AttentionToggled)))
+                    .content(m3::row_content(None, "Show all tasks", "", View::empty())),
             ));
         }
+        if sections.is_empty() {
+            let empty = if self.nav.agents_loading {
+                "Loading…"
+            } else if filtered {
+                "No matching tasks"
+            } else {
+                "No projects yet"
+            };
+            items.push(KeyedView::new("no-projects", quiet_row(empty, 0.0)));
+        }
+        let new_task_selected = self.main == Main::Conversation && self.chat.convo.is_none();
         for section in &sections {
-            let selected = new_task_selected && self.launch.workspace == section.checkout;
+            let selected = new_task_selected && section.holds(&self.launch.workspace);
             items.push(KeyedView::new(
-                format!("project:{}:{selected}", section.checkout),
-                self.project_row(section, selected, context, palette),
+                format!("project:{}:{selected}:{}", section.key, section.collapsed),
+                self.project_row(section, selected, filtered, context, palette),
             ));
+            if section.collapsed {
+                continue;
+            }
             if section.rows.is_empty() {
                 items.push(KeyedView::new(
-                    format!("empty:{}", section.checkout),
+                    format!("empty:{}", section.key),
                     quiet_row("No tasks", tokens::layout::TREE_INDENT),
                 ));
             }
@@ -937,8 +1123,30 @@ impl DesktopApp {
                     self.agent_row(row, selected, context, palette),
                 ));
             }
+            if section.older > 0 {
+                let label = if section.older_shown {
+                    "Hide older".to_owned()
+                } else {
+                    format!("Show {} older", section.older)
+                };
+                items.push(KeyedView::new(
+                    format!("older:{}:{}", section.key, section.older_shown),
+                    m3::sub_row(palette, false)
+                        .margin(Thickness::new(tokens::layout::TREE_INDENT, 0.0, 0.0, 0.0))
+                        .automation_name(format!("{label} in {}", section.name))
+                        .on_click(
+                            context.message(Message::Shell(ShellMsg::OlderToggled(
+                                section.key.clone(),
+                            ))),
+                        )
+                        .content(m3::secondary(label)),
+                ));
+            }
         }
-        if self.nav.agents.len() < self.nav.agents_total && self.nav.agents_next.is_some() {
+        if !filtered
+            && self.nav.agents.len() < self.nav.agents_total
+            && self.nav.agents_next.is_some()
+        {
             items.push(KeyedView::new(
                 "more",
                 m3::sub_row(palette, false)
@@ -953,7 +1161,7 @@ impl DesktopApp {
             ));
         }
         let recents = nav::recents(&self.nav.agents, RECENTS);
-        if !recents.is_empty() {
+        if !filtered && !recents.is_empty() {
             items.push(KeyedView::new("recents-caption", section_label("Recents")));
             for agent in recents {
                 items.push(KeyedView::new(
@@ -963,7 +1171,7 @@ impl DesktopApp {
             }
         }
         let list = ScrollViewer::new()
-            .grid_row(2)
+            .grid_row(3)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .automation_name("Projects and Agents")
             .content(
@@ -973,62 +1181,138 @@ impl DesktopApp {
             );
 
         let monitor_open = self.panel == Panel::Monitor;
-        let bottom = StackPanel::new()
-            .grid_row(3)
-            .margin(Thickness::new(pad, 0.0, pad, pad))
-            .keyed_children(vec![
-                KeyedView::new(
-                    "divider",
-                    m3::divider(palette).margin(Thickness::new(
-                        tokens::spacing::INSET,
-                        0.0,
-                        tokens::spacing::INSET,
-                        tokens::spacing::SM,
+        let mut bottom = vec![
+            KeyedView::new(
+                "divider",
+                m3::divider(palette).margin(Thickness::new(
+                    tokens::spacing::INSET,
+                    0.0,
+                    tokens::spacing::INSET,
+                    tokens::spacing::SM,
+                )),
+            ),
+            KeyedView::new(
+                format!("fleet:{monitor_open}"),
+                self.fleet_row(fleet, context, palette),
+            ),
+        ];
+        if fleet.attention > 0 {
+            bottom.push(KeyedView::new(
+                format!("attention:{attention}"),
+                m3::row(palette, attention)
+                    .automation_name(format!(
+                        "{} ({})",
+                        fleet.attention_label(),
+                        if attention { "listed" } else { "list them" }
+                    ))
+                    .on_click(context.message(Message::Shell(ShellMsg::AttentionToggled)))
+                    .content(m3::row_content(
+                        Some(m3::glyph::FLAG),
+                        &fleet.attention_label(),
+                        "",
+                        palette
+                            .dot(StatusTone::Attention)
+                            .map_or_else(View::empty, m3::dot),
                     )),
-                ),
-                KeyedView::new(
-                    format!("fleet:{monitor_open}"),
-                    self.fleet_row(context, palette),
-                ),
-                KeyedView::new(
-                    "settings",
-                    m3::row(palette, false)
-                        .automation_name("Settings")
-                        .on_click(context.message(Message::Shell(ShellMsg::SettingsOpened)))
-                        .content(m3::icon_label(m3::glyph::SETTINGS, "Settings")),
-                ),
-            ]);
+            ));
+        }
+        bottom.push(KeyedView::new(
+            "settings",
+            m3::row(palette, false)
+                .automation_name("Settings")
+                .on_click(context.message(Message::Shell(ShellMsg::SettingsOpened)))
+                .content(m3::icon_label(m3::glyph::SETTINGS, "Settings")),
+        ));
+        let bottom = StackPanel::new()
+            .grid_row(4)
+            .margin(Thickness::new(pad, 0.0, pad, pad))
+            .keyed_children(bottom);
 
         Grid::new()
             .rows([
                 GridLength::Auto,
                 GridLength::Auto,
+                GridLength::Auto,
                 GridLength::STAR,
                 GridLength::Auto,
             ])
-            .children((header, new_task, list, bottom))
+            .children((header, search, new_task, list, bottom))
     }
 
-    /// A project row: a new task in that project.
+    /// A project row: its chevron, folder and repository name collapse or
+    /// expand it; a collapsed project keeps its running tasks as a count.
+    /// The trailing button starts a new task in it.
     fn project_row(
         &self,
         section: &Section,
         selected: bool,
+        filtered: bool,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        m3::row(palette, selected)
+        let badge: View = if section.collapsed && section.running > 0 {
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::XS)
+                .vertical_alignment(VerticalAlignment::Center)
+                .children((
+                    palette
+                        .dot(StatusTone::Active)
+                        .map_or_else(View::empty, m3::dot),
+                    m3::secondary(section.running.to_string())
+                        .vertical_alignment(VerticalAlignment::Center),
+                ))
+        } else {
+            View::empty()
+        };
+        let (chevron, state) = if section.collapsed {
+            (m3::glyph::CHEVRON_RIGHT, "collapsed")
+        } else {
+            (m3::glyph::CHEVRON_DOWN, "expanded")
+        };
+        let mut name = format!("{}, project, {state}", section.name);
+        if section.collapsed && section.running > 0 {
+            name.push_str(&format!(", {} running", section.running));
+        }
+        let toggle = m3::row(palette, selected)
+            .automation_name(name)
+            .is_enabled(!filtered)
+            .on_click(context.message(Message::Shell(ShellMsg::ProjectToggled(
+                section.key.clone(),
+            ))))
+            .content(
+                Grid::new()
+                    .columns([GridLength::Auto, GridLength::STAR])
+                    .column_spacing(tokens::spacing::SM)
+                    .children((
+                        m3::icon(chevron),
+                        Border::new().grid_column(1).content(m3::row_content(
+                            Some(m3::glyph::FOLDER),
+                            &section.name,
+                            "",
+                            badge,
+                        )),
+                    )),
+            );
+        let new_task = m3::icon_button(palette)
+            .grid_column(1)
+            .width(tokens::height::CONTROL)
+            .height(tokens::height::CONTROL)
             .automation_name(format!("New task in {}", section.name))
             .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
                 section.checkout.clone(),
             ))))
-            .content(m3::icon_label(m3::glyph::FOLDER, &section.name))
+            .content(m3::icon(m3::glyph::NEW_TASK));
+        Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .children((toggle, new_task))
     }
 
     /// A task row under its project: indented 24 DIPs per level, so its
-    /// title lines up with the project's label (12 inset + 16 icon + 8 gap =
-    /// 36 = 24 + 12). A manager with workers carries its expand chevron in
-    /// that indent.
+    /// title lines up with the project's label. One line: the title, the
+    /// worktree where the project spans several, and a state dot only for
+    /// a task that runs or needs attention. A manager with workers carries
+    /// its expand chevron in that indent.
     fn agent_row(
         &self,
         row: &Row,
@@ -1037,7 +1321,7 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let agent = &row.agent;
-        let title = self.agent_title(&agent.id);
+        let title = agent.title.as_str();
         let indent = tokens::layout::TREE_INDENT;
         let chevron: View = if row.expandable() {
             let (glyph, name) = if row.expanded {
@@ -1064,6 +1348,9 @@ impl DesktopApp {
             View::empty()
         };
         let mut name = format!("{title}, {}, Agent {}", agent.state, agent.id);
+        if let Some(place) = &row.place {
+            name.push_str(&format!(", in {place}"));
+        }
         if row.depth > 0 {
             name.push_str(&format!(", worker level {}", row.depth));
         }
@@ -1095,9 +1382,9 @@ impl DesktopApp {
                     .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
                     .content(m3::row_content(
                         None,
-                        &title,
-                        "",
-                        m3::list_dot(palette, &agent.state),
+                        title,
+                        row.place.as_deref().unwrap_or(""),
+                        task_dot(palette, agent),
                     )),
                 note,
             ))
@@ -1110,23 +1397,28 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let title = self.agent_title(&agent.id);
         m3::sub_row(palette, false)
-            .automation_name(format!("Recent: {title}, {}", agent.state))
+            .automation_name(format!("Recent: {}, {}", agent.title, agent.state))
             .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
             .content(m3::row_content(
                 None,
-                &title,
+                &agent.title,
                 "",
-                m3::list_dot(palette, &agent.state),
+                task_dot(palette, agent),
             ))
     }
 
-    /// The fleet in one row ("2 running · 1 waiting"); it opens the
-    /// monitor.
-    fn fleet_row(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let (summary, tone) = fleet_summary(&self.nav.agents, self.nav.agents_total);
-        let dot = palette.dot(tone).map_or_else(View::empty, m3::dot);
+    /// The fleet in one calm row ("6 running", "All quiet · 40 Agents");
+    /// it opens the monitor.
+    fn fleet_row(&self, fleet: Fleet, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let summary = fleet.summary(self.nav.agents_total);
+        let dot = if fleet.running > 0 {
+            palette
+                .dot(StatusTone::Active)
+                .map_or_else(View::empty, m3::dot)
+        } else {
+            View::empty()
+        };
         let open = self.panel == Panel::Monitor;
         m3::row(palette, open)
             .automation_name(format!(
@@ -1228,53 +1520,22 @@ fn quiet_row(text: &str, indent: f64) -> View {
         .into()
 }
 
-// The fleet line and its most urgent tone, from the listed Agents.
-pub(super) fn fleet_summary(agents: &[UiAgent], total: usize) -> (String, StatusTone) {
-    let count = |tone: StatusTone| {
-        agents
-            .iter()
-            .filter(|agent| StatusTone::of_state(&agent.state) == tone)
-            .count()
-    };
-    let (running, waiting, failed, unknown) = (
-        count(StatusTone::Active) + count(StatusTone::Pending),
-        count(StatusTone::Attention),
-        count(StatusTone::Failed),
-        count(StatusTone::Unknown),
-    );
-    let mut parts = Vec::new();
-    if running > 0 {
-        parts.push(format!("{running} running"));
-    }
-    if waiting > 0 {
-        parts.push(format!("{waiting} waiting"));
-    }
-    if failed > 0 {
-        parts.push(format!("{failed} failed"));
-    }
-    if unknown > 0 {
-        parts.push(format!("{unknown} unknown"));
-    }
-    let tone = if failed > 0 {
-        StatusTone::Failed
-    } else if waiting > 0 {
-        StatusTone::Attention
-    } else if unknown > 0 {
-        StatusTone::Unknown
-    } else if running > 0 {
-        StatusTone::Active
+/// A task's state dot, only while it runs or needs attention: a calm
+/// list carries no marks.
+fn task_dot(palette: Palette, agent: &UiAgent) -> View {
+    if agent.running() || agent.needs_attention() {
+        m3::list_dot(palette, &agent.state)
     } else {
-        StatusTone::Ready
-    };
-    let summary = if !parts.is_empty() {
-        parts.join(" · ")
-    } else if total == 0 {
-        "No Agents yet".to_owned()
-    } else {
-        format!(
-            "All quiet · {total} {}",
-            if total == 1 { "Agent" } else { "Agents" }
-        )
-    };
-    (summary, tone)
+        View::empty()
+    }
+}
+
+/// The start of the local day, in ms since the epoch.
+fn today_start_ms() -> i64 {
+    use chrono::{Local, TimeZone};
+    Local::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|midnight| Local.from_local_datetime(&midnight).earliest())
+        .map_or(0, |start| start.timestamp_millis())
 }

@@ -977,11 +977,15 @@ impl Store {
         let heavy = self.heavy_rollup(&id, record.generation)?;
         let session_growth =
             self.session_growth_view(&record.harness, &id, record.generation, growth_thresholds)?;
+        let preview = self.first_input_preview(record.id)?;
         Ok(AgentSummary {
             id,
             generation: record.generation,
             project: record.project,
             harness: record.harness,
+            name: record.name.filter(|name| !name.trim().is_empty()),
+            profile: Some(record.profile).filter(|profile| !profile.trim().is_empty()),
+            preview,
             state,
             parent: record.parent.map(format_agent_id),
             // A NULL root only arises from raw test rows without hierarchy
@@ -1009,6 +1013,28 @@ impl Store {
             heavy,
             session_growth,
         })
+    }
+
+    /// The opening characters of the Agent's oldest retained `send` text (a
+    /// launch's linked first input included): one seek on
+    /// `commands_target`. `None` when no send with text is retained.
+    fn first_input_preview(&self, agent: i64) -> Result<Option<String>> {
+        let preview: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT substr(json_extract(args, '$.text'), 1, ?2)
+                 FROM commands INDEXED BY commands_target
+                 WHERE target = ?1 AND verb = 'send'
+                   AND json_type(args, '$.text') = 'text'
+                 ORDER BY created_at, rowid LIMIT 1",
+                params![agent, core::api::AGENT_PREVIEW_CHARS as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        Ok(preview
+            .flatten()
+            .filter(|preview| !preview.trim().is_empty()))
     }
 
     /// Newest terminal turn for one Agent generation: its canonical outcome

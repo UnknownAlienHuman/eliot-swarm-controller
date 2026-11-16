@@ -11793,6 +11793,74 @@ fn local_user_event_atomic_commit_rejects_mismatch_and_leaves_unknown() {
 }
 
 #[test]
+fn agent_summaries_carry_name_profile_and_first_send_preview() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let brief = format!(
+        "# k75: sidebar titles
+
+{}",
+        "word ".repeat(100)
+    );
+    let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    launch.expected_generation = Some(0);
+    launch.args = json!({"harness": "codex", "profile": "codex-lite",
+        "profile_snapshot": {}, "project": "p", "workspace": "w", "text": brief});
+    let titled = store
+        .submit("owner", launch, now)
+        .expect("admit launch with text")
+        .command
+        .target
+        .expect("launch target");
+    let mut bare = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    bare.expected_generation = Some(0);
+    bare.args = json!({"harness": "muse", "profile": "muse",
+        "profile_snapshot": {}, "project": "p", "workspace": "w"});
+    let untitled = store
+        .submit("owner", bare, now + 1)
+        .expect("admit launch without text")
+        .command
+        .target
+        .expect("launch target");
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET name = 'planner' WHERE id = ?1",
+            [eliot_core::parse_agent_id(&untitled).expect("parse id")],
+        )
+        .expect("name the Agent");
+
+    let page = store
+        .list_agent_summaries(
+            &super::AgentListFilter::default(),
+            None,
+            10,
+            now + 2,
+            &SessionGrowthThresholds::default(),
+        )
+        .expect("list summaries");
+    let row = |id: &str| {
+        page.summaries
+            .iter()
+            .find(|summary| summary.id == id)
+            .expect("listed")
+    };
+    let first = row(&titled);
+    let expected: String = brief
+        .chars()
+        .take(eliot_core::api::AGENT_PREVIEW_CHARS)
+        .collect();
+    assert_eq!(first.preview.as_deref(), Some(expected.as_str()));
+    assert_eq!(first.profile.as_deref(), Some("codex-lite"));
+    assert_eq!(first.name, None);
+    first.validate().expect("bounded preview validates");
+    let second = row(&untitled);
+    assert_eq!(second.preview, None);
+    assert_eq!(second.name.as_deref(), Some("planner"));
+    assert_eq!(second.profile.as_deref(), Some("muse"));
+}
+
+#[test]
 fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
     use super::{AgentListFilter, agent_list_select};
 

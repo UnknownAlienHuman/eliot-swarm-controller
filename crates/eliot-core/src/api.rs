@@ -32,15 +32,15 @@ mod usage;
 mod waits;
 
 pub use agent_views::{
-    AgentConfigView, AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse,
-    AgentGitRequest, AgentGitResponse, AgentListRequest, AgentListResponse, AgentListRow,
-    AgentProcessesRequest, AgentProcessesResponse, AgentStatsRequest, AgentStatsResponse,
-    AgentSummary, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus, DaemonStatusRequest,
-    DaemonStatusResponse, DrainReport, GitCredentialHelper, OwnedProcessKind, OwnedProcessSummary,
-    PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectDiscoverRequest, ProjectDiscoverResponse,
-    ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary, RetentionView,
-    RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
-    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
+    AGENT_PREVIEW_CHARS, AgentConfigView, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
+    AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentListRequest, AgentListResponse,
+    AgentListRow, AgentProcessesRequest, AgentProcessesResponse, AgentStatsRequest,
+    AgentStatsResponse, AgentSummary, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus,
+    DaemonStatusRequest, DaemonStatusResponse, DrainReport, GitCredentialHelper, OwnedProcessKind,
+    OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectDiscoverRequest,
+    ProjectDiscoverResponse, ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary,
+    RetentionView, RunningTurnSummary, SourceOwner, SourceState, StatusBlocker,
+    UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,

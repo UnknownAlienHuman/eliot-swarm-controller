@@ -42,6 +42,7 @@ pub mod glyph {
     pub const PROFILE: &str = "\u{E77B}";
     pub const PULSE: &str = "\u{E9D9}";
     pub const TOOLS: &str = "\u{E90F}";
+    pub const FLAG: &str = "\u{E7C1}";
 }
 
 pub fn weight(style: TypeStyle) -> FontWeight {
@@ -222,6 +223,14 @@ pub fn send_button(palette: Palette) -> Button {
 /// secondary-container. Give it [`row_content`] or [`icon_label`].
 pub fn row(palette: Palette, selected: bool) -> Button {
     button(palette.row(selected))
+        .horizontal_alignment(HorizontalAlignment::Stretch)
+        .horizontal_content_alignment(HorizontalAlignment::Stretch)
+}
+
+/// The one tonal row: the sidebar's New task, the main action of the
+/// shell (primary-container, as M3's tonal emphasis).
+pub fn tonal_row(palette: Palette) -> Button {
+    button(palette.tonal_row())
         .horizontal_alignment(HorizontalAlignment::Stretch)
         .horizontal_content_alignment(HorizontalAlignment::Stretch)
 }
