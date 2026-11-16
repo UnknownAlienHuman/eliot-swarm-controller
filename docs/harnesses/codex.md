@@ -643,20 +643,37 @@ exposes the catalog per `cwd`. Implementation:
 
 ## Native subagents (`native_subagents` deny)
 
-Per-session mapping, verified on the installed Codex 0.167.1 binary:
-`codex features list` reports `multi_agent` stable on (default) and
-`multi_agent_v2` stable off. When the frozen profile carries
-`native_subagents = "deny"` (the default for profiles with a non-empty
-`child_profiles`), the plugin appends both
-`-c features.multi_agent=false` and `-c features.multi_agent_v2=false`
-before `app-server` on every Codex spawn for the session (MCP enumeration
-probes and the Agent launch), keeping the v2 switch off too. `allow` adds
-nothing and preserves today's behavior. The `-c key=value` override syntax
-is per `codex --help` (`-c, --config key=value`; `--disable FEATURE` is
-equivalent to `-c features.<name>=false`). Implementation:
-`plugins/codex/src/route.rs` (`native_subagents_argv`,
-`args_with_native_subagents`, `args_with_agent_mcp`) and
-`plugins/codex/src/host.rs` (start/probe launches).
+Verified against installed Codex 0.167.1's generated `ThreadStartParams`
+and `ThreadResumeParams` schemas and upstream tag `rust-v0.167.1`
+(`0a94398fa60c4fac0e7659e4213a0a36e613dd46`), 2026-11-16.
+When the frozen profile carries `native_subagents = "deny"` (the default
+with non-empty `child_profiles`), every `thread/start` and `thread/resume`
+sends dotted keys `agents.enabled=false`, `features.multi_agent=false`
+and `features.multi_agent_v2=false` in its `config` object. The same three
+overrides precede `app-server` as process `-c` flags, including enumeration
+probes. The thread overlay applies even without an explicit effort; an
+omitted effort still preserves the native default. `allow` adds no native
+subagent overrides and preserves native configuration.
+
+The feature flags alone do not enforce deny: model metadata can select a
+multi-agent backend before the legacy `multi_agent` feature is consulted.
+[`Config::multi_agent_version_override` and `multi_agent_version_for_model`,
+core/src/config/mod.rs:1687-1713](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/core/src/config/mod.rs#L1687-L1713)
+force `Disabled` when `agents.enabled=false`, provided v2 is also off.
+[`collab_tools_enabled`, core/src/tools/spec_plan.rs:735-748](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/core/src/tools/spec_plan.rs#L735-L748)
+then excludes native collaboration tools.
+
+App-server reloads thread configuration with the process overrides retained;
+[`ConfigManager::load_with_validation`, app-server/src/config_manager.rs:704-725](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/app-server/src/config_manager.rs#L704-L725)
+appends request `config` overrides after those process overrides.
+The [config loader's runtime layer, config/src/loader/mod.rs:426-433](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/config/src/loader/mod.rs#L426-L433)
+is above user/project configuration, so owner `[features]` values cannot
+re-enable these overridden settings. Both protocol requests expose `config`
+([start:100](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L100),
+[resume:410](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/app-server-protocol/src/protocol/v2/thread.rs#L410)).
+Implementation: `plugins/codex/src/native/types.rs`
+(`NativeThreadConfigOverrides::from_profile`), `host.rs` (both thread
+requests), and `route.rs` (`native_subagents_argv`). No vendor code is copied.
 
 ## Access levels (`--access ask|auto|full`)
 

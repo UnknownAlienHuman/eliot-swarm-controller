@@ -134,7 +134,41 @@ pub enum NativeSandboxMode {
 /// Per-thread `config` overlay; config keys retain their snake_case names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeThreadConfigOverrides {
-    pub model_reasoning_effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_reasoning_effort: Option<String>,
+    #[serde(
+        rename = "agents.enabled",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub agents_enabled: Option<bool>,
+    #[serde(
+        rename = "features.multi_agent",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub multi_agent: Option<bool>,
+    #[serde(
+        rename = "features.multi_agent_v2",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub multi_agent_v2: Option<bool>,
+}
+
+impl NativeThreadConfigOverrides {
+    pub(crate) fn from_profile(
+        model_reasoning_effort: Option<String>,
+        native_subagents: Option<&str>,
+    ) -> Option<Self> {
+        let deny = (native_subagents == Some("deny")).then_some(false);
+        (model_reasoning_effort.is_some() || deny.is_some()).then_some(Self {
+            model_reasoning_effort,
+            agents_enabled: deny,
+            multi_agent: deny,
+            multi_agent_v2: deny,
+        })
+    }
 }
 
 /// Minimal thread-start params (fresh `v2/ThreadStartParams.json`;
