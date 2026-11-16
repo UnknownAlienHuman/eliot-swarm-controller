@@ -70,6 +70,42 @@ pub fn project_name(label: &str, registered: &[(String, String)]) -> String {
         .to_owned()
 }
 
+/// Ids the daemon's project discovery mints: `project-` and a SHA-256.
+fn is_discovered_id(id: &str) -> bool {
+    id.strip_prefix("project-")
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// The name a person reads for a project: its id, or for an id minted by
+/// discovery, its checkout's folder name.
+pub fn project_display(id: &str, checkout: &str) -> String {
+    if is_discovered_id(id) {
+        project_name(checkout, &[])
+    } else {
+        id.to_owned()
+    }
+}
+
+/// Display names of `(id, checkout)` registrations, unique: a folder name
+/// shared by two discovered projects falls back to their ids.
+pub fn project_names(projects: &[(String, String)]) -> Vec<String> {
+    let names: Vec<String> = projects
+        .iter()
+        .map(|(id, checkout)| project_display(id, checkout))
+        .collect();
+    names
+        .iter()
+        .zip(projects)
+        .map(|(name, (id, _))| {
+            if names.iter().filter(|other| *other == name).count() > 1 {
+                id.clone()
+            } else {
+                name.clone()
+            }
+        })
+        .collect()
+}
+
 /// A path as a person reads it: without the `\\?\` verbatim prefix the
 /// daemon keeps on canonical Windows paths (a verbatim UNC path is left as
 /// it is).
@@ -283,6 +319,25 @@ fn push(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovered_projects_read_as_their_folder() {
+        let hash = "ab".repeat(32);
+        let discovered = format!("project-{hash}");
+        assert_eq!(project_display(&discovered, "C:\\work\\app"), "app");
+        assert_eq!(project_display("app-main", "C:\\work\\app"), "app-main");
+        assert_eq!(
+            project_display("project-short", "C:\\work\\app"),
+            "project-short"
+        );
+        let other = format!("project-{}", "cd".repeat(32));
+        let names = project_names(&[
+            (discovered.clone(), "C:\\a\\app".to_owned()),
+            (other.clone(), "C:\\b\\app".to_owned()),
+            ("web".to_owned(), "C:\\web".to_owned()),
+        ]);
+        assert_eq!(names, [discovered, other, "web".to_owned()]);
+    }
 
     fn agent(id: &str, project: &str, parent: Option<&str>) -> UiAgent {
         UiAgent {

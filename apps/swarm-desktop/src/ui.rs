@@ -100,6 +100,8 @@ const ADHOC_HARNESSES: [&str; 5] = ["codex", "claude", "muse", "opencode", "anti
 #[derive(Clone, Debug)]
 struct UiProject {
     id: String,
+    /// What the owner reads: the id, or the folder of a discovered project.
+    name: String,
     profiles: Vec<String>,
     workspace: String,
 }
@@ -273,12 +275,20 @@ fn load_projects_blocking(data_dir: &Path) -> Fallible<Vec<UiProject>> {
         let registrations = config_client::list_projects(data_dir)
             .await
             .map_err(|error| error.to_string())?;
+        let names = nav::project_names(
+            &registrations
+                .iter()
+                .map(|registration| (registration.id.clone(), registration.checkout.clone()))
+                .collect::<Vec<_>>(),
+        );
         Ok(registrations
             .into_iter()
-            .map(|registration| UiProject {
+            .zip(names)
+            .map(|(registration, name)| UiProject {
                 workspace: registration.checkout.clone(),
                 profiles: registration.profiles.clone(),
                 id: registration.id.clone(),
+                name,
             })
             .collect())
     })

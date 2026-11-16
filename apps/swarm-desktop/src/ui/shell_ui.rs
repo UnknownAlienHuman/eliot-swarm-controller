@@ -875,7 +875,7 @@ impl DesktopApp {
             .nav
             .projects
             .iter()
-            .map(|project| (project.workspace.clone(), project.id.clone()))
+            .map(|project| (project.workspace.clone(), project.name.clone()))
             .collect();
         let rows = nav::rows(
             &self.nav.agents,
@@ -1269,7 +1269,10 @@ pub(super) fn fleet_summary(agents: &[UiAgent], total: usize) -> (String, Status
     } else if total == 0 {
         "No Agents yet".to_owned()
     } else {
-        format!("All quiet · {total} Agents")
+        format!(
+            "All quiet · {total} {}",
+            if total == 1 { "Agent" } else { "Agents" }
+        )
     };
     (summary, tone)
 }

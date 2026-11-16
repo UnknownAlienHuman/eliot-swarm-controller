@@ -264,21 +264,17 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
     } else {
         View::empty()
     };
-    ScrollViewer::new()
-        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-        .content(
-            StackPanel::new().spacing(theme::spacing::MD).children((
-                crate::m3::card(palette)
-                    .padding(Thickness::uniform(theme::spacing::SM))
-                    .content(StackPanel::new().keyed_children(rows)),
-                crate::m3::card(palette)
-                    .content(StackPanel::new().spacing(12.0).keyed_children(form)),
-                small(state).opacity(theme::MUTED_OPACITY),
-                actions_row,
-                source,
-                small(data.status.to_owned()),
-            )),
-        )
+    // The Settings page scrolls the section, so the save bar follows.
+    StackPanel::new().spacing(theme::spacing::MD).children((
+        crate::m3::card(palette)
+            .padding(Thickness::uniform(theme::spacing::SM))
+            .content(StackPanel::new().keyed_children(rows)),
+        crate::m3::card(palette).content(StackPanel::new().spacing(12.0).keyed_children(form)),
+        small(state).opacity(theme::MUTED_OPACITY),
+        actions_row,
+        source,
+        small(data.status.to_owned()),
+    ))
 }
 
 fn utc(ms: i64) -> String {

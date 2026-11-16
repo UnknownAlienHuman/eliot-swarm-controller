@@ -949,7 +949,7 @@ impl DesktopApp {
             None => {
                 let project = self
                     .selected_project()
-                    .map(|project| project.id.clone())
+                    .map(|project| project.name.clone())
                     .or_else(|| {
                         (!self.launch.workspace.is_empty())
                             .then(|| nav::project_name(&self.launch.workspace, &[]))
@@ -1447,7 +1447,7 @@ impl DesktopApp {
         self.nav
             .projects
             .iter()
-            .map(|project| (project.workspace.clone(), project.id.clone()))
+            .map(|project| (project.workspace.clone(), project.name.clone()))
             .collect()
     }
 

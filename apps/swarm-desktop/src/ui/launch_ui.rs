@@ -20,7 +20,7 @@ const AUTO: &str = "Auto";
 #[derive(Clone, Debug)]
 pub(super) enum LaunchMsg {
     WorkspaceChanged(String),
-    /// A project chip entry: a registered project id or [`OTHER_FOLDER`].
+    /// A project chip entry: a registered project's name or [`OTHER_FOLDER`].
     ProjectMenu(String),
     /// A profile chip entry: [`AUTO`], a profile name or "<harness> harness".
     ProfileMenu(String),
@@ -140,7 +140,7 @@ impl DesktopApp {
                     .nav
                     .projects
                     .iter()
-                    .find(|project| project.id == label)
+                    .find(|project| project.name == label)
                     .cloned()
                 {
                     self.launch.workspace = project.workspace.clone();
@@ -382,7 +382,7 @@ impl DesktopApp {
     pub(super) fn launch_context(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let project_label = self
             .selected_project()
-            .map(|project| project.id.clone())
+            .map(|project| project.name.clone())
             .or_else(|| {
                 (!self.launch.workspace.is_empty())
                     .then(|| nav::project_name(&self.launch.workspace, &[]))
@@ -392,7 +392,7 @@ impl DesktopApp {
             .nav
             .projects
             .iter()
-            .map(|project| MenuItem::item(format!("p:{}", project.id), project.id.clone()))
+            .map(|project| MenuItem::item(format!("p:{}", project.id), project.name.clone()))
             .collect();
         if !project_items.is_empty() {
             project_items.push(MenuItem::separator("sep"));
@@ -469,15 +469,13 @@ impl DesktopApp {
                 MenuItem::item(format!("h:{harness}"), format!("{harness} harness"))
             }),
         ));
-        let tooltip = why.join("\n");
         let profile = m3::chip(palette)
             .automation_name(format!("Profile: {profile_label}. {}", why.join(". ")))
             .content(m3::chip_label(m3::glyph::PROFILE, &profile_label))
             .menu(Menu::new(
                 profile_items,
                 context.callback(|label: String| Message::Launch(LaunchMsg::ProfileMenu(label))),
-            ))
-            .tooltip(tooltip);
+            ));
         StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(theme::spacing::SM)

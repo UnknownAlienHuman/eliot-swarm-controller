@@ -358,7 +358,7 @@ impl DesktopApp {
                     .nav
                     .projects
                     .first()
-                    .map(|project| project.workspace.clone())
+                    .map(|project| nav::display_path(&project.workspace).to_owned())
                     .unwrap_or_default();
                 let s = &mut self.settings;
                 let key = s.new_assignment.trim().to_owned();
@@ -590,7 +590,7 @@ impl DesktopApp {
         } else {
             match page {
                 Page::General => scroll(self.general_section(context, palette)),
-                Page::Models => self.models_section(context, palette),
+                Page::Models => scroll(self.models_section(context, palette)),
                 Page::Routing => scroll(self.routing_section(context, palette)),
                 Page::Projects => scroll(self.projects_section(context, palette)),
                 Page::Automation => scroll(self.automation_section(context, palette)),
@@ -688,7 +688,6 @@ impl DesktopApp {
                         .content(m3::label("Discard")),
                 )),
             m3::muted(note, theme::type_scale::BODY_SMALL)
-                .automation_name(format!("{} save result", page.label()))
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true),
         ))
@@ -755,7 +754,6 @@ impl DesktopApp {
                 ],
             ),
             m3::muted(note, theme::type_scale::BODY_SMALL)
-                .automation_name("General save result")
                 .margin(Thickness::xy(theme::spacing::MD, 0.0))
                 .text_wrapping(TextWrapping::Wrap),
         ))
@@ -763,18 +761,10 @@ impl DesktopApp {
 
     fn models_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let dirty = self.editor.draft != self.editor.base;
-        Grid::new()
-            .rows([GridLength::STAR, GridLength::Auto])
-            .row_spacing(theme::spacing::MD)
-            .children((
-                self.profiles_view(context, palette),
-                Border::new().grid_row(1).content(self.save_bar(
-                    Page::Models,
-                    dirty,
-                    context,
-                    palette,
-                )),
-            ))
+        StackPanel::new().spacing(theme::spacing::MD).children((
+            self.profiles_view(context, palette),
+            self.save_bar(Page::Models, dirty, context, palette),
+        ))
     }
 
     fn routing_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
@@ -791,10 +781,13 @@ impl DesktopApp {
         // What Auto picks right now, from the saved policy.
         if let Some(Ok(decision)) = &self.launch.preview {
             let (headline, skipped) = model::decision_lines(decision);
-            let now = std::iter::once(format!("Now: {headline}."))
-                .chain(skipped)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let now = std::iter::once(format!(
+                "Right now Auto {}.",
+                headline.replacen("Routing picks", "picks", 1)
+            ))
+            .chain(skipped)
+            .collect::<Vec<_>>()
+            .join("\n");
             groups.push(KeyedView::new(
                 format!("now:{now}"),
                 m3::muted(now, theme::type_scale::BODY_SMALL)
@@ -940,10 +933,11 @@ impl DesktopApp {
             } else {
                 allowed.join(", ")
             };
+            let name = nav::project_display(&id, &path);
             items.push((
                 format!("project:{id}:{open}"),
                 m3::nav_item(palette, open)
-                    .automation_name(format!("Project {id}: {path}"))
+                    .automation_name(format!("Project {name}: {path}"))
                     .on_click(
                         context.message(Message::Settings(SettingsMsg::ProjectOpened(id.clone()))),
                     )
@@ -957,7 +951,8 @@ impl DesktopApp {
                                     .grid_column(1)
                                     .vertical_alignment(VerticalAlignment::Center)
                                     .children((
-                                        m3::text(id.clone(), theme::type_scale::BODY_LARGE),
+                                        m3::text(name.clone(), theme::type_scale::BODY_LARGE)
+                                            .text_trimming(TextTrimming::CharacterEllipsis),
                                         m3::muted(
                                             format!("{} · {summary}", nav::display_path(&path)),
                                             theme::type_scale::BODY_SMALL,
@@ -1006,7 +1001,7 @@ impl DesktopApp {
                     form_row(
                         "Checkout folder",
                         m3::field()
-                            .text(path.clone())
+                            .text(nav::display_path(&path).to_owned())
                             .automation_name(format!("Checkout folder of {id}"))
                             .is_enabled(!busy)
                             .on_text_changed(context.callback(move |text| {
@@ -1156,7 +1151,10 @@ impl DesktopApp {
                 form_row(
                     label,
                     m3::field()
-                        .text(model::assignment_text(automation, &key, field))
+                        .text(
+                            nav::display_path(&model::assignment_text(automation, &key, field))
+                                .to_owned(),
+                        )
                         .placeholder_text(hint)
                         .automation_name(format!("{label} of {key}"))
                         .is_enabled(!busy)
@@ -1210,6 +1208,8 @@ impl DesktopApp {
                     form_row(
                         "Agents kept busy",
                         NumberBox::new()
+                            .width(120.0)
+                            .horizontal_alignment(HorizontalAlignment::Left)
                             .minimum(1.0)
                             .maximum(1000.0)
                             .value(busy_count.map(|count| count as f64))
@@ -1376,7 +1376,7 @@ impl DesktopApp {
             "Every section applies without a restart.".to_owned()
         } else {
             format!(
-                "Applied at the daemon's next start: {}.",
+                "Changes to {} apply at the daemon's next start.",
                 self.settings
                     .restart_required
                     .iter()
