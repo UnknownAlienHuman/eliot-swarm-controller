@@ -596,14 +596,15 @@ on = { event = "hook.before_tool" }
 do = [{ action = "inject", target = "${event.agent}", at = "turn_safe_point", text = "Context: ${event.data.tool}" }]
 ```
 
-`target` renders from the captured event and must equal `event.agent`; the rule binds
-`expected_generation` to `event.generation` and, for `at = "turn_safe_point"`,
-`expected_turn_id` to the captured event's nonempty `data.turn_id`. For
+`target` renders from the captured event and must equal `event.agent`; for `at = "turn_safe_point"` the rule binds
+`expected_turn_id` to the captured event's nonempty `data.turn_id`. `expected_generation` stays unbound:
+hook events can report the turn's generation ahead of the retained Agent row, so Store enforces
+the captured Agent and turn id instead. For
 `at = "next_input"` the command carries no turn binding and is claimed by the next send.
 `at` is a literal `turn_safe_point` or `next_input` (no templates; `active_turn` is not
 a rule action). `text` renders once from the captured event and is frozen under the
-512 KiB text bound. Store revalidates the exact Agent, generation and (for safe-point)
-turn at admission and at the dispatch effect boundary; adapters whose effective
+512 KiB text bound. Store revalidates the exact Agent and (for safe-point) turn
+at admission and at the dispatch effect boundary; adapters whose effective
 `context_points` lack the requested point return their typed `unsupported`, never a
 weaker send. `inject` requires an event trigger and is unsupported for timers.
 
