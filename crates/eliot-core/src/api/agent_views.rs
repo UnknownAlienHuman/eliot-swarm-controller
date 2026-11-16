@@ -3,8 +3,9 @@
 
 use super::{GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView};
 use crate::{
-    Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity, ProcessIdentity,
-    ProcessRecord, Result, SessionUsage, TurnOutcome, TurnUsage,
+    Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
+    NativeChildActivityState, ProcessIdentity, ProcessRecord, Result, SessionUsage, TurnOutcome,
+    TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -405,6 +406,53 @@ impl AgentSummary {
             _ => "turn",
         };
         Some((tokens, scope))
+    }
+
+    /// Human-readable fleet STATE cell.
+    pub fn display_state(&self) -> String {
+        match &self.activity {
+            Some(activity) => format!("{} (observed)", activity_state_name(activity.state)),
+            None => agent_state_name(self.state).to_owned(),
+        }
+    }
+
+    /// Fleet counting bucket for one summary.
+    pub fn fleet_bucket(&self) -> &'static str {
+        match &self.activity {
+            Some(activity) => match activity.state {
+                NativeChildActivityState::Running => "running",
+                NativeChildActivityState::Idle => "idle",
+                NativeChildActivityState::Interrupted => "interrupted",
+                NativeChildActivityState::Unknown | NativeChildActivityState::Lost => "unknown",
+            },
+            None => agent_state_name(self.state),
+        }
+    }
+}
+
+/// Lifecycle state name shared by fleet displays and counts.
+pub fn agent_state_name(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Unknown => "unknown",
+        AgentState::Created => "created",
+        AgentState::Starting => "starting",
+        AgentState::Idle => "idle",
+        AgentState::Busy => "busy",
+        AgentState::Waiting => "waiting",
+        AgentState::Stopped => "stopped",
+        AgentState::Failed => "failed",
+        AgentState::Lost => "lost",
+    }
+}
+
+/// Read-only native observed-child activity name.
+pub fn activity_state_name(state: NativeChildActivityState) -> &'static str {
+    match state {
+        NativeChildActivityState::Running => "running",
+        NativeChildActivityState::Idle => "idle",
+        NativeChildActivityState::Interrupted => "interrupted",
+        NativeChildActivityState::Lost => "lost",
+        NativeChildActivityState::Unknown => "unknown",
     }
 }
 
@@ -2359,6 +2407,52 @@ mod tests {
         scoped.usage = Some(session);
         scoped.usage_scope = Some("session".to_owned());
         assert_eq!(scoped.fleet_usage(), Some((47_231, "session")));
+    }
+
+    #[test]
+    fn observed_display_and_bucket_follow_activity_not_lifecycle_state() {
+        use crate::NativeChildActivity;
+        use crate::NativeChildActivityState as Activity;
+        let observed = |state: Activity| {
+            let mut row = summary();
+            row.state = AgentState::Unknown;
+            row.activity = Some(NativeChildActivity {
+                state,
+                has_open_turn: matches!(state, Activity::Running | Activity::Lost),
+                last_progress_at: None,
+            });
+            row
+        };
+        assert_eq!(observed(Activity::Idle).display_state(), "idle (observed)");
+        assert_eq!(
+            observed(Activity::Running).display_state(),
+            "running (observed)"
+        );
+        assert_eq!(
+            observed(Activity::Interrupted).display_state(),
+            "interrupted (observed)"
+        );
+        assert_eq!(
+            observed(Activity::Unknown).display_state(),
+            "unknown (observed)"
+        );
+        assert_eq!(observed(Activity::Lost).display_state(), "lost (observed)");
+        assert_eq!(summary().display_state(), "idle");
+        assert_eq!(observed(Activity::Idle).fleet_bucket(), "idle");
+        assert_eq!(observed(Activity::Running).fleet_bucket(), "running");
+        assert_eq!(
+            observed(Activity::Interrupted).fleet_bucket(),
+            "interrupted"
+        );
+        assert_eq!(observed(Activity::Unknown).fleet_bucket(), "unknown");
+        assert_eq!(observed(Activity::Lost).fleet_bucket(), "unknown");
+        assert_eq!(summary().fleet_bucket(), "idle");
+        let mut unknown = summary();
+        unknown.state = AgentState::Unknown;
+        assert_eq!(unknown.fleet_bucket(), "unknown");
+        let wire = serde_json::to_value(observed(Activity::Idle)).unwrap();
+        assert_eq!(wire["state"], "unknown");
+        assert_eq!(wire["activity"]["state"], "idle");
     }
 
     #[test]

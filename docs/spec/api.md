@@ -670,6 +670,15 @@ response binding failures remain `unknown`; validate the reply before printing
 it or advancing a cursor. `swarm ls` and `swarm top` render these summaries as
 compact tables by default, labeling the active turn separately from the
 last-terminal outcome/usage and reporting observation data availability only;
+the human-readable STATE cell shows the read-only `activity` value with an
+`observed` marker for native observed children (for example `idle (observed)`),
+while `--json` and `swarm show` keep both the unchanged lifecycle `state`
+(`unknown` for observed rows) and the `activity` object. Fleet `unknown`
+counts bucket by activity, never by raw `state`: controlled Agents count by
+lifecycle state, observed children with `running`/`idle`/`interrupted`
+activity count under that activity, and only observed `unknown`/`lost`
+activity counts as `unknown` (desktop monitor and `daemon.status` consumers
+must use this bucket);
 both tables carry a `USAGE` cell with the native total when supplied,
 otherwise the input+output sum as a fleet signal, suffixed `(t)` for
 turn-backed usage and `(s)` for the session fallback; `--json` keeps
