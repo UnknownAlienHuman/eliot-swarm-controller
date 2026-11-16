@@ -3,7 +3,7 @@ use eliot_core::{
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
 use eliot_plugin::{
-    CommitSink, MAX_EVENT_BYTES, MAX_TEXT_BYTES, PeerClient,
+    CommitSink, MAX_EVENT_BYTES, MAX_TEXT_BYTES, PeerClient, is_definite_batch_rejection,
     native_stdio::StreamState,
     native_transport::encode_frame,
     protocol::{HookEvent, HookResponse},
@@ -1435,14 +1435,20 @@ impl EventProcessor {
             return;
         }
         if let Err(error) = self.process_record(record).await {
-            self.status.source_unknown = true;
-            if self.status.failure.is_none() {
-                self.status.failure = Some(error.message);
+            // A definite pre-transaction rejection already recorded its gap
+            // with the typed reason and cleared the commit latch, so it must
+            // not latch the source unknown or taint later associations.
+            if !is_definite_batch_rejection(&error.code) {
+                self.status.source_unknown = true;
+                if self.status.failure.is_none() {
+                    self.status.failure = Some(error.message);
+                }
             }
             return;
         }
         // An association may have unblocked buffered assistant text.
         if let Err(error) = self.flush_buffer().await
+            && !is_definite_batch_rejection(&error.code)
             && self.status.failure.is_none()
         {
             self.status.failure = Some(error.message);
@@ -1638,7 +1644,14 @@ impl EventProcessor {
                     data["context_outcomes"] = json!(context_outcomes);
                 }
                 if let Err(error) = self.commit_event("turn.started", native_id, data).await {
-                    settle(outcome, TurnOutcome::Unknown(error.message.clone()));
+                    // A definite rejection proves the association was never
+                    // committed (a gap covers it); it must not become
+                    // turn.unknown.
+                    if is_definite_batch_rejection(&error.code) {
+                        settle(outcome, TurnOutcome::Rejected(error.message.clone()));
+                    } else {
+                        settle(outcome, TurnOutcome::Unknown(error.message.clone()));
+                    }
                     return Err(error);
                 }
                 settle(outcome, TurnOutcome::Associated);

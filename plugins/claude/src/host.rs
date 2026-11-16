@@ -1274,6 +1274,41 @@ impl ClaudePlugin {
             )
             .await
         {
+            // A definite pre-transaction rejection (for example the daemon's
+            // `secret_in_payload` refusal) proves the batch was never
+            // committed, so the launch settles as definite `failed`, never
+            // `Unknown`. Clean up the spawned CLI first; unconfirmed cleanup
+            // stays unknown.
+            if eliot_plugin::is_definite_batch_rejection(&error.code) {
+                let begin_error = session.events.begin_stop().await.err();
+                let exit_error = session
+                    .native
+                    .terminate(false, Instant::now() + RPC_TIMEOUT)
+                    .await
+                    .err();
+                let drain_error = session
+                    .native
+                    .await_output_drained(Instant::now() + RPC_TIMEOUT)
+                    .await
+                    .err();
+                session.events.close().await;
+                if begin_error.is_some() || exit_error.is_some() || drain_error.is_some() {
+                    session.phase = SessionPhase::Unknown;
+                    self.session = Some(session);
+                    return Err(Error::new(
+                        "unknown",
+                        format!(
+                            "Claude session.ready was definitely rejected ({}) but owned CLI cleanup is unconfirmed",
+                            error.code
+                        ),
+                    ));
+                }
+                let reason = format!(
+                    "Claude session.ready was definitely rejected ({}); the batch was never committed",
+                    error.code
+                );
+                return Ok(self.retain_proven_no_effect_start(params, reason));
+            }
             session.phase = SessionPhase::Unknown;
             self.session = Some(session);
             return Err(Error::new(

@@ -321,6 +321,17 @@ Same id with another semantic payload/cursor, or mixed new/duplicate events, is
 batch. This retry is Store admission, never a native command retry. No adapter journal
 or unbounded seen-event store is required by this contract.
 
+A typed `events.put` error returned from validation before the daemon opens the
+Store transaction is a definite rejection: the batch was never committed, so the
+plugin clears its unacknowledged-batch latch and surfaces the typed code. The
+definite set is `secret_in_payload`, `invalid`, `not_allowed` and
+`stale_generation`. Any error at or after the transaction (Store errors, lock
+deadlines, ack encoding) stays `unknown` with the latch kept; transport
+timeouts, closed peers and malformed/mismatched acks are likewise `unknown`.
+A definite rejection records a source gap with its typed reason (or fails the
+start as definite `failed`); it never becomes `turn.unknown` or a launch
+`Unknown`.
+
 A replayable source resumes strictly after its opaque committed cursor. A source with
 no exclusive cursor reconnects at the live edge, records a gap and reads current native
 state; it does not republish history. With neither stable record id nor cursor, a lost

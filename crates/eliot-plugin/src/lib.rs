@@ -10,7 +10,10 @@ mod stderr;
 pub mod sync;
 
 pub use file_identity::{FileIdentity, file_final_path, file_identity};
-pub use peer::{CommitSink, Peer, PeerClient, SnapshotDispatch, preemptible_snapshot};
+pub use peer::{
+    CommitSink, Peer, PeerClient, SnapshotDispatch, is_definite_batch_rejection,
+    preemptible_snapshot,
+};
 pub use protocol::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
     InitializeParams, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES, ObserverAttachParams,

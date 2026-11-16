@@ -381,7 +381,13 @@ impl CommitSink {
         let result = self.client.call_prepared(prepared, deadline, permit).await;
         let value = match result {
             Ok(value) => value,
-            Err(_) => return Err(unknown_batch_error()),
+            Err(error) => {
+                if is_definite_batch_rejection(&error.code) {
+                    self.unknown_batches.remove(&key);
+                    return Err(error);
+                }
+                return Err(unknown_batch_error());
+            }
         };
         let ack: BatchAck = match serde_json::from_value(value) {
             Ok(ack) => ack,
@@ -627,6 +633,21 @@ fn protocol_error(code: &str, rpc_code: i64, message: &str) -> RpcError {
 
 fn timeout_error(message: &str) -> Error {
     Error::new("timeout", message)
+}
+
+/// Pre-transaction `events.put` rejections that prove the batch was never
+/// committed. The daemon returns these directly (never wrapped as `unknown`);
+/// any other error (transport timeout/close, malformed/mismatched ack,
+/// post-transaction `unknown`) keeps the latch.
+pub const DEFINITE_BATCH_REJECTION_CODES: &[&str] = &[
+    "secret_in_payload",
+    "invalid",
+    "not_allowed",
+    "stale_generation",
+];
+
+pub fn is_definite_batch_rejection(code: &str) -> bool {
+    DEFINITE_BATCH_REJECTION_CODES.contains(&code)
 }
 
 fn unknown_batch_error() -> Error {
@@ -1149,5 +1170,159 @@ mod tests {
         assert_eq!(recorded[0].1["credential"], "fixture-cred");
         assert_eq!(recorded[1].0, "events.put");
         assert_eq!(recorded[1].1["credential"], "fixture-cred");
+    }
+
+    #[test]
+    fn definite_batch_rejection_codes_are_documented() {
+        for code in [
+            "secret_in_payload",
+            "invalid",
+            "not_allowed",
+            "stale_generation",
+        ] {
+            assert!(is_definite_batch_rejection(code), "code={code}");
+        }
+        for code in [
+            "unknown",
+            "timeout",
+            "transport_closed",
+            "transport_write",
+            "invalid_response",
+            "source_integrity",
+            "internal",
+        ] {
+            assert!(!is_definite_batch_rejection(code), "code={code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn definite_pre_transaction_rejection_clears_latch() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
+
+        let batch = SourceBatch {
+            batch_id: "batch-secret".to_owned(),
+            agent_id: "a1".to_owned(),
+            generation: 3,
+            source: "stream".to_owned(),
+            events: vec![eliot_core::NativeEvent {
+                kind: "session.ready".to_owned(),
+                native_id: "native-1".to_owned(),
+                data: json!({"native_scope": "claude-config:/secret-path"}),
+                ts: Some(1),
+            }],
+            cursor: None,
+        };
+
+        let (host_io, plugin_io) = duplex(64 * 1024);
+        let (plugin_read, plugin_write) = split(plugin_io);
+        let mut peer = Peer::from_io(plugin_read, plugin_write);
+        let client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        let fake_host = async {
+            let mut line = String::new();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("events.put request read");
+            let req: RpcRequest = serde_json::from_str(&line).expect("decode request");
+            assert_eq!(req.method, "events.put");
+            let reply = RpcResponse::failure(
+                req.id.clone(),
+                RpcError {
+                    code: -32000,
+                    message: "native source payload contains a known secret in immutable metadata"
+                        .to_owned(),
+                    data: Some(json!({"code": "secret_in_payload"})),
+                },
+            );
+            let frame = encode_frame(&reply).expect("encode failure response");
+            host_write
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .expect("send failure response");
+            drop(host_write);
+            drop(host_reader);
+        };
+
+        let plugin_calls = async {
+            let mut sink = CommitSink::new(client, "credential");
+            let err = sink
+                .commit(batch.clone(), Instant::now() + Duration::from_secs(5))
+                .await
+                .expect_err("definite rejection surfaces");
+            assert_eq!(err.code, "secret_in_payload");
+            assert!(!sink.is_unknown(&batch.agent_id, batch.generation, &batch.source));
+        };
+
+        tokio::join!(fake_host, plugin_calls);
+        peer_task.await.expect("peer task clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn post_transaction_error_stays_unknown_and_latched() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
+
+        let batch = SourceBatch {
+            batch_id: "batch-store".to_owned(),
+            agent_id: "a9".to_owned(),
+            generation: 3,
+            source: "stream".to_owned(),
+            events: vec![eliot_core::NativeEvent {
+                kind: "turn.started".to_owned(),
+                native_id: "native-9".to_owned(),
+                data: json!({"turn_id": "t-1"}),
+                ts: Some(1),
+            }],
+            cursor: None,
+        };
+
+        let (host_io, plugin_io) = duplex(64 * 1024);
+        let (plugin_read, plugin_write) = split(plugin_io);
+        let mut peer = Peer::from_io(plugin_read, plugin_write);
+        let client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+
+        let (host_read, mut host_write) = split(host_io);
+        let mut host_reader = BufReader::new(host_read);
+        let fake_host = async {
+            let mut line = String::new();
+            host_reader
+                .read_line(&mut line)
+                .await
+                .expect("events.put request read");
+            let req: RpcRequest = serde_json::from_str(&line).expect("decode request");
+            assert_eq!(req.method, "events.put");
+            let reply = RpcResponse::failure(
+                req.id.clone(),
+                RpcError {
+                    code: -32000,
+                    message: "events.put outcome unknown: store_lock_deadline".to_owned(),
+                    data: Some(json!({"code": "unknown"})),
+                },
+            );
+            let frame = encode_frame(&reply).expect("encode failure response");
+            host_write
+                .write_all(format!("{frame}\n").as_bytes())
+                .await
+                .expect("send failure response");
+            drop(host_write);
+            drop(host_reader);
+        };
+
+        let plugin_calls = async {
+            let mut sink = CommitSink::new(client, "credential");
+            let err = sink
+                .commit(batch.clone(), Instant::now() + Duration::from_secs(5))
+                .await
+                .expect_err("post-transaction error stays unknown");
+            assert_eq!(err.code, "unknown");
+            assert!(sink.is_unknown(&batch.agent_id, batch.generation, &batch.source));
+        };
+
+        tokio::join!(fake_host, plugin_calls);
+        peer_task.await.expect("peer task clean shutdown");
     }
 }
