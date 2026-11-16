@@ -14,11 +14,11 @@ use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentResultRequest,
     AgentResultResponse, CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest,
     CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
-    CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, EventsBoundsRequest,
-    EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
-    EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest, HandoffResponse,
-    HarnessModelsRequest, HarnessModelsResponse, ReparentRequest, ReparentResponse, SwitchRequest,
-    SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
+    CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest,
+    DiagnoseResponse, EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest,
+    EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest,
+    HandoffResponse, HarnessModelsRequest, HarnessModelsResponse, ReparentRequest,
+    ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -87,6 +87,20 @@ pub async fn get_agent(data_dir: &Path, id: &str) -> Result<AgentGetResponse> {
     params.validate()?;
     let reply: AgentGetResponse =
         eliot_daemon::client_call_typed(data_dir, "agent.get", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Owner-scoped failure diagnosis for one command, Agent or agent:turn.
+/// The desktop shows the one-line summary in Agent details; the full chain
+/// lives behind `swarm why`.
+pub async fn diagnose(data_dir: &Path, target: &str) -> Result<DiagnoseResponse> {
+    let params = DiagnoseRequest {
+        target: target.to_owned(),
+    };
+    params.validate()?;
+    let reply: DiagnoseResponse =
+        eliot_daemon::client_call_typed(data_dir, "diagnose", &params).await?;
     params.validate_response(&reply)?;
     Ok(reply)
 }
@@ -270,7 +284,8 @@ pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
 }
 
 /// What a launch freezes: a stored profile, or the Owner ad-hoc snapshot
-/// of one harness with optional model/effort (absent = native default).
+/// of one harness with optional model/effort (absent = native default) and
+/// access level (`ask`/`auto`/`full`; absent = the harness's safe defaults).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchTarget {
     /// No profile: the daemon's routing chooses at admission (role default).
@@ -280,6 +295,7 @@ pub enum LaunchTarget {
         harness: String,
         model: Option<String>,
         effort: Option<String>,
+        access: Option<String>,
     },
 }
 
@@ -313,6 +329,7 @@ pub async fn submit_launch(
             harness,
             model,
             effort,
+            access,
         } => {
             args["harness"] = Value::String(harness);
             if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
@@ -320,6 +337,9 @@ pub async fn submit_launch(
             }
             if let Some(effort) = effort.filter(|effort| !effort.trim().is_empty()) {
                 args["effort"] = Value::String(effort);
+            }
+            if let Some(access) = access.filter(|access| !access.trim().is_empty()) {
+                args["access"] = Value::String(access);
             }
         }
     }

@@ -48,6 +48,10 @@ pub(crate) struct Cli {
 // function instead of accumulating every argument builder in this enum's frame.
 #[derive(Subcommand)]
 pub(crate) enum CliCommand {
+    /// Plan or apply cleanup for retained Agent artifacts.
+    Cleanup(CleanupArgs),
+    /// Register an artifact directory owned by this Agent generation.
+    Artifact(ArtifactArgs),
     /// Read or save unified daemon settings with revision checking.
     Settings(SettingsArgs),
     /// Start the local daemon, or stop it with a drain/force request.
@@ -141,6 +145,8 @@ pub(crate) enum CliCommand {
     Cmd(CmdArgs),
     /// Resolve an unknown turn with an exact owner assertion.
     Turn(TurnArgs),
+    /// Explain why and where a command, Agent or turn failed (owner only).
+    Why(WhyArgs),
     /// Read committed events after a sequence number.
     Events(EventsArgs),
     /// Wait for a frozen set of child commands/turns with all/any semantics.
@@ -168,6 +174,45 @@ pub(crate) enum CliCommand {
     /// Internal plugin entry point used by the daemon.
     #[command(hide = true)]
     Plugin(PluginArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct CleanupArgs {
+    #[command(subcommand)]
+    pub(crate) command: CleanupCommand,
+}
+#[derive(Subcommand)]
+pub(crate) enum CleanupCommand {
+    Plan {
+        #[arg(long, default_value="self_tree", value_parser=["self_tree","project","all"])]
+        scope: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        older_than: Option<i64>,
+    },
+    Apply {
+        plan_id: String,
+        /// After a local branch is removed, delete it from its upstream
+        /// remote as well. Owner-only; never automatic.
+        #[arg(long)]
+        delete_remote: bool,
+    },
+}
+#[derive(Args)]
+pub(crate) struct ArtifactArgs {
+    #[command(subcommand)]
+    pub(crate) command: ArtifactCommand,
+}
+#[derive(Subcommand)]
+pub(crate) enum ArtifactCommand {
+    Register {
+        path: String,
+        #[arg(long,value_parser=["build","data_dir","temp","other"])]
+        kind: String,
+        #[arg(long)]
+        purpose: String,
+    },
 }
 
 #[derive(Args)]
@@ -672,6 +717,12 @@ pub(crate) struct CmdArgs {
 pub(crate) struct TurnArgs {
     #[command(subcommand)]
     pub(crate) command: TurnCommand,
+}
+
+#[derive(Args)]
+pub(crate) struct WhyArgs {
+    /// Command id, Agent id, or Agent id with turn id as agent:turn.
+    pub(crate) target: String,
 }
 
 #[derive(Args)]

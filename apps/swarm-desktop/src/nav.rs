@@ -41,6 +41,8 @@ pub struct UiAgent {
     pub title: String,
     /// A native observed child: observe-only, outside Swarm's control.
     pub native_child: bool,
+    /// Tokens the Agent's summary reports ([`AgentSummary::fleet_usage`]).
+    pub tokens: Option<i64>,
 }
 
 impl UiAgent {
@@ -57,6 +59,7 @@ impl UiAgent {
             // The daemon reports child activity only for native observed
             // children.
             native_child: summary.activity.is_some(),
+            tokens: summary.fleet_usage().map(|(tokens, _)| tokens),
         }
     }
 
@@ -783,6 +786,7 @@ mod tests {
             updated_at: 0,
             title: id.to_owned(),
             native_child: false,
+            tokens: None,
         }
     }
 

@@ -131,6 +131,46 @@ fn capture_native_store_inputs_inner(
     // checks. This capture proves inputs, never an effective native root/scope.
     Ok(())
 }
+
+/// Freeze an Agent's exact build output directory when the profile admits it
+/// through `pass_env`. Only the literal `CARGO_TARGET_DIR` name is captured;
+/// the value must be an absolute local path or it is skipped. Skipped means
+/// absent: cleanup backfills only what is frozen here, and Agents may always
+/// register their own target directory through `artifact.register`.
+pub(crate) fn capture_build_inputs(
+    profile: &mut Value,
+    mut lookup: impl FnMut(&str) -> Option<OsString>,
+) -> core::Result<()> {
+    let names = profile
+        .get("pass_env")
+        .and_then(Value::as_array)
+        .ok_or_else(|| core::Error::new("invalid", "resolved profile pass_env must be an array"))?;
+    let admitted = names
+        .iter()
+        .any(|name| name.as_str() == Some("CARGO_TARGET_DIR"));
+    if !admitted {
+        return Ok(());
+    }
+    let Some(value) = lookup("CARGO_TARGET_DIR") else {
+        return Ok(());
+    };
+    let Ok(value) = value.into_string() else {
+        return Ok(());
+    };
+    if value.is_empty()
+        || value.len() > 4096
+        || value.contains('\0')
+        || value.chars().any(char::is_control)
+        || !std::path::Path::new(&value).is_absolute()
+    {
+        return Ok(());
+    }
+    profile
+        .as_object_mut()
+        .ok_or_else(|| core::Error::new("invalid", "resolved profile must be an object"))?
+        .insert("target_dir".to_owned(), Value::String(value));
+    Ok(())
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
@@ -371,6 +411,11 @@ pub(crate) struct AssignmentConfig {
     pub(crate) role: String,
     pub(crate) max_busy: u32,
     pub(crate) interval: String,
+    /// Clean up build/temp directories and managed worktrees after an
+    /// applied stop retires an assignment Agent, through the existing
+    /// completion-rule stop path. Off by default; not a second executor.
+    #[serde(default)]
+    pub(crate) cleanup_on_retire: bool,
 }
 
 impl Default for AutomationConfig {
@@ -542,7 +587,15 @@ fn default_max_unread_messages_per_agent() -> i64 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct DaemonConfig {
     #[serde(default)]
+    pub(crate) artifact_roots: Vec<String>,
+    #[serde(default)]
     pub(crate) retention: RetentionConfig,
+    /// Daemon log verbosity: `standard` (working mode) or `debug`
+    /// (everything mode). Hot-reloadable through `settings.save`; changing
+    /// only this key never requires a restart. See
+    /// docs/spec/configuration.md: daemon logging.
+    #[serde(default = "default_log_level")]
+    pub(crate) log_level: String,
     /// Hierarchy fanout bounds consumed by launch/selector admission. See
     /// docs/spec/configuration.md: daemon limits. Deserialized directly as
     /// the core type: unlike retention windows these always apply, so an
@@ -572,10 +625,16 @@ pub(crate) struct DaemonConfig {
     pub(crate) session_file_bytes: i64,
 }
 
+fn default_log_level() -> String {
+    "standard".to_owned()
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            artifact_roots: Vec::new(),
             retention: RetentionConfig::default(),
+            log_level: default_log_level(),
             limits: core::api::HierarchyLimits::default(),
             attention_suspicion_secs: default_attention_suspicion_secs(),
             heavy_wall_secs: default_heavy_wall_secs(),
@@ -613,6 +672,17 @@ fn default_session_file_bytes() -> i64 {
 
 impl DaemonConfig {
     fn validate(self) -> core::Result<Self> {
+        if self.artifact_roots.len() > 32
+            || self
+                .artifact_roots
+                .iter()
+                .any(|p| p.len() > 4096 || !std::path::Path::new(p).is_absolute())
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "daemon.artifact_roots must contain at most 32 absolute local roots",
+            ));
+        }
         self.limits.validate().map_err(|error| {
             core::Error::new("profile_error", format!("config.toml: {}", error.message))
         })?;
@@ -622,6 +692,10 @@ impl DaemonConfig {
                 "config.toml: daemon.attention_suspicion_secs must be a positive integer whose millisecond value fits in i64",
             ));
         }
+        // Parse here so an invalid level is a config error, not a silent
+        // fallback. The live value is applied at startup and on every
+        // `settings.save` through `crate::logging`.
+        crate::logging::LogLevel::parse(&self.log_level)?;
         if self.heavy_wall_secs <= 0 || self.heavy_wall_secs > 31_536_000 {
             return Err(core::Error::new(
                 "profile_error",
@@ -653,9 +727,11 @@ impl DaemonConfig {
             ));
         }
         Ok(Self {
+            artifact_roots: self.artifact_roots,
             retention: self.retention.validate()?,
             limits: self.limits,
             attention_suspicion_secs: self.attention_suspicion_secs,
+            log_level: self.log_level,
             heavy_wall_secs: self.heavy_wall_secs,
             heavy_cpu_secs: self.heavy_cpu_secs,
             heavy_rss_bytes: self.heavy_rss_bytes,
@@ -3639,6 +3715,22 @@ mod tests {
         assert_eq!(assignment.role, "worker");
         assert_eq!(assignment.max_busy, 2);
         assert_eq!(assignment.interval, "30s");
+        assert!(
+            !assignment.cleanup_on_retire,
+            "retirement cleanup stays off unless the assignment opts in"
+        );
+
+        fixture.write(
+            "[automation.assignments.review-queue]\n\
+             folder='C:/work/briefs'\nworkspace='C:/work/eliot'\n\
+             role='worker'\nmax_busy=2\ninterval='30s'\ncleanup_on_retire=true\n",
+        );
+        let opted = load_automation_config(&fixture.root)
+            .unwrap()
+            .assignments
+            .remove("review-queue")
+            .unwrap();
+        assert!(opted.cleanup_on_retire);
 
         fixture.write(
             "[automation.assignments.review-queue]\n\
@@ -3672,6 +3764,7 @@ mod tests {
         assert_eq!(
             load_daemon_config(&fixture.root).unwrap(),
             DaemonConfig {
+                artifact_roots: Vec::new(),
                 retention: RetentionConfig {
                     events_days: Some(7),
                     commands_days: Some(14),
@@ -3679,6 +3772,7 @@ mod tests {
                 },
                 limits: core::api::HierarchyLimits::default(),
                 attention_suspicion_secs: 15 * 60,
+                log_level: default_log_level(),
                 heavy_wall_secs: default_heavy_wall_secs(),
                 heavy_cpu_secs: default_heavy_cpu_secs(),
                 heavy_rss_bytes: default_heavy_rss_bytes(),
@@ -3691,6 +3785,7 @@ mod tests {
         assert_eq!(
             load_daemon_config(&fixture.root).unwrap(),
             DaemonConfig {
+                artifact_roots: Vec::new(),
                 retention: RetentionConfig {
                     events_days: Some(7),
                     commands_days: None,
@@ -3698,6 +3793,7 @@ mod tests {
                 },
                 limits: core::api::HierarchyLimits::default(),
                 attention_suspicion_secs: 15 * 60,
+                log_level: default_log_level(),
                 heavy_wall_secs: default_heavy_wall_secs(),
                 heavy_cpu_secs: default_heavy_cpu_secs(),
                 heavy_rss_bytes: default_heavy_rss_bytes(),
@@ -3705,6 +3801,29 @@ mod tests {
                 session_file_bytes: default_session_file_bytes(),
             }
         );
+    }
+
+    #[test]
+    fn daemon_log_level_defaults_parses_and_rejects() {
+        let fixture = AutomationConfigFixture::new();
+        assert_eq!(DaemonConfig::default().log_level, "standard");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap().log_level,
+            "standard"
+        );
+        fixture.write("[daemon]\nlog_level = \"debug\"\n");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap().log_level,
+            "debug"
+        );
+        for source in [
+            "[daemon]\nlog_level = \"verbose\"\n",
+            "[daemon]\nlog_level = 1\n",
+        ] {
+            fixture.write(source);
+            let error = load_daemon_config(&fixture.root).unwrap_err();
+            assert_eq!(error.code, "profile_error", "source: {source}");
+        }
     }
 
     #[test]
@@ -4425,6 +4544,37 @@ mod tests {
                 "invalid"
             );
             assert_eq!(profile, original);
+        }
+    }
+
+    #[test]
+    fn build_inputs_freeze_exact_target_dir_only_when_admitted() {
+        let mut admitted = json!({"pass_env":["CODEX_HOME", "CARGO_TARGET_DIR"]});
+        capture_build_inputs(&mut admitted, |name| match name {
+            "CARGO_TARGET_DIR" => Some(OsString::from("C:/targets/wt-proof")),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(admitted["target_dir"], "C:/targets/wt-proof");
+
+        let mut unadmitted = json!({"pass_env":["CODEX_HOME"]});
+        capture_build_inputs(&mut unadmitted, |_| {
+            Some(OsString::from("C:/targets/wt-proof"))
+        })
+        .unwrap();
+        assert!(unadmitted.get("target_dir").is_none());
+
+        let mut unset = json!({"pass_env":["CARGO_TARGET_DIR"]});
+        capture_build_inputs(&mut unset, |_| None).unwrap();
+        assert!(unset.get("target_dir").is_none());
+
+        for bad in ["relative/target", ""] {
+            let mut profile = json!({"pass_env":["CARGO_TARGET_DIR"]});
+            capture_build_inputs(&mut profile, |_| Some(OsString::from(bad))).unwrap();
+            assert!(
+                profile.get("target_dir").is_none(),
+                "refused value must stay absent: {bad}"
+            );
         }
     }
 

@@ -379,6 +379,11 @@ fn require_free(connection: &Connection, agent: &Agent, id: i64) -> Result<()> {
                     "configured capacity bound {} max_live={max_live} is reserved",
                     scope.scope
                 ),
+            )
+            .with_where("store.admission.capacity")
+            .with_origin(
+                core::FailureOrigin::Swarm,
+                "configured local capacity bound is reserved",
             ));
         }
     }

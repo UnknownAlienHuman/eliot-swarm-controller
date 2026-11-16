@@ -214,11 +214,12 @@ only edits preserve the schedule. Reconcile timers from stored state on restart.
 
 Global and registered-project timers use their namespace's startup-loaded rule files and
 the existing command router. The connected timer slice admits ordinary `stop`, `send` and
-`resume` Agent actions, plus targetless `launch` and `run` children for global and
-registered-project interval, cron and once firings, including manual `timer.run`. See
+`resume` Agent actions, plus targetless `launch`, `run`, `mail.send` and `var.set` children
+for global and registered-project interval, cron and once firings, including manual
+`timer.run`. See
 [Timer Run invocation context](#timer-run-invocation-context).
-Timer `interrupt`, `steer` and request-reply actions remain unsupported for scheduled or
-manual timer runs.
+Timer `interrupt`, `steer`, `inject` and request-reply actions remain unsupported for
+scheduled or manual timer runs; `inject` requires an event trigger with exact turn binding.
 Other action verbs remain future work.
 
 ```toml
@@ -239,7 +240,10 @@ Scheduled and manual timer actions have no event or subject context, so Agent-ac
 Neither text value can use event or subject templates.
 A timer `launch` uses the same literal profile or role and workspace fields; its optional
 text is literal and cannot use event or subject templates. Folder assignment is supported
-only by the settings-generated timer path.
+only by the settings-generated timer path. Timer `mail.send` and `var.set` use the same
+literal targetless coordination DTOs as event rules (no templates; bounded, secret-checked
+payloads) through the existing CAS and mailbox path with rule principal attribution and
+rule-action limits.
 
 An interval `every` value uses the humantime duration grammar and must be positive with
 whole-millisecond precision; it is normalized to signed `period_ms`. An explicit interval
@@ -399,8 +403,11 @@ Disabled rules advance their skipped range without firing.
 Backlog, explicit history catch-up, and rate-limit semantics are defined in
 [Retention and bounded backlog](#retention-and-bounded-backlog).
 This connected event-rule subset supports event actions `stop`, `send`, `launch`, `resume`,
-`interrupt`, `steer`, `approve`, `deny` and `answer`, plus project event-rule `run` during live
-evaluation and explicit history catch-up. Event-rule `resume` is available in live evaluation
+`interrupt`, `steer`, `approve`, `deny`, `answer`, `mail.send`, `var.set` and `inject`, plus
+project event-rule `run` during live
+evaluation and explicit history catch-up. Event `mail.send` and `var.set` are literal
+targetless coordination actions; event `inject` binds its Agent and turn exactly from the
+captured event (see below). Event-rule `resume` is available in live evaluation
 and finite `rule.catch_up`; both use the captured event binding and ordinary command admission.
 The global event-rule `run` contract below uses owner-global approval and the shared frozen
 execution path. Other full L4.2 action requirements remain cumulative. SEND uses the
@@ -451,6 +458,10 @@ alone grants no cleanup authority; project rules with the same name remain separ
 The completion rule stops only that captured Agent/generation,
 releasing native live capacity after custody closes. Native `data.cause` is not a match
 authority. Assigned Agents own one brief; they are retired after their terminal turn.
+When the assignment sets `cleanup_on_retire = true` (default false), the
+applied stop also cleans that Agent's build, temp and managed-worktree
+artifacts inline in the stop worker: same authority check, same quiescence
+gate and guarded deletion, with retained receipts, and no second executor.
 Manual timer runs use the same admission and cursor checks. Multiple firings race
 through the same retained cursor and are serialized by Store's cursor compare-and-swap.
 The ordinary command ID remains the timer child ID, preserving exact same-ID replay.
@@ -577,6 +588,31 @@ The existing global action guard also counts each configured action once. Only t
 impose a per-rule count. The `RuleLimit` configuration is unchanged, and this introduces no
 new quota or accounting key.
 
+### Inject context at the safe point
+
+The `inject` action submits the existing ordinary `inject` command through the
+Router/Store path with no new executor:
+
+```toml
+[[rule]]
+id = "hook-context"
+on = { event = "hook.before_tool" }
+do = [{ action = "inject", target = "${event.agent}", at = "turn_safe_point", text = "Context: ${event.data.tool}" }]
+```
+
+`target` renders from the captured event and must equal `event.agent`;
+`expected_generation` binds the captured event's generation. For
+`at = "turn_safe_point"` the rule also binds `expected_turn_id` to the captured
+event's nonempty `data.turn_id`. Store enforces these bindings and the live Agent
+generation at admission. For `at = "next_input"` the command carries no turn
+binding and is claimed by the next send in that generation.
+`at` is a literal `turn_safe_point` or `next_input` (no templates; `active_turn` is not
+a rule action). `text` renders once from the captured event and is frozen under the
+512 KiB text bound. Store revalidates the exact Agent and (for safe-point) turn
+at admission and at the dispatch effect boundary; adapters whose effective
+`context_points` lack the requested point return their typed `unsupported`, never a
+weaker send. `inject` requires an event trigger and is unsupported for timers.
+
 ## Matching and rendering
 
 `on.event` names a literal static committed event kind; ephemeral samples are not
@@ -620,6 +656,7 @@ hidden wait/acceptance state to the router.
 | `launch` | targetless ordinary launch command at generation 0; optional nonblank text creates the normal linked `send` |
 | `mail.send` | targetless ordinary command; Store atomically commits one scoped queued-mail fanout with its Applied outcome |
 | `var.set` | targetless ordinary command; Store atomically commits one versioned variable write with its Applied outcome |
+| `inject` | Agent-bound ordinary command through the existing `inject` verb; durable pending context claimed at `turn_safe_point` or `next_input` with exact event turn binding; unsupported points return typed `unsupported`, never a weaker send |
 | `run` | targetless `SubmitCommand` via Router; bounded child under saved authority; emitted commands become ordered children |
 | `notify` | targetless ordinary command; Store atomically commits one persisted `x.user.notify` event with its Applied outcome (local log only) |
 | `emit` | targetless ordinary command; Store atomically commits one persisted `x.user.<topic>` event with its Applied outcome (local log only) |

@@ -44,6 +44,9 @@ macro_rules! method {
 // Every Router match arm is described here. The coverage regression below makes
 // omission deliberate: new methods must be described before they can ship.
 const METHODS: &[Method] = &[
+    method!("artifact.register", ArtifactRegisterRequest, ArtifactView, false, true, "Register an existing Agent-owned artifact directory with exact generation and opened identity.", {"id":EXAMPLE_ID,"path":"C:/scratch/build","kind":"build","purpose":"assignment build"}),
+    method!("cleanup.plan", CleanupPlanRequest, CleanupPlan, false, false, "Plan bounded cleanup: Agents own subtree; Owner project or all. No deletion.", {"scope":"self_tree"}),
+    method!("cleanup.apply", CleanupApplyRequest, CleanupApplyResponse, false, true, "Consume one plan, rechecking safe entries; replay returns retained outcomes.", {"id":EXAMPLE_ID,"plan_id":EXAMPLE_ID}),
     method!(
         "client.identity",
         InferenceIdentityRequest,
@@ -95,6 +98,16 @@ const METHODS: &[Method] = &[
         {}
     ),
     method!("daemon.shutdown", DaemonShutdownRequest, DaemonShutdownResponse, true, true, "Request drain or force shutdown; acknowledgement is not process-exit proof.", {"id":EXAMPLE_ID,"mode":"drain"}),
+    #[cfg(debug_assertions)]
+    method!(
+        "daemon.panic_test",
+        DaemonPanicTestRequest,
+        DaemonPanicTestResponse,
+        true,
+        false,
+        "Debug builds only: force a daemon panic to test crash capture (Owner).",
+        {}
+    ),
     method!(
         "maintenance.run",
         MaintenanceRunRequest,
@@ -150,6 +163,7 @@ const METHODS: &[Method] = &[
     method!("agent.edits", AgentEditsRequest, AgentEditsResponse, false, false, "Read a bounded page of observed workspace edits.", {"id":"a1","limit":20}),
     method!("turn.get", TurnGetRequest, Turn, false, false, "Read one exact Agent/generation/turn binding.", {"agent":"a1","generation":1,"turn_id":"turn-1"}),
     method!("turn.resolve", TurnResolveRequest, TurnResolveResponse, true, true, "Record an owner resolution for one uncertain exact turn.", {"id":EXAMPLE_ID,"agent":"a1","generation":1,"turn_id":"turn-1","status":"completed","reason":"Owner verified completion."}),
+    method!("diagnose", DiagnoseRequest, DiagnoseResponse, true, false, "Explain a failed command, Agent or agent:turn: origin, where, exits, stderr tail (Owner).", {"target":"a1"}),
     method!(
         "events.bounds",
         EventsBoundsRequest,

@@ -47,18 +47,121 @@ pub enum Startup {
     LastConversation,
 }
 
+/// A launch access level: the Owner ad-hoc launch `access` and
+/// `[desktop] last_access` (`docs/spec/configuration.md`, the access table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    /// Every approval goes to the Owner as a pending request.
+    Ask,
+    /// The harness's automatic posture inside the workspace.
+    Auto,
+    /// The harness's full-access posture.
+    Full,
+}
+
+impl Access {
+    pub const ALL: [Self; 3] = [Self::Ask, Self::Auto, Self::Full];
+
+    /// The launch `access` value.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Auto => "auto",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ask => "Ask for approval",
+            Self::Auto => "Approve for me",
+            Self::Full => "Full access",
+        }
+    }
+
+    /// One line on what the level lets the Agent do.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Ask => "Every command and file change waits for your approval",
+            Self::Auto => "Works inside the project; asks only where the harness must",
+            Self::Full => "Unrestricted access to your files and the network, no approvals",
+        }
+    }
+}
+
+/// One model the picker remembers (`[desktop] favorite_models` and
+/// `recent_models`): the harness, its native model id and an optional effort.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelRef {
+    pub harness: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// `[desktop]` list bounds (the daemon's validation).
+pub const MAX_FAVORITES: usize = 50;
+pub const MAX_RECENTS: usize = 20;
+pub const MAX_COLLAPSED: usize = 100;
+/// The longest collapsed-project key `[desktop]` accepts.
+pub const MAX_COLLAPSED_KEY: usize = 256;
+
 /// The `[desktop]` preferences the window applies.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Preferences {
     pub theme: ThemeChoice,
     pub startup: Startup,
+    /// Favorite models, in the order they were marked.
+    pub favorites: Vec<ModelRef>,
+    /// Models launched recently, most recent first.
+    pub recents: Vec<ModelRef>,
+    /// Section keys of collapsed sidebar projects.
+    pub collapsed: Vec<String>,
+    /// The access level new tasks start with (the last one chosen).
+    pub last_access: Option<Access>,
 }
 
 impl Preferences {
     pub fn from_reply(reply: &SettingsReadResponse) -> Self {
+        let desktop = reply.sections.get(&SettingsSection::Desktop);
+        let field = |name: &str| desktop.and_then(|value| value.get(name)).cloned();
+        let models = |name: &str| -> Vec<ModelRef> {
+            field(name)
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default()
+        };
         Self {
             theme: theme(reply),
             startup: startup(reply),
+            favorites: models("favorite_models"),
+            recents: models("recent_models"),
+            collapsed: field("collapsed_projects")
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
+            last_access: field("last_access").and_then(|value| serde_json::from_value(value).ok()),
+        }
+    }
+
+    /// Put `model` first in Recents (once), within the bound.
+    pub fn remember(&mut self, model: ModelRef) {
+        self.recents.retain(|known| *known != model);
+        self.recents.insert(0, model);
+        self.recents.truncate(MAX_RECENTS);
+    }
+
+    /// Mark or unmark `model` (its harness and model id, any effort) as a
+    /// favorite. Returns whether it is one now; a full list adds nothing.
+    pub fn toggle_favorite(&mut self, model: ModelRef) -> bool {
+        let same = |known: &ModelRef| known.harness == model.harness && known.model == model.model;
+        if self.favorites.iter().any(same) {
+            self.favorites.retain(|known| !same(known));
+            false
+        } else if self.favorites.len() < MAX_FAVORITES {
+            self.favorites.push(model);
+            true
+        } else {
+            false
         }
     }
 }
@@ -292,11 +395,9 @@ pub async fn save_preferences(
     window: Option<(u32, u32)>,
 ) -> eliot_core::Result<SettingsSaveResponse> {
     let read = read(data_dir).await?;
-    let wire = |value: serde_json::Value| value.as_str().unwrap_or_default().to_owned();
     let desktop = crate::settings_model::desktop_section(
         read.sections.get(&SettingsSection::Desktop),
-        &wire(serde_json::to_value(preferences.theme).expect("theme serialization")),
-        &wire(serde_json::to_value(preferences.startup).expect("startup serialization")),
+        &preferences,
         window,
     );
     let request = SettingsSaveRequest {
@@ -358,6 +459,64 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(choice).unwrap(), text);
         }
+    }
+
+    #[test]
+    fn access_levels_match_launch_values() {
+        for access in Access::ALL {
+            assert_eq!(serde_json::to_value(access).unwrap(), access.wire());
+        }
+    }
+
+    #[test]
+    fn recents_stay_unique_most_recent_first_and_bounded() {
+        let model = |id: &str| ModelRef {
+            harness: "codex".to_owned(),
+            model: id.to_owned(),
+            effort: None,
+        };
+        let mut prefs = Preferences::default();
+        for index in 0..(MAX_RECENTS + 5) {
+            prefs.remember(model(&format!("m{index}")));
+        }
+        prefs.remember(model("m3"));
+        assert_eq!(prefs.recents.len(), MAX_RECENTS);
+        assert_eq!(prefs.recents[0], model("m3"));
+        assert_eq!(prefs.recents.iter().filter(|m| m.model == "m3").count(), 1);
+        assert!(prefs.toggle_favorite(model("a")));
+        assert!(prefs.favorites.iter().any(|known| known.model == "a"));
+        // The same model with another effort is the same favorite.
+        assert!(!prefs.toggle_favorite(ModelRef {
+            effort: Some("low".to_owned()),
+            ..model("a")
+        }));
+        assert!(prefs.favorites.is_empty());
+    }
+
+    #[test]
+    fn preferences_read_the_picker_lists() {
+        let reply = SettingsReadResponse {
+            revision: Some("r".to_owned()),
+            sections: [(
+                SettingsSection::Desktop,
+                serde_json::json!({
+                    "theme": "dark",
+                    "favorite_models": [{"harness": "claude", "model": "claude-opus-5-5", "effort": "high"}],
+                    "recent_models": [{"harness": "codex", "model": "gpt-6-luna"}],
+                    "collapsed_projects": ["repo:c:/x/.git"],
+                    "last_access": "full"
+                }),
+            )]
+            .into(),
+            restart_required: Vec::new(),
+            history: Vec::new(),
+        };
+        let prefs = Preferences::from_reply(&reply);
+        assert_eq!(prefs.theme, ThemeChoice::Dark);
+        assert_eq!(prefs.favorites[0].effort.as_deref(), Some("high"));
+        assert_eq!(prefs.recents[0].model, "gpt-6-luna");
+        assert_eq!(prefs.collapsed, vec!["repo:c:/x/.git".to_owned()]);
+        assert_eq!(prefs.last_access, Some(Access::Full));
     }
 
     #[test]

@@ -654,11 +654,12 @@ impl Router {
                     | "emit"
                     | "mail.send"
                     | "var.set"
+                    | "inject"
             )
         {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain a prepared stop, send, launch, resume, steer, interrupt, reply, Run, mail.send, var.set, or local event action",
+                "rule firing must contain a prepared stop, send, launch, resume, steer, interrupt, reply, Run, inject, mail.send, var.set, or local event action",
             ));
         }
         let admission = {
@@ -2005,7 +2006,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
             .unwrap_err();
         assert_eq!(error.code, "not_allowed");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "project registration changed before timer admission"
         );
     }

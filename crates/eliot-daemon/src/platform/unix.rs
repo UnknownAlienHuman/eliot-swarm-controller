@@ -565,6 +565,12 @@ pub(crate) fn linux_start_ticks(pid: u32) -> u64 {
 /// Whether a process identity recorded by an earlier daemon is still that
 /// running process. A zombie or a reused PID is not.
 #[cfg(target_os = "linux")]
+/// Handle deletion is unavailable off Windows: always keep a directory whose
+/// daemon lock file is present.
+pub(crate) fn lock_owner_process_alive(_pid: u32) -> bool {
+    true
+}
+
 pub(crate) fn recorded_process_alive(pid: u32, start_ticks: u64) -> Result<bool> {
     match read_linux_process_stat(pid) {
         Ok(stat) => Ok(stat.start_ticks == start_ticks && stat.state != ProcessState::Exited),

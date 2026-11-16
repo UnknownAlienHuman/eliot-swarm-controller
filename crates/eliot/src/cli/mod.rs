@@ -3,6 +3,7 @@
 //! module only routes a parsed command to the owning family runner.
 mod agents;
 pub(crate) mod args;
+mod cleanup;
 mod coord;
 mod daemon;
 mod reads;
@@ -21,6 +22,8 @@ pub(crate) async fn dispatch(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
+        CliCommand::Cleanup(args) => cleanup::run_cleanup(args, data_dir, json_output, id).await,
+        CliCommand::Artifact(args) => cleanup::run_artifact(args, data_dir, json_output, id).await,
         CliCommand::Settings(args) => settings::run(args, data_dir, json_output).await,
         CliCommand::Daemon(args) => daemon::run_daemon(args, data_dir, json_output, id).await,
         CliCommand::Mcp(args) => daemon::run_mcp(args, data_dir, json_output).await,
@@ -64,6 +67,7 @@ pub(crate) async fn dispatch(
         CliCommand::Worktree(args) => agents::run_worktree(args, data_dir, json_output, id).await,
         CliCommand::Cmd(args) => coord::run_cmd(args, data_dir, json_output, id).await,
         CliCommand::Turn(args) => coord::run_turn(args, data_dir, json_output, id).await,
+        CliCommand::Why(args) => reads::run_why(args, data_dir, json_output).await,
         CliCommand::Events(args) => reads::run_events(args, data_dir, json_output).await,
         CliCommand::Wait(args) => agents::run_wait(args, data_dir, json_output).await,
         CliCommand::Digest(args) => agents::run_digest(args, data_dir, json_output, id).await,

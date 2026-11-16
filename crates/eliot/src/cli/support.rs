@@ -66,7 +66,7 @@ impl Failure {
         let code = error.code.clone();
         let mut failure = Self::new(exit_code, error.to_string());
         failure.code = Some(code);
-        failure.diagnostics = error.diagnostics;
+        failure.diagnostics = *error.diagnostics;
         eliot_core::bound_stderr_diagnostics(
             &mut failure.diagnostics,
             eliot_core::MAX_STDERR_DIAGNOSTIC_BYTES,

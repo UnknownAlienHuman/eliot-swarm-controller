@@ -73,6 +73,40 @@ fn status(connection: &Connection, key: &str, max_busy: u64) -> Result<Assignmen
 }
 
 impl Store {
+    /// Return the folder-assignment key whose Owner launch created this exact
+    /// Agent generation, when exactly one launch claims it. Used by
+    /// retirement cleanup after an applied stop; ambiguous or absent
+    /// launches retire with no cleanup.
+    pub fn assignment_key_for_agent(&self, agent: &str, generation: i64) -> Result<Option<String>> {
+        let agent_num = parse_agent_id(agent)?;
+        self.ensure_committed_reads()?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT json_extract(args,'$.assignment.key') FROM commands
+                 WHERE verb='launch' AND principal='owner' AND target=?1 AND generation=?2
+                   AND json_extract(args,'$.assignment.key') IS NOT NULL LIMIT 2",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![agent_num, generation], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error)?;
+        let mut found: Option<String> = None;
+        let mut count = 0;
+        for key in rows {
+            count += 1;
+            found = Some(key.map_err(sql_error)?);
+        }
+        if count != 1 {
+            return Ok(None);
+        }
+        let key = found.ok_or_else(|| Error::new("source_integrity", "assignment key vanished"))?;
+        validate_key(&key)?;
+        Ok(Some(key))
+    }
+
     pub fn assignment_status(&self, key: &str, max_busy: u64) -> Result<AssignmentStatus> {
         self.ensure_committed_reads()?;
         status(&self.connection, key, max_busy)
@@ -591,5 +625,26 @@ mod tests {
             )
             .unwrap();
         assert!(!store.is_assignment_event(seq, "pool", &agent, 1).unwrap());
+    }
+
+    #[test]
+    fn assignment_key_for_agent_matches_exact_owner_launch() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let admission = store
+            .submit("owner", launch(None, "01.md"), 1_800_000_000_000)
+            .unwrap();
+        let agent = admission.command.target.clone().unwrap();
+        let generation = store.get_agent(&agent).unwrap().unwrap().generation;
+        assert_eq!(
+            store.assignment_key_for_agent(&agent, generation).unwrap(),
+            Some("pool".to_owned())
+        );
+        assert_eq!(
+            store
+                .assignment_key_for_agent(&agent, generation + 1)
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.assignment_key_for_agent("a999999", 1).unwrap(), None);
     }
 }

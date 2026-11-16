@@ -30,6 +30,10 @@ pub struct Settings {
     pub effort_verified: bool,
     /// The frozen profile's permissions (absent: the native default).
     pub permissions: Option<String>,
+    /// The frozen ad-hoc access level (`ask`/`auto`/`full`), when the
+    /// launch named one: it decides what the Agent may do, whatever the
+    /// harness's own permission fields say.
+    pub access: Option<String>,
 }
 
 impl Settings {
@@ -61,6 +65,7 @@ impl Settings {
             model_verified: flag("model_verified"),
             effort_verified: flag("effort_verified"),
             permissions: text(snapshot, "permissions"),
+            access: text(snapshot, "access"),
         }
     }
 

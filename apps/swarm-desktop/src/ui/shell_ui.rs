@@ -8,7 +8,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use super::*;
 use crate::nav::{Branch, Checkout, Fleet, Row, Section, Shown};
 use crate::settings::{Startup, ThemeChoice};
-use crate::shortcuts::Shortcut;
+use crate::shortcuts::{Input, Shortcut};
 use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
 
@@ -53,7 +53,7 @@ pub(super) enum ShellMsg {
     SearchChanged(String),
     /// A search suggestion chosen (clicked, or reached with the arrows).
     SearchChosen(String),
-    /// Ctrl+N or Ctrl+K.
+    /// A chord, a popover key or Enter from the keyboard hook.
     Shortcut(Shortcut),
     /// Try focusing the search box again (tries left): WinUI refused it,
     /// as it does right after the window is activated, or the box did not
@@ -67,6 +67,10 @@ pub(super) enum ShellMsg {
     NewTask,
     MoreAgentsRequested,
     SettingsOpened,
+    /// Open Settings at one page (the sidebar's Automations and Usage).
+    SettingsPage(settings_ui::Page),
+    /// The Settings navigation's search field.
+    SettingsSearch(String),
     /// The Settings navigation's Back row: the conversation again.
     SettingsClosed,
     PanelToggled(Panel),
@@ -105,9 +109,13 @@ const PRIME_RETRY_MS: u64 = 16;
 const SIDEBAR_PADDING: f64 = tokens::spacing::SM;
 /// Rows in Recents.
 const RECENTS: usize = 8;
-/// Focus attempts for Ctrl+K, and the wait between them.
-const SEARCH_FOCUS_TRIES: u8 = 3;
+/// Focus attempts for Ctrl+K, and the wait between them: right after a
+/// cold start WinUI refuses focus until the window's content is ready.
+const SEARCH_FOCUS_TRIES: u8 = 20;
 const SEARCH_FOCUS_RETRY_MS: u64 = 100;
+/// A suggestion WinUI reports as chosen this soon after ↑/↓ was reached
+/// with the arrows: it is only highlighted.
+const ARROW_CHOICE_MS: u64 = 500;
 /// How long the shortcut watcher waits before checking for cancellation.
 const SHORTCUT_POLL_MS: u64 = 500;
 /// The sidebar's states and Recents follow the daemon at this cadence.
@@ -157,9 +165,8 @@ pub(super) struct ShellState {
     /// Tags agent-list loads; a reply for an older request is dropped.
     pub(super) list_epoch: u64,
     pub(super) pending_select: Option<UiAgent>,
-    /// Section keys of collapsed projects, in memory for now: k76a adds
-    /// `[desktop] collapsed_projects`, written from
-    /// [`DesktopApp::collapsed_projects_changed`].
+    /// Section keys of collapsed projects (`[desktop] collapsed_projects`,
+    /// written from [`DesktopApp::collapsed_projects_changed`]).
     pub(super) collapsed: HashSet<String>,
     /// Section keys whose older stopped tasks are unfolded.
     pub(super) unfolded: HashSet<String>,
@@ -183,6 +190,9 @@ pub(super) struct Search {
     pub(super) query: String,
     /// `(label, Agent id)` per suggestion ([`nav::search`]).
     pub(super) results: Vec<(String, String)>,
+    /// The suggestion reached with ↑/↓: its label, Agent id and the input
+    /// epoch then. Enter opens it while no other input came between.
+    pub(super) highlighted: Option<(String, String, u64)>,
 }
 
 impl DesktopApp {
@@ -192,6 +202,8 @@ impl DesktopApp {
                 Ok((discovered, read)) => {
                     self.startup_error = false;
                     self.prefs = crate::settings::Preferences::from_reply(&read);
+                    self.nav.collapsed = self.prefs.collapsed.iter().cloned().collect();
+                    self.launch_preferences_loaded();
                     self.preferred_window = crate::settings::window(&read);
                     // The opened checkout, registered by discovery, is where
                     // a new task starts.
@@ -203,6 +215,8 @@ impl DesktopApp {
                     self.load_agents(context, None);
                     self.load_profile_list(context);
                     self.load_routing_preview(context);
+                    // The picker opens on a read catalogue (the daemon caches it).
+                    self.load_catalog(context);
                     if let Ok(data_dir) = self.data_dir.clone() {
                         let _task = context.spawn_background(move |_| {
                             Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(
@@ -303,6 +317,7 @@ impl DesktopApp {
                 }
             }
             ShellMsg::AgentOpened(agent) => {
+                self.close_popover();
                 self.chat.opened_from_search = false;
                 if self.main != Main::Conversation {
                     self.main = Main::Conversation;
@@ -366,13 +381,9 @@ impl DesktopApp {
                     self.load_agents(context, Some(after));
                 }
             }
-            ShellMsg::SettingsOpened => {
-                if self.main != Main::Settings {
-                    self.main = Main::Settings;
-                    self.reprime_fields(context);
-                    self.settings_entered(context);
-                }
-            }
+            ShellMsg::SettingsOpened => self.open_settings(None, context),
+            ShellMsg::SettingsPage(page) => self.open_settings(Some(page), context),
+            ShellMsg::SettingsSearch(text) => self.settings.query = text,
             ShellMsg::SettingsClosed => {
                 if self.main != Main::Conversation {
                     self.main = Main::Conversation;
@@ -443,10 +454,10 @@ impl DesktopApp {
                     self.alert(format!("Preferences not saved: {error}"));
                 }
                 // A choice made on the page reports there; window-size
-                // writes stay quiet.
+                // and composer writes stay quiet.
                 if self.main == Main::Settings || result.is_err() {
                     self.settings.notes.insert(
-                        settings_ui::Page::General,
+                        self.settings_page,
                         crate::settings_model::save_note(false, &result),
                     );
                 }
@@ -462,7 +473,7 @@ impl DesktopApp {
                 if !self.nav.collapsed.remove(&key) {
                     self.nav.collapsed.insert(key);
                 }
-                self.collapsed_projects_changed();
+                self.collapsed_projects_changed(context);
             }
             ShellMsg::OlderToggled(key) => {
                 if !self.nav.unfolded.remove(&key) {
@@ -492,18 +503,42 @@ impl DesktopApp {
                     .results
                     .iter()
                     .find(|(shown, _)| *shown == label)
-                    .and_then(|(_, id)| self.find_agent(id))
-                    .cloned();
-                if let Some(agent) = chosen {
-                    self.nav.selection.select_agent(Some(agent.id.clone()));
-                    self.shell_update(ShellMsg::AgentOpened(agent), context);
-                    self.chat.opened_from_search = true;
+                    .map(|(_, id)| id.clone());
+                // WinUI reports every suggestion reached with the arrows as
+                // chosen (Reactor 0.100.0 exposes no QuerySubmitted): that
+                // only highlights it. Enter (`Shortcut::Enter`) or a click
+                // opens it.
+                let (input, age, epoch) = crate::shortcuts::last_input();
+                if input == Input::Arrow && age <= ARROW_CHOICE_MS {
+                    self.nav.search.highlighted = chosen.map(|id| (label, id, epoch));
+                    return;
+                }
+                self.nav.search.highlighted = None;
+                if let Some(id) = chosen {
+                    self.open_found(&id, context);
                 }
             }
             ShellMsg::Shortcut(shortcut) => {
                 match shortcut {
                     Shortcut::NewTask => self.new_task(context),
                     Shortcut::Search => self.focus_search(SEARCH_FOCUS_TRIES, context),
+                    Shortcut::Settings => self.open_settings(None, context),
+                    Shortcut::ModelPicker => {
+                        if self.launch.open != Some(launch_ui::Pop::Model) {
+                            self.launch_update(LaunchMsg::Toggle(launch_ui::Pop::Model), context);
+                        }
+                    }
+                    Shortcut::Popover(key) => self.launch_update(LaunchMsg::Key(key), context),
+                    Shortcut::Enter(epoch) => {
+                        // Enter on a suggestion reached with the arrows, with
+                        // no other input since and the box still showing it.
+                        if let Some((label, id, at)) = self.nav.search.highlighted.take()
+                            && at == epoch
+                            && self.nav.search.text == label
+                        {
+                            self.open_found(&id, context);
+                        }
+                    }
                 }
                 self.watch_shortcuts(context);
             }
@@ -561,9 +596,33 @@ impl DesktopApp {
         }
     }
 
+    /// Open Settings, at `page` when given.
+    fn open_settings(&mut self, page: Option<settings_ui::Page>, context: &ComponentContext<Self>) {
+        self.close_popover();
+        let page_changed = page.is_some_and(|page| page != self.settings_page);
+        if let Some(page) = page {
+            self.settings_page = page;
+        }
+        if self.main != Main::Settings || page_changed {
+            self.main = Main::Settings;
+            self.reprime_fields(context);
+            self.settings_entered(context);
+        }
+    }
+
+    /// Open the Agent a search found.
+    fn open_found(&mut self, id: &str, context: &ComponentContext<Self>) {
+        if let Some(agent) = self.find_agent(id).cloned() {
+            self.nav.selection.select_agent(Some(agent.id.clone()));
+            self.shell_update(ShellMsg::AgentOpened(agent), context);
+            self.chat.opened_from_search = true;
+        }
+    }
+
     /// Leave the open conversation locally (the Agent keeps running) and
     /// show the empty new-task view.
     pub(super) fn new_task(&mut self, context: &ComponentContext<Self>) {
+        self.close_popover();
         if self.main != Main::Conversation {
             self.main = Main::Conversation;
             self.reprime_fields(context);
@@ -590,7 +649,7 @@ impl DesktopApp {
 
     /// The project a new task starts in: its checkout, and its profile
     /// allowlist when it is registered.
-    fn pick_project(&mut self, checkout: &str) {
+    pub(super) fn pick_project(&mut self, checkout: &str) {
         let registered = self
             .nav
             .projects
@@ -722,10 +781,17 @@ impl DesktopApp {
         });
     }
 
-    /// The collapsed projects changed. They live in memory until k76a's
-    /// `[desktop] collapsed_projects` exists; that change writes them here
-    /// through the settings writer, as the window size is.
-    fn collapsed_projects_changed(&self) {}
+    /// The collapsed projects changed: write `[desktop] collapsed_projects`
+    /// through the settings writer, so the state survives a restart.
+    fn collapsed_projects_changed(&mut self, context: &ComponentContext<Self>) {
+        let mut collapsed: Vec<String> = self.nav.collapsed.iter().cloned().collect();
+        collapsed.sort();
+        if collapsed != self.prefs.collapsed {
+            self.prefs.collapsed = collapsed;
+            self.prefs_rev += 1;
+            self.save_preferences(context);
+        }
+    }
 
     /// Reactor 0.100.0 creates a TextBox with `Text` before `AcceptsReturn`,
     /// and a TextBox that is still single-line keeps only the first line of
@@ -820,11 +886,11 @@ impl DesktopApp {
             return;
         };
         self.prefs_saving = true;
-        let (preferences, window) = (self.prefs, self.window_size);
+        let (preferences, window) = (self.prefs.clone(), self.window_size);
         let _task = context.spawn_background(move |_| {
             let saved = client::block_on(config_client::save_preferences(
                 &data_dir,
-                preferences,
+                preferences.clone(),
                 window,
             ))
             .map_err(|error| error.to_string());
@@ -1033,10 +1099,10 @@ impl DesktopApp {
             )
             .automation_name("Search tasks")
             .height(tokens::height::CONTROL)
-            .grid_row(1)
+            .grid_row(2)
             .margin(Thickness::new(pad, tokens::spacing::XS, pad, 0.0));
         let new_task = m3::tonal_row(palette)
-            .grid_row(2)
+            .grid_row(1)
             .margin(Thickness::new(pad, tokens::spacing::XS, pad, 0.0))
             .automation_name("New task (Ctrl+N)")
             .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
@@ -1048,6 +1114,28 @@ impl DesktopApp {
                     .vertical_alignment(VerticalAlignment::Center)
                     .into(),
             ));
+        // Then the two destinations, as in Antigravity's sidebar.
+        let destination = |page: settings_ui::Page, glyph: &str, label: &str| {
+            let shown = self.main == Main::Settings && self.settings_page == page;
+            KeyedView::new(
+                format!("{label}:{shown}"),
+                m3::row(palette, shown)
+                    .automation_name(label.to_owned())
+                    .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(page))))
+                    .content(m3::icon_label(glyph, label)),
+            )
+        };
+        let destinations = StackPanel::new()
+            .grid_row(3)
+            .margin(Thickness::new(pad, tokens::spacing::XS, pad, 0.0))
+            .keyed_children(vec![
+                destination(
+                    settings_ui::Page::Automations,
+                    m3::glyph::AUTOMATION,
+                    "Automations",
+                ),
+                destination(settings_ui::Page::Usage, m3::glyph::USAGE, "Usage"),
+            ]);
 
         let fleet = Fleet::of(&self.nav.agents);
         let attention = self.nav.attention_only && fleet.attention > 0;
@@ -1093,11 +1181,21 @@ impl DesktopApp {
             let empty = if self.nav.agents_loading {
                 "Loading…"
             } else if filtered {
-                "No matching tasks"
+                "No matching tasks. Clear the search to see all."
             } else {
-                "No projects yet"
+                "No projects yet. Start a task with New task, or add one in Settings › Projects."
             };
-            items.push(KeyedView::new("no-projects", quiet_row(empty, 0.0)));
+            items.push(KeyedView::new(
+                "no-projects",
+                m3::secondary(empty)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .margin(Thickness::new(
+                        tokens::spacing::INSET,
+                        tokens::spacing::XS,
+                        tokens::spacing::SM,
+                        0.0,
+                    )),
+            ));
         }
         let new_task_selected = self.main == Main::Conversation && self.chat.convo.is_none();
         for section in &sections {
@@ -1112,7 +1210,10 @@ impl DesktopApp {
             if section.rows.is_empty() {
                 items.push(KeyedView::new(
                     format!("empty:{}", section.key),
-                    quiet_row("No tasks", tokens::layout::TREE_INDENT),
+                    quiet_row(
+                        "No tasks yet: start one with New task",
+                        tokens::layout::TREE_INDENT,
+                    ),
                 ));
             }
             for row in &section.rows {
@@ -1171,7 +1272,7 @@ impl DesktopApp {
             }
         }
         let list = ScrollViewer::new()
-            .grid_row(3)
+            .grid_row(4)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .automation_name("Projects and Agents")
             .content(
@@ -1224,7 +1325,7 @@ impl DesktopApp {
                 .content(m3::icon_label(m3::glyph::SETTINGS, "Settings")),
         ));
         let bottom = StackPanel::new()
-            .grid_row(4)
+            .grid_row(5)
             .margin(Thickness::new(pad, 0.0, pad, pad))
             .keyed_children(bottom);
 
@@ -1233,10 +1334,11 @@ impl DesktopApp {
                 GridLength::Auto,
                 GridLength::Auto,
                 GridLength::Auto,
+                GridLength::Auto,
                 GridLength::STAR,
                 GridLength::Auto,
             ])
-            .children((header, search, new_task, list, bottom))
+            .children((header, new_task, search, destinations, list, bottom))
     }
 
     /// A project row: its chevron, folder and repository name collapse or
@@ -1429,23 +1531,41 @@ impl DesktopApp {
             .content(m3::row_content(Some(m3::glyph::PULSE), &summary, "", dot))
     }
 
-    /// Settings in the sidebar's place: a Back row, then one row per page.
+    /// Settings in the sidebar's place (the Codex settings navigation): a
+    /// Back row, a Search field that finds settings across the pages, then
+    /// the pages in their groups.
     fn settings_nav(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let pad = SIDEBAR_PADDING;
-        let mut rows: Vec<KeyedView> = vec![
-            KeyedView::new(
-                "back",
+        let top = StackPanel::new()
+            .margin(Thickness::new(pad, tokens::spacing::SM, pad, 0.0))
+            .spacing(tokens::spacing::XS)
+            .children((
                 m3::row(palette, false)
-                    .automation_name("Back to the conversation")
+                    .automation_name("Back to tasks")
                     .on_click(context.message(Message::Shell(ShellMsg::SettingsClosed)))
-                    .content(m3::icon_label(m3::glyph::BACK, "Back")),
-            ),
-            KeyedView::new("caption", section_label("Settings")),
-        ];
-        rows.extend(self.settings_rows(context, palette));
-        StackPanel::new()
-            .margin(Thickness::new(pad, tokens::spacing::SM, pad, pad))
-            .keyed_children(rows)
+                    .content(m3::icon_label(m3::glyph::BACK, "Back to tasks")),
+                m3::field()
+                    .text(self.settings.query.clone())
+                    .placeholder_text("Search settings")
+                    .automation_name("Search settings")
+                    .on_text_changed(
+                        context.callback(|text| Message::Shell(ShellMsg::SettingsSearch(text))),
+                    ),
+            ));
+        let rows = self.settings_rows(context, palette);
+        Grid::new()
+            .rows([GridLength::Auto, GridLength::STAR])
+            .children((
+                top,
+                ScrollViewer::new()
+                    .grid_row(1)
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .content(
+                        StackPanel::new()
+                            .margin(Thickness::new(pad, 0.0, pad, pad))
+                            .keyed_children(rows),
+                    ),
+            ))
     }
 
     /// Show a short notice above the composer (refusals, uncertain

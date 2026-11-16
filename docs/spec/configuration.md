@@ -1,5 +1,21 @@
 # Configuration
 
+### Artifact roots
+
+`[daemon].artifact_roots` is an optional array of at most 32 absolute local
+directories (default empty). Before native startup Swarm exclusively creates and
+durably binds `<first-root>/<agent>-<generation>/`; without a configured root it
+uses `<data-dir>/artifacts/<agent>-<generation>/`. `ELIOT_ARTIFACT_ROOT` hands this
+path to the Agent. Registration accepts only strict descendants of that exact
+generation root. Existing unbound directories are never adopted. Shared
+configured roots, workspace paths alone and user/native configuration
+remain protected. This does not scan or adopt existing unregistered files. See
+[registered artifacts and cleanup](coordination.md#registered-artifacts-and-cleanup-k69).
+The setting is available through the existing Daemon settings section. A folder assignment opts in with `[automation.assignments.<key>] cleanup_on_retire = true`
+(default false): after an applied stop retires its Agent, the existing stop
+worker cleans that Agent's build, temp and managed-worktree artifacts with
+Owner authority and retained receipts. It is not a second executor.
+
 Implement the single global Codex profile first. Project overlays, external plugins,
 services, mail and automation settings appear only with their owning roadmap layer;
 this page is the final configuration contract, not an L1 checklist.
@@ -103,6 +119,18 @@ when it is the only installed harness). This makes Swarm delegation available on
 first use; existing profiles and routing choices are preserved. An omitted model
 in these profiles requests the native default and retains requested/effective
 readback separately, as for an ad-hoc launch. There is no builtin fake profile.
+For Muse hot-start profiles the daemon enumerates installed `muse-bin-*.exe`
+builds newest-first and probes with the existing read-only `model/list`
+catalogue path (no session, turn or inference); it freezes the newest build whose
+catalogue is non-empty and records skipped empty-catalogue builds
+(`bootstrap.muse_empty_catalogue_skipped`). Selection stops at the first nonempty
+catalogue, with an 8-second per-build probe and one 20-second selection budget.
+When that budget expires, `bootstrap.muse_catalogue_budget_exhausted` is recorded
+and startup continues without a Muse default. Each probe uses scoped process
+custody and kill-on-drop, with at most 100 inbound frames, 1 MiB per line and
+4 MiB total before parsing. The launcher-marked 1.4.20 build serves
+an empty `bundledCatalog` and is skipped in favor of the 1.4.0 build with a live
+catalogue; `--cmd` still pins an explicit binary for ad-hoc launch.
 Before admission, an omitted profile selects the first available ordered role candidate. There is no post-dispatch harness/model/route/account
 fallback, no retry of an uncertain outcome and no hold-triggered account switch.
 Profiles stay the durable
@@ -743,7 +771,14 @@ selected by `pass_env` or unset; a selected empty string remains distinct. Prese
 values without trimming or path normalization. Names compare case-insensitively on
 Windows and exactly elsewhere. [Environment construction](../../crates/eliot-daemon/src/plugin_host/host.rs)
 uses these captured inputs instead of looking them up again. This selector capture
-leaves other `pass_env` resolution unchanged.
+leaves other `pass_env` resolution unchanged. When `pass_env` admits the
+literal name `CARGO_TARGET_DIR`, admission also freezes its exact value in
+`profile_snapshot.target_dir` (absolute local path only; skipped otherwise).
+Cleanup backfills that frozen directory as a build artifact when it lies
+outside the Agent workspace and inside its durably bound artifact root. A
+shared daemon-wide target is kept rather than attributed to an Agent. Agents
+should place their own target under `ELIOT_ARTIFACT_ROOT` and register it through
+`artifact.register`; targets containing hard-linked files stay `keep(hard_link)`.
 
 Retained mutation IDs hydrate their stored snapshot before any new capture. Admitted
 selector inputs are frozen at admission and are neither rewritten nor backfilled:
@@ -907,11 +942,16 @@ automation policy do not create a second executor. Desktop preferences use
 recently active Agent's conversation), `favorite_models` (bounded list of
 `{harness, model, effort?}`, at most 50), `recent_models` (bounded most-recent-first
 list of `{harness, model, effort?}`, at most 20), `collapsed_projects` (bounded
-list of project ids, at most 100) and `last_access` (`ask`, `auto` or `full`).
+list of the sidebar's project keys, at most 100) and `last_access` (`ask`, `auto` or `full`).
 Picker strings are stored verbatim: harness and access values must match their
-closed vocabularies exactly. Model ids and collapsed project ids are 1–256
+closed vocabularies exactly. Model ids and collapsed project keys are 1–256
 bytes, and effort is 1–128 bytes; these reject controls and surrounding whitespace.
 The desktop keeps no other preference store. The desktop writes `window` back once when the window closes, and only when the size changed.
+The new-task composer writes `recent_models` after an admitted model launch,
+`favorite_models` from the model picker (Ctrl+F or the row's star), `last_access`
+from the access chip or Settings › Default access, and `collapsed_projects` when a
+sidebar project is collapsed or expanded; a project key longer than 256
+bytes is not remembered.
 If that table is absent, the desktop imports the legacy per-user
 `swarm-desktop.json` preferences through the revision-guarded settings writer once.
 It retires the legacy file only after successful publication; an existing `[desktop]`
@@ -1201,6 +1241,35 @@ the adopted service. Agent stop owns only the Agent's controlled process tree. M
 service launch and service-management APIs remain `unsupported`. Readiness and effective
 configuration readback do not verify runtime authentication, inference or all traffic;
 report those facts as unverified. The owner remains responsible for service lifecycle.
+
+## Logging, crash capture and diagnosis
+
+`log_level` (`standard`, `debug`) applies live through the daemon settings
+section, never as a restart gate on its own. Standard mode keeps operational
+lines: structured request/settlement codes and bounded IDs, typed `where`, origin,
+classified sanitized origin evidence and approved sanitized stderr tails. Neither
+level persists `Error.message` or other unclassified free text. Debug mode adds numeric
+timing records: every RPC at the router choke point (`rpc.handled` /
+`rpc.failed` with method, elapsed milliseconds and ok), every
+daemon-to-plugin call (`plugin.call.ok` / `plugin.call.error`), and plugin
+frame, channel, process start/exit and stderr records over `ELIOT_DEBUG`.
+Plugin `ELIOT_DEBUG` lines, including malformed or oversized telemetry, are
+excluded from retained diagnostic tails in both modes. Only parsed metadata is
+routed to the bounded rotated daemon log when the current level is `debug`.
+Debug never logs payloads: ids are our own vocabulary, messages stay in the
+sanitized store, params and results never enter a record. Settings publication
+and live log-level application share the Store writer lock, preserving order.
+
+On panic the daemon writes a `daemon.panicked` marker and plugins write a
+`plugin.panicked` marker. Arbitrary payloads and unclassified thread names are
+omitted before either disk or stderr; source location, approved thread name and
+payload-free backtrace are sanitized and bounded first. Publication uses the
+existing private temporary-file/write/sync/atomic-rename primitive (bounded
+file/count); readers ignore temporary or incomplete files. The previous daemon
+marker is consumed once and reported in `daemon.status`, in `swarm daemon`
+startup output, and in `swarm why` when the diagnosed failure is otherwise
+unclassified. The desktop Agent details view shows the same one-line
+diagnosis summary; the full chain lives behind `swarm why`.
 
 ## Paths and platform defaults
 

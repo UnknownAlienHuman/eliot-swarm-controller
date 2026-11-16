@@ -2412,6 +2412,72 @@ fn scheduled_project_timer_launch_replay_precedes_current_profile_gate() {
 }
 
 #[test]
+fn timer_var_set_fires_three_times_with_cas_counter() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let mut state = ensure_interval(&mut store, "timer-var-cas", registration_ms, 1_000);
+    for expected in 0..3i64 {
+        let slot_ms = state.next_due_at.expect("timer has slot");
+        let mut action = SubmitCommand::new(Ulid::new().to_string(), "var.set");
+        action.args = json!({
+            "scope": "global",
+            "key": "counter",
+            "value": expected + 1,
+            "expect_version": expected,
+        });
+        let admission = store
+            .commit_timer_slot(
+                "owner",
+                &state,
+                TimerSlotCommit {
+                    scheduled_at_ms: slot_ms,
+                    next_due_at_ms: Some(slot_ms + 1_000),
+                    action: Some(action),
+                    skip_code: None,
+                },
+                slot_ms,
+            )
+            .expect("timer var slot admits");
+        assert!(admission.is_new, "slot {expected} is new");
+        let child = admission.child.expect("timer var child").command;
+        assert_eq!(child.verb, "var.set");
+        store
+            .dispatch(&child.id, slot_ms + 1)
+            .expect("dispatch var");
+        let applied = store
+            .commit_var_set_applied(&child.id, slot_ms + 2)
+            .expect("apply var");
+        assert_eq!(applied.value.state, CommandState::Applied);
+        assert_eq!(
+            applied.value.outcome.as_ref().unwrap()["version"],
+            json!(expected + 1)
+        );
+        state = admission.state;
+    }
+    let version: i64 = store
+        .connection
+        .query_row(
+            "SELECT version FROM vars WHERE scope = 'global' AND key = 'counter'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("counter version");
+    assert_eq!(version, 3);
+    let value: String = store
+        .connection
+        .query_row(
+            "SELECT value FROM vars WHERE scope = 'global' AND key = 'counter'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("counter value");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&value).unwrap(),
+        json!(3)
+    );
+}
+
+#[test]
 fn project_timer_run_reuses_registration_authority_at_dispatch() {
     let mut store = store();
     let registration_ms = now_ms();

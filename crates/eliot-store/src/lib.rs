@@ -5,6 +5,7 @@
 mod assignment;
 mod canonical;
 mod capacity;
+mod cleanup;
 mod projects;
 mod provider_holds;
 mod rules;
@@ -54,6 +55,7 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, HashSet},
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 use ulid::Ulid;
@@ -180,10 +182,34 @@ fn validate_remote_command_context(
     Ok(())
 }
 
+/// Process-lifetime commit telemetry: every store transaction counts
+/// here, success and failure, with total commit milliseconds. Metadata
+/// only: no payloads, ids, or SQL text ever enter these counters. The
+/// daemon exposes the snapshot through `diagnose` so a slow or failing
+/// disk shows up as store evidence, not a guessed origin.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxnStats {
+    pub commits: u64,
+    pub commit_errors: u64,
+    pub commit_ms_total: u64,
+}
+
+static TXN_COMMITS: AtomicU64 = AtomicU64::new(0);
+static TXN_COMMIT_ERRORS: AtomicU64 = AtomicU64::new(0);
+static TXN_COMMIT_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 fn commit_transaction(tx: Transaction<'_>, write_faulted: &Cell<bool>) -> Result<()> {
-    match tx.commit() {
+    let started = std::time::Instant::now();
+    let result = tx.commit();
+    TXN_COMMITS.fetch_add(1, Ordering::Relaxed);
+    TXN_COMMIT_MS_TOTAL.fetch_add(
+        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+    match result {
         Ok(()) => Ok(()),
         Err(error) => {
+            TXN_COMMIT_ERRORS.fetch_add(1, Ordering::Relaxed);
             write_faulted.set(true);
             Err(sql_error(error))
         }
@@ -263,6 +289,17 @@ pub enum StoreOpenPhase {
 }
 
 impl Store {
+    /// Process-lifetime commit counters for debug and `diagnose` evidence.
+    /// Daemon reads are racy by design: exact per-RPC attribution comes
+    /// from the daemon log, these counters show store health over time.
+    pub fn txn_stats(&self) -> TxnStats {
+        TxnStats {
+            commits: TXN_COMMITS.load(Ordering::Relaxed),
+            commit_errors: TXN_COMMIT_ERRORS.load(Ordering::Relaxed),
+            commit_ms_total: TXN_COMMIT_MS_TOTAL.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_observer(path, |_| {})
     }
@@ -1421,6 +1458,40 @@ impl Store {
         Ok(load_command_record(&self.connection, id)?.map(|record| record.command))
     }
 
+    /// Exact current-generation start, including a failed launch with no turn.
+    /// Generation is unique for launch/resume; never substitute another Agent
+    /// or a timestamp-near command when retention removed the causal command.
+    pub fn generation_start_command(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<Command>> {
+        let id: Option<String> = self.connection.query_row(
+            "SELECT id FROM commands WHERE target = ?1 AND generation = ?2 AND verb IN ('launch', 'resume') ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![parse_agent_id(agent)?, generation], |row| row.get(0),
+        ).optional().map_err(sql_error)?;
+        id.map(|id| self.get_command(&id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Latest retained terminal for this exact turn, for diagnostic fields
+    /// that are deliberately not a second persisted Turn projection.
+    pub fn turn_terminal_event(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+    ) -> Result<Option<Event>> {
+        let record = self.connection.query_row(
+            "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause FROM events
+             WHERE agent = ?1 AND generation = ?2 AND kind IN ('turn.completed', 'turn.unknown')
+               AND json_extract(data, '$.turn_id') = ?3 ORDER BY seq DESC LIMIT 1",
+            params![parse_agent_id(agent)?, generation, turn_id], event_record_from_row,
+        ).optional().map_err(sql_error)?;
+        record.map(event_from_record).transpose()
+    }
+
     pub fn get_turn(&self, agent: &str, generation: i64, turn_id: &str) -> Result<Option<Turn>> {
         let agent_num = parse_agent_id(agent)?;
         load_turn(&self.connection, agent_num, generation, turn_id)
@@ -1705,7 +1776,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT agent, generation, turn_id, state, status, outcome, native_status,
-                        final_text, started_at, completed_at, usage, config_revision
+                        final_text, started_at, completed_at, usage, config_revision, preceded_by
                  FROM turns WHERE agent = ?1 AND generation = ?2
                  ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
                  LIMIT ?3",
@@ -1723,6 +1794,40 @@ impl Store {
         }
         enforce_page_bytes(&mut turns)?;
         Ok(turns)
+    }
+
+    /// Latest terminal agent events (`agent.lost`, `agent.failed`) for one
+    /// generation, newest first. Powers `diagnose` process/exit steps: the
+    /// exit code, NTSTATUS and redacted stderr tail ride on these events.
+    /// Bounded like every other page; at most `limit` rows.
+    pub fn latest_agent_terminal_events(
+        &self,
+        agent: &str,
+        generation: i64,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        validate_limit(limit)?;
+        let agent_num = parse_agent_id(agent)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
+                 FROM events
+                 WHERE agent = ?1 AND generation = ?2 AND kind IN ('agent.lost', 'agent.failed')
+                 ORDER BY seq DESC LIMIT ?3",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![agent_num, generation, limit as i64],
+                event_record_from_row,
+            )
+            .map_err(sql_error)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(event_from_record(row.map_err(sql_error)?)?);
+        }
+        Ok(events)
     }
 
     pub fn read_events(
@@ -1899,6 +2004,8 @@ impl Store {
                 generation,
                 now,
                 "daemon_restart",
+                None,
+                None,
                 &mut events,
             )?;
         }
@@ -1950,13 +2057,36 @@ impl Store {
     }
 
     pub fn mark_lost(&mut self, agent: &str, generation: i64, now: i64) -> Result<Vec<Event>> {
+        self.mark_lost_with_exit(agent, generation, now, None, None)
+    }
+
+    /// Mark an agent generation lost with its process exit evidence: the
+    /// numeric exit code, the Windows NTSTATUS hex for crash statuses, and
+    /// the bounded redacted stderr tail. Numbers and the already-redacted
+    /// tail only; no argv, environment or output framing.
+    pub fn mark_lost_with_exit(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        now: i64,
+        exit: Option<eliot_core::ProcessExit>,
+        stderr_tail: Option<String>,
+    ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
-        let result = self.mark_lost_inner(agent, generation, now);
+        let result = self.mark_lost_inner(agent, generation, now, exit, stderr_tail);
         self.fault_on_persistence_error(&result);
         result
     }
 
-    fn mark_lost_inner(&mut self, agent: &str, generation: i64, now: i64) -> Result<Vec<Event>> {
+    #[allow(clippy::too_many_arguments)]
+    fn mark_lost_inner(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        now: i64,
+        exit: Option<eliot_core::ProcessExit>,
+        stderr_tail: Option<String>,
+    ) -> Result<Vec<Event>> {
         let agent_num = parse_agent_id(agent)?;
         let tx = self
             .connection
@@ -1977,6 +2107,8 @@ impl Store {
             generation,
             now,
             "owner_marked_lost",
+            exit.as_ref(),
+            stderr_tail.as_deref(),
             &mut events,
         )?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -3143,6 +3275,10 @@ struct TurnRecord {
     /// Configuration revision the turn ran under, copied from its bound
     /// send command at turn creation. 0 when no overlay applied.
     config_revision: i64,
+    /// Causal predecessor of a non-success terminal outcome: the command
+    /// whose terminal event settled the turn. NULL for success, running
+    /// turns and rows settled before predecessors were recorded.
+    preceded_by: Option<String>,
 }
 
 struct SourceStateRecord {
@@ -3342,6 +3478,7 @@ struct TurnInsert<'a> {
     completed_at: Option<i64>,
     usage: Option<&'a str>,
     config_revision: i64,
+    preceded_by: Option<&'a str>,
 }
 
 /// Indexed equality filters for the compact `agent.list` fleet projection.
@@ -4642,6 +4779,7 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
         completed_at: row.get(9)?,
         usage: row.get(10)?,
         config_revision: row.get(11)?,
+        preceded_by: row.get(12)?,
     })
 }
 
@@ -4676,6 +4814,7 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
         usage,
         config_revision: record.config_revision,
         config: None,
+        preceded_by: record.preceded_by.filter(|value| !value.is_empty()),
     })
 }
 
@@ -5435,7 +5574,7 @@ fn load_turn(
     let record = connection
         .query_row(
             "SELECT agent, generation, turn_id, state, status, outcome, native_status,
-                    final_text, started_at, completed_at, usage, config_revision
+                    final_text, started_at, completed_at, usage, config_revision, preceded_by
              FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
             params![agent, generation, turn_id],
             turn_record_from_row,
@@ -5465,8 +5604,9 @@ fn load_harness_by_num(connection: &Connection, agent: i64) -> Result<String> {
 fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
     db!(tx.execute(
         "INSERT INTO turns(agent, generation, turn_id, state, status, outcome, native_status,
-                           final_text, started_at, completed_at, usage, config_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                           final_text, started_at, completed_at, usage, config_revision,
+                           preceded_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             turn.agent,
             turn.generation,
@@ -5480,6 +5620,7 @@ fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
             turn.completed_at,
             turn.usage,
             turn.config_revision,
+            turn.preceded_by,
         ],
     ));
     Ok(())

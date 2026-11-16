@@ -165,10 +165,27 @@ pub enum WorkspaceCreationOutcome {
     Failed {
         code: String,
         message: String,
+        /// Typed failure location for the preparation failure
+        /// (`store.dispatch.workspace_gate` and below). Optional for
+        /// backward compatibility with persisted outcomes.
+        #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
+        failure_where: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<FailureOrigin>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_evidence: Option<String>,
     },
     Unknown {
         code: String,
         message: String,
+        /// Typed failure location for the preparation failure. Optional
+        /// for backward compatibility with persisted outcomes.
+        #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
+        failure_where: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<FailureOrigin>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_evidence: Option<String>,
     },
 }
 
@@ -746,6 +763,12 @@ pub struct Turn {
     /// absent on old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<AgentConfigView>,
+    /// Causal predecessor of a non-success terminal outcome: the command
+    /// whose terminal event settled this turn. `None` for success, for
+    /// running turns, and for rows settled before predecessors were
+    /// recorded. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preceded_by: Option<String>,
 }
 
 /// Native token usage attributed to one terminal turn. Every member is
@@ -1092,13 +1115,190 @@ pub enum Effect {
     },
 }
 
+/// Character bound for a failure message: every rejection, failure and
+/// unknown outcome carries a bounded, `SecretPolicy`-redacted message.
+pub const MAX_FAILURE_MESSAGE_CHARS: usize = 1024;
+/// Character bound for a typed failure location (`where`).
+pub const MAX_FAILURE_WHERE_CHARS: usize = 128;
+/// Character bound for the redacted evidence behind a failure origin.
+pub const MAX_FAILURE_ORIGIN_EVIDENCE_CHARS: usize = 512;
+/// Character bound for an error code on the wire.
+pub const MAX_FAILURE_CODE_CHARS: usize = 128;
+/// Character bound for a Windows NTSTATUS hex string (`0xC0000005`).
+pub const MAX_NTSTATUS_CHARS: usize = 16;
+
+/// A captured process exit: the numeric code plus the Windows NTSTATUS hex
+/// when the raw code is a crash status (for example `0xC0000005`). Numbers
+/// only: no argv, environment or output ever rides along. The NTSTATUS
+/// mapping is a heuristic by construction: negative `i32` codes on Windows
+/// are crash statuses (`0x80000000` and up); ordinary application codes are
+/// non-negative and Unix signals surface as no code at all.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessExit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_ntstatus",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ntstatus: Option<Box<str>>,
+}
+
+impl ProcessExit {
+    pub fn from_code(code: Option<i32>) -> Self {
+        Self {
+            exit_code: code.map(|code| code as i64),
+            ntstatus: code
+                .filter(|code| *code < 0)
+                .map(|code| format!("0x{:08X}", code as u32).into()),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.exit_code.is_none() && self.ntstatus.is_none()
+    }
+}
+
+fn deserialize_ntstatus<'de, D>(deserializer: D) -> std::result::Result<Option<Box<str>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let ntstatus: Option<String> =
+        <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(ntstatus.map(|ntstatus| bound_chars(&ntstatus, MAX_NTSTATUS_CHARS).into()))
+}
+
+/// Where a failure originates, with the evidence for it. The main goal of
+/// failure reporting is locating the origin: our Swarm core, bus, Router and
+/// plugin code (`swarm`), the native harness process or protocol
+/// (`harness`), the model provider behind the harness (`provider`), or the OS
+/// and machine (`environment`). `harness_contract_mismatch` is the narrow
+/// case where observed native behavior contradicts the documented contract in
+/// `docs/harnesses/<h>.md`; it carries the doc section reference.
+/// `unknown` means the evidence is insufficient, and its evidence note says
+/// what is missing. Unmapped native errors stay `harness` (with a
+/// `provider_suspected` note only when the native frame itself says the error
+/// came from the upstream API); provider classes are mapped from structured
+/// native error signals only, never guessed from free text.
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureOrigin {
+    Swarm,
+    Harness,
+    HarnessContractMismatch,
+    Provider,
+    Environment,
+    Unknown,
+}
+
+impl FailureOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Swarm => "swarm",
+            Self::Harness => "harness",
+            Self::HarnessContractMismatch => "harness_contract_mismatch",
+            Self::Provider => "provider",
+            Self::Environment => "environment",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "swarm" => Some(Self::Swarm),
+            "harness" => Some(Self::Harness),
+            "harness_contract_mismatch" => Some(Self::HarnessContractMismatch),
+            "provider" => Some(Self::Provider),
+            "environment" => Some(Self::Environment),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// Truncate to a character boundary; never splits UTF-8 mid-codepoint.
+fn bound_chars(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// Normalize a typed failure location to a stable dotted
+/// `component.phase[.detail]` lowercase ASCII path. Characters outside that
+/// vocabulary fold into `_`; an empty result means the caller supplied no
+/// location at all.
+pub fn normalize_failure_where(where_: &str) -> String {
+    let mut out = String::with_capacity(where_.len().min(MAX_FAILURE_WHERE_CHARS));
+    for ch in where_.chars().take(MAX_FAILURE_WHERE_CHARS) {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() || lower == '.' || lower == '_' {
+            out.push(lower);
+        } else if !out.ends_with('_') && !out.is_empty() {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches(|c| c == '.' || c == '_');
+    if trimmed.is_empty() {
+        "unknown".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+// Boxed so the owning `Error.message` field stays 16 bytes.
+#[allow(clippy::box_collection)]
+fn deserialize_failure_message<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Box<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let message = <String as serde::Deserialize>::deserialize(deserializer)?;
+    // Keep the complete input until the owning boundary can redact it.
+    Ok(message.into())
+}
+
+fn deserialize_failure_where<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Box<str>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let where_: Option<String> = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(where_.map(|where_| normalize_failure_where(&where_).into()))
+}
+
+fn deserialize_origin_evidence<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Box<str>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let evidence: Option<String> =
+        <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(evidence.map(Into::into))
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Deserialize)]
+// Boxed cold payloads keep `Error` at or under 128 bytes so every
+// `Result<_, Error>` passes `clippy::result_large_err`; the extra
+// allocation only happens on the error path. See
+// `error_stays_small_enough_for_result_err`.
+#[allow(clippy::box_collection)]
 pub struct Error {
     pub code: String,
-    pub message: String,
+    #[serde(deserialize_with = "deserialize_failure_message")]
+    pub message: Box<String>,
     #[serde(default, deserialize_with = "diagnostics::deserialize_diagnostics")]
     #[schemars(skip_serializing_if = "Vec::is_empty")]
-    pub diagnostics: Vec<StderrDiagnostic>,
+    pub diagnostics: Box<Vec<StderrDiagnostic>>,
     #[serde(default)]
     #[schemars(skip_serializing_if = "Option::is_none")]
     pub details: Option<Box<InvalidParam>>,
@@ -1106,6 +1306,43 @@ pub struct Error {
     #[serde(default)]
     #[schemars(skip_serializing_if = "Option::is_none")]
     pub routing: Option<Box<RoutingDecision>>,
+    /// Typed failure location: stable dotted `component.phase[.detail]`
+    /// path (for example `router.dispatch.profile_store`,
+    /// `plugin.opencode.start.auth_transfer`,
+    /// `store.dispatch.workspace_gate`). Present on rejections, failures and
+    /// unknown outcomes; absent on success paths. Schema-owned vocabulary
+    /// only: never a secret, parameter, prompt or model output.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_failure_where",
+        rename = "where"
+    )]
+    #[schemars(skip_serializing_if = "Option::is_none")]
+    pub failure_where: Option<Box<str>>,
+    /// Where the failure originates, with the evidence for it.
+    #[serde(default)]
+    #[schemars(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<FailureOrigin>,
+    /// Bounded, redacted evidence for `origin`: a doc section reference for
+    /// `harness_contract_mismatch`, a structured provider class detail for
+    /// `provider`, or a note naming the missing evidence for `unknown`.
+    /// Never a secret, parameter, prompt or model output.
+    #[serde(default, deserialize_with = "deserialize_origin_evidence")]
+    #[schemars(skip_serializing_if = "Option::is_none")]
+    pub origin_evidence: Option<Box<str>>,
+    /// Captured process exit when the failure is a process exit: the
+    /// harness or plugin exit code plus the Windows NTSTATUS hex for crash
+    /// statuses. Recorded with the stderr tail on `agent.lost`/`agent.failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<Box<i64>>,
+    /// Windows NTSTATUS hex for crash statuses (for example `0xC0000005`).
+    /// See [`ProcessExit`] for the heuristic.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_ntstatus",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ntstatus: Option<Box<str>>,
 }
 
 /// Parameter diagnostics contain schema-owned names/expectations, never values.
@@ -1136,19 +1373,157 @@ impl Error {
     pub fn with_field(mut self, field: impl Into<String>, expected: impl Into<String>) -> Self {
         let field: String = field.into().chars().take(256).collect();
         let expected: String = expected.into().chars().take(512).collect();
-        self.message = format!("{field}: expected {expected}");
+        self.message = format!("{field}: expected {expected}").into();
         self.details = Some(Box::new(InvalidParam { field, expected }));
         self
     }
 
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        let code: String = code.into().chars().take(MAX_FAILURE_CODE_CHARS).collect();
         Self {
-            code: code.into(),
-            message: message.into(),
-            diagnostics: Vec::new(),
+            code,
+            message: message.into().into(),
+            diagnostics: Box::default(),
             details: None,
             routing: None,
+            exit_code: None,
+            ntstatus: None,
+            failure_where: None,
+            origin: None,
+            origin_evidence: None,
         }
+    }
+
+    /// Attach a typed failure location. The path is normalized to a stable
+    /// dotted `component.phase[.detail]` vocabulary.
+    pub fn with_where(mut self, where_: impl Into<String>) -> Self {
+        self.failure_where = Some(normalize_failure_where(&where_.into()).into());
+        self
+    }
+
+    /// Attach the failure origin with its evidence. Evidence must already be
+    /// schema-owned vocabulary or a bounded observed-frame summary;
+    /// [`Self::sanitized`] applies the [`SecretPolicy`] backstop at the
+    /// boundary. Keep the complete evidence until redaction; serialization
+    /// independently enforces the wire bound.
+    pub fn with_origin(mut self, origin: FailureOrigin, evidence: impl Into<String>) -> Self {
+        self.origin = Some(origin);
+        self.origin_evidence = Some(evidence.into().into());
+        self
+    }
+
+    /// A failure the native harness caused: crashed or exited process, native
+    /// error frame, refused method, or unexpected/missing frame. `observed`
+    /// is a bounded summary of the observed frame (method, direction, size,
+    /// error class), never frame content.
+    pub fn harness(harness: &str, where_: &str, observed: impl Into<String>) -> Self {
+        Self::new(
+            "harness_error",
+            format!("{harness} failed before reporting a usable result"),
+        )
+        .with_where(where_)
+        .with_origin(FailureOrigin::Harness, observed.into())
+    }
+
+    /// The narrow contract-mismatch case: observed native behavior
+    /// contradicts the documented contract in `docs/harnesses/<h>.md`.
+    /// `doc` names the section (for example
+    /// `docs/harnesses/muse.md#steer`); `observed` summarizes the offending
+    /// frame in bounded, redacted form, never its content.
+    pub fn harness_contract_mismatch(
+        harness: &str,
+        where_: &str,
+        doc: &str,
+        observed: impl Into<String>,
+    ) -> Self {
+        let doc = doc.chars().take(128).collect::<String>();
+        let observed = observed.into();
+        Self::new(
+            "harness_contract_mismatch",
+            format!("{harness} contradicted its documented contract"),
+        )
+        .with_where(where_)
+        .with_origin(
+            FailureOrigin::HarnessContractMismatch,
+            format!("{doc}: {observed}"),
+        )
+    }
+
+    /// A failure the model provider behind the harness caused, mapped from a
+    /// structured native error signal only (never guessed from free text).
+    /// `class` is the [`ProviderRestrictionKind`] vocabulary (`rate_limit`,
+    /// `quota`, `auth`, `model_removed`); `detail` carries the structured
+    /// signal (harness name, status or error class, retry hint).
+    pub fn provider(
+        class: crate::ProviderRestrictionKind,
+        where_: &str,
+        detail: impl Into<String>,
+    ) -> Self {
+        let code = match class {
+            crate::ProviderRestrictionKind::RateLimit => "rate_limited",
+            crate::ProviderRestrictionKind::Quota => "quota_exhausted",
+            crate::ProviderRestrictionKind::Auth => "provider_unauthorized",
+            crate::ProviderRestrictionKind::ModelRemoved => "model_unavailable",
+        };
+        Self::new(
+            code,
+            format!(
+                "model provider {verb} the request",
+                verb = match class {
+                    crate::ProviderRestrictionKind::RateLimit => "rate-limited",
+                    crate::ProviderRestrictionKind::Quota => "refused for quota",
+                    crate::ProviderRestrictionKind::Auth => "rejected the credentials for",
+                    crate::ProviderRestrictionKind::ModelRemoved =>
+                        "no longer serves the model for",
+                }
+            ),
+        )
+        .with_where(where_)
+        .with_origin(FailureOrigin::Provider, detail.into())
+    }
+
+    /// Attach a captured process exit. Numbers only: exit codes and crash
+    /// statuses carry no secrets, parameters, prompts or model output.
+    pub fn with_exit(mut self, code: Option<i32>) -> Self {
+        let exit = ProcessExit::from_code(code);
+        self.exit_code = exit.exit_code.map(Box::new);
+        self.ntstatus = exit.ntstatus;
+        self
+    }
+
+    /// Redact the message, origin evidence and stderr tails with the caller
+    /// policy and re-apply every bound. `where` is already restricted
+    /// vocabulary; it is normalized, never redacted. Call at the trust
+    /// boundary before persisting an outcome, event or log record.
+    pub fn sanitized(mut self, policy: &SecretPolicy) -> Self {
+        self.message = bound_chars(
+            &policy.redact_text(&self.message),
+            MAX_FAILURE_MESSAGE_CHARS,
+        )
+        .into();
+        if let Some(evidence) = self.origin_evidence.take() {
+            self.origin_evidence = Some(
+                bound_chars(
+                    &policy.redact_text(&evidence),
+                    MAX_FAILURE_ORIGIN_EVIDENCE_CHARS,
+                )
+                .into(),
+            );
+        }
+        if let Some(where_) = self.failure_where.take() {
+            self.failure_where = Some(normalize_failure_where(&where_).into());
+        }
+        for diagnostic in self.diagnostics.iter_mut() {
+            diagnostic.snapshot.text = policy.redact_text(&diagnostic.snapshot.text);
+        }
+        self.bound_diagnostics();
+        self
+    }
+
+    /// The failure origin, defaulting to `unknown` when no site classified
+    /// it. Unknown origins must say what evidence is missing.
+    pub fn origin_or_unknown(&self) -> FailureOrigin {
+        self.origin.unwrap_or(FailureOrigin::Unknown)
     }
 
     /// Attach an already-sanitized tail, retaining the other stderr source.
@@ -1174,7 +1549,10 @@ impl Error {
     }
 
     pub fn with_message(mut self, message: impl Into<String>) -> Self {
-        self.message = message.into();
+        // Trusted caller text replaces the message verbatim, like HEAD:
+        // callers pass bounded or arbitrary native text and the 64 KiB wire
+        // cap is enforced at encode and persist boundaries, not here.
+        self.message = message.into().into();
         self.bound_diagnostics();
         self
     }
@@ -1208,16 +1586,41 @@ impl Serialize for Error {
             details: Option<InvalidParam>,
             #[serde(skip_serializing_if = "Option::is_none")]
             routing: Option<&'a RoutingDecision>,
+            #[serde(rename = "where", skip_serializing_if = "Option::is_none")]
+            failure_where: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            origin: Option<FailureOrigin>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            origin_evidence: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            exit_code: Option<i64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ntstatus: Option<String>,
         }
-        let mut diagnostics = self.diagnostics.clone();
-        bound_stderr_diagnostics(
-            &mut diagnostics,
-            error_diagnostic_budget(&self.code, &self.message),
-        );
+        // Re-apply every bound at the wire so a hand-built struct literal
+        // can never exceed the 64 KiB encoded error.
+        let code: String = self.code.chars().take(MAX_FAILURE_CODE_CHARS).collect();
+        let message = bound_chars(&self.message, MAX_FAILURE_MESSAGE_CHARS);
+        let ntstatus = self
+            .ntstatus
+            .as_deref()
+            .map(|ntstatus| bound_chars(ntstatus, MAX_NTSTATUS_CHARS));
+        let failure_where = self.failure_where.as_deref().map(normalize_failure_where);
+        let origin_evidence = self
+            .origin_evidence
+            .as_deref()
+            .map(|evidence| bound_chars(evidence, MAX_FAILURE_ORIGIN_EVIDENCE_CHARS));
+        let mut diagnostics = (*self.diagnostics).clone();
+        bound_stderr_diagnostics(&mut diagnostics, error_diagnostic_budget(&code, &message));
         WireError {
-            code: &self.code,
-            message: &self.message,
+            code: &code,
+            message: &message,
             diagnostics,
+            failure_where,
+            origin: self.origin,
+            origin_evidence,
+            exit_code: self.exit_code.as_deref().copied(),
+            ntstatus,
             details: self.details.as_ref().map(|detail| InvalidParam {
                 field: detail.field.chars().take(256).collect(),
                 expected: detail.expected.chars().take(512).collect(),
@@ -2382,6 +2785,174 @@ mod live_wire_tests {
             SourceHealthUpdate::new("a1", 1, " ", "ok")
                 .validate()
                 .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod failure_location_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn error_stays_small_enough_for_result_err() {
+        // `clippy::result_large_err` fires above 128 bytes; the typed
+        // failure context lives in cold boxed payloads so every `Result`
+        // keeps a small error. Trip this test before the gate does.
+        assert!(
+            std::mem::size_of::<Error>() <= 128,
+            "Error is {} bytes",
+            std::mem::size_of::<Error>()
+        );
+    }
+
+    #[test]
+    fn where_normalizes_to_stable_vocabulary() {
+        assert_eq!(
+            normalize_failure_where("router.dispatch.profile_store"),
+            "router.dispatch.profile_store"
+        );
+        assert_eq!(
+            normalize_failure_where("Plugin.OpenCode.Start.Auth-Transfer"),
+            "plugin.opencode.start.auth_transfer"
+        );
+        assert_eq!(normalize_failure_where(""), "unknown");
+        assert_eq!(normalize_failure_where("!!!"), "unknown");
+        assert!(normalize_failure_where(&"a.".repeat(200)).len() <= MAX_FAILURE_WHERE_CHARS);
+    }
+
+    #[test]
+    fn origin_round_trips_through_parse() {
+        for origin in [
+            FailureOrigin::Swarm,
+            FailureOrigin::Harness,
+            FailureOrigin::HarnessContractMismatch,
+            FailureOrigin::Provider,
+            FailureOrigin::Environment,
+            FailureOrigin::Unknown,
+        ] {
+            assert_eq!(FailureOrigin::parse(origin.as_str()), Some(origin));
+        }
+        assert_eq!(FailureOrigin::parse("datacenter"), None);
+    }
+
+    #[test]
+    fn failure_carries_where_origin_and_bounded_message() {
+        let error = Error::new("busy", "x".repeat(3000))
+            .with_where("router.dispatch.profile_store")
+            .with_origin(
+                FailureOrigin::Swarm,
+                "discovery readers at their in-flight bound (4)",
+            )
+            .sanitized(&SecretPolicy::default());
+        assert!(error.message.chars().count() <= MAX_FAILURE_MESSAGE_CHARS);
+        assert_eq!(
+            error.failure_where.as_deref(),
+            Some("router.dispatch.profile_store")
+        );
+        assert_eq!(error.origin, Some(FailureOrigin::Swarm));
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(wire["where"], json!("router.dispatch.profile_store"));
+        assert_eq!(wire["origin"], json!("swarm"));
+        assert!(wire["message"].as_str().unwrap().chars().count() <= MAX_FAILURE_MESSAGE_CHARS);
+        let back: Error = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, error);
+    }
+
+    #[test]
+    fn untrusted_wire_values_are_bounded_and_normalized() {
+        let wire = json!({
+            "code": "x",
+            "message": "y".repeat(5000),
+            "where": "BAD path!!",
+            "origin": "provider",
+            "origin_evidence": "z".repeat(5000),
+        });
+        let error = serde_json::from_value::<Error>(wire)
+            .unwrap()
+            .sanitized(&SecretPolicy::default());
+        assert!(error.message.chars().count() <= MAX_FAILURE_MESSAGE_CHARS);
+        assert_eq!(error.failure_where.as_deref(), Some("bad_path"));
+        assert_eq!(error.origin, Some(FailureOrigin::Provider));
+        assert!(
+            error.origin_evidence.as_deref().unwrap().chars().count()
+                <= MAX_FAILURE_ORIGIN_EVIDENCE_CHARS
+        );
+    }
+
+    #[test]
+    fn sanitized_redacts_message_evidence_and_tails() {
+        let policy = SecretPolicy::new(["s3cr3t"]);
+        let error = Error::new("harness_error", "leaked s3cr3t here")
+            .with_where("plugin.muse.turn.steer")
+            .with_origin(FailureOrigin::Harness, "frame mentions s3cr3t")
+            .with_stderr(
+                StderrSource::Harness,
+                StderrSnapshot {
+                    text: "s3cr3t tail".to_owned(),
+                    truncated: false,
+                    eof: true,
+                    read_error: false,
+                },
+            )
+            .sanitized(&policy);
+        assert!(!error.message.contains("s3cr3t"));
+        assert!(!error.origin_evidence.unwrap().contains("s3cr3t"));
+        assert!(!error.diagnostics[0].snapshot.text.contains("s3cr3t"));
+        assert_eq!(
+            error.failure_where.as_deref(),
+            Some("plugin.muse.turn.steer")
+        );
+    }
+
+    #[test]
+    fn exit_codes_carry_ntstatus_for_crash_statuses() {
+        let access_violation = 0xC000_0005u32 as i32;
+        let error = Error::new("harness_error", "native serve died")
+            .with_where("plugin.opencode.start.spawn")
+            .with_exit(Some(access_violation));
+        assert_eq!(error.exit_code.as_deref().copied(), Some(-1073741819));
+        assert_eq!(error.ntstatus.as_deref(), Some("0xC0000005"));
+        let wire = serde_json::to_value(&error).unwrap();
+        assert_eq!(wire["exit_code"], -1073741819);
+        let back: Error = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, error);
+        let plain = Error::new("busy", "full").with_exit(Some(1));
+        assert_eq!(plain.exit_code.as_deref().copied(), Some(1));
+        assert_eq!(plain.ntstatus, None);
+        let signal = Error::new("unknown", "killed").with_exit(None);
+        assert_eq!(signal.exit_code, None);
+        assert_eq!(signal.ntstatus, None);
+        let exit = ProcessExit::from_code(None);
+        assert!(exit.is_empty());
+    }
+
+    #[test]
+    fn provider_and_mismatch_constructors_carry_origin() {
+        let error = Error::provider(
+            ProviderRestrictionKind::RateLimit,
+            "plugin.codex.turn.failed",
+            "codex provider_restriction=rate_limit httpStatusCode=429",
+        );
+        assert_eq!(error.code, "rate_limited");
+        assert_eq!(error.origin, Some(FailureOrigin::Provider));
+        let mismatch = Error::harness_contract_mismatch(
+            "muse",
+            "plugin.muse.turn.steer",
+            "docs/harnesses/muse.md#steer",
+            "native error frame after applied steer",
+        );
+        assert_eq!(mismatch.code, "harness_contract_mismatch");
+        assert_eq!(
+            mismatch.origin,
+            Some(FailureOrigin::HarnessContractMismatch)
+        );
+        assert!(
+            mismatch
+                .origin_evidence
+                .as_ref()
+                .unwrap()
+                .starts_with("docs/harnesses/muse.md#steer: ")
         );
     }
 }

@@ -1224,6 +1224,7 @@ fn valid_timer_action_request(request: &SubmitCommand) -> bool {
         "launch" => valid_targetless_rule_launch_request(request),
         "git.fetch" => valid_targetless_git_fetch_request(request),
         "notify" | "emit" => valid_targetless_user_event_request(request),
+        "mail.send" | "var.set" => valid_targetless_coordination_request(request),
         _ => valid_rule_action_request(request, false),
     }
 }

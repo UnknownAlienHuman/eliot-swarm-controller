@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
     ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_SHARING_VIOLATION, FILETIME, GetLastError,
-    HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -902,6 +902,24 @@ pub(crate) fn process_start_time(pid: u32) -> u64 {
         .record
         .identity
         .start_time
+}
+
+/// Whether a numeric process id names a process that has not exited yet.
+/// Query-only rights are used and the handle is always closed. A reused PID
+/// reads as alive, which only keeps a directory: never a deletion proof.
+pub(crate) fn lock_owner_process_alive(pid: u32) -> bool {
+    // SAFETY: OpenProcess with query-only rights performs no write to the
+    // target; the handle is closed on every path below.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(process, &mut code) != 0;
+        CloseHandle(process);
+        ok && code == STILL_ACTIVE as u32
+    }
 }
 
 /// Whether a process recorded by an earlier daemon (exact creation FILETIME)

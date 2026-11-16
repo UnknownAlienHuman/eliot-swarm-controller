@@ -329,6 +329,7 @@ impl CodexPlugin {
             "profile.store" => self.profile_store(&request.params).await,
             "model.list" => self.model_list(&request.params).await,
             "quota.read" => self.quota_read(&request.params).await,
+            "native.archive" => self.native_archive(&request.params).await,
             "agent.attach" => self.attach(&request.params).await,
             "agent.detach" => self.detach(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
@@ -494,6 +495,56 @@ impl CodexPlugin {
         )
         .await?;
         Ok(json!({"details": details}))
+    }
+
+    /// Archive one thread through the documented `thread/archive` method. A
+    /// dedicated reader plugin instance performs the call with no turn and
+    /// no inference; raw session files are never touched. Used by Swarm
+    /// cleanup for terminal Codex Agents; every other harness reports no
+    /// native archive surface and keeps its sessions.
+    async fn native_archive(&self, raw: &Value) -> Result<Value> {
+        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Codex native.archive requires a dedicated reader plugin instance",
+            ));
+        }
+        let profile = raw.get("profile").unwrap_or(raw);
+        if profile.get("harness").and_then(Value::as_str) != Some("codex") {
+            return Err(Error::new(
+                "profile_error",
+                "Codex native.archive received another harness",
+            ));
+        }
+        let native_ref = raw
+            .get("native_ref")
+            .and_then(Value::as_str)
+            .filter(|reference| {
+                !reference.is_empty()
+                    && reference.len() <= 512
+                    && !reference.chars().any(char::is_control)
+            })
+            .ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "Codex native.archive needs a native session reference",
+                )
+            })?;
+        let (launch, secrets, metadata_secrets) = self.reader_launch(profile, &json!({}))?;
+        let binding =
+            frozen_store_binding(profile.as_object().ok_or_else(|| {
+                Error::new("profile_error", "archive requires a frozen profile")
+            })?)?;
+        crate::discovery::archive_thread(
+            launch,
+            &binding,
+            native_ref.to_owned(),
+            &metadata_secrets,
+            &secrets,
+            tokio::time::Instant::now() + crate::discovery::READ_TIMEOUT,
+        )
+        .await?;
+        Ok(json!({"archived": true}))
     }
 
     fn reader_launch(
@@ -1907,10 +1958,20 @@ impl CodexPlugin {
         }
         let event_status = session.events.status();
         if let Some(reason) = event_status.failure {
-            return Err(Error::new("unknown", reason));
+            return Err(Error::new("unknown", reason)
+                .with_where("plugin.codex.command.send")
+                .with_origin(
+                    eliot_core::FailureOrigin::Swarm,
+                    "send gate refused on event-source failure",
+                ));
         }
         if event_status.active_turn_id.is_some() {
-            return Err(Error::new("busy", "Codex already has an active turn"));
+            return Err(Error::new("busy", "Codex already has an active turn")
+                .with_where("plugin.codex.command.send")
+                .with_origin(
+                    eliot_core::FailureOrigin::Swarm,
+                    "send gate refused: native turn already active",
+                ));
         }
         let combined = with_claimed_context(text, &params.context, "Codex")?;
         let command_id = params.command_id.clone();
@@ -3572,7 +3633,7 @@ mod tests {
                 .with_stderr(StderrSource::Harness, harness_tail.clone());
             let recoded = pre_dispatch_read_error(unknown, code, message);
             assert_eq!(recoded.code, code);
-            assert_eq!(recoded.message, message);
+            assert_eq!(recoded.message.as_str(), message);
             assert_eq!(recoded.diagnostics.len(), 2);
             // The write guard would preserve unknown verbatim; reads must not.
             let preserved = contextual_error(
@@ -3677,7 +3738,10 @@ mod tests {
             "Codex thread/start may have changed native state; it will not be repeated",
         );
         assert_eq!(preserved.code, "unknown");
-        assert_eq!(preserved.message, "dummy uncertain thread/start outcome");
+        assert_eq!(
+            preserved.message.as_str(),
+            "dummy uncertain thread/start outcome"
+        );
         assert_eq!(preserved.diagnostics.len(), 2);
         assert_eq!(
             serde_json::to_value(&preserved).expect("serialize preserved"),

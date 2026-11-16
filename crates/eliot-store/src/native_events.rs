@@ -184,6 +184,7 @@ fn persist_turn_associated(
             completed_at: None,
             usage: None,
             config_revision: command.config_revision,
+            preceded_by: None,
         },
     )?;
     // The applied send outcome repeats what the native turn request
@@ -627,14 +628,22 @@ fn persist_turn_terminal(
     }
     let usage = usage.map(encode_json).transpose()?;
     let outcome = outcome.map(|outcome| outcome.as_str());
+    // A non-success terminal outcome reports on the bound command: record
+    // it as the causal predecessor. Success needs no explanation, and
+    // without a bound command there is nothing to link.
+    let preceded_by = match outcome {
+        Some("failure") | Some("interrupted") | Some("unknown") => command_id,
+        _ => None,
+    };
     let changed = tx
         .execute(
             "UPDATE turns SET state = ?1, status = COALESCE(?2, status),
                               outcome = COALESCE(?3, outcome),
                               native_status = COALESCE(?4, native_status),
                               final_text = COALESCE(?5, final_text), completed_at = ?6,
-                              usage = COALESCE(?7, usage)
-             WHERE agent = ?8 AND generation = ?9 AND turn_id = ?10",
+                              usage = COALESCE(?7, usage),
+                              preceded_by = COALESCE(?8, preceded_by)
+             WHERE agent = ?9 AND generation = ?10 AND turn_id = ?11",
             params![
                 turn_state_name(state),
                 status,
@@ -643,6 +652,7 @@ fn persist_turn_terminal(
                 final_text,
                 completed_at,
                 usage,
+                preceded_by,
                 agent_num,
                 generation,
                 turn_id,

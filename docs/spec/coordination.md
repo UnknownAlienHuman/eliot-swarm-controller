@@ -1,5 +1,101 @@
 # Coordination
 
+## Registered artifacts and cleanup (K69)
+
+The shared wire DTOs are in
+[`api/cleanup.rs`](../../crates/eliot-core/src/api/cleanup.rs).
+`artifact.register {id,path,kind,purpose}` admits an existing directory owned by
+the authenticated Agent generation. It captures the opened filesystem identity,
+project and generation-bound ancestor chain. Before native startup Swarm creates
+`<first-configured-artifact-root>/<agent>-<generation>/`, or
+`<data-dir>/artifacts/<agent>-<generation>/` when none is configured. Creation is
+exclusive: an existing unbound directory is refused, never adopted. Its opened
+identity is committed as an internal, non-deletable `ownership_root` ledger row,
+and the native process receives its path as `ELIOT_ARTIFACT_ROOT`. Agent-created
+directories must use absolute local paths strictly below that durable root; location in a
+workspace or a shared configured root alone proves no ownership. Legacy rows
+outside this binding remain kept. Roots themselves, reparse points,
+tracked source, overlapping claims, the daemon data directory and native/user
+configuration are refused. Kinds accepted from Agents are `build`, `data_dir`,
+`temp`, `other`; worktrees and branches come only from Swarm's retained workspace
+preparation. Declared profile scratch directories are recorded only in singly
+owned workspaces and when inside the Agent's durable root. The frozen
+`CARGO_TARGET_DIR` captured from a profile that passes it through `pass_env`
+is recorded when it lies outside the Agent
+workspace and inside the Agent's durable root. Private daemon data
+directories are recorded only by the Agent that created them through
+`artifact.register`; a daemon lock or a live process holding one keeps it.
+Existing worktree and native-subject facts are also reconciled
+when planning, without scanning arbitrary filesystem roots.
+
+`cleanup.plan {scope:self_tree|project|all,project?,older_than?}` changes no
+filesystem objects. It retains a bounded snapshot with per-item size, reason and
+`safe`/`keep` verdict. The cutoff is an exclusive Unix-millisecond creation time.
+Agents are restricted to their frozen and current subtree; Owner selects project
+or all. Terminal means Stopped or Failed with no open native source, pending
+command or retained non-exited owned process. Lost remains conservative.
+Clean managed worktrees require exact reciprocal Git/common-directory identity;
+tracked, untracked and ignored changes keep the worktree. Native stores are never
+deleted as files. A Codex session of a terminal Agent is `safe` with reason
+`native_archive_pending`; every other harness stays `keep(no_native_archive)`.
+The plan snapshot anchors the freshly classified branch tip (the backfill also refreshes the stored row), and apply re-verifies that exact tip. A branch is `safe` only after a fresh upstream fetch proves the tip is
+contained in the upstream default branch with no unpushed commits (a remote
+branch already deleted upstream counts as merged only together with that
+containment); otherwise it stays `keep` with `unmerged`, `ahead`, or a fetch
+readiness reason. Default-branch discovery must freshly advertise the remote
+HEAD symref; a cached remote HEAD never substitutes for a failed discovery
+(`keep(no_default_branch)`). The plan fetch updates remote-tracking state but never
+deletes branches. A present `daemon.lock` with a live owner keeps a data
+directory; only a provably dead owner releases it.
+
+`cleanup.apply {id,plan_id}` consumes only the plan's safe candidates, rechecks
+authority, generation, Git cleanliness, opened identities and busy/link refusal,
+then records each outcome as `removed`, `skipped` with reason, or `unknown`.
+The Store commits an unknown attempt before effects and settles results before
+acknowledgement. Exact same-ID replay returns the retained response. Another ID
+cannot consume the plan; another pre-existing plan cannot retry an attempted
+artifact. Uncertain attempts fence resume at admission and dispatch. Windows
+pins ancestors, opens the entire bounded tree through relative handles without
+delete sharing for every directory and file until disposition/close, refuses
+reparse points and deletes by handle disposition. Any file whose link count is
+not exactly one keeps the entire tree with `hard_link`, including Cargo targets
+with shared binaries. Guarded scans at both plan and apply refuse repository
+roots (including bare repositories), every `.git` entry, and native/user config
+descendants. Only a clean, retained Swarm worktree may include its exact
+reciprocal `.git` pointer, verified by opened identity; nested repositories stay
+protected even there.
+Unix reports unsupported rather than using pathname unlink. Worktree directory
+and its exact private Git administration directory are removed; its local branch
+is retained when the worktree is removed through worktree cleanup. A planned
+branch is deleted locally with the safe `-d` form after a second fresh-fetch
+verification at apply time, and only after its worktree is gone; refuse reasons
+are `branch_checked_out`, `branch_delete_refused` and `identity_changed`, and
+a branch that vanished concurrently is `unknown`. Remote branch deletion is a
+separate explicit Owner-only flag (`delete_remote`) on `cleanup.apply` and
+never automatic: the remote branch is verified absent before and after the
+push, and a remote failure after local deletion is `unknown`, never `skipped`.
+Native sessions are archived at apply through the harness documented archive
+method (Codex `thread/archive`) using the Agent's frozen profile and store
+binding. Artifact scope/reference must match that generation's native subject,
+and the initialized reader verifies its effective home/SQLite root against the
+frozen binding before dispatch. A malformed or secret-bearing acknowledgement
+after dispatch is `unknown` and retains the durable retry fence. Raw
+native store files are never touched. Logical reclaimed bytes count only fully
+confirmed removed trees; partial attempts report unknown and zero confirmed
+bytes.
+
+The current limits are 64 candidates, 4,096 retained artifacts, 1,024 retained
+plans, 10,000 filesystem entries, depth 64 and five seconds per tree scan.
+Exceeding a bound refuses the tree before deletion. Ledger exhaustion rejects new
+admission. Removed identities remain tombstones; unknown identities are never
+automatically retried. The CLI exposes `artifact register`, `cleanup plan` and
+`cleanup apply`; Desktop Settings > Advanced reviews a plan and applies its safe
+items through the same Router. A folder assignment opts in with
+`cleanup_on_retire`: after an applied stop retires its Agent, the existing
+stop worker runs the same plan/apply for that Agent's build, temp and
+worktree artifacts with Owner authority and retained receipts. It is off by
+default and is not a second executor.
+
 Add at L5, initially between two Codex Agents. Mail, shared variables, Git-backed `who`
 and advisory claims reuse the existing API/router/Store; no second scheduler.
 

@@ -136,7 +136,8 @@ fn start_failure_is_proven_no_effect(phase: StartPhase, _code: &str) -> bool {
 /// retires the plugin instead of pinning an unknown Agent.
 struct PhaseFailure {
     phase: StartPhase,
-    error: Error,
+    // Boxed: the diagnostics-carrying Error is large (clippy result_large_err).
+    error: Box<Error>,
 }
 
 /// Typed reason for one proven-no-effect failed start. Static per phase
@@ -668,18 +669,8 @@ impl ClaudePlugin {
     /// launch is definitely failed, never unknown. The reason names the
     /// failed check in short non-secret words; it is persisted in the daemon
     /// outcome, so it must never carry endpoints, ids, values, or secrets.
-    fn retain_proven_no_effect_start(
-        &mut self,
-        params: &AgentStartParams,
-        reason: impl Into<String>,
-    ) -> Value {
-        let value = json!({
-            "agent_id": params.agent_id,
-            "generation": params.generation,
-            "command_id": params.command_id,
-            "state": "failed",
-            "reason": reason.into(),
-        });
+    fn retain_proven_no_effect_start(&mut self, params: &AgentStartParams, error: Error) -> Value {
+        let value = eliot_plugin::session::failed_start_value(params, error);
         self.failed_start = Some(FailedStart {
             agent_id: params.agent_id.clone(),
             generation: params.generation,
@@ -706,7 +697,28 @@ impl ClaudePlugin {
             &failure.error.code
         ));
         let reason = prespawn_reason(failure.phase, &failure.error.code);
-        self.retain_proven_no_effect_start(params, reason)
+        let phase = match failure.phase {
+            StartPhase::Plan => "plan",
+            StartPhase::McpConfig => "mcp_config",
+            StartPhase::Skill => "skill",
+            StartPhase::Login => "login",
+            StartPhase::Spawn => "spawn",
+            StartPhase::PostSpawn => "post_spawn",
+        };
+        let mut error = *failure.error;
+        if error.origin.is_none()
+            && matches!(
+                failure.phase,
+                StartPhase::McpConfig | StartPhase::Skill | StartPhase::Login | StartPhase::Spawn
+            )
+        {
+            error = error.with_origin(
+                eliot_core::FailureOrigin::Environment,
+                "native executable, private file or external login operation failed",
+            );
+        }
+        let error = eliot_plugin::session::classify_start_failure(error, "claude", phase);
+        self.retain_proven_no_effect_start(params, error.with_message(reason))
     }
 
     async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> DispatchOutcome {
@@ -1329,7 +1341,7 @@ impl ClaudePlugin {
                     &params,
                     PhaseFailure {
                         phase: StartPhase::Plan,
-                        error,
+                        error: Box::new(error),
                     },
                 ));
             }
@@ -1340,7 +1352,7 @@ impl ClaudePlugin {
                 if start_failure_is_proven_no_effect(failure.phase, &failure.error.code) {
                     return Ok(self.proven_no_effect_start(&params, failure));
                 }
-                return Err(failure.error);
+                return Err(*failure.error);
             }
         };
         if let Err(error) = register_native_process(
@@ -2327,7 +2339,7 @@ async fn launch_session(
         ClaudeMcpConfigFile::create(&plan.instance_dir, &plan.swarm_binary, &plan.data_root)
             .map_err(|error| PhaseFailure {
                 phase: StartPhase::McpConfig,
-                error,
+                error: Box::new(error),
             })?;
     // Approvals always travel over stdio so every `can_use_tool` ask
     // reaches Eliot. Resume continues the exact retained session id; the
@@ -2380,7 +2392,10 @@ async fn launch_session(
     if !skill_root.is_dir() {
         return Err(PhaseFailure {
             phase: StartPhase::Skill,
-            error: Error::new("unavailable", "Claude skill root is unavailable"),
+            error: Box::new(Error::new(
+                "unavailable",
+                "Claude skill root is unavailable",
+            )),
         });
     }
     argv.push(OsString::from("--plugin-dir"));
@@ -2392,7 +2407,7 @@ async fn launch_session(
         .await
         .map_err(|error| PhaseFailure {
             phase: StartPhase::Login,
-            error,
+            error: Box::new(error),
         })?;
     let launch = NativeLaunch {
         program: plan.program.clone(),
@@ -2404,7 +2419,7 @@ async fn launch_session(
         .await
         .map_err(|error| PhaseFailure {
             phase: StartPhase::Spawn,
-            error,
+            error: Box::new(error),
         })?;
     let frames = match native.take_frames() {
         Ok(frames) => frames,
@@ -2412,7 +2427,7 @@ async fn launch_session(
             let _ = native.terminate(false, Instant::now() + RPC_TIMEOUT).await;
             return Err(PhaseFailure {
                 phase: StartPhase::PostSpawn,
-                error,
+                error: Box::new(error),
             });
         }
     };
@@ -3234,16 +3249,18 @@ mod tests {
         let mut plugin = ClaudePlugin::default();
         let failure = PhaseFailure {
             phase: StartPhase::Plan,
-            error: Error::new(
+            error: Box::new(Error::new(
                 "profile_error",
                 "Claude inherit MCP keeps the owner Swarm MCP server \"swarm\" from project .mcp.json",
-            ),
+            )),
         };
         let value = plugin.proven_no_effect_start(&params, failure);
         assert_eq!(value["state"], "failed");
         assert_eq!(value["agent_id"], "agent-9");
         assert_eq!(value["generation"], 1);
         assert_eq!(value["command_id"], "0199-owner-scan");
+        assert_eq!(value["origin"], "swarm");
+        assert_eq!(value["where"], "plugin.claude.start.plan");
         let reason = value["reason"].as_str().expect("typed reason");
         assert!(reason.contains("profile_error"));
         assert!(!reason.contains("swarm"));
