@@ -489,3 +489,13 @@ unmapped fields). `allow` is accepted and preserves today's behavior.
 Implementation: `crates/eliot-daemon/src/config.rs`
 (`freeze_native_subagents`).
 
+## Access levels (`--access ask|auto|full`)
+
+Ad-hoc mapping, frozen in the snapshot and reported in effective settings:
+`ask` and `auto` are `dangerously_skip_permissions=false`, keeping the ACP
+`session/request_permission` round-trip decided with `swarm approve`/`deny`;
+`full` is `dangerously_skip_permissions=true`, exactly the current full-access
+skip. Implementation:
+[`crates/eliot-daemon/src/adhoc.rs`](../../crates/eliot-daemon/src/adhoc.rs)
+(`apply_adhoc_access`).
+

@@ -704,3 +704,14 @@ load (typed, matching the existing pattern for unmapped fields). `allow` is
 accepted and preserves today's behavior. Implementation:
 `crates/eliot-daemon/src/config.rs` (`freeze_native_subagents`).
 
+## Access levels (`--access ask|auto|full`)
+
+Ad-hoc mapping, frozen in the snapshot and reported in effective settings:
+`ask` is `approval=onRequest` + `workspace-write` (pending
+`approval/request` decided with `swarm approve`/`deny`); `auto` is
+`approval=promptUnmatched` + `workspace-write`; `full` is
+`approval=allowAll` + `danger-full-access` (`--disable-sandbox`), exactly the
+current full-access posture. Implementation:
+[`crates/eliot-daemon/src/adhoc.rs`](../../crates/eliot-daemon/src/adhoc.rs)
+(`apply_adhoc_access`).
+

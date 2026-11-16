@@ -199,6 +199,22 @@ struct DesktopWindow {
     height: u32,
 }
 
+/// One desktop model favorite or recent entry.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DesktopModelRef {
+    #[serde(default)]
+    harness: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    effort: Option<String>,
+}
+
+/// Bounded desktop preferences for the new-task picker: favorite models,
+/// recent models (most recent first), collapsed projects and the last used
+/// access level. Stored in the unified `[desktop]` section via the existing
+/// settings writer.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct DesktopSettings {
@@ -208,7 +224,20 @@ struct DesktopSettings {
     window: Option<DesktopWindow>,
     #[serde(default)]
     startup: DesktopStartup,
+    #[serde(default)]
+    favorite_models: Vec<DesktopModelRef>,
+    #[serde(default)]
+    recent_models: Vec<DesktopModelRef>,
+    #[serde(default)]
+    collapsed_projects: Vec<String>,
+    #[serde(default)]
+    last_access: Option<String>,
 }
+
+/// Bounds for the `[desktop]` picker lists.
+const MAX_DESKTOP_FAVORITES: usize = 50;
+const MAX_DESKTOP_RECENTS: usize = 20;
+const MAX_DESKTOP_COLLAPSED: usize = 100;
 
 impl DesktopSettings {
     fn validate(&self) -> core::Result<()> {
@@ -220,6 +249,72 @@ impl DesktopSettings {
             return Err(core::Error::new(
                 "profile_error",
                 "config.toml: desktop window must be at least 640 by 480",
+            ));
+        }
+        if self.favorite_models.len() > MAX_DESKTOP_FAVORITES {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: desktop favorite_models exceeds 50 entries",
+            ));
+        }
+        if self.recent_models.len() > MAX_DESKTOP_RECENTS {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: desktop recent_models exceeds 20 entries",
+            ));
+        }
+        if self.collapsed_projects.len() > MAX_DESKTOP_COLLAPSED {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: desktop collapsed_projects exceeds 100 entries",
+            ));
+        }
+        for entry in self.favorite_models.iter().chain(self.recent_models.iter()) {
+            let harness = entry.harness.trim();
+            if !matches!(
+                harness,
+                "codex" | "claude" | "muse" | "opencode" | "antigravity"
+            ) {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: desktop model harness must be codex, claude, muse, opencode or antigravity",
+                ));
+            }
+            let model = entry.model.trim();
+            if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: desktop model must be 1-256 characters with no controls",
+                ));
+            }
+            if let Some(effort) = entry.effort.as_deref()
+                && (effort.trim().is_empty()
+                    || effort.len() > 128
+                    || effort.chars().any(char::is_control))
+            {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: desktop model effort must be 1-128 characters with no controls",
+                ));
+            }
+        }
+        for project in &self.collapsed_projects {
+            if project.trim().is_empty()
+                || project.len() > 256
+                || project.chars().any(char::is_control)
+            {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: desktop collapsed_projects entries must be 1-256 characters with no controls",
+                ));
+            }
+        }
+        if let Some(access) = self.last_access.as_deref()
+            && !matches!(access.trim(), "ask" | "auto" | "full")
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: desktop last_access must be ask, auto or full",
             ));
         }
         Ok(())
@@ -4997,5 +5092,63 @@ output_limit = 4096
                 .message
                 .contains("unsupported configuration field")
         );
+    }
+
+    fn desktop_settings(source: &str) -> DesktopSettings {
+        let config: FileConfig = toml::from_str(source).expect("valid TOML");
+        config.desktop
+    }
+
+    #[test]
+    fn desktop_picker_lists_validate_bounds_and_harness() {
+        desktop_settings("[desktop]\n").validate().unwrap();
+        let valid = desktop_settings(
+            "[desktop]\nfavorite_models = [{harness = 'codex', model = 'gpt-6-luna', effort = 'low'}]\nrecent_models = [{harness = 'opencode', model = 'opencode/deepseek-v4.1-flash-free'}]\ncollapsed_projects = ['app']\nlast_access = 'auto'\n",
+        );
+        valid.validate().unwrap();
+        let too_many_favorites = DesktopSettings {
+            favorite_models: vec![
+                DesktopModelRef {
+                    harness: "codex".to_owned(),
+                    model: "m".to_owned(),
+                    effort: None,
+                };
+                MAX_DESKTOP_FAVORITES + 1
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            too_many_favorites.validate().unwrap_err().code,
+            "profile_error"
+        );
+        let too_many_recents = DesktopSettings {
+            recent_models: vec![
+                DesktopModelRef {
+                    harness: "codex".to_owned(),
+                    model: "m".to_owned(),
+                    effort: None,
+                };
+                MAX_DESKTOP_RECENTS + 1
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            too_many_recents.validate().unwrap_err().code,
+            "profile_error"
+        );
+        let bad_harness = DesktopSettings {
+            favorite_models: vec![DesktopModelRef {
+                harness: "fake".to_owned(),
+                model: "m".to_owned(),
+                effort: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(bad_harness.validate().unwrap_err().code, "profile_error");
+        let bad_access = DesktopSettings {
+            last_access: Some("sometimes".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(bad_access.validate().unwrap_err().code, "profile_error");
     }
 }

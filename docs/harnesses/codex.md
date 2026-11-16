@@ -655,3 +655,14 @@ equivalent to `-c features.<name>=false`). Implementation:
 `plugins/codex/src/route.rs` (`native_subagents_argv`,
 `args_with_native_subagents`, `args_with_agent_mcp`) and
 `plugins/codex/src/host.rs` (start/probe launches).
+
+## Access levels (`--access ask|auto|full`)
+
+Ad-hoc mapping, frozen in the snapshot and reported in effective settings:
+`ask` is `approval_policy=on-request` + `workspace-write` (tool calls produce
+pending requests decided with `swarm approve`/`deny`); `auto` is
+`approval_policy=never` + `workspace-write`; `full` is
+`approval_policy=never` + `danger-full-access`, exactly the current
+full-access profiles. Implementation:
+[`crates/eliot-daemon/src/adhoc.rs`](../../crates/eliot-daemon/src/adhoc.rs)
+(`apply_adhoc_access`).

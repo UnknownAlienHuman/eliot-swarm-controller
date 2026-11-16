@@ -121,8 +121,8 @@ pass_env = ["CODEX_HOME"]
 ## Ad-hoc Owner launch (no stored profile)
 
 `swarm launch --harness <codex|claude|muse|opencode|antigravity>
-[--model M] [--effort E] [--auth I] [--cmd PATH] --workspace W "prompt"` (and the same in
-`command.submit` `launch` args, where `cmd` rides beside `model`/`effort` in
+[--model M] [--effort E] [--auth I] [--access ask|auto|full] [--cmd PATH] --workspace W "prompt"` (and the same in
+`command.submit` `launch` args, where `cmd` and `access` ride beside `model`/`effort` in
 the exact retry-bound payload) is an Owner-only tool that builds and freezes
 a profile-equivalent snapshot exactly like a stored profile: built-in safe
 defaults for that harness plus the supplied flags, reproducible and
@@ -156,6 +156,20 @@ omitted one defaults to the model provider prefix only when the native
 refuses before spawning with a typed `profile_error` naming `--auth` and
 listing the available integration ids; another provider's credential is never
 picked silently, and the plugin's pre-serve transfer gate is unchanged.
+`--access` selects the Owner access level next to `harness`/`model`/`effort`
+(`swarm launch --access …`, `swarm switch --access …`, `command.submit`
+`launch` `access`). Omitted keeps the safe defaults. The level freezes its
+native permission result in the snapshot and the effective settings report it
+truthfully. `ask` routes every approval through the existing pending-request
+path (`swarm approve`/`deny`); it is never silently weakened. A level a
+harness cannot express refuses with a typed `unsupported` reason.
+
+| Level | Codex | Claude | OpenCode | Muse | Antigravity |
+| --- | --- | --- | --- | --- | --- |
+| `ask` | `approval_policy=on-request` + `workspace-write` (pending-request) | `permission_mode=manual` (pending `can_use_tool`) | native permission-reply surface (pending) | `approval=onRequest` + `workspace-write` (pending `approval/request`) | `dangerously_skip_permissions=false` (ACP `session/request_permission`) |
+| `auto` | `approval_policy=never` + `workspace-write` | `permission_mode=auto` | native permission-reply surface (pending) | `approval=promptUnmatched` + `workspace-write` | `dangerously_skip_permissions=false` (ACP permission path) |
+| `full` | `approval_policy=never` + `danger-full-access` (exactly current full-access profiles) | `permission_mode=bypassPermissions` (full-access) | `unsupported` (no full-access mapping; refuses instead of widening) | `approval=allowAll` + `danger-full-access` (exactly current full-access) | `dangerously_skip_permissions=true` (exactly current full-access skip) |
+
 Agent principals keep
 the profile and `child_profiles` rules; they cannot ad-hoc launch
 (`not_allowed`).
@@ -859,8 +873,12 @@ accounts and proxies.
 Rules/scripts remain files owned by their existing APIs; settings references and
 automation policy do not create a second executor. Desktop preferences use
 `[desktop]`: `theme` (`system`, `light`, `dark`), `window` (`width`/`height`, at least
-640 by 480) and `startup` (`new_task`, or `last_conversation` to reopen the most
-recently active Agent's conversation). The desktop keeps no other preference store. The desktop writes `window` back once when the window closes, and only when the size changed.
+640 by 480), `startup` (`new_task`, or `last_conversation` to reopen the most
+recently active Agent's conversation), `favorite_models` (bounded list of
+`{harness, model, effort?}`, at most 50), `recent_models` (bounded most-recent-first
+list of `{harness, model, effort?}`, at most 20), `collapsed_projects` (bounded
+list of project ids, at most 100) and `last_access` (`ask`, `auto` or `full`).
+The desktop keeps no other preference store. The desktop writes `window` back once when the window closes, and only when the size changed.
 If that table is absent, the desktop imports the legacy per-user
 `swarm-desktop.json` preferences through the revision-guarded settings writer once.
 It retires the legacy file only after successful publication; an existing `[desktop]`
