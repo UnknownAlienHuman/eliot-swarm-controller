@@ -586,6 +586,29 @@ of the explicitly selected release scope.
 
 ## Later
 
+- [ ] **K69 manager cleanup (owner clarification 2026-11-16, #384).**
+      Implemented generation/tree artifact custody, bounded plan/apply, handle
+      deletion, branch verification, native archive, retirement opt-in, CLI and
+      Advanced Settings. The audit repair binds exclusive per-generation roots,
+      refuses hard links/repositories/configuration, requires a fresh remote
+      default, and preserves frozen native scope and uncertain archive fences.
+      Requalified on 2026-11-16 with a private release daemon and real Muse
+      `muse-spark-1.3-contributor`/low: manager a1 stopped children a2/a3 and
+      applied two plans, removing both managed worktrees, the merged branch,
+      temp/source artifacts and a released held directory (2,715 logical bytes).
+      The unmerged branch, initially dirty worktree, live-held directory, nested
+      repository, hard-linked Cargo targets and a substituted junction were
+      kept/refused as appropriate; sibling registration was denied. Static gate:
+      fmt, locked workspace all-targets build, warnings-denied Clippy and 2,014
+      tests passed. All owned processes exited and the private daemon drained.
+      Keep this item open: existing Agent policy prohibits managed-worktree
+      launches, so the private Owner created the children under the manager;
+      the exact manager-created-worktree scenario remains unqualified. Frozen
+      Codex archive scope and malformed acknowledgements have source/regression
+      coverage, without a native fault-injection run. Automatic approval review
+      blocked deletion of the private proof directory and five scratch directories
+      left by failing-before tests.
+
 Service continuity across daemon replacement requires an actual use case. The
 current contracts are not instructions to build that product in advance.
 The optional desktop companion is tracked above.

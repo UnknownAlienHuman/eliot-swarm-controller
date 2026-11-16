@@ -1591,7 +1591,8 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "DROP INDEX commands_turn_unknown;
+                    "DROP TABLE artifacts; DROP TABLE cleanup_plans;
+             DROP INDEX commands_turn_unknown;
                      DROP TRIGGER assignment_commands_insert;
                      DROP TRIGGER assignment_commands_update;
                      DROP TRIGGER assignment_commands_delete;

@@ -1211,6 +1211,12 @@ impl Router {
         resume_source_state: Option<Value>,
         linked_id: Option<String>,
     ) {
+        if let Err(error) = self.prepare_agent_artifact_root(&agent).await {
+            self.settle_plugin_error(id, &Error::new("native_not_dispatched", *error.message))
+                .await;
+            return;
+        }
+        let artifact_agent = agent.id.clone();
         let harness = agent.harness.clone();
         let start = self
             .inner
@@ -1227,6 +1233,11 @@ impl Router {
                     );
                     let _ = self.settle(id, CommandState::Failed, Some(value)).await;
                 } else {
+                    let artifact_snapshot =
+                        self.inner.store.lock().await.get_agent(&artifact_agent);
+                    if let Ok(Some(agent)) = artifact_snapshot {
+                        let _ = self.record_agent_artifacts(&agent).await;
+                    }
                     let _ = self
                         .settle(id, CommandState::Applied, Some(json!({"state": "ready"})))
                         .await;
@@ -1599,6 +1610,10 @@ impl Router {
             .await
         {
             let _ = self.settle(id, CommandState::Applied, Some(summary)).await;
+            // Assignment retirement runs inline in this stop worker, never in
+            // a second executor. Best effort: refused items stay registered.
+            self.retire_assignment_cleanup(&agent.id, agent.generation)
+                .await;
             return true;
         }
         let force = dispatched
@@ -1626,9 +1641,15 @@ impl Router {
                     .settle(id, CommandState::Applied, Some(summary))
                     .await
                     .is_some_and(|command| command.state == CommandState::Applied)
-                    && let Some(guard) = force_stop
                 {
-                    guard.finish();
+                    // Assignment retirement runs inline in this stop worker,
+                    // never in a second executor. Best effort: refused items
+                    // stay registered.
+                    self.retire_assignment_cleanup(&agent.id, agent.generation)
+                        .await;
+                    if let Some(guard) = force_stop {
+                        guard.finish();
+                    }
                 }
             }
             Err(error) => {

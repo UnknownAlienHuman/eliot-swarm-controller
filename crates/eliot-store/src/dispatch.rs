@@ -145,6 +145,7 @@ fn dispatch_resume_tx(
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let old_generation = command_generation;
+    cleanup::require_no_cleanup_attempt(tx, agent)?;
     if !matches!(command.state, CommandState::Accepted | CommandState::Queued)
         || command_generation != agent.generation
         || command

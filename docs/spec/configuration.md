@@ -1,5 +1,21 @@
 # Configuration
 
+### Artifact roots
+
+`[daemon].artifact_roots` is an optional array of at most 32 absolute local
+directories (default empty). Before native startup Swarm exclusively creates and
+durably binds `<first-root>/<agent>-<generation>/`; without a configured root it
+uses `<data-dir>/artifacts/<agent>-<generation>/`. `ELIOT_ARTIFACT_ROOT` hands this
+path to the Agent. Registration accepts only strict descendants of that exact
+generation root. Existing unbound directories are never adopted. Shared
+configured roots, workspace paths alone and user/native configuration
+remain protected. This does not scan or adopt existing unregistered files. See
+[registered artifacts and cleanup](coordination.md#registered-artifacts-and-cleanup-k69).
+The setting is available through the existing Daemon settings section. A folder assignment opts in with `[automation.assignments.<key>] cleanup_on_retire = true`
+(default false): after an applied stop retires its Agent, the existing stop
+worker cleans that Agent's build, temp and managed-worktree artifacts with
+Owner authority and retained receipts. It is not a second executor.
+
 Implement the single global Codex profile first. Project overlays, external plugins,
 services, mail and automation settings appear only with their owning roadmap layer;
 this page is the final configuration contract, not an L1 checklist.
@@ -755,7 +771,14 @@ selected by `pass_env` or unset; a selected empty string remains distinct. Prese
 values without trimming or path normalization. Names compare case-insensitively on
 Windows and exactly elsewhere. [Environment construction](../../crates/eliot-daemon/src/plugin_host/host.rs)
 uses these captured inputs instead of looking them up again. This selector capture
-leaves other `pass_env` resolution unchanged.
+leaves other `pass_env` resolution unchanged. When `pass_env` admits the
+literal name `CARGO_TARGET_DIR`, admission also freezes its exact value in
+`profile_snapshot.target_dir` (absolute local path only; skipped otherwise).
+Cleanup backfills that frozen directory as a build artifact when it lies
+outside the Agent workspace and inside its durably bound artifact root. A
+shared daemon-wide target is kept rather than attributed to an Agent. Agents
+should place their own target under `ELIOT_ARTIFACT_ROOT` and register it through
+`artifact.register`; targets containing hard-linked files stay `keep(hard_link)`.
 
 Retained mutation IDs hydrate their stored snapshot before any new capture. Admitted
 selector inputs are frozen at admission and are neither rewritten nor backfilled:

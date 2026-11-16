@@ -2,6 +2,7 @@ mod attention;
 mod attribution;
 mod auth;
 mod catalog;
+mod cleanup;
 mod command;
 mod config_ops;
 mod context;
@@ -347,6 +348,9 @@ impl Router {
                 Ok(json!({"state": "panicking"}))
             }
             "maintenance.run" => self.maintenance_run(&params, &principal).await,
+            "artifact.register" => self.artifact_register(&params, &principal).await,
+            "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
+            "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
             "command.submit" => {
                 let result = self
                     .submit_bound(&params, &principal, remote.as_ref())
@@ -1990,6 +1994,7 @@ impl Router {
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
             })?;
+            crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
             let harness = snapshot
                 .get("harness")
                 .and_then(Value::as_str)
@@ -2075,6 +2080,7 @@ impl Router {
                 crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                     std::env::var_os(name)
                 })?;
+                crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
                 let harness = snapshot
                     .get("harness")
                     .and_then(Value::as_str)
@@ -2106,6 +2112,7 @@ impl Router {
                 crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                     std::env::var_os(name)
                 })?;
+                crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
                 let harness = snapshot
                     .get("harness")
                     .and_then(Value::as_str)

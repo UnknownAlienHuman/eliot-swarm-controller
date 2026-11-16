@@ -463,8 +463,20 @@ impl PluginHost {
                     )
                 })?
         };
-        let target_environment =
+        let mut target_environment =
             build_target_environment(&self.state.data_root, &agent, &agent_token)?;
+        if let Some(root) = self
+            .state
+            .store
+            .lock()
+            .await
+            .agent_artifact_root(&agent.id, agent.generation)?
+        {
+            target_environment
+                .as_object_mut()
+                .ok_or_else(|| Error::new("invalid", "target environment is not an object"))?
+                .insert("ELIOT_ARTIFACT_ROOT".to_owned(), Value::String(root.path));
+        }
         // Cleanup closes admission, then waits for this gate before snapshotting
         // running. Cover the first filesystem effect through child ownership
         // handoff, including the awaits before registration; never hold Store.

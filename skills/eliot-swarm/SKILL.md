@@ -60,9 +60,37 @@ only the owner moves agents (`swarm.reparent`, `swarm.switch`).
 
 ## Finishing
 
-Report your result as your final message. The parent reads it with
-`agent.result` (`swarm result`); a digest may also deliver it to the
-parent mailbox. State plainly what you changed and what remains open.
+Register directories you create for an assignment with `artifact.register`
+(`swarm artifact register <absolute-path> --kind build|data_dir|temp|other`
+`--purpose <short-description>`). Register your own `CARGO_TARGET_DIR` when
+it lies outside your checkout, temporary folders, screenshots, and any
+private daemon data directory you start through the `swarm` CLI. The
+directory must be one you create under `ELIOT_ARTIFACT_ROOT`, the new directory
+Swarm exclusively creates and durably binds before native startup. Use a child
+such as `$env:ELIOT_ARTIFACT_ROOT/target`; never register the root itself. A
+workspace or shared `daemon.artifact_roots` location alone is not ownership.
+Data directories stay `keep` while a private daemon lock or a live process
+holds them. Never register user/native configuration or stores. Swarm
+records managed worktrees and branches, declared scratch directories, and
+the frozen `CARGO_TARGET_DIR` passed through your profile from retained
+launch facts only when inside this generation's bound root. Hard-linked files,
+nested repositories, `.git` and protected configuration keep the whole tree.
+
+A manager can review its subtree with `cleanup.plan {scope:"self_tree"}`
+(`swarm cleanup plan`), then consume that exact plan with
+`cleanup.apply {id,plan_id}` (`swarm cleanup apply <plan-id>`). Review `keep`
+reasons and sizes. Stop children before cleanup. Preserve an uncertain apply
+id; retry only that identical id/payload to read its retained result.
+`unknown` never authorizes another deletion attempt. The Owner can select
+`project` or `all`; an Agent cannot broaden its cleanup scope. Native
+stores are never raw filesystem cleanup targets. A terminal Codex session
+is archived through the harness `thread/archive` method at apply; every
+other harness stays `keep(no_native_archive)`. A branch is `safe` only
+after a fresh upstream fetch proves it merged into the upstream default
+with no unpushed commits; apply re-verifies and deletes locally with the
+safe `-d` form. Remote branch deletion is Owner-only
+(`swarm cleanup apply <plan-id> --delete-remote`) and never automatic.
+State plainly what you changed and what remains open.
 
 ## Honest unknown
 

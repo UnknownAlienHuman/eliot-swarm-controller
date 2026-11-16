@@ -14,7 +14,8 @@ use crate::{
             NativeClientInfo, NativeDiscoveryConfigReadResponse, NativeDiscoverySourceKind,
             NativeDiscoveryStatus, NativeDiscoveryThread, NativeInitializeParams,
             NativeInitializeResponse, NativeModelEntry, NativeModelListParams,
-            NativeModelListResponse, NativeThreadListParams, NativeThreadListResponse,
+            NativeModelListResponse, NativeThreadArchiveParams, NativeThreadListParams,
+            NativeThreadListResponse,
         },
     },
 };
@@ -455,6 +456,83 @@ pub(crate) async fn read_quota(
     let probe_result = probe_result.map_err(|error| probe.client().diagnostic_error(error));
     drop(probe);
     probe_result
+}
+
+/// Archive one thread through the documented app-server `thread/archive`
+/// method, then close the reader. A short-lived initialized reader performs
+/// the call with no turn and no inference; the response only confirms the
+/// archive. Raw session files are never touched: the harness owns the store.
+pub(crate) async fn archive_thread(
+    launch: NativeLaunch,
+    binding: &NativeStoreBinding,
+    thread_id: String,
+    metadata_secrets: &[String],
+    diagnostic_secrets: &[String],
+    deadline: Instant,
+) -> Result<()> {
+    if thread_id.is_empty() || thread_id.len() > 512 || thread_id.chars().any(char::is_control) {
+        return Err(Error::new(
+            "invalid",
+            "Codex thread archive reference is invalid",
+        ));
+    }
+    if native_scope(&binding.home) != binding.native_scope {
+        return Err(unverified_store());
+    }
+    let cwd = launch.cwd.clone();
+    let launch = pinned_launch_for_binding(&launch, binding)?;
+    let (mut probe, drainer, initialized) =
+        start_initialized_reader(launch, metadata_secrets, diagnostic_secrets, deadline).await?;
+    let probe_result: Result<()> = async {
+        let client = probe.client();
+        verify_initialized_store(
+            &client,
+            &initialized,
+            binding,
+            &cwd,
+            metadata_secrets,
+            deadline,
+        )
+        .await?;
+        let response = client
+            .call(
+                "thread/archive",
+                serde_json::to_value(NativeThreadArchiveParams { thread_id })
+                    .map_err(|_| invalid_page())?,
+                deadline,
+            )
+            .await
+            .map_err(|error| {
+                let message = error.message.clone();
+                if message.contains("thread/archive") {
+                    error
+                } else {
+                    error.with_message(format!("thread/archive: {message}"))
+                }
+            })?;
+        archive_acknowledgement(&response, metadata_secrets)
+    }
+    .await;
+    finish_reader(&mut probe, Some(drainer)).await?;
+    let probe_result = probe_result.map_err(|error| probe.client().diagnostic_error(error));
+    drop(probe);
+    probe_result
+}
+
+fn archive_acknowledgement(response: &Value, metadata_secrets: &[String]) -> Result<()> {
+    reject_secrets(response, metadata_secrets).map_err(|_| {
+        Error::new(
+            "unknown",
+            "Codex thread/archive acknowledgement cannot be validated; no replay",
+        )
+    })?;
+    if !response.as_object().is_some_and(|object| object.is_empty()) {
+        return Err(Error::new(
+            "unknown",
+            "Codex thread/archive acknowledgement is malformed; no replay",
+        ));
+    }
+    Ok(())
 }
 
 /// Project only quota signals from `account/rateLimits/read`. Account
@@ -1791,6 +1869,25 @@ mod tests {
     use eliot_core::{NativeStoreBinding, SecretPolicy};
     use serde_json::json;
     use std::{ffi::OsString, path::Path, time::Duration};
+
+    #[test]
+    fn malformed_archive_acknowledgement_is_unknown() {
+        assert!(super::archive_acknowledgement(&json!({}), &[]).is_ok());
+        for value in [
+            json!(null),
+            json!(true),
+            json!([]),
+            json!({"unexpected":true}),
+            json!({"secret":"credential"}),
+        ] {
+            assert_eq!(
+                super::archive_acknowledgement(&value, &["credential".to_owned()])
+                    .unwrap_err()
+                    .code,
+                "unknown"
+            );
+        }
+    }
 
     #[test]
     fn launch_mcp_surface_requires_exact_command_and_strict_projection() {

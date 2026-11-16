@@ -214,6 +214,10 @@ fn search_settings(query: &str) -> Vec<(Page, &'static str)> {
 
 #[derive(Clone, Debug)]
 pub(super) enum SettingsMsg {
+    CleanupPlan,
+    CleanupPlanned(Fallible<eliot_core::api::CleanupPlan>),
+    CleanupApply,
+    CleanupApplied(Fallible<eliot_core::api::CleanupApplyResponse>),
     PageSelected(Page),
     Loaded(Fallible<SettingsReadResponse>),
     Reload,
@@ -267,6 +271,9 @@ pub(super) enum SettingsMsg {
 /// save result of each section.
 #[derive(Default)]
 pub(super) struct SettingsState {
+    cleanup_plan: Option<eliot_core::api::CleanupPlan>,
+    cleanup_busy: bool,
+    cleanup_result: Option<String>,
     pub(super) loaded: bool,
     pub(super) reading: bool,
     /// A read was asked for while one ran (after a save): read again.
@@ -420,6 +427,96 @@ impl DesktopApp {
     pub(super) fn settings_update(&mut self, msg: SettingsMsg, context: &ComponentContext<Self>) {
         let s = &mut self.settings;
         match msg {
+            SettingsMsg::CleanupPlan => {
+                if s.cleanup_busy {
+                    return;
+                }
+                s.cleanup_busy = true;
+                s.cleanup_plan = None;
+                s.cleanup_result = None;
+                let Ok(data) = self.data_dir.clone() else {
+                    s.cleanup_busy = false;
+                    s.cleanup_result = Some("Daemon data directory unavailable".to_owned());
+                    return;
+                };
+                let _task = context.spawn_background(move |_| {
+                    let request = eliot_core::api::CleanupPlanRequest {
+                        scope: eliot_core::api::CleanupScope::All,
+                        project: None,
+                        older_than: None,
+                    };
+                    Message::Settings(SettingsMsg::CleanupPlanned(
+                        client::block_on(eliot_daemon::client_call_typed(
+                            &data,
+                            "cleanup.plan",
+                            &request,
+                        ))
+                        .map_err(|e| e.to_string()),
+                    ))
+                });
+            }
+            SettingsMsg::CleanupPlanned(result) => {
+                s.cleanup_busy = false;
+                match result {
+                    Ok(plan) => s.cleanup_plan = Some(plan),
+                    Err(e) => s.cleanup_result = Some(e),
+                }
+            }
+            SettingsMsg::CleanupApply => {
+                if s.cleanup_busy {
+                    return;
+                }
+                let Some(plan) = s.cleanup_plan.take() else {
+                    return;
+                };
+                s.cleanup_busy = true;
+                let Ok(data) = self.data_dir.clone() else {
+                    s.cleanup_busy = false;
+                    s.cleanup_result = Some("Daemon data directory unavailable".to_owned());
+                    return;
+                };
+                let _task = context.spawn_background(move |_| {
+                    let request = eliot_core::api::CleanupApplyRequest {
+                        id: ulid::Ulid::new().to_string(),
+                        plan_id: plan.plan_id,
+                        // The desktop applies local-only deletions; remote
+                        // branch deletion stays an explicit Owner CLI flag.
+                        delete_remote: false,
+                    };
+                    Message::Settings(SettingsMsg::CleanupApplied(
+                        client::block_on(eliot_daemon::client_call_typed(
+                            &data,
+                            "cleanup.apply",
+                            &request,
+                        ))
+                        .map_err(|e| e.to_string()),
+                    ))
+                });
+            }
+            SettingsMsg::CleanupApplied(result) => {
+                s.cleanup_busy = false;
+                s.cleanup_result = Some(match result {
+                    Ok(reply) => format!(
+                        "{} bytes reclaimed. {}",
+                        reply.bytes_reclaimed,
+                        reply
+                            .items
+                            .iter()
+                            .map(|item| format!(
+                                "{}: {}{}",
+                                item.artifact_id,
+                                item.outcome,
+                                item.reason
+                                    .as_ref()
+                                    .map(|r| format!(" ({r})"))
+                                    .unwrap_or_default()
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                    Err(error) => format!("Cleanup result unavailable: {error}"),
+                });
+            }
             SettingsMsg::PageSelected(page) => {
                 // A search result opens its page; the groups come back.
                 self.settings.query.clear();
@@ -2107,6 +2204,21 @@ impl DesktopApp {
                     ],
                 ),
                 history_view,
+                m3::group(palette,vec![
+                    KeyedView::new("cleanup",m3::form_row("Clean up",m3::body("Review owned artifacts and their sizes before applying cleanup.").into(),Some(m3::outlined(palette)
+                        .automation_name("Clean up")
+                        .is_enabled(!self.settings.cleanup_busy)
+                        .on_click(context.message(Message::Settings(SettingsMsg::CleanupPlan)))
+                        .content(m3::label("Clean up…"))))),
+                    KeyedView::new("cleanup-plan",m3::body(self.settings.cleanup_plan.as_ref().map(|plan| {
+                        let rows=plan.items.iter().map(|item|format!("{} · {} · {} · {}",item.artifact.path,item.bytes.map(|b|format!("{b} bytes")).unwrap_or_else(||"size unavailable".to_owned()),item.verdict,item.reason)).collect::<Vec<_>>().join("\n");
+                        format!("{} candidates{}\n{}",plan.items.len(),if plan.truncated {" (list truncated)"}else{""},rows)
+                    }).or_else(||self.settings.cleanup_result.clone()).unwrap_or_default()).text_wrapping(TextWrapping::Wrap)),
+                    KeyedView::new("cleanup-apply",m3::outlined(palette).automation_name("Apply cleanup")
+                        .is_enabled(!self.settings.cleanup_busy && self.settings.cleanup_plan.as_ref().is_some_and(|p|p.items.iter().any(|i|i.verdict=="safe")))
+                        .on_click(context.message(Message::Settings(SettingsMsg::CleanupApply)))
+                        .content(m3::label("Apply safe items"))),
+                ]),
                 m3::section_heading(
                     "All settings",
                     &format!(
