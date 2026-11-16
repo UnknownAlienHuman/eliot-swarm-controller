@@ -12,8 +12,10 @@
 
 use std::path::Path;
 
-use eliot_core::{Error, Result};
+use eliot_core::Result;
 use serde_json::Value;
+
+use eliot_plugin::owner_scan as shared_scan;
 
 /// Workspace project config files the installed server merges, in read
 /// order. The global/user layers stay neutralized by the isolated
@@ -23,16 +25,11 @@ pub const PROJECT_CONFIG_FILES: &[&str] = &["opencode.json", "opencode.jsonc"];
 /// Bound for one project config file read: far above real configs, small
 /// enough to keep the pre-spawn scan bounded. Larger, unreadable or
 /// unparseable files fail the start closed instead of scanning blind.
-pub const MAX_PROJECT_CONFIG_BYTES: usize = 256 * 1024;
+pub const MAX_PROJECT_CONFIG_BYTES: usize = shared_scan::MAX_SCAN_BYTES;
 
 /// Bound for one project MCP layer: far above real surfaces. More entries
 /// fail the start closed instead of truncating the scan.
-pub const MAX_PROJECT_SERVERS: usize = 1024;
-
-/// Bound for one projected argument value: matches the Codex transport
-/// bound so both harnesses screen the same shapes.
-pub const MAX_PROJECT_ARG_BYTES: usize = 2048;
-pub const MAX_PROJECT_ARGS: usize = 256;
+pub const MAX_PROJECT_SERVERS: usize = shared_scan::MAX_SCAN_SERVERS;
 
 /// One workspace project MCP server entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,43 +49,18 @@ pub fn scan_project_mcp(workspace: &Path) -> Result<Vec<ProjectMcpEntry>> {
     let mut entries = Vec::new();
     for &file in PROJECT_CONFIG_FILES {
         let path = workspace.join(file);
-        let bytes = match std::fs::read(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                return Err(Error::new(
-                    "profile_error",
-                    format!("OpenCode project MCP layer in {file} could not be read"),
-                ));
-            }
-            Ok(bytes) => bytes,
+        let label = format!("OpenCode project MCP layer in {file}");
+        let Some(document) =
+            shared_scan::read_jsonc_document(&path, &label, MAX_PROJECT_CONFIG_BYTES)?
+        else {
+            continue;
         };
-        if bytes.len() > MAX_PROJECT_CONFIG_BYTES {
-            return Err(Error::new(
-                "profile_error",
-                format!("OpenCode project MCP layer in {file} exceeds its bound"),
-            ));
-        }
-        let text = String::from_utf8(bytes).map_err(|_| {
-            Error::new(
-                "profile_error",
-                format!("OpenCode project MCP layer in {file} is not UTF-8"),
-            )
-        })?;
-        let stripped =
-            eliot_core::strip_jsonc_trailing_commas(&eliot_core::strip_jsonc_comments(&text));
-        let document: Value = serde_json::from_str(&stripped).map_err(|_| {
-            Error::new(
-                "profile_error",
-                format!("OpenCode project MCP layer in {file} could not be parsed"),
-            )
-        })?;
         entries.extend(project_entries(&document, file)?);
-        if entries.len() > MAX_PROJECT_SERVERS {
-            return Err(Error::new(
-                "profile_error",
-                "OpenCode project MCP layer exceeds its bound",
-            ));
-        }
+        shared_scan::ensure_total_entries(
+            entries.len(),
+            MAX_PROJECT_SERVERS,
+            "OpenCode project MCP layer exceeds its bound",
+        )?;
     }
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(entries)
@@ -98,10 +70,12 @@ pub fn scan_project_mcp(workspace: &Path) -> Result<Vec<ProjectMcpEntry>> {
 /// server and the project file it came from. The plugin fails the start
 /// with this reason before the native session exists.
 pub fn owner_refusal_reason(entry: &ProjectMcpEntry) -> String {
-    format!(
-        "OpenCode project MCP layer contributes the owner Swarm MCP server {:?} from {}",
-        entry.name, entry.file
+    *shared_scan::refusal_error(
+        "OpenCode project MCP layer contributes the owner Swarm MCP server",
+        &entry.name,
+        entry.file,
     )
+    .message
 }
 
 /// Owner-identity entries among the scanned project layer: stdio entries
@@ -116,7 +90,7 @@ pub fn find_owner_entries<'a>(
     entries
         .iter()
         .filter(|entry| {
-            eliot_core::is_owner_swarm_server(
+            shared_scan::is_owner_transport(
                 entry.command.as_deref(),
                 entry.args.as_deref(),
                 entry.url.as_deref(),
@@ -132,18 +106,14 @@ pub fn find_owner_entries<'a>(
 /// Non-object entries are skipped: only the documented table shape
 /// (`command` string/array, `url` string) is evaluated.
 fn project_entries(document: &Value, file: &'static str) -> Result<Vec<ProjectMcpEntry>> {
-    let Some(servers) = document.get("mcp").and_then(|mcp| mcp.get("servers")) else {
+    let label = format!("OpenCode project MCP layer in {file}");
+    let Some(servers) = shared_scan::table_object(
+        document.get("mcp").and_then(|mcp| mcp.get("servers")),
+        &label,
+    )?
+    else {
         return Ok(Vec::new());
     };
-    if servers.is_null() {
-        return Ok(Vec::new());
-    }
-    let servers = servers.as_object().ok_or_else(|| {
-        Error::new(
-            "profile_error",
-            format!("OpenCode project MCP layer in {file} is not an object"),
-        )
-    })?;
     let mut entries = Vec::with_capacity(servers.len().min(MAX_PROJECT_SERVERS));
     for (name, entry) in servers {
         let Some(table) = entry.as_object() else {
@@ -166,31 +136,7 @@ fn project_entries(document: &Value, file: &'static str) -> Result<Vec<ProjectMc
 /// with a malformed head or tail projecting as unknown (fail closed toward
 /// suppression). Anything else is unknown.
 fn project_command(value: Option<&Value>) -> (Option<String>, Option<Vec<String>>) {
-    match value {
-        None | Some(Value::Null) => (None, None),
-        Some(Value::String(command)) => (Some(command.clone()), Some(Vec::new())),
-        Some(Value::Array(items)) => {
-            if items.len() > MAX_PROJECT_ARGS + 1 {
-                return (None, None);
-            }
-            let mut items = items.iter();
-            let Some(command) = items.next() else {
-                return (None, Some(Vec::new()));
-            };
-            let Some(command) = command.as_str() else {
-                return (None, None);
-            };
-            let mut args = Vec::new();
-            for item in items {
-                match item.as_str() {
-                    Some(arg) if arg.len() <= MAX_PROJECT_ARG_BYTES => args.push(arg.to_owned()),
-                    _ => return (Some(command.to_owned()), None),
-                }
-            }
-            (Some(command.to_owned()), Some(args))
-        }
-        Some(_) => (None, None),
-    }
+    shared_scan::project_command_value(value)
 }
 
 #[cfg(test)]
