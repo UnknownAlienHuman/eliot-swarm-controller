@@ -2169,7 +2169,11 @@ mod heavy_attribution_tests {
     /// related process to one `cargo build` episode: the wrapper unwraps,
     /// the compiler attributes to its driver, console plumbing never
     /// surfaces, and overlapping same-command episodes merge into one.
+    // Live check: spawns a real PowerShell -> cargo build and samples it in a
+    // time window, so it is timing-dependent under a loaded parallel test run.
+    // Run explicitly: cargo test -p eliot-daemon --lib -- --ignored powershell_cargo_build
     #[test]
+    #[ignore = "live: spawns powershell + cargo build; run with --ignored"]
     fn powershell_cargo_build_resolves_to_one_cargo_build_episode() {
         let scratch_base = std::env::var_os("CARGO_TARGET_DIR")
             .map(PathBuf::from)
