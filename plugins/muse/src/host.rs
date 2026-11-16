@@ -427,6 +427,9 @@ impl MusePlugin {
     /// names the failed check in short non-secret words; it is persisted in
     /// the daemon outcome, so it must never carry paths, values, or secrets.
     fn retain_proven_no_effect_start(&mut self, params: &AgentStartParams, error: Error) -> Value {
+        debug_assert!(eliot_plugin::start_classification::is_proven_no_effect(
+            eliot_plugin::start_classification::StartPoint::NativeRefusalBeforeDispatch
+        ));
         let error = eliot_plugin::session::classify_start_failure(error, "muse", "prepare");
         let value = eliot_plugin::session::failed_start_value(params, error);
         self.failed_start = Some(FailedStart {
@@ -3550,5 +3553,22 @@ mod tests {
         .expect("recorded empty Muse model/list decodes");
         let error = select_launch_model(empty, None).unwrap_err();
         assert_eq!(error.code, "profile_error");
+    }
+
+    #[test]
+    fn refused_model_at_start_is_failed_with_harness_origin() {
+        let params = eliot_plugin::AgentStartParams::new("agent-1", 1, "cmd-ghost");
+        let mut plugin = MusePlugin::default();
+        let error = eliot_plugin::start_classification::harness_unavailable_model(
+            "muse",
+            "model_list",
+            "model is missing",
+        );
+        let value = plugin.retain_proven_no_effect_start(&params, error);
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["origin"], "harness");
+        assert!(eliot_plugin::start_classification::is_proven_no_effect(
+            eliot_plugin::start_classification::StartPoint::NativeRefusalBeforeDispatch
+        ));
     }
 }

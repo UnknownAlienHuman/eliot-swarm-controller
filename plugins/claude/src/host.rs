@@ -119,15 +119,19 @@ enum StartPhase {
 /// local validation or private-tree file preparation, so all pre-spawn
 /// codes (including `unknown`) settle failed. Adding a phase forces an
 /// explicit entry in the classification test below.
+fn start_point_for_phase(phase: StartPhase) -> eliot_plugin::start_classification::StartPoint {
+    use eliot_plugin::start_classification::StartPoint;
+    match phase {
+        StartPhase::Plan | StartPhase::McpConfig | StartPhase::Skill | StartPhase::Login => {
+            StartPoint::BeforeSpawn
+        }
+        StartPhase::Spawn => StartPoint::SpawnRefused,
+        StartPhase::PostSpawn => StartPoint::AfterDispatch,
+    }
+}
+
 fn start_failure_is_proven_no_effect(phase: StartPhase, _code: &str) -> bool {
-    matches!(
-        phase,
-        StartPhase::Plan
-            | StartPhase::McpConfig
-            | StartPhase::Skill
-            | StartPhase::Login
-            | StartPhase::Spawn
-    )
+    eliot_plugin::start_classification::is_proven_no_effect(start_point_for_phase(phase))
 }
 
 /// One pre-spawn failure: where it happened and the triggering error. The
@@ -154,7 +158,11 @@ fn prespawn_reason(phase: StartPhase, code: &str) -> String {
         StartPhase::Spawn => "Claude CLI failed to spawn",
         StartPhase::PostSpawn => "Claude start failed after native spawn",
     };
-    format!("{what} ({code}); no native process was spawned by this generation")
+    eliot_plugin::start_classification::format_start_reason(
+        what,
+        code,
+        "no native process was spawned by this generation",
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3281,5 +3289,26 @@ mod tests {
             plugin.replay_start(&newer).unwrap().unwrap_err().code,
             "bad_state"
         );
+    }
+
+    #[test]
+    fn refused_model_at_start_is_failed_with_harness_origin() {
+        let params = eliot_plugin::AgentStartParams::new("agent-9", 1, "0199-ghost");
+        let mut plugin = ClaudePlugin::default();
+        let error = eliot_plugin::start_classification::harness_unavailable_model(
+            "claude",
+            "plan",
+            "model is missing",
+        );
+        let value = plugin.retain_proven_no_effect_start(&params, error);
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["origin"], "harness");
+        assert!(start_failure_is_proven_no_effect(
+            StartPhase::Plan,
+            "native_model_unavailable"
+        ));
+        assert!(eliot_plugin::start_classification::is_proven_no_effect(
+            eliot_plugin::start_classification::StartPoint::BeforeSpawn
+        ));
     }
 }

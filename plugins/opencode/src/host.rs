@@ -128,19 +128,28 @@ enum StartPhase {
 /// been written and reconciliation failed, so it stays unknown per the
 /// authentication contract and never converts to proven-no-effect. Definite
 /// refusals before the import (any other code) still settle failed.
-fn start_failure_is_proven_no_effect(phase: StartPhase, code: &str) -> bool {
+fn start_point_for_phase(
+    phase: StartPhase,
+    code: &str,
+) -> eliot_plugin::start_classification::StartPoint {
+    use eliot_plugin::start_classification::StartPoint;
     if phase == StartPhase::Spawn && code == "unknown" {
-        return false;
+        return StartPoint::TransportLost;
     }
-    matches!(
-        phase,
-        StartPhase::Spawn
-            | StartPhase::Subscribe
-            | StartPhase::Register
-            | StartPhase::Verify
-            | StartPhase::CreateRefused
-            | StartPhase::ResumeRefused
-    )
+    match phase {
+        StartPhase::Spawn => StartPoint::SpawnRefused,
+        StartPhase::Subscribe | StartPhase::Register | StartPhase::Verify => {
+            StartPoint::BeforeSpawn
+        }
+        StartPhase::CreateRefused | StartPhase::ResumeRefused => {
+            StartPoint::NativeRefusalBeforeDispatch
+        }
+        StartPhase::PostCreate => StartPoint::AfterDispatch,
+    }
+}
+
+fn start_failure_is_proven_no_effect(phase: StartPhase, code: &str) -> bool {
+    eliot_plugin::start_classification::is_proven_no_effect(start_point_for_phase(phase, code))
 }
 
 /// One pre-session failure: where it happened and the triggering error. The
@@ -183,7 +192,11 @@ fn presession_reason(phase: StartPhase, code: &str) -> String {
         StartPhase::ResumeRefused => "OpenCode resume did not start",
         StartPhase::PostCreate => "OpenCode start failed after session/create",
     };
-    format!("{what} ({code}); no native session or prompt was dispatched by this generation")
+    eliot_plugin::start_classification::format_start_reason(
+        what,
+        code,
+        "no native session or prompt was dispatched by this generation",
+    )
 }
 
 const RESUME_DRAIN_ROUNDS: usize = 20;
@@ -5057,5 +5070,26 @@ mod tests {
                 StartAdmission::New(_) => panic!("settled start must replay"),
             }
         }
+    }
+
+    #[test]
+    fn refused_model_at_start_is_failed_with_harness_origin() {
+        let params = AgentStartParams::new("agent-1", 7, "0199-model-ghost");
+        let mut plugin = OpenCodePlugin::default();
+        let error = eliot_plugin::start_classification::harness_unavailable_model(
+            "opencode",
+            "create_refused",
+            "model is missing",
+        );
+        let value = plugin.retain_proven_no_effect_start(&params, StartPhase::CreateRefused, error);
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["origin"], "harness");
+        assert!(start_failure_is_proven_no_effect(
+            StartPhase::CreateRefused,
+            "native_model_unavailable"
+        ));
+        assert!(eliot_plugin::start_classification::is_proven_no_effect(
+            eliot_plugin::start_classification::StartPoint::NativeRefusalBeforeDispatch
+        ));
     }
 }
