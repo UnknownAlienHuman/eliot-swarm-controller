@@ -185,7 +185,7 @@ async fn run_owned(
     };
     router.note_events(&recovered);
     logging::record(&policy, "daemon.recovered", &[], None);
-    let (namespace, retained) = restart_capacity::retained(&store).await?;
+    let namespace = store.lock().await.custody_namespace()?;
     let capacity = restart_capacity::Reconcile {
         store: Arc::clone(&store),
         bus: bus.clone(),
@@ -193,8 +193,19 @@ async fn run_owned(
         policy: Arc::clone(&policy),
         namespace,
     };
-    let retained = restart_capacity::reconcile(&capacity, retained, true).await;
+    let report = restart_capacity::reconcile_first_pass(&capacity).await?;
     logging::record(&policy, "daemon.capacity_reconciled", &[], None);
+    logging::record_debug(
+        &policy,
+        "daemon.capacity_reconciled",
+        &[],
+        &[
+            ("processed", report.processed as u64),
+            ("batches", report.batches as u64),
+            ("max_batch", report.max_batch as u64),
+            ("retained", report.retained as u64),
+        ],
+    );
     let automation_config = crate::config::load_automation_config(data_dir.path())?;
     let daemon_config = crate::config::load_daemon_config(data_dir.path())?;
     let cloud_mcp_config = crate::config::load_cloud_mcp_config(data_dir.path())?;
@@ -271,8 +282,8 @@ async fn run_owned(
     recovery.spawn(async move { ("command", recovery_router.recover_accepted_commands().await) });
     // Dropped with this function, which aborts a recheck still waiting.
     let mut capacity_recheck = JoinSet::new();
-    if !retained.is_empty() {
-        capacity_recheck.spawn(restart_capacity::recheck(capacity, retained));
+    if report.retained > 0 {
+        capacity_recheck.spawn(restart_capacity::recheck(capacity));
     }
     let (automation_stop, automation_shutdown) = watch::channel(false);
     // The rule worker's successful output carries its actual exit reason

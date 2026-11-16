@@ -6,11 +6,13 @@
 
 use crate::platform::{CustodyGuarantee, DataDir, OwnedChild};
 use eliot_core::{
-    Error, Result,
+    Error, Result, SecretPolicy, StderrSnapshot, StderrSource,
     api::{CloudMcpCustody, CloudMcpHealth, CloudMcpStatus},
 };
 use eliot_plugin::{
+    StderrCapture,
     protocol::{MAX_MCP_HTTP_READY_BYTES, McpHttpReady},
+    spawn_stderr,
     sync::LockExt,
 };
 #[cfg(unix)]
@@ -21,7 +23,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio::{
@@ -79,13 +81,16 @@ pub async fn run(
     let data_root = data_dir.path().to_path_buf();
     let public_url = validate_config(&config)?;
     let runtime_url = public_url.clone();
+    let policy = Arc::new(supervisor_policy(&config));
     let mut status = StatusGuard::begin(CloudMcpSnapshot {
         public_url,
         health: CloudMcpHealth::StartingHttp,
         custody: platform_custody(),
+        http_stderr: None,
+        tunnel_stderr: None,
     })?;
 
-    let result = supervise(config, data_root, runtime_url, shutdown, &status).await;
+    let result = supervise(config, data_root, runtime_url, shutdown, &status, policy).await;
     status.finish(if result.is_ok() {
         CloudMcpHealth::Stopped
     } else {
@@ -100,6 +105,7 @@ async fn supervise(
     public_url: String,
     shutdown: CancellationToken,
     status: &StatusGuard,
+    policy: Arc<SecretPolicy>,
 ) -> Result<()> {
     if shutdown.is_cancelled() {
         status.set(CloudMcpHealth::Stopping);
@@ -108,19 +114,30 @@ async fn supervise(
 
     let mut http = spawn_http(&config, &data_root, &public_url)?;
     status.set_custody(map_custody(http.guarantee()));
-    let Some(http_stdin) = http.take_stdin() else {
+    let Some(http_stderr) = take_capture(&mut http, &policy) else {
         settle_child(&mut http, None, false, false).await?;
         return Err(Error::new(
             "cloud_mcp_spawn",
-            "managed MCP stdin pipe is unavailable",
+            "managed MCP stderr pipe is unavailable",
         ));
+    };
+    let Some(http_stdin) = http.take_stdin() else {
+        settle_child(&mut http, None, false, false).await?;
+        let tail = http_stderr.view().snapshot();
+        status.set_http_stderr(tail.clone());
+        return Err(
+            Error::new("cloud_mcp_spawn", "managed MCP stdin pipe is unavailable")
+                .with_stderr(StderrSource::Harness, tail),
+        );
     };
     let Some(mut http_stdout) = http.take_stdout() else {
         settle_child(&mut http, Some(http_stdin), false, false).await?;
-        return Err(Error::new(
-            "cloud_mcp_spawn",
-            "managed MCP stdout pipe is unavailable",
-        ));
+        let tail = http_stderr.view().snapshot();
+        status.set_http_stderr(tail.clone());
+        return Err(
+            Error::new("cloud_mcp_spawn", "managed MCP stdout pipe is unavailable")
+                .with_stderr(StderrSource::Harness, tail),
+        );
     };
 
     enum Startup {
@@ -146,20 +163,26 @@ async fn supervise(
         Startup::Shutdown => {
             status.set(CloudMcpHealth::Stopping);
             settle_child(&mut http, Some(http_stdin), false, true).await?;
+            status.set_http_stderr(http_stderr.view().snapshot());
             return Ok(());
         }
         Startup::HttpExited(result) => {
             status.set(CloudMcpHealth::Stopping);
             settle_child(&mut http, Some(http_stdin), result.is_ok(), false).await?;
+            let tail = http_stderr.view().snapshot();
+            status.set_http_stderr(tail.clone());
             return Err(Error::new(
                 "cloud_mcp_http_exit",
                 "managed MCP HTTP child exited before readiness",
-            ));
+            )
+            .with_stderr(StderrSource::Harness, tail));
         }
         Startup::Ready(Err(error)) => {
             status.set(CloudMcpHealth::Stopping);
             settle_child(&mut http, Some(http_stdin), false, false).await?;
-            return Err(error);
+            let tail = http_stderr.view().snapshot();
+            status.set_http_stderr(tail.clone());
+            return Err(error.with_stderr(StderrSource::Harness, tail));
         }
     };
 
@@ -177,8 +200,20 @@ async fn supervise(
         Err(error) => {
             status.set(CloudMcpHealth::Stopping);
             settle_child(&mut http, Some(http_stdin), false, false).await?;
-            return Err(error);
+            let tail = http_stderr.view().snapshot();
+            status.set_http_stderr(tail.clone());
+            return Err(error.with_stderr(StderrSource::Harness, tail));
         }
+    };
+    let Some(tunnel_stderr) = take_capture(&mut tunnel, &policy) else {
+        status.set(CloudMcpHealth::Stopping);
+        let tunnel_result = settle_child(&mut tunnel, None, false, false).await;
+        let http_result = settle_child(&mut http, Some(http_stdin), false, false).await;
+        combine_cleanup(tunnel_result, http_result)?;
+        return Err(Error::new(
+            "cloud_mcp_spawn",
+            "cloudflared stderr pipe is unavailable",
+        ));
     };
     status.set_custody(combine_custody(http.guarantee(), tunnel.guarantee()));
     status.set(CloudMcpHealth::Running);
@@ -200,6 +235,8 @@ async fn supervise(
         Supervision::Shutdown => {
             let tunnel_result = settle_child(&mut tunnel, None, false, false).await;
             let http_result = settle_child(&mut http, Some(http_stdin), false, true).await;
+            status.set_http_stderr(http_stderr.view().snapshot());
+            status.set_tunnel_stderr(tunnel_stderr.view().snapshot());
             combine_cleanup(tunnel_result, http_result)
         }
         Supervision::HttpExited(result) => {
@@ -207,19 +244,27 @@ async fn supervise(
                 settle_child(&mut http, Some(http_stdin), result.is_ok(), false).await;
             let tunnel_result = settle_child(&mut tunnel, None, false, false).await;
             combine_cleanup(http_result, tunnel_result)?;
+            let tail = http_stderr.view().snapshot();
+            status.set_http_stderr(tail.clone());
+            status.set_tunnel_stderr(tunnel_stderr.view().snapshot());
             Err(Error::new(
                 "cloud_mcp_http_exit",
                 "managed MCP HTTP child exited while the tunnel was running",
-            ))
+            )
+            .with_stderr(StderrSource::Harness, tail))
         }
         Supervision::TunnelExited(result) => {
             let tunnel_result = settle_child(&mut tunnel, None, result.is_ok(), false).await;
             let http_result = settle_child(&mut http, Some(http_stdin), false, true).await;
             combine_cleanup(tunnel_result, http_result)?;
+            let tail = tunnel_stderr.view().snapshot();
+            status.set_http_stderr(http_stderr.view().snapshot());
+            status.set_tunnel_stderr(tail.clone());
             Err(Error::new(
                 "cloud_mcp_tunnel_exit",
                 "cloudflared exited while the HTTP MCP child was running",
-            ))
+            )
+            .with_stderr(StderrSource::Harness, tail))
         }
     }
 }
@@ -241,7 +286,7 @@ fn spawn_http(config: &CloudMcpConfig, data_root: &Path, public_url: &str) -> Re
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     add_minimal_os_environment(&mut command)?;
     OwnedChild::spawn(command)
 }
@@ -263,9 +308,59 @@ fn spawn_tunnel(
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     add_minimal_os_environment(&mut command)?;
     OwnedChild::spawn(command)
+}
+
+/// Supervisor-owned stderr capture for one managed child, following the
+/// plugin host: the pipe is drained by an owned task while the capture lives
+/// in the supervisor, and views stay readable after the child exits.
+fn take_capture(child: &mut OwnedChild, policy: &Arc<SecretPolicy>) -> Option<StderrCapture> {
+    child
+        .take_stderr()
+        .map(|pipe| spawn_stderr(pipe, Arc::clone(policy)))
+}
+
+/// Secrets for supervisor-owned stderr capture: the credential path itself
+/// plus the secret string values inside the credentials file. Hostnames,
+/// tunnel IDs and team names stay visible so tails keep their value.
+/// Never persisted: the policy only redacts captured bytes in memory.
+fn supervisor_policy(config: &CloudMcpConfig) -> SecretPolicy {
+    let raw = config.credentials_file.to_string_lossy().into_owned();
+    let mut secrets = vec![raw.replace('\\', "/")];
+    if secrets[0] != raw {
+        secrets.push(raw);
+    }
+    if let Ok(raw) = fs::read(&config.credentials_file)
+        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw)
+    {
+        collect_secret_strings(&value, &mut secrets);
+    }
+    SecretPolicy::new(secrets)
+}
+
+fn collect_secret_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    const MAX_SECRET_VALUES: usize = 32;
+    const MAX_SECRET_LEN: usize = 4096;
+    match value {
+        serde_json::Value::String(text) => {
+            if out.len() < MAX_SECRET_VALUES && !text.is_empty() && text.len() <= MAX_SECRET_LEN {
+                out.push(text.clone());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_secret_strings(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_secret_strings(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn add_minimal_os_environment(command: &mut Command) -> Result<()> {
@@ -626,6 +721,18 @@ impl StatusGuard {
         }
     }
 
+    fn set_http_stderr(&self, snapshot: StderrSnapshot) {
+        if let Some(status) = current_slot().lock_recover().as_mut() {
+            status.http_stderr = Some(snapshot);
+        }
+    }
+
+    fn set_tunnel_stderr(&self, snapshot: StderrSnapshot) {
+        if let Some(status) = current_slot().lock_recover().as_mut() {
+            status.tunnel_stderr = Some(snapshot);
+        }
+    }
+
     fn finish(&mut self, health: CloudMcpHealth) {
         self.set(health);
         self.completed = true;
@@ -639,5 +746,157 @@ impl Drop for StatusGuard {
         {
             snapshot.health = CloudMcpHealth::Failed;
         }
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tail_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("eliot-cloud-mcp-{tag}-{}", ulid::Ulid::new()));
+            std::fs::create_dir_all(&path).expect("create fixture dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_config(credentials_file: PathBuf) -> CloudMcpConfig {
+        CloudMcpConfig {
+            http_mcp_executable: PathBuf::from("C:/tools/swarm.exe"),
+            cloudflared_executable: PathBuf::from("C:/tools/cloudflared.exe"),
+            tunnel_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            credentials_file,
+            hostname: "k95-test.example.com".to_owned(),
+            access_team_name: "testteam".to_owned(),
+            access_audience_tag: "ab".repeat(32),
+        }
+    }
+
+    #[test]
+    fn supervisor_policy_redacts_credential_paths_and_file_secrets() {
+        let dir = TempDir::new("policy");
+        let path = dir.0.join("credentials.json");
+        let secret = "k95-fake-tunnel-secret-value";
+        std::fs::write(
+            &path,
+            format!(r#"{{"TunnelSecret": "{secret}", "AccountTag": "team"}}"#),
+        )
+        .expect("write fixture credentials");
+        let policy = supervisor_policy(&test_config(path.clone()));
+        let displayed = path.to_string_lossy().replace('\\', "/");
+        let probe = format!("failed reading {displayed} with {secret}");
+        let redacted = policy.redact_text(&probe);
+        assert!(
+            !redacted.contains(secret),
+            "file secret is redacted: {redacted}"
+        );
+        assert!(
+            !redacted.contains(&displayed),
+            "credential path is redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("[REDACTED]"),
+            "redaction is visible: {redacted}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failing_child_exit_yields_redacted_tail() {
+        let dir = TempDir::new("tail");
+        let path = dir.0.join("credentials.json");
+        let secret = "k95-fake-tail-secret-1";
+        std::fs::write(&path, format!(r#"{{"TunnelSecret": "{secret}"}}"#))
+            .expect("write fixture credentials");
+        let policy = Arc::new(supervisor_policy(&test_config(path)));
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("cmd.exe");
+            command
+                .arg("/C")
+                .arg(format!("echo {secret} 1>&2 & exit 1"));
+            command
+        };
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("/bin/sh");
+            command.arg("-c").arg(format!("echo {secret} >&2; exit 1"));
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = OwnedChild::spawn(command).expect("spawn failing fixture child");
+        let capture = take_capture(&mut child, &policy).expect("capture fixture stderr");
+        let exit = child.wait().await.expect("reap fixture child");
+        assert!(!exit.success(), "the fixture child fails");
+        let tail = capture
+            .finish(tokio::time::Instant::now() + Duration::from_secs(5))
+            .await;
+        assert!(tail.eof, "the drain reaches EOF: {tail:?}");
+        assert!(
+            !tail.text.contains(secret),
+            "the tail never carries the secret: {}",
+            tail.text
+        );
+        let error = Error::new(
+            "cloud_mcp_tunnel_exit",
+            "cloudflared exited while the HTTP MCP child was running",
+        )
+        .with_stderr(StderrSource::Harness, tail);
+        let encoded = serde_json::to_value(&error).expect("encode error");
+        let text = encoded
+            .pointer("/diagnostics/0/snapshot/text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !text.contains(secret),
+            "the diagnostic tail is redacted: {text}"
+        );
+        assert!(
+            text.contains("[REDACTED]"),
+            "the diagnostic tail keeps the failure line: {text}"
+        );
+    }
+
+    #[test]
+    fn cloud_mcp_status_roundtrips_optional_tails() {
+        let status = CloudMcpStatus {
+            public_url: "https://k95-test.example.com/mcp".to_owned(),
+            health: CloudMcpHealth::Failed,
+            custody: CloudMcpCustody::Unknown,
+            http_stderr: Some(StderrSnapshot {
+                text: "boom".to_owned(),
+                truncated: false,
+                eof: true,
+                read_error: false,
+            }),
+            tunnel_stderr: None,
+        };
+        let encoded = serde_json::to_value(&status).expect("encode status");
+        let back: CloudMcpStatus = serde_json::from_value(encoded).expect("decode status");
+        assert_eq!(back, status);
+        let legacy = json!({
+            "public_url": "https://k95-test.example.com/mcp",
+            "health": "failed",
+            "custody": "unknown",
+        });
+        let back: CloudMcpStatus = serde_json::from_value(legacy).expect("legacy status decodes");
+        assert!(
+            back.http_stderr.is_none() && back.tunnel_stderr.is_none(),
+            "tails stay absent until the supervisor records them"
+        );
     }
 }
