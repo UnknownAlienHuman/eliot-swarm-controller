@@ -5,6 +5,11 @@
 # native-store selectors are frozen at admission and never reselected.
 # The first Codex integration uses the installed executable and existing ChatGPT login.
 # Select an exact model and an effort supported by the native model/list response.
+# Worker MCP policy: profiles default to `mcp = "minimal"` (only Eliot's
+# Agent-scoped server plus an optional `mcp_allow` list of native server
+# names; Swarm MCP names can never be allow-listed). `inherit` is an explicit
+# opt-in to the owner's full native MCP surface. Muse and Antigravity have no
+# minimal mapping, so their profiles must set `mcp = "inherit"` explicitly.
 
 [profiles.codex-luna]
 harness = "codex"
@@ -29,6 +34,7 @@ harness = "muse"
 cmd = "C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe"
 model = "muse-spark-1.3-contributor"
 effort = "medium"
+mcp = "inherit"
 # approval = "promptUnmatched"
 
 # Claude Code CLI (per-Agent `claude -p` stream-json). Point cmd at the
@@ -86,6 +92,7 @@ output_limit = 8192
 harness = "antigravity"
 cmd = "C:/Tools/Antigravity/antigravity.exe"
 model = "antigravity-model"
+mcp = "inherit"
 # mode = "auto"
 
 # Ordered routing candidates. Roles are extensible; each candidate must name

@@ -3,6 +3,7 @@ use crate::{
     mcp::{
         McpReadback, compute_disables, compute_plugin_disables, merge_status_page,
         parse_status_page, policy_from_profile, require_minimal_own_server, synthetic_apps_disable,
+        synthetic_swarm_owner_disables,
     },
     native::{
         NativeClient, NativeLaunch, NativeProcess,
@@ -909,7 +910,10 @@ impl CodexPlugin {
         // each suppressed plugin takes its own `plugins.<id>.enabled=false`
         // override, and the ChatGPT-backed Apps runtime (likewise absent
         // from `mcp_servers`) takes a synthetic transport-carrying disable.
-        // Inherit keeps the current additive behavior with no extra process.
+        // Inherit keeps the additive behavior (no pre-spawn enumeration),
+        // except owner Swarm entries: those are always suppressed with the
+        // synthetic transport-carrying disables, so a worker can never talk
+        // to the owner's daemon with the owner's identity in either policy.
         let (mcp_disables, plugin_disables) = if mcp_policy == McpPolicy::Minimal {
             let probe = NativeLaunch {
                 program: program.clone(),
@@ -942,9 +946,14 @@ impl CodexPlugin {
                 disables.push(apps);
             }
             let plugins = compute_plugin_disables(&surface.plugins, &mcp_allow)?;
+            for stub in synthetic_swarm_owner_disables() {
+                if !disables.iter().any(|kept| kept.name == stub.name) {
+                    disables.push(stub);
+                }
+            }
             (disables, plugins)
         } else {
-            (Vec::new(), Vec::new())
+            (synthetic_swarm_owner_disables(), Vec::new())
         };
         let launch = NativeLaunch {
             program,

@@ -40,7 +40,8 @@ pub use diagnostics::{
 pub use ids::parse_agent_id;
 pub use mcp_policy::{
     MAX_MCP_ALLOW_ENTRIES, MAX_MCP_SERVER_NAME_LEN, MCP_POLICY_INHERIT, MCP_POLICY_MINIMAL,
-    McpPolicy, parse_snapshot_allow_list, validate_allow_list,
+    McpPolicy, SWARM_RESERVED_SERVER_NAMES, is_swarm_reserved_server_name,
+    parse_snapshot_allow_list, validate_allow_list,
 };
 pub use native_child::{
     CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,

@@ -232,6 +232,40 @@ pub(super) fn synthetic_apps_disable(allow: &[String]) -> Option<EffectiveMcpSer
     })
 }
 
+/// Exact owner-side Swarm MCP server names that must never reach a worker in
+/// either policy. They carry the owner daemon identity (the owner file config
+/// entry runs plain `swarm mcp` with no `--require-agent`), while the
+/// session-owned `eliot_swarm_<command>` name never equals them.
+pub(super) use eliot_core::SWARM_RESERVED_SERVER_NAMES as OWNER_SWARM_SERVER_NAMES;
+
+/// Synthetic transport-carrying disables for the exact owner Swarm names.
+/// Same verified pattern as [`CODEX_APPS_SERVER_NAME`]: a nonexistent
+/// command alongside `enabled=false` is accepted by the 0.167.1 bootstrap
+/// and reports `disabled`, so the entry can never light up in the worker
+/// inventory. Used under `inherit` (where no enumeration runs) and as a
+/// backstop under `minimal` for owner entries the pre-spawn enumeration
+/// cannot see. A fresh transport-carrying entry wins over the owner layers;
+/// a name the owner never defined stays a disabled stub, absent from the
+/// inventory like any disabled server. The disabled server is never
+/// spawned, and if a future native ever ignored the flag the missing
+/// executable fails the readback closed instead of inheriting a live
+/// owner-identity server.
+pub(super) fn synthetic_swarm_owner_disables() -> Vec<EffectiveMcpServer> {
+    let command = if cfg!(windows) {
+        r"C:\eliot-minimal-suppressed-mcp-server.exe".to_owned()
+    } else {
+        "/eliot-minimal-suppressed-mcp-server".to_owned()
+    };
+    OWNER_SWARM_SERVER_NAMES
+        .iter()
+        .map(|name| EffectiveMcpServer {
+            name: (*name).to_owned(),
+            command: Some(command.clone()),
+            url: None,
+        })
+        .collect()
+}
+
 /// Read the frozen worker MCP policy back. Legacy snapshots without `mcp`
 /// keys mean `inherit`; malformed frozen values fail instead of inheriting.
 pub(super) fn policy_from_profile(
@@ -599,6 +633,47 @@ mod tests {
         ] {
             assert!(!is_suppressible_plugin_id(id), "accepted {id:?}");
         }
+    }
+
+    #[test]
+    fn swarm_owner_disables_cover_the_exact_owner_names() {
+        let stubs = synthetic_swarm_owner_disables();
+        assert_eq!(
+            stubs
+                .iter()
+                .map(|stub| stub.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eliot_swarm", "eliot-swarm"]
+        );
+        for stub in &stubs {
+            assert!(is_addressable_override_name(&stub.name));
+            let command = stub.command.as_deref().expect("synthetic transport");
+            assert!(!command.is_empty());
+            assert!(!command.chars().any(char::is_control));
+            assert!(stub.url.is_none());
+        }
+        // The session-owned name never collides with the suppressed owner
+        // names, so the backstop cannot starve the Agent-scoped server.
+        for stub in &stubs {
+            assert_ne!(stub.name, "eliot_swarm_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        }
+    }
+
+    #[test]
+    fn disables_suppress_an_owner_swarm_entry_like_any_non_allowed_server() {
+        let disables = compute_disables(
+            &[server(
+                "eliot_swarm",
+                Some("C:/Tools/Eliot/bin/306D38E4/swarm.exe"),
+                None,
+            )],
+            &[],
+            "eliot_swarm_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(disables.len(), 1);
+        assert_eq!(disables[0].name, "eliot_swarm");
     }
 
     #[test]
