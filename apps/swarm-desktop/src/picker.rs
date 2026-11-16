@@ -387,7 +387,7 @@ fn harness_rows(
     };
     let version = version_note(entry);
     if code == "claude" {
-        claude_rows(inputs, entry, query, rows);
+        claude_rows(inputs, reply, entry, query, rows);
         return;
     }
     let models: Vec<&ModelsCatalogEntry> = reply
@@ -426,9 +426,17 @@ fn harness_rows(
     }
 }
 
-/// Claude Code has no live catalogue (`harness.models` reports aliases
-/// only): its CLI default, and the model id typed in the search.
-fn claude_rows(inputs: &Inputs, entry: &HarnessEntry, query: &str, rows: &mut Vec<Row>) {
+/// Claude Code catalogue rows: the frozen documented aliases and full model
+/// ids from `models.catalog` (each marked `documented_alias`), plus the CLI
+/// default and the model id typed in the search. There is no live native
+/// inventory; the typed row still covers ids outside the frozen list.
+fn claude_rows(
+    inputs: &Inputs,
+    reply: &ModelsCatalogResponse,
+    entry: &HarnessEntry,
+    query: &str,
+    rows: &mut Vec<Row>,
+) {
     let code = "claude";
     let label = harness_label(code);
     let efforts: Vec<String> = inputs
@@ -437,11 +445,21 @@ fn claude_rows(inputs: &Inputs, entry: &HarnessEntry, query: &str, rows: &mut Ve
         .map(|effort| (*effort).to_owned())
         .collect();
     let named = query.is_empty() || text_matches(&[code, label, "anthropic", "default"], query);
+    let models: Vec<&ModelsCatalogEntry> = reply
+        .models
+        .iter()
+        .filter(|model| model.harness == code)
+        .filter(|model| query.is_empty() || catalog_matches(model, query))
+        .collect();
     let typed = typed_model_id(query);
-    if !named && typed.is_none() {
+    if !named && models.is_empty() && typed.is_none() {
         return;
     }
     rows.push(heading(code, label, &version_note(entry)));
+    for model in models {
+        let key = format!("{code}:{}", model.id);
+        rows.push(Row::Choice(catalog_item(inputs, key, model, None)));
+    }
     let item = |key: String, model: Option<String>, title: String, detail: String| {
         let effort = row_effort(inputs, &key, code, model.as_deref(), None, None);
         Item {
@@ -480,7 +498,7 @@ fn claude_rows(inputs: &Inputs, entry: &HarnessEntry, query: &str, rows: &mut Ve
     } else if query.is_empty() {
         rows.push(note(
             "claude:hint",
-            "Type a model id, for example claude-opus-5-5, to use another model.",
+            "Type a model id to use one outside this list.",
         ));
     }
 }
@@ -750,6 +768,7 @@ mod tests {
             default_effort: efforts.first().map(|e| (*e).to_owned()),
             default: false,
             availability: CATALOG_AVAILABLE.to_owned(),
+            source: None,
         }
     }
 
@@ -859,6 +878,45 @@ mod tests {
         assert_eq!(typed.efforts.len(), 5);
         let all = build("", &Choice::Auto, &HashMap::new());
         assert!(find(&all, Some("claude:default")).is_some());
+    }
+
+    #[test]
+    fn claude_lists_its_documented_catalogue_entries() {
+        let mut read = catalog();
+        for id in ["haiku", "opusplan", "claude-haiku-5-5"] {
+            let mut entry = model("claude", id, &["low", "medium", "high", "xhigh", "max"]);
+            entry.source = Some("documented_alias".to_owned());
+            read.as_mut().unwrap().models.push(entry);
+        }
+        let shown = rows(&Inputs {
+            catalog: Some(&read),
+            query: "",
+            favorites: &[],
+            recents: &[],
+            presets: &[],
+            current: &Choice::Auto,
+            auto_detail: "Swarm picks codex-luna",
+            efforts: &HashMap::new(),
+            claude_efforts: &["low", "medium", "high", "xhigh", "max"],
+        });
+        assert!(find(&shown, Some("claude:default")).is_some());
+        assert!(find(&shown, Some("claude:haiku")).is_some());
+        assert!(find(&shown, Some("claude:opusplan")).is_some());
+        assert!(find(&shown, Some("claude:claude-haiku-5-5")).is_some());
+        let filtered = rows(&Inputs {
+            catalog: Some(&read),
+            query: "haiku",
+            favorites: &[],
+            recents: &[],
+            presets: &[],
+            current: &Choice::Auto,
+            auto_detail: "Swarm picks codex-luna",
+            efforts: &HashMap::new(),
+            claude_efforts: &["low", "medium", "high", "xhigh", "max"],
+        });
+        assert!(find(&filtered, Some("claude:haiku")).is_some());
+        assert!(find(&filtered, Some("claude:claude-haiku-5-5")).is_some());
+        assert!(find(&filtered, Some("claude:opusplan")).is_none());
     }
 
     #[test]

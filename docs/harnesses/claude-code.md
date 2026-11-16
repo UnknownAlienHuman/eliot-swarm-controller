@@ -329,8 +329,19 @@ discovered deterministically by preferring the newest install by `--version`
 desktop-app bundles under `%APPDATA%\Claude\claude-code\<version>\<hash>`;
 `.cmd`/`.bat`/`.ps1` wrappers are refused and never frozen); `--cmd` pins one
 explicit install instead. `swarm harnesses` reports every discovered install
-newest first in `candidates`. `swarm models --harness claude` reports aliases
-plus the CLI default; no live catalogue exists.
+newest first in `candidates`. `swarm models --harness claude` reports the
+frozen documented `--model` aliases (`best`, `fable`, `sonnet`, `opus`,
+`haiku`, `sonnet[1m]`, `opus[1m]`, `opusplan`, `opusplan[1m]`) and full model
+ids (for example `claude-haiku-5-5`, `claude-opus-5-5`), each entry marked
+`source = "documented_alias"` with the CLI effort vocabulary attached and
+`unknown` availability; an omitted `--model` selects the CLI default, whose
+effective value is read back from initialize/stream. No live native catalogue
+exists (verified read-only against installed Claude Code 2.1.325 on
+2026-11-16: no `models` subcommand, `--model` names aliases or a full model
+name, settings `model`/`availableModels` is an allowlist rather than an
+inventory, and the stream-json `initialize` reply reports only the session
+model). Source: [Model configuration](https://code.claude.com/docs/en/model-config)
+(checked 2026-11-16) and the installed CLI `--help`.
 ## Agent skill delivery (`eliot-swarm`)
 
 Every owned CLI spawn passes `--plugin-dir <data-dir>/skills`, the

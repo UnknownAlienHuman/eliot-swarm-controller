@@ -4,7 +4,9 @@
 //! model turn and without inference. `harness.models` returns the harness's
 //! own read-only catalogue (Codex/Muse native `model/list`, OpenCode
 //! `opencode models` provider/model ids, Antigravity `agy models`; Claude
-//! exposes aliases plus the CLI default), cached per native route/account with a freshness
+//! exposes its documented aliases and full model ids plus the CLI default,
+//! each entry carrying `source = "documented_alias"`), cached per native
+//! route/account with a freshness
 //! timestamp and a nonsecret credential identity. `harness.quota`
 //! reports provider-supported account quota readback with timestamp, scope,
 //! an explicit supported/unsupported/unknown status and provider-verbatim
@@ -27,6 +29,8 @@ pub const MAX_HARNESS_PROFILE_BYTES: usize = 256;
 pub const MAX_HARNESS_SCOPE_BYTES: usize = 512;
 /// Maximum credential identity length (a name, never a secret value).
 pub const MAX_HARNESS_CREDENTIAL_BYTES: usize = 256;
+/// Maximum catalogue entry source marker length.
+pub const MAX_HARNESS_SOURCE_BYTES: usize = 64;
 /// Maximum quota note length.
 pub const MAX_HARNESS_QUOTA_NOTE_BYTES: usize = 1024;
 /// Maximum encoded bytes for structured quota details (provider-verbatim
@@ -216,6 +220,22 @@ fn validate_credential(credential: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_source(source: Option<&str>) -> Result<()> {
+    if let Some(source) = source {
+        let trimmed = source.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > MAX_HARNESS_SOURCE_BYTES
+            || trimmed.chars().any(char::is_control)
+        {
+            return Err(Error::new(
+                "invalid",
+                "catalogue entry source must be a non-empty string of at most 64 characters with no controls",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_freshness(fetched_at_ms: i64, ttl_ms: u64) -> Result<()> {
     if fetched_at_ms < 0 || ttl_ms == 0 || ttl_ms > MAX_HARNESS_READ_TTL_MS {
         return Err(Error::new(
@@ -240,13 +260,20 @@ pub struct HarnessModelEntry {
     /// The harness default reasoning effort, when reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_effort: Option<String>,
+    /// Provenance of this entry: absent for a live native read, or
+    /// `documented_alias` for the frozen Claude alias/id list (Claude Code
+    /// exposes no read-only model inventory; availability is never
+    /// asserted from catalogue membership).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Response for `harness.models`.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessModelsResponse {
     pub harness: String,
-    /// `native` (live catalogue), `aliases` (Claude, no catalogue),
+    /// `native` (live catalogue), `aliases` (Claude documented aliases and
+    /// full model ids, each entry carrying `source = "documented_alias"`),
     /// `empty` (the native read ran but listed no models; details in
     /// `note`), or `none` (no catalogue; details in `note`).
     pub catalogue: String,
@@ -337,6 +364,7 @@ impl HarnessModelsResponse {
                     "harness model id must be non-empty of at most 256 characters",
                 ));
             }
+            validate_source(model.source.as_deref())?;
         }
         validate_scope(&self.scope)?;
         validate_credential(&self.credential)?;
@@ -573,6 +601,11 @@ pub struct ModelsCatalogEntry {
     pub default: bool,
     /// One of `available`, `held` or `unknown`.
     pub availability: String,
+    /// Provenance of this entry, copied from the harness catalogue:
+    /// absent for a live native read, or `documented_alias` for the
+    /// frozen Claude alias/id list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl ModelsCatalogEntry {
@@ -608,6 +641,7 @@ impl ModelsCatalogEntry {
                 "catalogue availability must be available, held or unknown",
             ));
         }
+        validate_source(self.source.as_deref())?;
         Ok(())
     }
 }
@@ -809,6 +843,7 @@ mod tests {
                     default: false,
                     efforts: None,
                     default_effort: None,
+                    source: None,
                 })
                 .collect(),
         );
@@ -942,7 +977,41 @@ mod tests {
             default_effort: None,
             default: false,
             availability: CATALOG_UNKNOWN.to_owned(),
+            source: None,
         }
+    }
+
+    #[test]
+    fn catalogue_entry_source_marks_documented_aliases() {
+        let mut entry = catalog_entry("claude", "haiku");
+        entry.source = Some("documented_alias".to_owned());
+        entry.validate().unwrap();
+        let oversize = "x".repeat(MAX_HARNESS_SOURCE_BYTES + 1);
+        for source in ["".to_owned(), "  ".to_owned(), oversize] {
+            let mut bad = catalog_entry("claude", "haiku");
+            bad.source = Some(source);
+            assert_eq!(bad.validate().unwrap_err().code, "invalid");
+        }
+        let mut control = catalog_entry("claude", "haiku");
+        control.source = Some(
+            "a
+b"
+            .to_owned(),
+        );
+        assert_eq!(control.validate().unwrap_err().code, "invalid");
+        let mut response = models_response(
+            "claude",
+            vec![HarnessModelEntry {
+                id: "haiku".to_owned(),
+                default: false,
+                efforts: None,
+                default_effort: None,
+                source: Some("documented_alias".to_owned()),
+            }],
+        );
+        response.validate().unwrap();
+        response.models[0].source = Some(String::new());
+        assert_eq!(response.validate().unwrap_err().code, "invalid");
     }
 
     #[test]

@@ -2936,8 +2936,9 @@ impl Router {
     /// inference. Codex/Muse/OpenCode/Antigravity use the harness's own
     /// read-only method through a dedicated metadata reader, cached per native
     /// route/account with freshness and credential identity; Claude reports
-    /// aliases plus the CLI default. Native model ids are retained verbatim:
-    /// no fallback model is ever selected.
+    /// its frozen documented aliases and full model ids plus the CLI
+    /// default, each entry marked `documented_alias`. Native model ids are
+    /// retained verbatim: no fallback model is ever selected.
     async fn harness_models(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
         let request: eliot_core::api::HarnessModelsRequest =
@@ -2990,10 +2991,15 @@ impl Router {
             "claude" => eliot_core::api::HarnessModelsResponse {
                 harness: harness.clone(),
                 catalogue: "aliases".to_owned(),
-                models: Vec::new(),
+                models: crate::adhoc::claude_documented_models(),
                 default: None,
                 note: Some(
-                    "Claude accepts model aliases and the CLI default; no live catalogue exists"
+                    "Claude Code exposes no read-only model inventory (no models subcommand, \
+                     --model names aliases or a full model name, initialize reports only the \
+                     session model); entries are the documented aliases and full model ids from \
+                     https://code.claude.com/docs/en/model-config (checked 2026-11-16, installed \
+                     CLI 2.1.325), each marked source documented_alias with unknown availability; \
+                     the CLI default applies when no model is passed"
                         .to_owned(),
                 ),
                 scope: scope.clone(),
@@ -3042,6 +3048,8 @@ impl Router {
                             .get("default_effort")
                             .and_then(Value::as_str)
                             .map(str::to_owned),
+                        // Live native reads carry no provenance marker.
+                        source: None,
                     });
                 }
                 let default = raw
@@ -3331,9 +3339,7 @@ impl Router {
     /// optional query filters case-insensitively over model id, display
     /// name, provider and harness. The response is bounded and paginated.
     async fn models_catalog(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        use eliot_core::api::{
-            ModelsCatalogEntry, ModelsCatalogRequest, catalog_display_name, catalog_provider,
-        };
+        use eliot_core::api::{ModelsCatalogEntry, ModelsCatalogRequest};
         require_owner(principal)?;
         let request: ModelsCatalogRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
@@ -3407,15 +3413,11 @@ impl Router {
                 continue;
             }
             // Reuse the per-scope cached `harness.models` path so one live
-            // native read serves every caller until its TTL lapses.
-            let params = match harness {
-                "claude" => {
-                    // Claude exposes aliases plus the CLI default, no live
-                    // catalogue: no models to aggregate.
-                    continue;
-                }
-                _ => json!({"harness": harness}),
-            };
+            // native read serves every caller until its TTL lapses. Claude
+            // contributes its frozen documented-alias entries the same way;
+            // quota stays unsupported there, so their availability reads
+            // unknown (membership alone never proves availability).
+            let params = json!({"harness": harness});
             let response_value = match self.harness_models(&params, principal).await {
                 Ok(value) => value,
                 Err(_) => continue,
@@ -3432,19 +3434,13 @@ impl Router {
                     serde_json::from_value::<eliot_core::api::HarnessQuotaResponse>(value).ok()
                 });
             for model in response.models {
-                let provider = catalog_provider(harness, &model.id);
-                let availability =
-                    catalog::availability(held, quota.as_ref(), &model.id, now_ms()).to_owned();
-                models.push(ModelsCatalogEntry {
-                    harness: harness.to_owned(),
-                    id: model.id.clone(),
-                    display_name: catalog_display_name(&model.id),
-                    provider,
-                    efforts: model.efforts,
-                    default_effort: model.default_effort,
-                    default: model.default,
-                    availability,
-                });
+                models.push(catalog::catalog_entry(
+                    harness,
+                    model,
+                    held,
+                    quota.as_ref(),
+                    now_ms(),
+                ));
             }
         }
         models.sort_by(|left, right| {
@@ -15691,6 +15687,33 @@ mod run_authorization_tests {
         assert_eq!(first["scope"], json!("profile:adhoc harness:claude"));
         assert_eq!(first["credential"], json!("none"));
         assert!(first["fetched_at_ms"].as_i64().unwrap_or(-1) >= 0);
+        // The Claude group is no longer empty: documented aliases and full
+        // ids, each marked with its provenance and the CLI effort
+        // vocabulary, never a live availability claim.
+        let models = first["models"].as_array().expect("claude entries");
+        assert!(!models.is_empty());
+        for model in models {
+            assert_eq!(model["source"], json!("documented_alias"));
+            assert!(model["id"].as_str().is_some_and(|id| !id.is_empty()));
+            assert_eq!(
+                model["efforts"].as_array().expect("claude efforts").len(),
+                crate::adhoc::CLAUDE_EFFORT_LEVELS.len()
+            );
+        }
+        let ids: Vec<&str> = models
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        for expected in [
+            "haiku",
+            "sonnet",
+            "opus",
+            "opusplan",
+            "claude-haiku-5-5",
+            "claude-opus-5-5",
+        ] {
+            assert!(ids.contains(&expected), "missing {expected}");
+        }
         let second = router
             .harness_models(&json!({"harness": "claude"}), &Principal::Owner)
             .await
