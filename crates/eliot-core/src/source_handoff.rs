@@ -379,7 +379,7 @@ mod tests {
         let error = result.expect_err("unproven handoff");
         assert_eq!(error.code, "unknown");
         assert_eq!(
-            error.message,
+            error.message.as_ref(),
             "source handoff acknowledgement or current ownership is unproven"
         );
         assert!(error.diagnostics.is_empty());
@@ -429,7 +429,7 @@ mod tests {
             let error = request.prepare(&policy).unwrap_err();
             assert_eq!(error.code, "secret_in_payload");
             assert_eq!(
-                error.message,
+                error.message.as_ref(),
                 "source.handoff contains a known secret in immutable metadata"
             );
             assert!(error.diagnostics.is_empty());

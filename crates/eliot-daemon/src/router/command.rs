@@ -11,8 +11,8 @@ use super::{
 };
 use crate::common::now_ms;
 use eliot_core::{
-    Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FrozenScriptRun,
-    InjectArgs, InjectPoint, Result, SecretPolicy,
+    Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FailureOrigin,
+    FrozenScriptRun, InjectArgs, InjectPoint, Result, SecretPolicy,
     api::{FrozenGitFetch, ProjectRegistrationView},
     classify_dispatched_error,
 };
@@ -208,14 +208,35 @@ impl Router {
             && command.principal != "owner"
             && !command.principal.starts_with("project:")
         {
-            self.reject_undispatched(id, "unsupported").await;
+            self.reject_undispatched_error(
+                id,
+                &Error::new(
+                    "unsupported",
+                    "run commands need owner or project authority",
+                )
+                .with_where("router.dispatch.script_gate")
+                .with_origin(
+                    FailureOrigin::Swarm,
+                    "script dispatch gate: principal is neither owner nor project",
+                ),
+            )
+            .await;
             return false;
         }
         if command.verb == "run" && command.principal == "owner" {
             let frozen: FrozenScriptRun = match serde_json::from_value(command.args.clone()) {
                 Ok(frozen) => frozen,
                 Err(_) => {
-                    self.reject_undispatched(id, "invalid").await;
+                    self.reject_undispatched_error(
+                        id,
+                        &Error::new("invalid", "run args are not a valid frozen script run")
+                            .with_where("router.dispatch.script_gate")
+                            .with_origin(
+                                FailureOrigin::Swarm,
+                                "script dispatch gate: frozen run args failed validation",
+                            ),
+                    )
+                    .await;
                     return false;
                 }
             };
@@ -240,13 +261,34 @@ impl Router {
         let frozen = match serde_json::from_value::<FrozenGitFetch>(command.args.clone()) {
             Ok(frozen) if frozen.validate().is_ok() => frozen,
             _ => {
-                self.reject_undispatched(id, "invalid").await;
+                self.reject_undispatched_error(
+                    id,
+                    &Error::new("invalid", "git.fetch args are not a valid frozen fetch")
+                        .with_where("router.dispatch.git_fetch_gate")
+                        .with_origin(
+                            FailureOrigin::Swarm,
+                            "git.fetch admission gate: frozen fetch args failed validation",
+                        ),
+                )
+                .await;
                 return Err(());
             }
         };
         let project_principal = command.principal.strip_prefix("project:");
         if command.principal != "owner" && project_principal != Some(frozen.repository.as_str()) {
-            self.reject_undispatched(id, "not_allowed").await;
+            self.reject_undispatched_error(
+                id,
+                &Error::new(
+                    "not_allowed",
+                    "git.fetch principal does not own the repository",
+                )
+                .with_where("router.dispatch.git_fetch_gate")
+                .with_origin(
+                    FailureOrigin::Swarm,
+                    "git.fetch admission gate: principal mismatch",
+                ),
+            )
+            .await;
             return Err(());
         }
         let registration = {
@@ -256,7 +298,19 @@ impl Router {
         match registration {
             Ok(Some(registration)) => Ok(Some(registration)),
             Ok(None) => {
-                self.reject_undispatched(id, "not_allowed").await;
+                self.reject_undispatched_error(
+                    id,
+                    &Error::new(
+                        "not_allowed",
+                        "git.fetch project registration is unavailable",
+                    )
+                    .with_where("router.dispatch.git_fetch_gate")
+                    .with_origin(
+                        FailureOrigin::Swarm,
+                        "git.fetch admission gate: project registration missing",
+                    ),
+                )
+                .await;
                 Err(())
             }
             Err(error) => {
@@ -294,7 +348,16 @@ impl Router {
         let registration = match registration {
             Ok(Some(registration)) => registration,
             Ok(None) => {
-                self.reject_undispatched(id, "not_allowed").await;
+                self.reject_undispatched_error(
+                    id,
+                    &Error::new("not_allowed", "project registration is unavailable")
+                        .with_where("router.dispatch.project_gate")
+                        .with_origin(
+                            FailureOrigin::Swarm,
+                            "project dispatch gate: registration missing",
+                        ),
+                )
+                .await;
                 return false;
             }
             Err(error) => {
@@ -334,7 +397,19 @@ impl Router {
         ) {
             let (Some(target), Some(generation)) = (command.target.as_deref(), command.generation)
             else {
-                self.reject_undispatched(id, "invalid").await;
+                self.reject_undispatched_error(
+                    id,
+                    &Error::new(
+                        "invalid",
+                        "targeted verbs need an exact target and generation",
+                    )
+                    .with_where("router.dispatch.project_gate")
+                    .with_origin(
+                        FailureOrigin::Swarm,
+                        "project dispatch gate: command target binding missing",
+                    ),
+                )
+                .await;
                 return false;
             };
             if let Err(error) = self
@@ -404,7 +479,19 @@ impl Router {
                 let workspace = match agent.workspace.as_deref() {
                     Some(workspace) => workspace,
                     None => {
-                        self.reject_undispatched(id, "invalid").await;
+                        self.reject_undispatched_error(
+                            id,
+                            &Error::new(
+                                "invalid",
+                                "this codex launch is missing its workspace binding",
+                            )
+                            .with_where("router.dispatch.profile_store")
+                            .with_origin(
+                                FailureOrigin::Swarm,
+                                "launch dispatch gate: codex workspace binding missing",
+                            ),
+                        )
+                        .await;
                         return None;
                     }
                 };
@@ -593,7 +680,19 @@ impl Router {
                 Ok(_) => continue,
                 Err(broadcast::error::RecvError::Lagged(_)) => return true,
                 Err(broadcast::error::RecvError::Closed) => {
-                    self.reject_undispatched(id, "event bus closed").await;
+                    self.reject_undispatched_error(
+                        id,
+                        &Error::new(
+                            "event bus closed",
+                            "the daemon event bus closed before dispatch completed",
+                        )
+                        .with_where("router.dispatch.event_bus")
+                        .with_origin(
+                            FailureOrigin::Swarm,
+                            "dispatch wait: event bus closed while watching for dispatch",
+                        ),
+                    )
+                    .await;
                     return false;
                 }
             }
@@ -723,10 +822,22 @@ impl Router {
         registration: Option<ProjectRegistrationView>,
     ) {
         let Some(registration) = registration else {
+            let error = self.sanitized_failure(
+                &Error::new(
+                    "not_allowed",
+                    "git.fetch execution needs its project registration",
+                )
+                .with_where("router.dispatch.git_fetch_gate")
+                .with_origin(
+                    FailureOrigin::Swarm,
+                    "git.fetch execution gate: project registration missing",
+                ),
+                "router.dispatch.git_fetch_gate",
+            );
             self.settle(
                 id,
                 CommandState::Rejected,
-                Some(json!({"code":"not_allowed"})),
+                Some(self.command_error_outcome(&error, "code")),
             )
             .await;
             return;
@@ -734,8 +845,21 @@ impl Router {
         let frozen = match serde_json::from_value::<FrozenGitFetch>(dispatched.args.clone()) {
             Ok(frozen) => frozen,
             Err(_) => {
-                self.settle(id, CommandState::Rejected, Some(json!({"code":"invalid"})))
-                    .await;
+                let error = self.sanitized_failure(
+                    &Error::new("invalid", "git.fetch args are not a valid frozen fetch")
+                        .with_where("router.dispatch.git_fetch_gate")
+                        .with_origin(
+                            FailureOrigin::Swarm,
+                            "git.fetch execution gate: frozen fetch args failed validation",
+                        ),
+                    "router.dispatch.git_fetch_gate",
+                );
+                self.settle(
+                    id,
+                    CommandState::Rejected,
+                    Some(self.command_error_outcome(&error, "code")),
+                )
+                .await;
                 return;
             }
         };
@@ -775,10 +899,11 @@ impl Router {
         {
             Ok(kind_data) => kind_data,
             Err(error) => {
+                let error = self.sanitized_failure(&error, "router.dispatch.user_event_gate");
                 self.settle(
                     id,
                     CommandState::Rejected,
-                    Some(json!({"code": error.code})),
+                    Some(self.command_error_outcome(&error, "code")),
                 )
                 .await;
                 self.signal_progress();
@@ -790,8 +915,24 @@ impl Router {
         // that still reaches execution is rejected here. Only the internal
         // `attention.emit` verb below may use the bound commit.
         if kind == super::ATTENTION_USER_EVENT_KIND {
-            self.settle(id, CommandState::Rejected, Some(json!({"code": "invalid"})))
-                .await;
+            let error = self.sanitized_failure(
+                &Error::new(
+                    "invalid",
+                    "the reserved attention topic is never bound through emit",
+                )
+                .with_where("router.dispatch.user_event_gate")
+                .with_origin(
+                    FailureOrigin::Swarm,
+                    "user event gate: reserved attention topic through emit",
+                ),
+                "router.dispatch.user_event_gate",
+            );
+            self.settle(
+                id,
+                CommandState::Rejected,
+                Some(self.command_error_outcome(&error, "code")),
+            )
+            .await;
             self.signal_progress();
             return;
         }
@@ -828,10 +969,11 @@ impl Router {
         {
             Ok(kind_data) => kind_data,
             Err(error) => {
+                let error = self.sanitized_failure(&error, "router.dispatch.attention_gate");
                 self.settle(
                     id,
                     CommandState::Rejected,
-                    Some(json!({"code": error.code})),
+                    Some(self.command_error_outcome(&error, "code")),
                 )
                 .await;
                 self.signal_progress();
@@ -1070,11 +1212,12 @@ impl Router {
         linked_id: Option<String>,
     ) {
         if let Err(error) = self.prepare_agent_artifact_root(&agent).await {
-            self.settle_plugin_error(id, &Error::new("native_not_dispatched", error.message))
+            self.settle_plugin_error(id, &Error::new("native_not_dispatched", *error.message))
                 .await;
             return;
         }
         let artifact_agent = agent.id.clone();
+        let harness = agent.harness.clone();
         let start = self
             .inner
             .plugin_host
@@ -1084,6 +1227,10 @@ impl Router {
             Ok(mut value) => {
                 if classify_start_result(&value) == CommandState::Failed {
                     self.redact_native_value(&mut value);
+                    Self::ensure_outcome_failure_fields(
+                        &mut value,
+                        &format!("plugin.{harness}.command.start"),
+                    );
                     let _ = self.settle(id, CommandState::Failed, Some(value)).await;
                 } else {
                     let artifact_snapshot =
@@ -1283,6 +1430,13 @@ impl Router {
                 let _ = self.settle(id, CommandState::Applied, Some(outcome)).await;
             }
             Err(error) => {
+                let error = self.sanitized_failure(
+                    &error.with_where("store.dispatch.config_apply").with_origin(
+                        FailureOrigin::Swarm,
+                        "agent config Store gate refused the command",
+                    ),
+                    "store.dispatch.config_apply",
+                );
                 let _ = self
                     .settle(
                         id,
@@ -1319,6 +1473,10 @@ impl Router {
                 Some("rejected") | Some("failed") => {
                     let mut value = value;
                     self.redact_native_value(&mut value);
+                    Self::ensure_outcome_failure_fields(
+                        &mut value,
+                        &format!("plugin.{}.command.configure", agent.harness),
+                    );
                     let state = if value.get("state").and_then(Value::as_str) == Some("failed") {
                         CommandState::Failed
                     } else {
@@ -1337,6 +1495,10 @@ impl Router {
                         value["cause"] = Value::String(cause);
                     }
                     self.redact_native_value(&mut value);
+                    Self::ensure_outcome_failure_fields(
+                        &mut value,
+                        &format!("plugin.{}.command.configure", agent.harness),
+                    );
                     let _ = self.settle(id, CommandState::Unknown, Some(value)).await;
                     return;
                 }
@@ -1353,6 +1515,11 @@ impl Router {
                 &Error::new(
                     "unknown",
                     "plugin configure response omitted its command outcome",
+                )
+                .with_where(format!("plugin.{}.command.configure", agent.harness))
+                .with_origin(
+                    FailureOrigin::Harness,
+                    "plugin configure reply omitted its command outcome frame",
                 ),
             )
             .await;
@@ -1401,6 +1568,13 @@ impl Router {
                 let _ = self.settle(id, CommandState::Applied, Some(outcome)).await;
             }
             Err(error) => {
+                let error = self.sanitized_failure(
+                    &error.with_where("store.dispatch.config_apply").with_origin(
+                        FailureOrigin::Swarm,
+                        "agent config Store gate refused the command",
+                    ),
+                    "store.dispatch.config_apply",
+                );
                 let _ = self
                     .settle(
                         id,
@@ -1745,34 +1919,118 @@ impl Router {
         self.signal_progress();
     }
 
-    pub(super) async fn reject_undispatched(&self, id: &str, reason: &str) {
-        self.reject_undispatched_error(id, &Error::new(reason, reason))
-            .await;
+    pub(super) fn daemon_secrets(&self) -> Vec<String> {
+        self.inner
+            .secrets
+            .lock_recover()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
     }
 
-    fn command_error_outcome(&self, error: &Error, code_key: &str) -> Value {
-        let mut outcome = json!({"message": error.message});
-        outcome[code_key] = json!(error.code);
-        self.redact_native_value(&mut outcome);
-        if let Some(message) = outcome.get_mut("message") {
-            *message = json!(
-                message
-                    .as_str()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(1024)
-                    .collect::<String>()
+    /// Sanitize a failure for persistence: redact the message, origin
+    /// evidence and stderr tails with the daemon secrets, normalize `where`,
+    /// and fill the stable fallback location/origin when the creation site
+    /// did not classify them. The fallback origin is `unknown` with a note
+    /// naming the missing classification; it never invents a location.
+    fn sanitized_failure(&self, error: &Error, default_where: &str) -> Error {
+        let secrets = self.daemon_secrets();
+        let mut error = error.clone().sanitized(&SecretPolicy::new(&secrets));
+        if error.failure_where.is_none() {
+            error = error.with_where(default_where);
+        }
+        if error.origin.is_none() {
+            error = error.with_origin(
+                FailureOrigin::Unknown,
+                "no origin classified where this error was created",
             );
         }
+        error
+    }
+
+    /// Fill missing failure-location keys on an outcome value without
+    /// touching producer-supplied codes, messages, states or causes. Only the
+    /// stable fallback is recorded; real classification belongs at the error
+    /// creation site.
+    fn ensure_outcome_failure_fields(value: &mut Value, default_where: &str) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        if object
+            .get("where")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            object.insert("where".to_owned(), json!(default_where));
+        }
+        if object
+            .get("origin")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            object.insert("origin".to_owned(), json!("unknown"));
+        }
+        if object
+            .get("origin_evidence")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            object.insert(
+                "origin_evidence".to_owned(),
+                json!("origin not classified by the producer of this outcome"),
+            );
+        }
+    }
+
+    /// Every rejection, failure and unknown outcome carries the code, the
+    /// bounded redacted message, the stable `where` and the origin with its
+    /// evidence. Optional stderr tails ride along only when the error
+    /// already carries a sanitized tail; they never invalidate the primary
+    /// outcome.
+    fn command_error_outcome(&self, error: &Error, code_key: &str) -> Value {
+        let mut outcome = json!({
+            "message": error.message,
+            "where": error
+                .failure_where
+                .clone()
+                .unwrap_or_else(|| "router.dispatch.unknown".into()),
+            "origin": error.origin_or_unknown().as_str(),
+        });
+        outcome[code_key] = json!(error.code);
+        if let Some(evidence) = error.origin_evidence.as_deref() {
+            outcome["origin_evidence"] = json!(evidence);
+        }
+        if let Some(exit_code) = error.exit_code.as_deref() {
+            outcome["exit_code"] = json!(exit_code);
+        }
+        if let Some(ntstatus) = error.ntstatus.as_deref() {
+            outcome["ntstatus"] = json!(ntstatus);
+        }
+        for diagnostic in error.diagnostics.iter() {
+            crate::redaction::attach_stderr(
+                &mut outcome,
+                diagnostic.source,
+                diagnostic.snapshot.clone(),
+                &[],
+            );
+        }
+        self.redact_native_value(&mut outcome);
         outcome
     }
 
-    async fn reject_undispatched_error(&self, id: &str, error: &Error) {
-        let outcome = if error.code == "busy" {
-            self.command_error_outcome(error, "reason")
-        } else {
-            json!({"reason": error.code})
-        };
+    pub(super) async fn reject_undispatched_error(&self, id: &str, error: &Error) {
+        // Pre-dispatch refusals prove no native I/O. The persisted outcome
+        // keeps the full failure: code, bounded redacted message, stable
+        // `where` and origin with evidence. Nothing here is a secret,
+        // parameter, prompt or model output: the error was sanitized above.
+        let error = self.sanitized_failure(error, "router.dispatch.unknown");
+        let outcome = self.command_error_outcome(&error, "reason");
+        crate::logging::record(
+            &SecretPolicy::new(self.daemon_secrets()),
+            &error.code,
+            &[("command", id)],
+            Some(&error),
+        );
         let (result, write_faulted) = {
             let mut store = self.inner.store.lock().await;
             let result = match store.get_command(id) {
@@ -1893,16 +2151,9 @@ impl Router {
                 .plugin_host
                 .take_late_batch_cause(agent, *generation)
         });
-        let secrets = self
-            .inner
-            .secrets
-            .lock_recover()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let error = crate::redaction::redact_error(error.clone(), &secrets);
+        let error = self.sanitized_failure(error, "plugin.command.unknown");
         crate::logging::record(
-            &SecretPolicy::new(&secrets),
+            &SecretPolicy::new(self.daemon_secrets()),
             &error.code,
             &[("command", id)],
             Some(&error),
@@ -1929,8 +2180,25 @@ impl Router {
         } else {
             json!({"code": error.code})
         };
-        outcome["message"] = json!(error.message.chars().take(1024).collect::<String>());
-        for diagnostic in &error.diagnostics {
+        outcome["message"] = json!(error.message.clone());
+        outcome["where"] = json!(
+            error
+                .failure_where
+                .clone()
+                .unwrap_or_else(|| "plugin.command.unknown".into())
+        );
+        outcome["origin"] = json!(error.origin_or_unknown().as_str());
+        if let Some(evidence) = error.origin_evidence.as_deref() {
+            outcome["origin_evidence"] = json!(evidence);
+        }
+        if let Some(exit_code) = error.exit_code.as_deref() {
+            outcome["exit_code"] = json!(exit_code);
+        }
+        if let Some(ntstatus) = error.ntstatus.as_deref() {
+            outcome["ntstatus"] = json!(ntstatus);
+        }
+        let secrets = self.daemon_secrets();
+        for diagnostic in error.diagnostics.iter() {
             crate::redaction::attach_stderr(
                 &mut outcome,
                 diagnostic.source,
@@ -1938,6 +2206,7 @@ impl Router {
                 &secrets,
             );
         }
+        Self::ensure_outcome_failure_fields(&mut outcome, "plugin.command.unknown");
         self.redact_native_value(&mut outcome);
         let _ = self.settle(id, state, Some(outcome)).await;
     }
@@ -1960,6 +2229,12 @@ impl Router {
                     eliot_core::WorkspaceCreationOutcome::Unknown {
                         code: "workspace_identity_unknown".to_owned(),
                         message: "retained workspace identity could not be confirmed".to_owned(),
+                        failure_where: Some("store.dispatch.workspace_gate".to_owned()),
+                        origin: Some(eliot_core::FailureOrigin::Unknown),
+                        origin_evidence: Some(
+                            "retained identity readback neither proved nor disproved the workspace"
+                                .to_owned(),
+                        ),
                     },
                     now_ms(),
                 )
@@ -1967,16 +2242,9 @@ impl Router {
                 self.publish_locked(&change.events);
             }
         }
-        let secrets = self
-            .inner
-            .secrets
-            .lock_recover()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let error = crate::redaction::redact_error(error.clone(), &secrets);
+        let error = self.sanitized_failure(error, "store.dispatch.workspace_gate");
         crate::logging::record(
-            &SecretPolicy::new(&secrets),
+            &SecretPolicy::new(self.daemon_secrets()),
             &error.code,
             &[("command", id)],
             Some(&error),
@@ -2269,7 +2537,7 @@ fn coordination_commit_error_state(code: &str) -> CommandState {
 mod tests {
     use super::{Command, capture_dispatch_seq, validate_retained_resume_agent};
     use crate::common::now_ms;
-    use eliot_core::{Agent, AgentState, CommandState, Error, Event, SubmitCommand};
+    use eliot_core::{Agent, AgentState, CommandState, Error, Event, FailureOrigin, SubmitCommand};
     use eliot_plugin::sync::LockExt;
     use serde_json::json;
     use ulid::Ulid;
@@ -2290,7 +2558,12 @@ mod tests {
         router
             .reject_undispatched_error(
                 &id,
-                &Error::new("busy", format!("metadata_readers limit=4 {secret}")),
+                &Error::new("busy", format!("metadata_readers limit=4 {secret}"))
+                    .with_where("router.dispatch.discovery_readers")
+                    .with_origin(
+                        FailureOrigin::Swarm,
+                        "discovery readers at their in-flight bound",
+                    ),
             )
             .await;
         let store = router.inner.store.lock().await;
@@ -2301,6 +2574,12 @@ mod tests {
         let message = outcome["message"].as_str().unwrap();
         assert!(message.contains("metadata_readers limit=4"));
         assert!(!message.contains(&"s".repeat(100)));
+        assert_eq!(outcome["where"], "router.dispatch.discovery_readers");
+        assert_eq!(outcome["origin"], "swarm");
+        assert_eq!(
+            outcome["origin_evidence"],
+            "discovery readers at their in-flight bound"
+        );
         let rejected = store
             .read_events(0, 100, None)
             .unwrap()
@@ -2437,7 +2716,9 @@ mod tests {
         assert_eq!(settled.state, CommandState::Rejected);
         assert_eq!(
             settled.outcome,
-            Some(json!({"reason": dispatch_error.code, "message": dispatch_error.message}))
+            Some(
+                json!({"reason": dispatch_error.code, "message": dispatch_error.message, "where": "router.dispatch.unknown", "origin": "unknown", "origin_evidence": "no origin classified where this error was created"})
+            )
         );
         // No generation, source, or token changed: the fence fired before any
         // native effect, and the command no longer blocks drain or re-observe.

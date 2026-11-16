@@ -490,6 +490,69 @@ identifiers and structured sanitized tails, applying that policy to the code and
 values. It does not log `Error.message`, request data or environment values. Failure to
 record a diagnostic cannot alter the external-effect result.
 
+### Failure location and origin
+
+Every settled failure carries a typed location and an origin. `where` is a stable
+dotted `component.phase[.detail]` path (`store.dispatch.workspace_gate`,
+`plugin.opencode.start.auth_transfer`, `provider.request`): lowercase
+alphanumerics, dots and underscores, anything else folds to `_`, empty folds to
+`unknown`. `origin` names the layer at fault, never the messenger:
+`swarm` (our core, bus and plugin implementation), `harness` (the native harness), `harness_contract_mismatch`
+(the harness behaved differently from its documented protocol), `provider` (the
+model service), `environment` (OS, disk, network, credentials outside every
+adapter), or `unknown` with an evidence note saying what is missing. Structured
+signals only: a provider error classifies from status and machine-readable error
+codes, never from message text. Exit codes ride alongside (`exit_code`, plus an
+`ntstatus` hex string for negative process codes such as `0xC0000005`).
+
+| Evidence | Origin |
+|---|---|
+| Swarm validation, schema, queue or implementation failure | `swarm` |
+| Missing executable; OS, disk, network or external credential failure | `environment` |
+| Native harness refusal, including an unavailable model without upstream evidence | `harness` |
+| Structured upstream rate, quota, auth or model error | `provider` |
+| Observed contradiction of a documented harness protocol | `harness_contract_mismatch`, with `docs/harnesses/<h>.md#section` |
+| Insufficient evidence | `unknown`, stating the missing evidence |
+
+Redact complete messages and evidence before imposing their persistence/wire bounds.
+Constructors retain complete text until the owning policy is available. No minimum
+secret or truncated-prefix length is a confidentiality boundary. A failed-start
+conversion preserves the typed origin, location and evidence; proof of no effect
+does not imply a Swarm origin. A plugin panic is diagnostic evidence from the exact
+owned process pipe bound to its Agent/generation, never a replacement effect code.
+
+Native mappings are versioned at their owning adapters: Codex 0.167.1
+`CodexErrorInfo` upstream variants/statuses; Claude stream-json structured
+`assistant.error` ([vendor enum](https://code.claude.com/docs/en/agent-sdk/typescript#sdkassistantmessage));
+OpenCode 2.2.7 `Session.StructuredError` provider types/statuses from its installed
+`/openapi.json`; Muse 1.4.0-R4161.1 `authRequired` from its exported MSP schema.
+AGY 1.5.9 ACP exposes no documented structured provider error, so native refusals
+remain `harness` rather than guessing from model text. Verified 2026-11-16.
+
+Non-success turn outcomes link their cause: `Turn.preceded_by` holds the command
+whose terminal event settled the turn, `None` for success, running turns and rows
+settled before predecessors were recorded. The store schema migrates forward;
+legacy rows read back as `None`, never as a guessed predecessor.
+
+### Causal chains (`diagnose`)
+
+`diagnose` and `swarm why` assemble the existing records above into a bounded
+response (at most 16 steps, one 512-character summary, per-field byte caps);
+they keep no store of their own. The chain is command outcome, related turn
+outcomes with `preceded_by`, process exits with codes, the last stderr lines,
+and the previous-run crash marker, included only when the terminal failure has
+no classified origin. The summary always starts with the failure origin.
+Agent diagnosis joins the exact generation's launch/resume even when no turn
+exists, and the failed turn's input and `preceded_by` commands. Native terminal
+diagnostics come from that exact retained turn event; missing retained links are
+left missing, never inferred by timestamps.
+Capacity preflight can refuse before command admission. `diagnose` can explain
+that exact request ID from a `command.refused` operational record while it
+remains in the bounded rotated log. This admission step carries structured
+code/location/origin/evidence, no free-text error message. It is optional
+diagnostic evidence and creates neither command state nor replay authority;
+rotation or log loss leaves the unadmitted ID `not_found`.
+
 ## Storage
 
 Use bundled SQLite, WAL, synchronous FULL, one writer and bounded read queries. Commit

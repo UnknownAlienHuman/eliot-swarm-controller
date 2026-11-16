@@ -775,7 +775,7 @@ impl EventProcessor {
                             .await;
                     }
                     if self.status.failure.is_none() {
-                        self.status.failure = Some(error.message);
+                        self.status.failure = Some(*error.message);
                     }
                 }
             }
@@ -797,7 +797,7 @@ impl EventProcessor {
                         let _ = self.record_gap(&reason).await;
                     }
                     if self.status.failure.is_none() {
-                        self.status.failure = Some(error.message);
+                        self.status.failure = Some(*error.message);
                     }
                 }
             }
@@ -1274,7 +1274,7 @@ impl EventProcessor {
                         .await;
                 }
                 if self.status.failure.is_none() {
-                    self.status.failure = Some(error.message);
+                    self.status.failure = Some(*error.message);
                 }
                 return Err(Error::new(
                     "unknown",
@@ -1944,6 +1944,24 @@ impl EventProcessor {
             "native_status": turn_status(&notification.turn.status),
         });
         // The semantic hold signal gets first claim on the bounded terminal data.
+        if notification.turn.status == NativeTurnStatus::Failed {
+            let origin = notification
+                .turn
+                .error
+                .as_ref()
+                .map(|error| error.failure_origin())
+                .unwrap_or(eliot_core::FailureOrigin::Unknown);
+            let evidence = if origin == eliot_core::FailureOrigin::Provider {
+                "CodexErrorInfo reports structured upstream rate, quota, auth, model or HTTP failure"
+            } else if origin == eliot_core::FailureOrigin::Harness {
+                "native turn error without a structured upstream signal"
+            } else {
+                "native failed terminal omitted its error classification"
+            };
+            eliot_plugin::session::attach_failure_origin(
+                &mut data, "codex", origin, evidence, &secrets,
+            );
+        }
         if let Some(restriction) = provider_restriction {
             attach_provider_restriction(&mut data, restriction, &secrets);
         }
@@ -2221,7 +2239,7 @@ impl EventProcessor {
                     error.code
                 );
                 if state.failure.is_none() {
-                    state.failure = Some(error.message);
+                    state.failure = Some(*error.message);
                 }
                 (!state.gap_reported && !state.writes_blocked, reason)
             };
@@ -2347,7 +2365,7 @@ impl EventProcessor {
                     error.code
                 );
                 if state.failure.is_none() {
-                    state.failure = Some(error.message);
+                    state.failure = Some(*error.message);
                 }
                 (!state.gap_reported && !state.writes_blocked, reason)
             };
@@ -2638,7 +2656,7 @@ impl EventProcessor {
                             state.source_unknown = true;
                             let code = error.code.clone();
                             if state.failure.is_none() {
-                                state.failure = Some(error.message);
+                                state.failure = Some(*error.message);
                             }
                             (!state.gap_reported && !state.writes_blocked, code)
                         };

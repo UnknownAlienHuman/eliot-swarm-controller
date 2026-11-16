@@ -727,7 +727,7 @@ impl Router {
                     &classification.url,
                 )
                 .await
-                .map_err(|error| Error::new("remote_delete_failed", error.message.clone()))?;
+                .map_err(|error| Error::new("remote_delete_failed", (*error.message).clone()))?;
             }
             return Ok(0);
         }
@@ -778,7 +778,7 @@ impl Router {
                     ) {
                         // Transport, timeout or shutdown: the archive may or
                         // may not have happened. Never claim a skip.
-                        Error::new("unknown", error.message.clone())
+                        Error::new("unknown", (*error.message).clone())
                     } else {
                         error
                     }

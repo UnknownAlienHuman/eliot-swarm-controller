@@ -452,7 +452,7 @@ mod tests {
         };
         assert_eq!(error.code, "unavailable");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "daemon IPC connect deadline elapsed before any request was sent"
         );
     }

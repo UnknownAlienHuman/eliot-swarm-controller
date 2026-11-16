@@ -729,7 +729,7 @@ impl GitProbe {
         let command = self.build_command(root, args, overrides, binding)?;
         let mut child = OwnedChild::spawn_leaf(command).map_err(|error| {
             if error.code == "unavailable" {
-                Error::new("git_leaf_fence_unavailable", error.message)
+                Error::new("git_leaf_fence_unavailable", *error.message)
             } else {
                 error
             }

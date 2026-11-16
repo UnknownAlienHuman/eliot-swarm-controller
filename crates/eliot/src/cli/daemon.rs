@@ -226,8 +226,12 @@ pub(crate) async fn wait_for_daemon_ready(
         )
         .await;
         match status {
-            Ok(Ok(_)) => {
+            Ok(Ok(status)) => {
                 let boot_id = read_daemon_boot_id(data_dir);
+                let crash_note = status
+                    .previous_crash
+                    .as_ref()
+                    .map(|crash| format!("previous run crashed: {}", crash.summary()));
                 if json_output {
                     print_value(
                         &json!({
@@ -235,6 +239,7 @@ pub(crate) async fn wait_for_daemon_ready(
                             "data_dir": data_dir.to_string_lossy(),
                             "boot_id": boot_id.unwrap_or_default(),
                             "log": log_path.to_string_lossy(),
+                            "previous_crash": status.previous_crash,
                         }),
                         true,
                     );
@@ -246,6 +251,9 @@ pub(crate) async fn wait_for_daemon_ready(
                     );
                 } else {
                     println!("daemon ready; data_dir: {}", data_dir.display());
+                }
+                if let Some(note) = crash_note {
+                    println!("{note}");
                 }
                 return Ok(0);
             }

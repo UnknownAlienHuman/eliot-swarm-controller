@@ -623,6 +623,11 @@ impl PluginHost {
                 }
                 tokio::sync::TryAcquireError::NoPermits => {
                     Error::new("busy", "metadata_readers in-flight bound reached (limit=4)")
+                        .with_where("router.dispatch.discovery_readers")
+                        .with_origin(
+                            eliot_core::FailureOrigin::Swarm,
+                            "discovery readers at their in-flight bound",
+                        )
                 }
             })?;
         self.register_metadata_reader_slot(slot)

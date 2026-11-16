@@ -1610,6 +1610,8 @@ mod tests {
                      DELETE FROM schema_migrations WHERE version = 41;
                      DROP INDEX inference_write_inventory;
                      ALTER TABLE writes DROP COLUMN inference_seq;
+                     ALTER TABLE turns DROP COLUMN preceded_by;
+                     DELETE FROM schema_migrations WHERE version = 45;
                      DELETE FROM schema_migrations WHERE version >= 39;
                      DROP TABLE inference_calls;
                      DROP TABLE inference_clients;

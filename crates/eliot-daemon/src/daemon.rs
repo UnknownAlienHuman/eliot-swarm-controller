@@ -82,6 +82,10 @@ pub async fn run(path: PathBuf) -> Result<()> {
     let daemon_lock = data_dir.acquire_daemon_lock()?;
     crate::skill::materialize(data_dir.path())?;
     let _log = logging::init(&data_dir, &daemon_lock)?;
+    // `[daemon] log_level` sets process verbosity at startup; an invalid
+    // value fails startup like invalid retention or mail config.
+    let daemon_config = crate::config::load_daemon_config(data_dir.path())?;
+    crate::logging::set_log_level(crate::logging::LogLevel::parse(&daemon_config.log_level)?);
     let policy = Arc::new(SecretPolicy::new([data_dir.owner_token()]));
     logging::record(&policy, "daemon.starting", &[], None);
     let outcome = run_owned(&data_dir, &daemon_lock, Arc::clone(&policy)).await;
@@ -135,6 +139,33 @@ async fn run_owned(
     crate::bootstrap::ensure_hot_start(data_dir.path(), &store, &policy, startup_cwd.as_deref())
         .await?;
 
+    // A previous run's panic is reported once: in the log as
+    // `daemon.panicked` (with when, where and which code in ids), in
+    // `daemon.status`, and in `swarm daemon` startup output. Markers are
+    // consumed on read, so a later restart does not repeat the report.
+    // A WMI-started daemon has no console, so this file is the durable path.
+    if let Some(previous) = crate::crash::load_previous_crash(data_dir.path(), &policy) {
+        let when = previous.timestamp;
+        let summary = previous.summary();
+        crate::logging::record(
+            &policy,
+            "daemon.panicked",
+            &[
+                ("when", &when.to_string()),
+                ("location", previous.location.as_str()),
+                ("thread", previous.thread.as_str()),
+            ],
+            Some(
+                &eliot_core::Error::new("daemon.panicked", summary)
+                    .with_where("daemon.runtime.panic")
+                    .with_origin(
+                        eliot_core::FailureOrigin::Swarm,
+                        "previous daemon run panicked before shutdown",
+                    ),
+            ),
+        );
+        router.set_previous_crash(Some(previous));
+    }
     let recovered = {
         let mut store = store.lock().await;
         let events = store.recover_on_restart(now_ms())?;
@@ -1171,8 +1202,9 @@ fn rpc_error(mut error: Error, policy: &SecretPolicy) -> RpcError {
         .redact_text(&error.message)
         .chars()
         .take(1_024)
-        .collect();
-    for diagnostic in &mut error.diagnostics {
+        .collect::<String>()
+        .into();
+    for diagnostic in error.diagnostics.iter_mut() {
         diagnostic.snapshot.text = policy.redact_text(&diagnostic.snapshot.text);
     }
     if let Some(detail) = error.details.as_mut() {
@@ -1191,7 +1223,7 @@ fn rpc_error(mut error: Error, policy: &SecretPolicy) -> RpcError {
     }
     RpcError {
         code,
-        message: error.message,
+        message: *error.message,
         data: Some(data),
     }
 }
@@ -1611,7 +1643,7 @@ fn with_connect_hint(path: &Path, mut error: Error) -> Error {
     }
     let hint = daemon_connect_hint(path);
     if !error.message.contains("hint: data_dir=") {
-        error.message = format!("{}; {}", error.message, hint);
+        error.message = format!("{}; {}", error.message, hint).into();
         bound_stderr_diagnostics(&mut error.diagnostics, MAX_STDERR_DIAGNOSTIC_BYTES);
     }
     error
@@ -1671,7 +1703,7 @@ mod tests {
         let error = result.expect_err("invalid params before client I/O");
         assert_eq!(error.code, "invalid");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "daemon RPC parameters could not be serialized"
         );
         assert!(!error.message.contains("dummy-private"));
@@ -1856,12 +1888,13 @@ mod tests {
                     read_error: false,
                 },
             })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         let wire = rpc_error(original, &policy);
         assert!(serde_json::to_vec(&wire).unwrap().len() <= 64 * 1024);
         let restored = core_error(wire, &policy);
         assert_eq!(restored.code, "unknown");
-        assert_eq!(restored.message, "same primary message");
+        assert_eq!(restored.message.as_str(), "same primary message");
         assert_eq!(restored.diagnostics.len(), 2);
         assert!(
             restored
@@ -1875,7 +1908,7 @@ mod tests {
                 .iter()
                 .any(|tail| tail.source == StderrSource::Harness)
         );
-        for diagnostic in &restored.diagnostics {
+        for diagnostic in restored.diagnostics.iter() {
             assert!(diagnostic.snapshot.truncated);
             assert!(!diagnostic.snapshot.text.contains('!'));
         }

@@ -46,6 +46,12 @@ Use supported typed APIs, not an inferred method list from a different host vers
 
 ## Native mapping
 
+The installed `turn/steer` result must echo the submitted `commandId`, the exact
+`expectedTurnId` as `turnId`, and `status="accepted"` (1.4.0-R4161.1 exported
+MSP schema). A malformed result or contradictory echo is a diagnostic
+`harness_contract_mismatch` at this section; the effect remains unknown. A
+native refusal alone does not prove a contract mismatch or an upstream failure.
+
 | Eliot verb | Installed MSP mechanism to verify |
 | --- | --- |
 | launch/send | session/start then turn/start; readiness, input association and result separate |

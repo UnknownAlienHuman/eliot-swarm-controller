@@ -37,8 +37,10 @@ pub use agent_views::{
     AGENT_PREVIEW_CHARS, AgentConfigView, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
     AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentListRequest, AgentListResponse,
     AgentListRow, AgentProcessesRequest, AgentProcessesResponse, AgentStatsRequest,
-    AgentStatsResponse, AgentSummary, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus,
-    DaemonStatusRequest, DaemonStatusResponse, DrainReport, GitCredentialHelper, OwnedProcessKind,
+    AgentStatsResponse, AgentSummary, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus, CrashMarker,
+    DaemonPanicTestRequest, DaemonPanicTestResponse, DaemonStatusRequest, DaemonStatusResponse,
+    DiagnoseRequest, DiagnoseResponse, DiagnoseStep, DrainReport, GitCredentialHelper,
+    MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS, MAX_DIAGNOSE_SUMMARY_CHARS, OwnedProcessKind,
     OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectDiscoverRequest,
     ProjectDiscoverResponse, ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary,
     RetentionView, RunningTurnSummary, SourceOwner, SourceState, StatusBlocker,
@@ -719,7 +721,7 @@ mod tests {
             for result in response_validation(after, next, high_water, &[]) {
                 let error = result.unwrap_err();
                 assert_eq!(error.code, "unknown");
-                assert_eq!(error.message, "event response is invalid");
+                assert_eq!(error.message.as_ref(), "event response is invalid");
                 assert!(error.diagnostics.is_empty());
             }
         }
@@ -738,7 +740,7 @@ mod tests {
             for result in response_validation(2, 9, 12, &sequences) {
                 let error = result.unwrap_err();
                 assert_eq!(error.code, "unknown");
-                assert_eq!(error.message, "event response is invalid");
+                assert_eq!(error.message.as_ref(), "event response is invalid");
                 assert!(error.diagnostics.is_empty());
             }
         }

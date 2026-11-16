@@ -234,7 +234,15 @@ impl ClaudeClient {
     }
 
     pub fn diagnostic_error(&self, mut error: Error) -> Error {
-        error.message = self.policy.redact_text(&error.message);
+        if error.origin.is_none() && error.code == "native_rejected" {
+            error = error
+                .with_where("plugin.claude.native.response")
+                .with_origin(
+                    eliot_core::FailureOrigin::Harness,
+                    "native control refusal without structured upstream evidence",
+                );
+        }
+        error = error.sanitized(&self.policy);
         error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
     }
 
@@ -263,7 +271,7 @@ impl ClaudeClient {
             },
         )?;
 
-        let (_guard, response_rx) = self.pending.insert(id);
+        let (_guard, response_rx) = self.pending.insert(id, subtype, encoded.len());
         if let Err(error) = self.write_encoded(encoded, deadline).await {
             if error.code == "native_not_dispatched" {
                 return Err(error);

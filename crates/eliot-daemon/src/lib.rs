@@ -7,6 +7,7 @@ mod bus;
 pub mod cloud_mcp;
 mod common;
 mod config;
+pub mod crash;
 mod daemon;
 mod fs_invalidation;
 mod git_actions;

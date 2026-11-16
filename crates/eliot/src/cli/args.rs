@@ -145,6 +145,8 @@ pub(crate) enum CliCommand {
     Cmd(CmdArgs),
     /// Resolve an unknown turn with an exact owner assertion.
     Turn(TurnArgs),
+    /// Explain why and where a command, Agent or turn failed (owner only).
+    Why(WhyArgs),
     /// Read committed events after a sequence number.
     Events(EventsArgs),
     /// Wait for a frozen set of child commands/turns with all/any semantics.
@@ -715,6 +717,12 @@ pub(crate) struct CmdArgs {
 pub(crate) struct TurnArgs {
     #[command(subcommand)]
     pub(crate) command: TurnCommand,
+}
+
+#[derive(Args)]
+pub(crate) struct WhyArgs {
+    /// Command id, Agent id, or Agent id with turn id as agent:turn.
+    pub(crate) target: String,
 }
 
 #[derive(Args)]

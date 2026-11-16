@@ -589,6 +589,12 @@ pub(crate) struct DaemonConfig {
     pub(crate) artifact_roots: Vec<String>,
     #[serde(default)]
     pub(crate) retention: RetentionConfig,
+    /// Daemon log verbosity: `standard` (working mode) or `debug`
+    /// (everything mode). Hot-reloadable through `settings.save`; changing
+    /// only this key never requires a restart. See
+    /// docs/spec/configuration.md: daemon logging.
+    #[serde(default = "default_log_level")]
+    pub(crate) log_level: String,
     /// Hierarchy fanout bounds consumed by launch/selector admission. See
     /// docs/spec/configuration.md: daemon limits. Deserialized directly as
     /// the core type: unlike retention windows these always apply, so an
@@ -618,11 +624,16 @@ pub(crate) struct DaemonConfig {
     pub(crate) session_file_bytes: i64,
 }
 
+fn default_log_level() -> String {
+    "standard".to_owned()
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             artifact_roots: Vec::new(),
             retention: RetentionConfig::default(),
+            log_level: default_log_level(),
             limits: core::api::HierarchyLimits::default(),
             attention_suspicion_secs: default_attention_suspicion_secs(),
             heavy_wall_secs: default_heavy_wall_secs(),
@@ -680,6 +691,10 @@ impl DaemonConfig {
                 "config.toml: daemon.attention_suspicion_secs must be a positive integer whose millisecond value fits in i64",
             ));
         }
+        // Parse here so an invalid level is a config error, not a silent
+        // fallback. The live value is applied at startup and on every
+        // `settings.save` through `crate::logging`.
+        crate::logging::LogLevel::parse(&self.log_level)?;
         if self.heavy_wall_secs <= 0 || self.heavy_wall_secs > 31_536_000 {
             return Err(core::Error::new(
                 "profile_error",
@@ -715,6 +730,7 @@ impl DaemonConfig {
             retention: self.retention.validate()?,
             limits: self.limits,
             attention_suspicion_secs: self.attention_suspicion_secs,
+            log_level: self.log_level,
             heavy_wall_secs: self.heavy_wall_secs,
             heavy_cpu_secs: self.heavy_cpu_secs,
             heavy_rss_bytes: self.heavy_rss_bytes,
@@ -3674,6 +3690,7 @@ mod tests {
                 },
                 limits: core::api::HierarchyLimits::default(),
                 attention_suspicion_secs: 15 * 60,
+                log_level: default_log_level(),
                 heavy_wall_secs: default_heavy_wall_secs(),
                 heavy_cpu_secs: default_heavy_cpu_secs(),
                 heavy_rss_bytes: default_heavy_rss_bytes(),
@@ -3694,6 +3711,7 @@ mod tests {
                 },
                 limits: core::api::HierarchyLimits::default(),
                 attention_suspicion_secs: 15 * 60,
+                log_level: default_log_level(),
                 heavy_wall_secs: default_heavy_wall_secs(),
                 heavy_cpu_secs: default_heavy_cpu_secs(),
                 heavy_rss_bytes: default_heavy_rss_bytes(),
@@ -3701,6 +3719,29 @@ mod tests {
                 session_file_bytes: default_session_file_bytes(),
             }
         );
+    }
+
+    #[test]
+    fn daemon_log_level_defaults_parses_and_rejects() {
+        let fixture = AutomationConfigFixture::new();
+        assert_eq!(DaemonConfig::default().log_level, "standard");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap().log_level,
+            "standard"
+        );
+        fixture.write("[daemon]\nlog_level = \"debug\"\n");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap().log_level,
+            "debug"
+        );
+        for source in [
+            "[daemon]\nlog_level = \"verbose\"\n",
+            "[daemon]\nlog_level = 1\n",
+        ] {
+            fixture.write(source);
+            let error = load_daemon_config(&fixture.root).unwrap_err();
+            assert_eq!(error.code, "profile_error", "source: {source}");
+        }
     }
 
     #[test]

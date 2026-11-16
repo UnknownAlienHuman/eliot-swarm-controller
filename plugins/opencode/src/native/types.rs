@@ -383,6 +383,38 @@ pub struct StructuredError {
     #[serde(rename = "type")]
     pub error_type: String,
     pub message: String,
+    #[serde(default)]
+    pub status: Option<u16>,
+}
+
+impl StructuredError {
+    pub fn failure_origin(&self) -> eliot_core::FailureOrigin {
+        use eliot_core::FailureOrigin;
+        // Installed 2.2.7 Session.StructuredError, verified /openapi.json.
+        // Only provider.* error types plus an actual upstream HTTP failure
+        // establish provider origin. A local server HTTP status does not.
+        if matches!(
+            self.error_type.as_str(),
+            "provider.rate-limit"
+                | "provider.auth"
+                | "provider.quota"
+                | "provider.free-limit"
+                | "provider.chatgpt-limit"
+        ) || self.error_type.starts_with("provider.")
+            && self
+                .status
+                .is_some_and(|status| (400..600).contains(&status))
+        {
+            FailureOrigin::Provider
+        } else if matches!(
+            self.error_type.as_str(),
+            "provider.transport" | "provider.timeout"
+        ) {
+            FailureOrigin::Environment
+        } else {
+            FailureOrigin::Harness
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +772,40 @@ pub struct EliotContextResolveOutput {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn installed_structured_provider_error_origin() {
+        for (kind, status, origin) in [
+            (
+                "provider.auth",
+                Some(403),
+                eliot_core::FailureOrigin::Provider,
+            ),
+            (
+                "provider.rate-limit",
+                None,
+                eliot_core::FailureOrigin::Provider,
+            ),
+            ("provider.quota", None, eliot_core::FailureOrigin::Provider),
+            (
+                "provider.error",
+                Some(404),
+                eliot_core::FailureOrigin::Provider,
+            ),
+            (
+                "provider.transport",
+                None,
+                eliot_core::FailureOrigin::Environment,
+            ),
+            ("unknown", None, eliot_core::FailureOrigin::Harness),
+        ] {
+            let error = super::StructuredError {
+                error_type: kind.to_owned(),
+                message: "ignored upstream auth rate quota text".to_owned(),
+                status,
+            };
+            assert_eq!(error.failure_origin(), origin);
+        }
+    }
     use super::*;
 
     #[test]

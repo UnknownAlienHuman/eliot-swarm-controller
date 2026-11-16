@@ -1958,10 +1958,20 @@ impl CodexPlugin {
         }
         let event_status = session.events.status();
         if let Some(reason) = event_status.failure {
-            return Err(Error::new("unknown", reason));
+            return Err(Error::new("unknown", reason)
+                .with_where("plugin.codex.command.send")
+                .with_origin(
+                    eliot_core::FailureOrigin::Swarm,
+                    "send gate refused on event-source failure",
+                ));
         }
         if event_status.active_turn_id.is_some() {
-            return Err(Error::new("busy", "Codex already has an active turn"));
+            return Err(Error::new("busy", "Codex already has an active turn")
+                .with_where("plugin.codex.command.send")
+                .with_origin(
+                    eliot_core::FailureOrigin::Swarm,
+                    "send gate refused: native turn already active",
+                ));
         }
         let combined = with_claimed_context(text, &params.context, "Codex")?;
         let command_id = params.command_id.clone();
@@ -3623,7 +3633,7 @@ mod tests {
                 .with_stderr(StderrSource::Harness, harness_tail.clone());
             let recoded = pre_dispatch_read_error(unknown, code, message);
             assert_eq!(recoded.code, code);
-            assert_eq!(recoded.message, message);
+            assert_eq!(recoded.message.as_str(), message);
             assert_eq!(recoded.diagnostics.len(), 2);
             // The write guard would preserve unknown verbatim; reads must not.
             let preserved = contextual_error(
@@ -3728,7 +3738,10 @@ mod tests {
             "Codex thread/start may have changed native state; it will not be repeated",
         );
         assert_eq!(preserved.code, "unknown");
-        assert_eq!(preserved.message, "dummy uncertain thread/start outcome");
+        assert_eq!(
+            preserved.message.as_str(),
+            "dummy uncertain thread/start outcome"
+        );
         assert_eq!(preserved.diagnostics.len(), 2);
         assert_eq!(
             serde_json::to_value(&preserved).expect("serialize preserved"),

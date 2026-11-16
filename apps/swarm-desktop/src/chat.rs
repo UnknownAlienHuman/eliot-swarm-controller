@@ -975,6 +975,7 @@ mod tests {
             native_status: None,
             config_revision: 0,
             config: None,
+            preceded_by: None,
         }
     }
 
