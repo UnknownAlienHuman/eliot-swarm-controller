@@ -329,8 +329,11 @@ definite set is `secret_in_payload`, `invalid`, `not_allowed` and
 deadlines, ack encoding) stays `unknown` with the latch kept; transport
 timeouts, closed peers and malformed/mismatched acks are likewise `unknown`.
 A definite rejection records a source gap with its typed reason (or fails the
-start as definite `failed`); it never becomes `turn.unknown` or a launch
-`Unknown`.
+`session.ready` start as definite `failed` before any input); it never becomes
+`turn.unknown` or a launch `Unknown`. A definite rejection of event persistence
+after input dispatch does not by itself establish a definite native outcome:
+the dispatched command stays `unknown` with its exact binding, fencing fresh
+input until reconciliation.
 
 A replayable source resumes strictly after its opaque committed cursor. A source with
 no exclusive cursor reconnects at the live edge, records a gap and reads current native
