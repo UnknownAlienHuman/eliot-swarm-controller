@@ -50,7 +50,11 @@ mod monitor;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod nav;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod picker;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod profiles;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod quota;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod scripts;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -61,6 +65,8 @@ mod settings_model;
 mod state;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod theme;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod worktrees;
 
 #[cfg(windows)]
 #[derive(clap::Parser)]

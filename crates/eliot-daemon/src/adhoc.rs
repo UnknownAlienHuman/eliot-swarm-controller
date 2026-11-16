@@ -68,7 +68,7 @@ fn validate_adhoc_model(model: &str) -> core::Result<String> {
 /// Closed Claude Code `--effort` vocabulary, mirroring the profile freeze
 /// (`claude_snapshot_from_entry` in config.rs): `claude --help` documents
 /// `--effort <level>` and the frozen profile accepts exactly these levels.
-const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+pub const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
     if !matches!(harness, "codex" | "muse" | "claude") {

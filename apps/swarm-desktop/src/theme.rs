@@ -360,14 +360,33 @@ pub mod winui {
             self.role(|s| s.on_error_container, ThemeBrush::PrimaryText)
         }
 
+        /// The one warning text: the Full access level (owner review
+        /// 2026-11-16: no orange or red except this warning and
+        /// destructive actions).
+        pub fn warning(self) -> Brush {
+            self.role(|s| s.warning, ThemeBrush::SystemCritical)
+        }
+
+        /// The keyboard highlight of a popover row (secondary-container,
+        /// the selection's role).
+        pub fn highlight(self) -> Brush {
+            self.role(|s| s.secondary_container, ThemeBrush::CardBackground)
+        }
+
+        /// A popover above the composer: surface-container, a hairline
+        /// outline (the M3 menu container).
+        pub fn popover(self) -> Brush {
+            self.role(|s| s.surface_container, ThemeBrush::SolidBackground)
+        }
+
         /// The status dot of a tone; `None` for tones that need no mark in
         /// a list (ready, ended), so a calm fleet shows no dots at all.
+        /// Failed and unknown use the attention role: orange and red are
+        /// kept for the access warning and destructive actions.
         pub fn dot(self, tone: StatusTone) -> Option<Brush> {
             let pick: fn(&Scheme) -> Rgb8 = match tone {
                 StatusTone::Active => |s| s.primary,
-                StatusTone::Attention => |s| s.tertiary,
-                StatusTone::Failed => |s| s.error,
-                StatusTone::Unknown => |s| s.warning,
+                StatusTone::Attention | StatusTone::Failed | StatusTone::Unknown => |s| s.tertiary,
                 StatusTone::Pending => |s| s.outline,
                 StatusTone::Ready | StatusTone::Neutral => return None,
             };
@@ -475,6 +494,23 @@ pub mod winui {
                 }
                 .overrides(s)
             })
+        }
+
+        /// The access chip at Full access: the chip's outline, warning
+        /// content.
+        pub fn warning_chip(self) -> ResourceOverrides {
+            self.with(|s| {
+                Family {
+                    outline: Some(s.outline_variant),
+                    ..Family::new(None, s.warning)
+                }
+                .overrides(s)
+            })
+        }
+
+        /// The Full access row of the access menu: warning content.
+        pub fn warning_row(self) -> ResourceOverrides {
+            self.with(|s| Family::new(None, s.warning).overrides(s))
         }
 
         /// One segment of a segmented button: secondary-container when
