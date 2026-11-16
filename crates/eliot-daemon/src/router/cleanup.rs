@@ -1998,8 +1998,29 @@ mod tests {
         }
     }
 
+    /// Git marks pack and object files read-only on Windows, which makes a
+    /// plain `remove_dir_all` fail; clear the attribute first so fixtures
+    /// never leak into the temp directory.
     fn finish(root: &Path) {
-        let _ = std::fs::remove_dir_all(root);
+        fn writable(path: &Path) {
+            let Ok(meta) = std::fs::symlink_metadata(path) else {
+                return;
+            };
+            if meta.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        writable(&entry.path());
+                    }
+                }
+            } else {
+                let mut permissions = meta.permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                let _ = std::fs::set_permissions(path, permissions);
+            }
+        }
+        writable(root);
+        std::fs::remove_dir_all(root).expect("remove cleanup fixture");
     }
 
     #[test]
