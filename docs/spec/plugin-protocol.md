@@ -327,6 +327,12 @@ notifications.
 
 A source row's `open|closed` lifecycle, health and latest historical gap are independent.
 A gap neither closes the source nor changes its owner or health automatically.
+An adapter may report a family-scoped observation-coverage gap (for example,
+bounded tool telemetry) without declaring the separately associated native
+turn outcome or later input unavailable. This requires a canonical gap ACK;
+an unresolved gap/batch ACK still fences admission. Session/turn identity loss,
+unproven delivery and transport loss cannot use this coverage-only path, and
+it never clears existing uncertainty or replays a missing fact.
 `source.health` changes only health and `updated_at` on an already-open current-generation
 native source; an unchanged value is a no-op with no event. It does not clear a gap,
 move a cursor, change ownership or reopen a closed row. A controlled caller binds
