@@ -61,6 +61,8 @@ impl DesktopApp {
                                 title: row.title.clone(),
                                 native_child: row.activity.is_some(),
                                 tokens: row.tokens,
+                                chat: false,
+                                archived: false,
                             })
                     });
                 if let Some(agent) = agent {
@@ -284,21 +286,28 @@ impl DesktopApp {
             .filter(|_| self.selected_agent_id().as_deref() == Some(id.as_str()));
         match (detail, read) {
             (Some(detail), _) => {
-                agent_lines.push(format!(
-                    "Agent {id} · generation {} · {} · {}",
-                    detail.generation, detail.harness, detail.state
-                ));
-                agent_lines.push(format!("Profile {}", detail.settings.profile));
+                let harness = crate::picker::harness_label(&detail.harness);
+                agent_lines.push(format!("{harness} · {}", state_label(&detail.state)));
                 agent_lines.extend(detail.settings.lines());
+                agent_lines.push(format!(
+                    "Access: {}",
+                    launch_ui::agent_access_label(&detail.settings)
+                ));
+                if !detail.settings.profile.starts_with("adhoc-") {
+                    agent_lines.push(format!("Preset {}", detail.settings.profile));
+                }
                 if detail.observe_only {
-                    agent_lines.push("Observe-only: native control verbs are refused.".to_owned());
+                    agent_lines.push(format!(
+                        "Watched only: {harness} runs it; Swarm cannot steer or stop it."
+                    ));
                 }
-                if let Some(turn) = &detail.active_turn {
-                    agent_lines.push(format!("Active turn {turn}"));
+                if detail.active_turn.is_some() {
+                    agent_lines.push("Working on a turn".to_owned());
                 }
+                agent_lines.push(format!("ID {id} · generation {}", detail.generation));
             }
             (None, Some(read)) => agent_lines.extend(monitor_view::identity_lines(read)),
-            (None, None) => agent_lines.push(format!("Agent {id} · reading…")),
+            (None, None) => agent_lines.push("Reading…".to_owned()),
         }
         if !self.configure.status.is_empty() && detail.is_some() {
             agent_lines.push(format!("Last configure: {}", self.configure.status));
@@ -311,13 +320,13 @@ impl DesktopApp {
         // The failure diagnosis summary: why and where the Agent last
         // failed, from the same monitor read as the identity above. The
         // full causal chain lives behind `swarm why`.
-        if let Some(summary) = read
+        if let Some(line) = read
             .and_then(|read| read.diagnosis.as_ref().ok())
-            .filter(|summary| !summary.trim().is_empty())
+            .and_then(|summary| monitor::diagnosis_line(summary))
         {
             sections.push(KeyedView::new(
                 "diagnosis",
-                section(palette, "Diagnosis", std::slice::from_ref(summary)),
+                section(palette, "What went wrong", &[line]),
             ));
         }
 
@@ -339,9 +348,10 @@ impl DesktopApp {
                         .chain(skipped)
                         .collect()
                 }
-                None => vec![format!(
-                    "Started on {profile}, named by its launch; routing did not choose it."
-                )],
+                None if profile.starts_with("adhoc-") => {
+                    vec!["You chose its harness and model when you started it.".to_owned()]
+                }
+                None => vec![format!("You started it on the preset {profile}.")],
             };
             sections.push(KeyedView::new(
                 "routing",
@@ -350,14 +360,22 @@ impl DesktopApp {
         }
 
         // The conversation's retained coverage and the feed.
+        // Only what is unusual about the conversation: older turns not
+        // loaded, pruned activity, a feed that is not live.
         if let Some(convo) = self.chat.convo.as_ref().filter(|convo| convo.agent() == id) {
-            let mut lines = convo.coverage().lines(convo.inputs_unavailable());
-            lines.push(format!("Feed: {}", self.chat.live.label()));
-            lines.push(format!("Last event: {}", self.status));
-            sections.push(KeyedView::new(
-                "coverage",
-                section(palette, "Conversation", &lines),
-            ));
+            let mut lines = convo.coverage().notes(convo.inputs_unavailable());
+            if !matches!(
+                self.chat.live,
+                LiveStatus::Live | LiveStatus::Idle | LiveStatus::Loading
+            ) {
+                lines.push(format!("Live updates: {}", self.chat.live.label()));
+            }
+            if !lines.is_empty() {
+                sections.push(KeyedView::new(
+                    "coverage",
+                    section(palette, "Conversation", &lines),
+                ));
+            }
         }
 
         let resources = monitor_view::resource_views(&self.monitor.data, &id, palette);
@@ -379,14 +397,13 @@ impl DesktopApp {
         };
         sections.push(KeyedView::new("usage", section(palette, "Usage", &usage)));
 
-        let observe = match read {
-            Some(read) => monitor_view::observe_lines(read),
-            None => vec!["Reading.".to_owned()],
-        };
-        sections.push(KeyedView::new(
-            "observe",
-            section(palette, "Observe", &observe),
-        ));
+        let observe = read.map(monitor_view::observe_lines).unwrap_or_default();
+        if !observe.is_empty() {
+            sections.push(KeyedView::new(
+                "observe",
+                section(palette, "Heavy work", &observe),
+            ));
+        }
 
         // Change manager: one row per possible manager, each button bound
         // to that row's generation and the shown source generation.
@@ -451,6 +468,20 @@ impl DesktopApp {
                             .keyed_children(sections),
                     ),
             ))
+    }
+}
+
+/// An Agent state code in words.
+fn state_label(state: &str) -> &'static str {
+    match state {
+        "created" | "starting" => "Starting",
+        "idle" => "Ready",
+        "busy" | "running" => "Working",
+        "waiting" => "Waiting for you",
+        "stopped" => "Stopped",
+        "failed" => "Failed",
+        "lost" => "Lost",
+        _ => "State not confirmed",
     }
 }
 

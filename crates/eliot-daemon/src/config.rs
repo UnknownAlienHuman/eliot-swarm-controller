@@ -252,6 +252,29 @@ struct DesktopModelRef {
     effort: Option<String>,
 }
 
+/// One "Manage models" choice: a model (`model`) or a whole provider group
+/// of one harness (`provider`) shown or hidden in the desktop's picker.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DesktopModelVisibility {
+    #[serde(default)]
+    harness: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    visible: bool,
+}
+
+/// One desktop display name: a sidebar project (`project:<key>`) or an
+/// Agent (`agent:<id>`) and the name the owner gave it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DesktopDisplayName {
+    key: String,
+    name: String,
+}
+
 /// Bounded desktop preferences for the new-task picker: favorite models,
 /// recent models (most recent first), collapsed projects and the last used
 /// access level. Stored in the unified `[desktop]` section via the existing
@@ -273,12 +296,37 @@ struct DesktopSettings {
     collapsed_projects: Vec<String>,
     #[serde(default)]
     last_access: Option<String>,
+    #[serde(default)]
+    model_visibility: Vec<DesktopModelVisibility>,
+    #[serde(default)]
+    collapsed_model_groups: Vec<String>,
+    #[serde(default)]
+    display_names: Vec<DesktopDisplayName>,
 }
 
 /// Bounds for the `[desktop]` picker lists.
 const MAX_DESKTOP_FAVORITES: usize = 50;
 const MAX_DESKTOP_RECENTS: usize = 20;
 const MAX_DESKTOP_COLLAPSED: usize = 100;
+const MAX_DESKTOP_VISIBILITY: usize = 500;
+const MAX_DESKTOP_DISPLAY_NAMES: usize = 200;
+/// Longest desktop display name, in characters.
+const MAX_DESKTOP_DISPLAY_NAME_CHARS: usize = 120;
+
+/// A verbatim desktop key: 1-256 bytes, no controls, no surrounding
+/// whitespace.
+fn desktop_key_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.chars().any(char::is_control)
+        && value == value.trim()
+}
+
+const DESKTOP_HARNESSES: [&str; 5] = ["codex", "claude", "muse", "opencode", "antigravity"];
+
+fn desktop_error(message: &str) -> core::Error {
+    core::Error::new("profile_error", format!("config.toml: {message}"))
+}
 
 impl DesktopSettings {
     fn validate(&self) -> core::Result<()> {
@@ -363,6 +411,62 @@ impl DesktopSettings {
                 "profile_error",
                 "config.toml: desktop last_access must be ask, auto or full",
             ));
+        }
+        self.validate_picker_choices()
+    }
+
+    /// `model_visibility`, `collapsed_model_groups` and `display_names`.
+    fn validate_picker_choices(&self) -> core::Result<()> {
+        if self.model_visibility.len() > MAX_DESKTOP_VISIBILITY {
+            return Err(desktop_error(
+                "desktop model_visibility exceeds 500 entries",
+            ));
+        }
+        for entry in &self.model_visibility {
+            if !DESKTOP_HARNESSES.contains(&entry.harness.as_str()) {
+                return Err(desktop_error(
+                    "desktop model_visibility harness must be codex, claude, muse, opencode or antigravity",
+                ));
+            }
+            match (entry.model.as_deref(), entry.provider.as_deref()) {
+                (Some(value), None) | (None, Some(value)) if desktop_key_valid(value) => {}
+                _ => {
+                    return Err(desktop_error(
+                        "desktop model_visibility entries name exactly one model or provider of 1-256 bytes with no controls or surrounding whitespace",
+                    ));
+                }
+            }
+        }
+        if self.collapsed_model_groups.len() > MAX_DESKTOP_COLLAPSED {
+            return Err(desktop_error(
+                "desktop collapsed_model_groups exceeds 100 entries",
+            ));
+        }
+        if !self
+            .collapsed_model_groups
+            .iter()
+            .all(|group| desktop_key_valid(group))
+        {
+            return Err(desktop_error(
+                "desktop collapsed_model_groups entries must be 1-256 bytes with no controls or surrounding whitespace",
+            ));
+        }
+        if self.display_names.len() > MAX_DESKTOP_DISPLAY_NAMES {
+            return Err(desktop_error("desktop display_names exceeds 200 entries"));
+        }
+        for entry in &self.display_names {
+            let name = entry.name.as_str();
+            if !desktop_key_valid(&entry.key)
+                || !(entry.key.starts_with("project:") || entry.key.starts_with("agent:"))
+                || name.is_empty()
+                || name.chars().count() > MAX_DESKTOP_DISPLAY_NAME_CHARS
+                || name.chars().any(char::is_control)
+                || name != name.trim()
+            {
+                return Err(desktop_error(
+                    "desktop display_names need a project: or agent: key and a 1-120 character name with no controls or surrounding whitespace",
+                ));
+            }
         }
         Ok(())
     }
@@ -5594,5 +5698,63 @@ output_limit = 4096
             ..Default::default()
         };
         assert_eq!(bad_access.validate().unwrap_err().code, "profile_error");
+    }
+
+    #[test]
+    fn desktop_manage_models_collapsed_groups_and_names_validate() {
+        desktop_settings(
+            "[desktop]\nmodel_visibility = [{harness = 'opencode', provider = 'openrouter', visible = false}, {harness = 'opencode', model = 'openrouter/openai/gpt-6-luna', visible = true}]\ncollapsed_model_groups = ['opencode', 'opencode/openrouter']\ndisplay_names = [{key = 'agent:a3', name = 'Fix login'}, {key = 'project:repo:c:/x/.git', name = 'Atlas'}]\n",
+        )
+        .validate()
+        .unwrap();
+        let entry = |model: Option<&str>, provider: Option<&str>| DesktopModelVisibility {
+            harness: "opencode".to_owned(),
+            model: model.map(str::to_owned),
+            provider: provider.map(str::to_owned),
+            visible: false,
+        };
+        for bad in [
+            entry(None, None),
+            entry(Some("m"), Some("p")),
+            entry(Some(" m"), None),
+            DesktopModelVisibility {
+                harness: "fake".to_owned(),
+                ..entry(Some("m"), None)
+            },
+        ] {
+            let settings = DesktopSettings {
+                model_visibility: vec![bad],
+                ..Default::default()
+            };
+            assert_eq!(settings.validate().unwrap_err().code, "profile_error");
+        }
+        let too_many = DesktopSettings {
+            model_visibility: vec![entry(Some("m"), None); MAX_DESKTOP_VISIBILITY + 1],
+            ..Default::default()
+        };
+        assert!(too_many.validate().is_err());
+        for (key, name) in [
+            ("a3", "x"),
+            ("agent:a3", ""),
+            ("agent:a3", " padded"),
+            ("agent:a3", "line\nbreak"),
+        ] {
+            let settings = DesktopSettings {
+                display_names: vec![DesktopDisplayName {
+                    key: key.to_owned(),
+                    name: name.to_owned(),
+                }],
+                ..Default::default()
+            };
+            assert!(settings.validate().is_err(), "{key} {name}");
+        }
+        assert!(
+            DesktopSettings {
+                collapsed_model_groups: vec!["codex\n".to_owned()],
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

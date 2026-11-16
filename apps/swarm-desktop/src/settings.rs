@@ -100,10 +100,33 @@ pub struct ModelRef {
     pub effort: Option<String>,
 }
 
+/// One Manage models choice (`[desktop] model_visibility`): a model, or a
+/// whole provider group of one harness, shown or hidden in the picker.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Visibility {
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    pub visible: bool,
+}
+
+/// One owner-given display name (`[desktop] display_names`): `project:<key>`
+/// or `agent:<id>`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DisplayName {
+    pub key: String,
+    pub name: String,
+}
+
 /// `[desktop]` list bounds (the daemon's validation).
 pub const MAX_FAVORITES: usize = 50;
 pub const MAX_RECENTS: usize = 20;
 pub const MAX_COLLAPSED: usize = 100;
+pub const MAX_VISIBILITY: usize = 500;
+pub const MAX_DISPLAY_NAMES: usize = 200;
+pub const MAX_DISPLAY_NAME_CHARS: usize = 120;
 /// The longest collapsed-project key `[desktop]` accepts.
 pub const MAX_COLLAPSED_KEY: usize = 256;
 
@@ -120,6 +143,12 @@ pub struct Preferences {
     pub collapsed: Vec<String>,
     /// The access level new tasks start with (the last one chosen).
     pub last_access: Option<Access>,
+    /// Manage models: models and provider groups shown or hidden.
+    pub visibility: Vec<Visibility>,
+    /// Collapsed picker groups (`<harness>` or `<harness>/<provider>`).
+    pub collapsed_groups: Vec<String>,
+    /// Owner-given names of sidebar projects and Agents.
+    pub names: Vec<DisplayName>,
 }
 
 impl Preferences {
@@ -140,7 +169,135 @@ impl Preferences {
                 .and_then(|value| serde_json::from_value(value).ok())
                 .unwrap_or_default(),
             last_access: field("last_access").and_then(|value| serde_json::from_value(value).ok()),
+            visibility: field("model_visibility")
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
+            collapsed_groups: field("collapsed_model_groups")
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
+            names: field("display_names")
+                .and_then(|value| serde_json::from_value(value).ok())
+                .unwrap_or_default(),
         }
+    }
+
+    /// Whether the picker shows `model` of `harness` under `provider`: its
+    /// own choice, else its provider group's, else shown.
+    pub fn model_visible(&self, harness: &str, provider: &str, model: &str) -> bool {
+        let own = self
+            .visibility
+            .iter()
+            .find(|entry| entry.harness == harness && entry.model.as_deref() == Some(model));
+        own.or_else(|| self.group_entry(harness, provider))
+            .is_none_or(|entry| entry.visible)
+    }
+
+    /// Whether a provider group is shown (its own entry, else shown).
+    pub fn group_visible(&self, harness: &str, provider: &str) -> bool {
+        self.group_entry(harness, provider)
+            .is_none_or(|entry| entry.visible)
+    }
+
+    fn group_entry(&self, harness: &str, provider: &str) -> Option<&Visibility> {
+        self.visibility
+            .iter()
+            .find(|entry| entry.harness == harness && entry.provider.as_deref() == Some(provider))
+    }
+
+    /// Show or hide one model; a choice equal to its group's drops out.
+    pub fn set_model_visible(&mut self, harness: &str, provider: &str, model: &str, visible: bool) {
+        self.visibility
+            .retain(|entry| !(entry.harness == harness && entry.model.as_deref() == Some(model)));
+        if self.group_visible(harness, provider) != visible
+            && self.visibility.len() < MAX_VISIBILITY
+        {
+            self.visibility.push(Visibility {
+                harness: harness.to_owned(),
+                model: Some(model.to_owned()),
+                provider: None,
+                visible,
+            });
+        }
+    }
+
+    /// Show or hide a provider group: one entry, and its models' own
+    /// choices drop out (`models` lists the group's model ids).
+    pub fn set_group_visible(
+        &mut self,
+        harness: &str,
+        provider: &str,
+        models: &[&str],
+        visible: bool,
+    ) {
+        self.visibility.retain(|entry| {
+            entry.harness != harness
+                || (entry.provider.as_deref() != Some(provider)
+                    && !entry
+                        .model
+                        .as_deref()
+                        .is_some_and(|model| models.contains(&model)))
+        });
+        if !visible && self.visibility.len() < MAX_VISIBILITY {
+            self.visibility.push(Visibility {
+                harness: harness.to_owned(),
+                model: None,
+                provider: Some(provider.to_owned()),
+                visible,
+            });
+        }
+    }
+
+    /// Whether a picker group is collapsed.
+    pub fn group_collapsed(&self, key: &str) -> bool {
+        self.collapsed_groups.iter().any(|known| known == key)
+    }
+
+    /// Collapse or expand one picker group.
+    pub fn toggle_group(&mut self, key: &str) {
+        if self.group_collapsed(key) {
+            self.collapsed_groups.retain(|known| known != key);
+        } else if self.collapsed_groups.len() < MAX_COLLAPSED && key.len() <= MAX_COLLAPSED_KEY {
+            self.collapsed_groups.push(key.to_owned());
+        }
+    }
+
+    /// The owner's name for `key` (`project:<key>` or `agent:<id>`).
+    pub fn display_name(&self, key: &str) -> Option<&str> {
+        self.names
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.name.as_str())
+    }
+
+    /// Set (or, with a blank name, clear) the display name of `key`: its
+    /// words joined by single spaces, cut to the bound. False when the list
+    /// is full or the key cannot be stored.
+    pub fn rename(&mut self, key: &str, name: &str) -> bool {
+        let name: String = name
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(MAX_DISPLAY_NAME_CHARS)
+            .collect();
+        let name = name.trim().to_owned();
+        self.names.retain(|entry| entry.key != key);
+        if name.is_empty() {
+            return true;
+        }
+        if self.names.len() >= MAX_DISPLAY_NAMES
+            || key.is_empty()
+            || key.len() > MAX_COLLAPSED_KEY
+            || key.chars().any(char::is_control)
+            || key != key.trim()
+        {
+            return false;
+        }
+        self.names.push(DisplayName {
+            key: key.to_owned(),
+            name,
+        });
+        true
     }
 
     /// Put `model` first in Recents (once), within the bound.

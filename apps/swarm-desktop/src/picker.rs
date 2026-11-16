@@ -5,6 +5,12 @@
 //! effort inline on each row, a check on the current one, badges). The rows
 //! come from `models.catalog` (k76a), the `[desktop]` favorites and recents
 //! and the saved presets (configured profiles). No I/O.
+//!
+//! Every harness group, and each OpenCode provider inside it, collapses
+//! (`[desktop] collapsed_model_groups`), and OpenCode's "Manage models"
+//! dialog is followed for visibility (pattern only): the picker lists the
+//! models `[desktop] model_visibility` shows, while a search still finds a
+//! hidden model and marks it hidden.
 
 use std::collections::HashMap;
 
@@ -12,7 +18,7 @@ use eliot_core::api::{
     HarnessEntry, ModelsCatalogEntry, ModelsCatalogResponse, ProfileSummary, catalog_matches,
 };
 
-use crate::settings::ModelRef;
+use crate::settings::{ModelRef, Preferences};
 
 /// The harness groups, in the order the picker shows them.
 pub const HARNESSES: [&str; 5] = ["codex", "claude", "opencode", "muse", "antigravity"];
@@ -145,6 +151,8 @@ pub struct Item {
     pub favorite: bool,
     /// Why the row cannot be chosen (it is greyed), if so.
     pub disabled: Option<String>,
+    /// Hidden by Manage models (shown only because a search found it).
+    pub hidden: bool,
 }
 
 impl Item {
@@ -204,16 +212,20 @@ impl Item {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Row {
     /// A section title ("Favorites", "Codex") and its note (a version,
-    /// "not installed").
+    /// "not installed"); a harness group collapses (`group`).
     Heading {
         key: String,
         title: String,
         note: String,
+        group: Option<String>,
+        collapsed: bool,
     },
-    /// A provider inside a harness (OpenCode's providers).
+    /// A provider inside a harness (OpenCode's providers), collapsible.
     Provider {
         key: String,
         title: String,
+        group: String,
+        collapsed: bool,
     },
     /// A line that is not a choice: an empty state or a reason.
     Note {
@@ -246,8 +258,11 @@ pub struct Inputs<'a> {
     /// The catalogue read: not yet, failed, or the reply.
     pub catalog: Option<&'a Result<ModelsCatalogResponse, String>>,
     pub query: &'a str,
-    pub favorites: &'a [ModelRef],
-    pub recents: &'a [ModelRef],
+    /// Favorites, recents, Manage models choices and collapsed groups.
+    pub prefs: &'a Preferences,
+    /// Only this harness's models (a preset's Model field): no Auto,
+    /// favorites, recents or presets.
+    pub only_harness: Option<&'a str>,
     /// Presets the selected project allows.
     pub presets: &'a [&'a ProfileSummary],
     pub current: &'a Choice,
@@ -265,8 +280,9 @@ pub fn rows(inputs: &Inputs) -> Vec<Row> {
     let query = inputs.query.trim();
     let mut rows = Vec::new();
     let reply = inputs.catalog.and_then(|read| read.as_ref().ok());
+    let composer = inputs.only_harness.is_none();
 
-    if query.is_empty() || text_matches(&["auto", "swarm"], query) {
+    if composer && (query.is_empty() || text_matches(&["auto", "swarm"], query)) {
         rows.push(Row::Choice(Item {
             key: "auto".to_owned(),
             kind: ItemKind::Auto,
@@ -278,13 +294,19 @@ pub fn rows(inputs: &Inputs) -> Vec<Row> {
             default: false,
             favorite: false,
             disabled: None,
+            hidden: false,
         }));
     }
 
-    for (title, prefix, list) in [
-        ("Favorites", "fav", inputs.favorites),
-        ("Recent", "recent", inputs.recents),
-    ] {
+    let remembered: [(&str, &str, &[ModelRef]); 2] = if composer {
+        [
+            ("Favorites", "fav", &inputs.prefs.favorites),
+            ("Recent", "recent", &inputs.prefs.recents),
+        ]
+    } else {
+        [("Favorites", "fav", &[]), ("Recent", "recent", &[])]
+    };
+    for (title, prefix, list) in remembered {
         let items: Vec<Item> = list
             .iter()
             .map(|known| {
@@ -308,7 +330,10 @@ pub fn rows(inputs: &Inputs) -> Vec<Row> {
         (None, _) => rows.push(note("loading", "Reading the models…")),
         (Some(Err(error)), _) => rows.push(note("error", &format!("Models not read: {error}"))),
         (_, Some(reply)) => {
-            for code in HARNESSES {
+            for code in HARNESSES
+                .into_iter()
+                .filter(|code| inputs.only_harness.is_none_or(|only| only == *code))
+            {
                 harness_rows(inputs, reply, code, query, &mut rows);
             }
         }
@@ -318,6 +343,7 @@ pub fn rows(inputs: &Inputs) -> Vec<Row> {
     let presets: Vec<Item> = inputs
         .presets
         .iter()
+        .filter(|_| composer)
         .filter(|preset| {
             query.is_empty()
                 || text_matches(
@@ -351,6 +377,7 @@ pub fn rows(inputs: &Inputs) -> Vec<Row> {
                     .clone()
                     .unwrap_or_else(|| "cannot start now".to_owned())
             }),
+            hidden: false,
         })
         .collect();
     if !presets.is_empty() {
@@ -390,39 +417,87 @@ fn harness_rows(
         claude_rows(inputs, reply, entry, query, rows);
         return;
     }
-    let models: Vec<&ModelsCatalogEntry> = reply
+    let searching = !query.is_empty();
+    let all: Vec<&ModelsCatalogEntry> = reply
         .models
         .iter()
         .filter(|model| model.harness == code)
-        .filter(|model| query.is_empty() || catalog_matches(model, query) || named)
+        .collect();
+    let models: Vec<&ModelsCatalogEntry> = all
+        .iter()
+        .copied()
+        .filter(|model| !searching || catalog_matches(model, query) || named)
+        .filter(|model| searching || visible(inputs, model))
         .collect();
     if models.is_empty() {
         if named {
-            rows.push(heading(code, label, &version));
+            rows.push(group_heading(inputs, code, label, &version, searching));
             rows.push(note(
                 &format!("{code}:none"),
-                "No models reported by this harness right now.",
+                if all.is_empty() {
+                    "No models reported by this harness right now."
+                } else {
+                    "Every model is hidden. Manage models shows them again."
+                },
             ));
         }
         return;
     }
-    rows.push(heading(code, label, &version));
-    let mut provider: Option<&str> = None;
+    let heading = group_heading(inputs, code, label, &version, searching);
+    let collapsed = matches!(
+        heading,
+        Row::Heading {
+            collapsed: true,
+            ..
+        }
+    );
+    rows.push(heading);
+    if collapsed {
+        return;
+    }
+    let mut provider: Option<(&str, bool)> = None;
     let mut ordered = models;
     if code == "opencode" {
         // Stable within a provider: the daemon sorts by id.
         ordered.sort_by(|left, right| left.provider.cmp(&right.provider));
     }
     for model in ordered {
-        if code == "opencode" && provider != Some(model.provider.as_str()) {
-            provider = Some(model.provider.as_str());
+        if code == "opencode" && provider.map(|(name, _)| name) != Some(model.provider.as_str()) {
+            let group = format!("{code}/{}", model.provider);
+            let collapsed = !searching && inputs.prefs.group_collapsed(&group);
+            provider = Some((model.provider.as_str(), collapsed));
             rows.push(Row::Provider {
                 key: format!("{code}:provider:{}", model.provider),
                 title: provider_label(&model.provider),
+                group,
+                collapsed,
             });
         }
+        if provider.is_some_and(|(_, collapsed)| collapsed) {
+            continue;
+        }
         let key = format!("{code}:{}", model.id);
-        rows.push(Row::Choice(catalog_item(inputs, key, model, None)));
+        let mut item = catalog_item(inputs, key, model, None);
+        item.hidden = !visible(inputs, model);
+        rows.push(Row::Choice(item));
+    }
+}
+
+/// Whether Manage models shows `model`.
+fn visible(inputs: &Inputs, model: &ModelsCatalogEntry) -> bool {
+    inputs
+        .prefs
+        .model_visible(&model.harness, &model.provider, &model.id)
+}
+
+/// A harness heading that collapses; a search shows every group open.
+fn group_heading(inputs: &Inputs, code: &str, label: &str, note: &str, searching: bool) -> Row {
+    Row::Heading {
+        key: format!("heading:{code}"),
+        title: label.to_owned(),
+        note: note.to_owned(),
+        group: Some(code.to_owned()),
+        collapsed: !searching && inputs.prefs.group_collapsed(code),
     }
 }
 
@@ -445,20 +520,35 @@ fn claude_rows(
         .map(|effort| (*effort).to_owned())
         .collect();
     let named = query.is_empty() || text_matches(&[code, label, "anthropic", "default"], query);
+    let searching = !query.is_empty();
     let models: Vec<&ModelsCatalogEntry> = reply
         .models
         .iter()
         .filter(|model| model.harness == code)
-        .filter(|model| query.is_empty() || catalog_matches(model, query))
+        .filter(|model| !searching || catalog_matches(model, query))
+        .filter(|model| searching || visible(inputs, model))
         .collect();
     let typed = typed_model_id(query);
     if !named && models.is_empty() && typed.is_none() {
         return;
     }
-    rows.push(heading(code, label, &version_note(entry)));
+    let heading = group_heading(inputs, code, label, &version_note(entry), searching);
+    let collapsed = matches!(
+        heading,
+        Row::Heading {
+            collapsed: true,
+            ..
+        }
+    );
+    rows.push(heading);
+    if collapsed {
+        return;
+    }
     for model in models {
         let key = format!("{code}:{}", model.id);
-        rows.push(Row::Choice(catalog_item(inputs, key, model, None)));
+        let mut item = catalog_item(inputs, key, model, None);
+        item.hidden = !visible(inputs, model);
+        rows.push(Row::Choice(item));
     }
     let item = |key: String, model: Option<String>, title: String, detail: String| {
         let effort = row_effort(inputs, &key, code, model.as_deref(), None, None);
@@ -466,7 +556,7 @@ fn claude_rows(
             current: is_current(inputs.current, code, model.as_deref()),
             favorite: model
                 .as_deref()
-                .is_some_and(|model| is_favorite(inputs.favorites, code, model)),
+                .is_some_and(|model| is_favorite(&inputs.prefs.favorites, code, model)),
             key,
             kind: ItemKind::Model {
                 harness: code.to_owned(),
@@ -478,6 +568,7 @@ fn claude_rows(
             efforts: efforts.clone(),
             default: false,
             disabled: None,
+            hidden: false,
         }
     };
     if named {
@@ -556,7 +647,7 @@ fn remembered_item(
                     None,
                 ),
                 current: is_current(inputs.current, &known.harness, Some(&known.model)),
-                favorite: is_favorite(inputs.favorites, &known.harness, &known.model),
+                favorite: is_favorite(&inputs.prefs.favorites, &known.harness, &known.model),
                 key,
                 kind: ItemKind::Model {
                     harness: known.harness.clone(),
@@ -567,6 +658,7 @@ fn remembered_item(
                 efforts,
                 default: false,
                 disabled: None,
+                hidden: false,
             }
         }
     };
@@ -606,7 +698,7 @@ fn catalog_item(
             model.default_effort.as_deref(),
         ),
         current: is_current(inputs.current, &model.harness, Some(&model.id)),
-        favorite: is_favorite(inputs.favorites, &model.harness, &model.id),
+        favorite: is_favorite(&inputs.prefs.favorites, &model.harness, &model.id),
         kind: ItemKind::Model {
             harness: model.harness.clone(),
             model: Some(model.id.clone()),
@@ -621,6 +713,7 @@ fn catalog_item(
         default: model.default,
         disabled: (model.availability == HELD)
             .then(|| "on hold: provider limit or outage".to_owned()),
+        hidden: false,
         key,
     }
 }
@@ -696,7 +789,106 @@ fn heading(key: &str, title: &str, note: &str) -> Row {
         key: format!("heading:{key}"),
         title: title.to_owned(),
         note: note.to_owned(),
+        group: None,
+        collapsed: false,
     }
+}
+
+/// One Manage models group: a provider of one harness, its group toggle
+/// and one toggle per model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManageGroup {
+    pub harness: String,
+    pub provider: String,
+    /// `<harness>/<provider>`: the collapse key.
+    pub key: String,
+    pub title: String,
+    /// The group's own toggle (its provider entry).
+    pub visible: bool,
+    pub collapsed: bool,
+    /// Models the search keeps, in catalogue order.
+    pub models: Vec<ManageModel>,
+    /// Every model id of the group (the group toggle clears their choices).
+    pub all: Vec<String>,
+    /// How many of the group's models the picker shows.
+    pub shown: usize,
+}
+
+/// One model of a Manage models group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManageModel {
+    pub id: String,
+    pub title: String,
+    pub visible: bool,
+}
+
+/// The Manage models groups of the catalogue: one per harness and
+/// provider (installed harnesses only), filtered by `query`. A search
+/// opens every group it matches.
+pub fn manage_groups(
+    reply: &ModelsCatalogResponse,
+    prefs: &Preferences,
+    query: &str,
+) -> Vec<ManageGroup> {
+    let query = query.trim();
+    let mut groups: Vec<ManageGroup> = Vec::new();
+    for code in HARNESSES {
+        if !reply
+            .harnesses
+            .iter()
+            .any(|entry| entry.harness == code && entry.installed)
+        {
+            continue;
+        }
+        let mut models: Vec<&ModelsCatalogEntry> = reply
+            .models
+            .iter()
+            .filter(|model| model.harness == code)
+            .collect();
+        models.sort_by(|left, right| left.provider.cmp(&right.provider));
+        for model in models {
+            let group_key = format!("{code}/{}", model.provider);
+            let index = match groups.iter().position(|group| group.key == group_key) {
+                Some(index) => index,
+                None => {
+                    groups.push(ManageGroup {
+                        harness: code.to_owned(),
+                        provider: model.provider.clone(),
+                        title: format!(
+                            "{} · {}",
+                            harness_label(code),
+                            provider_label(&model.provider)
+                        ),
+                        visible: prefs.group_visible(code, &model.provider),
+                        collapsed: query.is_empty() && prefs.group_collapsed(&group_key),
+                        key: group_key,
+                        models: Vec::new(),
+                        all: Vec::new(),
+                        shown: 0,
+                    });
+                    groups.len() - 1
+                }
+            };
+            let group = &mut groups[index];
+            let visible = prefs.model_visible(code, &model.provider, &model.id);
+            group.all.push(model.id.clone());
+            group.shown += usize::from(visible);
+            let named = text_matches(&[&group.title, code], query);
+            if query.is_empty() || named || catalog_matches(model, query) {
+                group.models.push(ManageModel {
+                    id: model.id.clone(),
+                    title: if code == "opencode" {
+                        short_model(&model.display_name).to_owned()
+                    } else {
+                        model.display_name.clone()
+                    },
+                    visible,
+                });
+            }
+        }
+    }
+    groups.retain(|group| query.is_empty() || !group.models.is_empty());
+    groups
 }
 
 fn note(key: &str, text: &str) -> Row {
@@ -794,18 +986,33 @@ mod tests {
         })
     }
 
+    fn prefs_with_recent() -> Preferences {
+        Preferences {
+            recents: vec![ModelRef {
+                harness: "codex".to_owned(),
+                model: "gpt-6-luna".to_owned(),
+                effort: Some("high".to_owned()),
+            }],
+            ..Preferences::default()
+        }
+    }
+
     fn build(query: &str, current: &Choice, efforts: &HashMap<String, String>) -> Vec<Row> {
+        build_with(query, current, efforts, &prefs_with_recent())
+    }
+
+    fn build_with(
+        query: &str,
+        current: &Choice,
+        efforts: &HashMap<String, String>,
+        prefs: &Preferences,
+    ) -> Vec<Row> {
         let read = catalog();
-        let recents = vec![ModelRef {
-            harness: "codex".to_owned(),
-            model: "gpt-6-luna".to_owned(),
-            effort: Some("high".to_owned()),
-        }];
         rows(&Inputs {
             catalog: Some(&read),
             query,
-            favorites: &[],
-            recents: &recents,
+            prefs,
+            only_harness: None,
             presets: &[],
             current,
             auto_detail: "Swarm picks codex-luna",
@@ -888,11 +1095,12 @@ mod tests {
             entry.source = Some("documented_alias".to_owned());
             read.as_mut().unwrap().models.push(entry);
         }
+        let prefs = Preferences::default();
         let shown = rows(&Inputs {
             catalog: Some(&read),
             query: "",
-            favorites: &[],
-            recents: &[],
+            prefs: &prefs,
+            only_harness: None,
             presets: &[],
             current: &Choice::Auto,
             auto_detail: "Swarm picks codex-luna",
@@ -906,8 +1114,8 @@ mod tests {
         let filtered = rows(&Inputs {
             catalog: Some(&read),
             query: "haiku",
-            favorites: &[],
-            recents: &[],
+            prefs: &prefs,
+            only_harness: None,
             presets: &[],
             current: &Choice::Auto,
             auto_detail: "Swarm picks codex-luna",
@@ -947,6 +1155,84 @@ mod tests {
                 .as_deref(),
             Some("low")
         );
+    }
+
+    #[test]
+    fn collapsed_groups_and_hidden_models_leave_the_list_but_search_finds_them() {
+        let mut prefs = prefs_with_recent();
+        prefs.toggle_group("codex");
+        prefs.toggle_group("opencode/openrouter");
+        prefs.set_model_visible("opencode", "opencode-go", "opencode-go/gpt-5.6-luna", false);
+        let shown = build_with("", &Choice::Auto, &HashMap::new(), &prefs);
+        assert!(matches!(
+            shown.iter().find(|row| row.key() == "heading:codex"),
+            Some(Row::Heading {
+                collapsed: true,
+                ..
+            })
+        ));
+        assert!(find(&shown, Some("codex:gpt-6-luna")).is_none());
+        assert!(matches!(
+            shown
+                .iter()
+                .find(|row| row.key() == "opencode:provider:openrouter"),
+            Some(Row::Provider {
+                collapsed: true,
+                ..
+            })
+        ));
+        assert!(find(&shown, Some("opencode:openrouter/gpt-6-luna")).is_none());
+        assert!(find(&shown, Some("opencode:opencode-go/gpt-5.6-luna")).is_none());
+        // A search opens every group and marks a hidden model.
+        let found = build_with("luna", &Choice::Auto, &HashMap::new(), &prefs);
+        assert!(find(&found, Some("codex:gpt-6-luna")).is_some());
+        let hidden = find(&found, Some("opencode:opencode-go/gpt-5.6-luna")).unwrap();
+        assert!(hidden.hidden);
+    }
+
+    #[test]
+    fn a_group_toggle_hides_its_models_and_one_model_can_return() {
+        let read = catalog();
+        let reply = read.as_ref().unwrap();
+        let mut prefs = Preferences::default();
+        let models = ["opencode-go/gpt-5.6-luna"];
+        prefs.set_group_visible("opencode", "opencode-go", &models, false);
+        let groups = manage_groups(reply, &prefs, "");
+        let go = groups
+            .iter()
+            .find(|g| g.key == "opencode/opencode-go")
+            .unwrap();
+        assert!(!go.visible);
+        assert_eq!(go.shown, 0);
+        prefs.set_model_visible("opencode", "opencode-go", "opencode-go/gpt-5.6-luna", true);
+        assert!(prefs.model_visible("opencode", "opencode-go", "opencode-go/gpt-5.6-luna"));
+        assert_eq!(prefs.visibility.len(), 2);
+        // Muse is not installed: no group.
+        assert!(!groups.iter().any(|g| g.harness == "muse"));
+        let searched = manage_groups(reply, &prefs, "sol");
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].models[0].id, "gpt-6.1-sol");
+    }
+
+    #[test]
+    fn a_preset_picker_lists_only_its_harness() {
+        let read = catalog();
+        let prefs = prefs_with_recent();
+        let shown = rows(&Inputs {
+            catalog: Some(&read),
+            query: "",
+            prefs: &prefs,
+            only_harness: Some("codex"),
+            presets: &[],
+            current: &Choice::Auto,
+            auto_detail: "",
+            efforts: &HashMap::new(),
+            claude_efforts: &["low"],
+        });
+        assert!(shown.iter().all(|row| !row.key().starts_with("opencode")));
+        assert!(find(&shown, Some("auto")).is_none());
+        assert!(find(&shown, Some("recent:codex:gpt-6-luna:high")).is_none());
+        assert!(find(&shown, Some("codex:gpt-6-luna")).is_some());
     }
 
     #[test]

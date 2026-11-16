@@ -63,6 +63,18 @@ impl DraftStore {
         self.drafts.get(agent).map(|(_, rev)| *rev).unwrap_or(0)
     }
 
+    /// Give a submission's text back after it did not go through: only
+    /// while the draft is still empty at that same revision (nothing typed
+    /// since), so a retry keeps the revision and its mutation id.
+    pub fn restore(&mut self, agent: &str, text: String, submitted: u64) -> bool {
+        if self.revision(agent) == submitted && self.get(agent).is_empty() {
+            self.drafts.insert(agent.to_owned(), (text, submitted));
+            true
+        } else {
+            false
+        }
+    }
+
     /// Clear the draft only when `submitted` is still the current revision.
     /// Returns true when the draft was cleared. A late reply carrying an
     /// older revision leaves newer text untouched. The revision itself is
@@ -186,6 +198,21 @@ mod tests {
         let _second = drafts.set("a1", "hello, edited".to_owned());
         assert!(!drafts.ack("a1", first));
         assert_eq!(drafts.get("a1"), "hello, edited");
+    }
+
+    #[test]
+    fn a_restored_draft_keeps_its_revision_unless_newer_text_exists() {
+        let mut drafts = DraftStore::default();
+        let sent = drafts.set("a1", "hello".to_owned());
+        assert!(drafts.ack("a1", sent));
+        assert!(drafts.restore("a1", "hello".to_owned(), sent));
+        assert_eq!(drafts.get("a1"), "hello");
+        assert_eq!(drafts.revision("a1"), sent);
+        assert!(drafts.ack("a1", sent));
+        let newer = drafts.set("a1", "new".to_owned());
+        assert!(!drafts.restore("a1", "hello".to_owned(), sent));
+        assert_eq!(drafts.get("a1"), "new");
+        assert_eq!(drafts.revision("a1"), newer);
     }
 
     #[test]

@@ -10,7 +10,7 @@
 
 use windows_reactor::*;
 
-use crate::profiles::{self, FORM_FIELDS};
+use crate::profiles::{self, FormField};
 use crate::theme::winui::Palette;
 use crate::ui::tokens;
 use eliot_core::api::{ProfileSummary, RuleListEntry, TimerSchedule};
@@ -46,29 +46,22 @@ pub struct ProfilesData<'a> {
     pub summaries: &'a [ProfileSummary],
     /// The TOML source editor is shown.
     pub source_open: bool,
+    /// The selected profile's enumerated fields, with its harness's values.
+    pub fields: Vec<FormField>,
+    /// The selected profile's Model control: the catalogue picker's chip
+    /// (and the picker under it while open).
+    pub model: Option<View>,
 }
 
 /// Callbacks the Models and profiles section emits.
 pub struct ProfilesActions {
     pub draft_changed: Callback<String>,
     pub select: Callback<Option<usize>>,
-    pub field_changed: Vec<Callback<String>>,
     pub duplicate_name_changed: Callback<String>,
     pub duplicate: Callback<()>,
     pub toggle_source: Callback<()>,
-    /// One per [`FORM_FIELDS`] entry: a dropdown index picked.
+    /// One per [`ProfilesData::fields`] entry: a dropdown index picked.
     pub choice_picked: Vec<Callback<Option<usize>>>,
-}
-
-/// Form labels of [`FORM_FIELDS`].
-fn field_label(key: &str) -> &str {
-    match key {
-        "model" => "Model",
-        "effort" => "Effort",
-        "permissions" => "Permissions",
-        "approval_policy" => "Approval policy",
-        other => other,
-    }
 }
 
 /// Models and profiles: one 32-DIP row per profile, the selected profile's
@@ -137,56 +130,50 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 error_note(format!("Cannot launch now: {error}"), palette),
             ));
         }
-        for (index, key) in FORM_FIELDS.iter().enumerate() {
+        if let Some(model) = data.model {
+            form.push(KeyedView::new(
+                "field-model",
+                crate::m3::form_row("Model", model, None),
+            ));
+        }
+        for (index, field) in data.fields.iter().enumerate() {
+            let key = field.key;
             // Only plain strings round-trip through the form; anything else
             // is edited in the source so its value cannot change.
-            let (value, editable, hint) = match profiles::field(data.draft, name, key) {
-                profiles::Field::Absent => (String::new(), true, "Harness default".to_owned()),
-                profiles::Field::Simple(value) => (value, true, String::new()),
-                profiles::Field::Complex => (
-                    String::new(),
-                    false,
-                    "Complex value: edit it as TOML".to_owned(),
-                ),
-            };
-            let choices = editable
-                .then(|| profiles::choices(key, Some(value.as_str()).filter(|v| !v.is_empty())))
-                .flatten();
-            let field: View = match (choices, actions.choice_picked.get(index).cloned()) {
-                // An enumerated field: a dropdown sized for its values.
-                // WinUI drops a ComboBox's selection when its items change,
-                // so the choices key the control.
-                (Some(choices), Some(picked)) => {
-                    let selected = choices
-                        .iter()
-                        .position(|choice| *choice == value)
+            let control: View = match (
+                profiles::field(data.draft, name, key),
+                actions.choice_picked.get(index).cloned(),
+            ) {
+                (profiles::Field::Complex, _) | (_, None) => {
+                    small("Complex value: edit it as TOML").into()
+                }
+                (current, Some(picked)) => {
+                    let value = match current {
+                        profiles::Field::Simple(value) => Some(value),
+                        _ => None,
+                    };
+                    let choices = profiles::choices(&field.values, value.as_deref());
+                    let selected = value
+                        .as_deref()
+                        .and_then(|value| choices.iter().position(|choice| choice == value))
                         .unwrap_or(0);
+                    // A dropdown sized for its values. WinUI drops a
+                    // ComboBox's selection when its items change, so the
+                    // choices key the control.
                     Grid::new().keyed_children(vec![KeyedView::new(
-                        choices.join("\u{1f}"),
+                        format!("{}\u{1f}{selected}", choices.join("\u{1f}")),
                         crate::m3::enum_width(ComboBox::new())
                             .items_source(choices)
                             .selected_index(selected)
                             .is_enabled(!data.busy)
-                            .automation_name(format!("Profile {}", field_label(key)))
+                            .automation_name(format!("Profile {}", field.label))
                             .on_selection_changed(picked),
                     )])
-                }
-                _ => {
-                    let callback = actions.field_changed.get(index).cloned();
-                    let mut field = crate::m3::field()
-                        .text(value)
-                        .placeholder_text(hint)
-                        .automation_name(format!("Profile {}", field_label(key)))
-                        .is_enabled(!data.busy && editable);
-                    if let Some(callback) = callback.filter(|_| editable) {
-                        field = field.on_text_changed(callback);
-                    }
-                    field.into()
                 }
             };
             form.push(KeyedView::new(
                 format!("field-{key}"),
-                crate::m3::form_row(field_label(key), field, None),
+                crate::m3::form_row(field.label, control, None),
             ));
         }
         form.push(KeyedView::new(

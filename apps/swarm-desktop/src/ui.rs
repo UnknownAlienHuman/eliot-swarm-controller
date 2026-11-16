@@ -17,12 +17,10 @@
 //! ratio, so the transcript cannot detect "at the bottom" or auto-follow;
 //! "Jump to latest" moves focus to the end anchor, which WinUI brings into
 //! view. There is no font-family property (code is not monospace), no
-//! clipboard (see [`crate::clipboard`]) and no key events on `TextBox`, so
-//! Enter cannot send. A multiline `TextBox` consumes Ctrl+Enter as a newline
-//! before any `KeyboardAccelerator` sees it, and Reactor's Button/Grid
-//! accelerators (Ctrl+R, Ctrl+Enter) did not fire under real keystrokes in
-//! this window, so none is offered: the keyboard path is Tab to the action
-//! button, then Enter or Space.
+//! clipboard (see [`crate::clipboard`]) and no key events on `TextBox`: Enter
+//! sends through the window's thread keyboard hook, which marks the line
+//! break that Enter without Shift typed into the composer
+//! ([`crate::shortcuts::take_plain_enter`]); Shift+Enter keeps it.
 //!
 //! Checked against windows-rs master `f37e2f9046cf9710fe00285436c4d22ad6053d72`
 //! (2026-11-14, unreleased `windows-reactor` 0.101.0, MIT OR Apache-2.0):
@@ -36,8 +34,8 @@
 //! composition events. It is not pinned: conditional bottom-follow stays
 //! impossible there, and a Git pin makes every lockfile resolution
 //! (including both uncached CI jobs) fetch the 1.48 GB windows-rs
-//! repository. Monospace code and Enter-to-send wait for a published
-//! release that carries those two APIs.
+//! repository. Monospace code waits for a published release that carries
+//! `font_family`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -56,6 +54,7 @@ mod chat_ui;
 mod configure_ui;
 mod handoff_ui;
 mod launch_ui;
+mod menu_ui;
 mod monitor_ui;
 mod picker_ui;
 mod profiles_ui;
@@ -68,6 +67,7 @@ use automation_ui::AutomationMsg;
 use chat_ui::ChatMsg;
 use configure_ui::ConfigureMsg;
 use launch_ui::LaunchMsg;
+use menu_ui::MenuMsg;
 use monitor_ui::MonitorMsg;
 use profiles_ui::ProfilesMsg;
 use scripts_ui::ScriptsMsg;
@@ -86,7 +86,7 @@ use crate::markdown::Doc;
 use crate::monitor::{self, Monitor, MonitorSnapshot};
 use crate::monitor_view;
 use crate::nav::{self, UiAgent};
-use crate::profiles::{self, FORM_FIELDS};
+use crate::profiles;
 use crate::reparent;
 use crate::scripts;
 use crate::state::{BoundAction, DraftStore, MutationLedger, Selection};
@@ -158,6 +158,8 @@ struct SendOutcome {
     text: String,
     state: String,
     recovered: bool,
+    /// The send that followed a steer the ended turn refused.
+    fallback: bool,
 }
 
 /// Admission of one launch-with-text: the new Agent and its linked input.
@@ -188,6 +190,7 @@ enum Message {
     Scripts(ScriptsMsg),
     Handoff(handoff_ui::HandoffMsg),
     Settings(SettingsMsg),
+    Menu(MenuMsg),
 }
 
 /// The input to the single desktop window: the workspace plus the shared
@@ -291,6 +294,8 @@ struct DesktopApp {
     chat: chat_ui::ChatState,
     monitor: monitor_ui::MonitorState,
     automation: automation_ui::AutomationState,
+    /// The sidebar's right-click menu, rename and confirmation.
+    menu: menu_ui::MenuState,
 }
 
 impl DesktopApp {
@@ -345,17 +350,35 @@ fn load_projects_blocking(data_dir: &Path) -> Fallible<Vec<UiProject>> {
     })
 }
 
-/// One validated page of Agent rows on a worker.
-fn load_agents_blocking(data_dir: &Path, request: &AgentListRequest) -> Fallible<AgentPage> {
+/// One validated page of Agent rows on a worker, with each row's chat and
+/// archived flags; `archived` is the list filter (None: the default).
+fn load_agents_blocking(
+    data_dir: &Path,
+    request: &AgentListRequest,
+    archived: Option<&str>,
+) -> Fallible<AgentPage> {
     client::block_on(async {
-        let reply = client::list_agents(data_dir, request)
+        let (reply, flags) = client::list_agents_flagged(data_dir, request, archived)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                if archived.is_some() {
+                    client::archived_filter_error(&error)
+                } else {
+                    error.to_string()
+                }
+            })?;
         Ok(AgentPage {
             rows: reply
                 .agents
                 .iter()
-                .map(|row| UiAgent::from_summary(&row.summary))
+                .map(|row| {
+                    let mut agent = UiAgent::from_summary(&row.summary);
+                    if let Some((chat, archived)) = flags.get(&agent.id) {
+                        agent.chat = *chat;
+                        agent.archived = *archived;
+                    }
+                    agent
+                })
                 .collect(),
             next: reply.next,
             total: reply.total,
@@ -529,6 +552,7 @@ impl Component for DesktopApp {
                 pending_select: None,
                 collapsed: HashSet::new(),
                 unfolded: HashSet::new(),
+                show_archived: false,
                 attention_only: false,
                 search: shell_ui::Search::default(),
                 search_ref: ElementRef::new(),
@@ -557,6 +581,7 @@ impl Component for DesktopApp {
                 end_anchor: ElementRef::new(),
                 composer_ref: ElementRef::new(),
                 pending_local: None,
+                waiting_label: None,
                 opened_from_search: false,
                 drafts: DraftStore::default(),
                 answers: HashMap::new(),
@@ -574,6 +599,7 @@ impl Component for DesktopApp {
                 status: String::new(),
                 epoch: 0,
             },
+            menu: menu_ui::MenuState::default(),
         };
         // Before the first controls exist (see `app_resources::install`).
         if let Err(error) = crate::app_resources::install(app.palette().scheme()) {
@@ -606,6 +632,7 @@ impl Component for DesktopApp {
             Message::Automation(msg) => self.automation_update(msg, context),
             Message::Scripts(msg) => self.scripts_update(msg, context),
             Message::Handoff(msg) => self.handoff_update(msg, context),
+            Message::Menu(msg) => self.menu_update(msg, context),
         }
     }
 

@@ -807,8 +807,11 @@ pub fn dictionary_xaml(scheme: &Scheme) -> String {
 /// - `AccentButtonStyle`: the hand-off dialog's primary, which keeps the
 ///   theme's filled colors there (based on WinUI's own AccentButtonStyle).
 ///
-/// Text fields, dropdowns and number boxes take the control corner and
-/// height, check boxes the M3 default corner, menu items the control
+/// Text fields never offer Windows text
+/// prediction or spell check (`IsTextPredictionEnabled`,
+/// `IsSpellCheckEnabled` false: owner review 2026-11-16, prediction junk in
+/// a model id). Text fields, dropdowns and number boxes take the control
+/// corner and height, check boxes the M3 default corner, menu items the control
 /// height, menus and dialogs the container corner. None of these sets a template: WinUI applies the
 /// control's built-in style underneath, so every control keeps its states
 /// and focus visuals.
@@ -846,6 +849,8 @@ pub fn styles_xaml() -> String {
          <Style TargetType=\"TextBox\">\
            <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
            <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
+           <Setter Property=\"IsTextPredictionEnabled\" Value=\"False\"/>\
+           <Setter Property=\"IsSpellCheckEnabled\" Value=\"False\"/>\
          </Style>\
          <Style TargetType=\"ComboBox\">\
            <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\

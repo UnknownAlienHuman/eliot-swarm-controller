@@ -306,7 +306,7 @@ pub(super) struct SettingsState {
     /// Default access as edited (None: as saved).
     access_draft: Option<Access>,
     /// Quota per harness, as read.
-    quotas: BTreeMap<String, Fallible<HarnessQuotaResponse>>,
+    pub(super) quotas: BTreeMap<String, Fallible<HarnessQuotaResponse>>,
     quotas_loading: usize,
 }
 
@@ -730,7 +730,7 @@ impl DesktopApp {
 
     /// Read the quota of every installed harness (one worker each) and the
     /// catalogue's harness list when it is not read yet.
-    fn load_quotas(&mut self, context: &ComponentContext<Self>) {
+    pub(super) fn load_quotas(&mut self, context: &ComponentContext<Self>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
@@ -1347,20 +1347,24 @@ impl DesktopApp {
                             .note
                             .clone()
                             .unwrap_or_else(|| "the harness reports no quota".to_owned());
+                        let line = if reply.status
+                            == eliot_core::api::harness::HARNESS_QUOTA_UNSUPPORTED
+                        {
+                            format!("Not supported: {why}.")
+                        } else {
+                            format!("Not read now: {why}.")
+                        };
                         vec![KeyedView::new(
                             "unsupported",
-                            m3::setting_row(
-                                "Quota",
-                                &format!("Not supported: {why}."),
-                                View::empty(),
-                            ),
+                            m3::setting_row("Quota", &line, View::empty()),
                         )]
                     } else {
                         windows
                             .iter()
-                            .map(|window| {
+                            .enumerate()
+                            .map(|(index, window)| {
                                 KeyedView::new(
-                                    format!("{}:{}", window.label, window.remaining),
+                                    format!("{index}:{}:{}", window.label, window.remaining),
                                     m3::setting_row(
                                         &format!("{} remaining", window.label),
                                         &window.reset_note(crate::handoff::now_ms()),

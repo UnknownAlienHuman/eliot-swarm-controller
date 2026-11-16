@@ -942,16 +942,27 @@ automation policy do not create a second executor. Desktop preferences use
 recently active Agent's conversation), `favorite_models` (bounded list of
 `{harness, model, effort?}`, at most 50), `recent_models` (bounded most-recent-first
 list of `{harness, model, effort?}`, at most 20), `collapsed_projects` (bounded
-list of the sidebar's project keys, at most 100) and `last_access` (`ask`, `auto` or `full`).
+list of the sidebar's project keys, at most 100), `last_access` (`ask`, `auto` or `full`),
+`model_visibility` (the picker's "Manage models" choices: a bounded list of
+`{harness, model, visible}` or `{harness, provider, visible}`, at most 500; a model
+entry overrides its provider's entry, and a model without either is shown),
+`collapsed_model_groups` (bounded list of collapsed picker group keys, `<harness>` or
+`<harness>/<provider>`, at most 100) and `display_names` (bounded list of
+`{key, name}`, at most 200: `key` is `project:<sidebar project key>` or
+`agent:<Agent id>`, `name` is the owner's display name of 1–120 characters; it
+renames what the sidebar shows and changes no project registration or Agent record).
 Picker strings are stored verbatim: harness and access values must match their
-closed vocabularies exactly. Model ids and collapsed project keys are 1–256
-bytes, and effort is 1–128 bytes; these reject controls and surrounding whitespace.
+closed vocabularies exactly. Model ids, provider names, collapsed project and group
+keys and display-name keys are 1–256 bytes, and effort is 1–128 bytes; these reject
+controls and surrounding whitespace.
 The desktop keeps no other preference store. The desktop writes `window` back once when the window closes, and only when the size changed.
 The new-task composer writes `recent_models` after an admitted model launch,
 `favorite_models` from the model picker (Ctrl+F or the row's star), `last_access`
 from the access chip or Settings › Default access, and `collapsed_projects` when a
 sidebar project is collapsed or expanded; a project key longer than 256
-bytes is not remembered.
+bytes is not remembered. The picker writes `collapsed_model_groups` when a group is
+collapsed or expanded and `model_visibility` from Manage models (a group toggle is one
+provider entry); the sidebar's Rename writes `display_names`.
 If that table is absent, the desktop imports the legacy per-user
 `swarm-desktop.json` preferences through the revision-guarded settings writer once.
 It retires the legacy file only after successful publication; an existing `[desktop]`

@@ -124,11 +124,12 @@ impl Obs {
         }
     }
 
-    /// Freshness as the daemon reported it: sample age against its TTL,
-    /// coverage, clock regression; never inferred from the refresh time.
+    /// Freshness as the daemon reported it, in words: sample age against
+    /// its TTL, partial coverage and clock regression only when they apply;
+    /// never inferred from the refresh time.
     pub fn freshness(&self) -> String {
         match self {
-            Self::Unavailable(code) => format!("observation unavailable ({code})"),
+            Self::Unavailable(_) => "Process activity is not observed for this Agent.".to_owned(),
             Self::Data {
                 age_ms,
                 ttl_ms,
@@ -139,24 +140,23 @@ impl Obs {
                 ..
             } => {
                 if sampled_at.is_none() {
-                    return format!("no process sample yet ({coverage})");
+                    return "Not sampled yet.".to_owned();
                 }
                 let mut text = match age_ms {
                     Some(age) if *age > *ttl_ms => {
-                        format!(
-                            "stale: sample {} old, TTL {}",
-                            seconds(*age),
-                            seconds(*ttl_ms)
-                        )
+                        format!("Out of date: last sampled {} ago.", seconds(*age))
                     }
-                    Some(age) => format!("sample {} old · {coverage}", seconds(*age)),
-                    None => format!("sample age unknown · {coverage}"),
+                    Some(age) => format!("Sampled {} ago.", seconds(*age)),
+                    None => "Sampled; its age was not reported.".to_owned(),
                 };
+                if coverage == "partial" {
+                    text.push_str(" Some processes could not be read.");
+                }
                 if *clock_regressed {
-                    text.push_str(" · clock regressed");
+                    text.push_str(" The clock went back; the rate restarts.");
                 }
                 if let Some(error) = error {
-                    text.push_str(&format!(" · {error}"));
+                    text.push_str(&format!(" {error}"));
                 }
                 text
             }
@@ -179,7 +179,95 @@ impl Obs {
 }
 
 fn seconds(ms: i64) -> String {
-    format!("{:.1} s", ms as f64 / 1000.0)
+    let secs = ms / 1000;
+    match secs {
+        s if s < 60 => format!("{s} s"),
+        s if s < 3600 => format!("{} min", s / 60),
+        s => format!("{} h {} min", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// A state as a counter's noun ("3 working", "1 not confirmed").
+fn count_words(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Unknown => "not confirmed",
+        AgentState::Created | AgentState::Starting => "starting",
+        AgentState::Idle => "ready",
+        AgentState::Busy => "working",
+        AgentState::Waiting => "waiting for you",
+        AgentState::Stopped => "stopped",
+        AgentState::Failed => "failed",
+        AgentState::Lost => "lost",
+    }
+}
+
+/// A turn outcome in words ("completed", "interrupted", "failed",
+/// "ended with an unknown result").
+pub fn outcome_words(outcome: &str) -> String {
+    match outcome {
+        "success" | "completed" => "completed".to_owned(),
+        "unknown" => "ended with an unknown result".to_owned(),
+        other => other.replace('_', " "),
+    }
+}
+
+/// An Agent state in words, for people.
+pub fn state_words(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Unknown => "State not confirmed",
+        AgentState::Created | AgentState::Starting => "Starting",
+        AgentState::Idle => "Ready",
+        AgentState::Busy => "Working",
+        AgentState::Waiting => "Waiting for you",
+        AgentState::Stopped => "Stopped",
+        AgentState::Failed => "Failed",
+        AgentState::Lost => "Lost",
+    }
+}
+
+/// `swarm why`'s one-line summary ("provider origin: a3 failure: free usage
+/// limit reached") as the details panel's origin line ("Provider: free
+/// usage limit reached"); `None` when there is nothing wrong to report (an
+/// unknown origin on an Agent that did not fail).
+pub fn diagnosis_line(summary: &str) -> Option<String> {
+    let (origin, rest) = summary.split_once(" origin: ")?;
+    let (head, message) = match rest.split_once(": ") {
+        Some((head, message)) => (head, Some(message.trim())),
+        None => (rest, None),
+    };
+    let what = head
+        .split_once(' ')
+        .map_or("", |(_, what)| what)
+        .split(" at ")
+        .next()
+        .unwrap_or("")
+        .trim();
+    // An unknown state alone (an Agent Swarm only watches) is no failure.
+    let failed = matches!(
+        what,
+        "failure" | "failed" | "lost" | "interrupted" | "refused" | "crashed"
+    );
+    if origin == "unknown" && message.is_none() && !failed {
+        return None;
+    }
+    let label = match origin {
+        "provider" => "Provider".to_owned(),
+        "environment" => "Environment".to_owned(),
+        "harness" => "Harness".to_owned(),
+        "swarm" => "Swarm".to_owned(),
+        "user" | "owner" => "You".to_owned(),
+        "unknown" => "Cause not determined".to_owned(),
+        other => {
+            let mut chars = other.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        }
+    };
+    let text = message
+        .filter(|message| !message.is_empty())
+        .map_or_else(|| what.replace('_', " "), str::to_owned);
+    Some(format!("{label}: {text}"))
 }
 
 pub fn bytes_label(bytes: Option<u64>) -> String {
@@ -265,15 +353,19 @@ impl MonitorRow {
         }
     }
 
-    /// Compact operation label: current turn or last outcome.
+    /// What the Agent does, in words: the turn it works on, or how its
+    /// last turn ended.
     pub fn operation(&self) -> String {
         match (&self.active_turn, &self.last_outcome) {
             (Some(_), _) => match self.progress_age_ms {
-                Some(age) => format!("turn active · progress {} ago", seconds(age)),
-                None => "turn active · no model progress yet".to_owned(),
+                Some(age) => format!("Working · last output {} ago", seconds(age)),
+                None => "Working · no output yet".to_owned(),
             },
-            (None, Some(outcome)) => format!("last turn {outcome}"),
-            (None, None) => "no turn".to_owned(),
+            (None, Some(outcome)) => format!("Last turn {}", outcome_words(outcome)),
+            (None, None) if self.activity.is_some() => {
+                "Activity not reported by the harness".to_owned()
+            }
+            (None, None) => "No turns yet".to_owned(),
         }
     }
 }
@@ -554,11 +646,11 @@ impl Monitor {
                 Some(0) => None,
                 Some(total) if count.shown < total && count.shown > 0 => Some(format!(
                     "{total} {} ({} shown)",
-                    state_name(count.state),
+                    count_words(count.state),
                     count.shown
                 )),
-                Some(total) => Some(format!("{total} {}", state_name(count.state))),
-                None => Some(format!("{} not counted", state_name(count.state))),
+                Some(total) => Some(format!("{total} {}", count_words(count.state))),
+                None => Some(format!("{} not counted", count_words(count.state))),
             })
             .collect::<Vec<_>>()
             .join(" · ")
@@ -955,7 +1047,25 @@ mod tests {
             processes: 1,
             processes_truncated: false,
         };
-        assert!(obs.freshness().starts_with("stale"));
+        assert!(obs.freshness().starts_with("Out of date"));
+    }
+
+    #[test]
+    fn diagnosis_reads_as_its_origin_and_hides_when_nothing_failed() {
+        assert_eq!(
+            diagnosis_line("provider origin: a3 failure: free usage limit reached").as_deref(),
+            Some("Provider: free usage limit reached")
+        );
+        assert_eq!(diagnosis_line("unknown origin: a1 idle"), None);
+        assert_eq!(
+            diagnosis_line("environment origin: a2 failed at plugin start").as_deref(),
+            Some("Environment: failed")
+        );
+        assert_eq!(
+            diagnosis_line("unknown origin: a4 lost").as_deref(),
+            Some("Cause not determined: lost")
+        );
+        assert_eq!(diagnosis_line("unknown origin: a3 unknown"), None);
     }
 
     #[test]
@@ -977,7 +1087,7 @@ mod tests {
         };
         assert_eq!(
             monitor.counter_line(),
-            "30 busy (20 shown) · idle not counted"
+            "30 working (20 shown) · ready not counted"
         );
         let quiet = Monitor {
             counts: vec![
@@ -994,6 +1104,6 @@ mod tests {
             ],
             ..Monitor::default()
         };
-        assert_eq!(quiet.counter_line(), "3 idle");
+        assert_eq!(quiet.counter_line(), "3 ready");
     }
 }

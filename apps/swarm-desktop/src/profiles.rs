@@ -9,40 +9,109 @@
 //! daemon (`settings.save`, dry run first), which runs its own parser and
 //! launch resolution; nothing here decides validity.
 
-/// Common profile fields the form edits. Everything else stays source-only.
-pub const FORM_FIELDS: [&str; 4] = ["model", "effort", "permissions", "approval_policy"];
-
 /// The first choice of an enumerated field: the key is left out, so the
 /// harness default applies.
 pub const DEFAULT_CHOICE: &str = "Harness default";
 
-/// The documented values of an enumerated form field, or `None` for a
-/// free-text field (`model`). `effort` lists the closed vocabulary the CLI
-/// documents for ad-hoc launches and the daemon enforces for Claude
-/// profiles (Codex and Muse pass a profile's value to the native
-/// catalogue); `permissions` and `approval_policy` follow
-/// `docs/spec/configuration.md`. The daemon validates per harness on
-/// Validate and Save.
-fn documented(key: &str) -> Option<&'static [&'static str]> {
-    match key {
-        "effort" => Some(&["low", "medium", "high", "xhigh", "max"]),
-        "permissions" => Some(&["read-only", "workspace-write", "danger-full-access"]),
-        "approval_policy" => Some(&["never", "on-request"]),
-        _ => None,
+/// One enumerated form field of a profile: its key, label and the values
+/// the profile's harness accepts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormField {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub values: Vec<String>,
+}
+
+/// Claude Code's and the ad-hoc launch's effort vocabulary.
+const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// The enumerated fields a profile of `harness` takes besides its model,
+/// with that harness's real values (the daemon's profile validation in
+/// `eliot-daemon` `config.rs` and `docs/spec/configuration.md`):
+///
+/// * Codex: effort, `permissions` (sandbox) and `approval_policy`;
+/// * Claude Code: effort and `approval` (its permission mode);
+/// * Muse: effort, `approval` and `permissions` (no read-only);
+/// * Antigravity: `mode` (no effort, permissions or approval presets);
+/// * OpenCode: none (its slice maps no preset).
+///
+/// `efforts` are the catalogue's efforts of the profile's model, when it
+/// reports them (Codex and Muse pass a profile's effort to it); Claude
+/// keeps its closed vocabulary.
+pub fn form_fields(harness: &str, efforts: Option<&[String]>) -> Vec<FormField> {
+    let list = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect();
+    let effort = |fallback: &[&str]| FormField {
+        key: "effort",
+        label: "Effort",
+        values: efforts
+            .filter(|efforts| !efforts.is_empty())
+            .map_or_else(|| list(fallback), <[String]>::to_vec),
+    };
+    match harness {
+        "codex" => vec![
+            effort(&["low", "medium", "high", "xhigh"]),
+            FormField {
+                key: "permissions",
+                label: "Permissions",
+                values: list(&["read-only", "workspace-write", "danger-full-access"]),
+            },
+            FormField {
+                key: "approval_policy",
+                label: "Approval policy",
+                values: list(&["never", "on-request"]),
+            },
+        ],
+        "claude" => vec![
+            FormField {
+                key: "effort",
+                label: "Effort",
+                values: list(&EFFORTS),
+            },
+            FormField {
+                key: "approval",
+                label: "Permission mode",
+                values: list(&[
+                    "manual",
+                    "auto",
+                    "acceptEdits",
+                    "plan",
+                    "dontAsk",
+                    "bypassPermissions",
+                ]),
+            },
+        ],
+        "muse" => vec![
+            effort(&["low", "medium", "high", "xhigh"]),
+            FormField {
+                key: "approval",
+                label: "Approval",
+                values: list(&["onRequest", "promptUnmatched", "denyUnmatched", "allowAll"]),
+            },
+            FormField {
+                key: "permissions",
+                label: "Permissions",
+                values: list(&["workspace-write", "danger-full-access"]),
+            },
+        ],
+        "antigravity" => vec![FormField {
+            key: "mode",
+            label: "Mode",
+            values: list(&["plan", "auto", "accept-edits"]),
+        }],
+        _ => Vec::new(),
     }
 }
 
-/// The dropdown choices of an enumerated field: [`DEFAULT_CHOICE`], the
-/// documented values, and the current value when it is none of them, so a
-/// form edit never drops what the source says. `None` for free-text keys.
-pub fn choices(key: &str, current: Option<&str>) -> Option<Vec<String>> {
-    let values = documented(key)?;
+/// The dropdown choices of an enumerated field: [`DEFAULT_CHOICE`], its
+/// values, and the current value when it is none of them, so a form edit
+/// never drops what the source says.
+pub fn choices(values: &[String], current: Option<&str>) -> Vec<String> {
     let mut all = vec![DEFAULT_CHOICE.to_owned()];
-    all.extend(values.iter().map(|value| (*value).to_owned()));
-    if let Some(current) = current.filter(|current| !values.contains(current)) {
+    all.extend(values.iter().cloned());
+    if let Some(current) = current.filter(|current| !values.iter().any(|value| value == current)) {
         all.push(current.to_owned());
     }
-    Some(all)
+    all
 }
 
 /// The value a dropdown index sets: `None` (remove the key) for the
@@ -270,22 +339,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enumerated_fields_offer_the_default_the_documented_values_and_the_current_one() {
-        assert_eq!(choices("model", Some("gpt")), None);
-        let effort = choices("effort", None).unwrap();
+    fn enumerated_fields_offer_the_default_the_harness_values_and_the_current_one() {
+        let claude = form_fields("claude", None);
+        let effort = choices(&claude[0].values, None);
         assert_eq!(effort[0], DEFAULT_CHOICE);
         assert_eq!(&effort[1..], ["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(claude[1].key, "approval");
+        assert!(claude[1].values.contains(&"bypassPermissions".to_owned()));
         // A native value outside the vocabulary stays selectable.
-        let custom = choices("effort", Some("minimal")).unwrap();
+        let custom = choices(&claude[0].values, Some("minimal"));
         assert_eq!(custom.last().map(String::as_str), Some("minimal"));
-        assert_eq!(choices("effort", Some("high")).unwrap().len(), 6);
+        assert_eq!(choices(&claude[0].values, Some("high")).len(), 6);
         assert_eq!(choice_value(&custom, 0), None);
         assert_eq!(choice_value(&custom, 2), Some("medium"));
         assert_eq!(choice_value(&custom, 99), None);
+        let codex = form_fields("codex", Some(&["low".to_owned(), "high".to_owned()]));
+        assert_eq!(codex[0].values, ["low", "high"]);
         assert_eq!(
-            choices("approval_policy", None).unwrap(),
+            choices(&codex[2].values, None),
             [DEFAULT_CHOICE, "never", "on-request"]
         );
+        assert!(
+            !form_fields("muse", None)[2]
+                .values
+                .contains(&"read-only".to_owned())
+        );
+        assert_eq!(form_fields("antigravity", None)[0].key, "mode");
+        assert!(form_fields("opencode", None).is_empty());
     }
 
     const DRAFT: &str = "[profiles.a]\nharness = \"codex\"\nmodel = \"m1\"\n\n[profiles.a.extra]\nx = 1\n\n[profiles.b]\nharness = \"muse\" # note\nmodel = \"spark\"\n";

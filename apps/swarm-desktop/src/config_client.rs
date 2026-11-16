@@ -48,6 +48,31 @@ pub async fn save_settings(
     settings::save(data_dir, request).await
 }
 
+/// Unregister projects (Remove project in the sidebar): the `projects`
+/// settings section without their ids, through the revision-guarded
+/// settings writer. Their folders, Agents and files stay.
+pub async fn remove_projects(data_dir: &Path, ids: &[String]) -> Result<SettingsSaveResponse> {
+    use eliot_core::api::{SettingsClientSource, SettingsSection};
+    let read = settings::read(data_dir).await?;
+    let mut projects = read
+        .sections
+        .get(&SettingsSection::Projects)
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    if let Some(map) = projects.as_object_mut() {
+        for id in ids {
+            map.remove(id);
+        }
+    }
+    let request = SettingsSaveRequest {
+        expected_revision: read.revision,
+        sections: [(SettingsSection::Projects, projects)].into(),
+        dry_run: false,
+        client: SettingsClientSource::Desktop,
+    };
+    settings::save(data_dir, &request).await
+}
+
 /// Project registrations for the launch picker. `project.list` returns a bare
 /// array (not an object), so it cannot pass the typed object boundary; the
 /// rows get the same field validation instead.

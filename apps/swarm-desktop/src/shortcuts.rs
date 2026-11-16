@@ -1,8 +1,11 @@
 //! The window's keyboard: the chords Ctrl+N (new task), Ctrl+K (search
 //! tasks), Ctrl+M (model picker) and Ctrl+, (Settings); the keys of an open
-//! popover (↑/↓/←/→, Enter, Esc, Ctrl+F); and how the last input arrived,
+//! popover (↑/↓/←/→, Enter, Esc, Ctrl+F); how the last input arrived,
 //! which tells a search suggestion reached with the arrows from one chosen
-//! with Enter or a click.
+//! with Enter or a click; and whether the last key was Enter without Shift,
+//! which turns the line break it typed into the composer into Send
+//! (Reactor 0.100.0 has no key events on `TextBox`; Shift+Enter keeps the
+//! line break).
 //!
 //! Reactor 0.100.0 has no key events, and its `KeyAccelerator` keys are R,
 //! Enter and the number pad only; WinUI's own `KeyboardAccelerator` needs
@@ -93,6 +96,21 @@ static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
 /// Counts inputs that end a keyboard walk through suggestions: any key
 /// other than ↑/↓/Enter, and every pointer press.
 static INPUT_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// The last key press was Enter without Shift (cleared by any other key and
+/// when [`take_plain_enter`] consumes it), and when it was pressed.
+static PLAIN_ENTER: AtomicU8 = AtomicU8::new(0);
+static PLAIN_ENTER_MS: AtomicU64 = AtomicU64::new(0);
+/// How long a plain Enter may take to reach the composer's text change.
+const PLAIN_ENTER_MS_MAX: u64 = 1_500;
+
+/// Whether the text change being handled came from Enter without Shift
+/// (pressed within the last 1.5 s, no key since). Consumes it: one Enter
+/// sends once.
+pub fn take_plain_enter() -> bool {
+    let fresh =
+        now_ms().saturating_sub(PLAIN_ENTER_MS.load(Ordering::SeqCst)) <= PLAIN_ENTER_MS_MAX;
+    PLAIN_ENTER.swap(0, Ordering::SeqCst) == 1 && fresh
+}
 
 /// Tell the hook which popover is open (its keys are taken while it is).
 pub fn set_popover(popover: Popover) {
@@ -225,6 +243,11 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             return 1;
         }
         if pressed && !matches!(key, VK_CONTROL | VK_SHIFT) {
+            let plain = key == VK_RETURN && !shift && !alt;
+            PLAIN_ENTER.store(u8::from(plain), Ordering::SeqCst);
+            if plain {
+                PLAIN_ENTER_MS.store(now_ms(), Ordering::SeqCst);
+            }
             match key {
                 VK_UP | VK_DOWN => note_input(Input::Arrow),
                 VK_RETURN => {

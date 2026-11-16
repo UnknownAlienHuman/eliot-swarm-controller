@@ -501,8 +501,9 @@ of the explicitly selected release scope.
       dot, details toggle, a "…" menu for Hand off/Switch, Change manager,
       Resume, Detach, Stop and Force stop); coverage, ids and readback live in
       the details panel. The composer of a conversation carries its project,
-      the model-and-effort and access chips, Send, and Interrupt/Steer only
-      while a turn runs; a new task's composer is D9. Settings replaces the
+      the model-and-effort and access chips, Send (which steers the running
+      turn, D10), and Interrupt only while a turn runs; a new task's composer
+      is D9. Settings replaces the
       sidebar with its own navigation and shows one centred page of at most
       840 DIPs (D9). One component system at Codex density with Material 3
       color roles (owner reviews 2026-11-15 and 2026-11-16), every size from
@@ -567,6 +568,35 @@ of the explicitly selected release scope.
       under the data directory by project with Open; cleanup waits for
       `cleanup.plan` / `cleanup.apply`. Shortcuts: Ctrl+N, Ctrl+K, Ctrl+M,
       Ctrl+,. (Refs #407)
+- [x] **D10 The owner's second pass (2026-11-16).** Picker groups (each
+      harness, and each OpenCode provider) collapse, remembered in `[desktop]
+      collapsed_model_groups`; OpenCode's Manage models (the sliders button at
+      the end of the search row) toggles provider groups and single models into
+      `[desktop] model_visibility`, the picker lists only shown models and a
+      search still finds a hidden one, marked hidden. The selected effort
+      segment is filled, so it reads on a highlighted search row. Settings ›
+      Models & presets picks a preset's model with the same picker filtered to
+      its harness, and its dropdowns carry that harness's real fields (Codex
+      sandbox and approval policy, Claude Code permission mode, Muse approval
+      and sandbox, Antigravity mode); no text box offers Windows text
+      prediction. Enter sends and Shift+Enter keeps the line break (the window
+      hook marks the line break Enter typed); one Send steers the active turn
+      while one runs and, after a definite `bad_state`/`stale_generation`/
+      `unsupported` refusal, goes as the next message with one line saying so.
+      The message shows at once with "Sending…"/"Starting Codex…" until its
+      turn starts. Right-click menus on projects (New task here, Open folder,
+      Rename, Collapse/Expand, Remove project) and on tasks and chats (Rename,
+      Stop, Archive/Unarchive, Delete after a confirmation naming it, Copy
+      Agent ID, Open folder) are drawn in the window; Rename writes `[desktop]
+      display_names`, Remove project the `projects` section. A Chats section
+      and "No project (chat)" launch `chat: true`; Archive/Delete call
+      `agent.archive`/`agent.delete` and Show archived filters `agent.list`:
+      these, and Claude/Antigravity/OpenCode/Muse quota windows (read by shape,
+      shown with reset times and the composer's usage ring), need the k92
+      daemon contract and say so on an older daemon. Details and monitor speak
+      plain words and hide empty rows (`swarm why`'s origin line stays);
+      observed native children nest under their parent and stay out of
+      Recents. (Refs #407)
 
 ## M1 — Memory one-shot inference (#199)
 

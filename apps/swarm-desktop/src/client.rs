@@ -80,6 +80,118 @@ pub async fn list_agents(data_dir: &Path, params: &AgentListRequest) -> Result<A
     Ok(reply)
 }
 
+/// Per-row chat and archived flags of one `agent.list` page.
+pub type ListFlags = std::collections::HashMap<String, (bool, bool)>;
+
+/// One validated `agent.list` page plus each row's `chat` and `archived`
+/// flags, and the `archived` filter (`exclude` default, `include`, `only`).
+///
+/// Bridge to the k92 contract (`agent-briefs/20261116/k92-backend-quota-
+/// archive-chats.md` §2 and §3: `AgentSummary.chat`/`archived`,
+/// `AgentListRequest.archived`) until those fields land in
+/// `eliot_core::api`; then this reads them from the typed DTOs. A daemon
+/// without k92 reports neither flag (both read false) and refuses the
+/// filter field, which [`archived_filter_error`] words.
+pub async fn list_agents_flagged(
+    data_dir: &Path,
+    params: &AgentListRequest,
+    archived: Option<&str>,
+) -> Result<(AgentListResponse, ListFlags)> {
+    params.validate()?;
+    let mut request = serde_json::to_value(params)
+        .map_err(|_| Error::new("internal", "agent.list request could not be encoded"))?;
+    if let Some(filter) = archived {
+        request["archived"] = Value::String(filter.to_owned());
+    }
+    let raw = eliot_daemon::client_call(data_dir, "agent.list", request).await?;
+    let flags = raw
+        .get("agents")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let flag = |name: &str| row.get(name).and_then(Value::as_bool).unwrap_or(false);
+                    Some((
+                        row.get("id")?.as_str()?.to_owned(),
+                        (flag("chat"), flag("archived")),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let reply: AgentListResponse = serde_json::from_value(raw)
+        .map_err(|_| Error::new("unknown", "agent.list returned a malformed result"))?;
+    params.validate_response(&reply)?;
+    Ok((reply, flags))
+}
+
+/// A daemon without the k92 `agent.list` filter refuses the field; say so.
+pub fn archived_filter_error(error: &Error) -> String {
+    if error.code == "invalid" || error.message.contains("archived") {
+        "Show archived needs a daemon with agent.archive (k92); this one lists active Agents only"
+            .to_owned()
+    } else {
+        error.to_string()
+    }
+}
+
+/// `agent.archive {id, agent, archived}` (k92 §2, Owner only): hide or show
+/// a stopped or idle Agent tree in the default list; durable, idempotent
+/// by mutation id. Returns the number of Agents it changed.
+pub async fn archive_agent(
+    data_dir: &Path,
+    mutation_id: String,
+    agent: &str,
+    archived: bool,
+) -> Result<usize> {
+    let reply = eliot_daemon::client_call(
+        data_dir,
+        "agent.archive",
+        serde_json::json!({ "id": mutation_id, "agent": agent, "archived": archived }),
+    )
+    .await
+    .map_err(k92_missing)?;
+    Ok(affected(&reply))
+}
+
+/// `agent.delete {id, agent}` (k92 §2, Owner only, stopped trees only):
+/// removes the tree's records from the Store; never the workspace, native
+/// store files or branches.
+pub async fn delete_agent(data_dir: &Path, mutation_id: String, agent: &str) -> Result<usize> {
+    let reply = eliot_daemon::client_call(
+        data_dir,
+        "agent.delete",
+        serde_json::json!({ "id": mutation_id, "agent": agent }),
+    )
+    .await
+    .map_err(k92_missing)?;
+    Ok(affected(&reply))
+}
+
+fn affected(reply: &Value) -> usize {
+    reply
+        .get("affected")
+        .and_then(Value::as_u64)
+        .map_or(0, |count| count as usize)
+}
+
+/// An unknown method means the daemon predates k92: say what is missing.
+fn k92_missing(error: Error) -> Error {
+    let unknown_method = matches!(
+        error.code.as_str(),
+        "method_not_found" | "unknown_method" | "not_found"
+    ) && error.message.contains("method");
+    let not_implemented = error.code == "unsupported" && error.message.contains("not implemented");
+    if unknown_method || not_implemented {
+        Error::new(
+            "unsupported",
+            "this daemon has no agent.archive/agent.delete yet (they come with k92)",
+        )
+    } else {
+        error
+    }
+}
+
 /// Full readback for one Agent: generation, active turn, pending requests,
 /// profile snapshot and effective settings.
 pub async fn get_agent(data_dir: &Path, id: &str) -> Result<AgentGetResponse> {
@@ -299,6 +411,15 @@ pub enum LaunchTarget {
     },
 }
 
+/// Where a new task runs: a project checkout or folder, or a chat without a
+/// project (`chat: true` and no workspace: the daemon creates the chat's
+/// private directory under `chats_root`, per the k92 launch contract).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchPlace {
+    Workspace(String),
+    Chat,
+}
+
 /// First prompt as one submission: nonblank text rides the launch admission
 /// and the linked `<id>/send` command must appear in the reply. Overrides
 /// exist only on the ad-hoc path, which the daemon validates; a profile
@@ -307,13 +428,16 @@ pub async fn submit_launch(
     data_dir: &Path,
     mutation_id: String,
     target: LaunchTarget,
-    workspace: &str,
+    place: &LaunchPlace,
     text: Option<String>,
 ) -> Result<CommandSubmitResponse> {
     if let Some(text) = text.as_deref() {
         check_text(text)?;
     }
-    let mut args = serde_json::json!({ "workspace": workspace });
+    let mut args = match place {
+        LaunchPlace::Workspace(workspace) => serde_json::json!({ "workspace": workspace }),
+        LaunchPlace::Chat => serde_json::json!({ "chat": true }),
+    };
     match target {
         LaunchTarget::Routed => {}
         LaunchTarget::Profile(profile) if !profile.trim().is_empty() => {
