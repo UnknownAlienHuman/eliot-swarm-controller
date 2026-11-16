@@ -7,7 +7,7 @@ use crate::{
         types::{InboxUser, McpServerReadback, ModelRef, NativeModelEntry, SessionInfo},
     },
 };
-use eliot_core::{ContextItem, Error, InjectPoint, Result};
+use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, Result};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -102,6 +102,9 @@ enum StartPhase {
     Subscribe,
     /// Daemon-side native-process registration, before session create.
     Register,
+    /// Local backend verification, before session create: the adopted
+    /// provider answers for the expected model without creating state.
+    Verify,
     /// Session/create refused or provably never dispatched.
     CreateRefused,
     /// Resume refused before the retained session was touched (wrong scope
@@ -134,6 +137,7 @@ fn start_failure_is_proven_no_effect(phase: StartPhase, code: &str) -> bool {
         StartPhase::Spawn
             | StartPhase::Subscribe
             | StartPhase::Register
+            | StartPhase::Verify
             | StartPhase::CreateRefused
             | StartPhase::ResumeRefused
     )
@@ -145,16 +149,34 @@ fn start_failure_is_proven_no_effect(phase: StartPhase, code: &str) -> bool {
 /// the plugin instead of pinning an unknown Agent.
 struct PhaseFailure {
     phase: StartPhase,
-    error: Error,
+    error: Box<Error>,
 }
 
 /// Typed reason for one proven-no-effect failed start. Static per phase plus
 /// the triggering error code (a fixed literal, never a payload): enough to
 /// tell a slow cold start from a refused selector without risking secrets,
 /// endpoints, or native text in the persisted outcome.
+impl StartPhase {
+    /// Stable pre-session location for failed-start outcome values:
+    /// `plugin.opencode.start.<phase>`. The credential transfer shares the
+    /// `spawn` phase but reports its own `auth_transfer` step in the reason.
+    fn as_str(self) -> &'static str {
+        match self {
+            StartPhase::Spawn => "spawn",
+            StartPhase::Subscribe => "subscribe",
+            StartPhase::Register => "register",
+            StartPhase::Verify => "verify",
+            StartPhase::CreateRefused => "create_refused",
+            StartPhase::ResumeRefused => "resume_refused",
+            StartPhase::PostCreate => "post_create",
+        }
+    }
+}
+
 fn presession_reason(phase: StartPhase, code: &str) -> String {
     let what = match phase {
         StartPhase::Spawn => "OpenCode serve failed to start",
+        StartPhase::Verify => "OpenCode local backend verification failed",
         StartPhase::Subscribe => "OpenCode event subscription failed",
         StartPhase::Register => "OpenCode native-process registration failed",
         StartPhase::CreateRefused => "OpenCode session/create was not admitted",
@@ -494,12 +516,26 @@ impl OpenCodePlugin {
                         .and_then(Value::as_str)
                         .is_some_and(|state| matches!(state, "unknown" | "rejected" | "failed"))
                 {
-                    let diagnostics = serde_json::to_value(
-                        session.server.diagnostic_error(Error::new("unknown", "")),
+                    // The attached error names the plugin method and the
+                    // value's own reason: an empty harness tail stays honest
+                    // (empty text), but the outcome still says which plugin
+                    // method produced it and with what reason.
+                    let context = Error::new(
+                        "unknown",
+                        value
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .filter(|reason| !reason.trim().is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                format!("OpenCode {} produced an uncertain outcome", request.method)
+                            }),
                     )
-                    .map_err(|_| {
-                        Error::new("internal", "OpenCode diagnostics could not be encoded")
-                    })?;
+                    .with_where(format!("plugin.opencode.command.{}", request.method));
+                    let diagnostics =
+                        serde_json::to_value(session.server.diagnostic_error(context)).map_err(
+                            |_| Error::new("internal", "OpenCode diagnostics could not be encoded"),
+                        )?;
                     if let Some(tails) = diagnostics
                         .get("diagnostics")
                         .filter(|tails| !tails.is_null())
@@ -613,14 +649,24 @@ impl OpenCodePlugin {
     fn retain_proven_no_effect_start(
         &mut self,
         params: &AgentStartParams,
+        phase: StartPhase,
         reason: impl Into<String>,
     ) -> Value {
+        // The failed value carries its own typed location and origin, so a
+        // launch that never touched native I/O still says where and why:
+        // our pre-session gate (`swarm`), never the harness or provider.
         let value = json!({
             "agent_id": params.agent_id,
             "generation": params.generation,
             "command_id": params.command_id,
             "state": "failed",
             "reason": reason.into(),
+            "where": format!("plugin.opencode.start.{}", phase.as_str()),
+            "origin": "swarm",
+            "origin_evidence": format!(
+                "pre-session phase {} failed before any native session or prompt",
+                phase.as_str(),
+            ),
         });
         self.failed_start = Some(FailedStart {
             agent_id: params.agent_id.clone(),
@@ -648,7 +694,7 @@ impl OpenCodePlugin {
             &failure.error.code
         ));
         let reason = presession_reason(failure.phase, &failure.error.code);
-        self.retain_proven_no_effect_start(params, reason)
+        self.retain_proven_no_effect_start(params, failure.phase, reason)
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
@@ -674,7 +720,7 @@ impl OpenCodePlugin {
                 if start_failure_is_proven_no_effect(failure.phase, &failure.error.code) {
                     return Ok(self.proven_no_effect_start(&parsed.params, failure));
                 }
-                return Err(self.retain_failed_start(&parsed.params, failure.error));
+                return Err(self.retain_failed_start(&parsed.params, *failure.error));
             }
         };
         let session = match self
@@ -935,7 +981,7 @@ impl OpenCodePlugin {
             Err(error) => {
                 return Err(PhaseFailure {
                     phase: StartPhase::Spawn,
-                    error,
+                    error: Box::new(error),
                 });
             }
         };
@@ -950,7 +996,7 @@ impl OpenCodePlugin {
                     .await;
                 return Err(PhaseFailure {
                     phase: StartPhase::Subscribe,
-                    error: server.diagnostic_error(error),
+                    error: Box::new(server.diagnostic_error(error)),
                 });
             }
         };
@@ -1025,7 +1071,7 @@ impl OpenCodePlugin {
             let error = session.server.diagnostic_error(error);
             return Err(PhaseFailure {
                 phase: StartPhase::Register,
-                error,
+                error: Box::new(error),
             });
         }
         Ok(session)
@@ -1066,10 +1112,14 @@ impl OpenCodePlugin {
             {
                 Ok(fragment) => Some(fragment),
                 Err(error) => {
-                    let reason = error.message.clone();
+                    let reason = (*error.message).clone();
                     discard_failed_start(&mut session, error, envelope).await;
                     return Ok(CreateOutcome::ProvenFailed(
-                        self.retain_proven_no_effect_start(&parsed.params, reason),
+                        self.retain_proven_no_effect_start(
+                            &parsed.params,
+                            StartPhase::Verify,
+                            reason,
+                        ),
                     ));
                 }
             }
@@ -1100,7 +1150,7 @@ impl OpenCodePlugin {
                     &parsed.params,
                     PhaseFailure {
                         phase: StartPhase::CreateRefused,
-                        error: Error::new("rejected", reason),
+                        error: Box::new(Error::new("rejected", reason)),
                     },
                 )));
             }
@@ -1112,7 +1162,7 @@ impl OpenCodePlugin {
                     &parsed.params,
                     PhaseFailure {
                         phase: StartPhase::CreateRefused,
-                        error: Error::new("native_not_dispatched", reason),
+                        error: Box::new(Error::new("native_not_dispatched", reason)),
                     },
                 )));
             }
@@ -1123,6 +1173,11 @@ impl OpenCodePlugin {
                     format!(
                         "OpenCode session/create may have changed native state; it will not be repeated ({reason})"
                     ),
+                )
+                .with_where("plugin.opencode.start.create")
+                .with_origin(
+                    FailureOrigin::Harness,
+                    "native session/create outcome uncertain; native state may exist",
                 ));
             }
         };
@@ -1233,10 +1288,10 @@ impl OpenCodePlugin {
                 &parsed.params,
                 PhaseFailure {
                     phase: StartPhase::ResumeRefused,
-                    error: Error::new(
+                    error: Box::new(Error::new(
                         "profile_error",
                         "OpenCode resume subject is outside the authenticated native scope",
-                    ),
+                    )),
                 },
             ));
         }
@@ -1255,7 +1310,7 @@ impl OpenCodePlugin {
                     &parsed.params,
                     PhaseFailure {
                         phase: StartPhase::ResumeRefused,
-                        error,
+                        error: Box::new(error),
                     },
                 ));
             }
@@ -1263,17 +1318,17 @@ impl OpenCodePlugin {
         };
         session.session_id = Some(retained.id.clone());
         if let Err(error) = Self::resume_quiesce(&session, &retained.id, deadline).await {
-            return Err(self.stash_resume_unknown(session, error.message).await);
+            return Err(self.stash_resume_unknown(session, *error.message).await);
         }
         if let Err(error) = Self::resume_verify_idle(&session, &retained.id, deadline).await {
-            return Err(self.stash_resume_unknown(session, error.message).await);
+            return Err(self.stash_resume_unknown(session, *error.message).await);
         }
         let effective = match Self::resume_configure(&parsed, &session, &retained.id, deadline)
             .await
         {
             Ok(effective) => effective,
             Err(error) if error.code == "unknown" => {
-                return Err(self.stash_resume_unknown(session, error.message).await);
+                return Err(self.stash_resume_unknown(session, *error.message).await);
             }
             Err(error) => return Err(self.fail_resume(&parsed, session, error, envelope).await),
         };
@@ -1295,7 +1350,7 @@ impl OpenCodePlugin {
             )
             .await
         {
-            return Err(self.stash_resume_unknown(session, error.message).await);
+            return Err(self.stash_resume_unknown(session, *error.message).await);
         }
         session.phase = SessionPhase::Ready;
         let result = json!({
@@ -1755,6 +1810,16 @@ impl OpenCodePlugin {
         envelope: Instant,
     ) -> Error {
         let error = discard_failed_start(&mut session, error, envelope).await;
+        // Resume-phase native failures keep their harness origin: the
+        // readback or configuration the native side refused or left
+        // unresolved. Only the location is filled when missing.
+        let mut error = error.with_where("plugin.opencode.start.resume");
+        if error.origin.is_none() {
+            error = error.with_origin(
+                FailureOrigin::Harness,
+                "resume-phase native readback or configuration failed or stayed unresolved",
+            );
+        }
         self.retain_failed_start(&parsed.params, error)
     }
 
@@ -1765,6 +1830,11 @@ impl OpenCodePlugin {
         Error::new(
             "unknown",
             format!("OpenCode resume is unresolved ({message})"),
+        )
+        .with_where("plugin.opencode.start.resume")
+        .with_origin(
+            FailureOrigin::Harness,
+            "retained native session state unresolved after resume readback",
         )
     }
 
@@ -1794,6 +1864,11 @@ impl OpenCodePlugin {
                     "OpenCode session is known but session.ready was not acknowledged: {}",
                     error.message
                 ),
+            )
+            .with_where("plugin.opencode.start.ready")
+            .with_origin(
+                FailureOrigin::Harness,
+                "native session.ready acknowledgement unobserved; native session is known",
             ));
         }
         session.phase = SessionPhase::Ready;
@@ -4493,7 +4568,7 @@ mod tests {
         .await
         .expect_err("unreachable backend must fail the start gate");
         assert_eq!(error.code, "profile_error");
-        assert_eq!(error.message, "adopted backend unreachable");
+        assert_eq!(error.message.as_str(), "adopted backend unreachable");
         // The short safe reason carries no endpoint, id, value or secret.
         assert!(!error.message.contains("127.0.0.1"));
         assert!(!error.message.contains("test-model"));
@@ -4573,7 +4648,11 @@ mod tests {
     fn proven_no_effect_start_returns_failed_state_and_replays() {
         let params = AgentStartParams::new("agent-1", 7, "0199-start-1");
         let mut plugin = OpenCodePlugin::default();
-        let value = plugin.retain_proven_no_effect_start(&params, "adopted backend unreachable");
+        let value = plugin.retain_proven_no_effect_start(
+            &params,
+            StartPhase::Verify,
+            "adopted backend unreachable",
+        );
         assert_eq!(value["state"], "failed");
         assert_eq!(value["agent_id"], "agent-1");
         assert_eq!(value["generation"], 7);
@@ -4607,6 +4686,7 @@ mod tests {
             StartPhase::Spawn,
             StartPhase::Subscribe,
             StartPhase::Register,
+            StartPhase::Verify,
             StartPhase::CreateRefused,
             StartPhase::ResumeRefused,
         ] {
@@ -4756,6 +4836,7 @@ mod tests {
             StartPhase::Spawn,
             StartPhase::Subscribe,
             StartPhase::Register,
+            StartPhase::Verify,
             StartPhase::CreateRefused,
             StartPhase::ResumeRefused,
         ] {
@@ -4765,7 +4846,7 @@ mod tests {
                 &params,
                 PhaseFailure {
                     phase,
-                    error: eliot_core::Error::new("native_spawn", "probe"),
+                    error: Box::new(eliot_core::Error::new("native_spawn", "probe")),
                 },
             );
             assert_eq!(value["state"], "failed");

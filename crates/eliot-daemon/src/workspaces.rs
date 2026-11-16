@@ -1773,6 +1773,11 @@ fn creation_unknown(code: &str) -> WorkspaceCreationOutcome {
     WorkspaceCreationOutcome::Unknown {
         code: code.to_owned(),
         message: "workspace creation or child quiescence is unknown".to_owned(),
+        failure_where: Some("store.dispatch.workspace_gate".to_owned()),
+        origin: Some(eliot_core::FailureOrigin::Swarm),
+        origin_evidence: Some(
+            "managed workspace preparation gate left the creation state unresolved".to_owned(),
+        ),
     }
 }
 
@@ -1789,6 +1794,11 @@ fn safe_creation(outcome: WorkspaceCreationOutcome) -> WorkspaceCreationOutcome 
         WorkspaceCreationOutcome::Failed { .. } => WorkspaceCreationOutcome::Failed {
             code: "workspace_creation_failed".to_owned(),
             message: "workspace creation readback proved no created subject".to_owned(),
+            failure_where: Some("store.dispatch.workspace_gate".to_owned()),
+            origin: Some(eliot_core::FailureOrigin::Swarm),
+            origin_evidence: Some(
+                "managed workspace preparation gate proved no created subject".to_owned(),
+            ),
         },
         WorkspaceCreationOutcome::Unknown { .. } => creation_unknown("workspace_creation_unknown"),
     }
@@ -2179,6 +2189,9 @@ mod tests {
                     WorkspaceCreationOutcome::Failed {
                         code: "fixture_no_git_effect".to_owned(),
                         message: "fixture released its reservation before spawn".to_owned(),
+                        failure_where: Some("store.dispatch.workspace_gate".to_owned()),
+                        origin: Some(eliot_core::FailureOrigin::Swarm),
+                        origin_evidence: Some("test fixture released its reservation".to_owned()),
                     },
                     now_ms(),
                 )

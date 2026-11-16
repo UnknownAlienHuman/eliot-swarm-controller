@@ -206,6 +206,7 @@ mod tests {
             usage: None,
             config_revision: 0,
             config: None,
+            preceded_by: None,
         }
     }
 
@@ -319,7 +320,7 @@ mod tests {
         let error = result.expect_err("mismatched binding");
         assert_eq!(error.code, "unknown");
         assert_eq!(
-            error.message,
+            error.message.as_ref(),
             "read response does not match the requested binding"
         );
         assert!(error.diagnostics.is_empty());

@@ -152,7 +152,7 @@ mod tests {
         let error = result.expect_err("invalid mutation reply");
         assert_eq!(error.code, "unknown");
         assert_eq!(
-            error.message,
+            error.message.as_ref(),
             "mutation response does not match the requested binding"
         );
         assert!(error.diagnostics.is_empty());

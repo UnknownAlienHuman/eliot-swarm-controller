@@ -1077,6 +1077,25 @@ service launch and service-management APIs remain `unsupported`. Readiness and e
 configuration readback do not verify runtime authentication, inference or all traffic;
 report those facts as unverified. The owner remains responsible for service lifecycle.
 
+## Logging, crash capture and diagnosis
+
+`log_level` (`standard`, `debug`) applies live through the daemon settings
+section, never as a restart gate on its own. Standard mode keeps operational
+lines: requests, settlements and sanitized tails. Debug mode adds numeric
+timing records: every RPC at the router choke point (`rpc.handled` /
+`rpc.failed` with method, elapsed milliseconds and ok), every
+daemon-to-plugin call (`plugin.call.ok` / `plugin.call.error`), and plugin
+frame, channel, process start/exit and stderr records over `ELIOT_DEBUG`.
+Debug never logs payloads: ids are our own vocabulary, messages stay in the
+sanitized store, params and results never enter a record.
+
+On panic the daemon and each plugin write a `daemon.panicked` JSON marker to
+the crash directory (capped count, per-write byte cap, redacted under the
+secret policy) and report it once: in `daemon.status`, in `swarm daemon`
+startup output, and in `swarm why` when the diagnosed failure is otherwise
+unclassified. The desktop Agent details view shows the same one-line
+diagnosis summary; the full chain lives behind `swarm why`.
+
 ## Paths and platform defaults
 
 Keep Windows paths short; use long-path Git arguments/environment without rewriting

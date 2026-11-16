@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 44;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 45;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1117,6 +1117,18 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 45 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE turns ADD COLUMN preceded_by TEXT;
+                  INSERT INTO schema_migrations(version) VALUES (45);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1150,7 +1162,9 @@ mod continuity_tests {
              DROP TABLE settings_history;
              DELETE FROM schema_migrations WHERE version=41;
              ALTER TABLE inference_clients DROP COLUMN expired_id_through_ms;
-             DELETE FROM schema_migrations WHERE version=40;",
+             DELETE FROM schema_migrations WHERE version=40;
+             ALTER TABLE turns DROP COLUMN preceded_by;
+             DELETE FROM schema_migrations WHERE version=45;",
             )
             .unwrap();
         let client = format!("memory:{}", Ulid::new());
@@ -1231,6 +1245,7 @@ mod continuity_tests {
              ALTER TABLE inference_clients DROP COLUMN previous_release_proven;
              ALTER TABLE inference_clients DROP COLUMN previous_restarted;
              ALTER TABLE inference_clients DROP COLUMN expired_id_through_ms;
+             ALTER TABLE turns DROP COLUMN preceded_by;
              DELETE FROM schema_migrations WHERE version>=39;",
             )
             .unwrap();

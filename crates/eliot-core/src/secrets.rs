@@ -4,6 +4,14 @@ use serde_json::Value;
 
 const MARKER: &[u8] = b"[REDACTED]";
 
+/// A trailing text fragment this long that exactly matches the start of a
+/// longer registered secret is treated as the secret cut short by an earlier
+/// bound (construction truncates messages before sanitization can redact
+/// them) and is redacted. Shorter coincidences pass through: over-redaction
+/// below this floor would corrupt innocent text, while a run this long
+/// matching a secret prefix is the truncated secret beyond reasonable doubt.
+const MIN_TRUNCATED_SECRET_PREFIX: usize = 64;
+
 #[derive(Clone, Default)]
 pub struct SecretPolicy {
     values: Vec<String>,
@@ -81,7 +89,9 @@ impl SecretPolicy {
     /// must retain bytes[consumed..] for the next chunk and call with eof=true at
     /// finalization. A possible unfinished literal or marker stays pending;
     /// complete markers are preserved without scanning their contents. Retain/truncate only
-    /// the returned safe bytes, never the pending original suffix.
+    /// the returned safe bytes, never the pending original suffix. At end of
+    /// input a trailing fragment that matches the start of a longer secret is
+    /// redacted (see [`MIN_TRUNCATED_SECRET_PREFIX`]).
     pub fn redact_prefix(&self, bytes: &[u8], eof: bool) -> (Vec<u8>, usize) {
         let mut safe = Vec::with_capacity(bytes.len());
         let mut consumed = 0;
@@ -110,6 +120,15 @@ impl SecretPolicy {
             {
                 safe.extend_from_slice(MARKER);
                 consumed += secret.len();
+            } else if eof
+                && rest.len() >= MIN_TRUNCATED_SECRET_PREFIX
+                && self
+                    .values
+                    .iter()
+                    .any(|secret| secret.len() > rest.len() && secret.as_bytes().starts_with(rest))
+            {
+                safe.extend_from_slice(MARKER);
+                consumed += rest.len();
             } else {
                 safe.push(bytes[consumed]);
                 consumed += 1;
@@ -170,6 +189,28 @@ mod tests {
             policy.redact_prefix(b"ab", true),
             (b"[REDACTED]".to_vec(), 2)
         );
+    }
+
+    #[test]
+    fn truncated_secret_tail_at_end_of_input_is_redacted() {
+        // A secret longer than the message bound survives construction only
+        // as a truncated prefix; sanitization must still catch the tail.
+        let secret = "s".repeat(1100);
+        let policy = SecretPolicy::new([secret.as_str(), "owner-credential"]);
+        let bounded: String = format!("metadata_readers limit=4 {secret}")
+            .chars()
+            .take(crate::MAX_FAILURE_MESSAGE_CHARS)
+            .collect();
+        assert!(bounded.len() > 1000);
+        let safe = policy.redact_text(&bounded);
+        assert!(!safe.contains(&"s".repeat(100)), "{safe}");
+        assert!(safe.contains("[REDACTED]"));
+        assert!(safe.starts_with("metadata_readers limit=4 "));
+        // Exact secrets still match literally, short coincidences survive.
+        assert_eq!(policy.redact_text("owner-credential"), "[REDACTED]");
+        assert_eq!(policy.redact_text("ends with s"), "ends with s");
+        assert_eq!(policy.redact_text(&"s".repeat(63)), "s".repeat(63));
+        assert_eq!(policy.redact_text(&"s".repeat(64)), "[REDACTED]");
     }
 
     #[test]
@@ -264,7 +305,7 @@ mod tests {
             .with_stderr(StderrSource::Harness, harness.clone());
         assert_eq!(error.diagnostics.len(), 2);
         assert_eq!(error.code, "unavailable");
-        assert_eq!(error.message, "response lost");
+        assert_eq!(error.message.as_ref(), "response lost");
         assert_eq!(
             classify_dispatched_error(&error.code),
             CommandState::Unknown
@@ -322,7 +363,7 @@ mod tests {
         );
         assert!(serde_json::to_vec(&error).unwrap().len() <= 64 * 1024);
         assert_eq!(error.code, "unavailable");
-        assert_eq!(error.message, "response lost");
+        assert_eq!(error.message.as_ref(), "response lost");
         assert_eq!(
             classify_dispatched_error(&error.code),
             CommandState::Unknown
@@ -349,7 +390,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(error.code, "unavailable");
-            assert_eq!(error.message, "response lost");
+            assert_eq!(error.message.as_ref(), "response lost");
             assert!(error.diagnostics.is_empty());
         }
         let error: Error = serde_json::from_value(json!({"code":"unavailable","message":"response lost","diagnostics":[{

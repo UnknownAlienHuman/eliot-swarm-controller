@@ -1208,15 +1208,15 @@ mod tests {
             let error = validate_source_plan(harness, families, None).expect_err("missing plan");
             assert_eq!(error.code, "unsupported");
             assert_eq!(
-                error.message,
-                format!("{harness} start requires an installed stream source plan")
+                error.message.as_ref(),
+                format!("{harness} start requires an installed stream source plan").as_str()
             );
             let error = validate_source_plan(harness, families, Some(&json!({})))
                 .expect_err("unowned families");
             assert_eq!(error.code, "unsupported");
             assert_eq!(
-                error.message,
-                format!("{harness} start requires stream ownership for {joined}")
+                error.message.as_ref(),
+                format!("{harness} start requires stream ownership for {joined}").as_str()
             );
         }
     }
@@ -1240,8 +1240,8 @@ mod tests {
                 .expect_err("unsupported kind");
             assert_eq!(error.code, "invalid");
             assert_eq!(
-                error.message,
-                format!("{harness} request event kind is unsupported")
+                error.message.as_ref(),
+                format!("{harness} request event kind is unsupported").as_str()
             );
             let error = request_event_id("", "request.opened", id_prefix, harness)
                 .expect_err("empty request id");
@@ -1250,8 +1250,8 @@ mod tests {
             let error = optional_profile_text(&profile, "mode", harness).expect_err("non-string");
             assert_eq!(error.code, "profile_error");
             assert_eq!(
-                error.message,
-                format!("{harness} profile field mode must be a non-empty string")
+                error.message.as_ref(),
+                format!("{harness} profile field mode must be a non-empty string").as_str()
             );
             assert_eq!(
                 optional_profile_text(&profile, "absent", harness).expect("absent"),
@@ -1274,7 +1274,7 @@ mod tests {
         let before = serde_json::to_value(&unknown).expect("serialize unknown");
         let preserved = contextual_error(unknown, "profile_error", "context message");
         assert_eq!(preserved.code, "unknown");
-        assert_eq!(preserved.message, "dummy uncertain outcome");
+        assert_eq!(preserved.message.as_ref(), "dummy uncertain outcome");
         assert_eq!(preserved.diagnostics.len(), 2);
         assert_eq!(
             serde_json::to_value(&preserved).expect("serialize preserved"),
@@ -1283,7 +1283,7 @@ mod tests {
         let normal = Error::new("failed", "original").with_stderr(StderrSource::Plugin, snapshot);
         let contextualized = contextual_error(normal, "profile_error", "context message");
         assert_eq!(contextualized.code, "profile_error");
-        assert_eq!(contextualized.message, "context message");
+        assert_eq!(contextualized.message.as_ref(), "context message");
         assert_eq!(contextualized.diagnostics.len(), 1);
         assert_eq!(contextualized.diagnostics[0].source, StderrSource::Plugin);
     }

@@ -490,6 +490,35 @@ identifiers and structured sanitized tails, applying that policy to the code and
 values. It does not log `Error.message`, request data or environment values. Failure to
 record a diagnostic cannot alter the external-effect result.
 
+### Failure location and origin
+
+Every settled failure carries a typed location and an origin. `where` is a stable
+dotted `component.phase[.detail]` path (`store.dispatch.workspace_gate`,
+`plugin.opencode.start.auth_transfer`, `provider.request`): lowercase
+alphanumerics, dots and underscores, anything else folds to `_`, empty folds to
+`unknown`. `origin` names the layer at fault, never the messenger:
+`swarm` (our code and schema), `harness` (the adapter), `harness_contract_mismatch`
+(the harness behaved differently from its documented protocol), `provider` (the
+model service), `environment` (OS, disk, network, credentials outside every
+adapter), or `unknown` with an evidence note saying what is missing. Structured
+signals only: a provider error classifies from status and machine-readable error
+codes, never from message text. Exit codes ride alongside (`exit_code`, plus an
+`ntstatus` hex string for negative process codes such as `0xC0000005`).
+
+Non-success turn outcomes link their cause: `Turn.preceded_by` holds the command
+whose terminal event settled the turn, `None` for success, running turns and rows
+settled before predecessors were recorded. The store schema migrates forward;
+legacy rows read back as `None`, never as a guessed predecessor.
+
+### Causal chains (`diagnose`)
+
+`diagnose` and `swarm why` assemble the existing records above into a bounded
+response (at most 16 steps, one 512-character summary, per-field byte caps);
+they keep no store of their own. The chain is command outcome, related turn
+outcomes with `preceded_by`, process exits with codes, the last stderr lines,
+and the previous-run crash marker, included only when the terminal failure has
+no classified origin. The summary always starts with the failure origin.
+
 ## Storage
 
 Use bundled SQLite, WAL, synchronous FULL, one writer and bounded read queries. Commit

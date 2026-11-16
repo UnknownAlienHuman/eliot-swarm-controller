@@ -991,7 +991,7 @@ impl EventProcessor {
                             .await;
                     }
                     if self.status.failure.is_none() {
-                        self.status.failure = Some(error.message);
+                        self.status.failure = Some(*error.message);
                     }
                 }
             }
@@ -1018,7 +1018,7 @@ impl EventProcessor {
                             .await;
                     }
                     if self.status.failure.is_none() {
-                        self.status.failure = Some(error.message);
+                        self.status.failure = Some(*error.message);
                     }
                 }
             }
@@ -1324,7 +1324,7 @@ impl EventProcessor {
                     .await;
             }
             if self.status.failure.is_none() {
-                self.status.failure = Some(error.message);
+                self.status.failure = Some(*error.message);
             }
             return Err(Error::new(
                 "unknown",
@@ -3459,7 +3459,7 @@ impl EventProcessor {
                         .await;
                 }
                 if self.status.failure.is_none() {
-                    self.status.failure = Some(error.message);
+                    self.status.failure = Some(*error.message);
                 }
             }
         }

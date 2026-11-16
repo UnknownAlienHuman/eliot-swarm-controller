@@ -351,6 +351,9 @@ fn unknown_native_worktree_creation_defers_same_repo_fetch_until_readback() {
         WorkspaceCreationOutcome::Unknown {
             code: "create_readback_unknown".to_owned(),
             message: "synthetic worktree creation uncertainty".to_owned(),
+            failure_where: None,
+            origin: None,
+            origin_evidence: None,
         },
         now + 23,
     );
@@ -580,6 +583,9 @@ fn retained_ready_resume_unknown_without_git_marker_does_not_fence_fetch() {
         WorkspaceCreationOutcome::Unknown {
             code: "retained_inspection_unknown".to_owned(),
             message: "retained Ready workspace inspection did not complete".to_owned(),
+            failure_where: None,
+            origin: None,
+            origin_evidence: None,
         },
         now + 33,
     );
@@ -674,6 +680,9 @@ fn legacy_absent_marker_is_conservative_but_new_false_unknown_is_read_only() {
         WorkspaceCreationOutcome::Unknown {
             code: "legacy_create_readback_unknown".to_owned(),
             message: "synthetic legacy creation uncertainty".to_owned(),
+            failure_where: None,
+            origin: None,
+            origin_evidence: None,
         },
         now + 22,
     );
@@ -751,6 +760,9 @@ fn legacy_absent_marker_is_conservative_but_new_false_unknown_is_read_only() {
         WorkspaceCreationOutcome::Unknown {
             code: "new_preflight_unknown".to_owned(),
             message: "synthetic pre-native inspection uncertainty".to_owned(),
+            failure_where: None,
+            origin: None,
+            origin_evidence: None,
         },
         new_now + 21,
     );

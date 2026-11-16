@@ -329,6 +329,15 @@ qualification is incomplete; do not describe it as feature complete.
       owner-global configuration edits or automatic harness/model/account
       fallback. Codex against these backends stays unsupported.
 
+- [ ] **Failure diagnostics that say why and where (#384).** Typed `where`/`origin`
+      on every settled failure, sanitized daemon log with standard/debug modes,
+      crash markers surfaced in `daemon.status`, startup output and `swarm why`,
+      owner-scoped `diagnose` plus `swarm why <command|Agent|agent:turn>` with a
+      causal chain and one-line summary, `preceded_by` on turn outcomes, and the
+      same summary in desktop Agent details. Qualify on a private daemon:
+      nonexistent command, killed turn, invalid model, `max_live`, plugin panic
+      and forced daemon panic with the marker consumed exactly once.
+
 ## L7 — Qualification, repair and release
 
 Implement the bounded retention path first, then build/run the complete campaign against

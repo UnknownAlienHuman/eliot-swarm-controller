@@ -42,7 +42,7 @@ mod tests {
             let error = parse_agent_id(id).unwrap_err();
             assert_eq!(error.code, "invalid");
             assert_eq!(
-                error.message,
+                error.message.as_ref(),
                 "Agent id must use the a<positive integer> form"
             );
         }
@@ -60,7 +60,10 @@ mod tests {
         ] {
             let error = parse_agent_id(id).unwrap_err();
             assert_eq!(error.code, "invalid");
-            assert_eq!(error.message, "Agent id is not a signed 64-bit integer");
+            assert_eq!(
+                error.message.as_ref(),
+                "Agent id is not a signed 64-bit integer"
+            );
         }
         for id in [
             "a0",
@@ -73,7 +76,10 @@ mod tests {
         ] {
             let error = parse_agent_id(id).unwrap_err();
             assert_eq!(error.code, "invalid");
-            assert_eq!(error.message, "Agent id must be canonical and positive");
+            assert_eq!(
+                error.message.as_ref(),
+                "Agent id must be canonical and positive"
+            );
         }
     }
 }

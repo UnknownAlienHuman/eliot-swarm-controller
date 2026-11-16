@@ -2,7 +2,7 @@
 use super::args::{
     EditsArgs, EventsArgs, GenerationArgs, GitStatusArgs, HistoryArgs, ListFilterArgs, LsArgs,
     PageArgs, ProcessesArgs, ReadGenerationArgs, ResultArgs, ShowArgs, StatsArgs, TopArgs,
-    UsageArgs, WatchArgs,
+    UsageArgs, WatchArgs, WhyArgs,
 };
 use super::support::read_and_print;
 use super::support::{Failure, PAGE_SIZE, print_value, validate_limit};
@@ -11,9 +11,10 @@ use eliot_core::api::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse,
     AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest, AgentResultResponse,
-    AgentStatsRequest, AgentStatsResponse, EventsBoundsRequest, EventsBoundsResponse, EventsFilter,
-    EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
-    ObservationPage, TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse,
+    AgentStatsRequest, AgentStatsResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
+    EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
+    EventsSubscribeRequest, EventsSubscribeResponse, ObservationPage, TurnCounterMissing,
+    UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{AgentState, Error as CoreError, NativeChildActivityState};
 use serde_json::Value;
@@ -918,6 +919,62 @@ pub(crate) fn truncate_cell(value: &str, width: usize) -> String {
         .take(width.saturating_sub(1))
         .collect::<String>()
         + "~"
+}
+
+pub(crate) async fn run_why(
+    WhyArgs { target }: WhyArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let params = DiagnoseRequest { target };
+    if json_output {
+        read_and_print!(&data_dir, json_output, "diagnose", params, DiagnoseResponse)
+    } else {
+        params
+            .validate()
+            .map_err(|error| Failure::from_core(error, false))?;
+        let response: DiagnoseResponse =
+            eliot_daemon::client_call_typed(&data_dir, "diagnose", &params)
+                .await
+                .map_err(|error| Failure::from_core(error, false))?;
+        params
+            .validate_response(&response)
+            .map_err(|error| Failure::from_core(error, false))?;
+        print_why_diagnosis(&response);
+        Ok(0)
+    }
+}
+
+fn print_why_diagnosis(response: &DiagnoseResponse) {
+    println!("{}", response.summary);
+    for step in &response.steps {
+        let mut line = format!("  [{}]", step.kind);
+        if let Some(code) = step.code.as_deref() {
+            line.push_str(&format!(" {code}"));
+        }
+        if let Some(where_) = step.failure_where.as_deref() {
+            line.push_str(&format!(" at {where_}"));
+        }
+        if let Some(exit) = step.exit_code {
+            line.push_str(&format!(" exit {exit}"));
+        }
+        if let Some(ntstatus) = step.ntstatus.as_deref() {
+            line.push_str(&format!(" {ntstatus}"));
+        }
+        if let Some(message) = step.message.as_deref() {
+            line.push_str(&format!(": {message}"));
+        }
+        println!("{line}");
+        if let Some(origin) = step.origin.as_deref() {
+            println!("    origin: {origin}");
+        }
+    }
+    if let Some(preceded_by) = response.preceded_by.as_deref() {
+        println!("  preceded by: {preceded_by}");
+    }
+    if let Some(crash) = response.previous_crash.as_ref() {
+        println!("  previous crash: {}", crash.summary());
+    }
 }
 
 pub(crate) fn yes_no(value: bool) -> &'static str {

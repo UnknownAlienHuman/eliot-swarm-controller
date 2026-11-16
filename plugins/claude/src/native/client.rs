@@ -234,7 +234,7 @@ impl ClaudeClient {
     }
 
     pub fn diagnostic_error(&self, mut error: Error) -> Error {
-        error.message = self.policy.redact_text(&error.message);
+        error.message = self.policy.redact_text(&error.message).into();
         error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
     }
 
@@ -263,7 +263,7 @@ impl ClaudeClient {
             },
         )?;
 
-        let (_guard, response_rx) = self.pending.insert(id);
+        let (_guard, response_rx) = self.pending.insert(id, subtype, encoded.len());
         if let Err(error) = self.write_encoded(encoded, deadline).await {
             if error.code == "native_not_dispatched" {
                 return Err(error);

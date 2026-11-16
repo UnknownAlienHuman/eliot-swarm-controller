@@ -1009,7 +1009,7 @@ async fn dispatch_control(
             if let Err(error) = processor.finish_hook_callback(&request_id, result).await {
                 processor.status.source_unknown = true;
                 if processor.status.failure.is_none() {
-                    processor.status.failure = Some(error.message);
+                    processor.status.failure = Some(*error.message);
                 }
             }
             publish(processor, status);
@@ -1389,7 +1389,7 @@ impl EventProcessor {
                         .await;
                 }
                 if self.status.failure.is_none() {
-                    self.status.failure = Some(error.message);
+                    self.status.failure = Some(*error.message);
                 }
                 return Err(Error::new(
                     "unknown",
@@ -1437,7 +1437,7 @@ impl EventProcessor {
         if let Err(error) = self.process_record(record).await {
             self.status.source_unknown = true;
             if self.status.failure.is_none() {
-                self.status.failure = Some(error.message);
+                self.status.failure = Some(*error.message);
             }
             return;
         }
@@ -1445,7 +1445,7 @@ impl EventProcessor {
         if let Err(error) = self.flush_buffer().await
             && self.status.failure.is_none()
         {
-            self.status.failure = Some(error.message);
+            self.status.failure = Some(*error.message);
         }
     }
 
@@ -1638,7 +1638,7 @@ impl EventProcessor {
                     data["context_outcomes"] = json!(context_outcomes);
                 }
                 if let Err(error) = self.commit_event("turn.started", native_id, data).await {
-                    settle(outcome, TurnOutcome::Unknown(error.message.clone()));
+                    settle(outcome, TurnOutcome::Unknown((*error.message).clone()));
                     return Err(error);
                 }
                 settle(outcome, TurnOutcome::Associated);
@@ -3300,7 +3300,7 @@ impl EventProcessor {
         if let Err(error) = self.flush_buffer().await
             && self.status.failure.is_none()
         {
-            self.status.failure = Some(error.message);
+            self.status.failure = Some(*error.message);
         }
         if !self.gap_reported && !self.writes_blocked {
             let reason = self

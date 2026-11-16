@@ -490,7 +490,7 @@ impl MusePlugin {
         } = match start::prepare_profile(&params, initialized) {
             Ok(prepared) => prepared,
             Err(error) => {
-                return Ok(self.retain_proven_no_effect_start(&params, error.message));
+                return Ok(self.retain_proven_no_effect_start(&params, *error.message));
             }
         };
         // A spawn failure leaves no child behind: still proven-no-effect.
@@ -538,7 +538,7 @@ impl MusePlugin {
             // Registration failed but the child is terminated: no session was
             // dispatched, so this is proven-no-effect. Registration messages
             // are canned words plus a code, safe to persist as the reason.
-            return Ok(self.retain_proven_no_effect_start(&params, error.message));
+            return Ok(self.retain_proven_no_effect_start(&params, *error.message));
         }
 
         let initialized_native = match Self::initialize_native(
@@ -563,7 +563,7 @@ impl MusePlugin {
                 // model catalogue read) and the child is terminated: no
                 // `session/start|resume` was dispatched and no input was sent,
                 // so this is proven-no-effect (failed, never unknown).
-                return Ok(self.retain_proven_no_effect_start(&params, error.message));
+                return Ok(self.retain_proven_no_effect_start(&params, *error.message));
             }
         };
         session.selected_effort = initialized_native.effort.clone();
@@ -588,7 +588,7 @@ impl MusePlugin {
                     return Err(error.with_code("unknown").with_message(message));
                 }
                 // No `session/resume` was dispatched: proven-no-effect.
-                return Ok(self.retain_proven_no_effect_start(&params, error.message));
+                return Ok(self.retain_proven_no_effect_start(&params, *error.message));
             }
             session.session_id = Some(subject.native_ref.clone());
             if let Err(error) = verify_resume_preflight(
@@ -614,7 +614,7 @@ impl MusePlugin {
                     return Err(error.with_code("unknown").with_message(message));
                 }
                 // Only prerequisite reads ran: proven-no-effect.
-                return Ok(self.retain_proven_no_effect_start(&params, error.message));
+                return Ok(self.retain_proven_no_effect_start(&params, *error.message));
             }
         }
 
@@ -635,7 +635,7 @@ impl MusePlugin {
             match encoded {
                 Ok(value) => ("session/resume", value),
                 Err(error) => {
-                    return Ok(self.retain_proven_no_effect_start(&params, error.message));
+                    return Ok(self.retain_proven_no_effect_start(&params, *error.message));
                 }
             }
         } else {
@@ -653,7 +653,7 @@ impl MusePlugin {
             match encoded {
                 Ok(value) => ("session/start", value),
                 Err(error) => {
-                    return Ok(self.retain_proven_no_effect_start(&params, error.message));
+                    return Ok(self.retain_proven_no_effect_start(&params, *error.message));
                 }
             }
         };

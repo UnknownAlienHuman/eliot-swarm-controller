@@ -623,6 +623,40 @@ impl AgentEditsRequest {
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusRequest {}
 
+/// Debug-only forced daemon panic for crash-capture tests. Compiled out of
+/// release builds together with its router arm.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonPanicTestRequest {}
+
+impl DaemonPanicTestRequest {
+    pub fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+    pub fn validate_response(&self, reply: &DaemonPanicTestResponse) -> Result<()> {
+        if reply.state != "panicking" {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonPanicTestResponse {
+    #[serde(deserialize_with = "required_text")]
+    #[schemars(
+        description = "Always \"panicking\": the hook acknowledged before the panic aborts the process."
+    )]
+    pub state: String,
+}
+
+impl DaemonPanicTestResponse {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.state)
+    }
+}
+
 impl DaemonStatusRequest {
     pub fn validate(&self) -> Result<()> {
         Ok(())
@@ -664,6 +698,10 @@ impl DaemonStatusRequest {
                     || text(&command.verb).is_err()
                     || command.generation.is_some_and(|generation| generation < 0)
             })
+            || reply
+                .previous_crash
+                .as_ref()
+                .is_some_and(|crash| crash.validate().is_err())
         {
             return Err(invalid_response());
         }
@@ -1385,6 +1423,188 @@ pub struct DaemonStatusResponse {
     pub drain: Option<DrainReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionView>,
+    /// The previous run's crash, loaded once at daemon startup from the
+    /// private crash marker and consumed. Absent when the previous run did
+    /// not panic. `swarm daemon` startup output reports the same marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_crash: Option<CrashMarker>,
+}
+
+/// One captured process panic. Written by the panic hook (daemon and every
+/// plugin binary) to the private crash directory as `daemon.panicked` or
+/// `plugin.panicked`, with the thread, `file:line`, the redacted panic
+/// message and a bounded backtrace. The daemon reports the previous run's
+/// marker once: in `daemon.status`, in `swarm daemon` startup output, and in
+/// `swarm why` when relevant. Bounded; the message is control-stripped at
+/// capture and redacted with the daemon secrets at load.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrashMarker {
+    #[serde(deserialize_with = "required_text")]
+    pub code: String,
+    pub thread: String,
+    pub location: String,
+    pub message: String,
+    pub backtrace: String,
+    pub timestamp: i64,
+}
+
+impl CrashMarker {
+    pub const MAX_THREAD_CHARS: usize = 128;
+    pub const MAX_LOCATION_CHARS: usize = 256;
+    pub const MAX_MESSAGE_CHARS: usize = 1024;
+    pub const MAX_BACKTRACE_CHARS: usize = 8192;
+
+    pub fn validate(&self) -> Result<()> {
+        if self.code != "daemon.panicked" && self.code != "plugin.panicked" {
+            return Err(invalid_response());
+        }
+        if self.thread.chars().count() > Self::MAX_THREAD_CHARS
+            || self.location.chars().count() > Self::MAX_LOCATION_CHARS
+            || self.message.chars().count() > Self::MAX_MESSAGE_CHARS
+            || self.backtrace.chars().count() > Self::MAX_BACKTRACE_CHARS
+            || self.timestamp < 0
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+
+    /// One-line plain-language crash note for startup output and `swarm why`.
+    pub fn summary(&self) -> String {
+        let message = self.message.trim();
+        let short = message.chars().take(160).collect::<String>();
+        format!("{} at {}: {}", self.code, self.location, short)
+    }
+}
+
+/// Owner-scoped read-only failure diagnosis: `swarm why <command-id | agent
+/// | agent:turn>`. Assembles a bounded causal chain from existing events and
+/// readbacks, with no new store of record: the command lifecycle with code,
+/// message and `where`; the related turn outcome and native error; process
+/// exits with codes; the last stderr lines (redacted); a previous-run crash
+/// marker if relevant; and a one-line plain-language summary that starts
+/// with the failure origin.
+pub const MAX_DIAGNOSE_STEPS: usize = 16;
+pub const MAX_DIAGNOSE_SUMMARY_CHARS: usize = 512;
+pub const MAX_DIAGNOSE_MESSAGE_CHARS: usize = 1024;
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnoseRequest {
+    #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Command id, Agent id, or Agent id with turn id as agent:turn.")]
+    pub target: String,
+}
+
+impl DiagnoseRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.target.chars().count() > 256 {
+            return Err(Error::new("invalid", "diagnose target exceeds its bound"));
+        }
+        text(&self.target)
+    }
+
+    pub fn validate_response(&self, reply: &DiagnoseResponse) -> Result<()> {
+        reply.validate()
+    }
+}
+
+/// One link of the causal chain: a command, turn, process exit, crash marker,
+/// control command or stderr tail. String fields are bounded and redacted;
+/// `origin` names the failure origin vocabulary.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnoseStep {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
+    pub failure_where: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_evidence: Option<String>,
+    /// Captured process exit for `process` steps: numeric code, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    /// Windows NTSTATUS hex for crash statuses (for example `0xC0000005`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ntstatus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<i64>,
+}
+
+impl DiagnoseStep {
+    pub fn validate(&self) -> Result<()> {
+        if self.kind.chars().count() > 64
+            || self
+                .code
+                .as_deref()
+                .is_some_and(|code| code.chars().count() > 128)
+            || self
+                .message
+                .as_deref()
+                .is_some_and(|message| message.chars().count() > MAX_DIAGNOSE_MESSAGE_CHARS)
+            || self
+                .failure_where
+                .as_deref()
+                .is_some_and(|where_| where_.chars().count() > 128)
+            || self
+                .origin
+                .as_deref()
+                .is_some_and(|origin| origin.chars().count() > 32)
+            || self
+                .origin_evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.chars().count() > 512)
+            || self
+                .ntstatus
+                .as_deref()
+                .is_some_and(|ntstatus| ntstatus.chars().count() > 16)
+            || self.at.is_some_and(|at| at < 0)
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnoseResponse {
+    pub target: String,
+    pub summary: String,
+    pub steps: Vec<DiagnoseStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preceded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_crash: Option<CrashMarker>,
+}
+
+impl DiagnoseResponse {
+    pub fn validate(&self) -> Result<()> {
+        if text(&self.target).is_err()
+            || self.target.chars().count() > 256
+            || self.summary.chars().count() > MAX_DIAGNOSE_SUMMARY_CHARS
+            || self.summary.trim().is_empty()
+            || self.steps.len() > MAX_DIAGNOSE_STEPS
+            || self.steps.iter().any(|step| step.validate().is_err())
+            || self
+                .preceded_by
+                .as_deref()
+                .is_some_and(|id| text(id).is_err() || id.chars().count() > 64)
+            || self
+                .previous_crash
+                .as_ref()
+                .is_some_and(|crash| crash.validate().is_err())
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
 }
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1760,7 +1980,7 @@ mod tests {
     fn unknown(result: Result<()>) {
         let error = result.unwrap_err();
         assert_eq!(error.code, "unknown");
-        assert_eq!(error.message, "Agent view response is invalid");
+        assert_eq!(error.message.as_ref(), "Agent view response is invalid");
         assert!(error.diagnostics.is_empty());
     }
 

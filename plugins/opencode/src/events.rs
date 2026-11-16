@@ -814,12 +814,12 @@ impl EventProcessor {
                                 .await;
                         }
                         if self.status.failure.is_none() {
-                            self.status.failure = Some(error.message);
+                            self.status.failure = Some(*error.message);
                         }
                     } else if let Err(error) = self.flush_buffer().await
                         && self.status.failure.is_none()
                     {
-                        self.status.failure = Some(error.message);
+                        self.status.failure = Some(*error.message);
                         self.status.source_unknown = true;
                     }
                 }

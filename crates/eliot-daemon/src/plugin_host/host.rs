@@ -1576,6 +1576,15 @@ async fn run_agent_inner(
     loop {
         tokio::select! {
             status = child.wait() => {
+                // The plugin process exit is process evidence: its numeric
+                // code (and NTSTATUS for crash statuses) with the redacted
+                // stderr tail is recorded on `agent.lost` below. A killed
+                // process has no code; the tail still says what it last
+                // reported.
+                let exit = eliot_core::ProcessExit::from_code(
+                    status.as_ref().ok().and_then(|status| status.code()),
+                );
+                let stderr_tail = stderr.snapshot().text;
                 if let Some(state) = state.upgrade() {
                     fence_command_routing(&state, &key);
                 }
@@ -1618,7 +1627,13 @@ async fn run_agent_inner(
                     &state, &key, drained, control_gone, gap_reason,
                 ).await.is_ok();
                 if source_settled && control_gone && !planned_exit {
-                    mark_lost_state(&state, &key).await;
+                    mark_lost_state_with_exit(
+                        &state,
+                        &key,
+                        Some(exit),
+                        Some(stderr_tail),
+                    )
+                    .await;
                 }
                 break;
             }
@@ -3805,7 +3820,9 @@ async fn settle_drained_source_exit(
     .await;
     settlement.map_err(|mut error: Error| {
         error.code = "unknown".to_owned();
-        error.message = "owned exit native source settlement is unconfirmed".to_owned();
+        error.message = "owned exit native source settlement is unconfirmed"
+            .to_owned()
+            .into();
         error
     })?;
     if !reader_closed {
@@ -3851,6 +3868,20 @@ async fn record_root_exit_gap(state: &Weak<HostState>, key: &AgentKey, reason: &
 }
 
 async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey) {
+    mark_lost_state_with_exit(state, key, None, None).await;
+}
+
+/// Mark an agent generation lost with its process exit evidence: the
+/// numeric exit code, the Windows NTSTATUS hex for crash statuses, and the
+/// bounded redacted stderr tail recorded on the `agent.lost` event. Exit
+/// evidence comes from the observed plugin process wait; the tail is the
+/// already-redacted capture snapshot.
+async fn mark_lost_state_with_exit(
+    state: &Weak<HostState>,
+    key: &AgentKey,
+    exit: Option<eliot_core::ProcessExit>,
+    stderr_tail: Option<String>,
+) {
     let Some(state) = state.upgrade() else {
         return;
     };
@@ -3861,7 +3892,9 @@ async fn mark_lost_state(state: &Weak<HostState>, key: &AgentKey) {
             deferred.store(true, Ordering::Release);
             return;
         }
-        if let Ok(events) = store.mark_lost(&key.id, key.generation, now_ms()) {
+        if let Ok(events) =
+            store.mark_lost_with_exit(&key.id, key.generation, now_ms(), exit, stderr_tail)
+        {
             state.bus.publish(&events);
             note_unknown_commands(&state, &events);
         }
@@ -4386,7 +4419,7 @@ mod tests {
 
     fn assert_secret_error(error: Error) {
         assert_eq!(error.code, "secret_in_payload");
-        assert_eq!(error.message, SECRET_ERROR);
+        assert_eq!(error.message.as_str(), SECRET_ERROR);
         assert!(!serde_json::to_string(&error).unwrap().contains(SECRET));
     }
 

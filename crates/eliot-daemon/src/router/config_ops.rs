@@ -17,6 +17,18 @@ use eliot_core::{
 };
 use serde_json::Value;
 
+impl Router {
+    fn apply_saved_log_level(data_root: &std::path::Path) {
+        // Best effort: a read failure keeps the current level; the next
+        // save or restart repairs it. Never fails the save itself.
+        if let Ok(config) = crate::config::load_daemon_config(data_root)
+            && let Ok(level) = crate::logging::LogLevel::parse(&config.log_level)
+        {
+            crate::logging::set_log_level(level);
+        }
+    }
+}
+
 fn encode<T: serde::Serialize>(value: &T, what: &str) -> Result<Value> {
     serde_json::to_value(value)
         .map_err(|_| Error::new("internal", format!("{what} could not be encoded")))
@@ -140,6 +152,12 @@ impl Router {
         )?;
         self.publish_locked(&events);
         drop(store);
+        // `[daemon] log_level` applies live: refresh it from the saved
+        // file so standard/debug switches without a restart. Other daemon
+        // keys still report through `restart_required`.
+        if reply.saved {
+            Self::apply_saved_log_level(&self.inner.data_root);
+        }
         if !events.is_empty() {
             self.signal_progress();
         }

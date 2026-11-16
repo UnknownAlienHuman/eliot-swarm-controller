@@ -775,7 +775,7 @@ impl EventProcessor {
                             .await;
                     }
                     if self.status.failure.is_none() {
-                        self.status.failure = Some(error.message);
+                        self.status.failure = Some(*error.message);
                     }
                 }
             }
@@ -797,7 +797,7 @@ impl EventProcessor {
                         let _ = self.record_gap(&reason).await;
                     }
                     if self.status.failure.is_none() {
-                        self.status.failure = Some(error.message);
+                        self.status.failure = Some(*error.message);
                     }
                 }
             }
@@ -1274,7 +1274,7 @@ impl EventProcessor {
                         .await;
                 }
                 if self.status.failure.is_none() {
-                    self.status.failure = Some(error.message);
+                    self.status.failure = Some(*error.message);
                 }
                 return Err(Error::new(
                     "unknown",
@@ -2221,7 +2221,7 @@ impl EventProcessor {
                     error.code
                 );
                 if state.failure.is_none() {
-                    state.failure = Some(error.message);
+                    state.failure = Some(*error.message);
                 }
                 (!state.gap_reported && !state.writes_blocked, reason)
             };
@@ -2347,7 +2347,7 @@ impl EventProcessor {
                     error.code
                 );
                 if state.failure.is_none() {
-                    state.failure = Some(error.message);
+                    state.failure = Some(*error.message);
                 }
                 (!state.gap_reported && !state.writes_blocked, reason)
             };
@@ -2638,7 +2638,7 @@ impl EventProcessor {
                             state.source_unknown = true;
                             let code = error.code.clone();
                             if state.failure.is_none() {
-                                state.failure = Some(error.message);
+                                state.failure = Some(*error.message);
                             }
                             (!state.gap_reported && !state.writes_blocked, code)
                         };

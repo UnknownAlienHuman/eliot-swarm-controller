@@ -310,7 +310,7 @@ impl AgyClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.clone(), kind);
-        let (guard, _receiver) = self.pending.insert(id.clone());
+        let (guard, _receiver) = self.pending.insert(id.clone(), method, encoded.len());
         let registration = FencedGuard {
             _guard: guard,
             fenced: Arc::clone(&self.fenced),
@@ -426,7 +426,7 @@ impl AgyClient {
     }
 
     pub fn diagnostic_error(&self, mut error: Error) -> Error {
-        error.message = self.policy.redact_text(&error.message);
+        error.message = self.policy.redact_text(&error.message).into();
         error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
     }
 
@@ -447,7 +447,7 @@ impl AgyClient {
                 params,
             },
         )?;
-        let (_guard, response_rx) = self.pending.insert(id);
+        let (_guard, response_rx) = self.pending.insert(id, method, encoded.len());
         if let Err(error) = self.write_encoded(encoded, deadline).await {
             if error.code == "native_not_dispatched" {
                 return Err(error);
