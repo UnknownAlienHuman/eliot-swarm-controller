@@ -104,6 +104,7 @@ pub(super) fn persist_turn_fact(
         usage: None,
         config_revision: current_config_revision_tx(tx, id, agent.generation)?,
         config: None,
+        preceded_by: None,
     });
     match event.kind.as_str() {
         "turn.started" => {
@@ -191,6 +192,7 @@ pub(super) fn persist_turn_fact(
                 completed_at: turn.completed_at,
                 usage: None,
                 config_revision: turn.config_revision,
+                preceded_by: turn.preceded_by.as_deref(),
             },
         )?;
     } else {

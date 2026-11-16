@@ -386,7 +386,7 @@ mod tests {
                 serde_json::from_value(json!({"id":"id","verb":"send","args":bad})).unwrap();
             let error = request.validate().unwrap_err();
             assert_eq!(error.code, "invalid");
-            assert_eq!(error.message, "command args must be a JSON object");
+            assert_eq!(error.message.as_ref(), "command args must be a JSON object");
         }
     }
 

@@ -814,12 +814,12 @@ impl EventProcessor {
                                 .await;
                         }
                         if self.status.failure.is_none() {
-                            self.status.failure = Some(error.message);
+                            self.status.failure = Some(*error.message);
                         }
                     } else if let Err(error) = self.flush_buffer().await
                         && self.status.failure.is_none()
                     {
-                        self.status.failure = Some(error.message);
+                        self.status.failure = Some(*error.message);
                         self.status.source_unknown = true;
                     }
                 }
@@ -2592,6 +2592,22 @@ fn terminal_turn_data(
         native_error.map(|error| error.message.as_str()),
         secrets,
     );
+    if status == "failed" {
+        let origin = native_error
+            .map(|error| error.failure_origin())
+            .unwrap_or(eliot_core::FailureOrigin::Unknown);
+        eliot_plugin::session::attach_failure_origin(
+            &mut data,
+            "opencode",
+            origin,
+            if origin == eliot_core::FailureOrigin::Provider {
+                "Session.StructuredError provider type with upstream HTTP error status"
+            } else {
+                "native terminal lacks a structured upstream failure status"
+            },
+            secrets,
+        );
+    }
     data
 }
 

@@ -81,7 +81,12 @@ impl NativeStdioConfig for MuseStdioConfig {
         // `-32603` internal, all other MSP kinds, unknown codes — leaves an
         // admitted write unruled-out, so it is unknown, never rejected.
         if is_not_admitted(error.code) {
-            Err(Error::new("native_rejected", error.message))
+            Err(Error::new("native_rejected", error.message)
+                .with_where("plugin.muse.native.response")
+                .with_origin(
+                    eliot_core::FailureOrigin::Harness,
+                    "MSP pre-admission refusal",
+                ))
         } else {
             Err(Error::new(
                 "unknown",
@@ -91,6 +96,11 @@ impl NativeStdioConfig for MuseStdioConfig {
                     error.code,
                     MuseStdioConfig::NATIVE_ERROR_SUFFIX,
                 ),
+            )
+            .with_where("plugin.muse.native.response")
+            .with_origin(
+                eliot_core::FailureOrigin::Harness,
+                "MSP native error; upstream error class absent",
             ))
         }
     }

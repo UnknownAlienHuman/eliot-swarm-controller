@@ -308,6 +308,19 @@ impl DesktopApp {
             section(palette, "Agent", &agent_lines),
         ));
 
+        // The failure diagnosis summary: why and where the Agent last
+        // failed, from the same monitor read as the identity above. The
+        // full causal chain lives behind `swarm why`.
+        if let Some(summary) = read
+            .and_then(|read| read.diagnosis.as_ref().ok())
+            .filter(|summary| !summary.trim().is_empty())
+        {
+            sections.push(KeyedView::new(
+                "diagnosis",
+                section(palette, "Diagnosis", std::slice::from_ref(summary)),
+            ));
+        }
+
         // How the profile was chosen: the routing decision frozen at
         // admission, with every skipped candidate.
         let choice = match (detail, read) {

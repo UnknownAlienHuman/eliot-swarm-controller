@@ -1,5 +1,14 @@
 //! Authoritative daemon diagnostics, owned by run(), never by its CLI starter.
 //! Records are optional diagnostics, not semantic outcomes or replay authority.
+//!
+//! Two modes, both bounded with rotation. Standard mode records lifecycle,
+//! failures (with origin, `where`, code and classified evidence), crash
+//! markers, capacity refusals and daemon retention. Debug mode additionally
+//! records every RPC with timing, every plugin frame as metadata only
+//! (method, direction, size, latency, turn and command IDs; never content),
+//! every process start and exit with numeric metadata, and Store transaction
+//! timings. Secrets, prompts and model output never enter either mode.
+//! `swarm why` works in standard mode; debug only adds detail.
 
 use crate::platform::{
     DataDir,
@@ -14,13 +23,50 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 const LOG_BYTES: u64 = 1024 * 1024;
 const RECORD_BYTES: usize = 32 * 1024;
+pub(crate) const CAPACITY_REFUSAL_CODE: &str = "command.refused";
 static LOG: Mutex<Option<LogFile>> = Mutex::new(None);
+static LEVEL: AtomicU8 = AtomicU8::new(LogLevel::Standard as u8);
+
+/// Daemon log verbosity. Standard is the working mode; debug is the
+/// everything mode for chasing a live failure. Hot-reloadable through
+/// `settings.save` (`[daemon] log_level`); never a restart gate on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LogLevel {
+    Standard = 0,
+    Debug = 1,
+}
+
+impl LogLevel {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "standard" => Ok(Self::Standard),
+            "debug" => Ok(Self::Debug),
+            _ => Err(Error::new(
+                "profile_error",
+                "config.toml: daemon.log_level must be standard or debug",
+            )),
+        }
+    }
+}
+
+/// Current verbosity for this process. The daemon sets it at startup from
+/// `[daemon] log_level` and refreshes it on every `settings.save`.
+pub(crate) fn set_log_level(level: LogLevel) {
+    LEVEL.store(level as u8, Ordering::Relaxed);
+}
+
+pub(crate) fn is_debug() -> bool {
+    LEVEL.load(Ordering::Relaxed) == LogLevel::Debug as u8
+}
 
 /// Holding this guard keeps the daemon's log open; drop closes it before the
 /// enclosing single-owner lock is released. No reader/caller retains the file.
@@ -52,15 +98,44 @@ impl Drop for DaemonLog {
 }
 
 /// Best effort: neither encoding nor filesystem failure can change an external
-/// operation's code, result, acknowledgement or retry behavior. Error.message,
-/// requests and inherited environment are deliberately never written here.
+/// operation's code, result, acknowledgement or retry behavior. Request
+/// parameters, prompts, model output, environment values and raw native
+/// frames are deliberately never written here. A record failure is
+/// diagnostic loss only: it cannot change command settlement, source
+/// acknowledgement or process cleanup.
 pub(crate) fn record(
     policy: &SecretPolicy,
     code: &str,
     ids: &[(&str, &str)],
     error: Option<&Error>,
 ) {
-    write_record(policy, code, ids, None, error)
+    write_record(policy, code, ids, None, None, error)
+}
+
+/// Debug-only record: typed nonnegative numeric fields next to bounded
+/// string ids. Numbers are encoded as JSON numbers; callers pass no
+/// free-form text here, so secrets cannot enter through this path. Dropped
+/// unless the daemon runs at debug log level.
+pub(crate) fn record_debug(
+    policy: &SecretPolicy,
+    code: &str,
+    ids: &[(&str, &str)],
+    fields: &[(&str, u64)],
+) {
+    if !is_debug() {
+        return;
+    }
+    let mut detail = Map::new();
+    for (key, value) in fields.iter().take(8) {
+        if key.len() <= 64
+            && key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            detail.insert((*key).to_owned(), Value::from(*value));
+        }
+    }
+    write_record(policy, code, ids, None, Some(detail), None)
 }
 
 /// Typed nonnegative counts for one concrete diagnostic command. Counts are
@@ -81,7 +156,7 @@ pub(crate) fn record_counts(
     counts: Counts,
     error: Option<&Error>,
 ) {
-    write_record(policy, code, &[], Some(counts), error)
+    write_record(policy, code, &[], Some(counts), None, error)
 }
 
 fn write_record(
@@ -89,9 +164,10 @@ fn write_record(
     code: &str,
     ids: &[(&str, &str)],
     counts: Option<Counts>,
+    detail: Option<Map<String, Value>>,
     error: Option<&Error>,
 ) {
-    let Some(bytes) = encode_record(policy, code, ids, counts, error) else {
+    let Some(bytes) = encode_record(policy, code, ids, counts, detail, error) else {
         return;
     };
     let mut current = LOG.lock_recover();
@@ -119,6 +195,7 @@ fn encode_record(
     code: &str,
     ids: &[(&str, &str)],
     counts: Option<Counts>,
+    detail: Option<Map<String, Value>>,
     error: Option<&Error>,
 ) -> Option<Vec<u8>> {
     let ts = SystemTime::now()
@@ -164,9 +241,21 @@ fn encode_record(
             "digests": counts.digests,
         });
     }
+    if let Some(detail) = detail
+        && !detail.is_empty()
+    {
+        value["detail"] = Value::Object(detail);
+    }
     if let Some(error) = error {
         value["error_code"] = json!(bounded_text(policy, &error.code, 64));
-        let mut diagnostics = error.diagnostics.clone();
+        if let Some(where_) = error.failure_where.as_deref() {
+            value["where"] = json!(bounded_text(policy, where_, 128));
+        }
+        value["origin"] = json!(error.origin_or_unknown().as_str());
+        if let Some(evidence) = error.origin_evidence.as_deref() {
+            value["origin_evidence"] = json!(bounded_text(policy, evidence, 512));
+        }
+        let mut diagnostics = (*error.diagnostics).clone();
         for diagnostic in &mut diagnostics {
             diagnostic.snapshot.text = policy.redact_text(&diagnostic.snapshot.text);
         }
@@ -182,6 +271,62 @@ fn encode_record(
     }
     bytes.push(b'\n');
     Some(bytes)
+}
+
+/// Exact-ID capacity preflight evidence when no command was admitted. These
+/// optional rotated records are diagnostics only, never command/replay state.
+pub(crate) fn capacity_refusal(
+    data_root: &std::path::Path,
+    id: &str,
+    policy: &SecretPolicy,
+) -> Option<eliot_core::api::DiagnoseStep> {
+    if ulid::Ulid::from_string(id).is_err() {
+        return None;
+    }
+    for name in ["daemon.log", "daemon.log.1"] {
+        let path = data_root.join("logs").join(name);
+        if crate::platform::data_dir::ensure_private_file(&path).is_err() {
+            continue;
+        }
+        let Ok(file) = File::open(path) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if file.take(LOG_BYTES).read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        for line in bytes
+            .rsplit(|byte| *byte == b'\n')
+            .filter(|line| line.len() <= RECORD_BYTES)
+        {
+            let Ok(value) = serde_json::from_slice::<Value>(line) else {
+                continue;
+            };
+            if value["code"] != CAPACITY_REFUSAL_CODE
+                || value["ids"]["command"] != id
+                || value["error_code"] != "capacity_unavailable"
+                || value["origin"] != "swarm"
+            {
+                continue;
+            }
+            return Some(eliot_core::api::DiagnoseStep {
+                kind: "admission".to_owned(),
+                code: Some("capacity_unavailable".to_owned()),
+                message: Some("capacity refused before command admission".to_owned()),
+                failure_where: value["where"]
+                    .as_str()
+                    .map(|text| bounded_text(policy, text, 128)),
+                origin: Some("swarm".to_owned()),
+                origin_evidence: value["origin_evidence"]
+                    .as_str()
+                    .map(|text| bounded_text(policy, text, 512)),
+                exit_code: None,
+                ntstatus: None,
+                at: value["ts"].as_i64().filter(|at| *at >= 0),
+            });
+        }
+    }
+    None
 }
 
 struct LogFile {
@@ -266,6 +411,73 @@ mod tests {
     use super::*;
     use eliot_core::{MAX_STDERR_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource};
 
+    #[test]
+    fn capacity_refusal_is_exact_id_and_excludes_free_text() {
+        let root = FreshRoot::new();
+        let data = DataDir::open(&root.0).unwrap();
+        let lock = data.acquire_daemon_lock().unwrap();
+        let mut log = LogFile::open(&data, &lock).unwrap();
+        let id = ulid::Ulid::new().to_string();
+        let error = Error::new(
+            "capacity_unavailable",
+            "unclassified input must not be logged",
+        )
+        .with_where("store.admission.capacity")
+        .with_origin(
+            eliot_core::FailureOrigin::Swarm,
+            "configured local capacity bound is reserved",
+        );
+        let policy = SecretPolicy::default();
+        log.write(
+            &encode_record(
+                &policy,
+                "command.refused",
+                &[("command", &id)],
+                None,
+                None,
+                Some(&error),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let step = capacity_refusal(data.path(), &id, &policy).unwrap();
+        assert_eq!(step.origin.as_deref(), Some("swarm"));
+        assert_eq!(
+            step.failure_where.as_deref(),
+            Some("store.admission.capacity")
+        );
+        assert!(
+            !serde_json::to_string(&step)
+                .unwrap()
+                .contains("unclassified input")
+        );
+        assert!(capacity_refusal(data.path(), &ulid::Ulid::new().to_string(), &policy).is_none());
+    }
+
+    #[test]
+    fn standard_record_excludes_free_text_message() {
+        let error = Error::new("failed", "arbitrary user content")
+            .with_where("plugin.start")
+            .with_origin(eliot_core::FailureOrigin::Harness, "native refusal");
+        let bytes = encode_record(
+            &SecretPolicy::default(),
+            "command.failed",
+            &[],
+            None,
+            None,
+            Some(&error),
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("error_message").is_none());
+        assert!(
+            !String::from_utf8(bytes)
+                .unwrap()
+                .contains("arbitrary user content")
+        );
+        assert_eq!(value["origin"], "harness");
+    }
+
     struct FreshRoot(PathBuf);
     impl FreshRoot {
         fn new() -> Self {
@@ -287,7 +499,10 @@ mod tests {
         let lock = data.acquire_daemon_lock().unwrap();
         let policy = SecretPolicy::new([data.owner_token(), "log-test-secret"]);
         let mut log = LogFile::open(&data, &lock).unwrap();
-        let mut error = Error::new("unknown", "request text must never enter this log");
+        let mut error = Error::new(
+            "unknown",
+            "request carrying log-test-secret must never enter this log",
+        );
         for source in [StderrSource::Plugin, StderrSource::Harness] {
             error = error.with_stderr(
                 source,
@@ -308,6 +523,7 @@ mod tests {
             "plugin.failed",
             &[("agent", "a1")],
             None,
+            None,
             Some(&error),
         )
         .unwrap();
@@ -327,7 +543,7 @@ mod tests {
                 !contents.contains("log-test-secret"),
                 "known credential leaked"
             );
-            assert!(!contents.contains("request text must never enter this log"));
+            assert!(!contents.contains("request carrying"));
             let first: Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
             assert_eq!(first["diagnostics"].as_array().unwrap().len(), 2);
             drop(open_private_log_file(&path).unwrap()); // owner/reparse/DACL validation
@@ -350,8 +566,10 @@ mod tests {
                     read_error: false,
                 },
             })
-            .collect();
-        let bytes = encode_record(&policy, "operation.unknown", &[], None, Some(&error)).unwrap();
+            .collect::<Vec<_>>()
+            .into();
+        let bytes =
+            encode_record(&policy, "operation.unknown", &[], None, None, Some(&error)).unwrap();
         assert!(bytes.len() <= RECORD_BYTES);
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         let diagnostics = &value["diagnostics"];
@@ -367,7 +585,7 @@ mod tests {
             );
         }
         assert_eq!(error.code, "unknown");
-        assert_eq!(error.message, "primary message remains unchanged");
+        assert_eq!(error.message.as_str(), "primary message remains unchanged");
     }
 
     #[test]
@@ -399,6 +617,7 @@ mod tests {
             "rpc.error",
             &[("method", "daemon.status")],
             None,
+            None,
             Some(&error),
         )
         .unwrap();
@@ -410,6 +629,7 @@ mod tests {
             &policy,
             "rpc.error",
             &[("request", "must-not-appear")],
+            None,
             None,
             Some(&error),
         )
@@ -430,8 +650,15 @@ mod tests {
                 .unwrap();
         }
         let mut log = LogFile::open(&data, &lock).unwrap();
-        let record =
-            encode_record(&SecretPolicy::default(), "daemon.starting", &[], None, None).unwrap();
+        let record = encode_record(
+            &SecretPolicy::default(),
+            "daemon.starting",
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         log.write(&record).unwrap();
         drop(log);
         for name in ["daemon.log", "daemon.log.1"] {

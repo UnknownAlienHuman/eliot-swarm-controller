@@ -539,11 +539,15 @@ fn restart_required_for_change(
                     needs_restart.push(*section);
                     continue;
                 };
+                // Retention windows and the log level apply live: they are
+                // never a restart gate on their own.
                 if let Some(object) = before.as_object_mut() {
                     object.remove("retention");
+                    object.remove("log_level");
                 }
                 if let Some(object) = after.as_object_mut() {
                     object.remove("retention");
+                    object.remove("log_level");
                 }
                 if before != after {
                     needs_restart.push(*section);

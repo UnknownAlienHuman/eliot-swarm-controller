@@ -1,4 +1,4 @@
-use eliot_core::{Error, Result};
+use eliot_core::{Error, FailureOrigin, Result};
 use eliot_plugin::sync::LockExt;
 use std::process::ExitStatus;
 #[cfg(any(windows, target_os = "linux"))]
@@ -218,17 +218,9 @@ impl OwnedChild {
         command
             .as_std_mut()
             .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
-        let cwd = command
-            .as_std()
-            .get_current_dir()
-            .map(|dir| dir.display().to_string())
-            .unwrap_or_else(|| "<unknown>".to_owned());
-        let mut child = command.spawn().map_err(|error| {
-            io_error(
-                &format!("spawn suspended child in working directory {cwd}"),
-                error,
-            )
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| io_error("spawn suspended child", error))?;
         let process = match child.raw_handle() {
             Some(process) => process,
             None => {
@@ -650,7 +642,15 @@ mod leaf_tests {
 }
 
 fn io_error(action: &str, error: std::io::Error) -> Error {
+    // Process-start failures are the OS/machine refusing: a missing binary
+    // or denied execution is `environment`, never a secret, parameter or
+    // prompt. The action names the gate, never a working directory.
     Error::new("platform_io", format!("{action}: {error}"))
+        .with_where("platform.process.spawn")
+        .with_origin(
+            FailureOrigin::Environment,
+            "OS refused the process start (missing binary, denied execution, or machine limit)",
+        )
 }
 
 #[cfg(all(test, windows))]

@@ -6,6 +6,7 @@ mod command;
 mod config_ops;
 mod context;
 mod coordination;
+mod diagnose;
 mod digests;
 pub(crate) mod discovery;
 mod goals;
@@ -43,10 +44,10 @@ use eliot_core::{
         AgentListRequest, AgentListResponse, AgentListRow, AgentProcessesRequest,
         AgentProcessesResponse, AgentResultRequest, AgentResultResponse, AgentStatsRequest,
         AgentStatsResponse, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
-        CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse,
-        DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, DoctorHarnessEntry, DrainReport,
-        EmitDefinitionArgs, EventsBoundsRequest, EventsFilter, EventsReadRequest,
-        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+        CommandSubmitRequest, CommandSubmitResponse, CrashMarker, DaemonShutdownRequest,
+        DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage,
+        DoctorHarnessEntry, DrainReport, EmitDefinitionArgs, EventsBoundsRequest, EventsFilter,
+        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
         GitFetchDefinitionArgs, GitView, HarnessDoctorRequest, HarnessDoctorResponse,
         HeavyAgentTotals, HeavyEpisodeView, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS,
         MAX_SWARM_WAIT_TARGETS, MaintenanceRunRequest, MaintenanceRunResponse,
@@ -130,6 +131,7 @@ struct RouterInner {
     observe: Mutex<ObserveThresholds>,
     workspaces: WorkspaceManager,
     workspace_recovery_error: Mutex<Option<String>>,
+    previous_crash: Mutex<Option<CrashMarker>>,
     automation_tasks: Mutex<Vec<(String, WorkerTaskHealth, Option<String>)>>,
     mode: AtomicU8,
     shutdown_ready: AtomicBool,
@@ -262,6 +264,7 @@ impl Router {
                 observe: Mutex::new(ObserveThresholds::default()),
                 workspaces,
                 workspace_recovery_error: Mutex::new(None),
+                previous_crash: Mutex::new(None),
                 automation_tasks: Mutex::new(vec![
                     ("rule_worker".to_owned(), WorkerTaskHealth::Starting, None),
                     ("goal_driver".to_owned(), WorkerTaskHealth::Starting, None),
@@ -291,6 +294,10 @@ impl Router {
             .transpose()
             .map_err(|_| Error::new("not_allowed", "invalid remote context"))?;
         authorize_rpc_method(&principal, method)?;
+        // Debug mode times every RPC at this single choke point. Standard
+        // mode pays one Instant read and a branch; no parameters, prompts or
+        // results ever enter the record.
+        let started = std::time::Instant::now();
         let result = match method {
             "client.identity" => self.inference_identity(&params, &principal).await,
             "inference.client.install" => {
@@ -328,10 +335,38 @@ impl Router {
                 require_owner(&principal)?;
                 self.shutdown(&params, &principal).await
             }
+            // Debug-only forced daemon panic for crash-capture tests.
+            // Compiled out of release builds: the detached thread panic
+            // aborts the process after the hook writes its marker.
+            #[cfg(debug_assertions)]
+            "daemon.panic_test" => {
+                require_owner(&principal)?;
+                std::thread::spawn(|| {
+                    panic!("debug daemon panic-test trigger");
+                });
+                Ok(json!({"state": "panicking"}))
+            }
             "maintenance.run" => self.maintenance_run(&params, &principal).await,
             "command.submit" => {
-                self.submit_bound(&params, &principal, remote.as_ref())
-                    .await
+                let result = self
+                    .submit_bound(&params, &principal, remote.as_ref())
+                    .await;
+                // Capacity preflight can refuse before a command exists.
+                // Retain diagnostic metadata under the caller's exact ID in
+                // the existing bounded log; this grants no replay authority.
+                if let Err(error) = &result
+                    && error.code == "capacity_unavailable"
+                    && let Some(id) = params.get("id").and_then(Value::as_str)
+                    && ulid::Ulid::from_string(id).is_ok()
+                {
+                    crate::logging::record(
+                        &self.secret_policy_snapshot(),
+                        crate::logging::CAPACITY_REFUSAL_CODE,
+                        &[("command", id)],
+                        Some(error),
+                    );
+                }
+                result
             }
             "command.get" => self.command_get(&params, &principal).await,
             "command.children" => self.command_children(&params, &principal).await,
@@ -354,6 +389,7 @@ impl Router {
             "agent.edits" => self.agent_edits(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,
             "turn.resolve" => self.turn_resolve(&params, &principal).await,
+            "diagnose" => self.diagnose(&params, &principal).await,
             "events.bounds" => self.events_bounds(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
@@ -402,7 +438,35 @@ impl Router {
                 "unsupported",
                 format!("daemon method {method} is not implemented"),
             )),
-        }?;
+        };
+        // Every RPC is timed here for debug mode: method, elapsed
+        // milliseconds and ok/error. The method vocabulary is ours; params
+        // and results never enter the record.
+        if crate::logging::is_debug() {
+            let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let mut fields: [(&str, u64); 2] = [("elapsed_ms", elapsed_ms), ("ok", 0)];
+            if result.is_ok() {
+                fields[1].1 = 1;
+            }
+            let policy = SecretPolicy::new(self.daemon_secrets());
+            let (code, ids) = match &result {
+                Ok(_) => (
+                    "rpc.handled",
+                    [("method", method.to_owned()), ("code", String::new())],
+                ),
+                Err(error) => (
+                    "rpc.failed",
+                    [("method", method.to_owned()), ("code", error.code.clone())],
+                ),
+            };
+            crate::logging::record_debug(
+                &policy,
+                code,
+                &[("method", &ids[0].1), ("code", &ids[1].1)],
+                &fields,
+            );
+        }
+        let result = result?;
         Ok(match remote {
             Some(remote) => json!({"result": result, "remote_call": remote}),
             None => result,
@@ -4648,6 +4712,10 @@ impl Router {
             .map_err(|_| Error::new("internal", "maintenance.run result could not be encoded"))
     }
 
+    pub(super) fn set_previous_crash(&self, crash: Option<CrashMarker>) {
+        *self.inner.previous_crash.lock_recover() = crash;
+    }
+
     async fn status(&self) -> Result<Value> {
         let blockers = self.status_blockers().await?;
         let drain = self.drain_report().await?;
@@ -4713,6 +4781,7 @@ impl Router {
             blockers,
             drain: Some(drain),
             retention,
+            previous_crash: self.inner.previous_crash.lock_recover().clone(),
         })
         .map_err(|_| Error::new("internal", "daemon status could not be encoded"))
     }
@@ -6982,6 +7051,7 @@ fn reject_unknown_map_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_core::FailureOrigin;
     use eliot_core::api::{FrozenGitFetch, RuleCatchUpRequest};
     use eliot_store::RuleCatchUpAction;
 
@@ -7777,6 +7847,9 @@ mod tests {
                     eliot_core::WorkspaceCreationOutcome::Unknown {
                         code: "preflight_inspection_unknown".to_owned(),
                         message: "read-only workspace inspection did not complete".to_owned(),
+                        failure_where: Some("store.dispatch.workspace_gate".to_owned()),
+                        origin: Some(eliot_core::FailureOrigin::Unknown),
+                        origin_evidence: Some("preflight inspection state unresolved".to_owned()),
                     },
                     now + 4,
                 )
@@ -8151,7 +8224,14 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .unwrap()
                 .is_new
         );
-        router.reject_undispatched(&second_id, "test_cleanup").await;
+        router
+            .reject_undispatched_error(
+                &second_id,
+                &Error::new("test_cleanup", "test_cleanup")
+                    .with_where("router.dispatch.test")
+                    .with_origin(FailureOrigin::Swarm, "test-only cleanup rejection"),
+            )
+            .await;
         let drained = router
             .shutdown(
                 &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
@@ -9997,7 +10077,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .await
             .unwrap_err();
         assert_eq!(error.code, "internal");
-        assert_eq!(error.message, "retained shutdown result is invalid");
+        assert_eq!(
+            error.message.as_str(),
+            "retained shutdown result is invalid"
+        );
         assert!(
             !serde_json::to_string(&error)
                 .unwrap()
@@ -10066,7 +10149,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .await
             .unwrap_err();
         assert_eq!(error.code, "invalid");
-        assert_eq!(error.message, "command args must be a JSON object");
+        assert_eq!(error.message.as_str(), "command args must be a JSON object");
         assert_eq!(
             router
                 .submit(
@@ -10225,7 +10308,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let store = router.inner.store.lock().await;
         let command = store.get_command(&id).unwrap().unwrap();
         assert_eq!(command.state, CommandState::Rejected);
-        assert_eq!(command.outcome, Some(json!({"reason":"provider_held"})));
+        assert_eq!(
+            command.outcome,
+            Some(
+                json!({"reason":"provider_held", "message":"provider scope is held", "where":"router.dispatch.unknown", "origin":"unknown", "origin_evidence":"no origin classified where this error was created"})
+            )
+        );
         let events = store.read_events(0, 100, None).unwrap();
         assert!(events.iter().any(|event| event.kind == "command.rejected"));
         assert!(
@@ -10481,7 +10569,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             (command, events)
         };
         assert_eq!(rejected.state, CommandState::Rejected);
-        assert_eq!(rejected.outcome, Some(json!({"reason":"not_allowed"})));
+        assert_eq!(
+            rejected.outcome,
+            Some(
+                json!({"reason":"not_allowed", "message":"project registration changed after command admission", "where":"router.dispatch.unknown", "origin":"unknown", "origin_evidence":"no origin classified where this error was created"})
+            )
+        );
         assert_eq!(
             events_after_rejection
                 .iter()
@@ -10691,7 +10784,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             (command, events)
         };
         assert_eq!(rejected.state, CommandState::Rejected);
-        assert_eq!(rejected.outcome, Some(json!({"reason":"not_allowed"})));
+        assert_eq!(
+            rejected.outcome,
+            Some(
+                json!({"reason":"not_allowed", "message":"frozen global interpreter is no longer approved", "where":"router.dispatch.unknown", "origin":"unknown", "origin_evidence":"no origin classified where this error was created"})
+            )
+        );
         assert_eq!(
             events_after_rejection
                 .iter()
@@ -10762,7 +10860,14 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
 
         // A losing preflight must not overwrite the command after the winning
         // processor has committed its dispatch decision.
-        router.reject_undispatched(&id, "preflight_failed").await;
+        router
+            .reject_undispatched_error(
+                &id,
+                &Error::new("preflight_failed", "preflight_failed")
+                    .with_where("router.dispatch.test")
+                    .with_origin(FailureOrigin::Swarm, "test-only losing preflight"),
+            )
+            .await;
         {
             let store = router.inner.store.lock().await;
             assert_eq!(
@@ -10978,7 +11083,14 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             (agent, launch_id, resume_id, linked_id, previous_workspace)
         };
 
-        router.reject_undispatched(&resume_id, "not_allowed").await;
+        router
+            .reject_undispatched_error(
+                &resume_id,
+                &Error::new("not_allowed", "test-only resume refusal")
+                    .with_where("router.dispatch.test")
+                    .with_origin(FailureOrigin::Swarm, "test-only resume refusal"),
+            )
+            .await;
 
         let store = router.inner.store.lock().await;
         assert_eq!(

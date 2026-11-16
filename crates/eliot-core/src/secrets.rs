@@ -30,7 +30,10 @@ impl SecretPolicy {
         self.values.iter().any(|secret| text.contains(secret))
     }
 
-    /// Complete redaction markers are preserved across repeated sanitization.
+    /// Redact complete input before applying any bound. Complete redaction
+    /// markers are preserved across repeated sanitization. Streaming callers
+    /// must retain the unfinished suffix from `redact_prefix(_, false)`;
+    /// guessing whether an arbitrary text suffix is a secret is unsafe.
     pub fn redact_text(&self, text: &str) -> String {
         let (safe, _) = self.redact_prefix(text.as_bytes(), true);
         String::from_utf8_lossy(&safe).into_owned()
@@ -81,7 +84,9 @@ impl SecretPolicy {
     /// must retain bytes[consumed..] for the next chunk and call with eof=true at
     /// finalization. A possible unfinished literal or marker stays pending;
     /// complete markers are preserved without scanning their contents. Retain/truncate only
-    /// the returned safe bytes, never the pending original suffix.
+    /// the returned safe bytes, never the pending original suffix. At end of
+    /// input a trailing fragment that matches the start of a longer secret is
+    /// redacted (see [`MIN_TRUNCATED_SECRET_PREFIX`]).
     pub fn redact_prefix(&self, bytes: &[u8], eof: bool) -> (Vec<u8>, usize) {
         let mut safe = Vec::with_capacity(bytes.len());
         let mut consumed = 0;
@@ -129,6 +134,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn short_token_crossing_message_bound_is_redacted_before_truncation() {
+        let token = "0123456789abcdef".repeat(3);
+        let policy = SecretPolicy::new([&token]);
+        let error = Error::new("failed", format!("{}{token}", "x".repeat(1000))).sanitized(&policy);
+        assert_eq!(*error.message, format!("{}[REDACTED]", "x".repeat(1000)));
+        let decoded: Error = serde_json::from_value(json!({
+            "code": "failed", "message": format!("{}{token}", "x".repeat(1000))
+        }))
+        .unwrap();
+        assert_eq!(decoded.sanitized(&policy).message, error.message);
+    }
+
+    #[test]
     fn empty_short_overlap_and_generated_markers() {
         let empty = SecretPolicy::new([""]);
         assert!(!empty.contains_text("anything"));
@@ -170,6 +188,25 @@ mod tests {
             policy.redact_prefix(b"ab", true),
             (b"[REDACTED]".to_vec(), 2)
         );
+    }
+
+    #[test]
+    fn long_secret_is_redacted_before_message_bound_without_prefix_guessing() {
+        let secret = "s".repeat(1100);
+        let policy = SecretPolicy::new([secret.as_str(), "owner-credential"]);
+        let safe =
+            Error::new("busy", format!("metadata_readers limit=4 {secret}")).sanitized(&policy);
+        assert_eq!(*safe.message, "metadata_readers limit=4 [REDACTED]");
+        // Complete text uses literal matches; arbitrary suffix coincidences
+        // must not corrupt ordinary messages. Streaming carries every prefix.
+        assert_eq!(policy.redact_text("owner-credential"), "[REDACTED]");
+        assert_eq!(policy.redact_text("ends with s"), "ends with s");
+        for length in [1, 24, 48, 63, 64, 1024] {
+            assert_eq!(
+                policy.redact_prefix(&vec![b's'; length], false),
+                (Vec::new(), 0)
+            );
+        }
     }
 
     #[test]
@@ -264,7 +301,7 @@ mod tests {
             .with_stderr(StderrSource::Harness, harness.clone());
         assert_eq!(error.diagnostics.len(), 2);
         assert_eq!(error.code, "unavailable");
-        assert_eq!(error.message, "response lost");
+        assert_eq!(error.message.as_ref(), "response lost");
         assert_eq!(
             classify_dispatched_error(&error.code),
             CommandState::Unknown
@@ -322,7 +359,7 @@ mod tests {
         );
         assert!(serde_json::to_vec(&error).unwrap().len() <= 64 * 1024);
         assert_eq!(error.code, "unavailable");
-        assert_eq!(error.message, "response lost");
+        assert_eq!(error.message.as_ref(), "response lost");
         assert_eq!(
             classify_dispatched_error(&error.code),
             CommandState::Unknown
@@ -349,7 +386,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(error.code, "unavailable");
-            assert_eq!(error.message, "response lost");
+            assert_eq!(error.message.as_ref(), "response lost");
             assert!(error.diagnostics.is_empty());
         }
         let error: Error = serde_json::from_value(json!({"code":"unavailable","message":"response lost","diagnostics":[{
