@@ -354,9 +354,13 @@ impl DesktopApp {
                     self.apply_scheme();
                     self.reprime_fields(context);
                 }
+                // The first observation colors the title bar even when the
+                // palette is the starting one.
+                self.sync_title_bar();
             }
             ShellMsg::WindowResized(size) => {
                 self.window_width = Some(size.width);
+                self.sync_title_bar();
                 if size.width >= 640.0 && size.height >= 480.0 {
                     let window = (size.width as u32, size.height as u32);
                     if self.window_size != Some(window) {
@@ -442,6 +446,22 @@ impl DesktopApp {
     fn apply_scheme(&mut self) {
         if let Err(error) = crate::app_resources::apply_scheme(self.palette().scheme()) {
             self.set_status(format!("WinUI M3 resources not applied: {error}"));
+        }
+        self.sync_title_bar();
+    }
+
+    /// Color the title bar in the shown palette once the window exists and
+    /// whenever the palette changes (a runtime theme switch, High Contrast).
+    /// Until the window is shown the colors stay pending and the next scheme
+    /// or size observation tries again.
+    fn sync_title_bar(&mut self) {
+        let palette = self.palette();
+        if self.title_bar == Some(palette) {
+            return;
+        }
+        match crate::app_resources::apply_title_bar(palette.scheme()) {
+            Ok(()) => self.title_bar = Some(palette),
+            Err(error) => self.set_status(format!("Title bar colors not applied: {error}")),
         }
     }
 

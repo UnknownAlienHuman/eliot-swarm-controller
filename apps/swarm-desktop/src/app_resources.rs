@@ -38,11 +38,17 @@
 //! `Button` (`native/winui/mod.rs` `set_resource_overrides` writes into that
 //! element's own `Resources`); everything else here has no Reactor property.
 //!
+//! The window's title bar takes the same surface role ([`apply_title_bar`]).
+//!
 //! Interface ids and vtable slots are those of `Microsoft.UI.Xaml.winmd`
 //! (WinUI 2.3.0 metadata): `IApplicationStatics` slot 6 `get_Current`,
 //! `IApplication` slot 6 `get_Resources`, `IXamlReaderStatics` slot 6
-//! `Load`. Only these three calls are declared; Reactor's own bindings are
-//! crate-private.
+//! `Load`; and of `Microsoft.UI.winmd` (Windows App SDK 2.1.3, read with
+//! System.Reflection.Metadata; the `IAppWindow` and `IAppWindowTitleBar` ids
+//! match Reactor's own bindings): `IAppWindowStatics` slot 9
+//! `GetFromWindowId`, `IAppWindow` slot 16 `get_TitleBar` and the
+//! `IAppWindowTitleBar` color setters listed in [`title_bar_colors`]. Only
+//! these calls are declared; Reactor's own bindings are crate-private.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -51,6 +57,12 @@ use std::fmt::Write as _;
 use windows_collections::IMap;
 use windows_core::{GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface, RuntimeName};
 use windows_reference::IReference;
+use windows_sys::Win32::Foundation::{HWND, LPARAM};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible,
+};
+use windows_sys::core::BOOL;
 
 use crate::theme::{Rgb8, Scheme, state};
 use crate::ui::tokens::{height, radius, spacing};
@@ -1030,6 +1042,234 @@ fn load_xaml(xaml: &str) -> windows_core::Result<IInspectable> {
     Ok(unsafe { IInspectable::from_raw(out) })
 }
 
+/// `Windows.UI.Color`, the value of the title bar's color properties.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UiColor {
+    a: u8,
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl windows_core::imp::TypeKind for UiColor {
+    type TypeKind = windows_core::imp::CopyType;
+}
+
+impl windows_core::RuntimeType for UiColor {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::from_slice(b"struct(Windows.UI.Color;u1;u1;u1;u1)");
+}
+
+impl From<Rgb8> for UiColor {
+    fn from(value: Rgb8) -> Self {
+        Self {
+            a: 255,
+            r: value.r,
+            g: value.g,
+            b: value.b,
+        }
+    }
+}
+
+/// `IAppWindowTitleBar` setter slots (`Microsoft.UI.winmd`, Windows App SDK
+/// 2.1.3) and the M3 role each takes: the window content's surface with
+/// on-surface text, M3 state layers on the caption buttons, on-surface-variant
+/// text while the window is inactive. Windows keeps its own close-button
+/// hover and press colors.
+pub fn title_bar_colors(s: &Scheme) -> [(usize, Rgb8); 12] {
+    let hover = s.surface.mix(s.on_surface, state::HOVER);
+    let pressed = s.surface.mix(s.on_surface, state::PRESSED);
+    [
+        (7, s.surface),             // put_BackgroundColor
+        (9, s.surface),             // put_ButtonBackgroundColor
+        (11, s.on_surface),         // put_ButtonForegroundColor
+        (13, hover),                // put_ButtonHoverBackgroundColor
+        (15, s.on_surface),         // put_ButtonHoverForegroundColor
+        (17, s.surface),            // put_ButtonInactiveBackgroundColor
+        (19, s.on_surface_variant), // put_ButtonInactiveForegroundColor
+        (21, pressed),              // put_ButtonPressedBackgroundColor
+        (23, s.on_surface),         // put_ButtonPressedForegroundColor
+        (27, s.on_surface),         // put_ForegroundColor
+        (32, s.surface),            // put_InactiveBackgroundColor
+        (34, s.on_surface_variant), // put_InactiveForegroundColor
+    ]
+}
+
+/// Color the window's title bar in the shown scheme's surface role, so it
+/// reads as part of the content in both schemes (Windows draws its own light
+/// caption, a warm grey, beside the M3 surface otherwise). `None` (High
+/// Contrast) clears the colors, so the system colors apply.
+///
+/// Reactor 0.100.0 sets only `AppWindowTitleBar.PreferredTheme` and exposes
+/// neither the window handle nor its `AppWindow`, so this follows the Windows
+/// App SDK's own interop path (`Microsoft.UI.Interop.h`): the process's
+/// WinUI window, `Windowing_GetWindowIdFromWindow` from
+/// `Microsoft.Internal.FrameworkUdk.dll`, `AppWindow.GetFromWindowId`, then
+/// the `AppWindowTitleBar` color properties (supported for the default
+/// title bar on Windows 11).
+pub fn apply_title_bar(scheme: Option<&Scheme>) -> Result<(), String> {
+    let hwnd = own_window().ok_or("the window is not shown yet")?;
+    let window_id = window_id(hwnd)?;
+    let run = || -> windows_core::Result<()> {
+        let statics = windows_core::factory::<AppWindow, IAppWindowStatics>()?;
+        let mut out = std::ptr::null_mut();
+        // SAFETY: slot 9 of IAppWindowStatics is GetFromWindowId(WindowId,
+        // out AppWindow); WindowId is one UInt64 passed by value.
+        unsafe { (statics.vtable().get_from_window_id)(statics.as_raw(), window_id, &mut out) }
+            .ok()?;
+        if out.is_null() {
+            return Err(windows_core::Error::empty());
+        }
+        // SAFETY: GetFromWindowId returned one owned reference.
+        let app_window: IAppWindow = unsafe { IInspectable::from_raw(out) }.cast()?;
+        // SAFETY: slot 16 of IAppWindow is get_TitleBar.
+        let title_bar: IAppWindowTitleBar =
+            unsafe { get(&app_window, app_window.vtable().title_bar) }?.cast()?;
+        let colors: Vec<(usize, Option<IReference<UiColor>>)> = match scheme {
+            Some(scheme) => title_bar_colors(scheme)
+                .into_iter()
+                .map(|(slot, color)| (slot, Some(IReference::from(UiColor::from(color)))))
+                .collect(),
+            None => title_bar_colors(Scheme::of(false))
+                .into_iter()
+                .map(|(slot, _)| (slot, None))
+                .collect(),
+        };
+        for (slot, value) in colors {
+            let raw = title_bar.vtable().methods[slot - 6];
+            // SAFETY: every listed slot of IAppWindowTitleBar is a
+            // put_*Color(IReference<Windows.UI.Color>) setter; null clears it.
+            let setter: Setter = unsafe { std::mem::transmute::<usize, Setter>(raw) };
+            let argument = value
+                .as_ref()
+                .map_or(std::ptr::null_mut(), Interface::as_raw);
+            // SAFETY: the setter belongs to this title bar's vtable and only
+            // borrows the reference for the call.
+            unsafe { setter(title_bar.as_raw(), argument) }.ok()?;
+        }
+        Ok(())
+    };
+    run().map_err(|error| format!("{error} ({:#010X})", error.code().0))
+}
+
+/// This process's visible WinUI window (the desktop has one).
+fn own_window() -> Option<HWND> {
+    struct Search {
+        pid: u32,
+        found: HWND,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, search: LPARAM) -> BOOL {
+        // SAFETY: `search` is the `Search` passed to EnumWindows below, alive
+        // for the whole enumeration.
+        let search = unsafe { &mut *(search as *mut Search) };
+        let mut pid = 0;
+        // SAFETY: plain Win32 queries on a window handle EnumWindows gave us.
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        // SAFETY: as above.
+        if pid != search.pid || unsafe { IsWindowVisible(hwnd) } == 0 {
+            return 1;
+        }
+        let mut class = [0u16; 64];
+        // SAFETY: the buffer and its length match.
+        let length = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
+        if String::from_utf16_lossy(&class[..length.max(0) as usize]) == WINUI_WINDOW_CLASS {
+            search.found = hwnd;
+            return 0;
+        }
+        1
+    }
+    let mut search = Search {
+        pid: std::process::id(),
+        found: std::ptr::null_mut(),
+    };
+    // SAFETY: the callback only reads and writes `search`, which outlives the
+    // call.
+    unsafe { EnumWindows(Some(visit), &mut search as *mut Search as LPARAM) };
+    (!search.found.is_null()).then_some(search.found)
+}
+
+/// The window class of a WinUI 3 desktop window.
+const WINUI_WINDOW_CLASS: &str = "WinUIDesktopWin32WindowClass";
+
+/// `Windowing_GetWindowIdFromWindow`, as `Microsoft.UI.Interop.h` loads it.
+fn window_id(hwnd: HWND) -> Result<u64, String> {
+    type GetWindowId = unsafe extern "system" fn(HWND, *mut u64) -> HRESULT;
+    let dll: Vec<u16> = "Microsoft.Internal.FrameworkUdk.dll\0"
+        .encode_utf16()
+        .collect();
+    // SAFETY: a NUL-terminated wide string; the module is the Windows App
+    // SDK runtime WinUI already loaded (the header falls back to loading it).
+    let mut module = unsafe { GetModuleHandleW(dll.as_ptr()) };
+    if module.is_null() {
+        // SAFETY: as above.
+        module = unsafe { LoadLibraryW(dll.as_ptr()) };
+    }
+    if module.is_null() {
+        return Err("Microsoft.Internal.FrameworkUdk.dll is not loaded".to_owned());
+    }
+    // SAFETY: a NUL-terminated export name of a loaded module.
+    let export =
+        unsafe { GetProcAddress(module, c"Windowing_GetWindowIdFromWindow".as_ptr().cast()) }
+            .ok_or("Windowing_GetWindowIdFromWindow is not exported")?;
+    // SAFETY: the export has the `PfnGetWindowIdFromWindow` signature of
+    // Microsoft.UI.Interop.h (HWND, WindowId*) -> HRESULT; WindowId is one
+    // UInt64.
+    let get_window_id: GetWindowId = unsafe { std::mem::transmute(export) };
+    let mut id = 0u64;
+    // SAFETY: `id` is a valid out pointer for the call.
+    unsafe { get_window_id(hwnd, &mut id) }
+        .ok()
+        .map_err(|error| error.to_string())?;
+    Ok(id)
+}
+
+type Setter = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT;
+
+#[repr(C)]
+struct AppWindowStaticsVtbl {
+    base: InspectableSlots,
+    create: [usize; 3],
+    get_from_window_id: unsafe extern "system" fn(*mut c_void, u64, *mut *mut c_void) -> HRESULT,
+}
+
+#[repr(C)]
+struct AppWindowVtbl {
+    base: InspectableSlots,
+    /// get_Id … put_Title (slots 6–15).
+    before_title_bar: [usize; 10],
+    title_bar: Getter,
+}
+
+#[repr(C)]
+struct AppWindowTitleBarVtbl {
+    base: InspectableSlots,
+    /// Slots 6–38: the color properties, ExtendsContentIntoTitleBar, Height,
+    /// IconShowOptions, insets, ResetToDefault and SetDragRectangles.
+    methods: [usize; 33],
+}
+
+winrt_interface!(
+    IAppWindowStatics,
+    AppWindowStaticsVtbl,
+    0x3c315c24_d540_5d72_b518_b226b83627cb
+);
+winrt_interface!(
+    IAppWindow,
+    AppWindowVtbl,
+    0xcfa788b3_643b_5c5e_ad4e_321d48a82acd
+);
+winrt_interface!(
+    IAppWindowTitleBar,
+    AppWindowTitleBarVtbl,
+    0x5574efa2_c91c_5700_a363_539c71a7aaf4
+);
+
+struct AppWindow;
+impl RuntimeName for AppWindow {
+    const NAME: &'static str = "Microsoft.UI.Windowing.AppWindow";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,6 +1351,32 @@ mod tests {
         ));
         assert!(xaml.contains("<CornerRadius x:Key=\"ControlCornerRadius\">8</CornerRadius>"));
         assert!(xaml.contains("<CornerRadius x:Key=\"OverlayCornerRadius\">12</CornerRadius>"));
+    }
+
+    #[test]
+    fn the_title_bar_takes_the_content_surface_on_setter_slots() {
+        for dark in [false, true] {
+            let s = Scheme::of(dark);
+            let colors = title_bar_colors(s);
+            // put_BackgroundColor and put_InactiveBackgroundColor: the surface.
+            for slot in [7, 32] {
+                let color = colors.iter().find(|(at, _)| *at == slot).map(|(_, c)| *c);
+                assert_eq!(color, Some(s.surface), "slot {slot} dark={dark}");
+            }
+            let mut slots: Vec<usize> = colors.iter().map(|(slot, _)| *slot).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            assert_eq!(slots.len(), colors.len());
+            // Every setter is an odd slot (put_ after get_) in 7..=34, the
+            // color properties of IAppWindowTitleBar.
+            assert!(slots.iter().all(|slot| (7..=34).contains(slot)));
+            assert!(
+                slots
+                    .iter()
+                    .filter(|slot| **slot < 24)
+                    .all(|slot| slot % 2 == 1)
+            );
+        }
     }
 
     #[test]

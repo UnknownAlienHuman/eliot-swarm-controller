@@ -114,8 +114,6 @@ pub mod layout {
     /// A multiline source editor (TOML, JSON, a script).
     pub const SOURCE_MIN_HEIGHT: f64 = 240.0;
     pub const SOURCE_MAX_HEIGHT: f64 = 420.0;
-    /// The rules list scrolls past this height.
-    pub const RULES_MAX_HEIGHT: f64 = 180.0;
     /// The hand-off dialog's scrolling body.
     pub const DIALOG_MAX_HEIGHT: f64 = 520.0;
     /// A dropdown inside the hand-off dialog.

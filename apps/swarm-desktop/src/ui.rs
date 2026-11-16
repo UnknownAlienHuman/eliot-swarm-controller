@@ -236,6 +236,8 @@ struct DesktopApp {
     /// A notice for the owner above the composer, until dismissed.
     alert: Option<String>,
     appearance: shell_ui::Appearance,
+    /// The palette the title bar was last colored in (`None`: not yet).
+    title_bar: Option<theme::winui::Palette>,
     /// The `[desktop]` preferences (theme, what opens at start).
     prefs: crate::settings::Preferences,
     /// A preferences write is running (see `save_preferences`).
@@ -492,6 +494,7 @@ impl Component for DesktopApp {
             status: "Connecting to the daemon…".to_owned(),
             alert: None,
             appearance: shell_ui::Appearance::new(),
+            title_bar: None,
             prefs: crate::settings::Preferences::default(),
             prefs_saving: false,
             prefs_rev: 0,
