@@ -16,7 +16,7 @@ use std::{collections::HashMap, ffi::OsString, path::Path, time::Duration};
 
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, ProcessRecord, ProcessState,
-    Result, SecretPolicy, SourceBatch, SourceGap,
+    ProviderRestriction, Result, SecretPolicy, SourceBatch, SourceGap,
 };
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
@@ -853,6 +853,43 @@ pub fn attach_final_text_unavailable(data: &mut Value, policy: &SecretPolicy) {
             Value::String("event_budget".to_owned()),
         );
     }
+}
+
+/// Attach a terminal provider-restriction fact to committed event data.
+/// The key and its value define immutable wire semantics: refuse to write
+/// when the redaction policy collides with the key or value, when the field
+/// is already present, or when the encoded event would exceed its bound.
+/// Returns whether the field was attached.
+pub fn attach_provider_restriction(
+    data: &mut Value,
+    restriction: ProviderRestriction,
+    policy: &SecretPolicy,
+) -> bool {
+    let Ok(value) = serde_json::to_value(restriction) else {
+        return false;
+    };
+    // The key and actual value define immutable semantics and may not be redacted.
+    if policy.contains_text("provider_restriction")
+        || policy.contains_value(&value)
+        || data
+            .as_object()
+            .is_none_or(|fields| fields.contains_key("provider_restriction"))
+    {
+        return false;
+    }
+    let mut candidate = data.clone();
+    let Some(fields) = candidate.as_object_mut() else {
+        return false;
+    };
+    fields.insert("provider_restriction".to_owned(), value.clone());
+    if serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES) {
+        return false;
+    }
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert("provider_restriction".to_owned(), value);
+        return true;
+    }
+    false
 }
 
 /// The stream-commit half of a harness event processor: the commit sink, the

@@ -1956,6 +1956,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_root_is_created_exclusively_and_bound_to_generation() {
         let root = std::env::temp_dir().join(format!("eliot-root-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir(&root).unwrap();
         let router = super::super::tests::router_with_data_root(root.clone());
         let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
@@ -2041,7 +2042,6 @@ mod tests {
                 .is_err()
         );
         drop(router);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
@@ -2229,6 +2229,7 @@ mod tests {
     #[test]
     fn daemon_lock_absent_is_clean_and_live_owner_keeps() {
         let dir = std::env::temp_dir().join(format!("eliot-lock-test-{}", ulid::Ulid::new()));
+        let _temp_3 = crate::test_support::TempDir::own(dir.clone());
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(Router::cleanup_check_daemon_lock(&dir).is_ok());
@@ -2258,6 +2259,7 @@ mod tests {
     #[tokio::test]
     async fn another_repositories_tracked_descendants_are_protected() {
         let (root, work) = scratch_repo("primary");
+        let _temp_4 = crate::test_support::TempDir::own(root.clone());
         let other = root.join("other");
         std::fs::create_dir_all(other.join("sources")).unwrap();
         git(&other, &["init", "-b", "main"]);
@@ -2284,6 +2286,7 @@ mod tests {
     #[tokio::test]
     async fn stale_remote_head_cannot_replace_fresh_default_discovery() {
         let (root, work) = scratch_repo("stale-head");
+        let _temp_5 = crate::test_support::TempDir::own(root.clone());
         assert_eq!(
             git(&work, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
             "refs/remotes/origin/main"
@@ -2302,6 +2305,7 @@ mod tests {
     #[tokio::test]
     async fn merged_branch_classifies_safe_and_applies() {
         let (root, work) = scratch_repo("merged");
+        let _temp_6 = crate::test_support::TempDir::own(root.clone());
         git(&work, &["checkout", "-b", "feature-a"]);
         commit_file(&work, "a.txt", "a\n");
         git(&work, &["push", "-u", "origin", "feature-a"]);
@@ -2330,6 +2334,7 @@ mod tests {
     #[tokio::test]
     async fn unmerged_and_ahead_branches_stay_keep() {
         let (root, work) = scratch_repo("keeps");
+        let _temp_7 = crate::test_support::TempDir::own(root.clone());
         git(&work, &["checkout", "-b", "unmerged"]);
         commit_file(&work, "u.txt", "u\n");
         let unmerged = binding(&work, "unmerged");
@@ -2373,6 +2378,7 @@ mod tests {
     #[tokio::test]
     async fn remote_deleted_merged_branch_is_safe_and_remote_delete_roundtrips() {
         let (root, work) = scratch_repo("remote");
+        let _temp_8 = crate::test_support::TempDir::own(root.clone());
         git(&work, &["checkout", "-b", "gone"]);
         commit_file(&work, "g.txt", "g\n");
         git(&work, &["push", "-u", "origin", "gone"]);
@@ -2397,6 +2403,7 @@ mod tests {
     #[tokio::test]
     async fn checked_out_branch_refuses_delete() {
         let (root, work) = scratch_repo("checkedout");
+        let _temp_9 = crate::test_support::TempDir::own(root.clone());
         let current = git(&work, &["rev-parse", "--abbrev-ref", "HEAD"]);
         let tip = git(
             &work,

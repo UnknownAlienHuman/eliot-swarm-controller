@@ -38,6 +38,7 @@ pub use scripts::ScriptRunAdmission;
 pub use usage::ResolvedUsageScope;
 
 use eliot_core::api::{AgentConfigView, AgentSummary, HeavySummaryView, SessionGrowthView};
+use eliot_core::limits::{MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES};
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
@@ -64,9 +65,6 @@ use workspace::recover_workspaces;
 const MAX_PAGE_ENTRIES: usize = 1_000;
 const MAX_PAGE_BYTES: usize = 900 * 1024;
 const MAX_NATIVE_FAMILIES: i64 = 9;
-const MAX_EVENT_BYTES: usize = 64 * 1024;
-const MAX_INPUT_BYTES: usize = 512 * 1024;
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Allowed generator-clock skew for ULID age checks. A mutation id timestamp
 /// may run ahead of the Store commit clock by up to this margin; admission
@@ -6624,7 +6622,7 @@ fn optional_string(value: &Value, field: &str) -> Result<Option<String>> {
 }
 
 fn check_input(text: &str) -> Result<()> {
-    if text.len() > MAX_INPUT_BYTES {
+    if text.len() > MAX_TEXT_BYTES {
         return Err(Error::new(
             "frame_too_large",
             "inline input exceeds 512 KiB",

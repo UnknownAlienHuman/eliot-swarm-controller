@@ -4,8 +4,8 @@
 use super::{GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView};
 use crate::{
     Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
-    NativeChildActivityState, ProcessIdentity, ProcessRecord, Result, SessionUsage, TurnOutcome,
-    TurnUsage,
+    NativeChildActivityState, ProcessIdentity, ProcessRecord, Result, SessionUsage, StderrSnapshot,
+    TurnOutcome, TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -1469,12 +1469,20 @@ pub enum CloudMcpCustody {
 
 /// Current managed cloud MCP child-pair state. `running` proves the two child
 /// leaders are alive; it does not prove public tunnel connectivity or auth.
+/// The stderr tails are bounded, redacted supervisor-owned snapshots of the
+/// managed HTTP child and cloudflared; they are present once the supervisor
+/// records them, normally on a failed or finished run, and stay absent while
+/// both children are still starting.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloudMcpStatus {
     pub public_url: String,
     pub health: CloudMcpHealth,
     pub custody: CloudMcpCustody,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_stderr: Option<StderrSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_stderr: Option<StderrSnapshot>,
 }
 
 impl CloudMcpStatus {
