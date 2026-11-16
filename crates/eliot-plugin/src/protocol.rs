@@ -370,6 +370,15 @@ impl McpHttpReady {
     }
 }
 
+/// Private metadata-only quota request; never logged or persisted.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaReadParams {
+    pub profile: Value,
+    #[serde(default = "empty_object")]
+    pub environment: Value,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

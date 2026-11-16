@@ -661,6 +661,76 @@ async fn kill_and_reap(child: &mut Child) -> bool {
         .is_ok_and(|wait| wait.is_ok())
 }
 
+/// Read only the selected canonical credential using the native export schema.
+/// No import or write is performed; stderr and secret-bearing parse failures are discarded.
+pub(crate) async fn quota_credential(
+    profile: &serde_json::Value,
+    environment: Option<&serde_json::Value>,
+) -> Result<String> {
+    let cmd = profile
+        .get("cmd")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            eliot_plugin::quota::environment("OpenCode native executable is unavailable")
+        })?;
+    let mut command = Command::new(cmd);
+    if let Some(environment) = environment.and_then(serde_json::Value::as_object) {
+        for (key, value) in environment {
+            if let Some(value) = value.as_str() {
+                command.env(key, value);
+            }
+        }
+    }
+    command
+        .args(["auth", "export", "opencode-go", "--standalone"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|_| {
+        eliot_plugin::quota::environment("OpenCode credential reader could not start")
+    })?;
+    let deadline = Instant::now() + std::time::Duration::from_secs(8);
+    let stdout = child.stdout.take().ok_or_else(|| {
+        eliot_plugin::quota::environment("OpenCode credential reader has no output")
+    })?;
+    let mut bytes = Vec::new();
+    let read = async {
+        stdout
+            .take((MAX_AUTH_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        child.wait().await
+    };
+    let result = timeout_at(deadline, read).await;
+    if !matches!(result,Ok(Ok(status)) if status.success()) || bytes.len() > MAX_AUTH_BYTES {
+        kill_and_reap(&mut child).await;
+        return Err(eliot_plugin::quota::environment(
+            "OpenCode native credential read failed or exceeded its bound",
+        ));
+    }
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).map_err(|_| {
+        eliot_plugin::quota::environment("OpenCode credential export schema is unavailable")
+    })?;
+    let mut active = rows.iter().filter(|row| {
+        row.get("integrationID").and_then(serde_json::Value::as_str) == Some("opencode-go")
+            && row.get("active").and_then(serde_json::Value::as_bool) == Some(true)
+    });
+    let row = active.next().ok_or_else(|| {
+        eliot_plugin::quota::environment("OpenCode Go has no active native credential")
+    })?;
+    if active.next().is_some() {
+        return Err(eliot_plugin::quota::environment(
+            "OpenCode Go active native credential is ambiguous",
+        ));
+    }
+    row.pointer("/value/key")
+        .and_then(serde_json::Value::as_str)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| eliot_plugin::quota::environment("OpenCode Go native key is unavailable"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

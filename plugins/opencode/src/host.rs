@@ -519,6 +519,7 @@ impl OpenCodePlugin {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
             "model.list" => self.model_list(&request.params).await,
+            "quota.read" => crate::quota::read(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => self.command(&request.params).await,
             "agent.snapshot" => self.snapshot(&request.params).await,

@@ -5,6 +5,7 @@ mod hooks;
 mod host;
 mod native;
 mod profile;
+mod quota;
 mod session;
 
 pub async fn run() -> eliot_core::Result<()> {

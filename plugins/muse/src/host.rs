@@ -2195,8 +2195,8 @@ impl MusePlugin {
                 "Muse quota.read requires a dedicated reader plugin instance",
             ));
         }
-        let profile: Value = decode(raw, "Muse quota.read params are invalid")?;
-        let snapshot = profile.get("profile").unwrap_or(&profile);
+        let params = eliot_plugin::quota::decode(raw)?;
+        let snapshot = &params.profile;
         if snapshot.get("harness").and_then(Value::as_str) != Some("muse") {
             return Err(Error::new(
                 "profile_error",
@@ -2221,9 +2221,26 @@ impl MusePlugin {
                 program: OsString::from(program),
                 args: vec![OsString::from("serve")],
                 cwd,
-                environment: Vec::new(),
+                environment: params
+                    .environment
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (OsString::from(key), OsString::from(value)))
+                    })
+                    .collect(),
             },
-            SecretPolicy::new(std::iter::empty::<String>()),
+            SecretPolicy::new(
+                params
+                    .environment
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(_, value)| value.as_str()),
+            ),
         )
         .await?;
         let client = native.client();
@@ -2329,7 +2346,7 @@ impl MusePlugin {
                 // are fabricated.
                 None => serde_json::json!({}),
             };
-            Ok(json!({"details": details}))
+            Ok(json!({"details": if details.as_object().is_some_and(|o|o.is_empty()) { details } else {json!({"usage":details})}}))
         }
         .await;
         let result = result.map_err(|error| client.diagnostic_error(error));

@@ -6,6 +6,7 @@ pub mod native_transport;
 pub mod owner_scan;
 pub mod peer;
 pub mod protocol;
+pub mod quota;
 pub mod session;
 pub mod skill;
 pub mod start_classification;

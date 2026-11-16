@@ -1384,25 +1384,36 @@ scope with a freshness timestamp (`fetched_at_ms`, `ttl_ms`) and a nonsecret
 credential identity (a name, never a value); every response carries its
 `scope`, `fetched_at_ms`, `ttl_ms` and `credential`. Native model ids are
 retained verbatim and a failed read never selects another model or account.
-`harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is the separate
-provider-supported account quota readback: timestamp (`fetched_at_ms`,
-`ttl_ms`), `scope` and `credential` as above, plus an explicit `status` of
-`supported`, `unsupported` or `unknown` naming the checked native surface and,
-when `supported`, provider-verbatim quota signals in `details` (an object, at
-most 8192 encoded bytes; never secrets or personal data). Codex reads
-`account/rateLimits/read` plus `account/usage/read` when useful (windows with
-used percent, reset time, credits and plan; `account/read` is never called so
-no email enters the response, logs or Store); Muse reads `usage/read`
-(window and weekly used percent, reset time, tier and arrival stamp; an empty
-`details` object means the host observed nothing and no numbers are
-fabricated). A method-not-found or schema mismatch stays `unsupported` or
-`unknown` naming the checked method. OpenCode/Claude/Antigravity expose no
-read-only quota endpoint, so they report `unsupported`. Support never comes
-from an inference probe or per-Agent polling. Both reads are owner-only,
-read-only, deduplicated per account through the same bounded per-scope cache,
-and start no model turn and no inference
-(`swarm harnesses`, `swarm models --harness H [--profile P]`,
-`swarm quota --harness H [--profile P]`).
+`harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is an Owner-only,
+read-only provider quota query. `harness` and optional `profile` keep their current
+contract. The response retains `harness`, `scope`, `credential` (nonsecret names),
+`fetched_at_ms`, `ttl_ms`, `status`, optional `note` and optional `details` (8192 bytes).
+Codex keeps its `rateLimits` projection from `account/rateLimits/read`.
+Claude uses its CLI OAuth `GET /api/oauth/usage`; Antigravity uses its native
+Windows keyring credential and read-only Cloud Code Assist quota calls;
+OpenCode Go uses the selected native credential export and `GET /zen/go/v1/usage`.
+These provider readers return `details.windows`: at most 32
+[`QuotaWindow`](../../crates/eliot-core/src/api/harness.rs) values
+`{label, usedPercent, resetsAtMs, windowDurationMins}`. Percent is a finite number
+in 0..100; reset time is Unix milliseconds or null when absent. Windows identify
+5-hour, weekly and model-scoped limits when supplied; Eliot never invents limits
+or reset times. `details.state` is `ready` or `error`; `details.origin` is
+`provider` or `environment`. A failed read remains `status:"supported"` with
+`state:"error"`, a sanitized reason and no windows. Unsupported native integration
+sources remain `unsupported` with a concrete reason. The transport disables
+redirects, bounds each HTTP request to eight seconds and each response to 1 MiB;
+credential reads are bounded to 256 KiB. It never refreshes or writes credentials.
+
+Muse has no provider endpoint. The plugin projects MSP `usage/changed` as the
+session-family `quota.observed` event; Store retains the typed observation, and
+`harness.quota` selects the latest observation under the exact frozen profile.
+Its `fetched_at_ms` remains the native `observedAtMs`, and `note` says "observed
+during a turn". `usage/read` can also return that last native observation, exposed
+under `details.usage`. With no observation, or no installed MSP method, Muse
+returns `unsupported` and its reason. No quota query starts a turn, performs
+inference or polls Agents. CLI: `swarm quota --harness H [--profile P]`.
+
+
 `profile.list` (`ProfileListRequest`/`ProfileListResponse`, no params) returns the
 current `config.toml` revision, whether it parses, and per profile the name,
 harness, requested model/effort (absent = native default), permissions,

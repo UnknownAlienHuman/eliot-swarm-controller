@@ -256,11 +256,16 @@ impl PluginHost {
         if !profile
             .get("harness")
             .and_then(Value::as_str)
-            .is_some_and(|harness| matches!(harness, "codex" | "muse"))
+            .is_some_and(|harness| {
+                matches!(
+                    harness,
+                    "codex" | "muse" | "claude" | "opencode" | "antigravity"
+                )
+            })
         {
             return Err(Error::new(
                 "unsupported",
-                "harness.quota needs a codex or muse profile",
+                "harness.quota needs a supported native profile",
             ));
         }
         let environment = Value::Object(build_process_environment(&profile)?);
@@ -330,7 +335,11 @@ impl PluginHost {
         let read = async {
             let manifest = reader.initialize(&harness, until).await?;
             require_proxy_capability(&profile, &manifest)?;
-            let request = serde_json::json!({"profile": profile});
+            let request = serde_json::to_value(eliot_plugin::protocol::QuotaReadParams {
+                profile,
+                environment,
+            })
+            .map_err(|_| Error::new("internal", "quota.read params encoding failed"))?;
             let value = reader.client.call("quota.read", request, until).await?;
             if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
                 return Err(Error::new(
