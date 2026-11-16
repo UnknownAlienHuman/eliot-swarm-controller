@@ -85,10 +85,10 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let policy = self.secret_policy_snapshot();
-        let mut store = self.inner.store.lock().await;
+        let store = self.inner.store.lock().await;
         let reply = crate::config::settings::read_internal(
             &self.inner.data_root,
-            &mut store,
+            &store,
             request.sections.as_deref(),
             &policy,
         )?;

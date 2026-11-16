@@ -119,6 +119,12 @@ async fn run_owned(
     // Startup phase markers: a readiness timeout names the phase that stalled.
     logging::record(&policy, "daemon.store_opened", &[], None);
     let store = std::sync::Arc::new(Mutex::new(store));
+    // Settle crash-left pending settings history rows once at startup: reads
+    // never reconcile, so this plus the save path cover every pending row.
+    {
+        let mut store = store.lock().await;
+        crate::config::settings::reconcile_at_startup(data_dir.path(), &mut store)?;
+    }
     let bus = Bus::new(1_024);
     // Invalid `[mail]` fails startup like invalid retention; the Router keeps
     // the loaded limits for the run instead of re-reading the file per send.

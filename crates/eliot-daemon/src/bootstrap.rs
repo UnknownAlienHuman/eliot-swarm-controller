@@ -140,7 +140,7 @@ fn ensure_bootstrap_settings(
     use crate::config::settings::{self, SettingsAuthor};
     use eliot_core::api::SettingsSection::{Profiles, Routing};
 
-    let read = settings::read_internal(data_root, store, Some(&[Profiles, Routing]), policy)?;
+    let read = settings::read_internal(data_root, &*store, Some(&[Profiles, Routing]), policy)?;
     let current_profiles = read
         .sections
         .get(&Profiles)
@@ -288,7 +288,7 @@ fn ensure_project_identity(
     use crate::config::settings::{self, SettingsAuthor};
     use eliot_core::api::SettingsSection::{Profiles, Projects};
 
-    let read = settings::read_internal(data_root, store, Some(&[Profiles, Projects]), policy)?;
+    let read = settings::read_internal(data_root, &*store, Some(&[Profiles, Projects]), policy)?;
     let profiles = read
         .sections
         .get(&Profiles)
