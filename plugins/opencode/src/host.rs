@@ -32,19 +32,44 @@ use tokio::{
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Total bound for one agent.start dispatch, from admission to the ready or
-/// failed response. The daemon allows 90 s for the agent.start round trip
-/// (START_TIMEOUT in crates/eliot-daemon/src/plugin_host/host.rs); this
-/// envelope answers inside it with margin for the ready commit and the
-/// response write. Every pre-session phase (auth transfer, serve spawn and
-/// readiness, subscribe, registration, session create) shares this one
-/// envelope instead of stacking private budgets: a loaded cold start gets
-/// room without ever outliving the daemon budget (which would settle the
-/// launch unknown while the plugin is still working). A failure before any
-/// native session or prompt exists settles as a definite failed start with a
-/// typed reason, never unknown; unknown stays reserved for real
-/// uncertainty about a native effect.
+/// Total bound for one agent.start dispatch, from admission to the ready,
+/// failed, or unknown response. The daemon allows 90 s for the agent.start
+/// round trip ([`DAEMON_START_TIMEOUT`], `START_TIMEOUT` in
+/// crates/eliot-daemon/src/plugin_host/host.rs); this envelope answers
+/// inside it with [`START_SETTLE_RESERVE`] left for the daemon's Job
+/// retirement and settlement. Every pre-session phase (auth transfer, serve
+/// spawn and readiness, subscribe, registration, session create) shares this
+/// one envelope instead of stacking private budgets, and every start-failure
+/// cleanup (event close plus owned-server terminate and diagnostics) is
+/// clamped to it too: a loaded cold start gets room without ever outliving
+/// the daemon budget (which would settle the launch unknown while the plugin
+/// is still working, losing the late reply). A failure before any native
+/// session or prompt exists settles as a definite failed start with a typed
+/// reason, never unknown, except an uncertain auth import (the isolated
+/// credential store may already have been written and reconciliation
+/// failed): that stays unknown per the authentication contract. Unknown
+/// otherwise stays reserved for real uncertainty about a native effect.
 const START_ENVELOPE: std::time::Duration = std::time::Duration::from_secs(75);
+
+/// Bound for one start-failure cleanup (event close plus owned-server
+/// terminate and diagnostics), always clamped to [`START_ENVELOPE`]: a
+/// refusal at the edge of the envelope fails the cleanup fast instead of
+/// stacking another 30 s past the daemon budget. 10 s matches the serve
+/// readiness cleanup in `native/server.rs`: enough to kill and reap a wedged
+/// child, never enough to outlive the daemon budget.
+const START_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Time reserved after the envelope for the daemon's Job retirement and
+/// settlement: the envelope, cleanup included, always ends this far before
+/// the daemon 90 s agent.start budget, so a refusal at the edge of the
+/// budget settles failed and leaves `starting` instead of racing the daemon
+/// deadline (which would drop the reply, record unknown, and pin the Agent).
+const START_SETTLE_RESERVE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Daemon agent.start round-trip budget, mirrored from
+/// crates/eliot-daemon/src/plugin_host/host.rs (`START_TIMEOUT`): the start
+/// envelope plus the settlement reserve must fit inside it.
+const DAEMON_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Clamp one start-phase budget to the dispatch envelope: the phase gets its
 /// full budget when the envelope has room, otherwise whatever is left. A
@@ -68,7 +93,10 @@ fn phase_budget(envelope: Instant, budget: std::time::Duration) -> std::time::Du
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartPhase {
     /// Credential transfer, serve spawn, or serve readiness: no HTTP write
-    /// has run and no server is necessarily up.
+    /// has run and no server is necessarily up. The transfer may already
+    /// have touched the isolated credential store, so an uncertain transfer
+    /// outcome (code `unknown`) is not proven-no-effect even though no
+    /// native session or prompt exists.
     Spawn,
     /// Event subscription: read-only, before session create.
     Subscribe,
@@ -87,12 +115,20 @@ enum StartPhase {
     PostCreate,
 }
 
-/// Whether a failure in this start phase proves no native session or prompt
-/// exists, so the launch settles as a definite failed start instead of
+/// Whether a failure in this start phase with this error code proves no
+/// native session or prompt exists and no uncertain native effect is
+/// outstanding, so the launch settles as a definite failed start instead of
 /// unknown. This is the regression anchor for the pre-session rule: every
-/// phase before the first create write must map here, and no post-create
-/// phase may.
-fn start_failure_is_proven_no_effect(phase: StartPhase) -> bool {
+/// phase before the first create write maps here, and no post-create phase
+/// may, with one exception. A `Spawn` failure carrying code `unknown` is the
+/// uncertain auth import: the isolated credential store may already have
+/// been written and reconciliation failed, so it stays unknown per the
+/// authentication contract and never converts to proven-no-effect. Definite
+/// refusals before the import (any other code) still settle failed.
+fn start_failure_is_proven_no_effect(phase: StartPhase, code: &str) -> bool {
+    if phase == StartPhase::Spawn && code == "unknown" {
+        return false;
+    }
     matches!(
         phase,
         StartPhase::Spawn
@@ -597,15 +633,20 @@ impl OpenCodePlugin {
 
     /// Convert one pre-session failure into its retained failed-state result.
     /// By construction the failure happened before any native session or
-    /// prompt could exist, so the launch is definitely failed: the daemon
-    /// settles failed, retires the plugin, and releases capacity on proven
-    /// exit instead of pinning an unknown Agent that blocks drain.
+    /// prompt could exist and carries no uncertain effect (the caller keeps
+    /// uncertain auth imports on the error path), so the launch is definitely
+    /// failed: the daemon settles failed, retires the plugin, and releases
+    /// capacity on proven exit instead of pinning an unknown Agent that
+    /// blocks drain.
     fn proven_no_effect_start(
         &mut self,
         params: &AgentStartParams,
         failure: PhaseFailure,
     ) -> Value {
-        debug_assert!(start_failure_is_proven_no_effect(failure.phase));
+        debug_assert!(start_failure_is_proven_no_effect(
+            failure.phase,
+            &failure.error.code
+        ));
         let reason = presession_reason(failure.phase, &failure.error.code);
         self.retain_proven_no_effect_start(params, reason)
     }
@@ -620,11 +661,21 @@ impl OpenCodePlugin {
         // daemon agent.start budget (which would settle the launch unknown
         // while this plugin is still working).
         let envelope = Instant::now() + START_ENVELOPE;
+        debug_assert!(START_ENVELOPE + START_SETTLE_RESERVE <= DAEMON_START_TIMEOUT);
         let session = match Self::launch_start_session(peer, &parsed, envelope).await {
             Ok(session) => session,
             // Launch runs before any native session or prompt exists, so a
-            // failure here is a definite failed start, never unknown.
-            Err(failure) => return Ok(self.proven_no_effect_start(&parsed.params, failure)),
+            // failure here is a definite failed start, never unknown, with
+            // one exception: an uncertain auth import (code `unknown`) means
+            // the isolated credential store may already have been written and
+            // reconciliation failed, so it stays unknown per the
+            // authentication contract and replays as an error.
+            Err(failure) => {
+                if start_failure_is_proven_no_effect(failure.phase, &failure.error.code) {
+                    return Ok(self.proven_no_effect_start(&parsed.params, failure));
+                }
+                return Err(self.retain_failed_start(&parsed.params, failure.error));
+            }
         };
         let session = match self
             .register_start_session(peer, &parsed, session, envelope)
@@ -843,7 +894,9 @@ impl OpenCodePlugin {
     }
 
     /// Start phase 2, launch: spawn the owned server, subscribe the event
-    /// stream, and assemble the session. The caller retains any error.
+    /// stream, and assemble the session. The caller retains any error. A
+    /// spawn failure carries its provenance: an uncertain auth import (code
+    /// `unknown`) settles unknown, definite refusals settle failed.
     /// The cloud path carries the selected native integration; the local
     /// path carries the adopted provider and no canonical credential.
     async fn launch_start_session(
@@ -875,9 +928,10 @@ impl OpenCodePlugin {
         {
             Ok(server) => server,
             // The spawn cleans up its own child on failure; no diagnostics
-            // exist yet because no server was retained. Either way no native
-            // session or prompt exists, so the caller settles a definite
-            // failed start, never unknown.
+            // exist yet because no server was retained. The caller settles a
+            // definite failed start, except an uncertain auth import (code
+            // `unknown`): the isolated credential store may have been
+            // written, so that stays unknown.
             Err(error) => {
                 return Err(PhaseFailure {
                     phase: StartPhase::Spawn,
@@ -892,7 +946,7 @@ impl OpenCodePlugin {
             Ok(subscribed) => subscribed,
             Err(error) => {
                 let _ = server
-                    .terminate(true, phase_deadline(envelope, RPC_TIMEOUT))
+                    .terminate(true, phase_deadline(envelope, START_CLEANUP_BUDGET))
                     .await;
                 return Err(PhaseFailure {
                     phase: StartPhase::Subscribe,
@@ -963,10 +1017,10 @@ impl OpenCodePlugin {
         )
         .await
         {
-            session.events.close().await;
+            close_start_events(&session, envelope).await;
             let _ = session
                 .server
-                .terminate(true, phase_deadline(envelope, RPC_TIMEOUT))
+                .terminate(true, phase_deadline(envelope, START_CLEANUP_BUDGET))
                 .await;
             let error = session.server.diagnostic_error(error);
             return Err(PhaseFailure {
@@ -1013,7 +1067,7 @@ impl OpenCodePlugin {
                 Ok(fragment) => Some(fragment),
                 Err(error) => {
                     let reason = error.message.clone();
-                    discard_failed_start(&mut session, error).await;
+                    discard_failed_start(&mut session, error, envelope).await;
                     return Ok(CreateOutcome::ProvenFailed(
                         self.retain_proven_no_effect_start(&parsed.params, reason),
                     ));
@@ -1041,7 +1095,7 @@ impl OpenCodePlugin {
             Err(HttpOutcome::Rejected { reason, .. }) => {
                 // Authoritative refusal: the server proves no session was
                 // admitted, so this settles as a definite failed start.
-                discard_unstarted(&mut session).await;
+                discard_unstarted(&mut session, envelope).await;
                 return Ok(CreateOutcome::ProvenFailed(self.proven_no_effect_start(
                     &parsed.params,
                     PhaseFailure {
@@ -1053,7 +1107,7 @@ impl OpenCodePlugin {
             Err(HttpOutcome::NotDispatched { reason }) => {
                 // Provably never dispatched: no byte left the socket, so no
                 // native session exists and this is a definite failed start.
-                discard_unstarted(&mut session).await;
+                discard_unstarted(&mut session, envelope).await;
                 return Ok(CreateOutcome::ProvenFailed(self.proven_no_effect_start(
                     &parsed.params,
                     PhaseFailure {
@@ -1136,7 +1190,7 @@ impl OpenCodePlugin {
             with_context_points(effective, &[InjectPoint::NextInput])
         };
         if !model_verified || !location_ok {
-            let kill_note = delete_created_session(&mut session, &created.id).await;
+            let kill_note = delete_created_session(&mut session, &created.id, envelope).await;
             let error = discard_failed_start(
                 &mut session,
                 Error::new(
@@ -1145,6 +1199,7 @@ impl OpenCodePlugin {
                         "OpenCode effective model or session directory did not match the frozen profile; {kill_note}"
                     ),
                 ),
+                envelope,
             )
             .await;
             return Err(self.retain_failed_start(&parsed.params, error));
@@ -1173,7 +1228,7 @@ impl OpenCodePlugin {
             // Wrong store: this generation created nothing and the retained
             // session, if any, is untouched, so the resume is definitely
             // failed, never unknown.
-            discard_unstarted(&mut session).await;
+            discard_unstarted(&mut session, envelope).await;
             return Ok(self.proven_no_effect_start(
                 &parsed.params,
                 PhaseFailure {
@@ -1186,25 +1241,26 @@ impl OpenCodePlugin {
             ));
         }
         let deadline = phase_deadline(envelope, RPC_TIMEOUT);
-        let retained =
-            match Self::resume_read_retained(&session, &resume.native_ref, deadline).await {
-                Ok(retained) => retained,
-                // Proven absent: the retained session no longer exists, so
-                // there is nothing to resume and this generation created
-                // nothing. Any other read failure stays unknown: the retained
-                // session may still exist.
-                Err(error) if error.code == "not_found" => {
-                    discard_unstarted(&mut session).await;
-                    return Ok(self.proven_no_effect_start(
-                        &parsed.params,
-                        PhaseFailure {
-                            phase: StartPhase::ResumeRefused,
-                            error,
-                        },
-                    ));
-                }
-                Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
-            };
+        let retained = match Self::resume_read_retained(&session, &resume.native_ref, deadline)
+            .await
+        {
+            Ok(retained) => retained,
+            // Proven absent: the retained session no longer exists, so
+            // there is nothing to resume and this generation created
+            // nothing. Any other read failure stays unknown: the retained
+            // session may still exist.
+            Err(error) if error.code == "not_found" => {
+                discard_unstarted(&mut session, envelope).await;
+                return Ok(self.proven_no_effect_start(
+                    &parsed.params,
+                    PhaseFailure {
+                        phase: StartPhase::ResumeRefused,
+                        error,
+                    },
+                ));
+            }
+            Err(error) => return Err(self.fail_resume(&parsed, session, error, envelope).await),
+        };
         session.session_id = Some(retained.id.clone());
         if let Err(error) = Self::resume_quiesce(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, error.message).await);
@@ -1212,14 +1268,15 @@ impl OpenCodePlugin {
         if let Err(error) = Self::resume_verify_idle(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, error.message).await);
         }
-        let effective =
-            match Self::resume_configure(&parsed, &session, &retained.id, deadline).await {
-                Ok(effective) => effective,
-                Err(error) if error.code == "unknown" => {
-                    return Err(self.stash_resume_unknown(session, error.message).await);
-                }
-                Err(error) => return Err(self.fail_resume(&parsed, session, error).await),
-            };
+        let effective = match Self::resume_configure(&parsed, &session, &retained.id, deadline)
+            .await
+        {
+            Ok(effective) => effective,
+            Err(error) if error.code == "unknown" => {
+                return Err(self.stash_resume_unknown(session, error.message).await);
+            }
+            Err(error) => return Err(self.fail_resume(&parsed, session, error, envelope).await),
+        };
         let context_bound = bind_context_hooks(&session.http, &retained.id, deadline).await;
         let effective = if context_bound {
             with_context_points(
@@ -1695,8 +1752,9 @@ impl OpenCodePlugin {
         parsed: &ParsedStart,
         mut session: AgentSession,
         error: Error,
+        envelope: Instant,
     ) -> Error {
-        let error = discard_failed_start(&mut session, error).await;
+        let error = discard_failed_start(&mut session, error, envelope).await;
         self.retain_failed_start(&parsed.params, error)
     }
 
@@ -3593,26 +3651,52 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
     Ok(())
 }
 
-async fn discard_unstarted(session: &mut AgentSession) {
-    session.events.close().await;
+/// Close the start event stream inside the shared envelope: the raw close
+/// waits up to a full event deadline on its own, so clamp it to the cleanup
+/// budget instead of stacking it past the daemon budget.
+async fn close_start_events(session: &AgentSession, envelope: Instant) {
+    let _ = timeout_at(
+        phase_deadline(envelope, START_CLEANUP_BUDGET),
+        session.events.close(),
+    )
+    .await;
+}
+
+/// Discard a server that never admitted a session or prompt: the event close
+/// and the terminate/diagnostic wait share one cleanup budget clamped to the
+/// start envelope, so a refusal at the edge of the budget settles fast
+/// inside the daemon deadline instead of stacking a fresh 30 s past it
+/// (which would lose the reply and pin the Agent in `starting`).
+async fn discard_unstarted(session: &mut AgentSession, envelope: Instant) {
+    close_start_events(session, envelope).await;
     let _ = session
         .server
-        .terminate(true, Instant::now() + RPC_TIMEOUT)
+        .terminate(true, phase_deadline(envelope, START_CLEANUP_BUDGET))
         .await;
     session.phase = SessionPhase::Stopped;
 }
 
-async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error {
-    discard_unstarted(session).await;
+async fn discard_failed_start(
+    session: &mut AgentSession,
+    error: Error,
+    envelope: Instant,
+) -> Error {
+    discard_unstarted(session, envelope).await;
     session.server.diagnostic_error(error)
 }
 
 /// Best-effort delete of a created session for a failed start: returns the
-/// kill note for the retained error. Never fails itself.
-async fn delete_created_session(session: &mut AgentSession, session_id: &str) -> String {
+/// kill note for the retained error. Never fails itself. The delete shares
+/// the start envelope cleanup budget so a mismatch at the edge of the budget
+/// still answers inside the daemon deadline.
+async fn delete_created_session(
+    session: &mut AgentSession,
+    session_id: &str,
+    envelope: Instant,
+) -> String {
     match session
         .http
-        .delete_session(session_id, Instant::now() + RPC_TIMEOUT)
+        .delete_session(session_id, phase_deadline(envelope, START_CLEANUP_BUDGET))
         .await
     {
         Ok(true) => "the created native session was removed".to_owned(),
@@ -3719,8 +3803,9 @@ fn opencode_manifest() -> PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendKind, LocalProvider, McpSettle, OpenCodeHttp, OpenCodePlugin, PhaseFailure,
-        START_ENVELOPE, SWARM_MCP_SERVER_NAME, StartAdmission, StartPhase, catalogue_contains,
+        BackendKind, DAEMON_START_TIMEOUT, LocalProvider, McpSettle, OpenCodeHttp, OpenCodePlugin,
+        PhaseFailure, START_CLEANUP_BUDGET, START_ENVELOPE, START_SETTLE_RESERVE,
+        SWARM_MCP_SERVER_NAME, StartAdmission, StartPhase, catalogue_contains,
         fetch_backend_inventory, local_key_value, mcp_names, mcp_settle, normalize_endpoint,
         opencode_manifest, opencode_scope, parse_configure_model, parse_local_provider,
         phase_budget, phase_deadline, presession_reason, split_model, start_auth_selector,
@@ -4511,9 +4596,11 @@ mod tests {
     }
 
     /// Pre-session classification: every phase before the first create write
-    /// proves no native session or prompt exists and settles definite failed;
-    /// only the post-create phase stays uncertain. Adding a phase forces an
-    /// explicit entry here.
+    /// proves no native session or prompt exists and settles definite failed,
+    /// except a Spawn failure carrying code `unknown` (the uncertain auth
+    /// import, which may already have written the isolated credential store).
+    /// Only the post-create phase otherwise stays uncertain. Adding a phase
+    /// forces an explicit entry here.
     #[test]
     fn presession_phases_classify_failed_before_native_session() {
         for phase in [
@@ -4523,28 +4610,88 @@ mod tests {
             StartPhase::CreateRefused,
             StartPhase::ResumeRefused,
         ] {
+            for code in [
+                "native_spawn",
+                "native_readback",
+                "rejected",
+                "profile_error",
+            ] {
+                assert!(
+                    start_failure_is_proven_no_effect(phase, code),
+                    "pre-session failure must be proven-no-effect: {phase:?} {code}"
+                );
+            }
+        }
+        assert!(!start_failure_is_proven_no_effect(
+            StartPhase::Spawn,
+            "unknown"
+        ));
+        assert!(!start_failure_is_proven_no_effect(
+            StartPhase::PostCreate,
+            "native_spawn"
+        ));
+        assert!(!start_failure_is_proven_no_effect(
+            StartPhase::PostCreate,
+            "unknown"
+        ));
+    }
+
+    /// Uncertain auth import stays unknown: a Spawn failure with code
+    /// `unknown` (the import may already have written the isolated credential
+    /// store and reconciliation failed) is never proven-no-effect, while
+    /// every definite refusal before the import settles failed.
+    #[test]
+    fn spawn_uncertain_import_stays_unknown() {
+        assert!(!start_failure_is_proven_no_effect(
+            StartPhase::Spawn,
+            "unknown"
+        ));
+        for code in [
+            "native_spawn",
+            "native_readback",
+            "profile_error",
+            "invalid",
+        ] {
             assert!(
-                start_failure_is_proven_no_effect(phase),
-                "pre-session phase must be proven-no-effect: {phase:?}"
+                start_failure_is_proven_no_effect(StartPhase::Spawn, code),
+                "definite refusal before the import must settle failed: {code}"
             );
         }
-        assert!(!start_failure_is_proven_no_effect(StartPhase::PostCreate));
+        // The uncertain spawn retains the error for replay instead of
+        // converting to a failed-state value.
+        let params = AgentStartParams::new("agent-9", 1, "0199-uncertain");
+        let mut plugin = OpenCodePlugin::default();
+        let error = plugin.retain_failed_start(&params, eliot_core::Error::new("unknown", "probe"));
+        assert_eq!(error.code, "unknown");
+        match plugin
+            .start_replay_admission(&params)
+            .expect("admission")
+            .expect("replay")
+        {
+            StartAdmission::Replay(Err(replayed)) => assert_eq!(replayed.code, "unknown"),
+            StartAdmission::Replay(Ok(_)) => panic!("uncertain failure must replay an error"),
+            StartAdmission::New(_) => panic!("settled start must replay"),
+        }
     }
 
     /// The readiness deadline is the real-signal bound and the start envelope
-    /// always fits the daemon agent.start budget: the plugin answers ready
-    /// or definite-failed before the daemon settles the launch unknown.
+    /// always fits the daemon agent.start budget: the plugin, cleanup
+    /// included, answers ready, failed, or unknown before the daemon retires
+    /// the Job and settles, so a refusal at the edge of the budget settles
+    /// failed and leaves `starting` instead of racing the daemon deadline.
     #[test]
     fn readiness_and_envelope_bounds_fit_daemon_start_budget() {
-        // Daemon START_TIMEOUT in the daemon plugin host.
-        const DAEMON_START_TIMEOUT_SECS: u64 = 90;
         assert!(
             READINESS_TIMEOUT <= START_ENVELOPE,
             "readiness must fit inside the start envelope"
         );
         assert!(
-            START_ENVELOPE.as_secs() + 15 <= DAEMON_START_TIMEOUT_SECS,
-            "envelope must leave ready-commit and response margin"
+            START_CLEANUP_BUDGET <= START_ENVELOPE,
+            "failure cleanup must fit inside the start envelope"
+        );
+        assert!(
+            START_ENVELOPE + START_SETTLE_RESERVE <= DAEMON_START_TIMEOUT,
+            "envelope must leave Job-retirement and settlement margin"
         );
     }
 
@@ -4563,6 +4710,21 @@ mod tests {
         );
         assert_eq!(
             phase_budget(spent, std::time::Duration::from_secs(30)),
+            std::time::Duration::ZERO
+        );
+    }
+
+    /// Failure cleanup at the edge of the budget fails fast: with a spent
+    /// envelope the cleanup budget is zero, so a refusal at the envelope
+    /// edge settles the failed value at once instead of stacking another
+    /// 30 s past the daemon deadline (which would lose the reply and pin
+    /// the Agent in `starting`).
+    #[test]
+    fn spent_envelope_fails_failure_cleanup_fast() {
+        let spent = super::Instant::now();
+        assert_eq!(phase_deadline(spent, START_CLEANUP_BUDGET), spent);
+        assert_eq!(
+            phase_budget(spent, START_CLEANUP_BUDGET),
             std::time::Duration::ZERO
         );
     }

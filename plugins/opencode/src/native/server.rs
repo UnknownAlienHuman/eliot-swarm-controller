@@ -207,8 +207,12 @@ impl OwnedServer {
     /// credential in the isolated store, reserve a loopback port, spawn the
     /// server on the per-Agent store, and wait for readiness. Every failure
     /// from this function happens before any native session or prompt
-    /// exists, so the caller settles it as a definite failed start, never
-    /// unknown. Any failure leaves no running child behind. The child inherits the
+    /// exists, so the caller settles it as a definite failed start, except
+    /// an uncertain auth-import outcome (code `unknown`): the isolated
+    /// credential store may already have been written and reconciliation
+    /// failed, so that error propagates for the caller to settle unknown per
+    /// the authentication contract. Any failure leaves no running child
+    /// behind. The child inherits the
     /// daemon-allowlisted plugin environment plus the shared target
     /// environment the host built, the generated password, and the XDG
     /// roots — exactly like the Codex/Muse stdio servers, with no
