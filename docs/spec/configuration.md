@@ -161,12 +161,16 @@ picked silently, and the plugin's pre-serve transfer gate is unchanged.
 `launch` `access`). Omitted keeps the safe defaults. The level freezes its
 native permission result in the snapshot and the effective settings report it
 truthfully. `ask` routes every approval through the existing pending-request
-path (`swarm approve`/`deny`); it is never silently weakened. A level a
+path (`swarm approve`/`deny`). For a generation frozen with `access=ask`,
+only the Owner may `approve`, `deny` or `answer`: self, manager and other
+non-Owner replies refuse with `not_allowed` through CLI and MCP alike.
+The Agent-scoped Swarm MCP tool may be auto-approved because it cannot
+authorize these replies. A level a
 harness cannot express refuses with a typed `unsupported` reason.
 
 | Level | Codex | Claude | OpenCode | Muse | Antigravity |
 | --- | --- | --- | --- | --- | --- |
-| `ask` | `approval_policy=on-request` + `workspace-write` (pending-request) | `permission_mode=manual` (pending `can_use_tool`) | native permission-reply surface (pending) | `approval=onRequest` + `workspace-write` (pending `approval/request`) | `dangerously_skip_permissions=false` (ACP `session/request_permission`) |
+| `ask` (Owner replies only) | `approval_policy=on-request` + `workspace-write` (pending-request) | `permission_mode=manual` (pending `can_use_tool`) | native permission-reply surface (pending) | `approval=onRequest` + `workspace-write` (pending `approval/request`) | `dangerously_skip_permissions=false` (ACP `session/request_permission`) |
 | `auto` | `approval_policy=never` + `workspace-write` | `permission_mode=auto` | native permission-reply surface (pending) | `approval=promptUnmatched` + `workspace-write` | `dangerously_skip_permissions=false` (ACP permission path) |
 | `full` | `approval_policy=never` + `danger-full-access` (exactly current full-access profiles) | `permission_mode=bypassPermissions` (full-access) | `unsupported` (no full-access mapping; refuses instead of widening) | `approval=allowAll` + `danger-full-access` (exactly current full-access) | `dangerously_skip_permissions=true` (exactly current full-access skip) |
 
@@ -878,6 +882,9 @@ recently active Agent's conversation), `favorite_models` (bounded list of
 `{harness, model, effort?}`, at most 50), `recent_models` (bounded most-recent-first
 list of `{harness, model, effort?}`, at most 20), `collapsed_projects` (bounded
 list of project ids, at most 100) and `last_access` (`ask`, `auto` or `full`).
+Picker strings are stored verbatim: harness and access values must match their
+closed vocabularies exactly. Model ids and collapsed project ids are 1–256
+bytes, and effort is 1–128 bytes; these reject controls and surrounding whitespace.
 The desktop keeps no other preference store. The desktop writes `window` back once when the window closes, and only when the size changed.
 If that table is absent, the desktop imports the legacy per-user
 `swarm-desktop.json` preferences through the revision-guarded settings writer once.

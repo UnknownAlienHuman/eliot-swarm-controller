@@ -164,16 +164,16 @@ pub(crate) fn aggregate_key(harnesses: &[HarnessEntry]) -> String {
 }
 
 impl CatalogCache {
-    pub(crate) fn get_models(&self, scope: &str, now: i64) -> Option<HarnessModelsResponse> {
+    pub(crate) fn get_models(&self, key: &str, now: i64) -> Option<HarnessModelsResponse> {
         self.models
-            .get(scope)
+            .get(key)
             .filter(|entry| fresh(entry.fetched_at_ms, entry.ttl_ms, now))
             .cloned()
     }
 
-    pub(crate) fn insert_models(&mut self, entry: HarnessModelsResponse) {
+    pub(crate) fn insert_models(&mut self, key: String, entry: HarnessModelsResponse) {
         evict_models(&mut self.models, entry.fetched_at_ms);
-        self.models.insert(entry.scope.clone(), entry);
+        self.models.insert(key, entry);
     }
 
     pub(crate) fn get_quota(&self, scope: &str, now: i64) -> Option<HarnessQuotaResponse> {
@@ -211,6 +211,74 @@ impl CatalogCache {
     }
 }
 
+/// The private native-read key includes executable/version identity without
+/// changing the public account scope. A failed version probe cannot reuse
+/// a previously cached native read.
+pub(crate) fn models_key(scope: &str, cmd: &str, version: Option<&str>) -> Option<String> {
+    version.map(|version| format!("{scope}\0{cmd}\0{version}"))
+}
+
+/// Catalogue membership establishes identity, not account availability.
+/// Only complete hold readback plus affirmative, fresh native quota signals
+/// can establish availability. Unsupported and missing signals stay unknown.
+pub(crate) fn availability(
+    held: Option<bool>,
+    quota: Option<&HarnessQuotaResponse>,
+    model: &str,
+    now: i64,
+) -> &'static str {
+    use eliot_core::api::harness::{CATALOG_AVAILABLE, CATALOG_HELD, CATALOG_UNKNOWN};
+    if held == Some(true) {
+        return CATALOG_HELD;
+    }
+    let Some(quota) = quota.filter(|quota| {
+        held == Some(false)
+            && quota.status == "supported"
+            && fresh(quota.fetched_at_ms, quota.ttl_ms, now)
+    }) else {
+        return CATALOG_UNKNOWN;
+    };
+    let Some(details) = quota.details.as_ref() else {
+        return CATALOG_UNKNOWN;
+    };
+    let headroom = |window: &Value| {
+        window["usedPercent"]
+            .as_i64()
+            .is_some_and(|used| (0..100).contains(&used))
+            && window["resetsAtMs"]
+                .as_i64()
+                .or_else(|| {
+                    window["resetsAt"]
+                        .as_i64()
+                        .map(|time| time.saturating_mul(1000))
+                })
+                .is_some_and(|reset| reset > now)
+    };
+    let available = match quota.harness.as_str() {
+        "muse" => headroom(&details["window"]) && headroom(&details["weekly"]),
+        "codex" => {
+            let rates = &details["rateLimits"];
+            details["ordinaryUsageAllowed"].as_bool() == Some(true)
+                && headroom(&rates["primary"])
+                && headroom(&rates["secondary"])
+                && match details.get("rateLimitsByLimitId") {
+                    None | Some(Value::Null) => true,
+                    Some(Value::Object(limits)) if limits.is_empty() => true,
+                    Some(Value::Object(limits)) => limits.get(model).is_some_and(|rates| {
+                        headroom(&rates["primary"]) && headroom(&rates["secondary"])
+                    }),
+                    _ => false,
+                }
+        }
+        _ => false,
+    };
+    if available {
+        CATALOG_AVAILABLE
+    } else {
+        CATALOG_UNKNOWN
+    }
+}
+
 fn fresh(fetched_at_ms: i64, ttl_ms: u64, now: i64) -> bool {
     fetched_at_ms >= 0 && now >= 0 && (now.saturating_sub(fetched_at_ms) as u64) <= ttl_ms
 }
@@ -243,6 +311,97 @@ fn evict_quotas(map: &mut HashMap<String, HarnessQuotaResponse>, now: i64) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_model_cache_invalidates_inside_ttl_on_executable_or_version_change() {
+        let scope = "profile:adhoc harness:codex route:direct";
+        let mut cache = CatalogCache::default();
+        let key = models_key(scope, "C:/v1/codex.exe", Some("1.0")).unwrap();
+        cache.insert_models(
+            key.clone(),
+            HarnessModelsResponse {
+                harness: "codex".to_owned(),
+                catalogue: "native".to_owned(),
+                models: Vec::new(),
+                default: Some("old-model".to_owned()),
+                note: None,
+                scope: scope.to_owned(),
+                fetched_at_ms: 1_000,
+                ttl_ms: CATALOG_TTL_MS,
+                credential: "ambient".to_owned(),
+                configure: Default::default(),
+            },
+        );
+        assert_eq!(
+            cache.get_models(&key, 1_001).unwrap().default.as_deref(),
+            Some("old-model")
+        );
+        for (cmd, version) in [("C:/v1/codex.exe", "1.1"), ("C:/v2/codex.exe", "1.0")] {
+            let changed = models_key(scope, cmd, Some(version)).unwrap();
+            assert!(cache.get_models(&changed, 1_001).is_none());
+        }
+        assert!(models_key(scope, "C:/v1/codex.exe", None).is_none());
+    }
+
+    #[test]
+    fn availability_requires_complete_holds_and_affirmative_fresh_quota() {
+        let now = 1_000;
+        let mut quota = HarnessQuotaResponse {
+            harness: "muse".to_owned(),
+            scope: "profile:adhoc harness:muse".to_owned(),
+            fetched_at_ms: now,
+            ttl_ms: CATALOG_TTL_MS,
+            credential: "ambient".to_owned(),
+            status: "supported".to_owned(),
+            note: None,
+            details: Some(json!({"window":{"usedPercent":10,"resetsAtMs":2_000},
+                "weekly":{"usedPercent":20,"resetsAtMs":3_000}})),
+        };
+        assert_eq!(
+            availability(Some(false), Some(&quota), "m", now),
+            "available"
+        );
+        assert_eq!(availability(None, Some(&quota), "m", now), "unknown");
+        assert_eq!(availability(Some(true), None, "m", now), "held");
+        assert_eq!(availability(Some(false), None, "m", now), "unknown");
+        for status in ["unsupported", "unknown"] {
+            quota.status = status.to_owned();
+            assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+        }
+        quota.status = "supported".to_owned();
+        for details in [
+            json!({}),
+            json!({"window":{"usedPercent":0,"resetsAtMs":2_000}}),
+            json!({"window":{"usedPercent":0,"resetsAtMs":2_000},"weekly":{"usedPercent":100,"resetsAtMs":3_000}}),
+            json!({"window":{"usedPercent":0,"resetsAtMs":999},"weekly":{"usedPercent":0,"resetsAtMs":3_000}}),
+        ] {
+            quota.details = Some(details);
+            assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+        }
+        quota.harness = "codex".to_owned();
+        quota.details = Some(json!({"ordinaryUsageAllowed":true,
+            "rateLimits":{"primary":{"usedPercent":0,"resetsAt":2},"secondary":{"usedPercent":0,"resetsAt":3}}}));
+        assert_eq!(
+            availability(Some(false), Some(&quota), "m", now),
+            "available"
+        );
+        assert_eq!(
+            availability(
+                Some(false),
+                Some(&quota),
+                "m",
+                now + CATALOG_TTL_MS as i64 + 1
+            ),
+            "unknown"
+        );
+        quota.details.as_mut().unwrap()["ordinaryUsageAllowed"] = Value::Bool(false);
+        assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+        quota.details.as_mut().unwrap()["ordinaryUsageAllowed"] = Value::Bool(true);
+        quota.details.as_mut().unwrap()["rateLimitsByLimitId"] = json!({"other":{}});
+        assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+        quota.harness = "opencode".to_owned();
+        assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+    }
 
     #[test]
     fn codex_direct_scope_uses_ambient_identity() {

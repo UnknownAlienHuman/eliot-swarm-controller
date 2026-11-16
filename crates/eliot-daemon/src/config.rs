@@ -270,7 +270,7 @@ impl DesktopSettings {
             ));
         }
         for entry in self.favorite_models.iter().chain(self.recent_models.iter()) {
-            let harness = entry.harness.trim();
+            let harness = entry.harness.as_str();
             if !matches!(
                 harness,
                 "codex" | "claude" | "muse" | "opencode" | "antigravity"
@@ -280,17 +280,22 @@ impl DesktopSettings {
                     "config.toml: desktop model harness must be codex, claude, muse, opencode or antigravity",
                 ));
             }
-            let model = entry.model.trim();
-            if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+            let model = entry.model.as_str();
+            if model.is_empty()
+                || model.len() > 256
+                || model.chars().any(char::is_control)
+                || model != model.trim()
+            {
                 return Err(core::Error::new(
                     "profile_error",
-                    "config.toml: desktop model must be 1-256 characters with no controls",
+                    "config.toml: desktop model must be 1-256 bytes with no controls or surrounding whitespace",
                 ));
             }
             if let Some(effort) = entry.effort.as_deref()
-                && (effort.trim().is_empty()
+                && (effort.is_empty()
                     || effort.len() > 128
-                    || effort.chars().any(char::is_control))
+                    || effort.chars().any(char::is_control)
+                    || effort != effort.trim())
             {
                 return Err(core::Error::new(
                     "profile_error",
@@ -299,9 +304,10 @@ impl DesktopSettings {
             }
         }
         for project in &self.collapsed_projects {
-            if project.trim().is_empty()
+            if project.is_empty()
                 || project.len() > 256
                 || project.chars().any(char::is_control)
+                || project != project.trim()
             {
                 return Err(core::Error::new(
                     "profile_error",
@@ -310,7 +316,7 @@ impl DesktopSettings {
             }
         }
         if let Some(access) = self.last_access.as_deref()
-            && !matches!(access.trim(), "ask" | "auto" | "full")
+            && !matches!(access, "ask" | "auto" | "full")
         {
             return Err(core::Error::new(
                 "profile_error",
@@ -5097,6 +5103,67 @@ output_limit = 4096
     fn desktop_settings(source: &str) -> DesktopSettings {
         let config: FileConfig = toml::from_str(source).expect("valid TOML");
         config.desktop
+    }
+
+    #[test]
+    fn desktop_picker_rejects_raw_whitespace_controls_and_oversize_strings() {
+        for list in ["favorite_models", "recent_models"] {
+            for (field, value) in [
+                ("harness", " codex".to_owned()),
+                ("harness", "codex\n".to_owned()),
+                ("harness", format!("{}codex", " ".repeat(300))),
+                ("model", " m".to_owned()),
+                ("model", "m\t".to_owned()),
+                ("model", format!("m{}", " ".repeat(256))),
+                ("model", "é".repeat(129)),
+                ("effort", "low ".to_owned()),
+            ] {
+                let mut entry = DesktopModelRef {
+                    harness: "codex".to_owned(),
+                    model: "m".to_owned(),
+                    effort: None,
+                };
+                match field {
+                    "harness" => entry.harness = value,
+                    "model" => entry.model = value,
+                    _ => entry.effort = Some(value),
+                }
+                let settings = if list == "favorite_models" {
+                    DesktopSettings {
+                        favorite_models: vec![entry],
+                        ..Default::default()
+                    }
+                } else {
+                    DesktopSettings {
+                        recent_models: vec![entry],
+                        ..Default::default()
+                    }
+                };
+                assert_eq!(
+                    settings.validate().unwrap_err().code,
+                    "profile_error",
+                    "{list} {field}"
+                );
+            }
+        }
+        for access in [" ask", "full\n", "auto "] {
+            assert!(
+                DesktopSettings {
+                    last_access: Some(access.to_owned()),
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            DesktopSettings {
+                collapsed_projects: vec![" app".to_owned()],
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

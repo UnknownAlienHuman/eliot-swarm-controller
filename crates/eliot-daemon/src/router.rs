@@ -2727,12 +2727,31 @@ impl Router {
             None => self.resolve_catalog_snapshot(&harness, profile, true)?,
         };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+        let cmd = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("cmd"))
+            .and_then(Value::as_str)
+            .unwrap_or(&harness);
+        let executable = if std::path::Path::new(cmd).is_absolute() {
+            Some(PathBuf::from(cmd))
+        } else {
+            crate::adhoc::find_on_path(&format!("{cmd}.exe"))
+                .or_else(|| crate::adhoc::find_on_path(cmd))
+        };
+        let cmd = executable
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| cmd.to_owned());
+        let version = if harness == "claude" {
+            Some("static-aliases".to_owned())
+        } else {
+            crate::adhoc::native_version_string(&cmd)
+        };
+        let cache_key = catalog::models_key(&scope, &cmd, version.as_deref());
         let now = now_ms();
-        if let Some(hit) = self
-            .inner
-            .catalog_cache
-            .lock_recover()
-            .get_models(&scope, now)
+        if let Some(hit) = cache_key
+            .as_deref()
+            .and_then(|key| self.inner.catalog_cache.lock_recover().get_models(key, now))
         {
             request.validate_response(&hit)?;
             return serde_json::to_value(hit)
@@ -2866,10 +2885,12 @@ impl Router {
             }
         };
         request.validate_response(&response)?;
-        self.inner
-            .catalog_cache
-            .lock_recover()
-            .insert_models(response.clone());
+        if let Some(key) = cache_key {
+            self.inner
+                .catalog_cache
+                .lock_recover()
+                .insert_models(key, response.clone());
+        }
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "harness models could not be encoded"))
     }
@@ -3127,22 +3148,28 @@ impl Router {
         }
         // Provider holds for availability: a hold whose scope names the
         // harness marks that harness's models held.
+        const HOLD_LIMIT: usize = 1000;
         let holds = {
             let store = self.inner.store.lock().await;
-            store
-                .list_provider_holds(None, 1000)
-                .map(|page| page.holds)
-                .unwrap_or_default()
+            store.list_provider_holds(None, HOLD_LIMIT).ok()
         };
         let held_harness = |harness: &str| {
-            holds.iter().any(|hold| {
-                hold.scope.contains(harness)
+            let page = holds.as_ref()?;
+            let scope = format!("profile:{}", crate::adhoc::adhoc_profile_name(harness));
+            if page.holds.iter().any(|hold| {
+                hold.scope == scope
                     && matches!(
                         hold.state,
                         eliot_core::ProviderHoldState::Held
                             | eliot_core::ProviderHoldState::Probing
                     )
-            })
+            }) {
+                Some(true)
+            } else if page.holds.len() < HOLD_LIMIT {
+                Some(false)
+            } else {
+                None
+            }
         };
         let mut models: Vec<ModelsCatalogEntry> = Vec::new();
         for entry in &harnesses {
@@ -3168,15 +3195,17 @@ impl Router {
                 serde_json::from_value(response_value)
                     .map_err(|_| Error::new("internal", "harness models could not be decoded"))?;
             let held = held_harness(harness);
+            let quota = self
+                .harness_quota(&params, principal)
+                .await
+                .ok()
+                .and_then(|value| {
+                    serde_json::from_value::<eliot_core::api::HarnessQuotaResponse>(value).ok()
+                });
             for model in response.models {
                 let provider = catalog_provider(harness, &model.id);
-                let availability = if held {
-                    eliot_core::api::harness::CATALOG_HELD.to_owned()
-                } else if response.catalogue == "native" {
-                    eliot_core::api::harness::CATALOG_AVAILABLE.to_owned()
-                } else {
-                    eliot_core::api::harness::CATALOG_UNKNOWN.to_owned()
-                };
+                let availability =
+                    catalog::availability(held, quota.as_ref(), &model.id, now_ms()).to_owned();
                 models.push(ModelsCatalogEntry {
                     harness: harness.to_owned(),
                     id: model.id.clone(),
@@ -3188,10 +3217,6 @@ impl Router {
                     availability,
                 });
             }
-            // A live catalogue that returned no models still proves the
-            // harness: availability stays unknown unless held (handled above
-            // per model; no models means nothing to report).
-            let _ = response.catalogue;
         }
         models.sort_by(|left, right| {
             (left.harness.as_str(), left.id.as_str())
@@ -13640,6 +13665,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     }
 
     pub(super) fn result_fixture(store: &mut eliot_store::Store) -> (String, String) {
+        result_fixture_with_snapshot(store, json!({}))
+    }
+
+    fn result_fixture_with_snapshot(
+        store: &mut eliot_store::Store,
+        snapshot: Value,
+    ) -> (String, String) {
         let launch_id = ulid::Ulid::new().to_string();
         let agent = store
             .submit(
@@ -13651,7 +13683,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     verb: "launch".to_owned(),
                     args: json!({
                         "project":"typed-results", "workspace":"synthetic-workspace",
-                        "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+                        "harness":"codex", "profile":"synthetic", "profile_snapshot":snapshot,
                     }),
                     expected_generation: Some(0),
                     expected_turn_id: None,
@@ -13670,7 +13702,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             store,
             &agent,
             "session.ready",
-            json!({"native_scope":"fixture-scope", "native_ref":"fixture-ref"}),
+            json!({"native_scope":"fixture-scope", "native_ref":format!("fixture-ref-{agent}")}),
         );
         store
             .settle(&launch_id, CommandState::Applied, None, now_ms())
@@ -13701,6 +13733,90 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             json!({"command_id":send_id, "turn_id":"turn-1"}),
         );
         (agent, send_id)
+    }
+
+    #[tokio::test]
+    async fn ask_replies_refuse_self_and_manager_but_owner_and_other_access_work() {
+        for access in ["ask", "auto", "full"] {
+            for verb in ["approve", "deny", "answer"] {
+                let router = router();
+                let (agent, manager) = {
+                    let mut store = router.inner.store.lock().await;
+                    let (manager, _) =
+                        result_fixture_with_snapshot(&mut store, json!({"control":"project"}));
+                    let (agent, send) =
+                        result_fixture_with_snapshot(&mut store, json!({"access":access}));
+                    read_fixture_event(
+                        &mut store,
+                        &agent,
+                        "request.opened",
+                        json!({
+                            "command_id":send, "request_id":"access-request", "turn_id":"turn-1",
+                            "kind":"request_user_input", "details":{"questions":[{
+                                "id":"q1", "header":"Continue", "question":"Continue?",
+                                "options":[{"label":"Yes", "description":"Continue"}]
+                            }]}
+                        }),
+                    );
+                    (agent, manager)
+                };
+                let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), verb);
+                request.target = Some(agent.clone());
+                request.expected_generation = Some(1);
+                request.expected_turn_id = Some("turn-1".to_owned());
+                request.request_id = Some("access-request".to_owned());
+                if verb == "answer" {
+                    request.args = json!({"answers":{"q1":{"answers":["Yes"]}}});
+                }
+                // These are the authenticated principals used by CLI/MCP.
+                for caller in [&agent, &manager] {
+                    let principal = Principal::Agent {
+                        id: caller.clone(),
+                        generation: 1,
+                    };
+                    if access == "ask" {
+                        let value = serde_json::to_value(&request).unwrap();
+                        let error = router.submit(&value, &principal).await.unwrap_err();
+                        assert_eq!(error.code, "not_allowed", "{verb} {caller}");
+                        assert!(error.message.contains("Owner"));
+                    } else {
+                        // Verify hierarchy scope, then admit and dispatch without
+                        // scheduling any native effect in this source regression.
+                        let mut request = request.clone();
+                        request.id = ulid::Ulid::new().to_string();
+                        router
+                            .authorize_submission_scope(&mut request, &principal)
+                            .await
+                            .unwrap();
+                        let mut store = router.inner.store.lock().await;
+                        let admission = store
+                            .submit(&principal_name(&principal), request, now_ms())
+                            .unwrap();
+                        assert_eq!(
+                            store
+                                .dispatch(&admission.command.id, now_ms())
+                                .unwrap()
+                                .value
+                                .state,
+                            CommandState::Dispatched
+                        );
+                        store
+                            .settle(&admission.command.id, CommandState::Failed, None, now_ms())
+                            .unwrap();
+                    }
+                }
+                let mut store = router.inner.store.lock().await;
+                let admitted = store.submit("owner", request, now_ms()).unwrap();
+                assert_eq!(
+                    store
+                        .dispatch(&admitted.command.id, now_ms())
+                        .unwrap()
+                        .value
+                        .state,
+                    CommandState::Dispatched
+                );
+            }
+        }
     }
 
     #[tokio::test]

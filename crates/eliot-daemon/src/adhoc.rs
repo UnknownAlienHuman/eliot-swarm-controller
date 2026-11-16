@@ -642,7 +642,7 @@ fn path_search_dirs() -> Vec<PathBuf> {
     std::env::var_os("PATH").map_or_else(Vec::new, |paths| std::env::split_paths(&paths).collect())
 }
 
-fn find_on_path(file: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(file: &str) -> Option<PathBuf> {
     let target = file.to_ascii_lowercase();
     for dir in path_search_dirs() {
         let candidate = dir.join(file);
@@ -1080,7 +1080,7 @@ const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Bounded `<exe> --version` first line, or `None` when the probe fails.
 /// A hung native executable must not stall `harness.list`: only the child
 /// this probe started is ever killed on timeout.
-fn native_version_string(program: &str) -> Option<String> {
+pub(crate) fn native_version_string(program: &str) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let Ok(mut child) = Command::new(program)
