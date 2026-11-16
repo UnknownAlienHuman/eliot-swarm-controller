@@ -547,6 +547,8 @@ struct ProfileEntry {
     #[serde(default)]
     child_profiles: Option<Vec<String>>,
     #[serde(default)]
+    native_subagents: Option<String>,
+    #[serde(default)]
     pass_env: Option<Vec<String>>,
     #[serde(default)]
     setup: Vec<crate::setup::SetupEntry>,
@@ -1043,6 +1045,8 @@ fn resolve_profile_in(config: &FileConfig, source: &str, name: &str) -> core::Re
         source,
         snapshot,
     )?;
+    let snapshot =
+        freeze_native_subagents(name, entry.get_ref(), entry.span().start, source, snapshot)?;
     bind_route_and_capacity(
         name,
         entry.get_ref(),
@@ -1106,6 +1110,68 @@ fn freeze_child_profiles(
         frozen.push(Value::String(child.to_owned()));
     }
     snapshot["child_profiles"] = Value::Array(frozen);
+    Ok(snapshot)
+}
+/// Freeze the harness-native subagent switch for this profile: `allow` keeps
+/// today's behavior, `deny` asks the harness plugin to disable its native
+/// subagent surface for the session. An omitted value defaults to `deny`
+/// when the profile names a non-empty `child_profiles` allow-list (managers
+/// delegate through Swarm), and to `allow` otherwise. The frozen value is
+/// reported in the snapshot so effective settings stay truthful. `deny` has
+/// a per-session mapping on Codex, Claude and OpenCode only; on Muse and
+/// Antigravity the installed binaries expose no verified switch, so `deny`
+/// is `unsupported` at config load, matching the existing pattern for
+/// unmapped fields.
+fn freeze_native_subagents(
+    profile_name: &str,
+    entry: &ProfileEntry,
+    table_offset: usize,
+    source: &str,
+    mut snapshot: Value,
+) -> core::Result<Value> {
+    let harness = snapshot
+        .get("harness")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let requested = entry
+        .native_subagents
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let effective = match requested {
+        Some(value) => {
+            if !matches!(value, "allow" | "deny") {
+                return Err(profile_field_error(
+                    source,
+                    table_offset,
+                    profile_name,
+                    "native_subagents",
+                    "must be allow or deny",
+                    "profile_error",
+                ));
+            }
+            value.to_owned()
+        }
+        None => {
+            let has_children = entry
+                .child_profiles
+                .as_deref()
+                .is_some_and(|names| !names.is_empty());
+            if has_children { "deny" } else { "allow" }.to_owned()
+        }
+    };
+    if effective == "deny" && matches!(harness.as_str(), "muse" | "antigravity") {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            profile_name,
+            "native_subagents",
+            "native_subagents deny has no mapping on this harness",
+            "unsupported",
+        ));
+    }
+    snapshot["native_subagents"] = Value::String(effective);
     Ok(snapshot)
 }
 /// Best-effort configured cloud MCP hostname for ad-hoc snapshots: the
@@ -3464,6 +3530,71 @@ mod tests {
                 error.message.contains("child_profiles") && error.message.contains(fragment),
                 "{}",
                 error.message
+            );
+        }
+    }
+
+    #[test]
+    fn native_subagents_default_deny_for_managers_allow_otherwise() {
+        let fixture = AutomationConfigFixture::new();
+        fixture.write(
+            "[profiles.manager]\nharness = \"codex\"\nmodel = \"fixture-model\"\nchild_profiles = [\"worker\"]\n\
+             [profiles.worker]\nharness = \"codex\"\nmodel = \"fixture-cheap\"\n",
+        );
+        assert_eq!(
+            resolve_profile(&fixture.root, "manager").unwrap()["native_subagents"],
+            json!("deny")
+        );
+        assert_eq!(
+            resolve_profile(&fixture.root, "worker").unwrap()["native_subagents"],
+            json!("allow")
+        );
+        fixture.write(
+            "[profiles.solo]\nharness = \"codex\"\nmodel = \"fixture-model\"\nnative_subagents = \"allow\"\n",
+        );
+        assert_eq!(
+            resolve_profile(&fixture.root, "solo").unwrap()["native_subagents"],
+            json!("allow")
+        );
+        fixture.write(
+            "[profiles.manager]\nharness = \"codex\"\nmodel = \"fixture-model\"\nchild_profiles = [\"worker\"]\nnative_subagents = \"allow\"\n\
+             [profiles.worker]\nharness = \"codex\"\nmodel = \"fixture-cheap\"\n",
+        );
+        assert_eq!(
+            resolve_profile(&fixture.root, "manager").unwrap()["native_subagents"],
+            json!("allow")
+        );
+        fixture.write(
+            "[profiles.bad]\nharness = \"codex\"\nmodel = \"fixture-model\"\nnative_subagents = \"sometimes\"\n",
+        );
+        let error = resolve_profile(&fixture.root, "bad").unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        assert!(
+            error.message.contains("native_subagents"),
+            "{}",
+            error.message
+        );
+        for harness in ["muse", "antigravity"] {
+            let cmd = "C:/Tools/Native/agent.exe";
+            fixture.write(&format!(
+                "[profiles.manager]\nharness = \"{harness}\"\ncmd = \"{cmd}\"\nchild_profiles = [\"worker\"]\n\
+                 [profiles.worker]\nharness = \"codex\"\nmodel = \"fixture-cheap\"\n"
+            ));
+            let error = resolve_profile(&fixture.root, "manager").unwrap_err();
+            assert_eq!(error.code, "unsupported", "harness: {harness}");
+            assert!(
+                error.message.contains("native_subagents"),
+                "{}",
+                error.message
+            );
+            fixture.write(&format!(
+                "[profiles.manager]\nharness = \"{harness}\"\ncmd = \"{cmd}\"\nchild_profiles = [\"worker\"]\nnative_subagents = \"allow\"\n\
+                 [profiles.worker]\nharness = \"codex\"\nmodel = \"fixture-cheap\"\n"
+            ));
+            assert_eq!(
+                resolve_profile(&fixture.root, "manager").unwrap()["native_subagents"],
+                json!("allow"),
+                "harness: {harness}"
             );
         }
     }

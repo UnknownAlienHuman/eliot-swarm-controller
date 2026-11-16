@@ -84,9 +84,13 @@ fn control_rank(control: AgentControl) -> u8 {
 /// Snapshot keys that may differ between an allow-listed child and its
 /// parent: a cheaper worker/reviewer model (and its effort) is the point of
 /// the allow-list, `child_profiles` governs the next hop rather than this
-/// launch, and `control` is checked separately as equal or narrower.
+/// launch, `native_subagents` governs the child's own session rather than
+/// this launch, and `control` is checked separately as equal or narrower.
 fn ignored_child_snapshot_key(key: &str) -> bool {
-    matches!(key, "model" | "effort" | "child_profiles" | "control")
+    matches!(
+        key,
+        "model" | "effort" | "child_profiles" | "native_subagents" | "control"
+    )
 }
 
 /// "Same profile except model and effort" over frozen snapshots (#398

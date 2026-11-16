@@ -85,7 +85,8 @@ stored profile. First use writes visible, editable native-default profiles for
 installed harnesses through the settings writer as `bootstrap`. On a fresh root,
 the default is `codex` when installed,
 otherwise the first installed profile in name order. It has `control = "tree"`
-and `child_profiles` listing the other installed bootstrap profiles. The `worker`
+and `child_profiles` listing the other installed bootstrap profiles (so its
+omitted `native_subagents` resolves to `deny`). The `worker`
 routing role lists those profiles in name order (or the inherited default profile
 when it is the only installed harness). This makes Swarm delegation available on
 first use; existing profiles and routing choices are preserved. An omitted model
@@ -201,6 +202,19 @@ remain inherited. A cross-harness child retains its own capacity scopes and ever
 non-profile scope of the parent with the same bounds; conflicting bounds reject.
 The parent's own profile scope is replaced by the child's. See the launch authority
 check in [api](api.md) and [coordination](coordination.md#claims-and-hierarchy).
+
+A profile selects its harness-native subagent surface in `native_subagents`:
+`allow` (the default without `child_profiles`) keeps today's behavior, while
+`deny` asks the harness plugin to disable its native subagent tool for the
+session so delegation goes through Swarm (`launch` with `role` or an allowed
+profile, claims, mail, `wait`/`digest`). An omitted value defaults to `deny`
+for profiles with a non-empty `child_profiles` allow-list (managers delegate
+through Swarm) and to `allow` otherwise. The frozen value is captured in the
+profile snapshot and reported truthfully in the effective settings. Explicit
+`allow` on a manager preserves native subagents (audit profiles that rely on
+Codex native subagents set `allow`). `deny` has a per-session mapping on
+Codex, Claude and OpenCode only; on Muse and Antigravity the installed
+binaries expose no verified switch, so `deny` is `unsupported` at config load.
 
 An optional `collaboration_mode` selects Codex's `default` or `plan` preset for each
 turn. The selected mode is frozen with the profile; omission preserves the native
