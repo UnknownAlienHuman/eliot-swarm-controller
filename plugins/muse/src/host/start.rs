@@ -26,6 +26,7 @@ use eliot_plugin::{
         ResumeSubject, TargetEnvironment, native_no_write, optional_profile_text,
         parse_resume_subject, target_environment, validate_source_plan,
     },
+    skill,
 };
 use serde_json::Value;
 use std::{
@@ -191,6 +192,30 @@ pub(super) async fn spawn_owned_session(
     secrets: Vec<String>,
     peer: &PeerClient,
 ) -> Result<AgentSession> {
+    // Muse `serve` offers no per-session skill flag, so the first turn
+    // carries the identical skill text instead. Resolve the daemon-owned
+    // copy here: a missing copy fails the start rather than starting an
+    // Agent that believes it has no skill.
+    let data_dir = params
+        .target_environment
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|environment| environment.get("ELIOT_HOME"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .ok_or_else(|| {
+            Error::new(
+                "not_allowed",
+                "Muse skill delivery requires the Agent-bound Eliot data root",
+            )
+        })?;
+    let skill_text = skill::read_skill_file(&skill::skill_body_path(&data_dir)).map_err(|_| {
+        Error::new(
+            "skill_unavailable",
+            "Muse skill source is unavailable; the daemon did not materialize it",
+        )
+    })?;
     let mut native =
         NativeProcess::spawn(launch, SecretPolicy::new(secrets.iter().cloned())).await?;
     let frames = native.take_frames()?;
@@ -227,6 +252,8 @@ pub(super) async fn spawn_owned_session(
         rejected_commands: HashSet::new(),
         control_commands: HashMap::new(),
         stop_command_id: None,
+        skill_text,
+        skill_pending: true,
     })
 }
 

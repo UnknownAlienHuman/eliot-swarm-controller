@@ -72,6 +72,7 @@ pub(crate) async fn dispatch(
         CliCommand::Inbox(args) => coord::run_inbox(args, data_dir, json_output).await,
         CliCommand::Var(args) => coord::run_var(args, data_dir, json_output, id).await,
         CliCommand::Who(args) => coord::run_who(args, data_dir, json_output).await,
+        CliCommand::Identity => coord::run_identity(data_dir, json_output).await,
         CliCommand::Claim(args) => coord::run_claim(args, data_dir, json_output, id).await,
         CliCommand::Plugin(_) => Err(Failure::new(
             1,
