@@ -14633,3 +14633,28 @@ fn exact_turn_unknown_mask_uses_covering_index_and_matches_per_turn() {
         "plan avoids full scan: {plan:?}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn new_store_database_files_are_current_user_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The database file itself carries an explicit 0600 creation mode, so it
+    // is private under any ambient umask. WAL/SHM siblings honor the process
+    // umask the daemon sets at startup (covered by live proof).
+    let path = std::env::temp_dir().join(format!("eliot-perms-{}.sqlite", Ulid::new()));
+    let store = Store::open(&path).expect("open new Store");
+    drop(store);
+    let mode = fs::metadata(&path)
+        .expect("new Store database exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "new Store database is 0600");
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        let _ = fs::remove_file(PathBuf::from(&candidate));
+    }
+    let _ = fs::remove_file(&path);
+}
