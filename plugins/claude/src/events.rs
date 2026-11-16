@@ -3,7 +3,7 @@ use eliot_core::{
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
 use eliot_plugin::{
-    CommitSink, MAX_EVENT_BYTES, MAX_TEXT_BYTES, PeerClient,
+    CommitSink, MAX_EVENT_BYTES, MAX_TEXT_BYTES, PeerClient, is_definite_batch_rejection,
     native_stdio::StreamState,
     native_transport::encode_frame,
     protocol::{HookEvent, HookResponse},
@@ -1444,14 +1444,20 @@ impl EventProcessor {
             return;
         }
         if let Err(error) = self.process_record(record).await {
-            self.status.source_unknown = true;
-            if self.status.failure.is_none() {
-                self.status.failure = Some(*error.message);
+            // A definite pre-transaction rejection already recorded its gap
+            // with the typed reason and cleared the commit latch, so it must
+            // not latch the source unknown or taint later associations.
+            if !is_definite_batch_rejection(&error.code) {
+                self.status.source_unknown = true;
+                if self.status.failure.is_none() {
+                    self.status.failure = Some(*error.message);
+                }
             }
             return;
         }
         // An association may have unblocked buffered assistant text.
         if let Err(error) = self.flush_buffer().await
+            && !is_definite_batch_rejection(&error.code)
             && self.status.failure.is_none()
         {
             self.status.failure = Some(*error.message);
@@ -1651,7 +1657,7 @@ impl EventProcessor {
                     data["context_outcomes"] = json!(context_outcomes);
                 }
                 if let Err(error) = self.commit_event("turn.started", native_id, data).await {
-                    settle(outcome, TurnOutcome::Unknown((*error.message).clone()));
+                    self.settle_turn_started_persistence(outcome, &error);
                     return Err(error);
                 }
                 settle(outcome, TurnOutcome::Associated);
@@ -1676,6 +1682,30 @@ impl EventProcessor {
                 self.record_gap("Claude lifecycle carried an unknown turn state")
                     .await
             }
+        }
+    }
+
+    /// Settle a post-dispatch `turn.started` persistence failure. The input
+    /// was already written to the CLI, so even a definite batch rejection
+    /// proves only that the batch was never committed (a gap covers it),
+    /// never a definite native outcome. The command stays `Unknown` with its
+    /// exact binding, and fresh input is fenced via `source_unknown`/`failure`
+    /// until reconciliation. Only `session.ready` before any input may settle
+    /// definite `failed`; the commit latch itself stays clear (no
+    /// `writes_blocked`/`batch_unknown`) because the batch is known
+    /// uncommitted.
+    fn settle_turn_started_persistence(
+        &mut self,
+        outcome: Option<oneshot::Sender<TurnOutcome>>,
+        error: &Error,
+    ) {
+        let reason = (*error.message).clone();
+        self.status.source_unknown = true;
+        if self.status.failure.is_none() {
+            self.status.failure = Some(reason.clone());
+        }
+        if let Some(sender) = outcome {
+            let _ = sender.send(TurnOutcome::Unknown(reason));
         }
     }
 
@@ -3888,6 +3918,51 @@ mod tests {
         processor
             .register_turn("cmd-2".to_owned(), "turn-2".to_owned(), outcome_tx)
             .expect("registration works after the cancel");
+    }
+
+    #[tokio::test]
+    async fn definite_turn_started_rejection_stays_unknown_and_fenced() {
+        // Post-dispatch persistence failure keeps the command Unknown with
+        // its exact binding (never Rejected) and fences fresh input, even
+        // for the four definite batch-rejection codes. Only `session.ready`
+        // before any input may settle definite `failed`.
+        for code in [
+            "secret_in_payload",
+            "invalid",
+            "not_allowed",
+            "stale_generation",
+            "unknown",
+        ] {
+            let mut processor = ready_processor();
+            let (tx, rx) = oneshot::channel();
+            let error = eliot_core::Error::new(code, format!("{code} fixture"));
+            processor.settle_turn_started_persistence(Some(tx), &error);
+            match rx.await.expect("persistence failure settles the waiter") {
+                TurnOutcome::Unknown(reason) => assert!(
+                    reason.contains(code),
+                    "reason keeps the typed cause: {reason}"
+                ),
+                TurnOutcome::Associated | TurnOutcome::Rejected(_) => {
+                    panic!("turn.started persistence failure must stay Unknown, code={code}")
+                }
+            }
+            assert!(
+                processor.status.source_unknown,
+                "post-dispatch failure fences snapshots, code={code}"
+            );
+            assert!(
+                processor.status.failure.is_some(),
+                "post-dispatch failure fences fresh input, code={code}"
+            );
+            assert!(
+                !processor.status.batch_unknown,
+                "definite batch stays known-uncommitted, code={code}"
+            );
+            assert!(
+                !processor.writes_blocked,
+                "commit latch stays clear for a definite rejection, code={code}"
+            );
+        }
     }
 
     #[tokio::test]

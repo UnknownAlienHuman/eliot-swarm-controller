@@ -588,6 +588,35 @@ mod tests {
         assert_eq!(error.message.as_str(), "primary message remains unchanged");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_private_log_keeps_ambient_umask_for_outside_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The daemon sets no process-wide umask: private files carry explicit
+        // 0600 modes while outside files keep the ambient mask.
+        let _mask = crate::platform::unix::hold_umask(0o022);
+        let root = FreshRoot::new();
+        let data = DataDir::open(&root.0).unwrap();
+        let lock = data.acquire_daemon_lock().unwrap();
+        let log = LogFile::open(&data, &lock).unwrap();
+        drop(log);
+        let mode = fs::metadata(data.path().join("logs").join("daemon.log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "daemon log is current-user-only");
+        let outside = std::env::temp_dir().join(format!("eliot-ambient-{}", ulid::Ulid::new()));
+        fs::write(&outside, b"ambient").unwrap();
+        let outside_mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        let _ = fs::remove_file(&outside);
+        assert_eq!(
+            outside_mode, 0o644,
+            "files outside the data dir keep the ambient umask"
+        );
+    }
+
     #[test]
     fn existing_non_file_is_not_replaced_or_cleaned_up() {
         let root = FreshRoot::new();

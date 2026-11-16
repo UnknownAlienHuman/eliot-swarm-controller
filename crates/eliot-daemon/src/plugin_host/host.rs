@@ -1120,19 +1120,62 @@ impl PluginHost {
         restrict: impl FnOnce(&Path) -> std::io::Result<()>,
     ) -> Result<(PathBuf, String)> {
         let parent = self.state.data_root.join("plugins");
-        std::fs::create_dir_all(&parent).map_err(|error| {
-            Error::new(
-                "platform_io",
-                format!("create plugin instance root: {error}"),
-            )
-        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(&parent)
+                .map_err(|error| {
+                    Error::new(
+                        "platform_io",
+                        format!("create plugin instance root: {error}"),
+                    )
+                })?;
+            if parent.is_dir() {
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |error| {
+                        Error::new(
+                            "platform_io",
+                            format!("restrict plugin instance root: {error}"),
+                        )
+                    },
+                )?;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(&parent).map_err(|error| {
+                Error::new(
+                    "platform_io",
+                    format!("create plugin instance root: {error}"),
+                )
+            })?;
+        }
         let instance_dir = parent.join(format!("{}-g{}-{}", key.id, key.generation, Ulid::new()));
-        std::fs::create_dir(&instance_dir).map_err(|error| {
-            Error::new(
-                "platform_io",
-                format!("create plugin instance directory: {error}"),
-            )
-        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&instance_dir)
+                .map_err(|error| {
+                    Error::new(
+                        "platform_io",
+                        format!("create plugin instance directory: {error}"),
+                    )
+                })?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir(&instance_dir).map_err(|error| {
+                Error::new(
+                    "platform_io",
+                    format!("create plugin instance directory: {error}"),
+                )
+            })?;
+        }
         if let Err(error) = restrict(&instance_dir) {
             remove_empty_instance_dir(&instance_dir);
             return Err(Error::new(
@@ -2395,11 +2438,9 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                         }
                         Ok(batch) => {
                             if observation.is_some() {
-                                Err(late_batch_error(
-                                    &state,
-                                    &agent_id,
-                                    generation,
-                                    "source_generation_mismatch",
+                                Err(Error::new(
+                                    "stale_generation",
+                                    "events.put generation does not match this Agent generation",
                                 ))
                             } else {
                                 native_children::put_child_batch(
@@ -2414,12 +2455,7 @@ async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSo
                                 .await
                             }
                         }
-                        Err(_) => Err(late_batch_error(
-                            &state,
-                            &agent_id,
-                            generation,
-                            "events_put_malformed",
-                        )),
+                        Err(_) => Err(Error::new("invalid", "events.put params are malformed")),
                     },
                     "source.gap" => {
                         let is_producer = params.get("agent_id").and_then(Value::as_str)
@@ -4768,6 +4804,87 @@ mod tests {
         assert_eq!(gap_event.data["reason"], json!("reader lost [REDACTED]"));
         assert!(!serde_json::to_string(&events).unwrap().contains(SECRET));
 
+        client.close_input(deadline()).await.unwrap();
+        timeout_at(deadline(), task).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_put_malformed_params_are_definite_invalid() {
+        let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
+        let command_id = Ulid::new().to_string();
+        let now = now_ms();
+        let agent_id = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: command_id.clone(),
+                    target: None,
+                    selector: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"project":"malformed-guard", "workspace":"synthetic-workspace", "harness":"codex", "profile":"fixture", "profile_snapshot":{}}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&command_id, now).unwrap();
+        crate::test_support::install_fixture_sources(&mut store, &agent_id, &command_id, 1, now);
+        let before = store.high_water().unwrap();
+        let store = Arc::new(AsyncMutex::new(store));
+        let bus = Bus::new(16);
+        let mut published = bus.subscribe();
+        let credential = "private-malformed-guard";
+        let (host_io, peer_io) = tokio::io::duplex(16 * 1024);
+        let (host_read, host_write) = tokio::io::split(host_io);
+        let (peer_read, peer_write) = tokio::io::split(peer_io);
+        let host = PluginConnection::new(host_read, host_write);
+        let peer = PluginConnection::new(peer_read, peer_write);
+        let client = peer.client();
+        let task = tokio::spawn(serve_plugin_requests(
+            host,
+            EventSource {
+                store: store.clone(),
+                bus: bus.clone(),
+                monitoring: Monitoring::new(
+                    store.clone(),
+                    bus,
+                    Arc::new(Mutex::new(HashSet::new())),
+                ),
+                source_credentials: Arc::from([credential.to_owned()]),
+                state: Weak::new(),
+                key: AgentKey {
+                    id: agent_id.clone(),
+                    generation: 1,
+                },
+                agent_id: agent_id.clone(),
+                generation: 1,
+                expected_credential: credential.to_owned(),
+                observation: None,
+            },
+        ));
+        // Decode happens before the Store transaction opens, so a malformed
+        // body is a definite rejection: never committed, never `unknown`.
+        for params in [
+            json!({"credential": credential}),
+            json!({"credential": credential, "agent_id": agent_id, "generation": "one"}),
+        ] {
+            let error = client
+                .call("events.put", params, deadline())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid");
+        }
+        assert_eq!(store.lock().await.high_water().unwrap(), before);
+        assert!(matches!(
+            published.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         client.close_input(deadline()).await.unwrap();
         timeout_at(deadline(), task).await.unwrap().unwrap();
     }

@@ -277,6 +277,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_crash_marker_is_current_user_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("eliot-crash-mode-{}", ulid::Ulid::new()));
+        let marker = CrashMarker {
+            code: "daemon.panicked".to_owned(),
+            thread: "main".to_owned(),
+            location: "src/main.rs:1".to_owned(),
+            message: "explicit panic".to_owned(),
+            backtrace: "frames".to_owned(),
+            timestamp: 1_700_000_000_000,
+        };
+        write_marker(&dir, &marker);
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(entries.len(), 1, "one crash marker was written");
+        let mode = entries[0].metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "crash marker is current-user-only");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn load_redacts_and_keeps_latest() {
         let root = std::env::temp_dir().join(format!("k68-crash2-{}", std::process::id()));

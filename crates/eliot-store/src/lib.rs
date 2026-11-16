@@ -312,6 +312,35 @@ impl Store {
         let owned_path = core::verbatim_path(path);
         #[cfg(windows)]
         let path: &Path = &owned_path;
+        #[cfg(unix)]
+        if path != Path::new(":memory:") {
+            // Create the database file current-user-only (0600). SQLite's
+            // `-wal`/`-shm`/`-journal` siblings inherit the database file's
+            // permissions, unadulterated by the umask (see `os_unix.c`: "We
+            // want those files to have *exactly* the same permissions as
+            // their original database, unadulterated by the umask.",
+            // https://sqlite.org/src/artifact?ci=trunk&filename=src/os_unix.c);
+            // no process-wide umask is needed. Windows keeps its ACL checks.
+            // The `:memory:` sentinel is not a filesystem path: bypass
+            // pre-creation so no literal file is created.
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+            {
+                Ok(file) => drop(file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(Error::new(
+                        "platform_io",
+                        format!("create private Store database: {error}"),
+                    ));
+                }
+            }
+        }
         let connection = Connection::open(path).map_err(sql_error)?;
         connection
             .busy_timeout(Duration::from_secs(5))

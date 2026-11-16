@@ -880,8 +880,9 @@ pub struct StreamSource<'a> {
 
 impl StreamSource<'_> {
     /// Commit one native record. An unknown acknowledgement latches the
-    /// source (no replay is ever allowed); any other commit failure records
-    /// an explicit gap instead.
+    /// source (no replay is ever allowed); a definite pre-transaction
+    /// rejection records an explicit gap with its typed reason and returns
+    /// that typed error instead of `unknown`.
     pub async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
         let mut ignored = None;
         self.commit_event_inner(kind, native_id, data, &mut ignored)
@@ -1001,15 +1002,20 @@ impl StreamSource<'_> {
                 format!("{} event batch acknowledgement is unknown", self.harness),
             ));
         }
+        // Definite rejection: the latch is clear, so the batch was never
+        // committed. Record a gap with the definite reason without latching
+        // unknown, and return the typed error so callers never map it to
+        // `turn.unknown` or a launch `Unknown`.
         let reason = format!("{kind} could not be committed: {}", error.code);
-        self.record_gap_inner(&reason, retained).await?;
-        Err(Error::new(
-            "unknown",
-            format!(
-                "{} native fact was not committed; no replay is allowed",
-                self.harness
-            ),
-        ))
+        self.record_gap_inner_until(
+            &reason,
+            retained,
+            (None, None),
+            Instant::now() + EVENT_DEADLINE,
+            false,
+        )
+        .await?;
+        Err(error)
     }
 
     async fn record_gap_inner(

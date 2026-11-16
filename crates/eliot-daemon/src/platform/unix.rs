@@ -197,6 +197,30 @@ fn verify_unprivileged_leaf() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Hold the process umask at `mask` until the guard drops, then restore the
+/// previous mask. Test-only: the process umask is global, so holders must not
+/// run concurrently with other file-creation assertions; pass the ambient
+/// mask (usually `0o022`) to keep the window behavior-identical.
+#[cfg(test)]
+pub(crate) fn hold_umask(mask: libc::mode_t) -> MaskGuard {
+    // SAFETY: the previous mask is captured and restored by the guard; the
+    // caller accepts the process-global window documented above.
+    let previous = unsafe { libc::umask(mask) };
+    MaskGuard(previous)
+}
+
+/// Restores the held process umask on drop. See [`hold_umask`].
+#[cfg(test)]
+pub(crate) struct MaskGuard(libc::mode_t);
+
+#[cfg(test)]
+impl Drop for MaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: restoring the exact previously observed mask value.
+        unsafe { libc::umask(self.0) };
+    }
+}
+
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: geteuid has no pointer arguments or preconditions.
     unsafe { libc::geteuid() }
