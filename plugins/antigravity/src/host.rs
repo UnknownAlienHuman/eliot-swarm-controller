@@ -525,26 +525,42 @@ impl Plugin {
                 "Antigravity start is unresolved; it will not be replayed",
             )),
         ));
-        let result =
-            match Session::spawn(&params, &plan, peer, &credential, hook_config, hooks).await {
-                Ok(session) => {
-                    self.session = Some(session);
-                    let session = self
-                        .session
-                        .as_mut()
-                        .ok_or_else(|| Error::new("internal", "Antigravity session disappeared"))?;
-                    let result = session.start(&plan, peer, &credential).await;
-                    if result.is_err() && session.terminate(true).await.is_err() {
-                        Err(Error::new(
-                            "unknown",
-                            "Antigravity start failed and owned cleanup is unconfirmed",
-                        ))
-                    } else {
-                        result
+        let result = match Session::spawn(&params, &plan, peer, &credential, hook_config, hooks)
+            .await
+        {
+            Ok(session) => {
+                self.session = Some(session);
+                let session = self
+                    .session
+                    .as_mut()
+                    .ok_or_else(|| Error::new("internal", "Antigravity session disappeared"))?;
+                let result = session.start(&plan, peer, &credential).await;
+                match result {
+                    Err(error) if error.code == "native_model_unavailable" => {
+                        if session.terminate(true).await.is_ok() {
+                            let error = eliot_plugin::session::classify_start_failure(
+                                error,
+                                "antigravity",
+                                "session",
+                            );
+                            let value = eliot_plugin::session::failed_start_value(&params, error);
+                            Ok(value)
+                        } else {
+                            Err(Error::new(
+                                "unknown",
+                                "Antigravity start failed and owned cleanup is unconfirmed",
+                            ))
+                        }
                     }
+                        Err(_) if session.terminate(true).await.is_err() => Err(Error::new(
+                        "unknown",
+                        "Antigravity start failed and owned cleanup is unconfirmed",
+                    )),
+                    other => other,
                 }
-                Err(error) => Err(error),
-            };
+            }
+            Err(error) => Err(error),
+        };
         self.start = Some((identity, result.clone()));
         result
     }

@@ -422,10 +422,13 @@ impl Plan {
                         .any(|(advertised, _)| advertised == &value)
                 });
             if !advertised {
-                return Err(Error::new(
-                    "unknown",
-                    "Antigravity ACP session did not advertise a required config value",
-                ));
+                return Err(
+                    eliot_plugin::start_classification::harness_unavailable_model(
+                        "antigravity",
+                        "session",
+                        "Antigravity ACP session did not advertise a required config value",
+                    ),
+                );
             }
         }
         // The reported effective selectors are the realignment target
@@ -1165,5 +1168,19 @@ mod tests {
         assert_eq!(effective["mcp_servers"], Value::Null);
         assert_eq!(effective["mcp_servers_verified"], json!(false));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn refused_model_at_start_is_failed_with_harness_origin() {
+        let error = eliot_plugin::start_classification::harness_unavailable_model(
+            "antigravity",
+            "session",
+            "model is missing",
+        );
+        assert_eq!(error.code, "native_model_unavailable");
+        assert_eq!(error.origin, Some(eliot_core::FailureOrigin::Harness));
+        assert!(eliot_plugin::start_classification::is_proven_no_effect(
+            eliot_plugin::start_classification::StartPoint::NativeRefusalBeforeDispatch
+        ));
     }
 }
