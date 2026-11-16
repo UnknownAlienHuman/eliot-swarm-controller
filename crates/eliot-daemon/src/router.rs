@@ -1940,9 +1940,9 @@ impl Router {
         // captured `child_profiles`; the captured list governs, so a later
         // config edit cannot widen an already-running manager. The allowed
         // child profile resolves now, before any native effect, and must use
-        // the parent's harness; it inherits the parent's captured credential
-        // bindings verbatim and must match the parent snapshot except for
-        // model, effort, and its own profile scope.
+        // its own harness policy. Same-harness children retain the existing
+        // credential and model-only confinement; cross-harness children use
+        // the Owner-approved profile's bindings and inherit capacity bounds.
         let agent_child_snapshot = if matches!(principal, Principal::Agent { .. })
             && request.args.get("parent").is_some()
         {
@@ -1993,20 +1993,7 @@ impl Router {
                     .filter(|harness| !harness.trim().is_empty())
                     .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
                     .to_owned();
-                // Cross-harness children are not supported: equal policy
-                // names mean different native surfaces on different
-                // harnesses. The child inherits the parent's captured
-                // credential bindings verbatim and never re-discovers them.
-                if harness != parent.harness {
-                    return Err(Error::new(
-                        "not_allowed",
-                        format!(
-                            "cross-harness child profiles are not supported: parent profile uses {0} but child profile {name} uses {harness}",
-                            parent.harness
-                        ),
-                    ));
-                }
-                hierarchy::inherit_parent_launch_bindings(&mut snapshot, &parent.profile_snapshot);
+                hierarchy::inherit_child_launch_bounds(&mut snapshot, &parent)?;
                 Some((name.to_owned(), harness, snapshot))
             } else {
                 Some((
@@ -5983,6 +5970,7 @@ struct RetainedLaunchProfile {
     workspace: Option<Value>,
     project: Option<Value>,
     preparation: Option<Value>,
+    agent_child: bool,
 }
 
 fn install_retained_attach_profile(
@@ -6054,6 +6042,8 @@ fn retained_launch_profile(
     let workspace = command.args.get("workspace").cloned();
     let project = command.args.get("project").cloned();
     let preparation = command.args.get("workspace_preparation").cloned();
+    let agent_child =
+        command.principal.starts_with("agent:") && command.args.get("parent").is_some();
     let stored_snapshot = command
         .args
         .get("profile_snapshot")
@@ -6084,6 +6074,7 @@ fn retained_launch_profile(
             workspace,
             project,
             preparation,
+            agent_child,
         }));
     }
 
@@ -6109,6 +6100,7 @@ fn retained_launch_profile(
             workspace,
             project,
             preparation,
+            agent_child,
         }));
     }
 
@@ -6178,12 +6170,18 @@ fn install_retained_profile(
         workspace,
         project,
         preparation,
+        agent_child,
     } = retained;
     let same_workspace = match (
         request.args.get("workspace").and_then(Value::as_str),
         workspace.as_ref().and_then(Value::as_str),
     ) {
         (Some(requested), Some(stored)) => same_retained_workspace(requested, stored),
+        (None, Some(_))
+            if agent_child && matches!(request.args.get("workspace"), None | Some(Value::Null)) =>
+        {
+            true
+        }
         _ => false,
     };
     // Match the exact payload shape that Store admitted. This keeps retries of
@@ -6216,6 +6214,8 @@ fn install_retained_profile(
     } else {
         args.remove("workspace_preparation");
     }
+    // An Agent child's omitted workspace inherits the retained workspace,
+    // without consulting a changed parent or the filesystem on exact replay.
     // Normalize only the same caller workspace without touching the filesystem.
     // A changed path/branch/base/text stays in the payload for Store's id_conflict.
     if same_workspace {

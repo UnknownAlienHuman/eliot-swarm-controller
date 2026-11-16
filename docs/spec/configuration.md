@@ -95,7 +95,17 @@ and Antigravity. Each profile selects one `harness` explicitly and may pin an ex
 `model` or preserve the native default. Only Codex may omit `cmd`, in which case it launches `codex` by name;
 the other four adapters require an explicit native executable in `cmd` in a
 stored profile. First use writes visible, editable native-default profiles for
-installed harnesses through the settings writer as `bootstrap`. An omitted model
+installed harnesses through the settings writer as `bootstrap`. On a fresh root,
+the default is the first installed of `codex`, `claude` and `opencode` (the
+harnesses that can disable native subagents per session), otherwise the first
+installed profile in name order. It has `control = "tree"` and `child_profiles`
+listing the other installed bootstrap profiles, so on those harnesses its omitted
+`native_subagents` resolves to `deny`. A Muse or Antigravity default, which has
+no per-session switch, is written with `native_subagents = "allow"` so the
+bootstrap settings stay valid. The `worker`
+routing role lists those profiles in name order (or the inherited default profile
+when it is the only installed harness). This makes Swarm delegation available on
+first use; existing profiles and routing choices are preserved. An omitted model
 in these profiles requests the native default and retains requested/effective
 readback separately, as for an ad-hoc launch. There is no builtin fake profile.
 Before admission, an omitted profile selects the first available ordered role candidate. There is no post-dispatch harness/model/route/account
@@ -191,19 +201,36 @@ These values are frozen at admission. The supported approval and question callba
 are handled through exact pending request IDs; an unsupported callback receives an
 error, never a default choice.
 
-An owner may allow a profile's Agents to launch children on other configured
-profiles of the same harness with `child_profiles`, e.g.
-`child_profiles = ["codex-worker", "codex-review"]`. Cross-harness child profiles
-are not supported and are rejected at config load and at launch. Names must exist
+An Owner may allow a profile's Agents to launch children on other configured
+profiles of any harness with `child_profiles`, e.g.
+`child_profiles = ["claude-worker", "muse-worker"]`. Names must exist
 as configured profiles, and a profile must not list itself; absent or empty keeps
 today's behavior (Agent children reuse the parent profile only). The parent's
 launch captures the list in its frozen snapshot, so a later config edit cannot
-widen an already-running manager. A child on an allow-listed profile carries that
-profile's freshly frozen snapshot with only model and effort differing (control is
-narrowed or equal under the separate check); the child inherits the parent's
-captured credential bindings verbatim, and its capacity scopes keep every
-non-profile scope of the parent with the same bounds. See the launch authority
+widen an already-running manager. Naming a different harness is an explicit Owner
+authority grant: the child carries that profile's freshly frozen harness, model,
+permissions, MCP policy and credential references/selector bindings. Parent policy
+names are never reinterpreted on the child's harness, and parent credential or
+native-store bindings are never copied across harnesses. Same-harness children keep
+the existing model/effort-only confinement and inherit captured credential bindings
+verbatim. Control remains equal or narrower on every harness; workspace and project
+remain inherited. A cross-harness child retains its own capacity scopes and every
+non-profile scope of the parent with the same bounds; conflicting bounds reject.
+The parent's own profile scope is replaced by the child's. See the launch authority
 check in [api](api.md) and [coordination](coordination.md#claims-and-hierarchy).
+
+A profile selects its harness-native subagent surface in `native_subagents`:
+`allow` (the default without `child_profiles`) keeps today's behavior, while
+`deny` asks the harness plugin to disable its native subagent tool for the
+session so delegation goes through Swarm (`launch` with `role` or an allowed
+profile, claims, mail, `wait`/`digest`). An omitted value defaults to `deny`
+for profiles with a non-empty `child_profiles` allow-list (managers delegate
+through Swarm) and to `allow` otherwise. The frozen value is captured in the
+profile snapshot and reported truthfully in the effective settings. Explicit
+`allow` on a manager preserves native subagents (audit profiles that rely on
+Codex native subagents set `allow`). `deny` has a per-session mapping on
+Codex, Claude and OpenCode only; on Muse and Antigravity the installed
+binaries expose no verified switch, so `deny` is `unsupported` at config load.
 
 An optional `collaboration_mode` selects Codex's `default` or `plan` preset for each
 turn. The selected mode is frozen with the profile; omission preserves the native
@@ -1054,7 +1081,10 @@ otherwise their CLI calls remain attributed to the parent, as the plugin reports
 
 Configured profile, account and selected-proxy `max_live` caps are local admission
 limits. An omitted cap (`None`) is unlimited; `0` disables that scope. The snapshot
-freezes the scope names and configured values. A full scope rejects before native
+freezes the scope names and configured values. Cross-harness children reserve
+their own scopes and inherited parent
+account/proxy scopes together, so multiple distinct scopes of one kind are allowed;
+duplicate scope identities reject. A full scope rejects before native
 control with `capacity_unavailable`. That request is not admitted or persisted, so it
 creates no command, Agent, event or reservation; the same ID may be submitted again
 after capacity changes. An already admitted command retains its result under its ID, and

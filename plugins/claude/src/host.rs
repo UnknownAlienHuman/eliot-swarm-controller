@@ -305,6 +305,9 @@ struct StartPlan {
     requested_effort: Option<String>,
     requested_mcp_policy: McpPolicy,
     requested_mcp_allow: Vec<String>,
+    /// Frozen native-subagent switch: `deny` disables the native subagent
+    /// tool for the session via `--disallowedTools Task`.
+    native_subagents_deny: bool,
     resume_ref: Option<String>,
 }
 
@@ -899,6 +902,10 @@ impl ClaudePlugin {
         let requested_mcp_allow = eliot_core::parse_snapshot_allow_list(profile)
             .map_err(|error| Error::new("profile_error", format!("Claude {}", error.message)))?;
         check_mcp_allow_empty(&requested_mcp_allow)?;
+        let native_subagents_deny = profile
+            .get("native_subagents")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "deny");
         let workspace = params
             .workspace
             .as_deref()
@@ -1001,6 +1008,7 @@ impl ClaudePlugin {
             requested_effort,
             requested_mcp_policy,
             requested_mcp_allow,
+            native_subagents_deny,
             resume_ref,
         })
     }
@@ -2358,6 +2366,7 @@ async fn launch_session(
         argv.push(OsString::from("--effort"));
         argv.push(OsString::from(effort));
     }
+    argv.extend(native_subagents_argv(plan.native_subagents_deny));
     argv.extend(mcp_argv(
         plan.requested_mcp_policy,
         mcp_config.path().as_os_str(),
@@ -2549,6 +2558,18 @@ fn mcp_argv(policy: McpPolicy, config_path: &std::ffi::OsStr) -> Vec<OsString> {
     argv
 }
 
+/// Per-session native-subagent mapping for the installed Claude Code CLI
+/// (installed 2.1.278 exposes `--disallowedTools`; the `Task` tool launches
+/// subagents, per `claude --help` and the official subagent docs): `deny`
+/// passes `--disallowedTools Task`, `allow` adds nothing and preserves
+/// today's behavior.
+fn native_subagents_argv(deny: bool) -> Vec<OsString> {
+    if !deny {
+        return Vec::new();
+    }
+    vec![OsString::from("--disallowedTools"), OsString::from("Task")]
+}
+
 fn claude_manifest() -> PluginManifest {
     let controlled = BTreeMap::from([
         ("message".to_owned(), "stream".to_owned()),
@@ -2654,8 +2675,8 @@ fn target_environment(
 mod tests {
     use super::{
         ClaudePlugin, PendingSend, PhaseFailure, SendHistory, StartPhase, check_mcp_allow_empty,
-        claude_manifest, claude_scope, mcp_argv, new_uuid, prespawn_reason, retain_send_rejection,
-        send_unknown, setter_error, start_failure_is_proven_no_effect,
+        claude_manifest, claude_scope, mcp_argv, native_subagents_argv, new_uuid, prespawn_reason,
+        retain_send_rejection, send_unknown, setter_error, start_failure_is_proven_no_effect,
     };
     use crate::events::TurnOutcome;
     use eliot_core::Error;
@@ -2859,6 +2880,18 @@ mod tests {
                 std::ffi::OsString::from("--strict-mcp-config"),
                 std::ffi::OsString::from("--mcp-config"),
                 std::ffi::OsString::from("agent-mcp.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_subagents_deny_disables_task_tool() {
+        assert!(native_subagents_argv(false).is_empty());
+        assert_eq!(
+            native_subagents_argv(true),
+            vec![
+                std::ffi::OsString::from("--disallowedTools"),
+                std::ffi::OsString::from("Task"),
             ]
         );
     }
