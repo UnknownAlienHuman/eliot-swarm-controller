@@ -267,10 +267,46 @@ impl Store {
         Self::open_with_observer(path, |_| {})
     }
 
+    /// Verbatim Windows form for database files past the Win32 parse limit.
+    /// SQLite reaches the filesystem through raw Win32 calls without the Rust
+    /// standard library path handling, so prefix here instead of at callers.
+    #[cfg(windows)]
+    fn verbatim_db_path(path: &Path) -> std::path::PathBuf {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let local_disk = matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(p))
+                if matches!(
+                    p.kind(),
+                    std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+                )
+        );
+        if !local_disk {
+            return path.to_path_buf();
+        }
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let verbatim = wide.len() >= 4
+            && wide[0] == 92
+            && wide[1] == 92
+            && (wide[2] == 63 || wide[2] == 46)
+            && wide[3] == 92;
+        if !verbatim {
+            let mut prefixed = vec![92u16, 92, 63, 92];
+            prefixed.append(&mut wide);
+            wide = prefixed;
+        }
+        std::path::PathBuf::from(OsString::from_wide(&wide))
+    }
+
     pub fn open_with_observer<F>(path: &Path, mut on_phase: F) -> Result<Self>
     where
         F: FnMut(StoreOpenPhase),
     {
+        #[cfg(windows)]
+        let owned_path = Self::verbatim_db_path(path);
+        #[cfg(windows)]
+        let path: &Path = &owned_path;
         let connection = Connection::open(path).map_err(sql_error)?;
         connection
             .busy_timeout(Duration::from_secs(5))

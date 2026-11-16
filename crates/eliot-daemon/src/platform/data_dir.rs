@@ -1118,4 +1118,23 @@ mod tests {
             data.owner_token()
         );
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn long_private_data_root_round_trip() {
+        let base = std::env::temp_dir().join(format!("eliot-long-root-{}", ulid::Ulid::new()));
+        let long = base.join("D".repeat(200)).join("E".repeat(40));
+        assert!(
+            long.as_os_str().len() > 260,
+            "fixture must exceed the parse limit"
+        );
+        let data = DataDir::open(&long).expect("open long private data root");
+        validate_private_root(data.path()).expect("long root keeps a protected ACL");
+        let _lock = data
+            .acquire_daemon_lock()
+            .expect("lock a file inside the long root");
+        let _store =
+            eliot_store::Store::open(&data.path().join("eliot.db")).expect("open long database");
+        let _ = fs::remove_dir_all(&base);
+    }
 }
