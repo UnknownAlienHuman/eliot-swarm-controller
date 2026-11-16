@@ -356,3 +356,18 @@ supported; Swarm does not enable it per session because no per-server
 scoping exists on 2.1.278 and the strict config already bounds `minimal` to
 one server.
 
+## Native subagents (`native_subagents` deny)
+
+Per-session mapping, verified on the installed Claude Code 2.1.278 binary:
+`claude --help` exposes `--disallowedTools <tools...>` (comma or
+space-separated deny list). The `Task` tool launches subagents (official
+subagent docs describe deny via `Agent(name)` / `--disallowedTools`; the
+installed help lists the flag). When the frozen profile carries
+`native_subagents = "deny"` (the default for profiles with a non-empty
+`child_profiles`), the plugin passes `--disallowedTools Task` on every CLI
+spawn for the session. `allow` adds nothing and preserves today's behavior.
+Implementation: `plugins/claude/src/host.rs` (`native_subagents_argv`,
+`StartPlan::native_subagents_deny`, `launch_session`). The brief names
+2.1.325; the installed binary in this worktree reports 2.1.278, and the flag
+was verified there.
+

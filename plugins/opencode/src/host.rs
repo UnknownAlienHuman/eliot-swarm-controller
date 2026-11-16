@@ -281,6 +281,9 @@ struct ControlBinding {
 /// the local path never imports a canonical credential.
 struct ParsedStart {
     params: AgentStartParams,
+    /// Frozen native-subagent switch (`allow` or `deny`): `deny` disables
+    /// the `task` tool in the isolated per-Agent config.
+    native_subagents: Option<String>,
     /// Requested `provider/model`, or `None` when the profile omitted it and
     /// the configured native default applies. Requested stays absent
     /// separately from the effective readback.
@@ -728,6 +731,10 @@ impl OpenCodePlugin {
         }
         let (initialized, profile) = self.start_prereqs(&params)?;
         let requested_mcp_policy = policy_from_snapshot(profile)?;
+        let native_subagents = profile
+            .get("native_subagents")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let mcp_cloud_hostname = eliot_core::parse_snapshot_cloud_hostname(profile);
         // The retained subject validates through the shared Muse/Claude
         // helper: same continuity rules and codes, no local copy.
@@ -802,6 +809,7 @@ impl OpenCodePlugin {
         })?;
         Ok(StartAdmission::New(Box::new(ParsedStart {
             params,
+            native_subagents,
             requested_model,
             model_ref,
             override_model,
@@ -933,6 +941,7 @@ impl OpenCodePlugin {
                 local: parsed.local.clone(),
                 swarm_executable: parsed.swarm_executable.clone(),
                 swarm_data_dir: parsed.swarm_data_dir.clone(),
+                native_subagents: parsed.native_subagents.clone(),
             },
             &parsed.secrets,
             envelope,

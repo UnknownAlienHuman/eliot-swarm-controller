@@ -892,17 +892,22 @@ only its own children (the Router defaults an absent parent to the caller), the 
 inherits the parent's project label and tree root, and the configured fanout limits
 are checked at admission. The parent must be controlled. An Agent-principal child
 never supplies `profile_snapshot`: the daemon freezes it, so a supplied snapshot
-rejects. It may omit `profile` or specify the parent's same profile name, with no
+rejects. With no configured default route, it may omit `profile`, or it may
+specify the parent's same profile name, with no
 `worktree`, and reuses the parent's frozen profile snapshot
 verbatim, without resolving a mutable named profile. It may instead name a profile
 from the parent snapshot's captured `child_profiles` allow-list; the daemon resolves
-that configured profile now and freezes its snapshot for the child. Any other name,
-or a cross-harness profile, is rejected before any native effect. An omitted
+that configured profile now and freezes its snapshot for the child. A `role`
+instead selects ordered candidates intersected with the parent's frozen allow-list
+(including its inherited profile). An unlisted name is rejected before any native effect. An omitted
 `workspace` defaults to the parent's workspace; an explicit different workspace
-rejects, so a child never escapes the parent's authority. The child must
-use the parent's harness: only model and effort may differ, the child inherits the
-parent's captured credential bindings verbatim, and its capacity scopes keep every
-non-profile scope of the parent with the same bounds. Then the authority check below
+rejects, so a child never escapes the parent's workspace. Same-harness children
+retain model/effort-only confinement and inherit captured credential bindings
+verbatim. An allow-listed different harness is an explicit Owner grant of that
+profile's own native policy and bindings; parent credential/native-store bindings
+are never copied across harnesses. Capacity scopes keep every non-profile scope
+of the parent with the same bounds alongside the child's own scopes; conflicting
+bounds reject. Then the authority check below
 applies: control is narrowed or equal, the workspace is shared, and no worktree is
 minted. An Owner child launch may instead supply `profile`, a different workspace,
 and `worktree`, and remains unrestricted by that check
