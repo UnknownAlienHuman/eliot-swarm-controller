@@ -77,13 +77,37 @@ pub(crate) async fn run_show(
     data_dir: PathBuf,
     json_output: bool,
 ) -> Result<u8, Failure> {
-    read_and_print!(
-        &data_dir,
-        json_output,
-        "agent.get",
-        AgentGetRequest::new(agent),
-        AgentGetResponse
-    )
+    if json_output {
+        read_and_print!(
+            &data_dir,
+            json_output,
+            "agent.get",
+            AgentGetRequest::new(agent),
+            AgentGetResponse
+        )
+    } else {
+        let params = AgentGetRequest::new(agent);
+        params
+            .validate()
+            .map_err(|error| Failure::from_core(error, false))?;
+        let response: AgentGetResponse =
+            eliot_daemon::client_call_typed(&data_dir, "agent.get", &params)
+                .await
+                .map_err(|error| Failure::from_core(error, false))?;
+        params
+            .validate_response(&response)
+            .map_err(|error| Failure::from_core(error, false))?;
+        if let Some(activity) = response.agent.activity.as_ref() {
+            println!(
+                "state: {} (observed) (lifecycle state=unknown)",
+                activity_state_name(activity.state)
+            );
+        }
+        let value = serde_json::to_value(response)
+            .map_err(|_| Failure::new(4, "agent.get response is invalid"))?;
+        print_value(&value, false);
+        Ok(0)
+    }
 }
 
 pub(crate) async fn run_processes(
@@ -629,12 +653,12 @@ pub(crate) async fn read_agent_list(
 pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations: bool) {
     if with_observations {
         println!(
-            "{:<6} {:<4} {:<9} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12}",
+            "{:<6} {:<4} {:<22} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12}",
             "ID", "GEN", "STATE", "ACTIVITY", "ACT_TURN", "AGE", "LAST_OUT", "USAGE", "DATA"
         );
     } else {
         println!(
-            "{:<6} {:<4} {:<9} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
+            "{:<6} {:<4} {:<22} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
             "ID",
             "GEN",
             "STATE",
@@ -676,10 +700,10 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                 })
                 .unwrap_or_else(|| "-".to_owned());
             println!(
-                "{:<6} {:<4} {:<9} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12}",
+                "{:<6} {:<4} {:<22} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12}",
                 truncate_cell(&summary.id, 6),
                 summary.generation,
-                state_cell(summary.state),
+                truncate_cell(&summary.display_state(), 22),
                 activity,
                 truncate_cell(turn, 12),
                 age,
@@ -694,10 +718,10 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                     .filter(|age| *age >= 0),
             );
             println!(
-                "{:<6} {:<4} {:<9} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
+                "{:<6} {:<4} {:<22} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
                 truncate_cell(&summary.id, 6),
                 summary.generation,
-                state_cell(summary.state),
+                truncate_cell(&summary.display_state(), 22),
                 truncate_cell(&summary.project, 14),
                 truncate_cell(&summary.harness, 9),
                 truncate_cell(turn, 12),
@@ -863,20 +887,6 @@ pub(crate) fn missing_cell(missing: &TurnCounterMissing) -> String {
     )
 }
 
-pub(crate) fn state_cell(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Unknown => "unknown",
-        AgentState::Created => "created",
-        AgentState::Starting => "starting",
-        AgentState::Idle => "idle",
-        AgentState::Busy => "busy",
-        AgentState::Waiting => "waiting",
-        AgentState::Stopped => "stopped",
-        AgentState::Failed => "failed",
-        AgentState::Lost => "lost",
-    }
-}
-
 pub(crate) fn activity_state_name(state: NativeChildActivityState) -> &'static str {
     match state {
         NativeChildActivityState::Running => "running",
@@ -928,7 +938,7 @@ pub(crate) fn yes_no(value: bool) -> &'static str {
 mod tests {
     use super::{
         activity_state_name, age_cell, fleet_usage_cell, is_transient_watch_error, list_params,
-        print_usage_table, state_cell, truncate_cell, watch_retry_delay, with_watch_resume_cursor,
+        print_usage_table, truncate_cell, watch_retry_delay, with_watch_resume_cursor,
     };
     use crate::cli::args::ListFilterArgs;
     use crate::cli::support::Failure;
@@ -1077,6 +1087,34 @@ mod tests {
     }
 
     #[test]
+    fn observed_rows_display_activity_with_marker() {
+        use eliot_core::NativeChildActivity;
+        let mut observed = fleet_summary(None, None);
+        observed.state = AgentState::Unknown;
+        observed.activity = Some(NativeChildActivity {
+            state: NativeChildActivityState::Idle,
+            has_open_turn: false,
+            last_progress_at: None,
+        });
+        assert_eq!(observed.display_state(), "idle (observed)");
+        assert_eq!(observed.fleet_bucket(), "idle");
+        observed.activity.as_mut().unwrap().state = NativeChildActivityState::Running;
+        observed.activity.as_mut().unwrap().has_open_turn = true;
+        assert_eq!(observed.display_state(), "running (observed)");
+        assert_eq!(observed.fleet_bucket(), "running");
+        observed.activity.as_mut().unwrap().state = NativeChildActivityState::Lost;
+        assert_eq!(observed.display_state(), "lost (observed)");
+        assert_eq!(observed.fleet_bucket(), "unknown");
+        let controlled = fleet_summary(None, None);
+        assert_eq!(controlled.display_state(), "idle");
+        assert_eq!(
+            eliot_core::api::agent_state_name(AgentState::Unknown),
+            "unknown"
+        );
+        assert_eq!(activity_state_name(NativeChildActivityState::Idle), "idle");
+    }
+
+    #[test]
     fn fleet_table_cells_stay_compact() {
         assert_eq!(age_cell(None), "-");
         assert_eq!(age_cell(Some(-1)), "-");
@@ -1086,7 +1124,7 @@ mod tests {
         assert_eq!(age_cell(Some(172_800_000)), "2d");
         assert_eq!(truncate_cell("a1", 6), "a1");
         assert_eq!(truncate_cell("alongprojectname", 6), "along~");
-        assert_eq!(state_cell(AgentState::Busy), "busy");
+        assert_eq!(eliot_core::api::agent_state_name(AgentState::Busy), "busy");
         assert_eq!(activity_state_name(NativeChildActivityState::Lost), "lost");
     }
 
