@@ -131,6 +131,10 @@ pub(super) struct ChatState {
     /// The composer, focused again after input is admitted, a launch and New.
     pub(super) composer_ref: ElementRef<TextBox>,
     pub(super) pending_local: Option<(String, String, String)>,
+    /// The open conversation came from a search suggestion: the keyboard
+    /// stays in the search box (its arrows, Enter and Esc), so the latest
+    /// turn is not followed by moving focus.
+    pub(super) opened_from_search: bool,
     // Mutations.
     pub(super) drafts: DraftStore,
     pub(super) answers: HashMap<String, String>,
@@ -317,7 +321,9 @@ impl DesktopApp {
                 if epoch != self.chat.epoch {
                     return;
                 }
-                if self.chat.end_anchor.request_focus() {
+                if self.chat.opened_from_search {
+                    // Focus would leave the search box and close its list.
+                } else if self.chat.end_anchor.request_focus() {
                     // The latest turn is in view; typing goes on in the composer.
                     let _ = self.chat.composer_ref.request_focus();
                 } else if tries < FOLLOW_TRIES && !self.chat.items.is_empty() {

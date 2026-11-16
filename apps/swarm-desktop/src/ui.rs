@@ -91,7 +91,6 @@ use crate::scripts;
 use crate::state::{BoundAction, DraftStore, MutationLedger, Selection};
 use crate::theme;
 use crate::views::{self, RenderCache, RenderedItem, RowCallbacks};
-use futures_util::StreamExt;
 
 /// Agent rows per `agent.list` page in the navigation list.
 const AGENT_PAGE: usize = 100;
@@ -106,6 +105,9 @@ struct UiProject {
     name: String,
     profiles: Vec<String>,
     workspace: String,
+    /// The Git common directory registered with the checkout: its
+    /// repository, which the sidebar groups by.
+    common_dir: String,
 }
 
 /// One page of the navigation list with its honest counters.
@@ -333,6 +335,7 @@ fn load_projects_blocking(data_dir: &Path) -> Fallible<Vec<UiProject>> {
             .zip(names)
             .map(|(registration, name)| UiProject {
                 workspace: registration.checkout.clone(),
+                common_dir: registration.repo_common_dir.clone(),
                 profiles: registration.profiles.clone(),
                 id: registration.id.clone(),
                 name,
@@ -350,16 +353,8 @@ fn load_agents_blocking(data_dir: &Path, request: &AgentListRequest) -> Fallible
         Ok(AgentPage {
             rows: reply
                 .agents
-                .into_iter()
-                .map(|row| UiAgent {
-                    id: row.summary.id,
-                    generation: row.summary.generation,
-                    harness: row.summary.harness,
-                    state: format!("{:?}", row.summary.state).to_lowercase(),
-                    project: row.summary.project,
-                    parent: row.summary.parent,
-                    updated_at: row.summary.updated_at,
-                })
+                .iter()
+                .map(|row| UiAgent::from_summary(&row.summary))
                 .collect(),
             next: reply.next,
             total: reply.total,
@@ -531,8 +526,12 @@ impl Component for DesktopApp {
                 agents_loading: false,
                 list_epoch: 0,
                 pending_select: None,
-                titles: HashMap::new(),
-                titles_inflight: false,
+                collapsed: HashSet::new(),
+                unfolded: HashSet::new(),
+                attention_only: false,
+                search: shell_ui::Search::default(),
+                search_ref: ElementRef::new(),
+                shortcuts: None,
             },
             launch: launch_ui::LaunchState {
                 workspace: input.workspace.to_string_lossy().into_owned(),
@@ -557,6 +556,7 @@ impl Component for DesktopApp {
                 end_anchor: ElementRef::new(),
                 composer_ref: ElementRef::new(),
                 pending_local: None,
+                opened_from_search: false,
                 drafts: DraftStore::default(),
                 answers: HashMap::new(),
                 confirm_force: None,
@@ -581,6 +581,14 @@ impl Component for DesktopApp {
         if let Ok(data_dir) = app.data_dir.clone() {
             app.watch_high_contrast(context);
             app.start_connection(data_dir, context);
+        }
+        // On the UI thread, before its message loop runs.
+        match crate::shortcuts::install() {
+            Ok(chords) => {
+                app.nav.shortcuts = Some(Arc::new(Mutex::new(chords)));
+                app.watch_shortcuts(context);
+            }
+            Err(error) => app.status = error,
         }
         app
     }
