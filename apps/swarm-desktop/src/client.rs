@@ -11,14 +11,15 @@
 use std::path::{Path, PathBuf};
 
 use eliot_core::api::{
-    AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentResultRequest,
-    AgentResultResponse, CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest,
-    CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
-    CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest,
-    DiagnoseResponse, EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest,
-    EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest,
-    HandoffResponse, HarnessModelsRequest, HarnessModelsResponse, ReparentRequest,
-    ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
+    AgentArchiveRequest, AgentDeleteRequest, AgentGetRequest, AgentGetResponse, AgentListRequest,
+    AgentListResponse, AgentResultRequest, AgentResultResponse, AgentTreeResponse, ArchivedFilter,
+    CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest, CommandChildrenResponse,
+    CommandGetRequest, CommandResolution, CommandResolveRequest, CommandResolveResponse,
+    CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest, DiagnoseResponse,
+    EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
+    EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest, HandoffResponse,
+    HarnessModelsRequest, HarnessModelsResponse, ReparentRequest, ReparentResponse, SwitchRequest,
+    SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -84,112 +85,79 @@ pub async fn list_agents(data_dir: &Path, params: &AgentListRequest) -> Result<A
 pub type ListFlags = std::collections::HashMap<String, (bool, bool)>;
 
 /// One validated `agent.list` page plus each row's `chat` and `archived`
-/// flags, and the `archived` filter (`exclude` default, `include`, `only`).
-///
-/// Bridge to the k92 contract (`agent-briefs/20261116/k92-backend-quota-
-/// archive-chats.md` §2 and §3: `AgentSummary.chat`/`archived`,
-/// `AgentListRequest.archived`) until those fields land in
-/// `eliot_core::api`; then this reads them from the typed DTOs. A daemon
-/// without k92 reports neither flag (both read false) and refuses the
-/// filter field, which [`archived_filter_error`] words.
+/// flags, under the `archived` filter (`exclude` default, `include`, `only`).
 pub async fn list_agents_flagged(
     data_dir: &Path,
     params: &AgentListRequest,
     archived: Option<&str>,
 ) -> Result<(AgentListResponse, ListFlags)> {
-    params.validate()?;
-    let mut request = serde_json::to_value(params)
-        .map_err(|_| Error::new("internal", "agent.list request could not be encoded"))?;
-    if let Some(filter) = archived {
-        request["archived"] = Value::String(filter.to_owned());
-    }
-    let raw = eliot_daemon::client_call(data_dir, "agent.list", request).await?;
-    let flags = raw
-        .get("agents")
-        .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|row| {
-                    let flag = |name: &str| row.get(name).and_then(Value::as_bool).unwrap_or(false);
-                    Some((
-                        row.get("id")?.as_str()?.to_owned(),
-                        (flag("chat"), flag("archived")),
-                    ))
-                })
-                .collect()
+    let mut params = params.clone();
+    params.archived = match archived {
+        Some("only") => ArchivedFilter::Only,
+        Some("include") => ArchivedFilter::Include,
+        _ => ArchivedFilter::Exclude,
+    };
+    let reply = list_agents(data_dir, &params).await?;
+    let flags = reply
+        .agents
+        .iter()
+        .map(|row| {
+            (
+                row.summary.id.clone(),
+                (row.summary.chat, row.summary.archived),
+            )
         })
-        .unwrap_or_default();
-    let reply: AgentListResponse = serde_json::from_value(raw)
-        .map_err(|_| Error::new("unknown", "agent.list returned a malformed result"))?;
-    params.validate_response(&reply)?;
+        .collect();
     Ok((reply, flags))
 }
 
-/// A daemon without the k92 `agent.list` filter refuses the field; say so.
+/// The `agent.list` error, worded for the sidebar's Show archived toggle.
 pub fn archived_filter_error(error: &Error) -> String {
-    if error.code == "invalid" || error.message.contains("archived") {
-        "Show archived needs a daemon with agent.archive (k92); this one lists active Agents only"
-            .to_owned()
-    } else {
-        error.to_string()
-    }
+    error.to_string()
 }
 
-/// `agent.archive {id, agent, archived}` (k92 §2, Owner only): hide or show
-/// a stopped or idle Agent tree in the default list; durable, idempotent
-/// by mutation id. Returns the number of Agents it changed.
+/// `agent.archive` (Owner only): hide or show a stopped or idle Agent tree
+/// in the default list; durable, idempotent by mutation id. Returns the
+/// number of Agents it changed.
 pub async fn archive_agent(
     data_dir: &Path,
     mutation_id: String,
     agent: &str,
     archived: bool,
 ) -> Result<usize> {
-    let reply = eliot_daemon::client_call(
-        data_dir,
-        "agent.archive",
-        serde_json::json!({ "id": mutation_id, "agent": agent, "archived": archived }),
-    )
-    .await
-    .map_err(k92_missing)?;
-    Ok(affected(&reply))
+    let request = AgentArchiveRequest {
+        id: mutation_id,
+        agent: agent.to_owned(),
+        archived,
+    };
+    request.validate()?;
+    let reply: AgentTreeResponse = typed_call(data_dir, "agent.archive", &request).await?;
+    Ok(reply.affected)
 }
 
-/// `agent.delete {id, agent}` (k92 §2, Owner only, stopped trees only):
-/// removes the tree's records from the Store; never the workspace, native
-/// store files or branches.
+/// `agent.delete` (Owner only, stopped trees only): removes the tree's
+/// records from the Store; never the workspace, native store files or
+/// branches.
 pub async fn delete_agent(data_dir: &Path, mutation_id: String, agent: &str) -> Result<usize> {
-    let reply = eliot_daemon::client_call(
-        data_dir,
-        "agent.delete",
-        serde_json::json!({ "id": mutation_id, "agent": agent }),
-    )
-    .await
-    .map_err(k92_missing)?;
-    Ok(affected(&reply))
+    let request = AgentDeleteRequest {
+        id: mutation_id,
+        agent: agent.to_owned(),
+    };
+    request.validate()?;
+    let reply: AgentTreeResponse = typed_call(data_dir, "agent.delete", &request).await?;
+    Ok(reply.affected)
 }
 
-fn affected(reply: &Value) -> usize {
-    reply
-        .get("affected")
-        .and_then(Value::as_u64)
-        .map_or(0, |count| count as usize)
-}
-
-/// An unknown method means the daemon predates k92: say what is missing.
-fn k92_missing(error: Error) -> Error {
-    let unknown_method = matches!(
-        error.code.as_str(),
-        "method_not_found" | "unknown_method" | "not_found"
-    ) && error.message.contains("method");
-    let not_implemented = error.code == "unsupported" && error.message.contains("not implemented");
-    if unknown_method || not_implemented {
-        Error::new(
-            "unsupported",
-            "this daemon has no agent.archive/agent.delete yet (they come with k92)",
-        )
-    } else {
-        error
-    }
+async fn typed_call<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+    data_dir: &Path,
+    method: &str,
+    request: &Req,
+) -> Result<Resp> {
+    let params = serde_json::to_value(request)
+        .map_err(|_| Error::new("internal", format!("{method} request could not be encoded")))?;
+    let raw = eliot_daemon::client_call(data_dir, method, params).await?;
+    serde_json::from_value(raw)
+        .map_err(|_| Error::new("unknown", format!("{method} returned a malformed result")))
 }
 
 /// Full readback for one Agent: generation, active turn, pending requests,
