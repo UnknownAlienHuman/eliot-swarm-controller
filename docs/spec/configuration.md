@@ -85,6 +85,13 @@ stored profile. First use writes visible, editable native-default profiles for
 installed harnesses through the settings writer as `bootstrap`. An omitted model
 in these profiles requests the native default and retains requested/effective
 readback separately, as for an ad-hoc launch. There is no builtin fake profile.
+For Muse hot-start profiles the daemon enumerates installed `muse-bin-*.exe`
+builds newest-first and probes each with the existing read-only `model/list`
+catalogue path (no session, turn or inference); it freezes the newest build whose
+catalogue is non-empty and records skipped empty-catalogue builds
+(`bootstrap.muse_empty_catalogue_skipped`). The launcher-marked 1.4.20 build serves
+an empty `bundledCatalog` and is skipped in favor of the 1.4.0 build with a live
+catalogue; `--cmd` still pins an explicit binary for ad-hoc launch.
 Before admission, an omitted profile selects the first available ordered role candidate. There is no post-dispatch harness/model/route/account
 fallback, no retry of an uncertain outcome and no hold-triggered account switch.
 Profiles stay the durable

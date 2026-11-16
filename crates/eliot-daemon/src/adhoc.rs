@@ -805,6 +805,194 @@ fn discover_muse_cmd(launcher_dir: &Path) -> core::Result<String> {
     ))
 }
 
+type MuseVersionedPath = (Option<(u64, u64, u64)>, String);
+
+pub(crate) fn discover_muse_candidates(launcher_dir: &Path) -> Vec<String> {
+    let mut versioned: Vec<MuseVersionedPath> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(launcher_dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("muse-bin-") || !name.ends_with(".exe") {
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        let version_text = name
+            .strip_prefix("muse-bin-")
+            .and_then(|r| r.strip_suffix(".exe"))
+            .unwrap_or_default();
+        let triple = parse_muse_version_triple(version_text);
+        versioned.push((triple, path.to_string_lossy().into_owned()));
+    }
+    versioned.sort_by(|l, r| match (&l.0, &r.0) {
+        (Some(a), Some(b)) => b.cmp(a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => l.1.cmp(&r.1),
+    });
+    versioned.into_iter().map(|(_, c)| c).collect()
+}
+
+fn parse_muse_version_triple(text: &str) -> Option<(u64, u64, u64)> {
+    let core = text.split('-').next().unwrap_or(text);
+    let mut parts = core.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(a), Some(b), Some(c), None) => match (a.parse(), b.parse(), c.parse()) {
+            (Ok(a), Ok(b), Ok(c)) => Some((a, b, c)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub(crate) fn select_muse_first_nonempty(
+    candidates: &[String],
+    nonempty: &[bool],
+) -> Option<String> {
+    for (cmd, ok) in candidates.iter().zip(nonempty.iter()) {
+        if *ok {
+            return Some(cmd.clone());
+        }
+    }
+    None
+}
+
+fn default_muse_launcher_dir() -> std::path::PathBuf {
+    Path::new("C:/Tools/MuseCode").to_path_buf()
+}
+
+pub(crate) async fn probe_muse_catalogue_nonempty(cmd: &str) -> bool {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::time::Duration;
+    const PER_CANDIDATE: Duration = Duration::from_secs(20);
+    let probe = async {
+        let mut child = tokio::process::Command::new(cmd)
+            .arg("serve")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdin = child.stdin.take()?;
+        let stdout = child.stdout.take()?;
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let version = env!("CARGO_PKG_VERSION");
+        let init = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "muse-bootstrap-1",
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "eliot", "version": version, "title": "Eliot"},
+                "capabilities": {"userInputDialogs": true}
+            }
+        });
+        let mut frame = serde_json::to_string(&init).ok()?;
+        frame.push('\n');
+        tokio::time::timeout(Duration::from_secs(10), stdin.write_all(frame.as_bytes()))
+            .await
+            .ok()?
+            .ok()?;
+        let initialized = loop {
+            let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .ok()?
+                .ok()??;
+            let v: serde_json::Value = serde_json::from_str(&line).ok()?;
+            if v.get("id").and_then(|id| id.as_str()) == Some("muse-bootstrap-1") {
+                break v;
+            }
+        };
+        if initialized.get("error").is_some() || initialized.get("result").is_none() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return None::<bool>;
+        }
+        let notify = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}\n";
+        tokio::time::timeout(Duration::from_secs(5), stdin.write_all(notify.as_bytes()))
+            .await
+            .ok()?
+            .ok()?;
+        let list = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "muse-bootstrap-2",
+            "method": "model/list",
+            "params": {}
+        });
+        let mut frame = serde_json::to_string(&list).ok()?;
+        frame.push('\n');
+        tokio::time::timeout(Duration::from_secs(10), stdin.write_all(frame.as_bytes()))
+            .await
+            .ok()?
+            .ok()?;
+        let mut nonempty = false;
+        for _ in 0..100 {
+            let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+                .await
+                .ok()?
+                .ok()??;
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if v.get("id").and_then(|id| id.as_str()) != Some("muse-bootstrap-2") {
+                continue;
+            }
+            if v.get("error").is_some() {
+                break;
+            }
+            let models = v
+                .get("result")
+                .and_then(|r| r.get("models"))
+                .and_then(|m| m.as_array());
+            nonempty = models.is_some_and(|m| !m.is_empty());
+            break;
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        Some(nonempty)
+    };
+    tokio::time::timeout(PER_CANDIDATE, probe)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+pub(crate) async fn select_muse_hot_start_cmd() -> (Option<String>, Vec<String>) {
+    let candidates = discover_muse_candidates(&default_muse_launcher_dir());
+    let mut nonempty = Vec::with_capacity(candidates.len());
+    for cmd in &candidates {
+        nonempty.push(probe_muse_catalogue_nonempty(cmd).await);
+    }
+    let best = select_muse_first_nonempty(&candidates, &nonempty);
+    let mut skipped = Vec::new();
+    match &best {
+        Some(cmd) => {
+            for (c, ok) in candidates.iter().zip(nonempty.iter()) {
+                if c == cmd {
+                    break;
+                }
+                if !ok {
+                    skipped.push(c.clone());
+                }
+            }
+        }
+        None => {
+            for (c, ok) in candidates.iter().zip(nonempty.iter()) {
+                if !ok {
+                    skipped.push(c.clone());
+                }
+            }
+        }
+    }
+    (best, skipped)
+}
+
 fn discover_antigravity_cmd() -> core::Result<String> {
     // The `agy` CLI serves both `acp` (launch) and `models` (catalogue);
     // prefer it over the Electron app path, which boots the IDE and serves
@@ -1305,6 +1493,35 @@ mod tests {
         std::fs::write(dir.join("muse.cmd"), b"@echo off").unwrap();
         let resolved = discover_muse_cmd(&dir).unwrap();
         assert_eq!(resolved, native.to_string_lossy());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn muse_hot_start_prefers_newest_nonempty_catalogue() {
+        let dir = std::env::temp_dir().join(format!(
+            "eliot-adhoc-muse-catalogue-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|e| e.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("muse-bin-1.4.0-R4161.1.exe");
+        let new = dir.join("muse-bin-1.4.20-R8619.1.exe");
+        std::fs::write(&old, b"fake").unwrap();
+        std::fs::write(&new, b"fake").unwrap();
+        let candidates = discover_muse_candidates(&dir);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], new.to_string_lossy());
+        assert_eq!(candidates[1], old.to_string_lossy());
+        // Fixture: newest 1.4.20 serves an empty catalogue, 1.4.0 is live.
+        let best = select_muse_first_nonempty(&candidates, &[false, true]);
+        assert_eq!(best, Some(old.to_string_lossy().into_owned()));
+        // All empty stays None so no hot-start muse profile is written.
+        assert_eq!(
+            select_muse_first_nonempty(&candidates, &[false, false]),
+            None
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

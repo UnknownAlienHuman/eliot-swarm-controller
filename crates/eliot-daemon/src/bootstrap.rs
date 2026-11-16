@@ -30,8 +30,26 @@ pub(crate) async fn ensure_hot_start(
     cwd: Option<&Path>,
 ) -> Result<()> {
     {
+        let needs = {
+            let mut store = store.lock().await;
+            bootstrap_needed(data_root, &mut store, policy)?
+        };
+        let muse_cmd = if needs {
+            let (cmd, skipped) = crate::adhoc::select_muse_hot_start_cmd().await;
+            for cmd in &skipped {
+                crate::logging::record(
+                    policy,
+                    "bootstrap.muse_empty_catalogue_skipped",
+                    &[("cmd", cmd.as_str())],
+                    None,
+                );
+            }
+            cmd
+        } else {
+            None
+        };
         let mut store = store.lock().await;
-        ensure_bootstrap_settings(data_root, &mut store, policy)?;
+        ensure_bootstrap_settings(data_root, &mut store, policy, muse_cmd)?;
     }
     if let Some(cwd) = cwd
         && let Some((checkout, common_dir)) = workspace_identity(cwd).await?
@@ -132,10 +150,27 @@ async fn workspace_identity(workspace: &Path) -> Result<Option<(String, String)>
     }
 }
 
+fn bootstrap_needed(data_root: &Path, store: &mut Store, policy: &SecretPolicy) -> Result<bool> {
+    use crate::config::settings::{self};
+    use eliot_core::api::SettingsSection::{Profiles, Routing};
+    let read = settings::read_internal(data_root, store, Some(&[Profiles, Routing]), policy)?;
+    let current_profiles = read
+        .sections
+        .get(&Profiles)
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let profile_names = current_profiles
+        .as_object()
+        .map(|profiles| profiles.keys().len())
+        .unwrap_or_default();
+    Ok(read.revision.is_none() && profile_names == 0)
+}
+
 fn ensure_bootstrap_settings(
     data_root: &Path,
     store: &mut Store,
     policy: &SecretPolicy,
+    muse_cmd: Option<String>,
 ) -> Result<()> {
     use crate::config::settings::{self, SettingsAuthor};
     use eliot_core::api::SettingsSection::{Profiles, Routing};
@@ -158,7 +193,7 @@ fn ensure_bootstrap_settings(
         .unwrap_or_default();
 
     if read.revision.is_none() && profile_names.is_empty() {
-        let profiles = installed_default_profiles();
+        let profiles = installed_default_profiles(muse_cmd);
         profile_names = profiles.keys().cloned().collect();
         if !profiles.is_empty() {
             sections.insert(Profiles, Value::Object(profiles));
@@ -199,9 +234,20 @@ fn ensure_bootstrap_settings(
     Ok(())
 }
 
-fn installed_default_profiles() -> serde_json::Map<String, Value> {
+fn installed_default_profiles(muse_cmd: Option<String>) -> serde_json::Map<String, Value> {
     let mut profiles = serde_json::Map::new();
     for harness in crate::adhoc::SUPPORTED_HARNESSES {
+        if *harness == "muse" {
+            let Some(cmd) = muse_cmd.clone() else {
+                continue;
+            };
+            let mut profile = serde_json::Map::new();
+            profile.insert("harness".to_owned(), Value::String("muse".to_owned()));
+            profile.insert("mcp".to_owned(), Value::String("inherit".to_owned()));
+            profile.insert("cmd".to_owned(), Value::String(cmd));
+            profiles.insert("muse".to_owned(), Value::Object(profile));
+            continue;
+        }
         let discovered = crate::adhoc::harness_installation(harness);
         if discovered.get("installed").and_then(Value::as_bool) != Some(true) {
             continue;
