@@ -1467,6 +1467,33 @@ fn owner_var_cas_conflict_and_global_scope() {
 }
 
 #[test]
+fn swarm_identity_reports_the_calling_principal() {
+    let mut fixture = Fixture::new("swarm identity principal");
+    fixture.start();
+    let identity = fixture.json(&["identity"]);
+    assert_eq!(identity["principal"], "owner");
+    assert!(identity["agent_id"].is_null());
+    assert!(
+        identity
+            .get("allowed_scopes")
+            .and_then(Value::as_array)
+            .is_some_and(|scopes| !scopes.is_empty())
+    );
+    fixture.stop(false);
+}
+
+#[test]
+fn swarm_who_marks_no_row_for_the_owner_caller() {
+    let mut fixture = Fixture::new("swarm who owner self mark");
+    fixture.start();
+    let who = fixture.json(&["who"]);
+    let who_response: WhoResponse = serde_json::from_value(who).expect("typed WhoResponse");
+    assert!(who_response.workers.is_empty());
+    assert!(who_response.workers.iter().all(|worker| !worker.is_self));
+    fixture.stop(false);
+}
+
+#[test]
 fn fixture_cli_under_synthetic_ambient_identity_helper() {
     let mut fixture = Fixture::new("synthetic ambient identity helper");
     fixture.start();

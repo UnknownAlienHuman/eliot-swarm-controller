@@ -1311,6 +1311,11 @@ impl WhoRequest {
 pub struct WhoWorker {
     pub agent: String,
     pub generation: i64,
+    /// True only on the row owned by the calling principal. Set
+    /// server-side from the authenticated identity, so `swarm who`
+    /// answers "which one am I" without trusting client state.
+    #[serde(default)]
+    pub is_self: bool,
     pub state: AgentState,
     pub project: String,
     #[serde(deserialize_with = "nullable")]
@@ -1823,10 +1828,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn who_self_mark_defaults_off_and_validates() {
+        // Older daemons omit the mark: the row still decodes, unmarked.
+        let mut value = serde_json::to_value(who_worker("a1")).unwrap();
+        value.as_object_mut().unwrap().remove("is_self");
+        let decoded: WhoWorker = serde_json::from_value(value).unwrap();
+        assert!(!decoded.is_self);
+        decoded.validate().unwrap();
+        // The mark never invalidates a row.
+        let mut marked = who_worker("a1");
+        marked.is_self = true;
+        marked.validate().unwrap();
+        let round_trip: WhoWorker =
+            serde_json::from_value(serde_json::to_value(&marked).unwrap()).unwrap();
+        assert!(round_trip.is_self);
+    }
+
     fn who_worker(agent: &str) -> WhoWorker {
         WhoWorker {
             agent: agent.to_owned(),
             generation: 1,
+            is_self: false,
             state: AgentState::Idle,
             project: "app".to_owned(),
             workspace: Some("/repo".to_owned()),

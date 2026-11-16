@@ -139,6 +139,13 @@ impl Router {
             by_agent.entry(claim.agent.clone()).or_default().push(claim);
         }
         let mut truncated = roster_truncated || claims.truncated;
+        // The caller's own row carries the self mark, so an Agent can
+        // answer "which one am I" from `who` alone. Owner/Run callers
+        // authenticate without an Agent row and mark nothing.
+        let caller = match principal {
+            Principal::Agent { id, .. } => Some(id.as_str()),
+            _ => None,
+        };
 
         let mut workers = Vec::new();
         let mut encoded_bytes = 0_usize;
@@ -152,13 +159,14 @@ impl Router {
                 Err(error) => GitView::unavailable(error.code),
             };
             record_workspace_dirty(&mut workspace_dirty, row.workspace.as_deref(), &git);
-            let worker = build_who_worker(
+            let mut worker = build_who_worker(
                 row,
                 &git,
                 by_agent.remove(row.id.as_str()).unwrap_or_default(),
                 &counts,
                 request.want_history(),
             )?;
+            worker.is_self = caller == Some(worker.agent.as_str());
             let row_bytes = serde_json::to_vec(&worker)
                 .map_err(|_| Error::new("internal", "cannot encode who worker"))?
                 .len();
@@ -274,6 +282,7 @@ fn build_who_worker(
     let worker = WhoWorker {
         agent: row.id.clone(),
         generation: row.generation,
+        is_self: false,
         state: row.state,
         project: row.project.clone(),
         workspace: row.workspace.clone(),
