@@ -12,12 +12,18 @@
 //! config; for names contributed by project layers, plugins or builtins the
 //! bootstrap rejects the touched table (`invalid transport in
 //! 'mcp_servers.<name>'`). Re-emitting the effective `command`/`url`
-//! alongside `enabled=false` disables those servers cleanly. Minimal mode
-//! therefore enumerates the worker's effective `mcp_servers` entries
-//! pre-spawn and disables every non-allowed server with its own transport
-//! explicitly, then verifies the visible surface with the installed
-//! `mcpServerStatus/list` app-server method (v2 schema: `{data:
-//! [{name, runtimeStatus, ...}], nextCursor}`).
+//! alongside `enabled=false` disables those servers cleanly. Both modes
+//! therefore enumerate the worker's effective `mcp_servers` entries
+//! pre-spawn: minimal disables every non-allowed server with its own
+//! transport explicitly, then verifies the visible surface with the
+//! installed `mcpServerStatus/list` app-server method (v2 schema:
+//! `{data: [{name, runtimeStatus, ...}], nextCursor}`); inherit disables
+//! every entry that carries the owner Swarm identity by transport
+//! (`eliot_core::is_owner_swarm_server`: a swarm executable selecting
+//! `mcp` without `--require-agent`, or a URL on the configured cloud
+//! hostname), regardless of entry name or allow list, so a renamed owner
+//! server never survives. An allow-listed name that matches the identity
+//! is rejected at launch instead of re-admitted.
 
 use eliot_core::{Error, McpPolicy, Result, SecretPolicy};
 use serde_json::Value;
@@ -41,14 +47,20 @@ pub(super) fn is_addressable_override_name(name: &str) -> bool {
 
 /// One worker-visible native MCP server as enumerated from the effective
 /// `config/read` response: the table key plus the transport the native
-/// bootstrap validates. Only `command`/`url` are projected; env, timeouts
-/// and tool gates merge from the owner layers and never reach argv.
+/// One worker-visible native MCP server as enumerated from the effective
+/// `config/read` response: the table key plus the transport the native
+/// bootstrap validates and the stdio argument vector the owner-identity
+/// rule screens. Only `command`/`url` re-emit into spawn argv; env,
+/// timeouts and tool gates merge from the owner layers and never reach
+/// argv, while `args` (absent as an empty vector, unreported or malformed
+/// as `None`) only feeds the identity rule and never renders.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EffectiveMcpServer {
     pub(super) name: String,
     pub(super) command: Option<String>,
     pub(super) url: Option<String>,
+    pub(super) args: Option<Vec<String>>,
 }
 
 /// Bound one re-emitted MCP transport value carried in a spawn `-c`
@@ -69,48 +81,122 @@ pub(super) fn compute_disables(
     allow: &[String],
     own_server_name: &str,
     metadata_secrets: &[String],
+    controller_executable: Option<&str>,
+    cloud_mcp_hostname: Option<&str>,
 ) -> Result<Vec<EffectiveMcpServer>> {
     let allowed: HashSet<&str> = allow.iter().map(String::as_str).collect();
     let secrets = SecretPolicy::new(metadata_secrets.iter().cloned());
     let mut disables: Vec<EffectiveMcpServer> = Vec::new();
     for server in enumerated {
-        if server.name == own_server_name || allowed.contains(server.name.as_str()) {
+        if server.name == own_server_name {
             continue;
         }
-        if !is_addressable_override_name(&server.name) {
-            return Err(Error::new(
-                "profile_error",
-                "Codex minimal MCP cannot suppress a native server whose name is not a plain override segment",
-            ));
-        }
-        let command = clean_transport(server.command.as_deref())?;
-        let url = clean_transport(server.url.as_deref())?;
-        if command.is_none() && url.is_none() {
-            return Err(Error::new(
-                "profile_error",
-                "Codex minimal MCP cannot suppress a native server without a usable command or url transport",
-            ));
-        }
-        for transport in command.iter().chain(url.iter()) {
-            if secrets.contains_value(&Value::String(transport.clone())) {
+        if allowed.contains(server.name.as_str()) {
+            // An allow-listed name that carries the owner Swarm identity is
+            // rejected at launch: the allow list can never re-admit the
+            // owner's daemon identity, whatever the entry is named.
+            if eliot_core::is_owner_swarm_server(
+                server.command.as_deref(),
+                server.args.as_deref(),
+                server.url.as_deref(),
+                controller_executable,
+                cloud_mcp_hostname,
+            ) {
                 return Err(Error::new(
-                    "secret_in_payload",
-                    "Codex minimal MCP transport carries a known secret",
+                    "profile_error",
+                    format!(
+                        "mcp_allow cannot include the owner Swarm MCP server {:?}",
+                        server.name
+                    ),
                 ));
             }
+            continue;
         }
-        if !disables.iter().any(|kept| kept.name == server.name) {
-            disables.push(EffectiveMcpServer {
-                name: server.name.clone(),
-                command,
-                url,
-            });
+        let entry = disable_entry(server, &secrets)?;
+        if !disables.iter().any(|kept| kept.name == entry.name) {
+            disables.push(entry);
         }
     }
     disables.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(disables)
 }
 
+/// Spawn-safe overrides for an inherit worker: every enumerated effective
+/// server that carries the owner Swarm identity by transport, regardless
+/// of name, minus Eliot's own Agent-scoped server, sorted for
+/// deterministic argv. Each entry carries its effective transport because
+/// the native `-c` bootstrap validates a touched `mcp_servers.<name>`
+/// table on its own. A matching server that cannot be addressed, has no
+/// usable transport, or would leak a known secret into argv fails closed
+/// instead of silently inheriting the owner's daemon identity.
+pub(super) fn compute_owner_disables(
+    enumerated: &[EffectiveMcpServer],
+    own_server_name: &str,
+    controller_executable: Option<&str>,
+    cloud_mcp_hostname: Option<&str>,
+    metadata_secrets: &[String],
+) -> Result<Vec<EffectiveMcpServer>> {
+    let secrets = SecretPolicy::new(metadata_secrets.iter().cloned());
+    let mut disables: Vec<EffectiveMcpServer> = Vec::new();
+    for server in enumerated {
+        if server.name == own_server_name {
+            continue;
+        }
+        if !eliot_core::is_owner_swarm_server(
+            server.command.as_deref(),
+            server.args.as_deref(),
+            server.url.as_deref(),
+            controller_executable,
+            cloud_mcp_hostname,
+        ) {
+            continue;
+        }
+        let entry = disable_entry(server, &secrets)?;
+        if !disables.iter().any(|kept| kept.name == entry.name) {
+            disables.push(entry);
+        }
+    }
+    disables.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(disables)
+}
+
+/// One transport-carrying disable entry: an addressable name plus a usable
+/// command or url transport, with no known secret in argv. Shared by the
+/// minimal allow-set path and the inherit owner-identity path, so both
+/// policies suppress with the same spawn-safe shape.
+fn disable_entry(
+    server: &EffectiveMcpServer,
+    secrets: &SecretPolicy,
+) -> Result<EffectiveMcpServer> {
+    if !is_addressable_override_name(&server.name) {
+        return Err(Error::new(
+            "profile_error",
+            "Codex MCP cannot suppress a native server whose name is not a plain override segment",
+        ));
+    }
+    let command = clean_transport(server.command.as_deref())?;
+    let url = clean_transport(server.url.as_deref())?;
+    if command.is_none() && url.is_none() {
+        return Err(Error::new(
+            "profile_error",
+            "Codex MCP cannot suppress a native server without a usable command or url transport",
+        ));
+    }
+    for transport in command.iter().chain(url.iter()) {
+        if secrets.contains_value(&Value::String(transport.clone())) {
+            return Err(Error::new(
+                "secret_in_payload",
+                "Codex MCP transport carries a known secret",
+            ));
+        }
+    }
+    Ok(EffectiveMcpServer {
+        name: server.name.clone(),
+        command,
+        url,
+        args: None,
+    })
+}
 /// Project one effective transport value for a `-c` override: absent when
 /// empty, bounded and control-free otherwise. The value itself never
 /// reaches the error message.
@@ -231,7 +317,43 @@ pub(super) fn synthetic_apps_disable(allow: &[String]) -> Option<EffectiveMcpSer
             "/eliot-minimal-suppressed-mcp-server".to_owned()
         }),
         url: None,
+        args: None,
     })
+}
+
+/// Exact owner-side Swarm MCP server names that must never reach a worker in
+/// either policy. They carry the owner daemon identity (the owner file config
+/// entry runs plain `swarm mcp` with no `--require-agent`), while the
+/// session-owned `eliot_swarm_<command>` name never equals them.
+pub(super) use eliot_core::SWARM_RESERVED_SERVER_NAMES as OWNER_SWARM_SERVER_NAMES;
+
+/// Synthetic transport-carrying disables for the exact owner Swarm names.
+/// Same verified pattern as [`CODEX_APPS_SERVER_NAME`]: a nonexistent
+/// command alongside `enabled=false` is accepted by the 0.167.1 bootstrap
+/// and reports `disabled`, so the entry can never light up in the worker
+/// inventory. Used under `inherit` (where no enumeration runs) and as a
+/// backstop under `minimal` for owner entries the pre-spawn enumeration
+/// cannot see. A fresh transport-carrying entry wins over the owner layers;
+/// a name the owner never defined stays a disabled stub, absent from the
+/// inventory like any disabled server. The disabled server is never
+/// spawned, and if a future native ever ignored the flag the missing
+/// executable fails the readback closed instead of inheriting a live
+/// owner-identity server.
+pub(super) fn synthetic_swarm_owner_disables() -> Vec<EffectiveMcpServer> {
+    let command = if cfg!(windows) {
+        r"C:\eliot-minimal-suppressed-mcp-server.exe".to_owned()
+    } else {
+        "/eliot-minimal-suppressed-mcp-server".to_owned()
+    };
+    OWNER_SWARM_SERVER_NAMES
+        .iter()
+        .map(|name| EffectiveMcpServer {
+            name: (*name).to_owned(),
+            command: Some(command.clone()),
+            url: None,
+            args: None,
+        })
+        .collect()
 }
 
 /// Read the frozen worker MCP policy back. Legacy snapshots without `mcp`
@@ -244,6 +366,15 @@ pub(super) fn policy_from_profile(
     let allow = eliot_core::parse_snapshot_allow_list(profile)
         .map_err(|error| Error::new("profile_error", format!("Codex {}", error.message)))?;
     Ok((policy, allow))
+}
+
+/// Read the frozen `mcp_cloud_hostname` snapshot field back for the
+/// owner-identity HTTP arm. Absent means the daemon configured no cloud
+/// hostname (or the snapshot predates it): the rule stays stdio-only.
+pub(super) fn cloud_hostname_from_profile(
+    profile: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    eliot_core::parse_snapshot_cloud_hostname(profile)
 }
 
 /// Secret-free effective server set for readiness reporting. `servers` is
@@ -406,10 +537,20 @@ mod tests {
     use serde_json::json;
 
     fn server(name: &str, command: Option<&str>, url: Option<&str>) -> EffectiveMcpServer {
+        server_with_args(name, command, None, url)
+    }
+
+    fn server_with_args(
+        name: &str,
+        command: Option<&str>,
+        args: Option<&[&str]>,
+        url: Option<&str>,
+    ) -> EffectiveMcpServer {
         EffectiveMcpServer {
             name: name.to_owned(),
             command: command.map(str::to_owned),
             url: url.map(str::to_owned),
+            args: args.map(|values| values.iter().map(|value| (*value).to_owned()).collect()),
         }
     }
 
@@ -426,6 +567,8 @@ mod tests {
             &["allowed".to_owned()],
             "eliot_swarm_x",
             &[],
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -440,7 +583,9 @@ mod tests {
                 &[server("plain", Some("p.exe"), None)],
                 &[],
                 "eliot_swarm_x",
-                &[]
+                &[],
+                None,
+                None
             )
             .unwrap()
             .is_empty()
@@ -458,6 +603,8 @@ mod tests {
             &[],
             "eliot_swarm_x",
             &[],
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -485,7 +632,9 @@ mod tests {
                     &[server(name, Some("s.exe"), None)],
                     &[],
                     "eliot_swarm_x",
-                    &[]
+                    &[],
+                    None,
+                    None
                 )
                 .is_err(),
                 "accepted {name:?}"
@@ -503,7 +652,8 @@ mod tests {
             server("notransport", None, None),
             server("empty", Some(""), Some("")),
         ] {
-            let error = compute_disables(&[entry], &[], "eliot_swarm_x", &[]).unwrap_err();
+            let error =
+                compute_disables(&[entry], &[], "eliot_swarm_x", &[], None, None).unwrap_err();
             assert_eq!(error.code, "profile_error");
         }
         // Control characters or an overlong value can never be quoted into
@@ -512,7 +662,8 @@ mod tests {
             server("control", Some("bad\nexe"), None),
             server("long", Some(&"x".repeat(MAX_MCP_TRANSPORT_BYTES + 1)), None),
         ] {
-            let error = compute_disables(&[entry], &[], "eliot_swarm_x", &[]).unwrap_err();
+            let error =
+                compute_disables(&[entry], &[], "eliot_swarm_x", &[], None, None).unwrap_err();
             assert_eq!(error.code, "profile_error");
             assert!(!error.message.contains("bad"));
         }
@@ -529,12 +680,149 @@ mod tests {
             &[],
             "eliot_swarm_x",
             &["hunter2".to_owned()],
+            None,
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, "secret_in_payload");
         assert!(!error.message.contains("hunter2"));
     }
 
+    #[test]
+    fn allow_listed_owner_identity_is_rejected_at_launch() {
+        // A renamed owner entry cannot ride the allow list back in.
+        let error = compute_disables(
+            &[server_with_args(
+                "swarm",
+                Some("swarm.exe"),
+                Some(&["mcp"]),
+                None,
+            )],
+            &["swarm".to_owned()],
+            "eliot_swarm_x",
+            &[],
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        assert!(error.message.contains("swarm"));
+        // The controller-path arm rejects too.
+        let renamed = r"C:\Tools\Eliot\bin\eliot.exe";
+        let error = compute_disables(
+            &[server_with_args(
+                "tools",
+                Some(renamed),
+                Some(&["mcp"]),
+                None,
+            )],
+            &["tools".to_owned()],
+            "eliot_swarm_x",
+            &[],
+            Some(renamed),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        // So does the cloud-host arm.
+        let error = compute_disables(
+            &[server("cloud", None, Some("https://mcp.example.com/mcp"))],
+            &["cloud".to_owned()],
+            "eliot_swarm_x",
+            &[],
+            None,
+            Some("mcp.example.com"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "profile_error");
+        // The Agent-scoped shape stays allowable: it is not the owner identity.
+        let disables = compute_disables(
+            &[server_with_args(
+                "agent-shape",
+                Some("swarm.exe"),
+                Some(&["mcp", "--require-agent"]),
+                None,
+            )],
+            &["agent-shape".to_owned()],
+            "eliot_swarm_x",
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(disables.is_empty());
+    }
+
+    #[test]
+    fn owner_disables_cover_renamed_entries_and_skip_agent_shape() {
+        let renamed = r"C:\Tools\Eliot\bin\eliot.exe";
+        let disables = compute_owner_disables(
+            &[
+                server_with_args("swarm", Some("swarm.exe"), Some(&["mcp"]), None),
+                server_with_args("tools", Some(renamed), Some(&["mcp"]), None),
+                server("cloud", None, Some("https://mcp.example.com/mcp")),
+                server_with_args(
+                    "agent-shape",
+                    Some("swarm.exe"),
+                    Some(&["mcp", "--require-agent"]),
+                    None,
+                ),
+                server("plain", Some("p.exe"), None),
+                server_with_args(
+                    "eliot_swarm_x",
+                    Some("swarm.exe"),
+                    Some(&["mcp", "--require-agent"]),
+                    None,
+                ),
+            ],
+            "eliot_swarm_x",
+            Some(renamed),
+            Some("mcp.example.com"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            disables
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cloud", "swarm", "tools"]
+        );
+        // Disables carry the enumerated transport, never the argument vector.
+        for entry in &disables {
+            assert!(entry.args.is_none());
+        }
+    }
+
+    #[test]
+    fn owner_disables_fail_closed_on_unknown_arguments() {
+        // Unreported arguments cannot prove `--require-agent`: a swarm
+        // command with unknown args is suppressed, never inherited.
+        let disables = compute_owner_disables(
+            &[server("maybe-owner", Some("swarm.exe"), None)],
+            "eliot_swarm_x",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(disables.len(), 1);
+        // An owner-identity entry that cannot be addressed fails closed.
+        let error = compute_owner_disables(
+            &[server_with_args(
+                "owner.search",
+                Some("swarm.exe"),
+                Some(&["mcp"]),
+                None,
+            )],
+            "eliot_swarm_x",
+            None,
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "profile_error");
+    }
     fn plugin(id: &str, enabled: bool) -> EffectiveMcpPlugin {
         EffectiveMcpPlugin {
             id: id.to_owned(),
@@ -601,6 +889,50 @@ mod tests {
         ] {
             assert!(!is_suppressible_plugin_id(id), "accepted {id:?}");
         }
+    }
+
+    #[test]
+    fn swarm_owner_disables_cover_the_exact_owner_names() {
+        let stubs = synthetic_swarm_owner_disables();
+        assert_eq!(
+            stubs
+                .iter()
+                .map(|stub| stub.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eliot_swarm", "eliot-swarm"]
+        );
+        for stub in &stubs {
+            assert!(is_addressable_override_name(&stub.name));
+            let command = stub.command.as_deref().expect("synthetic transport");
+            assert!(!command.is_empty());
+            assert!(!command.chars().any(char::is_control));
+            assert!(stub.url.is_none());
+        }
+        // The session-owned name never collides with the suppressed owner
+        // names, so the backstop cannot starve the Agent-scoped server.
+        for stub in &stubs {
+            assert_ne!(stub.name, "eliot_swarm_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        }
+    }
+
+    #[test]
+    fn disables_suppress_an_exact_owner_name_by_identity() {
+        let disables = compute_disables(
+            &[server_with_args(
+                "eliot_swarm",
+                Some("C:/Tools/Eliot/bin/306D38E4/swarm.exe"),
+                Some(&["mcp"]),
+                None,
+            )],
+            &[],
+            "eliot_swarm_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(disables.len(), 1);
+        assert_eq!(disables[0].name, "eliot_swarm");
     }
 
     #[test]

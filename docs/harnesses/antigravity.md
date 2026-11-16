@@ -413,12 +413,16 @@ strictly bounded to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon
 
 ## Worker MCP policy
 
-This harness keeps `inherit` only: the frozen profile always records
-`mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
-at config load. Verified read-only (`agy acp --help`, installed 1.5.9): the ACP server flags
-expose no MCP isolation mechanism (no strict/ignore-MCP flag; the documented
-top-level `--settings` is a session-only settings surface, not a verified isolation
-mechanism), so no `minimal` mechanism is implemented.
+This harness keeps `inherit` only: a profile that omits `mcp` resolves to
+`inherit` (the `minimal` default applies only where a harness maps it), and
+an explicit non-`inherit` policy is rejected as `unsupported` at config load. Verified read-only
+(`agy acp --help`, installed 1.5.9): the ACP server flags expose no MCP
+isolation mechanism (no strict/ignore-MCP flag; the documented top-level
+`--settings` is a session-only settings surface, not a verified isolation
+mechanism), so no `minimal` mechanism is implemented. The owner's
+`agy mcp list` surface (codebase_memory, eliot-search, windows-mcp on the
+reference machine) contains no Swarm entry, so no owner Swarm server can
+reach a worker through this harness.
 
 ## Permissions and final checks
 
@@ -433,7 +437,7 @@ stays in the plugin spec.
 
 `swarm launch --harness antigravity --model M --workspace W "prompt"` is
 Owner-only and freezes a profile-equivalent snapshot from safe defaults
-(`dangerously_skip_permissions = false`, MCP `inherit`) plus flags. A model
+(`dangerously_skip_permissions = false`, explicit MCP `inherit`) plus flags. A model
 may be omitted to preserve the verified ACP session default described above.
 `cmd` is the installed `agy` CLI when it is on `PATH` (it serves both `acp`
 and `models`), falling back to the installed app at
@@ -462,3 +466,15 @@ skill, the readiness transcript shows it and the fallback below applies.
 Implementation:
 [`plugins/antigravity/src/session.rs`](../../plugins/antigravity/src/session.rs)
 (`stage_hook_config`).
+
+## Minimal-context measurement (k61, 2026-11-16)
+
+Private daemon, identical trivial turn, `gemini-3.8-flash-high`, installed
+1.5.9, `inherit` (explicit; no minimal mapping exists). ACP exposes no MCP
+inventory, so the effective record stays null/unverified; the session carries
+exactly the Agent-scoped server by construction. Turn usage: input 14,934 +
+cache-read 16,837 + output 559 (total 32,330). A follow-up turn called
+`api.identity` through the `swarm` tool (after one Owner approval) and
+reported principal `agent`. `agy acp --help` and `agy mcp --help` expose no
+isolation or tool-deferral surface, so both stay unsupported.
+

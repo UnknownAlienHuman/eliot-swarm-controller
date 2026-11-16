@@ -41,7 +41,10 @@ pub use diagnostics::{
 pub use ids::parse_agent_id;
 pub use mcp_policy::{
     MAX_MCP_ALLOW_ENTRIES, MAX_MCP_SERVER_NAME_LEN, MCP_POLICY_INHERIT, MCP_POLICY_MINIMAL,
-    McpPolicy, parse_snapshot_allow_list, validate_allow_list,
+    McpPolicy, SWARM_RESERVED_SERVER_NAMES, is_owner_swarm_http, is_owner_swarm_server,
+    is_owner_swarm_stdio, is_swarm_executable_command, is_swarm_reserved_server_name,
+    parse_snapshot_allow_list, parse_snapshot_cloud_hostname, strip_jsonc_comments,
+    strip_jsonc_trailing_commas, url_host_equals, validate_allow_list,
 };
 pub use native_child::{
     CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,
