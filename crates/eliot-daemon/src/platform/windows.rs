@@ -11,7 +11,7 @@ use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::{null, null_mut};
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +22,8 @@ use windows_sys::Win32::Foundation::{
     HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SE_FILE_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -33,10 +33,12 @@ use windows_sys::Win32::Security::{
     SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
+    GetFileInformationByHandle, GetFileType, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    MoveFileExW, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
@@ -238,7 +240,7 @@ pub(crate) fn create_private_directory(path: &Path) -> Result<bool> {
         lpSecurityDescriptor: descriptor.0,
         bInheritHandle: 0,
     };
-    let path_wide = wide_path(path);
+    let path_wide = verbatim_file_path(path);
     // SAFETY: path and security descriptor remain alive through the call.
     if unsafe { CreateDirectoryW(path_wide.as_ptr(), &attributes) } != 0 {
         return Ok(true);
@@ -259,7 +261,7 @@ pub(crate) fn create_private_file_new(path: &Path) -> std::io::Result<fs::File> 
         lpSecurityDescriptor: descriptor.0,
         bInheritHandle: 0,
     };
-    let path_wide = wide_path(path);
+    let path_wide = verbatim_file_path(path);
     // SAFETY: path and security descriptor remain alive through the call. CREATE_NEW
     // preserves existing-object validation and never opens or truncates an old file.
     let handle = unsafe {
@@ -325,7 +327,7 @@ fn validate_new_or_raced_directory(path: &Path, created: bool) -> Result<()> {
     } else {
         "concurrently existing"
     };
-    ensure_current_owner(path).map_err(|error| {
+    ensure_current_owner(path, true).map_err(|error| {
         Error::new(
             "unsafe_data_dir",
             format!("{context} data directory failed owner validation: {error}"),
@@ -370,7 +372,7 @@ pub(crate) fn ensure_private_file(path: &Path) -> Result<()> {
         ));
     }
     reject_reparse(path)?;
-    ensure_current_owner(path)?;
+    ensure_current_owner(path, false)?;
     set_current_user_acl(path, false)
 }
 
@@ -401,7 +403,7 @@ pub(crate) fn validate_private_file(path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(super) fn set_test_untrusted_file_acl(path: &Path) -> Result<()> {
+pub(super) fn set_test_untrusted_file_acl(path: &Path, directory: bool) -> Result<()> {
     let sddl_wide: Vec<u16> = "D:P(A;;FA;;;WD)".encode_utf16().chain(Some(0)).collect();
     let mut raw_descriptor = null_mut();
     // SAFETY: sddl_wide is NUL-terminated and raw_descriptor is writable.
@@ -435,11 +437,11 @@ pub(super) fn set_test_untrusted_file_acl(path: &Path) -> Result<()> {
         ));
     }
 
-    let path_wide = wide_path(path);
-    // SAFETY: the path and descriptor remain live through the ACL update.
+    let handle = open_security_handle(path, READ_CONTROL | WRITE_DAC, directory)?;
+    // SAFETY: the handle and descriptor remain live through the ACL update.
     let status = unsafe {
-        SetNamedSecurityInfoW(
-            path_wide.as_ptr(),
+        SetSecurityInfo(
+            handle.0,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             null_mut(),
@@ -485,8 +487,8 @@ pub(crate) fn replace_file(source: &Path, target: &Path) -> Result<()> {
 }
 
 pub(crate) fn replace_file_once(source: &Path, target: &Path) -> std::io::Result<()> {
-    let source_wide = wide_path(source);
-    let target_wide = wide_path(target);
+    let source_wide = verbatim_file_path(source);
+    let target_wide = verbatim_file_path(target);
     // SAFETY: both paths are NUL-terminated UTF-16 strings for this call.
     if unsafe {
         MoveFileExW(
@@ -1244,7 +1246,7 @@ fn reject_reparse(path: &Path) -> Result<()> {
 }
 
 fn file_attributes(path: &Path) -> std::io::Result<u32> {
-    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let path_wide = verbatim_file_path(path);
     // SAFETY: path_wide is NUL-terminated UTF-16 for this call.
     let attributes =
         unsafe { windows_sys::Win32::Storage::FileSystem::GetFileAttributesW(path_wide.as_ptr()) };
@@ -1255,15 +1257,15 @@ fn file_attributes(path: &Path) -> std::io::Result<u32> {
     }
 }
 
-fn ensure_current_owner(path: &Path) -> Result<()> {
-    let path_wide = wide_path(path);
+fn ensure_current_owner(path: &Path, directory: bool) -> Result<()> {
+    let handle = open_security_handle(path, READ_CONTROL, directory)?;
     let mut owner = null_mut();
     let mut descriptor = null_mut();
     // SAFETY: outputs are writable pointers and the requested owner SID is
     // returned inside the allocated security descriptor.
     let status = unsafe {
-        GetNamedSecurityInfoW(
-            path_wide.as_ptr(),
+        GetSecurityInfo(
+            handle.0,
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION,
             &mut owner,
@@ -1319,15 +1321,15 @@ fn foreign_owner(path: &Path, owner: *mut c_void, user_sid: &[usize]) -> Error {
 }
 
 fn validate_current_user_acl(path: &Path, directory: bool) -> Result<()> {
-    let path_wide = wide_path(path);
+    let handle = open_security_handle(path, READ_CONTROL, directory)?;
     let mut owner = null_mut();
     let mut dacl = null_mut();
     let mut descriptor = null_mut();
     // SAFETY: output pointers are writable; the owner and DACL pointers are
     // backed by the returned security descriptor until it is freed below.
     let status = unsafe {
-        GetNamedSecurityInfoW(
-            path_wide.as_ptr(),
+        GetSecurityInfo(
+            handle.0,
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
@@ -1475,12 +1477,12 @@ fn set_current_user_acl(path: &Path, directory: bool) -> Result<()> {
         ));
     }
 
-    let path_wide = wide_path(path);
-    // SAFETY: path, user SID buffer and DACL remain live for this call. The
+    let handle = open_security_handle(path, READ_CONTROL | WRITE_DAC, directory)?;
+    // SAFETY: handle, user SID buffer and DACL remain live for this call. The
     // protected DACL replaces inherited access with a single user ACE.
     let status = unsafe {
-        SetNamedSecurityInfoW(
-            path_wide.as_ptr(),
+        SetSecurityInfo(
+            handle.0,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             null_mut(),
@@ -1612,6 +1614,155 @@ fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
+const VERBATIM_BACKSLASH: u16 = 92;
+const VERBATIM_QUESTION: u16 = 63;
+const VERBATIM_DOT: u16 = 46;
+
+/// Verbatim-prefixed form for file creation and security-handle opens.
+///
+/// Name-based Win32 security queries reject long paths at parse time
+/// (os error 123 on this host), while verbatim creation and handle-based
+/// security calls work at any length the filesystem accepts.
+fn verbatim_path(path: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let already = wide.len() >= 4
+        && wide[0] == VERBATIM_BACKSLASH
+        && wide[1] == VERBATIM_BACKSLASH
+        && (wide[2] == VERBATIM_QUESTION || wide[2] == VERBATIM_DOT)
+        && wide[3] == VERBATIM_BACKSLASH;
+    if already {
+        return path.to_path_buf();
+    }
+    let local_disk = path.is_absolute()
+        && matches!(
+            path.components().next(),
+            Some(Component::Prefix(p))
+                if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        );
+    if !local_disk {
+        return path.to_path_buf();
+    }
+    let normalized = match std::path::absolute(path) {
+        Ok(normalized) => normalized,
+        Err(_) => return path.to_path_buf(),
+    };
+    let wide: Vec<u16> = normalized.as_os_str().encode_wide().collect();
+    let already = wide.len() >= 4
+        && wide[0] == VERBATIM_BACKSLASH
+        && wide[1] == VERBATIM_BACKSLASH
+        && (wide[2] == VERBATIM_QUESTION || wide[2] == VERBATIM_DOT)
+        && wide[3] == VERBATIM_BACKSLASH;
+    if already {
+        return normalized;
+    }
+    let mut prefixed = vec![
+        VERBATIM_BACKSLASH,
+        VERBATIM_BACKSLASH,
+        VERBATIM_QUESTION,
+        VERBATIM_BACKSLASH,
+    ];
+    let mut wide = wide;
+    prefixed.append(&mut wide);
+    PathBuf::from(OsString::from_wide(&prefixed))
+}
+
+fn verbatim_file_path(path: &Path) -> Vec<u16> {
+    verbatim_path(path)
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect()
+}
+
+/// Uniquely owned handle for a handle-based private-data security call.
+struct SecurityHandle(HANDLE);
+
+impl Drop for SecurityHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from CreateFileW and closes exactly once here.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Open a private-data file or directory for a handle-based security call.
+///
+/// Backup semantics allow opening directories; pass READ_CONTROL to inspect
+/// or READ_CONTROL | WRITE_DAC to replace the DACL.
+fn open_security_handle(path: &Path, access: u32, directory: bool) -> Result<SecurityHandle> {
+    let verbatim = verbatim_file_path(path);
+    // SAFETY: verbatim is NUL-terminated and lives through the call; the
+    // returned handle is uniquely owned when valid. OPEN_REPARSE_POINT stops
+    // the open itself from following a junction or symlink, so a swap between
+    // the path check and this open cannot redirect the handle to a target.
+    let handle = unsafe {
+        CreateFileW(
+            verbatim.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io_error(
+            "open private data path for ACL inspection",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let guard = SecurityHandle(handle);
+    validate_security_handle(&guard, directory)?;
+    Ok(guard)
+}
+
+fn security_kind(directory: bool) -> &'static str {
+    if directory {
+        "unsafe_data_dir"
+    } else {
+        "unsafe_private_file"
+    }
+}
+
+/// Validate the opened handle itself: it must be a disk file or directory of
+/// the expected kind and must not be a reparse point. This closes the
+/// check-to-open race where a junction swapped in after the path check would
+/// otherwise redirect ACL inspection or mutation to its target.
+fn validate_security_handle(handle: &SecurityHandle, directory: bool) -> Result<()> {
+    // SAFETY: the handle is a valid open file handle owned by the guard.
+    let file_type = unsafe { GetFileType(handle.0) };
+    if file_type != FILE_TYPE_DISK {
+        return Err(Error::new(
+            security_kind(directory),
+            "private data path is not a file or directory",
+        ));
+    }
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is valid and info is writable storage for the call.
+    if unsafe { GetFileInformationByHandle(handle.0, &mut info) } == 0 {
+        return Err(io_error(
+            "inspect private data handle",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Error::new(
+            security_kind(directory),
+            "private data path is a reparse point",
+        ));
+    }
+    let is_dir = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    if is_dir != directory {
+        return Err(Error::new(
+            security_kind(directory),
+            "private data path has the wrong file kind",
+        ));
+    }
+    Ok(())
+}
+
 fn io_error(action: &str, error: std::io::Error) -> Error {
     Error::new("platform_io", format!("{action}: {error}"))
 }
@@ -1625,6 +1776,82 @@ unsafe extern "system" {
 mod tests {
     use super::*;
     use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+
+    #[test]
+    fn verbatim_leaves_drive_relative_unchanged() {
+        let input = PathBuf::from("C:eliot.db");
+        let wide = verbatim_file_path(&input);
+        let expected: Vec<u16> = input.as_os_str().encode_wide().chain(Some(0)).collect();
+        assert_eq!(
+            wide, expected,
+            "drive-relative must not gain a verbatim prefix"
+        );
+    }
+
+    #[test]
+    fn verbatim_normalizes_trailing_dot_component() {
+        let input = PathBuf::from(r"C:\eliot-verbatim-check\folder.\eliot.db");
+        let normalized = std::path::absolute(&input).expect("normalize");
+        assert!(
+            !normalized.to_string_lossy().contains("folder."),
+            "absolute() must normalize folder.: {}",
+            normalized.display()
+        );
+        let wide = verbatim_file_path(&input);
+        let wide_str = String::from_utf16_lossy(&wide);
+        assert!(
+            !wide_str.contains("folder."),
+            "verbatim must not preserve literal folder.: {wide_str}"
+        );
+    }
+
+    #[test]
+    fn verbatim_leaves_non_disk_paths_unchanged() {
+        for raw in [r"\\server\share\eliot.db", ":memory:", r"relative\eliot.db"] {
+            let input = PathBuf::from(raw);
+            let wide = verbatim_file_path(&input);
+            let expected: Vec<u16> = input.as_os_str().encode_wide().chain(Some(0)).collect();
+            assert_eq!(wide, expected, "{raw} must stay unchanged");
+        }
+        let verb = PathBuf::from(r"\\?\C:\already\verbatim.db");
+        let wide = verbatim_file_path(&verb);
+        let expected: Vec<u16> = verb.as_os_str().encode_wide().chain(Some(0)).collect();
+        assert_eq!(wide, expected, "already-verbatim must stay unchanged");
+    }
+
+    #[test]
+    fn security_handle_refuses_junction_swapped_in_after_path_check() {
+        let base = std::env::temp_dir().join(format!("eliot-junction-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&base).expect("base");
+        let target = base.join("target");
+        let victim = base.join("victim");
+        super::ensure_private_root(&target).expect("target private");
+        super::ensure_private_root(&victim).expect("victim private");
+        // Path check passes on the real directory.
+        super::check_no_reparse_components(&victim).expect("path check passes");
+        // Swap the checked object for a junction to the target.
+        std::fs::remove_dir(&victim).expect("remove victim");
+        let link = victim.to_string_lossy().into_owned();
+        let dest = target.to_string_lossy().into_owned();
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J", &link, &dest])
+            .output()
+            .expect("mklink junction");
+        assert!(
+            output.status.success(),
+            "mklink failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Handle-based inspection must refuse the junction, not follow it.
+        validate_current_user_acl(&victim, true).expect_err("junction must be refused");
+        // A SetSecurityInfo mutation through the junction must also refuse,
+        // leaving the target ACL untouched.
+        set_test_untrusted_file_acl(&victim, true)
+            .expect_err("untrusted ACL through junction must be refused");
+        super::validate_private_root(&target).expect("target ACL untouched");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn foreign_owner_names_the_file_and_both_sids() {

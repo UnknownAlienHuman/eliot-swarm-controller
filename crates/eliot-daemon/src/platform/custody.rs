@@ -152,9 +152,22 @@ impl OwnedChild {
     /// Start a read-only Git leaf with child-process creation fenced before exec.
     /// The caller must select the actual executable, not a launcher requiring children.
     pub fn spawn_leaf(command: Command) -> Result<Self> {
-        #[cfg(any(windows, unix))]
+        #[cfg(windows)]
         {
-            #[cfg(unix)]
+            // Build the leaf fence first: only its failure means the verified
+            // restrictions are unavailable. A later spawn failure keeps the
+            // true OS error (for example the working-directory limit) instead
+            // of blaming the fence.
+            let job = super::windows::Job::new_leaf().map_err(|_| {
+                Error::new(
+                    "git_leaf_fence_unavailable",
+                    "cannot start process with verified leaf restrictions",
+                )
+            })?;
+            Self::spawn_in_job(command, job)
+        }
+        #[cfg(unix)]
+        {
             let command = super::unix::prepare_leaf_command(command)?;
             Self::spawn_with_policy(command, true).map_err(|_| {
                 Error::new(
@@ -205,9 +218,17 @@ impl OwnedChild {
         command
             .as_std_mut()
             .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
-        let mut child = command
-            .spawn()
-            .map_err(|error| io_error("spawn suspended child", error))?;
+        let cwd = command
+            .as_std()
+            .get_current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        let mut child = command.spawn().map_err(|error| {
+            io_error(
+                &format!("spawn suspended child in working directory {cwd}"),
+                error,
+            )
+        })?;
         let process = match child.raw_handle() {
             Some(process) => process,
             None => {
@@ -591,6 +612,40 @@ mod leaf_tests {
                 .is_empty(),
             "the known absolute child must not execute in the leaf Job"
         );
+    }
+
+    #[tokio::test]
+    async fn leaf_spawn_preserves_unspawnable_cwd_error() {
+        let system_root =
+            PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
+        let parent = system_root.join("System32").join("cmd.exe");
+        let base = std::env::temp_dir().join(format!("eliot-leaf-long-{}", ulid::Ulid::new()));
+        let long = base.join("Q".repeat(240));
+        assert!(
+            long.as_os_str().len() > 258,
+            "fixture must exceed the spawnable cwd"
+        );
+        std::fs::create_dir_all(&base).expect("create fixture base");
+        std::fs::create_dir_all(&long).expect("create fixture cwd");
+        let mut command = Command::new(&parent);
+        command
+            .current_dir(&long)
+            .env_clear()
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.arg("/d").arg("/c").arg("exit /b 0");
+        let error = match OwnedChild::spawn_leaf(command) {
+            Ok(_) => panic!("over-long cwd cannot spawn"),
+            Err(error) => error,
+        };
+        assert_ne!(
+            error.code, "git_leaf_fence_unavailable",
+            "the true spawn error must survive, not the fence code: {}",
+            error.message
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
