@@ -14,7 +14,7 @@ See AGENTS.md for the work loop.
 
 ## Unified settings and hot start (2026-11-15)
 
-**Next:** S3 and S4, then L7 qualification.
+**Next:** L7 qualification.
 
 - [x] **S1 Settings store/API.** One revision-guarded `settings.read/save` path for
       profiles, routing, projects, daemon limits/retention, automation, mail,
@@ -24,15 +24,15 @@ See AGENTS.md for the work loop.
       for installed harnesses, automatic Git project registration, daemon startup
       from desktop, explicit safe remedy for unsafe existing roots, and a real
       profile-free launch from a clean directory.
-- [ ] **S3 Routing.** Ordered role candidates, installed/provider-hold/quota/capacity
+- [x] **S3 Routing.** Ordered role candidates, installed/provider-hold/quota/capacity
       selection before admission, recorded choice/reason, authorized child scope
       and no retry or reroute after dispatch or uncertain delivery.
-- [ ] **S4 Assignment through automation.** Settings-managed existing rules/timers
+- [x] **S4 Assignment through automation.** Settings-managed existing rules/timers
       keep a configured number of Agents busy on a brief queue through ordinary
       routing-aware launch; retain exact command identity and unknown gates.
 
-S1/S2 are the first increment; S3/S4 follow separately. The configuration and
-automation specs describe the target contract and identify the deferred behavior.
+S1-S4 are implemented. The configuration and automation specs own their contracts;
+fleet-wide and longer-running qualification remains in L7.
 
 ## Repairs to implemented paths
 

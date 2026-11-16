@@ -156,10 +156,22 @@ struct FileConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct RoutingConfig {
     #[serde(default)]
     pub(crate) default: Vec<String>,
+    /// Additional extensible roles share the same ordered candidate syntax.
+    #[serde(flatten)]
+    pub(crate) roles: BTreeMap<String, Vec<String>>,
+}
+
+impl RoutingConfig {
+    pub(crate) fn candidates(&self, role: &str) -> Option<&[String]> {
+        if role == "default" {
+            Some(&self.default)
+        } else {
+            self.roles.get(role).map(Vec::as_slice)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -232,6 +244,20 @@ pub(crate) struct AutomationConfig {
     pub(crate) max_event_backlog: i64,
     #[serde(default)]
     pub(crate) run: RunGrantConfig,
+    #[serde(default)]
+    pub(crate) assignments: BTreeMap<String, AssignmentConfig>,
+}
+
+/// Settings-owned identity and bounds for a routing-aware backlog assignment.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AssignmentConfig {
+    pub(crate) folder: String,
+    pub(crate) workspace: String,
+    #[serde(default = "default_assignment_role")]
+    pub(crate) role: String,
+    pub(crate) max_busy: u32,
+    pub(crate) interval: String,
 }
 
 impl Default for AutomationConfig {
@@ -239,6 +265,7 @@ impl Default for AutomationConfig {
         Self {
             max_event_backlog: default_max_event_backlog(),
             run: RunGrantConfig::default(),
+            assignments: BTreeMap::new(),
         }
     }
 }
@@ -255,6 +282,31 @@ impl AutomationConfig {
                 "config.toml: automation.max_event_backlog must be a positive integer",
             ));
         }
+        for (key, assignment) in &self.assignments {
+            if key.is_empty()
+                || key.len() > MAX_PROFILE_NAME_LEN
+                || !key.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+                || assignment.folder.trim().is_empty()
+                || !Path::new(&assignment.folder).is_absolute()
+                || !Path::new(&assignment.workspace).is_absolute()
+                || assignment.workspace.trim().is_empty()
+                || assignment.folder.chars().any(char::is_control)
+                || assignment.workspace.chars().any(char::is_control)
+                || assignment.max_busy == 0
+                || assignment.max_busy > 1000
+                || assignment.interval.trim() != assignment.interval
+                || assignment.interval.is_empty()
+                || crate::automation::parse_positive_duration_ms(&assignment.interval).is_err()
+            {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: automation assignment has invalid identity, paths, capacity or interval",
+                ));
+            }
+            validate_routing_role(&assignment.role)?;
+        }
         self.run = normalize_run_grant(
             &self.run.interpreters,
             &self.run.run_env,
@@ -269,6 +321,10 @@ impl AutomationConfig {
 
 fn default_max_event_backlog() -> i64 {
     100_000
+}
+
+fn default_assignment_role() -> String {
+    "worker".to_owned()
 }
 
 /// Store-size threshold for the unbounded-retention advisory: `daemon.status`
@@ -1056,21 +1112,56 @@ fn parse_config(source: &str) -> core::Result<FileConfig> {
     let config: FileConfig =
         toml::from_str(source).map_err(|error| map_toml_error(source, error))?;
     config.desktop.validate()?;
-    if config.routing.default.len() > 1 {
-        return Err(core::Error::new(
-            "unsupported",
-            "routing currently supports one explicit default profile",
-        ));
-    }
-    for profile in &config.routing.default {
-        if !config.profiles.contains_key(profile) {
+    let mut role_candidates = Vec::with_capacity(config.routing.roles.len() + 1);
+    role_candidates.push(("default", &config.routing.default));
+    role_candidates.extend(
+        config
+            .routing
+            .roles
+            .iter()
+            .map(|(role, profiles)| (role.as_str(), profiles)),
+    );
+    for (role, profiles) in role_candidates {
+        validate_routing_role(role)?;
+        if profiles.len() > 64 {
             return Err(core::Error::new(
                 "profile_error",
-                "config.toml: routing.default names an unknown profile",
+                "config.toml: routing roles allow at most 64 candidates",
             ));
+        }
+        let mut seen = HashSet::new();
+        for profile in profiles {
+            validate_profile_name(profile)?;
+            if !seen.insert(profile) {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: routing role contains a duplicate candidate profile",
+                ));
+            }
+            if !config.profiles.contains_key(profile) {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: routing candidate names an unknown profile",
+                ));
+            }
         }
     }
     Ok(config)
+}
+
+pub(crate) fn validate_routing_role(role: &str) -> core::Result<()> {
+    if role.is_empty()
+        || role.len() > MAX_PROFILE_NAME_LEN
+        || !role
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(core::Error::new(
+            "profile_error",
+            "config.toml: routing role names must be nonempty letters, digits, hyphen or underscore",
+        ));
+    }
+    Ok(())
 }
 
 /// Raw `config.toml` text within the size bound; `None` when absent.
@@ -1112,6 +1203,14 @@ pub(crate) fn load_automation_config(data_root: &Path) -> core::Result<Automatio
     config
         .automation
         .validate(&source, &route_credential_env_names)
+}
+
+pub(crate) fn routing_candidates(data_root: &Path, role: &str) -> core::Result<Vec<String>> {
+    validate_routing_role(role)?;
+    let Some((config, _)) = read_config(data_root)? else {
+        return Ok(Vec::new());
+    };
+    Ok(config.routing.candidates(role).unwrap_or_default().to_vec())
 }
 
 pub(crate) fn load_daemon_config(data_root: &Path) -> core::Result<DaemonConfig> {
@@ -3070,6 +3169,7 @@ mod tests {
             AutomationConfig {
                 max_event_backlog: 4096,
                 run: RunGrantConfig::default(),
+                assignments: BTreeMap::new(),
             }
         );
         assert_eq!(
@@ -3084,6 +3184,56 @@ mod tests {
                 run_env: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn routing_accepts_ordered_extensible_roles_and_rejects_bad_candidates() {
+        let source = "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\n\
+            [routing]\ndefault=['codex-luna']\nworker=['codex-luna']\n";
+        let config = parse_config(source).unwrap();
+        assert_eq!(
+            config.routing.candidates("default").unwrap(),
+            ["codex-luna"]
+        );
+        assert_eq!(config.routing.candidates("worker").unwrap(), ["codex-luna"]);
+        assert!(config.routing.candidates("missing").is_none());
+
+        for routing in [
+            "default=['codex-luna','codex-luna']",
+            "worker=['missing']",
+            "\"\"=['codex-luna']",
+            "bad.role=['codex-luna']",
+        ] {
+            let source = format!(
+                "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\n\
+                 [routing]\n{routing}\n"
+            );
+            assert!(parse_config(&source).is_err(), "accepted {routing}");
+        }
+    }
+
+    #[test]
+    fn automation_assignments_validate_and_load_from_settings_shape() {
+        let fixture = AutomationConfigFixture::new();
+        fixture.write(
+            "[automation.assignments.review-queue]\n\
+             folder='C:/work/briefs'\nworkspace='C:/work/eliot'\n\
+             role='worker'\nmax_busy=2\ninterval='30s'\n",
+        );
+        let config = load_automation_config(&fixture.root).unwrap();
+        let assignment = config.assignments.get("review-queue").unwrap();
+        assert_eq!(assignment.folder, "C:/work/briefs");
+        assert_eq!(assignment.workspace, "C:/work/eliot");
+        assert_eq!(assignment.role, "worker");
+        assert_eq!(assignment.max_busy, 2);
+        assert_eq!(assignment.interval, "30s");
+
+        fixture.write(
+            "[automation.assignments.review-queue]\n\
+             folder='C:/work/briefs'\nworkspace='C:/work/eliot'\n\
+             role='worker'\nmax_busy=0\ninterval='30s'\n",
+        );
+        assert!(load_automation_config(&fixture.root).is_err());
     }
 
     #[test]

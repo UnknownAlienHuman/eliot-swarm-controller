@@ -10,10 +10,14 @@ pub fn is_deterministic_pre_admission_rejection(code: &str) -> bool {
     matches!(
         code,
         "bad_state"
+            | "capacity_unavailable"
+            | "conflict"
             | "frame_too_large"
             | "invalid"
             | "not_allowed"
             | "not_found"
+            | "provider_held"
+            | "routing_unavailable"
             | "secret_in_payload"
             | "stale_generation"
             | "unsupported"

@@ -293,6 +293,10 @@ pub(crate) struct LaunchArgs {
     /// frozen profile; the Owner may supply one.
     #[arg(long, value_name = "PROFILE", conflicts_with = "harness")]
     pub(crate) profile: Option<String>,
+    /// Select an ordered routing policy when --profile is omitted. Omitted
+    /// role is the default role; the CLI preserves omission for replay identity.
+    #[arg(long, value_name = "ROLE", conflicts_with_all = ["profile", "harness"])]
+    pub(crate) role: Option<String>,
     /// Ad-hoc Owner launch harness (codex|claude|muse|opencode|antigravity).
     /// The daemon freezes a profile-equivalent snapshot from built-in
     /// per-harness defaults plus --model/--effort/--auth. Owner-only.
@@ -1226,7 +1230,39 @@ mod tests {
             panic!("launch required")
         };
         assert!(args.profile.is_none());
+        assert!(args.role.is_none());
         assert!(args.harness.is_none());
+    }
+
+    #[test]
+    fn launch_accepts_role_and_keeps_explicit_profile_conflict() {
+        let cli = Cli::try_parse_from([
+            "swarm",
+            "launch",
+            "--role",
+            "worker",
+            "--workspace",
+            ".",
+            "Review the brief",
+        ])
+        .unwrap();
+        let Some(CliCommand::Launch(args)) = cli.command else {
+            panic!("launch required");
+        };
+        assert_eq!(args.role.as_deref(), Some("worker"));
+        assert!(
+            Cli::try_parse_from([
+                "swarm",
+                "launch",
+                "--role",
+                "worker",
+                "--profile",
+                "codex",
+                "--workspace",
+                ".",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

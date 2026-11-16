@@ -75,8 +75,7 @@ stored profile. First use writes visible, editable native-default profiles for
 installed harnesses through the settings writer as `bootstrap`. An omitted model
 in these profiles requests the native default and retains requested/effective
 readback separately, as for an ad-hoc launch. There is no builtin fake profile.
-Before admission, an omitted profile may select a configured default; S3 extends
-this to ordered policy candidates. There is no post-dispatch harness/model/route/account
+Before admission, an omitted profile selects the first available ordered role candidate. There is no post-dispatch harness/model/route/account
 fallback, no retry of an uncertain outcome and no hold-triggered account switch.
 Profiles stay the durable
 explicit record: ad-hoc Owner launch (`swarm launch --harness ...`) freezes an
@@ -817,15 +816,38 @@ authority checks continue to apply at their owning effect boundaries.
 
 `[routing]` holds ordered profile candidates by role (`default`, `manager`, `worker`,
 `audit`, with additional named roles). Omitted `--profile` requests that policy.
+Each role is an ordered array of existing profile names, for example:
+
+```toml
+[routing]
+default = ["codex-luna", "muse"]
+worker = ["codex-luna"]
+```
+
+Role names use letters, digits, `-` and `_`; each role allows at most 64 candidates and rejects duplicate or
+unknown profile references. The `--role` launch argument selects the role only
+when `--profile` is omitted; omission stays absent on the wire and means
+`default`. An explicit profile continues to bypass routing.
 At first admission, candidates must be installed, outside provider holds, not known
 quota-exhausted where passive readback is supported, and within configured capacity.
 Unknown quota is reported as unknown rather than fabricated availability. Freeze the
 chosen profile and selection reason on the launch command/event before dispatch.
+The retained [`RoutingDecision` and `RouteSkip` DTOs](../../crates/eliot-core/src/routing.rs)
+carry the role, optional selected profile, source and reason, ordered typed skips and
+quota readback status (`supported`, `unsupported` or `unknown`). Exhaustion is a
+typed skip reason, separate from whether the provider supplied quota readback. A decision
+with no selected profile lists the candidates that were skipped; an unconfigured
+Owner role or an explicit nondefault child role remains a routing miss. A child
+requesting an unconfigured default role uses its inherited profile as the sole candidate.
 Child selection is intersected with the parent's frozen authorized child profiles
 (#398), including the inherited profile where authorized. No candidate means a typed
-rejection. Same-ID replay returns the frozen choice; failure, hold or unknown delivery
-never causes another candidate to run. S2 supplies only one explicit bootstrap default;
-availability-ranked multi-candidate selection is S3.
+`routing_unavailable` refusal with an `Error.routing` decision. The choice is retained
+on the Agent as `profile_choice` for `show`, `result` and desktop API consumers even
+after launch command history expires. Same-ID replay returns the frozen choice;
+failure, hold or unknown delivery never causes another candidate to run. A held
+candidate never selects a different account or captured credential selector of the
+same harness. Provider holds and capacity are rechecked transactionally at admission;
+a concurrent state change can refuse an otherwise prepared choice before dispatch.
 
 ### CLI editing
 

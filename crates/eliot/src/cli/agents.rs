@@ -146,6 +146,7 @@ pub(crate) async fn run_attach(
 pub(crate) async fn run_launch(
     LaunchArgs {
         profile,
+        role,
         harness,
         model,
         effort,
@@ -167,6 +168,18 @@ pub(crate) async fn run_launch(
         && name.is_empty()
     {
         return Err(Failure::new(2, "--profile must not be empty"));
+    }
+    if let Some(name) = &role
+        && (name.trim().is_empty()
+            || name.len() > 128
+            || !name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            }))
+    {
+        return Err(Failure::new(
+            2,
+            "--role must be a nonempty role name using letters, digits, '-' or '_'",
+        ));
     }
     let workspace = std::path::absolute(&workspace)
         .map_err(|error| Failure::new(2, format!("cannot resolve launch workspace: {error}")))?;
@@ -209,6 +222,9 @@ pub(crate) async fn run_launch(
     });
     if let Some(profile) = profile {
         args["profile"] = Value::String(profile);
+    }
+    if let Some(role) = role {
+        args["role"] = Value::String(role);
     }
     if let Some(harness) = harness {
         args["harness"] = Value::String(harness);

@@ -1,8 +1,10 @@
+pub(crate) mod assignment;
 mod definition;
 mod projects;
 mod reload;
 mod schedule;
 pub(crate) use definition::RuleDefinition;
+pub(crate) use schedule::parse_positive_duration_ms;
 
 use crate::{common::now_ms, logging, router::Router};
 use eliot_core::{
@@ -1047,12 +1049,18 @@ pub(crate) async fn run_global_rules(
                 }
             }
 
-            if !reconcile_due_timers(&router, &mut rules, now_ms()).await? {
+            if !reconcile_due_timers(&router, "owner", &mut rules, now_ms()).await? {
                 return Ok(RuleWorkerExit::AdmissionClosed);
             }
             for namespace in &mut project_rules {
                 if namespace.registration_current
-                    && !reconcile_due_timers(&router, &mut namespace.rules, now_ms()).await?
+                    && !reconcile_due_timers(
+                        &router,
+                        &namespace.principal,
+                        &mut namespace.rules,
+                        now_ms(),
+                    )
+                    .await?
                 {
                     return Ok(RuleWorkerExit::AdmissionClosed);
                 }
@@ -1327,6 +1335,31 @@ async fn reconcile_event_rules(
     Ok(true)
 }
 
+fn assignment_cleanup_key<'a>(
+    principal: &str,
+    project_scoped: bool,
+    rule_id: &'a str,
+    cause_rule: Option<&str>,
+) -> Option<&'a str> {
+    if principal != "owner" || project_scoped {
+        return None;
+    }
+    let key = rule_id
+        .strip_prefix("assignment-")?
+        .strip_suffix(".complete")?;
+    let expected_cause = format!("assignment-{key}");
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        || cause_rule != Some(expected_cause.as_str())
+    {
+        return None;
+    }
+    Some(key)
+}
+
 async fn process_rule_cursor(
     router: &Router,
     rule: &mut ActiveRule,
@@ -1375,6 +1408,18 @@ async fn process_rule_cursor(
                 rule.state = admission.state;
                 refresh_retiring(rule)?;
                 no_match_through = None;
+                continue;
+            }
+            if event.kind == "turn.completed"
+                && let Some(key) = assignment_cleanup_key(
+                    &rule.principal,
+                    rule.project.is_some(),
+                    &definition.id,
+                    event.cause.as_ref().and_then(|cause| cause.rule.as_deref()),
+                )
+                && !router.is_assignment_event(&event, key).await?
+            {
+                no_match_through = Some(event.seq);
                 continue;
             }
             let action = match definition::evaluate(&definition, &event) {
@@ -1619,14 +1664,16 @@ fn initial_next_due_at(schedule: &TimerSchedule, registration_now: i64) -> Resul
     }
 }
 
-async fn reconcile_due_timers(router: &Router, rules: &mut [ActiveRule], now: i64) -> Result<bool> {
+async fn reconcile_due_timers(
+    router: &Router,
+    principal: &str,
+    rules: &mut [ActiveRule],
+    now: i64,
+) -> Result<bool> {
     let mut after_id = None;
     loop {
-        let principal = rules
-            .first()
-            .map_or_else(|| "owner".to_owned(), |rule| rule.principal.clone());
         let page = router
-            .list_due_rule_timers(&principal, after_id.as_deref(), now, TIMER_PAGE_SIZE)
+            .list_due_rule_timers(principal, after_id.as_deref(), now, TIMER_PAGE_SIZE)
             .await?;
         let page_len = page.len();
         if page_len == 0 {
@@ -1702,14 +1749,29 @@ async fn reconcile_due_timers(router: &Router, rules: &mut [ActiveRule], now: i6
                                     )
                                     .await
                             }
-                            Ok(action) => match rule.project.as_ref() {
-                                Some(project) => {
-                                    router
-                                        .prepare_project_rule_submission(action, project)
-                                        .await
+                            Ok(action) => {
+                                if action.args.get("assignment").is_some() && rule.project.is_some()
+                                {
+                                    Err(Error::new(
+                                        "not_allowed",
+                                        "assignments require an Owner timer",
+                                    ))
+                                } else {
+                                    match assignment::prepare(router, action).await {
+                                        Ok(action) => match rule.project.as_ref() {
+                                            Some(project) => {
+                                                router
+                                                    .prepare_project_rule_submission(
+                                                        action, project,
+                                                    )
+                                                    .await
+                                            }
+                                            None => router.prepare_owner_submission(action).await,
+                                        },
+                                        Err(error) => Err(error),
+                                    }
                                 }
-                                None => router.prepare_owner_submission(action).await,
-                            },
+                            }
                             Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
                                 Err(error)
                             }
@@ -1973,6 +2035,94 @@ pub(crate) async fn prepare_rule_catch_up_actions(
 mod timer_tests {
     use super::*;
     use eliot_core::SubmitCommand;
+
+    #[test]
+    fn assignment_cleanup_candidate_is_owner_global_only() {
+        let rule_id = "assignment-pool.complete";
+        let cause_rule = Some("assignment-pool");
+        assert_eq!(
+            assignment_cleanup_key("owner", false, rule_id, cause_rule),
+            Some("pool")
+        );
+        assert_eq!(
+            assignment_cleanup_key("project:collision-project", true, rule_id, cause_rule),
+            None
+        );
+        assert_eq!(
+            assignment_cleanup_key("owner", false, rule_id, Some("other-rule")),
+            None
+        );
+        assert_eq!(
+            assignment_cleanup_key(
+                "owner",
+                false,
+                "assignment-pool.extra.complete",
+                Some("assignment-pool.extra"),
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_project_timer_lane_does_not_list_owner_timers() {
+        use std::io::Cursor;
+
+        let root =
+            std::env::temp_dir().join(format!("eliot-empty-project-timer-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Arc::new(tokio::sync::Mutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let router = Router::new(
+            root.clone(),
+            "empty-project-timer-fixture".to_owned(),
+            store,
+            crate::bus::Bus::new(16),
+        );
+        let definition = definition::load(Cursor::new(
+            "[[rule]]\nid = 'owner-timer'\non = { every = '1s' }\ndo = [{ action = 'launch', profile = 'fixture', workspace = 'C:/work' }]\n",
+        ))
+        .unwrap()
+        .remove(0);
+        let snapshot = reload::from_definitions(vec![definition]).unwrap();
+        let registered_at = now_ms();
+        let timers = timer_inputs(&router, "owner", &snapshot, &[], registered_at)
+            .await
+            .unwrap();
+        router
+            .initialize_rules("owner", &snapshot.inputs, &timers, registered_at)
+            .await
+            .unwrap();
+        let checkout = root.join("empty-project").to_string_lossy().into_owned();
+        let registration = router
+            .reconcile_project_registrations(&[eliot_store::ProjectRegistrationInput {
+                id: "empty-project".to_owned(),
+                checkout: checkout.clone(),
+                repo_common_dir: format!("{checkout}/.git"),
+                git: None,
+                profiles: vec!["fixture".to_owned()],
+                actions: vec!["stop".to_owned()],
+                interpreters: std::collections::BTreeMap::new(),
+                run_env: Vec::new(),
+            }])
+            .await
+            .unwrap()
+            .remove(0);
+        let principal = format!("project:{}", registration.id);
+
+        let mut empty_project_rules = Vec::new();
+        assert!(
+            reconcile_due_timers(
+                &router,
+                &principal,
+                &mut empty_project_rules,
+                registered_at + 10_000,
+            )
+            .await
+            .unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn timer() -> ActiveTimer {
         ActiveTimer {
