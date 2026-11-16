@@ -1,8 +1,9 @@
 //! Owner configuration screens' RPCs: the sanitized profile list, the
 //! `[profiles.*]` source read and its validated save, and the rule list.
 //!
-//! Profiles are resolved from `config.toml` at every launch admission, so
-//! these reads report exactly what the next launch will use; the save
+//! Profiles resolve from `config.toml` at every launch admission against a
+//! revision-keyed validated snapshot, so these reads report exactly what the
+//! next launch will use; file validation runs once per content revision. The save
 //! delegates to `config::profiles_edit`, which reuses the launch parser and
 //! resolution. `rule.list` pages the stored rule states of one namespace with
 //! their canonical definitions and timer states; it changes nothing.
@@ -96,10 +97,10 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let policy = self.secret_policy_snapshot();
-        let mut store = self.inner.store.lock().await;
+        let store = self.inner.store.lock().await;
         let reply = crate::config::settings::read_internal(
             &self.inner.data_root,
-            &mut store,
+            &store,
             request.sections.as_deref(),
             &policy,
         )?;

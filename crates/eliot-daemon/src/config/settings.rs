@@ -136,9 +136,18 @@ fn section_json(source: &str, name: &str) -> core::Result<JsonValue> {
     Ok(value)
 }
 
+/// One-time daemon-startup settlement of crash-left pending settings history
+/// rows against the current file revision. Reads never reconcile, so this
+/// plus the save path settle every pending row exactly once.
+pub(crate) fn reconcile_at_startup(data_root: &Path, store: &mut Store) -> core::Result<()> {
+    let current = read_config_source(data_root)?;
+    let current_revision = current.as_deref().map(profiles_edit::revision_of);
+    store.reconcile_settings_history(current_revision.as_deref())
+}
+
 pub(crate) fn read_internal(
     data_root: &Path,
-    store: &mut Store,
+    store: &Store,
     requested: Option<&[SettingsSection]>,
     policy: &SecretPolicy,
 ) -> core::Result<SettingsReadResponse> {
@@ -153,7 +162,6 @@ pub(crate) fn read_internal(
         ));
     }
     validate_candidate(&source)?;
-    store.reconcile_settings_history(revision.as_deref())?;
     let sections = requested.map_or_else(|| all_sections().to_vec(), ToOwned::to_owned);
     let mut values = BTreeMap::new();
     for section in &sections {
@@ -764,12 +772,36 @@ mod tests {
     }
 
     #[test]
+    fn read_leaves_history_unchanged_and_save_records() {
+        let root = TestRoot::new();
+        let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        let sections = BTreeMap::from([(SettingsSection::Profiles, profile_section("gpt-6-luna"))]);
+        let saved = save_internal(
+            &root.0,
+            &mut store,
+            None,
+            &sections,
+            SettingsAuthor::Owner(SettingsClientSource::Cli),
+            false,
+            &policy,
+        )
+        .expect("save settings");
+        assert!(saved.saved);
+        let before = store.list_settings_history(100).expect("history");
+        assert_eq!(before.len(), 1);
+        let _read = read_internal(&root.0, &store, None, &policy).expect("read settings");
+        let after = store.list_settings_history(100).expect("history");
+        assert_eq!(before, after);
+    }
+
+    #[test]
     fn existing_empty_config_keeps_its_revision_and_default_roundtrip_is_noop() {
         let root = TestRoot::new();
         std::fs::write(root.0.join("config.toml"), "").expect("write empty config");
         let mut store = Store::open(Path::new(":memory:")).expect("open Store");
         let policy = SecretPolicy::new(Vec::<String>::new());
-        let read = read_internal(&root.0, &mut store, None, &policy).expect("read empty config");
+        let read = read_internal(&root.0, &store, None, &policy).expect("read empty config");
         let revision = profiles_edit::revision_of("");
         assert_eq!(read.revision.as_deref(), Some(revision.as_str()));
         let result = save_internal(
@@ -904,7 +936,7 @@ mod tests {
         assert!(saved.restart_required.is_empty());
         let read = read_internal(
             &root.0,
-            &mut store,
+            &store,
             Some(&[SettingsSection::Automation, SettingsSection::Routing]),
             &policy,
         )
@@ -955,13 +987,8 @@ mod tests {
         assert!(has_desktop_section(
             &std::fs::read_to_string(root.0.join("config.toml")).unwrap()
         ));
-        let read = read_internal(
-            &root.0,
-            &mut store,
-            Some(&[SettingsSection::Desktop]),
-            &policy,
-        )
-        .unwrap();
+        let read =
+            read_internal(&root.0, &store, Some(&[SettingsSection::Desktop]), &policy).unwrap();
         let roundtrip = save_internal(
             &root.0,
             &mut store,
