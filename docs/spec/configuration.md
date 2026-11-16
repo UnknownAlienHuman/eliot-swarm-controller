@@ -1052,8 +1052,9 @@ that recheck and the rename can still be overwritten. A failure after the rename
 reports `unknown`, never "unchanged". The draft keeps the file's line ending. A
 leading UTF-8 BOM is preserved outside the profile blocks and is never handed
 to the editor. An identical result writes nothing. An invalid draft is never written, so the file keeps
-its last valid revision and the editor keeps the draft. The daemon holds no separate
-in-memory profile set to reload: the next admission reads the saved file.
+its last valid revision and the editor keeps the draft. The daemon keeps one revision-keyed validated snapshot per router: an admission
+whose file revision matches reuses it, and any byte change re-reads and re-validates,
+so the saved file is still what the next launch uses.
 
 ## Frozen files
 
