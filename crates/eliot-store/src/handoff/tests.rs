@@ -558,7 +558,7 @@ fn handoff_brief_redacts_labels_truncation_and_retains_history_pointers() {
     assert!(text.contains("TRUNCATED"));
     assert!(text.contains(&r.task_command));
     assert!(text.contains("source-final"));
-    assert!(text.len() <= MAX_INPUT_BYTES);
+    assert!(text.len() <= MAX_TEXT_BYTES);
 }
 
 #[test]

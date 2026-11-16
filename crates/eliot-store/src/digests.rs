@@ -15,7 +15,7 @@ use super::{
 use eliot_core::{Error, Result, api::SwarmDigestRequest, parse_agent_id};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// One stored digest registration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,31 +328,6 @@ impl Store {
         })();
         self.fault_on_persistence_error(&result);
         result
-    }
-
-    /// Test helper: decode the stored request back to its wire shape.
-    pub fn digest_request_json(&self, id: &str) -> Result<Option<Value>> {
-        let Some(row) = self.digest_row(id)? else {
-            return Ok(None);
-        };
-        let turns: Vec<Value> = row
-            .turns
-            .iter()
-            .map(|t| {
-                json!({
-                    "agent": t.agent,
-                    "generation": t.generation,
-                    "turn_id": t.turn_id,
-                })
-            })
-            .collect();
-        Ok(Some(json!({
-            "id": row.id,
-            "to": row.parent,
-            "mode": row.mode,
-            "commands": row.commands,
-            "turns": turns,
-        })))
     }
 }
 

@@ -5234,7 +5234,7 @@ mod tests {
         };
         let launch_text = "x".repeat(MAX_EVENT_BYTES - 4 * 1024);
         assert_eq!(launch_text.len(), 60 * 1024);
-        assert!(launch_text.len() < MAX_INPUT_BYTES);
+        assert!(launch_text.len() < MAX_TEXT_BYTES);
         assert!(ACTION_COUNT < RULE_ACTION_LIMIT as usize);
         assert!(ACTION_COUNT < GLOBAL_RULE_ACTION_LIMIT as usize);
         let pair_text_bytes = launch_text.len() * 2;
