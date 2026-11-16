@@ -282,6 +282,13 @@ mod bounded_recovery_tests {
             .expect("read custody namespace");
         let root = std::env::temp_dir().join(format!("eliot-restart-page-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&root).expect("create router root");
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveOnDrop(root.clone());
         let router = Router::new(
             root,
             "restart-page-fixture".to_owned(),
