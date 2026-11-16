@@ -155,7 +155,7 @@ impl Router {
         let mut snapshot = if let Some(parent) = parent.filter(|parent| parent.profile == name) {
             parent.profile_snapshot.clone()
         } else {
-            match crate::config::resolve_profile(&self.inner.data_root, name) {
+            match self.resolve_profile_cached(name) {
                 Ok(mut snapshot) => {
                     if crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                         std::env::var_os(name)
