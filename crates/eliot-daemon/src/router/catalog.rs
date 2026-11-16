@@ -91,6 +91,12 @@ pub(crate) fn describe_snapshot(
                     .map_or_else(|| "no-auth".to_owned(), |name| format!("env:{name}"));
             }
         }
+        "claude" => {
+            credential = "claude-cli-oauth".to_owned();
+        }
+        "antigravity" => {
+            credential = "antigravity-cli-keyring".to_owned();
+        }
         "muse" => {
             credential = "ambient".to_owned();
         }

@@ -483,15 +483,16 @@ impl CodexPlugin {
                 "Codex quota.read requires a dedicated reader plugin instance",
             ));
         }
-        let profile: Value = decode(raw, "Codex quota.read params are invalid")?;
-        let snapshot = profile.get("profile").unwrap_or(&profile);
+        let params = eliot_plugin::quota::decode(raw)?;
+        let snapshot = &params.profile;
         if snapshot.get("harness").and_then(Value::as_str) != Some("codex") {
             return Err(Error::new(
                 "profile_error",
                 "Codex quota.read received another harness",
             ));
         }
-        let (launch, secrets, metadata_secrets) = self.reader_launch(snapshot, &json!({}))?;
+        let (launch, secrets, metadata_secrets) =
+            self.reader_launch(snapshot, &params.environment)?;
         let details = crate::discovery::read_quota(
             launch,
             &metadata_secrets,

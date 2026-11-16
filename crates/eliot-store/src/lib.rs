@@ -38,6 +38,7 @@ pub use scripts::ScriptRunAdmission;
 pub use usage::ResolvedUsageScope;
 
 use eliot_core::api::{AgentConfigView, AgentSummary, HeavySummaryView, SessionGrowthView};
+use eliot_core::limits::{MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES};
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
@@ -64,9 +65,6 @@ use workspace::recover_workspaces;
 const MAX_PAGE_ENTRIES: usize = 1_000;
 const MAX_PAGE_BYTES: usize = 900 * 1024;
 const MAX_NATIVE_FAMILIES: i64 = 9;
-const MAX_EVENT_BYTES: usize = 64 * 1024;
-const MAX_INPUT_BYTES: usize = 512 * 1024;
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Allowed generator-clock skew for ULID age checks. A mutation id timestamp
 /// may run ahead of the Store commit clock by up to this margin; admission
@@ -101,7 +99,7 @@ const NONTERMINAL_AGENTS_WHERE: &str =
 const LIST_NONTERMINAL_AGENTS_COLUMNS: &str = "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited, profile_choice
+                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat
                  FROM agents";
 const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
     "state IN ('accepted', 'queued', 'dispatched', 'unknown') AND (
@@ -149,6 +147,7 @@ mod reparent;
 pub use native_children::{
     NATIVE_CHILD_ATTENTION_PAGE_SIZE, NativeChildrenAttention, NativeChildrenAttentionPage,
 };
+mod agent_lifecycle;
 mod native_events;
 mod observer;
 mod observer_live;
@@ -850,7 +849,7 @@ impl Store {
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited, profile_choice
+                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat
                  FROM agents WHERE id > ?1 ORDER BY id LIMIT ?2",
             )
             .map_err(sql_error)?;
@@ -998,6 +997,8 @@ impl Store {
             self.session_growth_view(&record.harness, &id, record.generation, growth_thresholds)?;
         let preview = self.first_input_preview(record.id)?;
         Ok(AgentSummary {
+            archived: record.archived,
+            chat: record.chat,
             id,
             generation: record.generation,
             project: record.project,
@@ -1104,7 +1105,7 @@ impl Store {
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited, profile_choice
+                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat
                  FROM agents
                  WHERE id > ?1 AND observe_only = 0 AND (state IN ('busy', 'waiting')
                    OR EXISTS(SELECT 1 FROM native_child_registrations r
@@ -3275,6 +3276,8 @@ struct AgentRecord {
     control: String,
     profile_inherited: bool,
     profile_choice: Option<String>,
+    archived: bool,
+    chat: bool,
 }
 
 struct CommandRecord {
@@ -3514,6 +3517,7 @@ struct TurnInsert<'a> {
 /// Unknown shapes reject at the Core DTO boundary, never as empty matches.
 #[derive(Clone, Debug, Default)]
 pub struct AgentListFilter {
+    pub archived: core::api::ArchivedFilter,
     pub state: Option<AgentState>,
     pub project: Option<String>,
     pub harness: Option<String>,
@@ -3630,7 +3634,7 @@ fn agent_list_select(
         "agents.id, agents.generation, agents.name, agents.project, agents.harness, agents.profile,
                 agents.profile_snapshot, agents.native_scope, agents.native_ref, agents.workspace, agents.effective,
                 agents.pending, agents.state, agents.active_turn, agents.created_at, agents.updated_at, agents.origin, agents.observe_only, (agents.token IS NOT NULL AND agents.observe_only = 0),
-                agents.parent, agents.root, agents.depth, agents.control, agents.profile_inherited, agents.profile_choice"
+                agents.parent, agents.root, agents.depth, agents.control, agents.profile_inherited, agents.profile_choice, agents.archived, agents.chat"
             .to_owned()
     };
     let mut predicates = Vec::new();
@@ -3680,7 +3684,15 @@ fn agent_list_select(
         equality("harness", rusqlite::types::Value::from(harness.clone()));
         note_index("agents_list_harness", false);
     }
-    let mut forced_index = structural.or(fallback);
+    match filter.archived {
+        core::api::ArchivedFilter::Exclude => equality("archived", 0.into()),
+        core::api::ArchivedFilter::Only => equality("archived", 1.into()),
+        core::api::ArchivedFilter::Include => {}
+    }
+    let mut forced_index = structural.or(fallback).or(match filter.archived {
+        core::api::ArchivedFilter::Include => None,
+        _ => Some("agents_list_archived"),
+    });
     let mut prefix = String::new();
     if let Some(caller) = caller {
         let caller_num = parse_agent_id(&caller.id)?;
@@ -3760,6 +3772,8 @@ fn agent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecor
         control: row.get(22)?,
         profile_inherited: row.get(23)?,
         profile_choice: row.get(24)?,
+        archived: row.get(25)?,
+        chat: row.get(26)?,
     })
 }
 
@@ -3775,6 +3789,8 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
             .flatten(),
     };
     Ok(Agent {
+        archived: record.archived,
+        chat: record.chat,
         id: format_agent_id(record.id),
         generation: record.generation,
         origin: parse_enum(&record.origin, "Agent origin")?,
@@ -3840,7 +3856,7 @@ fn load_agent_by_num(connection: &Connection, id: i64) -> Result<Option<Agent>> 
             "SELECT id, generation, name, project, harness, profile,
                     profile_snapshot, native_scope, native_ref, workspace, effective,
                     pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                    parent, root, depth, control, profile_inherited, profile_choice
+                    parent, root, depth, control, profile_inherited, profile_choice, archived, chat
              FROM agents WHERE id = ?1",
             [id],
             agent_record_from_row,
@@ -5905,7 +5921,7 @@ fn install_stream_source_plan(
 
 fn family_for_kind(kind: &str) -> Result<&'static str> {
     match kind {
-        "session.ready" | "session.ended" | "session.usage" => Ok("session"),
+        "session.ready" | "session.ended" | "session.usage" | "quota.observed" => Ok("session"),
         "turn.started" | "turn.completed" | "turn.unknown" => Ok("turn"),
         "message.completed" => Ok("message"),
         "tool.started" | "tool.completed" | "hook.before_tool" => Ok("tool"),
@@ -6606,7 +6622,7 @@ fn optional_string(value: &Value, field: &str) -> Result<Option<String>> {
 }
 
 fn check_input(text: &str) -> Result<()> {
-    if text.len() > MAX_INPUT_BYTES {
+    if text.len() > MAX_TEXT_BYTES {
         return Err(Error::new(
             "frame_too_large",
             "inline input exceeds 512 KiB",

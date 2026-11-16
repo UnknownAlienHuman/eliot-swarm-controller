@@ -299,6 +299,7 @@ mod assignment_tests {
     fn settings_assignment_generates_timer_and_ancestry_gated_cleanup() {
         let root =
             std::env::temp_dir().join(format!("eliot-assignment-rules-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("config.toml"), format!(
             "[automation.assignments.pool]\nfolder={}\nworkspace={}\nmax_busy=2\ninterval='2s'\n",
@@ -315,6 +316,5 @@ mod assignment_tests {
         assert_eq!(value["on"]["match"]["event.cause.rule"], "assignment-pool");
         assert_eq!(value["do"][0]["action"], "stop");
         assert_eq!(value["do"][0]["expected_generation"], "${event.generation}");
-        fs::remove_dir_all(root).unwrap();
     }
 }

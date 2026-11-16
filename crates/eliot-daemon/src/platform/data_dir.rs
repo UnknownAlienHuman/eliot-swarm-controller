@@ -1123,6 +1123,7 @@ mod tests {
     #[test]
     fn long_private_data_root_round_trip() {
         let base = std::env::temp_dir().join(format!("eliot-long-root-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(base.clone());
         let long = base.join("D".repeat(200)).join("E".repeat(40));
         assert!(
             long.as_os_str().len() > 260,
@@ -1135,6 +1136,5 @@ mod tests {
             .expect("lock a file inside the long root");
         let _store =
             eliot_store::Store::open(&data.path().join("eliot.db")).expect("open long database");
-        let _ = fs::remove_dir_all(&base);
     }
 }

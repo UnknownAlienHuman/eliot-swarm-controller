@@ -11,7 +11,90 @@ fn encoded(value: impl serde::Serialize) -> Result<Value> {
         .map_err(|_| Error::new("internal", "cleanup response cannot encode"))
 }
 
+pub(super) fn private_chat_root(path: &Path) -> Result<PathBuf> {
+    #[cfg(windows)]
+    crate::platform::windows::ensure_private_root(path)?;
+    #[cfg(unix)]
+    crate::platform::unix::ensure_private_root(path)?;
+    std::fs::canonicalize(path)
+        .map_err(|_| Error::new("unavailable", "private chat root unavailable"))
+}
+
 impl Router {
+    pub(super) async fn prepare_chat_directory(&self, command: &Command) -> Result<()> {
+        let store = self.inner.store.lock().await;
+        let agent = store
+            .get_agent(
+                command
+                    .target
+                    .as_deref()
+                    .ok_or_else(|| Error::new("invalid", "chat Agent absent"))?,
+            )?
+            .ok_or_else(|| Error::new("not_found", "chat Agent absent"))?;
+        if !agent.chat {
+            return Err(Error::new("source_integrity", "chat binding absent"));
+        }
+        let path = agent
+            .workspace
+            .as_deref()
+            .ok_or_else(|| Error::new("source_integrity", "chat workspace absent"))?;
+        if let Some(known) = store.known_artifact_path(path)? {
+            if known.agent != agent.id
+                || known.identity != directory_identity(Path::new(path))?
+                || known.purpose != "Swarm chat directory"
+            {
+                return Err(Error::new(
+                    "identity_changed",
+                    "chat directory ownership changed",
+                ));
+            }
+            return Ok(());
+        }
+        drop(store);
+        let path = Path::new(path);
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::new("invalid", "chat parent absent"))?;
+        let parent = crate::platform::script_file::Directory::open(parent)?;
+        #[cfg(windows)]
+        if !crate::platform::windows::create_private_directory(path)? {
+            return Err(Error::new("conflict", "chat directory already exists"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(path)
+                .map_err(|_| {
+                    Error::new(
+                        "conflict",
+                        "chat directory could not be exclusively created",
+                    )
+                })?;
+        }
+        let directory = crate::platform::script_file::Directory::open(&private_chat_root(path)?)?;
+        drop(parent);
+        self.inner
+            .store
+            .lock()
+            .await
+            .record_known_artifact(ArtifactView {
+                id: ulid::Ulid::new().to_string(),
+                agent: agent.id,
+                generation: agent.generation,
+                project: String::new(),
+                tree: Vec::new(),
+                path: directory.path.to_string_lossy().into_owned(),
+                kind: ArtifactKind::Other,
+                purpose: "Swarm chat directory".to_owned(),
+                identity: directory.identity()?,
+                created_at: now_ms(),
+                state: "registered".to_owned(),
+                git: None,
+            })
+    }
+
     pub(super) async fn prepare_agent_artifact_root(&self, agent: &Agent) -> Result<()> {
         let mut store = self.inner.store.lock().await;
         if let Some(root) = store.agent_artifact_root(&agent.id, agent.generation)? {
@@ -355,7 +438,31 @@ impl Router {
                 ));
             }
         }
-        if canonical == own_temp || !canonical.starts_with(&own_temp) {
+        let chat_directory = if agent.chat {
+            let identity = directory_identity(&canonical)?;
+            if let Some(workspace) = agent.workspace.as_deref() {
+                if directory_identity(Path::new(workspace)).ok().as_ref() == Some(&identity) {
+                    self.inner
+                        .store
+                        .lock()
+                        .await
+                        .known_artifact_path(workspace)?
+                        .is_some_and(|artifact| {
+                            artifact.agent == agent.id
+                                && artifact.generation == agent.generation
+                                && artifact.purpose == "Swarm chat directory"
+                                && artifact.identity == identity
+                        })
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !chat_directory && (canonical == own_temp || !canonical.starts_with(&own_temp)) {
             return Err(Error::new(
                 "not_allowed",
                 "artifact is outside the Agent generation's Swarm-created root",
@@ -891,7 +998,7 @@ impl Router {
         let deadline = Instant::now() + Duration::from_secs(10);
         // Check both the retained workspace and the candidate's actual containing
         // repository. Another checkout's tracked descendants are protected too.
-        for (location, required) in [(root, true), (path, false)] {
+        for (location, required) in [(root, !agent.chat), (path, false)] {
             let top = probe
                 .workspace_command(
                     location,
@@ -1849,6 +1956,7 @@ mod tests {
     #[tokio::test]
     async fn artifact_root_is_created_exclusively_and_bound_to_generation() {
         let root = std::env::temp_dir().join(format!("eliot-root-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir(&root).unwrap();
         let router = super::super::tests::router_with_data_root(root.clone());
         let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
@@ -1934,7 +2042,6 @@ mod tests {
                 .is_err()
         );
         drop(router);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
@@ -2122,6 +2229,7 @@ mod tests {
     #[test]
     fn daemon_lock_absent_is_clean_and_live_owner_keeps() {
         let dir = std::env::temp_dir().join(format!("eliot-lock-test-{}", ulid::Ulid::new()));
+        let _temp_3 = crate::test_support::TempDir::own(dir.clone());
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(Router::cleanup_check_daemon_lock(&dir).is_ok());
@@ -2151,6 +2259,7 @@ mod tests {
     #[tokio::test]
     async fn another_repositories_tracked_descendants_are_protected() {
         let (root, work) = scratch_repo("primary");
+        let _temp_4 = crate::test_support::TempDir::own(root.clone());
         let other = root.join("other");
         std::fs::create_dir_all(other.join("sources")).unwrap();
         git(&other, &["init", "-b", "main"]);
@@ -2177,6 +2286,7 @@ mod tests {
     #[tokio::test]
     async fn stale_remote_head_cannot_replace_fresh_default_discovery() {
         let (root, work) = scratch_repo("stale-head");
+        let _temp_5 = crate::test_support::TempDir::own(root.clone());
         assert_eq!(
             git(&work, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
             "refs/remotes/origin/main"
@@ -2195,6 +2305,7 @@ mod tests {
     #[tokio::test]
     async fn merged_branch_classifies_safe_and_applies() {
         let (root, work) = scratch_repo("merged");
+        let _temp_6 = crate::test_support::TempDir::own(root.clone());
         git(&work, &["checkout", "-b", "feature-a"]);
         commit_file(&work, "a.txt", "a\n");
         git(&work, &["push", "-u", "origin", "feature-a"]);
@@ -2223,6 +2334,7 @@ mod tests {
     #[tokio::test]
     async fn unmerged_and_ahead_branches_stay_keep() {
         let (root, work) = scratch_repo("keeps");
+        let _temp_7 = crate::test_support::TempDir::own(root.clone());
         git(&work, &["checkout", "-b", "unmerged"]);
         commit_file(&work, "u.txt", "u\n");
         let unmerged = binding(&work, "unmerged");
@@ -2266,6 +2378,7 @@ mod tests {
     #[tokio::test]
     async fn remote_deleted_merged_branch_is_safe_and_remote_delete_roundtrips() {
         let (root, work) = scratch_repo("remote");
+        let _temp_8 = crate::test_support::TempDir::own(root.clone());
         git(&work, &["checkout", "-b", "gone"]);
         commit_file(&work, "g.txt", "g\n");
         git(&work, &["push", "-u", "origin", "gone"]);
@@ -2290,6 +2403,7 @@ mod tests {
     #[tokio::test]
     async fn checked_out_branch_refuses_delete() {
         let (root, work) = scratch_repo("checkedout");
+        let _temp_9 = crate::test_support::TempDir::own(root.clone());
         let current = git(&work, &["rev-parse", "--abbrev-ref", "HEAD"]);
         let tip = git(
             &work,

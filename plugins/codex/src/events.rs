@@ -10,8 +10,9 @@ use eliot_plugin::{
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text as shared_attach_final_text,
-        attach_native_error as shared_attach_native_error, event_id as shared_event_id,
-        native_no_write, next_input_outcomes, rejected_control, unknown_control,
+        attach_native_error as shared_attach_native_error, attach_provider_restriction,
+        event_id as shared_event_id, native_no_write, next_input_outcomes, rejected_control,
+        unknown_control,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -3457,38 +3458,6 @@ fn terminal_provider_restriction(
         .error
         .as_ref()
         .and_then(NativeTurnError::provider_restriction)
-}
-
-fn attach_provider_restriction(
-    data: &mut Value,
-    restriction: ProviderRestriction,
-    policy: &SecretPolicy,
-) -> bool {
-    let Ok(value) = serde_json::to_value(restriction) else {
-        return false;
-    };
-    // The key and actual value define immutable semantics and may not be redacted.
-    if policy.contains_text("provider_restriction")
-        || policy.contains_value(&value)
-        || data
-            .as_object()
-            .is_none_or(|fields| fields.contains_key("provider_restriction"))
-    {
-        return false;
-    }
-    let mut candidate = data.clone();
-    let Some(fields) = candidate.as_object_mut() else {
-        return false;
-    };
-    fields.insert("provider_restriction".to_owned(), value.clone());
-    if serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES) {
-        return false;
-    }
-    if let Some(fields) = data.as_object_mut() {
-        fields.insert("provider_restriction".to_owned(), value);
-        return true;
-    }
-    false
 }
 
 /// Shared bounded terminal-text attachment, projecting the Codex turn

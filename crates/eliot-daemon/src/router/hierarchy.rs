@@ -1220,7 +1220,9 @@ mod tests {
     #[tokio::test]
     async fn allowed_child_profile_launches_with_the_configured_snapshot() {
         let (router, config_root) = router_with_profiles(CHILD_PROFILE_CONFIG);
+        let _temp_18 = crate::test_support::TempDir::own(config_root.clone());
         let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
+        let _temp_3 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
         let manager = launch_manager(&router, &workspace, "manager").await;
         let response = launch_child(&router, &manager, &workspace, Some("worker"))
@@ -1290,14 +1292,14 @@ mod tests {
                 .iter()
                 .any(|scope| scope == &parent_account_scope)
         );
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::remove_dir_all(&config_root);
     }
 
     #[tokio::test]
     async fn unlisted_child_profile_is_rejected_before_native_effects() {
         let (router, config_root) = router_with_profiles(CHILD_PROFILE_CONFIG);
+        let _temp_19 = crate::test_support::TempDir::own(config_root.clone());
         let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
+        let _temp_4 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
         let manager = launch_manager(&router, &workspace, "manager").await;
         // `stranger` is a configured profile but is not in the manager's
@@ -1311,14 +1313,14 @@ mod tests {
         );
         let store = router.inner.store.lock().await;
         assert_eq!(store.agent_count().unwrap(), 1);
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::remove_dir_all(&config_root);
     }
 
     #[tokio::test]
     async fn differing_snapshot_on_an_allowed_profile_is_rejected() {
         let (router, config_root) = router_with_profiles(WIDE_CHILD_CONFIG);
+        let _temp_21 = crate::test_support::TempDir::own(config_root.clone());
         let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
+        let _temp_5 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
         let manager = launch_manager(&router, &workspace, "manager").await;
         // Only model and effort may differ: differing permissions, approval
@@ -1343,8 +1345,6 @@ mod tests {
         }
         let store = router.inner.store.lock().await;
         assert_eq!(store.agent_count().unwrap(), 1);
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::remove_dir_all(&config_root);
     }
 
     #[tokio::test]
@@ -1364,7 +1364,9 @@ mod tests {
              [profiles.stranger]\nharness='claude'\ncmd='{cmd}'\n"
         );
         let (router, config_root) = router_with_profiles(&config);
+        let _temp_22 = crate::test_support::TempDir::own(config_root.clone());
         let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
+        let _temp_6 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
         let manager = launch_manager(&router, &workspace, "manager").await;
         let principal = agent_principal(&manager, 0);
@@ -1482,8 +1484,6 @@ mod tests {
         }
         assert_eq!(router.inner.store.lock().await.agent_count().unwrap(), 3);
         drop(router);
-        std::fs::remove_dir_all(&workspace).unwrap();
-        std::fs::remove_dir_all(&config_root).unwrap();
     }
 
     #[test]
@@ -1527,7 +1527,9 @@ mod tests {
     #[tokio::test]
     async fn same_profile_child_reuse_is_unchanged() {
         let (router, config_root) = router_with_fixture_profile();
+        let _temp_15 = crate::test_support::TempDir::own(config_root.clone());
         let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
+        let _temp_7 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
         let manager = launch_manager(&router, &workspace, "fixture").await;
         {
@@ -1559,14 +1561,14 @@ mod tests {
                 "an Agent child reusing its parent snapshot verbatim is inherited"
             );
         }
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::remove_dir_all(&config_root);
     }
 
     #[tokio::test]
     async fn config_reload_after_launch_does_not_widen_the_allow_list() {
         let (router, config_root) = router_with_profiles(CHILD_PROFILE_CONFIG);
+        let _temp_20 = crate::test_support::TempDir::own(config_root.clone());
         let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
+        let _temp_8 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
         let manager = launch_manager(&router, &workspace, "manager").await;
         // The owner edits the config after the manager launched: the frozen
@@ -1590,8 +1592,6 @@ mod tests {
                 .code,
             "not_allowed"
         );
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::remove_dir_all(&config_root);
     }
 
     #[tokio::test]
@@ -1603,7 +1603,9 @@ mod tests {
             "effort = \"low\"\n",
         );
         let (router, config_root) = router_with_profiles(RELOADABLE_CONFIG);
+        let _temp_23 = crate::test_support::TempDir::own(config_root.clone());
         let workspace = std::env::temp_dir().join(format!("eliot-reload-{}", ulid::Ulid::new()));
+        let _temp_9 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
         // The launch freezes its snapshot from config.toml through the
         // daemon's resolve path: the daemon keeps no cached copy, so every
@@ -1735,6 +1737,7 @@ mod tests {
         .unwrap();
         let reloaded_workspace =
             std::env::temp_dir().join(format!("eliot-reload-after-{}", ulid::Ulid::new()));
+        let _temp_10 = crate::test_support::TempDir::own(reloaded_workspace.clone());
         std::fs::create_dir_all(&reloaded_workspace).unwrap();
         let reloaded = launch_manager(&router, &reloaded_workspace, "reloadable").await;
         {
@@ -1814,16 +1817,14 @@ mod tests {
         assert_eq!(read_turn_view.revision, 1);
         assert_eq!(read_turn_view.model.as_deref(), Some("m1"));
         assert_eq!(read_turn_view.profile, "reloadable");
-
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::remove_dir_all(&reloaded_workspace);
-        let _ = std::fs::remove_dir_all(&config_root);
     }
 
     #[tokio::test]
     async fn agent_launch_through_the_router_inherits_its_project() {
         let (router, config_root) = router_with_fixture_profile();
+        let _temp_16 = crate::test_support::TempDir::own(config_root.clone());
         let workspace = std::env::temp_dir().join(format!("eliot-hierarchy-{}", ulid::Ulid::new()));
+        let _temp_11 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
         // The owner launches the parent through the same frozen profile the
         // Agent child must reuse.
@@ -1864,15 +1865,16 @@ mod tests {
         );
         assert_eq!(row.root, manager);
         assert_eq!(row.depth, 1);
-        let _ = std::fs::remove_dir_all(&workspace);
-        let _ = std::fs::remove_dir_all(&config_root);
     }
 
     #[tokio::test]
     async fn agent_launch_outside_the_parent_workspace_is_not_allowed() {
         let (router, config_root) = router_with_fixture_profile();
+        let _temp_17 = crate::test_support::TempDir::own(config_root.clone());
         let home = std::env::temp_dir().join(format!("eliot-hierarchy-home-{}", ulid::Ulid::new()));
+        let _temp_12 = crate::test_support::TempDir::own(home.clone());
         let away = std::env::temp_dir().join(format!("eliot-hierarchy-away-{}", ulid::Ulid::new()));
+        let _temp_13 = crate::test_support::TempDir::own(away.clone());
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&away).unwrap();
         let launch_as = |workspace: &std::path::PathBuf| {
@@ -1900,9 +1902,6 @@ mod tests {
         );
         let store = router.inner.store.lock().await;
         assert_eq!(store.agent_count().unwrap(), 1);
-        let _ = std::fs::remove_dir_all(&home);
-        let _ = std::fs::remove_dir_all(&away);
-        let _ = std::fs::remove_dir_all(&config_root);
     }
 
     #[tokio::test]

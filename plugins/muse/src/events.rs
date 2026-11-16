@@ -11,8 +11,8 @@ use eliot_plugin::{
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error,
-        event_id as shared_event_id, native_no_write, next_input_outcomes, rejected_control,
-        request_event_id, unknown_control,
+        attach_provider_restriction, event_id as shared_event_id, native_no_write,
+        next_input_outcomes, rejected_control, request_event_id, unknown_control,
     },
 };
 use serde::Serialize;
@@ -2489,6 +2489,36 @@ impl EventProcessor {
                     ));
                 }
                 self.complete_turn(params, false).await?;
+            }
+            "usage/changed" => {
+                let usage: crate::native::types::NativeSubscriptionUsage =
+                    serde_json::from_value(params).map_err(|_| {
+                        Error::new("native_protocol", "Muse usage/changed schema unavailable")
+                    })?;
+                let observation = eliot_core::api::harness::QuotaObservation {
+                    observed_at_ms: usage.observed_at_ms,
+                    windows: vec![
+                        eliot_core::api::harness::QuotaWindow {
+                            label: "5-hour".to_owned(),
+                            used_percent: usage.window.used_percent as f64,
+                            resets_at_ms: Some(usage.window.resets_at_ms),
+                            window_duration_mins: Some(usage.window.window_duration_mins),
+                        },
+                        eliot_core::api::harness::QuotaWindow {
+                            label: "Weekly".to_owned(),
+                            used_percent: usage.weekly.used_percent as f64,
+                            resets_at_ms: Some(usage.weekly.resets_at_ms),
+                            window_duration_mins: Some(10080),
+                        },
+                    ],
+                };
+                observation.validate()?;
+                self.commit_event(
+                    "quota.observed",
+                    ulid::Ulid::new().to_string(),
+                    json!({"observation":observation}),
+                )
+                .await?;
             }
             "session/tokenUsage" => {
                 self.observe_session_token_usage(params).await?;
@@ -5242,38 +5272,6 @@ fn terminal_provider_restriction(
         .error
         .as_ref()
         .and_then(NativeTurnError::provider_restriction)
-}
-
-fn attach_provider_restriction(
-    data: &mut Value,
-    restriction: ProviderRestriction,
-    policy: &SecretPolicy,
-) -> bool {
-    let Ok(value) = serde_json::to_value(restriction) else {
-        return false;
-    };
-    // The key and actual value define immutable semantics and may not be redacted.
-    if policy.contains_text("provider_restriction")
-        || policy.contains_value(&value)
-        || data
-            .as_object()
-            .is_none_or(|fields| fields.contains_key("provider_restriction"))
-    {
-        return false;
-    }
-    let mut candidate = data.clone();
-    let Some(fields) = candidate.as_object_mut() else {
-        return false;
-    };
-    fields.insert("provider_restriction".to_owned(), value.clone());
-    if serde_json::to_vec(&candidate).map_or(true, |encoded| encoded.len() > MAX_EVENT_BYTES) {
-        return false;
-    }
-    if let Some(fields) = data.as_object_mut() {
-        fields.insert("provider_restriction".to_owned(), value);
-        return true;
-    }
-    false
 }
 
 #[cfg(test)]

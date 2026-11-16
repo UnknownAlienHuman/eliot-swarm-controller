@@ -802,6 +802,7 @@ mod tests {
     #[test]
     fn transcript_scan_finds_the_exact_session_file() {
         let root = std::env::temp_dir().join(format!("eliot-claude-tx-{}", ulid::Ulid::new()));
+        let _tx = crate::test_temp::TempDir::own(root.clone());
         let project = root.join("projects").join("some-slug");
         std::fs::create_dir_all(&project).expect("fixture projects");
         std::fs::write(project.join("other.jsonl"), b"{}").expect("fixture other");
@@ -816,7 +817,6 @@ mod tests {
         assert_eq!(transcript_bytes_in(&roots, "../escape"), None);
         assert_eq!(transcript_bytes_in(&roots, ""), None);
         assert_eq!(transcript_bytes_in(&[], "sess-1"), None);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -404,7 +404,7 @@ impl HarnessQuotaRequest {
     }
 }
 
-/// Quota readback status: `supported` (provider read-only values present),
+/// Quota readback status: `supported` (known source; details state is ready or error),
 /// `unsupported` (the installed harness exposes no read-only quota surface)
 /// or `unknown` (support could not be determined without an inference probe
 /// or per-Agent read, so none was attempted).
@@ -417,7 +417,7 @@ pub const HARNESS_QUOTA_UNKNOWN: &str = "unknown";
 /// Response for `harness.quota`: provider-supported account quota readback.
 /// Carries only read-only provider signals with timestamp, scope and status;
 /// it starts no model turn, performs no inference and never polls per Agent.
-/// A `supported` response carries provider-verbatim quota signals in
+/// A `supported` response carries projected provider quota signals or a sanitized error in
 /// `details` (Codex rate-limit windows with used percent, reset time,
 /// credits and plan; Muse subscription usage windows with used percent,
 /// reset time and tier); never secrets or personal data.
@@ -737,6 +737,42 @@ pub fn catalog_matches(entry: &ModelsCatalogEntry, query: &str) -> bool {
     ]
     .iter()
     .any(|field| field.to_ascii_lowercase().contains(&query))
+}
+
+/// Provider quota observed in a native stream, never inferred from token expenditure.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QuotaObservation {
+    pub observed_at_ms: i64,
+    pub windows: Vec<QuotaWindow>,
+}
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct QuotaWindow {
+    pub label: String,
+    pub used_percent: f64,
+    pub resets_at_ms: Option<i64>,
+    pub window_duration_mins: Option<i64>,
+}
+impl QuotaObservation {
+    pub fn validate(&self) -> Result<()> {
+        if self.observed_at_ms < 0
+            || self.windows.is_empty()
+            || self.windows.len() > 32
+            || self.windows.iter().any(|w| {
+                w.label.is_empty()
+                    || w.label.len() > 128
+                    || w.label.chars().any(char::is_control)
+                    || !w.used_percent.is_finite()
+                    || !(0.0..=100.0).contains(&w.used_percent)
+                    || w.resets_at_ms.is_some_and(|at| at < 0)
+                    || w.window_duration_mins.is_some_and(|m| m <= 0)
+            })
+        {
+            return Err(Error::new("invalid", "quota observation is invalid"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

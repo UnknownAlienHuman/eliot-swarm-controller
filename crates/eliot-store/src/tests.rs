@@ -7312,7 +7312,11 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP INDEX writes_principal_method; DELETE FROM schema_migrations WHERE version = 47;
+            "DROP INDEX agents_list_archived;
+                 ALTER TABLE agents DROP COLUMN archived;
+                 ALTER TABLE agents DROP COLUMN chat;
+                 DELETE FROM schema_migrations WHERE version=48;
+                 DROP INDEX writes_principal_method; DELETE FROM schema_migrations WHERE version = 47;
              DROP TABLE artifacts; DROP TABLE cleanup_plans;
              DROP INDEX commands_turn_unknown;
              DROP TRIGGER assignment_commands_insert;

@@ -2083,6 +2083,7 @@ mod timer_tests {
 
         let root =
             std::env::temp_dir().join(format!("eliot-empty-project-timer-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         let store = Arc::new(tokio::sync::Mutex::new(
             eliot_store::Store::open(Path::new(":memory:")).unwrap(),
@@ -2135,7 +2136,6 @@ mod timer_tests {
             .await
             .unwrap()
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn timer() -> ActiveTimer {
@@ -2185,6 +2185,7 @@ mod timer_tests {
 
         let root =
             std::env::temp_dir().join(format!("eliot-rule-backlog-config-{}", ulid::Ulid::new()));
+        let _temp_2 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("config.toml"),
@@ -2318,7 +2319,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(global.current_cursor, high_water);
         assert_eq!(project.current_cursor, high_water);
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2327,6 +2327,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "eliot-rule-reload-store-validation-{}",
             ulid::Ulid::new()
         ));
+        let _temp_3 = crate::test_support::TempDir::own(root.clone());
         let rules_dir = root.join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
         let rule_path = rules_dir.join("reload.toml");
@@ -2474,8 +2475,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         .expect("repeat attempt remains a valid deferred edit");
         assert!(deferred_again);
         assert!(!claim_deferred_reload(&valid_snapshot.inputs, &mut notices).unwrap());
-
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2533,6 +2532,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
 
         let root =
             std::env::temp_dir().join(format!("eliot-project-run-catch-up-{}", ulid::Ulid::new()));
+        let _temp_4 = crate::test_support::TempDir::own(root.clone());
         let checkout = root.join("checkout");
         let data_root = root.join("owner-data");
         let scripts = checkout.join(".eliot").join("scripts");
@@ -2886,8 +2886,6 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
                 "revoked project Run approval fails request-wide before admission"
             );
         }
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2895,6 +2893,7 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
         use std::{io::Cursor, path::Path, sync::Arc};
 
         let root = std::env::temp_dir().join(format!("eliot-rule-launch-{}", ulid::Ulid::new()));
+        let _temp_5 = crate::test_support::TempDir::own(root.clone());
         let data_root = root.join("owner-data");
         std::fs::create_dir_all(&data_root).unwrap();
         std::fs::write(
@@ -3091,7 +3090,5 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
             Some(launch_agent.as_str())
         );
         assert_eq!(replayed_linked.generation, Some(1));
-
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

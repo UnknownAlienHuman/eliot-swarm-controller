@@ -1767,6 +1767,7 @@ mod tests {
                 .map(|elapsed| elapsed.as_nanos())
                 .unwrap_or(0)
         ));
+        let _temp_1 = crate::test_support::TempDir::own(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".muse-version"), "9.9.9-R1\n").unwrap();
         let native = dir.join("muse-bin-9.9.9-R1.exe");
@@ -1775,7 +1776,6 @@ mod tests {
         std::fs::write(dir.join("muse.cmd"), b"@echo off").unwrap();
         let resolved = discover_muse_cmd(&dir).unwrap();
         assert_eq!(resolved, native.to_string_lossy());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1787,6 +1787,7 @@ mod tests {
                 .map(|e| e.as_nanos())
                 .unwrap_or(0)
         ));
+        let _temp_2 = crate::test_support::TempDir::own(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         let old = dir.join("muse-bin-1.4.0-R4161.1.exe");
         let new = dir.join("muse-bin-1.4.20-R8619.1.exe");
@@ -1796,7 +1797,6 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0], new.to_string_lossy());
         assert_eq!(candidates[1], old.to_string_lossy());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -1941,10 +1941,10 @@ mod tests {
                 .map(|elapsed| elapsed.as_nanos())
                 .unwrap_or(0)
         ));
+        let _temp_3 = crate::test_support::TempDir::own(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         let error = discover_muse_cmd(&dir).unwrap_err();
         assert_eq!(error.code, "profile_error");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2216,6 +2216,7 @@ mod tests {
                 .map(|elapsed| elapsed.as_nanos())
                 .unwrap_or(0)
         ));
+        let _temp_4 = crate::test_support::TempDir::own(dir.clone());
         let first = dir
             .join("Claude")
             .join("claude-code")
@@ -2233,6 +2234,5 @@ mod tests {
             exes,
             vec![first.join("claude.exe"), second.join("claude.exe"),]
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -5,7 +5,10 @@ mod hooks;
 mod host;
 mod native;
 mod profile;
+mod quota;
 mod session;
+#[cfg(test)]
+pub(crate) mod test_temp;
 
 pub async fn run() -> eliot_core::Result<()> {
     host::run().await

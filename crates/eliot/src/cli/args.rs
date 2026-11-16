@@ -137,6 +137,12 @@ pub(crate) enum CliCommand {
     Detach(DetachArgs),
     /// Stop an Agent.
     Stop(StopArgs),
+    /// Hide an idle or stopped Agent tree.
+    Archive(ShowArgs),
+    /// Restore an archived Agent tree.
+    Unarchive(ShowArgs),
+    /// Delete stopped Agent tree records, preserving files.
+    Delete(ShowArgs),
     /// Switch a live Agent's model and/or effort for its next turn.
     Configure(ConfigureArgs),
     /// Manage an Agent's retained worktree.
@@ -389,7 +395,9 @@ pub(crate) struct LaunchArgs {
     #[arg(long, value_name = "PATH")]
     pub(crate) cmd: Option<String>,
     #[arg(long, value_name = "PATH")]
-    pub(crate) workspace: PathBuf,
+    pub(crate) workspace: Option<PathBuf>,
+    #[arg(long, conflicts_with_all=["workspace","worktree","parent"])]
+    pub(crate) chat: bool,
     #[arg(long, value_name = "BRANCH")]
     pub(crate) worktree: Option<String>,
     #[arg(long, value_name = "REF", requires = "worktree")]
@@ -517,6 +525,8 @@ pub(crate) struct AnswerArgs {
 
 #[derive(Args)]
 pub(crate) struct ListFilterArgs {
+    #[arg(long, default_value="exclude", value_parser=["exclude","only","include"])]
+    pub(crate) archived: String,
     /// Exact Agent state: unknown, created, starting, idle, busy, waiting,
     /// stopped, failed or lost.
     #[arg(long, value_name = "STATE")]

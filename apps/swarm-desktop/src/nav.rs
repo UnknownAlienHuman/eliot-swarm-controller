@@ -1302,6 +1302,9 @@ mod tests {
 
     fn summary(preview: Option<&str>, name: Option<&str>, profile: Option<&str>) -> AgentSummary {
         AgentSummary {
+            archived: false,
+            chat: false,
+
             id: "a7".to_owned(),
             generation: 1,
             project: "/p".to_owned(),

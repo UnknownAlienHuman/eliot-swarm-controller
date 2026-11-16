@@ -72,6 +72,51 @@ pub(crate) struct ProjectRegistrationConfig {
     pub run_env: Vec<String>,
 }
 
+pub(crate) fn default_chats_root() -> core::Result<std::path::PathBuf> {
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| {
+            core::Error::new("profile_error", "user home is unavailable for chats_root")
+        })?;
+    Ok(std::path::PathBuf::from(home).join("Eliot").join("chats"))
+}
+
+pub(crate) fn validate_chats_location(
+    data_root: &Path,
+    chats_root: Option<&str>,
+) -> core::Result<std::path::PathBuf> {
+    let root = chats_root
+        .map(std::path::PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(default_chats_root)?;
+    let resolve = |path: &Path| {
+        std::fs::canonicalize(path)
+            .or_else(|_| std::path::absolute(path))
+            .map_err(|_| core::Error::new("profile_error", "root path unavailable"))
+    };
+    let root = resolve(&root)?;
+    let data = resolve(data_root)?;
+    let normalized = |path: &Path| {
+        let text = path.to_string_lossy().replace('\\', "/");
+        let text = text.strip_prefix("//?/").unwrap_or(&text);
+        std::path::PathBuf::from(if cfg!(windows) {
+            text.to_lowercase()
+        } else {
+            text.to_owned()
+        })
+    };
+    let normalized_root = normalized(&root);
+    let normalized_data = normalized(&data);
+    if normalized_root.starts_with(&normalized_data)
+        || normalized_data.starts_with(&normalized_root)
+    {
+        return Err(core::Error::new(
+            "profile_error",
+            "chats_root must be outside the daemon data directory",
+        ));
+    }
+    Ok(root)
+}
+
 #[cfg(test)]
 pub(crate) fn capture_native_store_inputs_with_lookups(
     profile: &mut Value,
@@ -691,6 +736,8 @@ fn default_max_unread_messages_per_agent() -> i64 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct DaemonConfig {
     #[serde(default)]
+    pub(crate) chats_root: Option<String>,
+    #[serde(default)]
     pub(crate) artifact_roots: Vec<String>,
     #[serde(default)]
     pub(crate) retention: RetentionConfig,
@@ -736,6 +783,7 @@ fn default_log_level() -> String {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            chats_root: None,
             artifact_roots: Vec::new(),
             retention: RetentionConfig::default(),
             log_level: default_log_level(),
@@ -776,6 +824,16 @@ fn default_session_file_bytes() -> i64 {
 
 impl DaemonConfig {
     fn validate(self) -> core::Result<Self> {
+        if self.chats_root.as_ref().is_some_and(|p| {
+            p.len() > 4096
+                || !std::path::Path::new(p).is_absolute()
+                || p.chars().any(char::is_control)
+        }) {
+            return Err(core::Error::new(
+                "profile_error",
+                "daemon.chats_root must be an absolute local root",
+            ));
+        }
         if self.artifact_roots.len() > 32
             || self
                 .artifact_roots
@@ -831,6 +889,7 @@ impl DaemonConfig {
             ));
         }
         Ok(Self {
+            chats_root: self.chats_root,
             artifact_roots: self.artifact_roots,
             retention: self.retention.validate()?,
             limits: self.limits,
@@ -3868,6 +3927,7 @@ mod tests {
         assert_eq!(
             load_daemon_config(&fixture.root).unwrap(),
             DaemonConfig {
+                chats_root: None,
                 artifact_roots: Vec::new(),
                 retention: RetentionConfig {
                     events_days: Some(7),
@@ -3889,6 +3949,7 @@ mod tests {
         assert_eq!(
             load_daemon_config(&fixture.root).unwrap(),
             DaemonConfig {
+                chats_root: None,
                 artifact_roots: Vec::new(),
                 retention: RetentionConfig {
                     events_days: Some(7),

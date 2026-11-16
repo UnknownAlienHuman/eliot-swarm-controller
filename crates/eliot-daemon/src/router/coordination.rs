@@ -708,6 +708,7 @@ mod tests {
     #[tokio::test]
     async fn router_mail_send_honors_configured_mail_limits() {
         let root = std::env::temp_dir().join(format!("eliot-mail-limits-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         let router = router_with_config(&root, "[mail]\nmax_unread_messages_per_agent = 1\n");
         let a = ready_agent(&router, "app").await;
         let first = json!({
@@ -731,7 +732,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "mailbox_full");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

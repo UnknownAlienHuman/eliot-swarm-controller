@@ -119,12 +119,25 @@ impl Router {
             return;
         }
         let mut receiver = self.inner.bus.subscribe();
+        let prepare_started = std::time::Instant::now();
         let Some(prepared) = self
             .prepare_command_dispatch(&id, linked_id.is_some())
             .await
         else {
             return;
         };
+        crate::logging::record_debug(
+            &self.secret_policy_snapshot(),
+            "command.prepared",
+            &[("command_id", &id), ("verb", &prepared.command.verb)],
+            &[(
+                "elapsed_ms",
+                prepare_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            )],
+        );
         let Some((dispatched, dispatch_seq, context_items)) = self
             .dispatch_and_wait_for_effect(
                 &id,
@@ -426,6 +439,13 @@ impl Router {
     /// Prepare the managed workspace for a start verb before dispatch.
     /// Returns false after settling a preparation failure.
     async fn prepare_start_workspace(&self, id: &str, command: &Command) -> bool {
+        if command.verb == "launch" && command.args.get("chat") == Some(&Value::Bool(true)) {
+            let prepared = self.prepare_chat_directory(command).await;
+            if let Err(error) = prepared {
+                self.reject_undispatched_error(id, &error).await;
+                return false;
+            }
+        }
         if matches!(command.verb.as_str(), "launch" | "resume")
             && let Err(error) = self.inner.workspaces.prepare(id).await
         {

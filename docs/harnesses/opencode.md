@@ -376,3 +376,15 @@ widening. The level freezes as `access` in the snapshot. Implementation:
 [`crates/eliot-daemon/src/adhoc.rs`](../../crates/eliot-daemon/src/adhoc.rs)
 (`apply_adhoc_access`).
 
+
+## Read-only provider quota
+
+`plugins/opencode/src/quota.rs` follows OpenCodex 2.84.0's Go usage pattern,
+without copied code. The native `auth export opencode-go --standalone` read is
+bounded and captured only in memory; exactly one active exported credential is
+required. Its key authenticates `GET https://opencode.ai/zen/go/v1/usage`.
+Rolling, weekly and monthly percentages/reset times are projected. Selected
+non-Go integrations report `unsupported`: Zen rate-limit replies require inference
+and are never used as a read-only quota source. No native auth import, login,
+switch or global-config edit occurs. Failures retain supported error states and
+provider/environment origin; secret-bearing native stderr is discarded.

@@ -6368,6 +6368,7 @@ mod tests {
     async fn snapshot_turn_without_an_owned_plugin_fails_fast() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-snapshot-no-runtime-{}", Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(data_root.clone());
         let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
         let submitted = submit_launch(&mut store, "snapshot-absent", "synthetic-workspace");
         let agent_id = submitted.target.clone().unwrap();
@@ -6381,16 +6382,16 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "not_found");
-
-        let _ = std::fs::remove_dir_all(&data_root);
     }
 
     #[tokio::test]
     async fn start_validates_the_generation_credential_before_creating_an_instance_dir() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-plugin-cleanup-precreate-{}", Ulid::new()));
+        let _temp_2 = crate::test_support::TempDir::own(data_root.clone());
         let workspace =
             std::env::temp_dir().join(format!("eliot-plugin-cleanup-workspace-{}", Ulid::new()));
+        let _temp_3 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
         let workspace = workspace.to_string_lossy().into_owned();
         let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
@@ -6412,17 +6413,16 @@ mod tests {
             plugin_dir_entries(&data_root).is_empty(),
             "no instance directory may exist before the credential check"
         );
-
-        let _ = std::fs::remove_dir_all(&data_root);
-        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[tokio::test]
     async fn start_removes_only_the_exact_empty_instance_dir_on_a_pre_spawn_error() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-plugin-cleanup-prespawn-{}", Ulid::new()));
+        let _temp_4 = crate::test_support::TempDir::own(data_root.clone());
         let workspace =
             std::env::temp_dir().join(format!("eliot-plugin-cleanup-workspace-{}", Ulid::new()));
+        let _temp_5 = crate::test_support::TempDir::own(workspace.clone());
         std::fs::create_dir_all(&workspace).unwrap();
         let workspace = workspace.to_string_lossy().into_owned();
         // Admit a different workspace than the one start() observes, so
@@ -6459,9 +6459,6 @@ mod tests {
             plugin_dir_entries(&data_root).is_empty(),
             "a pre-spawn error must remove the exact generated empty directory"
         );
-
-        let _ = std::fs::remove_dir_all(&data_root);
-        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]
@@ -6564,6 +6561,7 @@ mod tests {
     async fn create_instance_dir_reports_a_blocked_parent() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-plugin-cleanup-blocked-{}", Ulid::new()));
+        let _temp_6 = crate::test_support::TempDir::own(data_root.clone());
         std::fs::create_dir_all(&data_root).unwrap();
         std::fs::write(data_root.join("plugins"), b"not a directory").unwrap();
         let store = Arc::new(AsyncMutex::new(
@@ -6578,14 +6576,13 @@ mod tests {
         let error = host.create_instance_dir(&key).unwrap_err();
         assert_eq!(error.code, "platform_io");
         assert!(data_root.join("plugins").is_file());
-
-        let _ = std::fs::remove_dir_all(&data_root);
     }
 
     #[test]
     fn create_instance_dir_removes_the_partial_directory_when_restriction_fails() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-plugin-cleanup-restrict-{}", Ulid::new()));
+        let _temp_7 = crate::test_support::TempDir::own(data_root.clone());
         let store = Arc::new(AsyncMutex::new(
             eliot_store::Store::open(Path::new(":memory:")).unwrap(),
         ));
@@ -6619,14 +6616,13 @@ mod tests {
             plugin_dir_entries(&data_root).is_empty(),
             "a failed restrict must leave plugins/ empty"
         );
-
-        let _ = std::fs::remove_dir_all(&data_root);
     }
 
     #[test]
     fn empty_instance_dir_removal_never_touches_nonempty_or_missing_paths() {
         let root =
             std::env::temp_dir().join(format!("eliot-plugin-cleanup-removal-{}", Ulid::new()));
+        let _temp_8 = crate::test_support::TempDir::own(root.clone());
         let empty = root.join("empty");
         let nonempty = root.join("nonempty");
         std::fs::create_dir_all(&empty).unwrap();
@@ -6638,7 +6634,5 @@ mod tests {
         remove_empty_instance_dir(&nonempty);
         assert!(nonempty.join("plugin-data").is_file());
         remove_empty_instance_dir(&root.join("missing"));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

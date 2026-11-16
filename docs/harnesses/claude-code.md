@@ -397,3 +397,14 @@ Implementation:
 [`crates/eliot-daemon/src/adhoc.rs`](../../crates/eliot-daemon/src/adhoc.rs)
 (`apply_adhoc_access`).
 
+
+## Read-only provider quota
+
+`harness.quota` is implemented in `plugins/claude/src/quota.rs`, following
+OpenCodex 2.84.0's OAuth usage reader as a pattern only. It reads the CLI's own
+`CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`) without writes, selects
+`claudeAiOauth.accessToken`, and calls Anthropic `/api/oauth/usage` with
+`anthropic-beta: oauth-2025-04-20`. It projects `five_hour`, `seven_day`, recognized
+model weekly buckets and `limits[kind=weekly_scoped]`, never account identity.
+Missing credentials, expiry and provider failures remain supported error states
+with explicit origin. No refresh, model turn or inference probe is attempted.

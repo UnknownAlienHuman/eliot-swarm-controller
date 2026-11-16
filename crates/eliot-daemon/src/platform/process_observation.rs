@@ -11,6 +11,26 @@ use super::windows::ProcessObserver as PlatformObserver;
 /// Bounds observations, not the number of processes an owner may launch.
 pub(crate) const MAX_PROCESS_SAMPLES: usize = 1024;
 
+/// Cap on one argv read: only the program plus its first tokens ever matter
+/// downstream, and the full body never persists.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const MAX_CMDLINE_BYTES: usize = 64 * 1024;
+
+/// Read at most [`MAX_CMDLINE_BYTES`] plus one probe byte, so an oversized
+/// body is rejected without a full read. Fails closed to `None` on missing
+/// input, read errors and oversized bodies.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn read_bounded_cmdline<R: std::io::Read>(reader: R) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let mut limited = reader.take(MAX_CMDLINE_BYTES as u64 + 1);
+    let mut body = Vec::new();
+    limited.read_to_end(&mut body).ok()?;
+    if body.len() > MAX_CMDLINE_BYTES {
+        return None;
+    }
+    Some(body)
+}
+
 /// Parsed `/proc/<pid>/stat` identity and counters for one host process.
 /// Pure data, so sweep grouping stays unit-testable on every platform; only
 /// the `/proc` reader itself is Linux-only.
@@ -373,5 +393,66 @@ mod sweep_tests {
         let (members, complete) = select_sweep_members(&entries, 99, 10, 0);
         assert!(members.is_empty());
         assert!(complete, "no match means no truncation");
+    }
+}
+
+#[cfg(test)]
+mod bounded_cmdline_tests {
+    use super::{MAX_CMDLINE_BYTES, read_bounded_cmdline};
+    use std::io::Read;
+
+    /// Counts every byte pulled from the source, proving the bound applies to
+    /// the read itself rather than after allocation.
+    struct CountingReader {
+        remaining: usize,
+        consumed: usize,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Ok(0);
+            }
+            let count = buf.len().min(self.remaining);
+            buf[..count].fill(b'x');
+            self.remaining -= count;
+            self.consumed += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn oversized_cmdline_is_refused_without_a_full_read() {
+        let mut reader = CountingReader {
+            remaining: 4 * 1024 * 1024,
+            consumed: 0,
+        };
+        assert!(
+            read_bounded_cmdline(&mut reader).is_none(),
+            "an oversized body is rejected"
+        );
+        assert_eq!(
+            reader.consumed,
+            MAX_CMDLINE_BYTES + 1,
+            "at most the bound plus one probe byte is ever read"
+        );
+    }
+
+    #[test]
+    fn cmdline_at_the_bound_is_accepted() {
+        let mut reader = CountingReader {
+            remaining: MAX_CMDLINE_BYTES,
+            consumed: 0,
+        };
+        let body = read_bounded_cmdline(&mut reader).expect("the bound itself fits");
+        assert_eq!(body.len(), MAX_CMDLINE_BYTES);
+        let mut reader = CountingReader {
+            remaining: MAX_CMDLINE_BYTES + 1,
+            consumed: 0,
+        };
+        assert!(
+            read_bounded_cmdline(&mut reader).is_none(),
+            "one byte over the bound is rejected"
+        );
     }
 }

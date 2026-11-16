@@ -803,6 +803,8 @@ pub(crate) fn list_params(
         })
         .transpose()?;
     Ok(AgentListRequest {
+        archived: serde_json::from_value(Value::String(filter.archived))
+            .map_err(|_| Failure::new(2, "invalid archived filter"))?,
         after,
         limit,
         observations,
@@ -1278,6 +1280,8 @@ mod tests {
     #[test]
     fn list_params_rejects_unknown_state_before_any_call() {
         let filter = |state: Option<&str>| ListFilterArgs {
+            archived: "exclude".to_owned(),
+
             state: state.map(str::to_owned),
             project: None,
             harness: None,
@@ -1292,6 +1296,9 @@ mod tests {
 
     fn fleet_summary(usage: Option<TurnUsage>, usage_scope: Option<&str>) -> AgentSummary {
         AgentSummary {
+            archived: false,
+            chat: false,
+
             id: "a1".to_owned(),
             generation: 0,
             project: "p".to_owned(),

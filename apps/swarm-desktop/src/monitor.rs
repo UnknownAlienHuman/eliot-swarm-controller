@@ -888,6 +888,9 @@ mod tests {
         use eliot_core::api::{AgentListResponse, AgentSummary};
         let row = |state: AgentState| AgentListRow {
             summary: AgentSummary {
+                archived: false,
+                chat: false,
+
                 id: "a7".to_owned(),
                 generation: 1,
                 project: "p".to_owned(),
@@ -937,6 +940,9 @@ mod tests {
         use eliot_core::TurnUsage;
         use eliot_core::api::AgentSummary;
         let summary = |usage: Option<TurnUsage>, usage_scope: Option<&str>| AgentSummary {
+            archived: false,
+            chat: false,
+
             id: "a7".to_owned(),
             generation: 1,
             project: "p".to_owned(),

@@ -711,6 +711,7 @@ mod tests {
         // generation stays live (stop and restart always terminalize it).
         let db_dir =
             std::env::temp_dir().join(format!("eliot-resolve-replay-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(db_dir.clone());
         std::fs::create_dir_all(&db_dir).unwrap();
         let store = eliot_store::Store::open(&db_dir.join("resolve-replay.sqlite")).unwrap();
         let router = Router::new(
@@ -831,7 +832,6 @@ mod tests {
         assert!(events.try_recv().is_err());
         assert_eq!(router.inner.plugin_host.snapshot_turn_calls(), 1);
         drop(router);
-        let _ = std::fs::remove_dir_all(&db_dir);
     }
 
     #[tokio::test]
