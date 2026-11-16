@@ -75,11 +75,16 @@ struct Initialized {
     instance_dir: String,
 }
 
+enum SettledStartFailure {
+    Uncertain(Error),
+    ProvenNoEffect(Value),
+}
+
 struct FailedStart {
     agent_id: String,
     generation: i64,
     command_id: String,
-    error: Error,
+    outcome: SettledStartFailure,
 }
 
 struct FailedObserverAttach {
@@ -804,7 +809,10 @@ impl CodexPlugin {
                 && failed.generation == params.generation
                 && failed.command_id == params.command_id
             {
-                return Err(failed.error.clone());
+                return match &failed.outcome {
+                    SettledStartFailure::Uncertain(error) => Err(error.clone()),
+                    SettledStartFailure::ProvenNoEffect(value) => Ok(value.clone()),
+                };
             }
             return Err(Error::new(
                 "bad_state",
@@ -1161,7 +1169,7 @@ impl CodexPlugin {
                 agent_id: params.agent_id,
                 generation: params.generation,
                 command_id: params.command_id,
-                error: error.clone(),
+                outcome: SettledStartFailure::Uncertain(error.clone()),
             });
             return Err(error);
         }
@@ -1183,12 +1191,12 @@ impl CodexPlugin {
             Ok((model, effort, scope)) => (model, effort, scope),
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
-                return Err(self.settle_pre_dispatch_outcome(
+                return self.settle_pre_dispatch_outcome(
                     session,
                     &params,
                     error,
                     "owned app-server cleanup is unconfirmed; no thread or input was sent",
-                ));
+                );
             }
         };
         session.selected_model = selected_model.clone();
@@ -1205,12 +1213,12 @@ impl CodexPlugin {
                     ),
                 )
                 .await;
-                return Err(self.settle_pre_dispatch_outcome(
+                return self.settle_pre_dispatch_outcome(
                     session,
                     &params,
                     error,
                     "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
-                ));
+                );
             }
             session.thread_id = Some(subject.native_ref.clone());
             if let Err(error) = verify_resume_preflight(
@@ -1227,12 +1235,12 @@ impl CodexPlugin {
                 // Only prerequisite reads ran; native thread effects were not dispatched.
                 let error = pre_dispatch_read_error(error, "native_readback", &message);
                 let error = discard_failed_start(&mut session, error).await;
-                return Err(self.settle_pre_dispatch_outcome(
+                return self.settle_pre_dispatch_outcome(
                     session,
                     &params,
                     error,
                     "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
-                ));
+                );
             }
         }
 
@@ -1310,7 +1318,7 @@ impl CodexPlugin {
                     agent_id: params.agent_id,
                     generation: params.generation,
                     command_id: params.command_id,
-                    error: error.clone(),
+                    outcome: SettledStartFailure::Uncertain(error.clone()),
                 });
                 return Err(error);
             }
@@ -1323,7 +1331,7 @@ impl CodexPlugin {
                     agent_id: params.agent_id,
                     generation: params.generation,
                     command_id: params.command_id,
-                    error: error.clone(),
+                    outcome: SettledStartFailure::Uncertain(error.clone()),
                 });
                 return Err(error);
             }
@@ -1392,7 +1400,7 @@ impl CodexPlugin {
                 agent_id: params.agent_id.clone(),
                 generation: params.generation,
                 command_id: params.command_id.clone(),
-                error: error.clone(),
+                outcome: SettledStartFailure::Uncertain(error.clone()),
             });
             return Err(error);
         }
@@ -1423,7 +1431,7 @@ impl CodexPlugin {
                         agent_id: params.agent_id.clone(),
                         generation: params.generation,
                         command_id: params.command_id.clone(),
-                        error: error.clone(),
+                        outcome: SettledStartFailure::Uncertain(error.clone()),
                     });
                     return Err(error);
                 }
@@ -1549,37 +1557,42 @@ impl CodexPlugin {
     /// cleanup caches the deterministic error for exact replay (residual
     /// unknown from a missed read path becomes deterministic profile_error).
     /// No thread/resume/input was dispatched. Returns the error for `start`.
+    /// Settle a pre-effect start failure after `discard_failed_start`.
+    /// `session` is the owned post-discard session (phase Stopped or Unknown).
+    /// Unconfirmed cleanup retains the controller with unknown; confirmed
+    /// cleanup returns the authoritative failed-start value for exact replay
+    /// (residual unknown from a missed read path becomes deterministic
+    /// native_model_unavailable). No thread/resume/input was dispatched.
     fn settle_pre_dispatch_outcome(
         &mut self,
         session: AgentSession,
         params: &AgentStartParams,
         error: Error,
         unconfirmed_context: &str,
-    ) -> Error {
+    ) -> Result<Value> {
         if session.phase == SessionPhase::Unknown {
             let error = unconfirmed_pre_dispatch_error(error, unconfirmed_context);
             self.session = Some(session);
-            error
-        } else {
-            // Residual unknown from any missed read path becomes deterministic
-            // after confirmed cleanup; callers classify their known reads beforehand.
-            let error = if error.code == "unknown" {
-                let message = format!(
-                    "Codex pre-dispatch metadata read failed before thread dispatch: {}",
-                    error.message
-                );
-                pre_dispatch_read_error(error, "profile_error", &message)
-            } else {
-                error
-            };
-            self.failed_start = Some(FailedStart {
-                agent_id: params.agent_id.clone(),
-                generation: params.generation,
-                command_id: params.command_id.clone(),
-                error: error.clone(),
-            });
-            error
+            return Err(error);
         }
+        let error = if error.code == "unknown" {
+            let message = format!(
+                "Codex pre-dispatch metadata read failed before thread dispatch: {}",
+                error.message
+            );
+            pre_dispatch_read_error(error, "native_model_unavailable", &message)
+        } else {
+            error
+        };
+        let error = eliot_plugin::session::classify_start_failure(error, "codex", "prepare");
+        let value = eliot_plugin::session::failed_start_value(params, error);
+        self.failed_start = Some(FailedStart {
+            agent_id: params.agent_id.clone(),
+            generation: params.generation,
+            command_id: params.command_id.clone(),
+            outcome: SettledStartFailure::ProvenNoEffect(value.clone()),
+        });
+        Ok(value)
     }
 
     async fn initialize_native(
@@ -2724,8 +2737,9 @@ fn select_launch_model(
             .find(|model| model.id == requested && model.model == requested)
             .cloned()
             .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
+                eliot_plugin::start_classification::harness_unavailable_model(
+                    "codex",
+                    "model_list",
                     "The exact requested Codex model is unavailable in this account catalogue",
                 )
             })
@@ -2735,8 +2749,9 @@ fn select_launch_model(
             .find(|model| model.is_default)
             .cloned()
             .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
+                eliot_plugin::start_classification::harness_unavailable_model(
+                    "codex",
+                    "model_list",
                     "Codex model/list reported no default model; use an explicit model",
                 )
             })
@@ -3291,10 +3306,10 @@ fn codex_manifest() -> PluginManifest {
 mod tests {
     use super::{
         AgentSession, CodexPlugin, CodexRoute, FailedObserverAttach, FailedStart, Initialized,
-        NativeLaunch, NativeProcess, SessionPhase, codex_manifest, contextual_error,
-        frozen_store_binding, is_proven_observer_start_failure, is_proven_scope_refusal,
-        pre_dispatch_read_error, target_environment, unconfirmed_pre_dispatch_error,
-        validate_resume_preflight,
+        NativeLaunch, NativeProcess, SessionPhase, SettledStartFailure, codex_manifest,
+        contextual_error, frozen_store_binding, is_proven_observer_start_failure,
+        is_proven_scope_refusal, pre_dispatch_read_error, target_environment,
+        unconfirmed_pre_dispatch_error, validate_resume_preflight,
     };
     use eliot_core::{Error, SecretPolicy, StderrSnapshot, StderrSource};
     use eliot_plugin::AgentStartParams;
@@ -3695,7 +3710,7 @@ mod tests {
                 agent_id: "a1".to_owned(),
                 generation: 1,
                 command_id: "cmd-1".to_owned(),
-                error: read_error.clone(),
+                outcome: SettledStartFailure::Uncertain(read_error.clone()),
             }),
             ..CodexPlugin::default()
         };
@@ -3831,12 +3846,14 @@ mod tests {
         );
         // Production boundary used by the scope-mismatch caller: must retain
         // the controller and return unknown for unconfirmed cleanup.
-        let settled = plugin.settle_pre_dispatch_outcome(
-            session,
-            &start_params,
-            scope_error,
-            "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
-        );
+        let settled = plugin
+            .settle_pre_dispatch_outcome(
+                session,
+                &start_params,
+                scope_error,
+                "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
+            )
+            .unwrap_err();
         assert_eq!(settled.code, "unknown");
         assert!(settled.message.contains("cleanup is unconfirmed"));
         assert!(settled.message.contains("no thread/resume"));
@@ -3997,7 +4014,7 @@ mod tests {
         assert_eq!(selected.id, "gpt-6-mini");
         assert!(!selected.is_default);
         let error = super::select_launch_model(&entries, Some("gpt-9-ghost")).unwrap_err();
-        assert_eq!(error.code, "profile_error");
+        assert_eq!(error.code, "native_model_unavailable");
     }
 
     #[test]
@@ -4006,6 +4023,22 @@ mod tests {
         // default to fall back to, so an omitted request fails instead of
         // substituting another model.
         let error = super::select_launch_model(&[], None).unwrap_err();
-        assert_eq!(error.code, "profile_error");
+        assert_eq!(error.code, "native_model_unavailable");
+    }
+
+    #[test]
+    fn refused_model_at_start_is_failed_with_harness_origin() {
+        let entries = recorded_catalogue();
+        let error = super::select_launch_model(&entries, Some("gpt-9-ghost")).unwrap_err();
+        assert_eq!(error.code, "native_model_unavailable");
+        assert_eq!(error.origin, Some(eliot_core::FailureOrigin::Harness));
+        assert!(eliot_plugin::start_classification::is_proven_no_effect(
+            eliot_plugin::start_classification::StartPoint::NativeRefusalBeforeDispatch
+        ));
+        let params = AgentStartParams::new("a1", 1, "cmd-1");
+        let classified = eliot_plugin::session::classify_start_failure(error, "codex", "prepare");
+        let value = eliot_plugin::session::failed_start_value(&params, classified);
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["origin"], "harness");
     }
 }
