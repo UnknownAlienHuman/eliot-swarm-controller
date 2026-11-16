@@ -12,7 +12,7 @@ use super::{
 use crate::common::now_ms;
 use eliot_core::{
     Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FrozenScriptRun,
-    InjectArgs, InjectPoint, NativeStoreBinding, Result, SecretPolicy,
+    InjectArgs, InjectPoint, Result, SecretPolicy,
     api::{FrozenGitFetch, ProjectRegistrationView},
     classify_dispatched_error,
 };
@@ -84,14 +84,14 @@ pub(super) enum RunWorkerStart {
 struct PreparedCommand {
     command: Command,
     git_fetch_registration: Option<ProjectRegistrationView>,
-    launch_binding: Option<(Agent, NativeStoreBinding)>,
+    launch_binding: Option<(Agent, eliot_plugin::protocol::ProfileStoreResult)>,
     resume_source_state: Option<Value>,
 }
 
 /// Launch/resume start inputs captured before dispatch: the native Store
 /// binding for a Codex launch and the retained source state for a resume.
 struct StartInputs {
-    launch_binding: Option<(Agent, NativeStoreBinding)>,
+    launch_binding: Option<(Agent, eliot_plugin::protocol::ProfileStoreResult)>,
     resume_source_state: Option<Value>,
 }
 
@@ -220,7 +220,7 @@ impl Router {
                 }
             };
             if let Err(error) = self.verify_global_run(&frozen).await {
-                self.reject_undispatched(id, &error.code).await;
+                self.reject_undispatched_error(id, &error).await;
                 return false;
             }
         }
@@ -260,7 +260,7 @@ impl Router {
                 Err(())
             }
             Err(error) => {
-                self.reject_undispatched(id, &error.code).await;
+                self.reject_undispatched_error(id, &error).await;
                 Err(())
             }
         }
@@ -298,7 +298,7 @@ impl Router {
                 return false;
             }
             Err(error) => {
-                self.reject_undispatched(id, &error.code).await;
+                self.reject_undispatched_error(id, &error).await;
                 return false;
             }
         };
@@ -306,26 +306,26 @@ impl Router {
             crate::automation::verify_project_registration(&self.inner.data_root, &registration)
                 .await
         {
-            self.reject_undispatched(id, &error.code).await;
+            self.reject_undispatched_error(id, &error).await;
             return false;
         }
         if command.verb == "launch" {
             if let Err(error) = validate_project_rule_launch_command(&registration, command) {
-                self.reject_undispatched(id, &error.code).await;
+                self.reject_undispatched_error(id, &error).await;
                 return false;
             }
         } else if command.verb == "resume" {
             if let Err(error) =
                 validate_project_rule_resume_command(&registration, command, has_linked)
             {
-                self.reject_undispatched(id, &error.code).await;
+                self.reject_undispatched_error(id, &error).await;
                 return false;
             }
             if let Err(error) = self
                 .verify_project_rule_resume_after_admission(&registration, command)
                 .await
             {
-                self.reject_undispatched(id, &error.code).await;
+                self.reject_undispatched_error(id, &error).await;
                 return false;
             }
         } else if matches!(
@@ -341,7 +341,7 @@ impl Router {
                 .verify_project_rule_target(&registration, target, generation)
                 .await
             {
-                self.reject_undispatched(id, &error.code).await;
+                self.reject_undispatched_error(id, &error).await;
                 return false;
             }
         }
@@ -370,7 +370,7 @@ impl Router {
                 Ok(Some(agent)) => Some(agent),
                 Ok(None) => return None, // A retained/settled command cannot acquire new I/O.
                 Err(error) => {
-                    self.reject_undispatched(id, &error.code).await;
+                    self.reject_undispatched_error(id, &error).await;
                     return None;
                 }
             }
@@ -381,7 +381,7 @@ impl Router {
             match self.capture_resume_source_state(id).await {
                 Ok((profile, source_state)) => (Some(profile), Some(source_state)),
                 Err(error) => {
-                    self.reject_undispatched(id, &error.code).await;
+                    self.reject_undispatched_error(id, &error).await;
                     return None;
                 }
             }
@@ -396,7 +396,7 @@ impl Router {
             && profile.get("route_binding").is_some()
             && let Err(error) = crate::proxy::check_profile_ready(profile).await
         {
-            self.reject_undispatched(id, &error.code).await;
+            self.reject_undispatched_error(id, &error).await;
             return None;
         }
         let launch_binding = if let Some(agent) = launch_agent {
@@ -416,7 +416,7 @@ impl Router {
                 {
                     Ok(binding) => binding,
                     Err(error) => {
-                        self.reject_undispatched(id, &error.code).await;
+                        self.reject_undispatched_error(id, &error).await;
                         return None;
                     }
                 };
@@ -442,14 +442,20 @@ impl Router {
         id: &str,
         receiver: &mut broadcast::Receiver<Event>,
         command: &Command,
-        launch_binding: &Option<(Agent, NativeStoreBinding)>,
+        launch_binding: &Option<(Agent, eliot_plugin::protocol::ProfileStoreResult)>,
     ) -> Option<(Command, i64, Vec<ContextItem>)> {
         let (dispatched, dispatch_seq, context_items) = loop {
             let change = {
                 let mut store = self.inner.store.lock().await;
                 let dispatched = match launch_binding {
                     Some((expected_agent, binding)) => store
-                        .dispatch_with_native_store_binding(id, now_ms(), expected_agent, binding)
+                        .dispatch_with_native_store_binding(
+                            id,
+                            now_ms(),
+                            expected_agent,
+                            &binding.binding,
+                            binding.startup.as_ref(),
+                        )
                         .map(|change| (change.value, Vec::new(), change.events)),
                     None if command.verb == "run"
                         && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
@@ -1270,7 +1276,7 @@ impl Router {
                     .settle(
                         id,
                         CommandState::Rejected,
-                        Some(json!({"reason": error.code})),
+                        Some(self.command_error_outcome(&error, "reason")),
                     )
                     .await;
             }
@@ -1388,7 +1394,7 @@ impl Router {
                     .settle(
                         id,
                         CommandState::Rejected,
-                        Some(json!({"reason": error.code})),
+                        Some(self.command_error_outcome(&error, "reason")),
                     )
                     .await;
             }
@@ -1713,13 +1719,39 @@ impl Router {
             self.note_unknown_if_uncertain(id, "store_dispatch_outcome_unknown")
                 .await;
         } else {
-            self.reject_undispatched(id, &error.code).await;
+            self.reject_undispatched_error(id, error).await;
         }
         self.signal_progress();
     }
 
     pub(super) async fn reject_undispatched(&self, id: &str, reason: &str) {
-        let outcome = json!({"reason": reason});
+        self.reject_undispatched_error(id, &Error::new(reason, reason))
+            .await;
+    }
+
+    fn command_error_outcome(&self, error: &Error, code_key: &str) -> Value {
+        let mut outcome = json!({"message": error.message});
+        outcome[code_key] = json!(error.code);
+        self.redact_native_value(&mut outcome);
+        if let Some(message) = outcome.get_mut("message") {
+            *message = json!(
+                message
+                    .as_str()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(1024)
+                    .collect::<String>()
+            );
+        }
+        outcome
+    }
+
+    async fn reject_undispatched_error(&self, id: &str, error: &Error) {
+        let outcome = if error.code == "busy" {
+            self.command_error_outcome(error, "reason")
+        } else {
+            json!({"reason": error.code})
+        };
         let (result, write_faulted) = {
             let mut store = self.inner.store.lock().await;
             let result = match store.get_command(id) {
@@ -1747,7 +1779,7 @@ impl Router {
                         Ok(false)
                     };
                     match workspace_resume {
-                        Ok(true) => store.reject_workspace_resume(id, reason, now_ms()),
+                        Ok(true) => store.reject_workspace_resume(id, &outcome, now_ms()),
                         Ok(false) => {
                             store.settle(id, CommandState::Rejected, Some(outcome), now_ms())
                         }
@@ -1876,6 +1908,7 @@ impl Router {
         } else {
             json!({"code": error.code})
         };
+        outcome["message"] = json!(error.message.chars().take(1024).collect::<String>());
         for diagnostic in &error.diagnostics {
             crate::redaction::attach_stderr(
                 &mut outcome,
@@ -2214,8 +2247,48 @@ fn coordination_commit_error_state(code: &str) -> CommandState {
 #[cfg(test)]
 mod tests {
     use super::{Command, capture_dispatch_seq, validate_retained_resume_agent};
-    use eliot_core::{Agent, AgentState, CommandState, Event};
+    use crate::common::now_ms;
+    use eliot_core::{Agent, AgentState, CommandState, Error, Event, SubmitCommand};
+    use eliot_plugin::sync::LockExt;
     use serde_json::json;
+    use ulid::Ulid;
+
+    #[tokio::test]
+    async fn busy_rejection_retains_redacted_bound_in_command_and_event() {
+        let router = super::super::tests::router();
+        let secret = "s".repeat(1100);
+        router.inner.secrets.lock_recover().insert(secret.clone());
+        let id = Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            let mut request = SubmitCommand::new(id.clone(), "launch");
+            request.args = json!({"harness":"codex", "profile":"luna", "project":"k65-regression", "workspace":".",
+                "profile_snapshot":{"harness":"codex"}});
+            store.submit("owner", request, now_ms()).unwrap();
+        }
+        router
+            .reject_undispatched_error(
+                &id,
+                &Error::new("busy", format!("metadata_readers limit=4 {secret}")),
+            )
+            .await;
+        let store = router.inner.store.lock().await;
+        let command = store.get_command(&id).unwrap().unwrap();
+        assert_eq!(command.state, CommandState::Rejected);
+        let outcome = command.outcome.unwrap();
+        assert_eq!(outcome["reason"], "busy");
+        let message = outcome["message"].as_str().unwrap();
+        assert!(message.contains("metadata_readers limit=4"));
+        assert!(!message.contains(&"s".repeat(100)));
+        let rejected = store
+            .read_events(0, 100, None)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "command.rejected")
+            .unwrap();
+        assert_eq!(rejected.data["outcome"], outcome);
+        assert_eq!(command.generation, Some(0));
+    }
 
     #[tokio::test]
     async fn coordination_stale_cas_settles_rejected_without_a_second_write() {
@@ -2343,7 +2416,7 @@ mod tests {
         assert_eq!(settled.state, CommandState::Rejected);
         assert_eq!(
             settled.outcome,
-            Some(json!({"reason": dispatch_error.code}))
+            Some(json!({"reason": dispatch_error.code, "message": dispatch_error.message}))
         );
         // No generation, source, or token changed: the fence fired before any
         // native effect, and the command no longer blocks drain or re-observe.

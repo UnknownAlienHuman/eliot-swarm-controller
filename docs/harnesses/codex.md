@@ -121,12 +121,15 @@ policy (`mcp = "inherit"` or `"minimal"`, default `inherit`) with an optional
 additive behavior above. `minimal` starts only Eliot's Agent-scoped server
 plus the explicitly allowed servers:
 
-- Before spawn, a short-lived metadata reader (initialize, one `config/read`
-  with the worker cwd, close; no thread) enumerates the worker-visible
-  `mcp_servers` entries (key plus `command`/`url` transport) and the
-  `plugins` states (id plus `enabled` flag). The reader is pinned to the
-  frozen native-store binding the same way the worker launch is pinned, and
-  the pin is verified before the enumeration is trusted. Every enumerated
+- For launch, the pre-dispatch `profile.store` reader projects the worker-visible
+  `mcp_servers` entries (key plus `command`/`url` transport) and `plugins` states
+  (id plus `enabled` flag) from the same `config/read` response used for verified
+  store selection, using the actual prepared workspace. Store freezes this projection
+  with the exact launch command ID alongside the store binding at dispatch. The worker
+  consumes only that command's projection; missing or mismatched metadata refuses
+  before worker spawn. No configuration cache or ambient reselection is used.
+  Resume instead enumerates through a reader pinned to its retained store, verifies
+  the pin, and never reuses the old launch projection. Every enumerated
   server outside the allow list gets its own transport plus
   `-c mcp_servers.<name>.enabled=false` overrides; a name no `-c` path can
   address (Codex splits override paths on literal dots before decoding), a
@@ -419,7 +422,10 @@ readback. An unexpected effective route does not authorize further input.
 
 Controlled launch resolves the effective native store through a dedicated read-only
 `profile.store` reader after workspace preparation, then commits its binding with launch
-dispatch. The controlled app-server pins and verifies that same store before
+dispatch, together with the minimal-policy MCP projection from the same config response.
+Read-only readers deliver stdin EOF, then require process reap and complete output
+and notification drainage within their cleanup deadline; unknown cleanup remains fenced.
+The controlled app-server pins and verifies that same store before
 `thread/start` or `thread/resume`. Resume reuses the retained binding; a legacy Agent
 without one refuses before native control. This does not change admitted command
 arguments/digests or replay input. See

@@ -372,7 +372,10 @@ fn require_free(connection: &Connection, agent: &Agent, id: i64) -> Result<()> {
         if u64::try_from(count).map_or(true, |count| count >= max_live) {
             return Err(Error::new(
                 "capacity_unavailable",
-                "configured live capacity is reserved",
+                format!(
+                    "configured capacity bound {} max_live={max_live} is reserved",
+                    scope.scope
+                ),
             ));
         }
     }

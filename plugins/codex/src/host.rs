@@ -587,6 +587,7 @@ impl CodexPlugin {
             &params.target_environment,
             &metadata_secrets,
             &diagnostic_secrets,
+            params.profile.get("mcp").and_then(Value::as_str) == Some("minimal"),
             Instant::now() + crate::discovery::READ_TIMEOUT,
         )
         .await?;
@@ -899,8 +900,8 @@ impl CodexPlugin {
             .to_string()
             .to_ascii_lowercase();
         let mcp_server_name = format!("eliot_swarm_{start_command}");
-        // Minimal policy: enumerate the worker-visible native MCP surface
-        // with a short-lived metadata reader, then suppress every
+        // Minimal launch uses the surface frozen with store selection before
+        // dispatch. Resume enumerates afresh against its retained store, then suppresses every
         // non-allowed server with its own transport-carrying
         // `enabled=false` overrides. A bare `enabled=false` breaks the
         // native bootstrap for project/plugin names (verified on 0.167.1),
@@ -917,21 +918,25 @@ impl CodexPlugin {
                 cwd: workspace.clone(),
                 environment: environment.clone(),
             };
-            let surface = crate::discovery::read_effective_mcp_surface(
-                &probe,
-                &frozen_store,
-                &metadata_secrets,
-                &secrets,
-                Instant::now() + RPC_TIMEOUT,
-            )
-            .await
-            .map_err(|error| {
-                pre_dispatch_read_error(
-                    error,
-                    "profile_error",
-                    "Codex minimal MCP server enumeration failed before worker spawn",
+            let surface = if resume_subject.is_none() {
+                crate::discovery::frozen_mcp_surface(profile, &params.command_id)?
+            } else {
+                crate::discovery::read_effective_mcp_surface(
+                    &probe,
+                    &frozen_store,
+                    &metadata_secrets,
+                    &secrets,
+                    Instant::now() + RPC_TIMEOUT,
                 )
-            })?;
+                .await
+                .map_err(|error| {
+                    pre_dispatch_read_error(
+                        error,
+                        "profile_error",
+                        "Codex minimal MCP server enumeration failed before worker spawn",
+                    )
+                })?
+            };
             let mut disables = compute_disables(
                 &surface.servers,
                 &mcp_allow,

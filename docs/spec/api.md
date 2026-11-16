@@ -839,6 +839,15 @@ Generation-changing dispatch follows [core](core.md#generation-fence): advance a
 revoke before native I/O, no rollback, no replay after unknown. Terminal settlement
 revokes the token even if degraded Unix custody reports possible escaped descendants.
 
+Admitted launches wait for transient internal metadata-reader concurrency before native
+start. Launch preparation has its own bounded 32-reader lane; interactive discovery
+keeps its four-reader lane. These bounds limit active metadata processes, not the
+Agent fleet or a burst's admitted launches. Waiting consumes no native start attempt; closing admission
+wakes waiters without starting a process. Configured capacity refusal remains
+`capacity_unavailable` and names the scope and `max_live` bound. A retained `busy`
+command outcome includes a redacted `message` naming the exhausted lane or bound;
+the CLI prints its code and message, including through linked-start failure readback.
+
 Launch/resume with explicit text creates a start plus linked `<id>/send`. Without
 `--wait`, return session readiness; with it, follow the linked input to its exact terminal
 turn. An input-created native session still reports these distinct outcomes.
@@ -1012,6 +1021,10 @@ snapshot exits 5, interrupted entries exit 7, `unknown`/`not_found`/`not_visible
 entries exit 4, and plain failures exit 1.
 
 ## Input, turn and unknown gates
+
+Exact turn reads check uncertain commands by Agent, generation and turn ID. A full
+fleet status page never makes an unrelated turn unavailable; durable and in-memory
+unknown outcomes for the exact turn still mask completion.
 
 Transport/inbox admission is not send applied. Bind input to an exact native turn, then
 track its result independently. Unassociated dispatched/unknown input blocks later

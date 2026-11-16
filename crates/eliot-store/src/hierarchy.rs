@@ -969,7 +969,7 @@ mod tests {
         };
         let expected = store.get_agent(&parent).unwrap().expect("manager row");
         store
-            .dispatch_with_native_store_binding(&launch_id, now, &expected, &binding)
+            .dispatch_with_native_store_binding(&launch_id, now, &expected, &binding, None)
             .expect("dispatch manager with its real binding");
         let parent_binding = store
             .get_agent(&parent)

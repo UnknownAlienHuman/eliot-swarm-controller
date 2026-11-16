@@ -760,7 +760,7 @@ pub(crate) async fn run_goal_driver(
                         &mut pending,
                         &mut pending_reconcile,
                         event,
-                    );
+                    ).await;
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     let policy = router.secret_policy_snapshot();
@@ -819,7 +819,7 @@ pub(crate) async fn run_goal_driver(
                             &mut pending,
                             &mut pending_reconcile,
                             follow,
-                        );
+                        ).await;
                     }
                     drain_pending_reconcile(
                         &router,
@@ -854,7 +854,7 @@ enum IdleSubject {
 /// Start one automatic round for an idle event unless its Goal already
 /// has one in flight — then a newer event is remembered for a follow-up —
 /// or the global cap is reached (the event is dropped and logged).
-fn spawn_auto_round(
+async fn spawn_auto_round(
     router: &Router,
     run_check: GoalCheckRunner,
     rounds: &mut JoinSet<(String, i64)>,
@@ -886,6 +886,9 @@ fn spawn_auto_round(
         tokio::spawn(async move {
             mail_router.reoffer_mail_notice(&mail_agent).await;
         });
+    }
+    if !idle_goal_is_eligible(router, &agent, event.generation).await {
+        return;
     }
     reserve_idle_round(
         router,
@@ -1046,6 +1049,32 @@ fn reserve_idle_round(
     in_flight.insert(agent, InFlightAutoRound { cancel, seq, task });
 }
 
+async fn idle_goal_is_eligible(router: &Router, agent: &str, generation: Option<i64>) -> bool {
+    let view = {
+        let store = router.inner.store.lock().await;
+        // Native wait point: an actively driving native Goal owns the
+        // Agent, so Eliot rounds wait. None exists today.
+        match store.goal_native_driving(agent) {
+            Ok(false) => {}
+            _ => return false,
+        }
+        match store.goal_get(agent, "eliot") {
+            Ok(view) => view,
+            Err(_) => return false,
+        }
+    };
+    let Some(view) = view else {
+        return false;
+    };
+    if view.status != GoalStatus::Active || Some(view.generation) != generation {
+        return false;
+    }
+    if view.definition.cadence_ms.is_some() {
+        return false;
+    }
+    true
+}
+
 /// Shared automatic-round driver for one exact-generation idle subject:
 /// the same scope, enablement and single-flight checks whether the
 /// subject arrived on the bus or was retained from `goal.set`/`resume`.
@@ -1063,26 +1092,7 @@ async fn drive_goal_at_idle(
     if !router.rule_firings_open() {
         return;
     }
-    let view = {
-        let store = router.inner.store.lock().await;
-        // Native wait point: an actively driving native Goal owns the
-        // Agent, so Eliot rounds wait. None exists today.
-        match store.goal_native_driving(agent) {
-            Ok(false) => {}
-            _ => return,
-        }
-        match store.goal_get(agent, "eliot") {
-            Ok(view) => view,
-            Err(_) => return,
-        }
-    };
-    let Some(view) = view else {
-        return;
-    };
-    if view.status != GoalStatus::Active || view.generation != generation {
-        return;
-    }
-    if view.definition.cadence_ms.is_some() {
+    if !idle_goal_is_eligible(router, agent, Some(generation)).await {
         return;
     }
     let params = json!({
@@ -2482,7 +2492,8 @@ mod tests {
             &mut pending,
             &mut pending_reconcile,
             attention,
-        );
+        )
+        .await;
         assert!(
             in_flight.is_empty(),
             "advisory attention starts no automatic round"
@@ -2602,6 +2613,32 @@ mod tests {
         assert_eq!(view.status, eliot_core::api::GoalStatus::Completed);
         assert_eq!(view.counters.rounds, 1);
         assert_eq!(view.last_round_key, Some(format!("idle:{key}")));
+    }
+
+    #[tokio::test]
+    async fn goal_driver_does_not_reserve_slots_for_agents_without_goals() {
+        let router = router();
+        let mut rounds = JoinSet::new();
+        let mut in_flight = HashMap::new();
+        let mut pending = HashMap::new();
+        let mut pending_reconcile = BTreeMap::new();
+        for index in 0..MAX_CONCURRENT_AUTO_ROUNDS + 5 {
+            let agent = ready_agent(&router, &format!("no-goal-slot-{index}")).await;
+            spawn_auto_round(
+                &router,
+                exploding_runner,
+                &mut rounds,
+                &mut in_flight,
+                &mut pending,
+                &mut pending_reconcile,
+                idle_event(&agent, 1, high_water(&router).await),
+            )
+            .await;
+        }
+        assert!(rounds.is_empty());
+        assert!(in_flight.is_empty());
+        assert!(pending.is_empty());
+        assert!(pending_reconcile.is_empty());
     }
 
     #[tokio::test]

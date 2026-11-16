@@ -47,6 +47,13 @@ including JSON escaping. Error serialization reserves space for its primary code
 message within the 64 KiB encoded Error bound. Do not serialize free-form error messages,
 request arguments or environment values into the log record.
 
+The host keeps four interactive metadata-reader slots and an independent 32-slot
+launch-preparation lane. A launch's `profile.store` waits fairly for its own slot
+before opening a reader, rather than refusing a transient full pool.
+Only confirmed reader custody cleanup releases its slot; unknown cleanup retains it.
+Shutdown closes slot admission and wakes waiting launches. Explicit discovery/catalogue
+reads may refuse `busy`, with a message naming `metadata_readers` and its limit.
+
 Maximum encoded frame is 1 MiB including the NDJSON newline. Inline input is at most
 512 KiB; persisted event data/final text 64 KiB; pages at most 1,000 entries and below
 900 KiB. Both semantic and encoded limits apply, including JSON escaping. Reject
@@ -95,7 +102,7 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `agent.attach` | exact subject, generation, observe/control, profile/environment, source plan/cursors | attach only to that subject; otherwise not found/unsupported. A bound `failed` result is limited to a proven pre-native refusal or `native_start_failed` (no thread/session effect and confirmed native-helper cleanup); uncertain outcomes remain unknown. |
 | `agent.detach` | exact observed subject/generation and command id | close only its reader; never end the native session |
 | `discover` | frozen profile, target environment without Agent identity, optional exact scope/cursor, `archived` (default `false`), bounded limit | read-only native-subject metadata page |
-| `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return the effective [`NativeStoreBinding`](../../crates/eliot-core/src/native_store.rs) using the caller's actual prepared workspace and a bounded, owned metadata reader; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
+| `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return [`ProfileStoreResult`](../../crates/eliot-plugin/src/protocol.rs): the effective `NativeStoreBinding` and optional plugin-owned startup projection, using the caller's actual prepared workspace and one bounded, owned metadata reader. Store freezes both with the exact launch dispatch; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
 
 Steer uses an ordered, bounded write followed by a correlated response wait: the host

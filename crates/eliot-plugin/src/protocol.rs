@@ -156,6 +156,16 @@ pub struct ProfileStoreParams {
     pub workspace: String,
 }
 
+/// One launch's verified native-store selection and optional plugin-owned
+/// startup metadata from the same read. The daemon freezes both at dispatch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileStoreResult {
+    pub binding: eliot_core::NativeStoreBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup: Option<Value>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiscoverParams {

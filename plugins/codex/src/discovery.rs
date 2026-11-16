@@ -131,17 +131,49 @@ pub(crate) async fn profile_store(
     environment: &Value,
     metadata_secrets: &[String],
     diagnostic_secrets: &[String],
+    minimal: bool,
     deadline: Instant,
-) -> Result<NativeStoreBinding> {
-    probe_store(
-        launch,
-        environment,
+) -> Result<eliot_plugin::protocol::ProfileStoreResult> {
+    let (mut probe, drainer, initialized) = start_initialized_reader(
+        NativeLaunch {
+            program: launch.program.clone(),
+            args: launch.args.clone(),
+            cwd: launch.cwd.clone(),
+            environment: launch.environment.clone(),
+        },
         metadata_secrets,
         diagnostic_secrets,
         deadline,
     )
-    .await?
-    .native_binding(metadata_secrets)
+    .await?;
+    let result = async {
+        let (store, config) = read_store_config(
+            &probe.client(),
+            environment,
+            &initialized.codex_home,
+            &launch.cwd,
+            deadline,
+        )
+        .await?;
+        let startup = if minimal {
+            let surface = EffectiveMcpSurface {
+                servers: mcp_server_entries(&config)?,
+                plugins: mcp_plugin_states(&config)?,
+            };
+            let value = serde_json::to_value(surface).map_err(|_| invalid_page())?;
+            reject_secrets(&value, metadata_secrets)?;
+            Some(value)
+        } else {
+            None
+        };
+        Ok(eliot_plugin::protocol::ProfileStoreResult {
+            binding: store.native_binding(metadata_secrets)?,
+            startup,
+        })
+    }
+    .await;
+    finish_reader(&mut probe, Some(drainer)).await?;
+    result.map_err(|error| probe.client().diagnostic_error(error))
 }
 
 /// Worker-visible native MCP surface for a minimal policy: the effective
@@ -153,10 +185,29 @@ pub(crate) async fn profile_store(
 /// long-lived process is born. The reader is pinned to the frozen
 /// native-store binding the same way the worker launch is pinned, and the
 /// pin is verified before the enumeration `config/read` is trusted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EffectiveMcpSurface {
     pub(crate) servers: Vec<crate::mcp::EffectiveMcpServer>,
     pub(crate) plugins: Vec<crate::mcp::EffectiveMcpPlugin>,
+}
+
+pub(crate) fn frozen_mcp_surface(
+    profile: &serde_json::Map<String, Value>,
+    command_id: &str,
+) -> Result<EffectiveMcpSurface> {
+    let metadata = profile
+        .get("native_launch_metadata")
+        .filter(|metadata| metadata.get("command_id").and_then(Value::as_str) == Some(command_id))
+        .and_then(|metadata| metadata.get("data"))
+        .ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                "Codex launch requires its exact frozen MCP surface",
+            )
+        })?;
+    serde_json::from_value(metadata.clone())
+        .map_err(|_| Error::new("profile_error", "Codex frozen MCP surface is malformed"))
 }
 
 /// Enumerate the worker-visible native MCP surface (servers plus plugin
@@ -1048,7 +1099,12 @@ pub(crate) async fn finish_reader(
 ) -> Result<()> {
     // One shared cleanup deadline, including when selection/readback was rejected.
     let cleanup_deadline = Instant::now() + CLEANUP_TIMEOUT;
-    let reaped = native.terminate(false, cleanup_deadline).await;
+    // Flush alone keeps the app-server waiting on stdin for the full kill
+    // grace. Deliver EOF; still require reap and complete output drainage.
+    let reaped = native
+        .transport
+        .terminate_dropping_input(false, cleanup_deadline)
+        .await;
     let output_drained = native.await_output_drained(cleanup_deadline).await;
     let notifications_drained = finish_drainer(drainer, cleanup_deadline).await;
     if reaped.is_err() || output_drained.is_err() || !notifications_drained {
@@ -1121,6 +1177,18 @@ async fn read_store(
     reader_cwd: &Path,
     deadline: Instant,
 ) -> Result<StoreContext> {
+    read_store_config(client, environment, reported_home, reader_cwd, deadline)
+        .await
+        .map(|(store, _)| store)
+}
+
+async fn read_store_config(
+    client: &NativeClient,
+    environment: &Value,
+    reported_home: &str,
+    reader_cwd: &Path,
+    deadline: Instant,
+) -> Result<(StoreContext, Value)> {
     // Codex 979011409de0a60b52f179721948e65531d26144:
     // config_manager_service.rs:119-149 returns effective ConfigToml for cwd,
     // including trusted project layers and exact requirements. Config.additional preserves
@@ -1152,17 +1220,18 @@ async fn read_store(
     ensure_store_pin_supported(&config, &requirements)?;
     let selection = {
         let config: NativeDiscoveryConfigReadResponse =
-            serde_json::from_value(config).map_err(|_| unverified_store())?;
+            serde_json::from_value(config.clone()).map_err(|_| unverified_store())?;
         select_store(&config, environment, Path::new(reported_home), reader_cwd)?
     };
     let reported_home = reported_home.to_owned();
-    timeout_at(
+    let store = timeout_at(
         deadline,
         tokio::task::spawn_blocking(move || verify_store(&reported_home, &selection)),
     )
     .await
     .map_err(|_| unverified_store())?
-    .map_err(|_| unverified_store())?
+    .map_err(|_| unverified_store())??;
+    Ok((store, config))
 }
 
 fn pinned_launch(launch: &NativeLaunch, root: &Path) -> Result<NativeLaunch> {
@@ -1638,6 +1707,45 @@ mod tests {
     use eliot_core::{NativeStoreBinding, SecretPolicy};
     use serde_json::json;
     use std::{ffi::OsString, path::Path, time::Duration};
+
+    #[test]
+    fn launch_mcp_surface_requires_exact_command_and_strict_projection() {
+        let config = json!({"config":{
+            "mcp_servers":{"local":{"command":"native-helper"}},
+            "plugins":{"computer-use":{"enabled":true}}
+        }});
+        let surface = super::EffectiveMcpSurface {
+            servers: mcp_server_entries(&config).unwrap(),
+            plugins: mcp_plugin_states(&config).unwrap(),
+        };
+        let profile = json!({"native_launch_metadata":{
+            "command_id":"launch-1", "data":serde_json::to_value(&surface).unwrap()
+        }});
+        assert_eq!(
+            super::frozen_mcp_surface(profile.as_object().unwrap(), "launch-1").unwrap(),
+            surface
+        );
+        assert_eq!(
+            super::frozen_mcp_surface(profile.as_object().unwrap(), "launch-2")
+                .unwrap_err()
+                .code,
+            "profile_error"
+        );
+        let mut malformed = profile.clone();
+        malformed["native_launch_metadata"]["data"]["extra"] = json!(true);
+        assert_eq!(
+            super::frozen_mcp_surface(malformed.as_object().unwrap(), "launch-1")
+                .unwrap_err()
+                .code,
+            "profile_error"
+        );
+        assert_eq!(
+            super::frozen_mcp_surface(json!({}).as_object().unwrap(), "launch-1")
+                .unwrap_err()
+                .code,
+            "profile_error"
+        );
+    }
 
     #[tokio::test]
     async fn expired_startup_deadline_is_definite_before_any_native_spawn() {

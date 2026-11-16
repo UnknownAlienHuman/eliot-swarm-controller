@@ -43,7 +43,8 @@ pub(super) fn is_addressable_override_name(name: &str) -> bool {
 /// `config/read` response: the table key plus the transport the native
 /// bootstrap validates. Only `command`/`url` are projected; env, timeouts
 /// and tool gates merge from the owner layers and never reach argv.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveMcpServer {
     pub(super) name: String,
     pub(super) command: Option<String>,
@@ -174,7 +175,8 @@ pub(super) fn is_suppressible_plugin_id(id: &str) -> bool {
 
 /// One worker-visible native plugin as enumerated from the effective
 /// `config/read` response: the plugin id plus whether it is enabled.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveMcpPlugin {
     pub(super) id: String,
     pub(super) enabled: bool,

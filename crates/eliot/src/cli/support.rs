@@ -88,6 +88,20 @@ impl Failure {
         command: &CoreCommand,
     ) -> Self {
         let mut failure = Self::new(exit_code, message);
+        if let Some(outcome) = command.outcome.as_ref() {
+            let code = outcome
+                .get("code")
+                .or_else(|| outcome.get("reason"))
+                .and_then(Value::as_str);
+            let detail = outcome.get("message").and_then(Value::as_str);
+            if let Some(code) = code {
+                failure.code = Some(code.to_owned());
+                failure.message.push_str(&format!(": {code}"));
+            }
+            if let Some(detail) = detail.filter(|detail| Some(*detail) != code) {
+                failure.message.push_str(&format!(": {detail}"));
+            }
+        }
         if let Some(value) = command
             .outcome
             .as_ref()
@@ -407,5 +421,32 @@ pub(crate) fn print_value(value: &Value, json_output: bool) {
         println!("{rendered}");
     } else {
         println!("{value}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn busy_readback_prints_the_persisted_bound_and_preserves_exit_code() {
+        let mut command: CoreCommand = serde_json::from_value(json!({
+            "id":"launch", "principal":"owner", "method":"command.submit", "verb":"launch",
+            "target":"a1", "generation":0, "args":{}, "state":"rejected",
+            "created_at":1, "updated_at":2,
+            "outcome":{"reason":"busy", "message":"metadata_readers in-flight bound reached (limit=4)"}
+        })).unwrap();
+        let error = command_state_result(&command).unwrap_err();
+        assert_eq!(error.exit_code, 3);
+        assert_eq!(error.code.as_deref(), Some("busy"));
+        assert!(error.message.contains("metadata_readers"));
+        assert!(error.message.contains("limit=4"));
+        command.state = CommandState::Unknown;
+        command.outcome =
+            Some(json!({"code":"busy", "message":"Agent plugin command queue is full"}));
+        let error = command_state_result(&command).unwrap_err();
+        assert_eq!(error.exit_code, 4);
+        assert!(error.message.contains("Agent plugin command queue"));
     }
 }

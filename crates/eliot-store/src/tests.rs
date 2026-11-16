@@ -6255,6 +6255,42 @@ fn same_scope_restriction_during_probe_survives_exact_probe_completion() {
 }
 
 #[test]
+fn fresh_launch_rebinds_parent_startup_metadata_without_reselecting_profile() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let mut request = native_store_request();
+    request.args["profile_snapshot"]["native_launch_metadata"] =
+        json!({"command_id":"parent-launch", "data":{"servers":[], "plugins":[]}});
+    let admission = store.submit("owner", request.clone(), now).unwrap();
+    let id = admission.command.target.as_deref().unwrap();
+    let expected = store.get_agent(id).unwrap().unwrap();
+    let binding = native_store_binding();
+    let startup = json!({"servers":[], "plugins":[]});
+    store
+        .dispatch_with_native_store_binding(
+            &request.id,
+            now + 1,
+            &expected,
+            &binding,
+            Some(&startup),
+        )
+        .unwrap();
+    let agent = store.get_agent(id).unwrap().unwrap();
+    assert_eq!(
+        agent.profile_snapshot["native_launch_metadata"],
+        json!({"command_id":request.id, "data":startup})
+    );
+    assert_eq!(
+        agent.profile_snapshot["native_store_binding"],
+        json!(binding)
+    );
+    assert_eq!(
+        store.get_command(&request.id).unwrap().unwrap().args,
+        admission.command.args
+    );
+}
+
+#[test]
 fn native_store_binding_commits_without_changing_admitted_input_or_retry_binding() {
     let mut store = Store::open(Path::new(":memory:")).unwrap();
     let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
@@ -6271,8 +6307,15 @@ fn native_store_binding_commits_without_changing_admitted_input_or_retry_binding
         )
         .unwrap();
     let binding = native_store_binding();
+    let startup = json!({"servers":[], "plugins":[]});
     let dispatched = store
-        .dispatch_with_native_store_binding(&request.id, now + 1, &expected, &binding)
+        .dispatch_with_native_store_binding(
+            &request.id,
+            now + 1,
+            &expected,
+            &binding,
+            Some(&startup),
+        )
         .unwrap();
     install_fixture_sources(&mut store, id, &request.id, 1, now + 1);
     assert_eq!(dispatched.value.state, CommandState::Dispatched);
@@ -6284,11 +6327,19 @@ fn native_store_binding_commits_without_changing_admitted_input_or_retry_binding
         agent.profile_snapshot["native_store_binding"],
         json!(binding)
     );
+    assert_eq!(
+        agent.profile_snapshot["native_launch_metadata"],
+        json!({"command_id":request.id, "data":startup})
+    );
     let mut input = agent.profile_snapshot.clone();
     input
         .as_object_mut()
         .unwrap()
         .remove("native_store_binding");
+    input
+        .as_object_mut()
+        .unwrap()
+        .remove("native_launch_metadata");
     assert_eq!(input, expected.profile_snapshot);
     assert_eq!(
         digest,
@@ -6309,7 +6360,7 @@ fn native_store_binding_commits_without_changing_admitted_input_or_retry_binding
     assert_eq!(retained.command, dispatched.value);
     assert_eq!(
         store
-            .dispatch_with_native_store_binding(&request.id, now + 2, &expected, &binding)
+            .dispatch_with_native_store_binding(&request.id, now + 2, &expected, &binding, None)
             .unwrap_err()
             .code,
         "bad_state"
@@ -6386,7 +6437,8 @@ fn native_store_binding_rechecks_probe_identity_and_snapshot_before_dispatch() {
                     &request.id,
                     now + 1,
                     &changed,
-                    &native_store_binding()
+                    &native_store_binding(),
+                    None
                 )
                 .unwrap_err()
                 .code,
@@ -6442,7 +6494,8 @@ fn native_store_binding_preserves_workspace_readiness_and_cancellation_fences() 
                 &request.id,
                 now,
                 &expected,
-                &native_store_binding()
+                &native_store_binding(),
+                None
             )
             .unwrap_err()
             .code,
@@ -6475,7 +6528,8 @@ fn native_store_binding_preserves_workspace_readiness_and_cancellation_fences() 
                 &request.id,
                 now + 3,
                 &expected,
-                &native_store_binding()
+                &native_store_binding(),
+                None
             )
             .unwrap_err()
             .code,
@@ -6564,7 +6618,7 @@ fn native_store_binding_retains_identical_internal_binding_and_rejects_replaceme
     let before = store.high_water().unwrap();
     assert_eq!(
         store
-            .dispatch_with_native_store_binding(&request.id, now + 1, &expected, &replacement)
+            .dispatch_with_native_store_binding(&request.id, now + 1, &expected, &replacement, None)
             .unwrap_err()
             .code,
         "source_integrity"
@@ -6572,7 +6626,7 @@ fn native_store_binding_retains_identical_internal_binding_and_rejects_replaceme
     assert_eq!(store.high_water().unwrap(), before);
     assert_eq!(store.get_agent(id).unwrap().unwrap(), expected);
     store
-        .dispatch_with_native_store_binding(&request.id, now + 2, &expected, &binding)
+        .dispatch_with_native_store_binding(&request.id, now + 2, &expected, &binding, None)
         .unwrap();
     assert_eq!(
         store.get_agent(id).unwrap().unwrap().profile_snapshot,
@@ -6606,7 +6660,7 @@ fn native_store_binding_frame_and_persistence_failures_roll_back_entire_dispatch
         }
         let before = store.high_water().unwrap();
         let error = store
-            .dispatch_with_native_store_binding(&request.id, now + 1, &expected, &binding)
+            .dispatch_with_native_store_binding(&request.id, now + 1, &expected, &binding, None)
             .unwrap_err();
         assert_eq!(
             error.code,
@@ -6671,13 +6725,12 @@ fn configured_capacity_scopes_are_reserved_atomically_and_retries_are_idempotent
         ]),
     );
     let account_blocked_id = account_blocked.id.clone();
-    assert_eq!(
-        account_store
-            .submit("owner", account_blocked, now + 2)
-            .unwrap_err()
-            .code,
-        "capacity_unavailable"
-    );
+    let error = account_store
+        .submit("owner", account_blocked, now + 2)
+        .unwrap_err();
+    assert_eq!(error.code, "capacity_unavailable");
+    assert!(error.message.contains("account:shared-account"));
+    assert!(error.message.contains("max_live=1"));
     assert_eq!(account_store.agent_count().unwrap(), 1);
     assert!(
         account_store
@@ -7374,7 +7427,11 @@ fn managed_workspace_resume_rejection_restores_ready_after_project_revocation() 
         "generic settlement remains closed for a managed workspace resume"
     );
     let rejected = store
-        .reject_workspace_resume(&resume.id, "project_registration_revoked", now + 10)
+        .reject_workspace_resume(
+            &resume.id,
+            &json!({"reason":"project_registration_revoked"}),
+            now + 10,
+        )
         .expect("withdraw admitted resume without renewed Project authority");
     assert_eq!(rejected.value.state, CommandState::Rejected);
     assert_eq!(
@@ -7560,7 +7617,11 @@ fn managed_catch_up_resume_sibling_cancellation_restores_for_retry() {
         Some(2)
     );
     store
-        .reject_workspace_resume(&first_resume_id, "fixture_pre_dispatch_rejection", now + 23)
+        .reject_workspace_resume(
+            &first_resume_id,
+            &json!({"reason":"fixture_pre_dispatch_rejection"}),
+            now + 23,
+        )
         .expect("withdraw the known no-effect predecessor");
     assert_eq!(
         store.get_command(&first_send_id).unwrap().unwrap().state,
@@ -8110,7 +8171,11 @@ fn managed_resume_sibling_waits_for_exact_workspace_stop_settlement() {
         .request_workspace_cancel(&stop_id, &second_resume_id, 2, now + 24)
         .expect("latch exact Stop ownership on the second Resume");
     store
-        .reject_workspace_resume(&first_resume_id, "fixture_pre_dispatch_rejection", now + 25)
+        .reject_workspace_resume(
+            &first_resume_id,
+            &json!({"reason":"fixture_pre_dispatch_rejection"}),
+            now + 25,
+        )
         .expect("make the first Resume sibling terminal");
 
     let held = store
@@ -8297,7 +8362,11 @@ fn unknown_managed_resume_stop_preserves_marker_input_and_reservation() {
         .unwrap();
     assert_eq!(
         store
-            .reject_workspace_resume(&resume_id, "must_not_override_unknown_stop", now + 10)
+            .reject_workspace_resume(
+                &resume_id,
+                &json!({"reason":"must_not_override_unknown_stop"}),
+                now + 10
+            )
             .unwrap_err()
             .code,
         "bad_state"
@@ -8472,7 +8541,11 @@ fn managed_resume_withdrawal_refuses_uncertain_inputs_and_foreign_markers() {
             .unwrap();
 
         let error = store
-            .reject_workspace_resume(&resume_id, "fixture_rejection", reject_now)
+            .reject_workspace_resume(
+                &resume_id,
+                &json!({"reason":"fixture_rejection"}),
+                reject_now,
+            )
             .expect_err("uncertain or foreign custody must remain fenced");
         assert_eq!(
             error.code,
