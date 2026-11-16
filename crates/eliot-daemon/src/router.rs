@@ -385,6 +385,30 @@ impl Router {
             "harness.doctor" => self.harness_doctor(&params, &principal).await,
             "models.catalog" => self.models_catalog(&params, &principal).await,
             "agent.history" => self.agent_history(&params, &principal).await,
+            "agent.archive" => {
+                require_owner(&principal)?;
+                let request: eliot_core::api::AgentArchiveRequest =
+                    eliot_core::api::discovery::decode_params(params.clone())?;
+                request.validate()?;
+                self.inner.store.lock().await.change_agent_tree(
+                    &request.id,
+                    &request.agent,
+                    Some(request.archived),
+                    now_ms(),
+                )
+            }
+            "agent.delete" => {
+                require_owner(&principal)?;
+                let request: eliot_core::api::AgentDeleteRequest =
+                    eliot_core::api::discovery::decode_params(params.clone())?;
+                request.validate()?;
+                self.inner.store.lock().await.change_agent_tree(
+                    &request.id,
+                    &request.agent,
+                    None,
+                    now_ms(),
+                )
+            }
             "agent.list" => self.agent_list(&params, &principal).await,
             "agent.result" => self.agent_result(&params, &principal).await,
             "agent.processes" => self.agent_processes(&params, &principal).await,
@@ -842,6 +866,14 @@ impl Router {
             "launch" => {
                 reject_launch_derived_keys(&request.args)?;
                 if let Some(retained) = retained_launch_profile(&store, request)? {
+                    if request.args.get("chat") == Some(&Value::Bool(true))
+                        && request.args.get("workspace").is_none()
+                    {
+                        if let Some(workspace) = retained.workspace.clone() {
+                            request.args["workspace"] = workspace;
+                        }
+                        request.args["project"] = json!("");
+                    }
                     align_retained_workspace_alias(request, retained.workspace.as_ref());
                     install_retained_profile(request, retained)?;
                 }
@@ -1673,8 +1705,41 @@ impl Router {
                         let store = self.inner.store.lock().await;
                         hierarchy::default_agent_child_workspace(&store, &mut request, principal)?;
                     }
+                    let chat = match request.args.get("chat") {
+                        None => false,
+                        Some(Value::Bool(value)) => *value,
+                        _ => return Err(Error::new("invalid", "launch chat must be a boolean")),
+                    };
+                    if chat {
+                        require_owner(principal)?;
+                        if ["workspace", "worktree", "base", "parent", "project"]
+                            .iter()
+                            .any(|key| request.args.get(*key).is_some())
+                        {
+                            return Err(Error::new(
+                                "invalid",
+                                "chat launch omits workspace, project, parent and worktree",
+                            ));
+                        }
+                        let configured = crate::config::load_daemon_config(&self.inner.data_root)?;
+                        let root = crate::config::validate_chats_location(
+                            &self.inner.data_root,
+                            configured.chats_root.as_deref(),
+                        )?;
+                        let root = cleanup::private_chat_root(&root)?;
+                        let data = std::fs::canonicalize(&self.inner.data_root)
+                            .map_err(|_| Error::new("unavailable", "data root unavailable"))?;
+                        if root.starts_with(&data) || data.starts_with(&root) {
+                            return Err(Error::new(
+                                "invalid",
+                                "chats_root must be outside the daemon data directory",
+                            ));
+                        }
+                        request.args["workspace"] = json!(root.to_string_lossy());
+                    }
                     normalize_launch(&mut request, principal)?;
                     if matches!(principal, Principal::Owner)
+                        && !chat
                         && let Some(workspace) =
                             request.args.get("workspace").and_then(Value::as_str)
                     {
@@ -1806,6 +1871,14 @@ impl Router {
         let store = self.inner.store.lock().await;
         store.ensure_committed_reads()?;
         if let Some(retained) = retained_launch_profile(&store, request)? {
+            if request.args.get("chat") == Some(&Value::Bool(true))
+                && request.args.get("workspace").is_none()
+            {
+                if let Some(workspace) = retained.workspace.clone() {
+                    request.args["workspace"] = workspace;
+                }
+                request.args["project"] = json!("");
+            }
             align_retained_workspace_alias(request, retained.workspace.as_ref());
             install_retained_profile(request, retained)?;
             return Ok(true);
@@ -4106,6 +4179,7 @@ impl Router {
         let request: AgentListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let filter = AgentListFilter {
+            archived: request.archived,
             state: request.state,
             project: request.project.clone(),
             harness: request.harness.clone(),
@@ -6329,7 +6403,14 @@ fn normalize_launch(request: &mut SubmitCommand, _principal: &Principal) -> Resu
         }
     }
     args.insert("workspace".to_owned(), Value::String(workspace.clone()));
-    args.insert("project".to_owned(), Value::String(workspace));
+    args.insert(
+        "project".to_owned(),
+        Value::String(if args.get("chat") == Some(&Value::Bool(true)) {
+            String::new()
+        } else {
+            workspace
+        }),
+    );
     Ok(())
 }
 

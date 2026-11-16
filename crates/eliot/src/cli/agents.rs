@@ -199,6 +199,7 @@ pub(crate) async fn run_launch(
         access,
         cmd,
         workspace,
+        chat,
         worktree,
         base,
         parent,
@@ -227,8 +228,13 @@ pub(crate) async fn run_launch(
             "--role must be a nonempty role name using letters, digits, '-' or '_'",
         ));
     }
-    let workspace = std::path::absolute(&workspace)
+    let workspace = workspace
+        .map(std::path::absolute)
+        .transpose()
         .map_err(|error| Failure::new(2, format!("cannot resolve launch workspace: {error}")))?;
+    if workspace.is_none() && !chat {
+        return Err(Failure::new(2, "launch requires --workspace or --chat"));
+    }
     if let Some(name) = &harness
         && name.trim().is_empty()
     {
@@ -272,9 +278,13 @@ pub(crate) async fn run_launch(
     }
     validate_text(prompt.as_deref())?;
     let deadline = wait_deadline(timeout_seconds)?;
-    let mut args = json!({
-        "workspace": workspace.to_string_lossy(),
-    });
+    let mut args = json!({});
+    if let Some(workspace) = workspace {
+        args["workspace"] = json!(workspace.to_string_lossy());
+    }
+    if chat {
+        args["chat"] = json!(true);
+    }
     if let Some(profile) = profile {
         args["profile"] = Value::String(profile);
     }
@@ -1165,6 +1175,30 @@ pub(crate) fn swarm_wait_exit_code(response: &SwarmWaitResponse) -> u8 {
         return 4;
     }
     1
+}
+
+pub(crate) async fn run_tree_change(
+    agent: String,
+    archived: Option<bool>,
+    data_dir: PathBuf,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
+    let id = mutation_id(id)?;
+    let method = if archived.is_some() {
+        "agent.archive"
+    } else {
+        "agent.delete"
+    };
+    let mut params = json!({"id":id,"agent":agent});
+    if let Some(archived) = archived {
+        params["archived"] = json!(archived);
+    }
+    let value: Value = eliot_daemon::client_call_typed(&data_dir, method, &params)
+        .await
+        .map_err(|e| Failure::from_core(e, true))?;
+    print_value(&value, json_output);
+    Ok(0)
 }
 
 #[cfg(test)]

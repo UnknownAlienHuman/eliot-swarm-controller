@@ -404,6 +404,10 @@ pub struct PendingRequest {
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Agent {
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub chat: bool,
     pub id: String,
     pub generation: i64,
     #[serde(default)]
@@ -470,6 +474,8 @@ impl Agent {
     ) -> Self {
         let id = id.into();
         Self {
+            archived: false,
+            chat: false,
             root: id.clone(),
             id,
             generation: 0,
@@ -1941,6 +1947,17 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         "tool.started" | "tool.completed" | "hook.before_tool" => {
             // Pure watch facts: exact active-turn binding only, no state change.
             require_live_turn(agent, event)?;
+        }
+        "quota.observed" => {
+            let observation: api::harness::QuotaObservation = serde_json::from_value(
+                event
+                    .data
+                    .get("observation")
+                    .cloned()
+                    .ok_or_else(|| Error::new("invalid", "quota observation absent"))?,
+            )
+            .map_err(|_| Error::new("invalid", "quota observation schema invalid"))?;
+            observation.validate()?;
         }
         "session.usage" => {
             // Session-scoped usage snapshot for this Agent generation: no

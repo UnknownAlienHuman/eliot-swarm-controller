@@ -1,6 +1,8 @@
 //! Shared public API DTOs for events, views, reads and mutations. Authorization,
 //! admission and effect handling remain in the Router and Store.
 
+mod agent_lifecycle;
+pub use agent_lifecycle::*;
 mod agent_views;
 mod cleanup;
 pub use cleanup::*;

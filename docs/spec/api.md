@@ -635,6 +635,33 @@ wrong types and out-of-range values are `invalid`. `observations` defaults to fa
 when omitted and must be a boolean when present; explicit null is `invalid`. Absent
 optional members are omitted when requests are serialized.
 
+`agent.archive {id, agent:"aN", archived:bool}` is Owner-only and atomically
+archives or unarchives the selected Agent and all current descendants. Every
+member must be idle or stopped, with no active/uncertain turn, pending request or
+open command; otherwise it returns typed `busy` and stops nothing. The flag is
+durable. `agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;
+totals and cursors use the same filter. Summaries and full Agents expose `archived`.
+CLI: `swarm archive aN`, `swarm unarchive aN`, `swarm ls --archived include`.
+
+`agent.delete {id, agent:"aN"}` is Owner-only and removes one stopped Agent tree's
+Store records, using retention's leaf-first command cleanup. Live custody, open
+commands, uncertain turns or a pinned history floor return `busy`; oversized
+operations return `unavailable` atomically. It never stops an Agent or deletes
+workspace files, native stores or Git branches. Run artifact cleanup separately
+before removing its ownership records. Deleted command IDs remain bound until
+the retry window expires, preventing a deleted native effect from being readmitted.
+Archive/delete replies are `{agent, affected, archived:bool|null, deleted:bool}`;
+mutation ID, result and changes commit together. Exact retries return the retained
+reply even after deletion; changed payloads return `id_conflict`. MCP mints `id`
+when omitted, as for other durable writes. CLI: `swarm delete aN`.
+
+Removing a project already uses the settings writer: call
+`settings.read {sections:["projects"]}`, remove its key from the returned complete
+projects object, then `settings.save {expected_revision:<read revision>,
+sections:{projects:<remaining object>},client:"desktop",dry_run:false}`. This
+unregisters it without deleting its checkout or chats. No `project.remove` alias
+is needed. A later explicit open/launch in that checkout can discover it again.
+
 `agent.list` returns compact summaries ordered by Agent ID, never full Agent
 records; full records stay available through `agent.get`. Optional `state`,
 `project`, `harness`, `parent` and `root` filters are exact indexed matches:
@@ -879,6 +906,16 @@ the CLI prints its code and message, including through linked-start failure read
 Launch/resume with explicit text creates a start plus linked `<id>/send`. Without
 `--wait`, return session readiness; with it, follow the linked input to its exact terminal
 turn. An input-created native session still reports these distinct outcomes.
+
+An Owner `launch` may set `args.chat:true` and omit `workspace`. It must also
+omit `project`, `parent`, `worktree` and `base`. The daemon freezes the configured
+`[daemon].chats_root`, Store allocates the Agent ID, and the daemon exclusively
+creates `<chats_root>/<agent-id>` as a private directory before native startup.
+The directory identity is registered for artifact cleanup; collisions are refused.
+The Agent and summaries carry `chat:true` and `project:""`; children inherit this
+classification. Ordinary project discovery is skipped. The command retains the
+root input, and same-ID retries use its frozen path even after settings change.
+CLI: `swarm launch --chat --harness codex [PROMPT]` (or `--profile P`).
 
 Worktree creation is opt-in on the same launch command:
 

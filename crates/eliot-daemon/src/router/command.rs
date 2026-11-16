@@ -426,6 +426,13 @@ impl Router {
     /// Prepare the managed workspace for a start verb before dispatch.
     /// Returns false after settling a preparation failure.
     async fn prepare_start_workspace(&self, id: &str, command: &Command) -> bool {
+        if command.verb == "launch" && command.args.get("chat") == Some(&Value::Bool(true)) {
+            let prepared = self.prepare_chat_directory(command).await;
+            if let Err(error) = prepared {
+                self.reject_undispatched_error(id, &error).await;
+                return false;
+            }
+        }
         if matches!(command.verb.as_str(), "launch" | "resume")
             && let Err(error) = self.inner.workspaces.prepare(id).await
         {
