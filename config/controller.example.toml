@@ -9,7 +9,7 @@
 # Agent-scoped server plus an optional `mcp_allow` list of native server
 # names; Swarm MCP names can never be allow-listed). `inherit` is an explicit
 # opt-in to the owner's full native MCP surface. Muse and Antigravity have no
-# minimal mapping, so their profiles must set `mcp = "inherit"` explicitly.
+# minimal mapping, so a profile that omits `mcp` resolves to `inherit` there.
 
 [profiles.codex-luna]
 harness = "codex"

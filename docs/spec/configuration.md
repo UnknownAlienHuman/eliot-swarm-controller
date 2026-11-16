@@ -246,8 +246,9 @@ exact tool formats are resolved separately. See the
 
 ### Worker MCP policy
 
-Every profile selects a worker MCP policy in `mcp`: `minimal` (the default)
-or `inherit` (explicit opt-in), plus an optional `mcp_allow` list of native
+Every profile selects a worker MCP policy in `mcp`: `minimal` (the default
+where the harness maps it) or `inherit` (explicit opt-in, and the default for
+Muse and Antigravity, which have no minimal mapping), plus an optional `mcp_allow` list of native
 server names. Swarm MCP names (`eliot_swarm`, `eliot-swarm` and the
 per-session prefix) are reserved in every policy and can never be
 allow-listed: a worker that talks to the owner's daemon with the owner's
@@ -291,9 +292,9 @@ Codex, Claude and OpenCode implement `minimal`, each with its installed
 isolation mechanism (Codex per-run transport-carrying disables, Claude the
 Eliot-only per-run config plus `--strict-mcp-config`, OpenCode the isolated
 per-Agent serve whose generated config carries only the Agent-scoped
-server); Muse and Antigravity keep `inherit` only and reject `minimal` as
-`unsupported`, so their profiles must set `mcp = "inherit"` explicitly now
-that the default is `minimal`. Only Codex implements selective inclusion: a
+server); Muse and Antigravity keep `inherit` only and reject an explicit
+`minimal` as `unsupported`; a profile that omits `mcp` resolves to `inherit`
+there, so existing Muse and Antigravity profiles keep loading. Only Codex implements selective inclusion: a
 non-empty `mcp_allow` with `minimal` on Claude or OpenCode is rejected as
 `unsupported` at config load (an allow list would be silently dropped), and
 with `inherit` an allow list is already rejected because it requires

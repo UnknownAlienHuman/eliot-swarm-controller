@@ -2787,16 +2787,22 @@ fn freeze_mcp_policy(
     let harness = support.harness;
     let supports_minimal = support.minimal;
     let supports_allow = support.allow;
-    let policy = core::McpPolicy::parse(entry.mcp.as_deref()).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "mcp",
-            &error.message,
-            "profile_error",
-        )
-    })?;
+    // An unset `mcp` takes the default `minimal` only where the harness maps
+    // it; Muse and Antigravity have no minimal mapping, so their profiles
+    // keep loading as `inherit` instead of failing after the default change.
+    let policy = match entry.mcp.as_deref() {
+        None if !supports_minimal => core::McpPolicy::Inherit,
+        raw => core::McpPolicy::parse(raw).map_err(|error| {
+            profile_field_error(
+                source,
+                table_offset,
+                name,
+                "mcp",
+                &error.message,
+                "profile_error",
+            )
+        })?,
+    };
     let allow =
         core::validate_allow_list(entry.mcp_allow.as_deref().unwrap_or(&[])).map_err(|error| {
             profile_field_error(
@@ -4320,8 +4326,8 @@ permissions = "workspace-write"
         // Claude and OpenCode implement minimal without selective inclusion,
         // so a non-empty allow list is unsupported there; only Codex maps
         // it. Muse and Antigravity keep inherit only: no harness isolation
-        // mechanism is verified, so profiles that omit `mcp` fail there and
-        // must opt into `inherit` explicitly.
+        // mechanism is verified, so an omitted `mcp` resolves to `inherit`
+        // there (existing profiles keep loading); explicit `minimal` fails.
         let claude_cmd = if cfg!(windows) {
             "C:/Users/test/.local/bin/claude.exe"
         } else {
@@ -4387,12 +4393,12 @@ permissions = "workspace-write"
             (
                 "muse",
                 "[profiles.muse]\nharness='muse'\nmodel='m'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\n",
-                "unsupported",
+                "ok",
             ),
             (
                 "agy",
                 "[profiles.agy]\nharness='antigravity'\nmodel='test-model'\ncmd='C:/Tools/Agy/agy.exe'\n",
-                "unsupported",
+                "ok",
             ),
             (
                 "muse",

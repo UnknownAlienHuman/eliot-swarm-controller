@@ -590,9 +590,9 @@ turns, no retries, no tool calls and no approval requests. Both owned hosts and
 their observed descendants exited; owner settings and trust state were
 unchanged. Existing Eliot launch behavior remains unchanged.
 
-This harness keeps `inherit` only: profiles must set `mcp = "inherit"`
-explicitly (the default is now `minimal`), and a non-`inherit` policy is
-rejected as `unsupported` at config load. Verified read-only
+This harness keeps `inherit` only: a profile that omits `mcp` resolves to
+`inherit` (the `minimal` default applies only where a harness maps it), and
+an explicit non-`inherit` policy is rejected as `unsupported` at config load. Verified read-only
 (`muse --help`, `muse mcp --help`): `muse mcp` covers OAuth login/logout
 only, and no `serve` isolation flag for MCP sources was observed, so no
 `minimal` mechanism is implemented.

@@ -413,9 +413,9 @@ strictly bounded to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon
 
 ## Worker MCP policy
 
-This harness keeps `inherit` only: profiles must set `mcp = "inherit"`
-explicitly (the default is now `minimal`), and a non-`inherit` policy is
-rejected as `unsupported` at config load. Verified read-only
+This harness keeps `inherit` only: a profile that omits `mcp` resolves to
+`inherit` (the `minimal` default applies only where a harness maps it), and
+an explicit non-`inherit` policy is rejected as `unsupported` at config load. Verified read-only
 (`agy acp --help`, installed 1.5.9): the ACP server flags expose no MCP
 isolation mechanism (no strict/ignore-MCP flag; the documented top-level
 `--settings` is a session-only settings surface, not a verified isolation
