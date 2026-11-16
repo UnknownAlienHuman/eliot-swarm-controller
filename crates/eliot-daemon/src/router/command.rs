@@ -2112,55 +2112,25 @@ impl Router {
         }
     }
 
-    /// Upgrade a post-dispatch plugin error with a plugin panic marker
-    /// newer than the failed command. The marker is authoritative: the
-    /// plugin process died mid-command, so the failure is a Swarm plugin
-    /// crash with its thread and `file:line`, and the retained stderr tails
-    /// (including the `eliot_crash` line) stay attached as evidence.
-    fn attach_plugin_crash(&self, created_at: Option<i64>, error: &Error) -> Error {
-        let Some(since_ms) = created_at else {
-            return error.clone();
-        };
-        let markers = crate::crash::take_recent_plugin_markers(
-            &crate::crash::crash_dir(&self.inner.data_root),
-            since_ms,
-        );
-        let Some(marker) = markers.last() else {
-            return error.clone();
-        };
-        let mut crashed = Error::new(
-            "plugin_panicked",
-            format!("plugin panicked mid-command: {}", marker.message),
-        )
-        .with_where("plugin.command.panic")
-        .with_origin(FailureOrigin::Swarm, marker.summary());
-        crashed.diagnostics = error.diagnostics.clone();
-        crashed
-    }
-
     async fn settle_plugin_error(&self, id: &str, error: &Error) {
         let current = {
             let store = self.inner.store.lock().await;
             store.get_command(id)
         };
-        let (current_state, command_target, previous_outcome, created_at) = match current {
+        let (current_state, command_target, previous_outcome) = match current {
             Ok(Some(command)) => (
                 Some(command.state),
                 command.target.zip(command.generation),
                 command.outcome,
-                Some(command.created_at),
             ),
-            _ => (None, None, None, None),
+            _ => (None, None, None),
         };
         let late_batch_cause = command_target.as_ref().and_then(|(agent, generation)| {
             self.inner
                 .plugin_host
                 .take_late_batch_cause(agent, *generation)
         });
-        // Attach before sanitizing so the marker message is redacted with
-        // the daemon secrets at the same boundary as every other failure.
-        let error = self.attach_plugin_crash(created_at, error);
-        let error = self.sanitized_failure(&error, "plugin.command.unknown");
+        let error = self.sanitized_failure(error, "plugin.command.unknown");
         crate::logging::record(
             &SecretPolicy::new(self.daemon_secrets()),
             &error.code,

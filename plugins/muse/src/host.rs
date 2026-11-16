@@ -403,18 +403,9 @@ impl MusePlugin {
     /// sent, so the launch is definitely failed, never unknown. The reason
     /// names the failed check in short non-secret words; it is persisted in
     /// the daemon outcome, so it must never carry paths, values, or secrets.
-    fn retain_proven_no_effect_start(
-        &mut self,
-        params: &AgentStartParams,
-        reason: impl Into<String>,
-    ) -> Value {
-        let value = json!({
-            "agent_id": params.agent_id,
-            "generation": params.generation,
-            "command_id": params.command_id,
-            "state": "failed",
-            "reason": reason.into(),
-        });
+    fn retain_proven_no_effect_start(&mut self, params: &AgentStartParams, error: Error) -> Value {
+        let error = eliot_plugin::session::classify_start_failure(error, "muse", "prepare");
+        let value = eliot_plugin::session::failed_start_value(params, error);
         self.failed_start = Some(FailedStart {
             agent_id: params.agent_id.clone(),
             generation: params.generation,
@@ -490,7 +481,7 @@ impl MusePlugin {
         } = match start::prepare_profile(&params, initialized) {
             Ok(prepared) => prepared,
             Err(error) => {
-                return Ok(self.retain_proven_no_effect_start(&params, *error.message));
+                return Ok(self.retain_proven_no_effect_start(&params, error));
             }
         };
         // A spawn failure leaves no child behind: still proven-no-effect.
@@ -504,7 +495,9 @@ impl MusePlugin {
                         "Muse session host process could not be spawned ({})",
                         error.code
                     );
-                    return Ok(self.retain_proven_no_effect_start(&params, reason));
+                    return Ok(
+                        self.retain_proven_no_effect_start(&params, error.with_message(reason))
+                    );
                 }
             };
 
@@ -538,7 +531,7 @@ impl MusePlugin {
             // Registration failed but the child is terminated: no session was
             // dispatched, so this is proven-no-effect. Registration messages
             // are canned words plus a code, safe to persist as the reason.
-            return Ok(self.retain_proven_no_effect_start(&params, *error.message));
+            return Ok(self.retain_proven_no_effect_start(&params, error));
         }
 
         let initialized_native = match Self::initialize_native(
@@ -563,7 +556,7 @@ impl MusePlugin {
                 // model catalogue read) and the child is terminated: no
                 // `session/start|resume` was dispatched and no input was sent,
                 // so this is proven-no-effect (failed, never unknown).
-                return Ok(self.retain_proven_no_effect_start(&params, *error.message));
+                return Ok(self.retain_proven_no_effect_start(&params, error));
             }
         };
         session.selected_effort = initialized_native.effort.clone();
@@ -588,7 +581,7 @@ impl MusePlugin {
                     return Err(error.with_code("unknown").with_message(message));
                 }
                 // No `session/resume` was dispatched: proven-no-effect.
-                return Ok(self.retain_proven_no_effect_start(&params, *error.message));
+                return Ok(self.retain_proven_no_effect_start(&params, error));
             }
             session.session_id = Some(subject.native_ref.clone());
             if let Err(error) = verify_resume_preflight(
@@ -614,7 +607,7 @@ impl MusePlugin {
                     return Err(error.with_code("unknown").with_message(message));
                 }
                 // Only prerequisite reads ran: proven-no-effect.
-                return Ok(self.retain_proven_no_effect_start(&params, *error.message));
+                return Ok(self.retain_proven_no_effect_start(&params, error));
             }
         }
 
@@ -635,7 +628,7 @@ impl MusePlugin {
             match encoded {
                 Ok(value) => ("session/resume", value),
                 Err(error) => {
-                    return Ok(self.retain_proven_no_effect_start(&params, *error.message));
+                    return Ok(self.retain_proven_no_effect_start(&params, error));
                 }
             }
         } else {
@@ -653,7 +646,7 @@ impl MusePlugin {
             match encoded {
                 Ok(value) => ("session/start", value),
                 Err(error) => {
-                    return Ok(self.retain_proven_no_effect_start(&params, *error.message));
+                    return Ok(self.retain_proven_no_effect_start(&params, error));
                 }
             }
         };
@@ -1361,7 +1354,17 @@ impl MusePlugin {
                     || error.code == "native_rejected"
                     || error.code == "frame_too_large" =>
             {
-                let result = rejected_control("Muse turn/steer was not applied");
+                let mut result = rejected_control("Muse turn/steer was not applied");
+                eliot_plugin::session::attach_failure_origin(
+                    &mut result,
+                    "muse",
+                    error.origin_or_unknown(),
+                    error
+                        .origin_evidence
+                        .as_deref()
+                        .unwrap_or("native refusal lacks an origin signal"),
+                    &eliot_core::SecretPolicy::new(session.secrets.iter()),
+                );
                 settle_control(
                     session,
                     &params.command_id,
@@ -1378,7 +1381,14 @@ impl MusePlugin {
                 let steered: NativeTurnSteerResult = match serde_json::from_value(value) {
                     Ok(steered) => steered,
                     Err(_) => {
-                        let result = unknown_control("Muse turn/steer response was invalid");
+                        let mut result = unknown_control("Muse turn/steer response was invalid");
+                        eliot_plugin::session::attach_failure_origin(
+                            &mut result,
+                            "muse",
+                            eliot_core::FailureOrigin::HarnessContractMismatch,
+                            "docs/harnesses/muse.md#native-mapping: turn/steer response violates the installed result schema",
+                            &eliot_core::SecretPolicy::new(session.secrets.iter()),
+                        );
                         settle_control(session, &params.command_id, ControlOutcome::Unknown);
                         return Ok(result);
                     }
@@ -1387,7 +1397,15 @@ impl MusePlugin {
                     || steered.status != "accepted"
                     || steered.turn_id != turn_id
                 {
-                    let result = unknown_control("Muse turn/steer was not absorbed by its turn");
+                    let mut result =
+                        unknown_control("Muse turn/steer was not absorbed by its turn");
+                    eliot_plugin::session::attach_failure_origin(
+                        &mut result,
+                        "muse",
+                        eliot_core::FailureOrigin::HarnessContractMismatch,
+                        "docs/harnesses/muse.md#native-mapping: turn/steer result contradicts the submitted command, expected turn or accepted status",
+                        &eliot_core::SecretPolicy::new(session.secrets.iter()),
+                    );
                     settle_control(session, &params.command_id, ControlOutcome::Unknown);
                     return Ok(result);
                 }
@@ -1944,7 +1962,8 @@ fn select_launch_model(
                     format!(
                         "Muse model catalogue (source {source}, {count} models) does not contain the exact requested model"
                     ),
-                )
+                ).with_where("plugin.muse.start.model_list")
+                 .with_origin(eliot_core::FailureOrigin::Harness, "native model catalogue omits the exact requested model; upstream error absent")
             }),
         None if catalog.models.is_empty() => Err(Error::new(
             "profile_error",
@@ -3286,7 +3305,10 @@ mod tests {
     fn proven_no_effect_start_result_carries_binding_and_reason() {
         let params = AgentStartParams::new("agent-1", 1, "018f0a00-0000-7000-8000-000000000002");
         let mut plugin = MusePlugin::default();
-        let value = plugin.retain_proven_no_effect_start(&params, "Muse test check failed");
+        let value = plugin.retain_proven_no_effect_start(
+            &params,
+            eliot_core::Error::new("profile_error", "Muse test check failed"),
+        );
         assert_eq!(value.get("state").and_then(Value::as_str), Some("failed"));
         assert_eq!(
             value.get("reason").and_then(Value::as_str),

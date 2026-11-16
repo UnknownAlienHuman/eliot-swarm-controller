@@ -4,18 +4,18 @@
 //! and every plugin (`swarm plugin <harness>`), so one hook with a
 //! mode-aware code covers both: `daemon.panicked` in the daemon,
 //! `plugin.panicked` in plugin mode. The hook records the thread,
-//! `file:line`, the bounded control-stripped panic message and a bounded
+//! `file:line`, a payload-omitted notice and a bounded payload-free
 //! backtrace, writes the marker file under `ELIOT_CRASH_DIR`, and echoes
 //! one `eliot_crash` JSON line to stderr (a WMI-started daemon has no
 //! console, so the file is the durable path). The hook never touches the
 //! Store, never allocates unboundedly, and never panics itself: logging
 //! and settlement of the marker happen after restart (daemon) or in the
-//! observing daemon (plugin), never inside the hook.
+//! observing daemon (plugin), never inside the hook. Arbitrary panic
+//! payloads are never classified as safe, even when no policy is available.
 //!
 //! Markers are consumed once: daemon startup loads the latest
 //! `daemon.panicked` marker into `daemon.status` and deletes it; plugin
-//! error settlement consumes `plugin.panicked` markers newer than the
-//! failed command.
+//! error settlement reads only the exact owned plugin's stderr pipe.
 
 use eliot_core::{SecretPolicy, api::CrashMarker};
 use std::path::{Path, PathBuf};
@@ -59,8 +59,18 @@ fn install_panic_hook_for(code: &'static str) {
     if INSTALLED.swap(true, Ordering::SeqCst) {
         return;
     }
+    // Capture known environment credentials before a panic, not while unwinding.
+    let policy = SecretPolicy::new(std::env::vars().filter_map(|(name, value)| {
+        let name = name.to_ascii_uppercase();
+        (name.contains("TOKEN")
+            || name.contains("SECRET")
+            || name.contains("PASSWORD")
+            || name.contains("API_KEY")
+            || name.contains("CREDENTIAL"))
+        .then_some(value)
+    }));
     std::panic::set_hook(Box::new(move |info| {
-        let marker = capture(code, info);
+        let marker = capture(code, info, &policy);
         let from_process = CRASH_DIR.get().cloned();
         let from_env = std::env::var("ELIOT_CRASH_DIR").ok().map(PathBuf::from);
         if let Some(dir) = from_process.or(from_env) {
@@ -86,39 +96,30 @@ fn bound_text(text: &str, limit: usize) -> String {
     text[..end].to_owned()
 }
 
-/// Control-stripped panic payload, bounded. Capture has no secret policy:
-/// payloads from our code are static strings; the daemon redacts the
-/// loaded marker with its secrets before persisting or serving it.
-fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
-    let payload = info
-        .payload()
-        .downcast_ref::<&str>()
-        .map(|text| (*text).to_owned())
-        .or_else(|| info.payload().downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "non-string panic payload".to_owned());
-    let stripped: String = payload
-        .chars()
-        .filter(|ch| !ch.is_control() || *ch == '\n' || *ch == '\t')
-        .collect();
-    bound_text(stripped.trim(), CrashMarker::MAX_MESSAGE_CHARS)
-}
-
-fn capture(code: &str, info: &std::panic::PanicHookInfo<'_>) -> CrashMarker {
+fn capture(code: &str, info: &std::panic::PanicHookInfo<'_>, policy: &SecretPolicy) -> CrashMarker {
     let location = info
         .location()
         .map(|location| format!("{}:{}", location.file(), location.line()))
         .unwrap_or_else(|| "unknown".to_owned());
-    let thread = std::thread::current()
-        .name()
-        .unwrap_or("unnamed")
-        .to_owned();
+    let current = std::thread::current();
+    // User-defined thread names are arbitrary strings just like payloads.
+    let thread = match current.name().unwrap_or("unnamed") {
+        name @ ("main" | "tokio-runtime-worker" | "unnamed") => name,
+        _ => "unclassified thread name omitted",
+    };
     let backtrace = format!("{}", std::backtrace::Backtrace::force_capture());
     CrashMarker {
         code: code.to_owned(),
-        thread: bound_text(&thread, CrashMarker::MAX_THREAD_CHARS),
-        location: bound_text(&location, CrashMarker::MAX_LOCATION_CHARS),
-        message: panic_message(info),
-        backtrace: bound_text(&backtrace, CrashMarker::MAX_BACKTRACE_CHARS),
+        thread: bound_text(&policy.redact_text(thread), CrashMarker::MAX_THREAD_CHARS),
+        location: bound_text(
+            &policy.redact_text(&location),
+            CrashMarker::MAX_LOCATION_CHARS,
+        ),
+        message: "panic payload omitted (unclassified)".to_owned(),
+        backtrace: bound_text(
+            &policy.redact_text(&backtrace),
+            CrashMarker::MAX_BACKTRACE_CHARS,
+        ),
         timestamp: now_ms(),
     }
 }
@@ -127,7 +128,13 @@ fn capture(code: &str, info: &std::panic::PanicHookInfo<'_>) -> CrashMarker {
 /// small file cap new markers are dropped rather than growing the
 /// directory. Never fails the panicking process further.
 pub(crate) fn write_marker(dir: &Path, marker: &CrashMarker) {
-    if std::fs::create_dir_all(dir).is_err() {
+    #[cfg(windows)]
+    let private = crate::platform::windows::ensure_private_root(dir);
+    #[cfg(unix)]
+    let private = crate::platform::unix::ensure_private_root(dir);
+    #[cfg(not(any(windows, unix)))]
+    let private: std::io::Result<()> = Err(std::io::ErrorKind::Unsupported.into());
+    if private.is_err() {
         return;
     }
     if std::fs::read_dir(dir)
@@ -148,13 +155,16 @@ pub(crate) fn write_marker(dir: &Path, marker: &CrashMarker) {
     {
         return;
     }
-    if let Ok(bytes) = serde_json::to_vec(marker) {
-        let _ = std::fs::write(dir.join(name), bytes);
+    if let Ok(bytes) = serde_json::to_vec(marker)
+        && bytes.len() <= 64 * 1024
+    {
+        // Reuse the existing private create/write/sync/atomic-rename owner.
+        let _ = crate::platform::data_dir::replace_private_file(dir, &name, &bytes);
     }
 }
 
 /// Read and consume (delete) every marker of one code, oldest first.
-/// Unparseable files are deleted too: they can never become evidence.
+/// Temporary or incomplete files are ignored, never deleted by a reader.
 pub(crate) fn take_markers(dir: &Path, code: &str) -> Vec<CrashMarker> {
     let mut markers = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -165,17 +175,21 @@ pub(crate) fn take_markers(dir: &Path, code: &str) -> Vec<CrashMarker> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(code))
+                .is_some_and(|name| {
+                    name.starts_with(&format!("{code}-")) && name.ends_with(".json")
+                })
         })
         .collect();
     paths.sort();
     for path in paths {
-        let parsed = std::fs::read(&path)
+        let parsed = std::fs::metadata(&path)
             .ok()
+            .filter(|metadata| metadata.len() <= 64 * 1024 && metadata.is_file())
+            .and_then(|_| std::fs::read(&path).ok())
             .and_then(|bytes| serde_json::from_slice::<CrashMarker>(&bytes).ok())
             .filter(|marker| marker.code == code && marker.validate().is_ok());
-        let _ = std::fs::remove_file(&path);
         if let Some(marker) = parsed {
+            let _ = std::fs::remove_file(&path);
             markers.push(marker);
         }
     }
@@ -199,19 +213,50 @@ pub(crate) fn load_previous_crash(data_root: &Path, policy: &SecretPolicy) -> Op
     })
 }
 
-/// Plugin markers newer than `since_ms` for failed-command settlement.
-/// Consumes every `plugin.panicked` file (old ones can never become
-/// evidence for a later command) but returns only the in-window markers.
-pub(crate) fn take_recent_plugin_markers(dir: &Path, since_ms: i64) -> Vec<CrashMarker> {
-    take_markers(dir, "plugin.panicked")
-        .into_iter()
-        .filter(|marker| marker.timestamp >= since_ms)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_probe() {
+        if let Ok(dir) = std::env::var("K68_PANIC_PROBE_DIR") {
+            set_crash_dir(Path::new(&dir));
+            install_panic_hook(false);
+            let _ = std::panic::catch_unwind(|| panic!("private-token-k68-panic"));
+        }
+    }
+
+    #[test]
+    fn panic_payload_never_reaches_either_sink() {
+        let dir = std::env::temp_dir().join(format!("k68-panic-{}", ulid::Ulid::new()));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash::tests::panic_probe", "--nocapture"])
+            .env("K68_PANIC_PROBE_DIR", &dir)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let markers = take_markers(&dir, "daemon.panicked");
+        assert_eq!(markers.len(), 1);
+        assert!(
+            !serde_json::to_string(&markers[0])
+                .unwrap()
+                .contains("private-token-k68-panic")
+        );
+        assert!(!stderr.contains("private-token-k68-panic"));
+        assert!(markers[0].location.contains("crash.rs:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incomplete_publication_is_ignored_without_deletion() {
+        let dir = std::env::temp_dir().join(format!("k68-partial-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let temp = dir.join("daemon.panicked-1-1.tmp");
+        std::fs::write(&temp, b"{\"code\":").unwrap();
+        assert!(take_markers(&dir, "daemon.panicked").is_empty());
+        assert!(temp.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn markers_round_trip_and_consume_once() {

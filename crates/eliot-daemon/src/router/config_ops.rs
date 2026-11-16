@@ -151,13 +151,15 @@ impl Router {
             projects.as_ref(),
         )?;
         self.publish_locked(&events);
-        drop(store);
         // `[daemon] log_level` applies live: refresh it from the saved
         // file so standard/debug switches without a restart. Other daemon
         // keys still report through `restart_required`.
         if reply.saved {
             Self::apply_saved_log_level(&self.inner.data_root);
         }
+        // Publication and application share the Store writer lock. A later
+        // save cannot publish or apply a newer level before this one applies.
+        drop(store);
         if !events.is_empty() {
             self.signal_progress();
         }
@@ -334,6 +336,46 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_log_level_saves_apply_in_publication_order() {
+        let root = SettingsRoot::new();
+        let router = crate::router::tests::router_with_data_root(root.0.clone());
+        let request = |path: &std::path::Path, level: &str| {
+            let source = std::fs::read_to_string(path.join("config.toml")).unwrap();
+            serde_json::to_value(SettingsSaveRequest {
+                expected_revision: Some(crate::config::profiles_edit::revision_of(&source)),
+                sections: [(
+                    eliot_core::api::SettingsSection::Daemon,
+                    json!({"log_level":level}),
+                )]
+                .into(),
+                dry_run: false,
+                client: eliot_core::api::SettingsClientSource::Cli,
+            })
+            .unwrap()
+        };
+        let a = router.clone();
+        let b = router.clone();
+        let first = tokio::spawn(async move {
+            a.settings_save(&request(&a.inner.data_root, "debug"), &Principal::Owner)
+                .await
+        });
+        let second = tokio::spawn(async move {
+            b.settings_save(&request(&b.inner.data_root, "standard"), &Principal::Owner)
+                .await
+        });
+        let results = [first.await.unwrap(), second.await.unwrap()];
+        assert!(results.iter().any(Result::is_ok));
+        for result in results {
+            if let Err(error) = result {
+                assert_eq!(error.code, "conflict");
+            }
+        }
+        let config = crate::config::load_daemon_config(&root.0).unwrap();
+        assert_eq!(crate::logging::is_debug(), config.log_level == "debug");
+        crate::logging::set_log_level(crate::logging::LogLevel::Standard);
     }
 
     fn project_request(

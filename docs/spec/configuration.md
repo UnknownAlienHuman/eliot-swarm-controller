@@ -1154,17 +1154,27 @@ report those facts as unverified. The owner remains responsible for service life
 
 `log_level` (`standard`, `debug`) applies live through the daemon settings
 section, never as a restart gate on its own. Standard mode keeps operational
-lines: requests, settlements and sanitized tails. Debug mode adds numeric
+lines: structured request/settlement codes and bounded IDs, typed `where`, origin,
+classified sanitized origin evidence and approved sanitized stderr tails. Neither
+level persists `Error.message` or other unclassified free text. Debug mode adds numeric
 timing records: every RPC at the router choke point (`rpc.handled` /
 `rpc.failed` with method, elapsed milliseconds and ok), every
 daemon-to-plugin call (`plugin.call.ok` / `plugin.call.error`), and plugin
 frame, channel, process start/exit and stderr records over `ELIOT_DEBUG`.
+Plugin `ELIOT_DEBUG` lines, including malformed or oversized telemetry, are
+excluded from retained diagnostic tails in both modes. Only parsed metadata is
+routed to the bounded rotated daemon log when the current level is `debug`.
 Debug never logs payloads: ids are our own vocabulary, messages stay in the
-sanitized store, params and results never enter a record.
+sanitized store, params and results never enter a record. Settings publication
+and live log-level application share the Store writer lock, preserving order.
 
-On panic the daemon and each plugin write a `daemon.panicked` JSON marker to
-the crash directory (capped count, per-write byte cap, redacted under the
-secret policy) and report it once: in `daemon.status`, in `swarm daemon`
+On panic the daemon writes a `daemon.panicked` marker and plugins write a
+`plugin.panicked` marker. Arbitrary payloads and unclassified thread names are
+omitted before either disk or stderr; source location, approved thread name and
+payload-free backtrace are sanitized and bounded first. Publication uses the
+existing private temporary-file/write/sync/atomic-rename primitive (bounded
+file/count); readers ignore temporary or incomplete files. The previous daemon
+marker is consumed once and reported in `daemon.status`, in `swarm daemon`
 startup output, and in `swarm why` when the diagnosed failure is otherwise
 unclassified. The desktop Agent details view shows the same one-line
 diagnosis summary; the full chain lives behind `swarm why`.

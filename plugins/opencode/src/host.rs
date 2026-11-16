@@ -662,24 +662,11 @@ impl OpenCodePlugin {
         &mut self,
         params: &AgentStartParams,
         phase: StartPhase,
-        reason: impl Into<String>,
+        error: Error,
     ) -> Value {
-        // The failed value carries its own typed location and origin, so a
-        // launch that never touched native I/O still says where and why:
-        // our pre-session gate (`swarm`), never the harness or provider.
-        let value = json!({
-            "agent_id": params.agent_id,
-            "generation": params.generation,
-            "command_id": params.command_id,
-            "state": "failed",
-            "reason": reason.into(),
-            "where": format!("plugin.opencode.start.{}", phase.as_str()),
-            "origin": "swarm",
-            "origin_evidence": format!(
-                "pre-session phase {} failed before any native session or prompt",
-                phase.as_str(),
-            ),
-        });
+        let error =
+            eliot_plugin::session::classify_start_failure(error, "opencode", phase.as_str());
+        let value = eliot_plugin::session::failed_start_value(params, error);
         self.failed_start = Some(FailedStart {
             agent_id: params.agent_id.clone(),
             generation: params.generation,
@@ -706,7 +693,11 @@ impl OpenCodePlugin {
             &failure.error.code
         ));
         let reason = presession_reason(failure.phase, &failure.error.code);
-        self.retain_proven_no_effect_start(params, failure.phase, reason)
+        self.retain_proven_no_effect_start(
+            params,
+            failure.phase,
+            (*failure.error).with_message(reason),
+        )
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
@@ -1134,13 +1125,13 @@ impl OpenCodePlugin {
             {
                 Ok(fragment) => Some(fragment),
                 Err(error) => {
-                    let reason = (*error.message).clone();
+                    let failure = error.clone();
                     discard_failed_start(&mut session, error, envelope).await;
                     return Ok(CreateOutcome::ProvenFailed(
                         self.retain_proven_no_effect_start(
                             &parsed.params,
                             StartPhase::Verify,
-                            reason,
+                            failure,
                         ),
                     ));
                 }
@@ -1156,13 +1147,13 @@ impl OpenCodePlugin {
             &parsed.swarm_executable,
             parsed.mcp_cloud_hostname.as_deref(),
         ) {
-            let reason = (*error.message).clone();
+            let failure = error.clone();
             discard_failed_start(&mut session, error, envelope).await;
             return Ok(CreateOutcome::ProvenFailed(
                 self.retain_proven_no_effect_start(
                     &parsed.params,
                     StartPhase::CreateRefused,
-                    reason,
+                    failure,
                 ),
             ));
         }
@@ -1190,7 +1181,10 @@ impl OpenCodePlugin {
                     &parsed.params,
                     PhaseFailure {
                         phase: StartPhase::CreateRefused,
-                        error: Box::new(Error::new("rejected", reason)),
+                        error: Box::new(Error::new("rejected", reason).with_origin(
+                            FailureOrigin::Harness,
+                            "native session/create refused without upstream evidence",
+                        )),
                     },
                 )));
             }
@@ -4842,7 +4836,7 @@ mod tests {
         let value = plugin.retain_proven_no_effect_start(
             &params,
             StartPhase::Verify,
-            "adopted backend unreachable",
+            eliot_core::Error::new("native_readback", "adopted backend unreachable"),
         );
         assert_eq!(value["state"], "failed");
         assert_eq!(value["agent_id"], "agent-1");
@@ -5037,11 +5031,21 @@ mod tests {
                 &params,
                 PhaseFailure {
                     phase,
-                    error: Box::new(eliot_core::Error::new("native_spawn", "probe")),
+                    error: Box::new(
+                        eliot_core::Error::new("native_spawn", "probe")
+                            .with_where("plugin.opencode.start.spawn")
+                            .with_origin(
+                                eliot_core::FailureOrigin::Environment,
+                                "OS refused native spawn",
+                            ),
+                    ),
                 },
             );
             assert_eq!(value["state"], "failed");
             assert_eq!(value["agent_id"], "agent-9");
+            assert_eq!(value["origin"], "environment");
+            assert_eq!(value["where"], "plugin.opencode.start.spawn");
+            assert_eq!(value["origin_evidence"], "OS refused native spawn");
             assert_eq!(value["command_id"], "0199-presession");
             match plugin
                 .start_replay_admission(&params)

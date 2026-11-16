@@ -1454,6 +1454,40 @@ impl Store {
         Ok(load_command_record(&self.connection, id)?.map(|record| record.command))
     }
 
+    /// Exact current-generation start, including a failed launch with no turn.
+    /// Generation is unique for launch/resume; never substitute another Agent
+    /// or a timestamp-near command when retention removed the causal command.
+    pub fn generation_start_command(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<Command>> {
+        let id: Option<String> = self.connection.query_row(
+            "SELECT id FROM commands WHERE target = ?1 AND generation = ?2 AND verb IN ('launch', 'resume') ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![parse_agent_id(agent)?, generation], |row| row.get(0),
+        ).optional().map_err(sql_error)?;
+        id.map(|id| self.get_command(&id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Latest retained terminal for this exact turn, for diagnostic fields
+    /// that are deliberately not a second persisted Turn projection.
+    pub fn turn_terminal_event(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+    ) -> Result<Option<Event>> {
+        let record = self.connection.query_row(
+            "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause FROM events
+             WHERE agent = ?1 AND generation = ?2 AND kind IN ('turn.completed', 'turn.unknown')
+               AND json_extract(data, '$.turn_id') = ?3 ORDER BY seq DESC LIMIT 1",
+            params![parse_agent_id(agent)?, generation, turn_id], event_record_from_row,
+        ).optional().map_err(sql_error)?;
+        record.map(event_from_record).transpose()
+    }
+
     pub fn get_turn(&self, agent: &str, generation: i64, turn_id: &str) -> Result<Option<Turn>> {
         let agent_num = parse_agent_id(agent)?;
         load_turn(&self.connection, agent_num, generation, turn_id)

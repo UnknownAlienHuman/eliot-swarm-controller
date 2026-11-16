@@ -342,8 +342,25 @@ impl Router {
             }
             "maintenance.run" => self.maintenance_run(&params, &principal).await,
             "command.submit" => {
-                self.submit_bound(&params, &principal, remote.as_ref())
-                    .await
+                let result = self
+                    .submit_bound(&params, &principal, remote.as_ref())
+                    .await;
+                // Capacity preflight can refuse before a command exists.
+                // Retain diagnostic metadata under the caller's exact ID in
+                // the existing bounded log; this grants no replay authority.
+                if let Err(error) = &result
+                    && error.code == "capacity_unavailable"
+                    && let Some(id) = params.get("id").and_then(Value::as_str)
+                    && ulid::Ulid::from_string(id).is_ok()
+                {
+                    crate::logging::record(
+                        &self.secret_policy_snapshot(),
+                        crate::logging::CAPACITY_REFUSAL_CODE,
+                        &[("command", id)],
+                        Some(error),
+                    );
+                }
+                result
             }
             "command.get" => self.command_get(&params, &principal).await,
             "command.children" => self.command_children(&params, &principal).await,

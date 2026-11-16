@@ -2980,6 +2980,26 @@ impl EventProcessor {
             "native_status": native_terminal(&notification.terminal),
         });
         // The semantic hold signal gets first claim on the bounded terminal data.
+        if notification.terminal == NativeTurnTerminal::Failed {
+            let origin = if provider_restriction.is_some() {
+                eliot_core::FailureOrigin::Provider
+            } else if notification.error.is_some() {
+                eliot_core::FailureOrigin::Harness
+            } else {
+                eliot_core::FailureOrigin::Unknown
+            };
+            eliot_plugin::session::attach_failure_origin(
+                &mut data,
+                "muse",
+                origin,
+                if origin == eliot_core::FailureOrigin::Provider {
+                    "MSP structured authRequired upstream error"
+                } else {
+                    "no documented structured upstream error on native terminal"
+                },
+                &secrets,
+            );
+        }
         if let Some(restriction) = provider_restriction {
             attach_provider_restriction(&mut data, restriction, &secrets);
         }

@@ -1944,6 +1944,24 @@ impl EventProcessor {
             "native_status": turn_status(&notification.turn.status),
         });
         // The semantic hold signal gets first claim on the bounded terminal data.
+        if notification.turn.status == NativeTurnStatus::Failed {
+            let origin = notification
+                .turn
+                .error
+                .as_ref()
+                .map(|error| error.failure_origin())
+                .unwrap_or(eliot_core::FailureOrigin::Unknown);
+            let evidence = if origin == eliot_core::FailureOrigin::Provider {
+                "CodexErrorInfo reports structured upstream rate, quota, auth, model or HTTP failure"
+            } else if origin == eliot_core::FailureOrigin::Harness {
+                "native turn error without a structured upstream signal"
+            } else {
+                "native failed terminal omitted its error classification"
+            };
+            eliot_plugin::session::attach_failure_origin(
+                &mut data, "codex", origin, evidence, &secrets,
+            );
+        }
         if let Some(restriction) = provider_restriction {
             attach_provider_restriction(&mut data, restriction, &secrets);
         }

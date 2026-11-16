@@ -669,18 +669,8 @@ impl ClaudePlugin {
     /// launch is definitely failed, never unknown. The reason names the
     /// failed check in short non-secret words; it is persisted in the daemon
     /// outcome, so it must never carry endpoints, ids, values, or secrets.
-    fn retain_proven_no_effect_start(
-        &mut self,
-        params: &AgentStartParams,
-        reason: impl Into<String>,
-    ) -> Value {
-        let value = json!({
-            "agent_id": params.agent_id,
-            "generation": params.generation,
-            "command_id": params.command_id,
-            "state": "failed",
-            "reason": reason.into(),
-        });
+    fn retain_proven_no_effect_start(&mut self, params: &AgentStartParams, error: Error) -> Value {
+        let value = eliot_plugin::session::failed_start_value(params, error);
         self.failed_start = Some(FailedStart {
             agent_id: params.agent_id.clone(),
             generation: params.generation,
@@ -707,7 +697,28 @@ impl ClaudePlugin {
             &failure.error.code
         ));
         let reason = prespawn_reason(failure.phase, &failure.error.code);
-        self.retain_proven_no_effect_start(params, reason)
+        let phase = match failure.phase {
+            StartPhase::Plan => "plan",
+            StartPhase::McpConfig => "mcp_config",
+            StartPhase::Skill => "skill",
+            StartPhase::Login => "login",
+            StartPhase::Spawn => "spawn",
+            StartPhase::PostSpawn => "post_spawn",
+        };
+        let mut error = *failure.error;
+        if error.origin.is_none()
+            && matches!(
+                failure.phase,
+                StartPhase::McpConfig | StartPhase::Skill | StartPhase::Login | StartPhase::Spawn
+            )
+        {
+            error = error.with_origin(
+                eliot_core::FailureOrigin::Environment,
+                "native executable, private file or external login operation failed",
+            );
+        }
+        let error = eliot_plugin::session::classify_start_failure(error, "claude", phase);
+        self.retain_proven_no_effect_start(params, error.with_message(reason))
     }
 
     async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> DispatchOutcome {
@@ -3226,6 +3237,8 @@ mod tests {
         assert_eq!(value["agent_id"], "agent-9");
         assert_eq!(value["generation"], 1);
         assert_eq!(value["command_id"], "0199-owner-scan");
+        assert_eq!(value["origin"], "swarm");
+        assert_eq!(value["where"], "plugin.claude.start.plan");
         let reason = value["reason"].as_str().expect("typed reason");
         assert!(reason.contains("profile_error"));
         assert!(!reason.contains("swarm"));

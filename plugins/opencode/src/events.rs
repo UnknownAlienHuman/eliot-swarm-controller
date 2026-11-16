@@ -2592,6 +2592,22 @@ fn terminal_turn_data(
         native_error.map(|error| error.message.as_str()),
         secrets,
     );
+    if status == "failed" {
+        let origin = native_error
+            .map(|error| error.failure_origin())
+            .unwrap_or(eliot_core::FailureOrigin::Unknown);
+        eliot_plugin::session::attach_failure_origin(
+            &mut data,
+            "opencode",
+            origin,
+            if origin == eliot_core::FailureOrigin::Provider {
+                "Session.StructuredError provider type with upstream HTTP error status"
+            } else {
+                "native terminal lacks a structured upstream failure status"
+            },
+            secrets,
+        );
+    }
     data
 }
 

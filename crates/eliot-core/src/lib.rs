@@ -1241,7 +1241,8 @@ where
     D: serde::Deserializer<'de>,
 {
     let message = <String as serde::Deserialize>::deserialize(deserializer)?;
-    Ok(bound_chars(&message, MAX_FAILURE_MESSAGE_CHARS).into())
+    // Keep the complete input until the owning boundary can redact it.
+    Ok(message.into())
 }
 
 fn deserialize_failure_where<'de, D>(
@@ -1262,7 +1263,7 @@ where
 {
     let evidence: Option<String> =
         <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
-    Ok(evidence.map(|evidence| bound_chars(&evidence, MAX_FAILURE_ORIGIN_EVIDENCE_CHARS).into()))
+    Ok(evidence.map(Into::into))
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -1361,7 +1362,7 @@ impl Error {
         let code: String = code.into().chars().take(MAX_FAILURE_CODE_CHARS).collect();
         Self {
             code,
-            message: bound_chars(&message.into(), MAX_FAILURE_MESSAGE_CHARS).into(),
+            message: message.into().into(),
             diagnostics: Box::default(),
             details: None,
             routing: None,
@@ -1383,12 +1384,11 @@ impl Error {
     /// Attach the failure origin with its evidence. Evidence must already be
     /// schema-owned vocabulary or a bounded observed-frame summary;
     /// [`Self::sanitized`] applies the [`SecretPolicy`] backstop at the
-    /// boundary. Evidence is bounded here so an untrusted caller cannot grow
-    /// the 64 KiB encoded error.
+    /// boundary. Keep the complete evidence until redaction; serialization
+    /// independently enforces the wire bound.
     pub fn with_origin(mut self, origin: FailureOrigin, evidence: impl Into<String>) -> Self {
         self.origin = Some(origin);
-        self.origin_evidence =
-            Some(bound_chars(&evidence.into(), MAX_FAILURE_ORIGIN_EVIDENCE_CHARS).into());
+        self.origin_evidence = Some(evidence.into().into());
         self
     }
 
@@ -1417,7 +1417,7 @@ impl Error {
         observed: impl Into<String>,
     ) -> Self {
         let doc = doc.chars().take(128).collect::<String>();
-        let observed = bound_chars(&observed.into(), MAX_FAILURE_ORIGIN_EVIDENCE_CHARS);
+        let observed = observed.into();
         Self::new(
             "harness_contract_mismatch",
             format!("{harness} contradicted its documented contract"),
@@ -2822,7 +2822,8 @@ mod failure_location_tests {
             .with_origin(
                 FailureOrigin::Swarm,
                 "discovery readers at their in-flight bound (4)",
-            );
+            )
+            .sanitized(&SecretPolicy::default());
         assert!(error.message.chars().count() <= MAX_FAILURE_MESSAGE_CHARS);
         assert_eq!(
             error.failure_where.as_deref(),
@@ -2846,7 +2847,9 @@ mod failure_location_tests {
             "origin": "provider",
             "origin_evidence": "z".repeat(5000),
         });
-        let error = serde_json::from_value::<Error>(wire).unwrap();
+        let error = serde_json::from_value::<Error>(wire)
+            .unwrap()
+            .sanitized(&SecretPolicy::default());
         assert!(error.message.chars().count() <= MAX_FAILURE_MESSAGE_CHARS);
         assert_eq!(error.failure_where.as_deref(), Some("bad_path"));
         assert_eq!(error.origin, Some(FailureOrigin::Provider));

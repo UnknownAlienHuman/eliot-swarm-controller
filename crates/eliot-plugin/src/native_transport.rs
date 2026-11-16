@@ -900,6 +900,14 @@ impl NativeChild {
                     labels.server
                 )),
             )
+            .with_where(format!(
+                "plugin.{}.start.spawn",
+                labels.short.to_ascii_lowercase()
+            ))
+            .with_origin(
+                eliot_core::FailureOrigin::Environment,
+                "OS refused native process creation",
+            )
         })?;
         let stdin = child.stdin.take().ok_or_else(|| {
             Error::new(

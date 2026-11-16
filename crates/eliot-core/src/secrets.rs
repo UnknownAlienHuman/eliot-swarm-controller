@@ -4,14 +4,6 @@ use serde_json::Value;
 
 const MARKER: &[u8] = b"[REDACTED]";
 
-/// A trailing text fragment this long that exactly matches the start of a
-/// longer registered secret is treated as the secret cut short by an earlier
-/// bound (construction truncates messages before sanitization can redact
-/// them) and is redacted. Shorter coincidences pass through: over-redaction
-/// below this floor would corrupt innocent text, while a run this long
-/// matching a secret prefix is the truncated secret beyond reasonable doubt.
-const MIN_TRUNCATED_SECRET_PREFIX: usize = 64;
-
 #[derive(Clone, Default)]
 pub struct SecretPolicy {
     values: Vec<String>,
@@ -38,7 +30,10 @@ impl SecretPolicy {
         self.values.iter().any(|secret| text.contains(secret))
     }
 
-    /// Complete redaction markers are preserved across repeated sanitization.
+    /// Redact complete input before applying any bound. Complete redaction
+    /// markers are preserved across repeated sanitization. Streaming callers
+    /// must retain the unfinished suffix from `redact_prefix(_, false)`;
+    /// guessing whether an arbitrary text suffix is a secret is unsafe.
     pub fn redact_text(&self, text: &str) -> String {
         let (safe, _) = self.redact_prefix(text.as_bytes(), true);
         String::from_utf8_lossy(&safe).into_owned()
@@ -120,15 +115,6 @@ impl SecretPolicy {
             {
                 safe.extend_from_slice(MARKER);
                 consumed += secret.len();
-            } else if eof
-                && rest.len() >= MIN_TRUNCATED_SECRET_PREFIX
-                && self
-                    .values
-                    .iter()
-                    .any(|secret| secret.len() > rest.len() && secret.as_bytes().starts_with(rest))
-            {
-                safe.extend_from_slice(MARKER);
-                consumed += rest.len();
             } else {
                 safe.push(bytes[consumed]);
                 consumed += 1;
@@ -146,6 +132,19 @@ mod tests {
         StderrSource, bound_stderr_diagnostics, classify_dispatched_error,
     };
     use serde_json::json;
+
+    #[test]
+    fn short_token_crossing_message_bound_is_redacted_before_truncation() {
+        let token = "0123456789abcdef".repeat(3);
+        let policy = SecretPolicy::new([&token]);
+        let error = Error::new("failed", format!("{}{token}", "x".repeat(1000))).sanitized(&policy);
+        assert_eq!(*error.message, format!("{}[REDACTED]", "x".repeat(1000)));
+        let decoded: Error = serde_json::from_value(json!({
+            "code": "failed", "message": format!("{}{token}", "x".repeat(1000))
+        }))
+        .unwrap();
+        assert_eq!(decoded.sanitized(&policy).message, error.message);
+    }
 
     #[test]
     fn empty_short_overlap_and_generated_markers() {
@@ -192,25 +191,22 @@ mod tests {
     }
 
     #[test]
-    fn truncated_secret_tail_at_end_of_input_is_redacted() {
-        // A secret longer than the message bound survives construction only
-        // as a truncated prefix; sanitization must still catch the tail.
+    fn long_secret_is_redacted_before_message_bound_without_prefix_guessing() {
         let secret = "s".repeat(1100);
         let policy = SecretPolicy::new([secret.as_str(), "owner-credential"]);
-        let bounded: String = format!("metadata_readers limit=4 {secret}")
-            .chars()
-            .take(crate::MAX_FAILURE_MESSAGE_CHARS)
-            .collect();
-        assert!(bounded.len() > 1000);
-        let safe = policy.redact_text(&bounded);
-        assert!(!safe.contains(&"s".repeat(100)), "{safe}");
-        assert!(safe.contains("[REDACTED]"));
-        assert!(safe.starts_with("metadata_readers limit=4 "));
-        // Exact secrets still match literally, short coincidences survive.
+        let safe =
+            Error::new("busy", format!("metadata_readers limit=4 {secret}")).sanitized(&policy);
+        assert_eq!(*safe.message, "metadata_readers limit=4 [REDACTED]");
+        // Complete text uses literal matches; arbitrary suffix coincidences
+        // must not corrupt ordinary messages. Streaming carries every prefix.
         assert_eq!(policy.redact_text("owner-credential"), "[REDACTED]");
         assert_eq!(policy.redact_text("ends with s"), "ends with s");
-        assert_eq!(policy.redact_text(&"s".repeat(63)), "s".repeat(63));
-        assert_eq!(policy.redact_text(&"s".repeat(64)), "[REDACTED]");
+        for length in [1, 24, 48, 63, 64, 1024] {
+            assert_eq!(
+                policy.redact_prefix(&vec![b's'; length], false),
+                (Vec::new(), 0)
+            );
+        }
     }
 
     #[test]

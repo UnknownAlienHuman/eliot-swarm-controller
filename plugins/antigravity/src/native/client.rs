@@ -486,11 +486,21 @@ impl AgyClient {
 /// unruled-out and stays unknown. The message is never surfaced.
 fn map_response_error(code: i64, message: String) -> Result<Value> {
     if matches!(code, -32602..=-32600) {
-        Err(Error::new("native_rejected", message))
+        Err(Error::new("native_rejected", message)
+            .with_where("plugin.antigravity.native.response")
+            .with_origin(
+                eliot_core::FailureOrigin::Harness,
+                "ACP validation refusal; no documented upstream error shape",
+            ))
     } else {
         Err(Error::new(
             "unknown",
             format!("Antigravity ACP call failed with native code {code}"),
+        )
+        .with_where("plugin.antigravity.native.response")
+        .with_origin(
+            eliot_core::FailureOrigin::Harness,
+            "native ACP error; upstream origin not documented",
         ))
     }
 }

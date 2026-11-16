@@ -66,6 +66,20 @@ impl Router {
         if is_agent {
             return self.diagnose_agent(target, target, previous_crash).await;
         }
+        if let Some(step) = crate::logging::capacity_refusal(
+            &self.inner.data_root,
+            target,
+            &self.secret_policy_snapshot(),
+        ) {
+            let steps = vec![step];
+            return Ok(DiagnoseResponse {
+                target: target.to_owned(),
+                summary: summary_for(target, &steps, "admission"),
+                steps,
+                preceded_by: None,
+                previous_crash: None,
+            });
+        }
         Err(Error::new(
             "not_found",
             format!("diagnose target {target} is not a command, Agent or agent:turn"),
@@ -99,16 +113,17 @@ impl Router {
                 if preceded_by.is_none() {
                     preceded_by = turn.preceded_by.clone();
                 }
-                steps.push(turn_step(&turn));
+                steps.push(turn_step(
+                    &turn,
+                    store
+                        .turn_terminal_event(agent, generation, &turn.turn_id)?
+                        .as_ref(),
+                ));
             }
             steps.extend(loss_steps(&store, agent, generation)?);
         }
         drop(store);
-        let origin = steps
-            .first()
-            .and_then(|step| step.origin.as_deref())
-            .unwrap_or("unknown")
-            .to_owned();
+        let origin = chain_origin(&steps);
         Ok(DiagnoseResponse {
             target: target.to_owned(),
             summary: summary_for(target, &steps, "command"),
@@ -140,14 +155,15 @@ impl Router {
             steps.push(command_step(&command));
         }
         let preceded_by = turn.preceded_by.clone();
-        steps.push(turn_step(&turn));
+        steps.push(turn_step(
+            &turn,
+            store
+                .turn_terminal_event(agent, generation, turn_id)?
+                .as_ref(),
+        ));
         steps.extend(loss_steps(&store, agent, generation)?);
         drop(store);
-        let origin = steps
-            .iter()
-            .find_map(|step| step.origin.as_deref())
-            .unwrap_or("unknown")
-            .to_owned();
+        let origin = chain_origin(&steps);
         Ok(DiagnoseResponse {
             target: target.to_owned(),
             summary: summary_for(target, &steps, "turn"),
@@ -180,6 +196,13 @@ impl Router {
             at: (row.updated_at >= 0).then_some(row.updated_at),
         }];
         let mut preceded_by = None;
+        let mut commands = std::collections::HashSet::new();
+        if let Some(command) = store.generation_start_command(agent, generation)? {
+            commands.insert(command.id.clone());
+            if command.state != eliot_core::CommandState::Applied {
+                steps.push(command_step(&command));
+            }
+        }
         if let Ok(turns) = store.list_turns(agent, generation, 32) {
             for turn in turns {
                 if steps.len() > MAX_TURNS_PER_DIAGNOSIS {
@@ -198,16 +221,35 @@ impl Router {
                 if preceded_by.is_none() {
                     preceded_by = turn.preceded_by.clone();
                 }
-                steps.push(turn_step(&turn));
+                // Prefer the command which settled this failure. The original
+                // input association remains a distinct exact causal link.
+                let mut causal = Vec::new();
+                if let Some(id) = turn.preceded_by.as_ref() {
+                    causal.push(id.clone());
+                }
+                if let Some(id) = store.turn_command_id(agent, generation, &turn.turn_id)? {
+                    causal.push(id);
+                }
+                for id in causal {
+                    if commands.insert(id.clone())
+                        && let Some(command) = store.get_command(&id)?
+                        && command.target.as_deref() == Some(agent)
+                        && command.generation == Some(generation)
+                    {
+                        steps.push(command_step(&command));
+                    }
+                }
+                steps.push(turn_step(
+                    &turn,
+                    store
+                        .turn_terminal_event(agent, generation, &turn.turn_id)?
+                        .as_ref(),
+                ));
             }
         }
         steps.extend(loss_steps(&store, agent, generation)?);
         drop(store);
-        let origin = steps
-            .iter()
-            .find_map(|step| step.origin.as_deref())
-            .unwrap_or("unknown")
-            .to_owned();
+        let origin = chain_origin(&steps);
         Ok(DiagnoseResponse {
             target: target.to_owned(),
             summary: summary_for(target, &steps, "agent"),
@@ -223,6 +265,15 @@ impl Router {
 /// the culprit, while an unknown origin may be the crash itself.
 fn crash_if_unexplained(origin: &str, previous_crash: Option<CrashMarker>) -> Option<CrashMarker> {
     (origin == "unknown").then_some(previous_crash).flatten()
+}
+
+fn chain_origin(steps: &[DiagnoseStep]) -> String {
+    steps
+        .iter()
+        .filter_map(|step| step.origin.as_deref())
+        .find(|origin| *origin != "unknown")
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 fn command_step(command: &Command) -> DiagnoseStep {
@@ -283,19 +334,25 @@ fn outcome_code(outcome: &Value) -> Option<String> {
     None
 }
 
-fn turn_step(turn: &Turn) -> DiagnoseStep {
-    let message = turn
-        .native_status
-        .as_deref()
+fn turn_step(turn: &Turn, terminal: Option<&Event>) -> DiagnoseStep {
+    let message = terminal
+        .and_then(|event| event.data.get("native_error")?.get("message")?.as_str())
+        .or(turn.native_status.as_deref())
         .or(turn.status.as_deref())
         .map(|message| bound_chars(message, 1024));
     DiagnoseStep {
         kind: "turn".to_owned(),
         code: turn.outcome.map(|outcome| outcome.as_str().to_owned()),
         message,
-        failure_where: None,
-        origin: None,
-        origin_evidence: None,
+        failure_where: terminal
+            .and_then(|event| event.data.get("where")?.as_str())
+            .map(|text| bound_chars(text, 128)),
+        origin: terminal
+            .and_then(|event| event.data.get("origin")?.as_str())
+            .map(|text| bound_chars(text, 32)),
+        origin_evidence: terminal
+            .and_then(|event| event.data.get("origin_evidence")?.as_str())
+            .map(|text| bound_chars(text, 512)),
         exit_code: None,
         ntstatus: None,
         at: turn.completed_at.filter(|at| *at >= 0),
@@ -366,7 +423,11 @@ fn loss_step(event: &Event, at: Option<i64>) -> DiagnoseStep {
 fn summary_for(target: &str, steps: &[DiagnoseStep], fallback_what: &str) -> String {
     let step = steps
         .iter()
-        .find(|step| step.origin.is_some())
+        .find(|step| {
+            step.origin
+                .as_deref()
+                .is_some_and(|origin| origin != "unknown")
+        })
         .or_else(|| {
             steps.iter().find(|step| {
                 step.kind == "turn"
@@ -497,6 +558,27 @@ mod tests {
             std::sync::Arc::new(tokio::sync::Mutex::new(store)),
             crate::bus::Bus::new(16),
         )
+    }
+
+    #[tokio::test]
+    async fn failed_launch_agent_includes_exact_command_without_a_turn() {
+        let router = test_router().await;
+        let (agent, _, _) = {
+            let mut store = router.inner.store.lock().await;
+            failed_send_fixture(&mut store)
+        };
+        let value = router
+            .diagnose(&json!({"target": agent}), &Principal::Owner)
+            .await
+            .unwrap();
+        let response: DiagnoseResponse = serde_json::from_value(value).unwrap();
+        assert!(
+            response.summary.starts_with("provider origin:"),
+            "{}",
+            response.summary
+        );
+        assert!(response.steps.iter().any(|step| step.kind == "command"
+            && step.failure_where.as_deref() == Some("provider.request")));
     }
 
     #[tokio::test]

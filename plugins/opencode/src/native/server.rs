@@ -437,10 +437,9 @@ impl OwnedServer {
             )
             .await
             .map_err(|error| {
-                // The credential transfer is our machinery with our bound: a
-                // definite transfer failure is ours (`swarm`); an uncertain
-                // import stays `unknown` with the ambiguity named. Only the
-                // location is filled when the transfer already set it.
+                // A definite no-effect transfer failure can belong to the OS,
+                // credentials, native CLI or our validation. Preserve typed
+                // evidence; uncertainty about an import remains explicit.
                 let mut error = error.with_where("plugin.opencode.start.auth_transfer");
                 if error.origin.is_none() {
                     if error.code == "unknown" {
@@ -449,9 +448,10 @@ impl OwnedServer {
                             "credential transfer outcome uncertain; isolated store may be written",
                         );
                     } else {
-                        error = error.with_origin(
-                            FailureOrigin::Swarm,
-                            "credential transfer gate failed the start before serve",
+                        error = eliot_plugin::session::classify_start_failure(
+                            error,
+                            "opencode",
+                            "auth_transfer",
                         );
                     }
                 }

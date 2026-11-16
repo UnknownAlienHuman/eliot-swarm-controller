@@ -21,6 +21,89 @@ use eliot_core::{
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
+/// Fill only missing origin/location from a machine-owned error code. A
+/// no-effect verdict says nothing about the layer that caused the failure.
+pub fn classify_start_failure(mut error: Error, harness: &str, phase: &str) -> Error {
+    if error.failure_where.is_none() {
+        error = error.with_where(format!("plugin.{harness}.start.{phase}"));
+    }
+    if error.origin.is_none() {
+        use eliot_core::FailureOrigin;
+        let (origin, evidence) = match error.code.as_str() {
+            "native_spawn_refused" | "native_spawn" | "platform_io" | "io" | "auth_required" => (
+                FailureOrigin::Environment,
+                "OS, executable, filesystem or external credential operation failed",
+            ),
+            "native_rejected" | "native_model_unavailable" => (
+                FailureOrigin::Harness,
+                "native harness refused the request without structured upstream evidence",
+            ),
+            "invalid" | "profile_error" | "unsupported" | "internal" | "schema" | "busy" => (
+                FailureOrigin::Swarm,
+                "Swarm validation, schema or implementation gate refused the request",
+            ),
+            _ => (
+                FailureOrigin::Unknown,
+                "missing a classified native error or OS failure signal",
+            ),
+        };
+        error = error.with_origin(origin, evidence);
+    }
+    error
+}
+
+/// Preserve typed diagnostics when a plugin proves that startup had no effect.
+/// Redact the complete fields before Error's wire bounds are applied.
+pub fn failed_start_value(params: &crate::AgentStartParams, error: Error) -> Value {
+    let secrets: Vec<_> = params
+        .target_environment
+        .as_ref()
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|env| env.iter())
+        .filter(|(name, _)| {
+            is_secret_name(name)
+                || is_passed_env(
+                    name,
+                    params.profile.as_ref().and_then(|p| p.get("pass_env")),
+                )
+        })
+        .filter_map(|(_, value)| value.as_str())
+        .collect();
+    let error = error.sanitized(&SecretPolicy::new(secrets));
+    let mut value = serde_json::to_value(error).unwrap_or_else(|_| json!({"code": "internal"}));
+    value["agent_id"] = json!(params.agent_id);
+    value["generation"] = json!(params.generation);
+    value["command_id"] = json!(params.command_id);
+    value["state"] = json!("failed");
+    value["reason"] = value["message"].clone();
+    value
+}
+
+/// Classified diagnostic fields on an exactly associated native terminal.
+/// These fields explain a failure; they do not decide effect settlement.
+pub fn attach_failure_origin(
+    data: &mut Value,
+    harness: &str,
+    origin: eliot_core::FailureOrigin,
+    evidence: &str,
+    policy: &SecretPolicy,
+) {
+    let error = Error::new("native_failure", "native turn failed")
+        .with_where(format!("plugin.{harness}.turn"))
+        .with_origin(origin, evidence)
+        .sanitized(policy);
+    for (key, value) in [
+        ("where", json!(error.failure_where)),
+        ("origin", json!(error.origin)),
+        ("origin_evidence", json!(error.origin_evidence)),
+    ] {
+        if !policy.contains_text(key) && !policy.contains_value(&value) {
+            data[key] = value;
+        }
+    }
+}
+
 use crate::{
     AgentSnapshotParams, CommitSink, MAX_EVENT_BYTES, MAX_TEXT_BYTES, PeerClient,
     protocol::MAX_COMMAND_ID_BYTES,
@@ -1178,6 +1261,23 @@ mod tests {
     use super::{contextual_error, optional_profile_text, request_event_id, validate_source_plan};
     use eliot_core::{Error, StderrSnapshot, StderrSource};
     use serde_json::json;
+
+    #[test]
+    fn failed_start_preserves_origin_location_evidence_and_effect_code() {
+        let params = crate::AgentStartParams::new("a1", 7, "command");
+        let error = Error::new("native_spawn", "OS refused spawn")
+            .with_where("plugin.opencode.start.spawn")
+            .with_origin(eliot_core::FailureOrigin::Environment, "OS spawn failure");
+        let value = super::failed_start_value(
+            &params,
+            super::classify_start_failure(error, "opencode", "prepare"),
+        );
+        assert_eq!(value["code"], "native_spawn");
+        assert_eq!(value["origin"], "environment");
+        assert_eq!(value["where"], "plugin.opencode.start.spawn");
+        assert_eq!(value["origin_evidence"], "OS spawn failure");
+        assert_eq!(value["generation"], 7);
+    }
 
     /// The shared source-plan check spells every harness message exactly as
     /// the per-plugin copies did (pure move).
