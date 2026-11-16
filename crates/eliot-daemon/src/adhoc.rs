@@ -855,146 +855,136 @@ fn parse_muse_version_triple(text: &str) -> Option<(u64, u64, u64)> {
     }
 }
 
-pub(crate) fn select_muse_first_nonempty(
-    candidates: &[String],
-    nonempty: &[bool],
-) -> Option<String> {
-    for (cmd, ok) in candidates.iter().zip(nonempty.iter()) {
-        if *ok {
-            return Some(cmd.clone());
-        }
-    }
-    None
-}
+const MUSE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const MUSE_SELECTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+const MUSE_PROBE_FRAME_BYTES: usize = 1024 * 1024;
+const MUSE_PROBE_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
+const MUSE_PROBE_FRAMES: usize = 100;
 
 fn default_muse_launcher_dir() -> std::path::PathBuf {
     Path::new("C:/Tools/MuseCode").to_path_buf()
 }
 
 pub(crate) async fn probe_muse_catalogue_nonempty(cmd: &str) -> bool {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    use tokio::time::Duration;
-    const PER_CANDIDATE: Duration = Duration::from_secs(20);
-    let probe = async {
-        let mut child = tokio::process::Command::new(cmd)
-            .arg("serve")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok()?;
-        let mut stdin = child.stdin.take()?;
-        let stdout = child.stdout.take()?;
-        let mut lines = tokio::io::BufReader::new(stdout).lines();
-        let version = env!("CARGO_PKG_VERSION");
-        let init = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "muse-bootstrap-1",
-            "method": "initialize",
-            "params": {
-                "clientInfo": {"name": "eliot", "version": version, "title": "Eliot"},
-                "capabilities": {"userInputDialogs": true}
-            }
-        });
-        let mut frame = serde_json::to_string(&init).ok()?;
-        frame.push('\n');
-        tokio::time::timeout(Duration::from_secs(10), stdin.write_all(frame.as_bytes()))
-            .await
-            .ok()?
-            .ok()?;
-        let initialized = loop {
-            let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
-                .await
-                .ok()?
-                .ok()??;
-            let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-            if v.get("id").and_then(|id| id.as_str()) == Some("muse-bootstrap-1") {
-                break v;
-            }
-        };
-        if initialized.get("error").is_some() || initialized.get("result").is_none() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return None::<bool>;
-        }
-        let notify = "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}\n";
-        tokio::time::timeout(Duration::from_secs(5), stdin.write_all(notify.as_bytes()))
-            .await
-            .ok()?
-            .ok()?;
-        let list = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "muse-bootstrap-2",
-            "method": "model/list",
-            "params": {}
-        });
-        let mut frame = serde_json::to_string(&list).ok()?;
-        frame.push('\n');
-        tokio::time::timeout(Duration::from_secs(10), stdin.write_all(frame.as_bytes()))
-            .await
-            .ok()?
-            .ok()?;
-        let mut nonempty = false;
-        for _ in 0..100 {
-            let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
-                .await
-                .ok()?
-                .ok()??;
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            if v.get("id").and_then(|id| id.as_str()) != Some("muse-bootstrap-2") {
-                continue;
-            }
-            if v.get("error").is_some() {
-                break;
-            }
-            let models = v
-                .get("result")
-                .and_then(|r| r.get("models"))
-                .and_then(|m| m.as_array());
-            nonempty = models.is_some_and(|m| !m.is_empty());
-            break;
-        }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        Some(nonempty)
+    let mut command = tokio::process::Command::new(cmd);
+    command.arg("serve");
+    probe_muse_command(command, MUSE_PROBE_TIMEOUT).await
+}
+
+async fn probe_muse_command(
+    mut command: tokio::process::Command,
+    budget: std::time::Duration,
+) -> bool {
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // Assign the Job before the suspended process resumes. On cancellation,
+    // OwnedChild drops the Job and Tokio kills/reaps the direct child as well.
+    let Ok(mut child) = crate::platform::custody::OwnedChild::spawn(command) else {
+        return false;
     };
-    tokio::time::timeout(PER_CANDIDATE, probe)
+    let probe = async { muse_probe_catalogue(child.take_stdin()?, child.take_stdout()?).await };
+    let nonempty = tokio::time::timeout(budget, probe)
         .await
         .ok()
         .flatten()
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let terminated = child.terminate().is_ok();
+    let reaped = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+        .await
+        .is_ok_and(|result| result.is_ok());
+    nonempty && terminated && reaped
 }
 
-pub(crate) async fn select_muse_hot_start_cmd() -> (Option<String>, Vec<String>) {
+async fn muse_probe_catalogue(
+    mut stdin: impl tokio::io::AsyncWrite + Unpin,
+    stdout: impl tokio::io::AsyncRead + Unpin,
+) -> Option<bool> {
+    use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::codec::{FramedRead, LinesCodec};
+
+    // Cap bytes at the reader, line length before String/JSON allocation, and
+    // frames across both initialize and model/list (including notifications).
+    let mut lines = FramedRead::with_capacity(
+        stdout.take(MUSE_PROBE_TOTAL_BYTES),
+        LinesCodec::new_with_max_length(MUSE_PROBE_FRAME_BYTES),
+        4096,
+    );
+    let init = json!({
+        "jsonrpc": "2.0", "id": "muse-bootstrap-1", "method": "initialize",
+        "params": {
+            "clientInfo": {"name": "eliot", "version": env!("CARGO_PKG_VERSION"), "title": "Eliot"},
+            "capabilities": {"userInputDialogs": true}
+        }
+    });
+    let mut frame = serde_json::to_vec(&init).ok()?;
+    frame.push(b'\n');
+    stdin.write_all(&frame).await.ok()?;
+    let mut initialized = false;
+    for _ in 0..MUSE_PROBE_FRAMES {
+        let line = lines.next().await?.ok()?;
+        let value: Value = serde_json::from_str(&line).ok()?;
+        let id = value.get("id").and_then(Value::as_str);
+        if !initialized && id == Some("muse-bootstrap-1") {
+            if value.get("error").is_some() || value.get("result").is_none() {
+                return None;
+            }
+            stdin
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}\n")
+                .await
+                .ok()?;
+            stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"muse-bootstrap-2\",\"method\":\"model/list\",\"params\":{}}\n").await.ok()?;
+            initialized = true;
+        } else if initialized && id == Some("muse-bootstrap-2") {
+            return Some(
+                value.get("error").is_none()
+                    && value
+                        .get("result")
+                        .and_then(|result| result.get("models"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|models| !models.is_empty()),
+            );
+        }
+    }
+    None
+}
+
+pub(crate) async fn select_muse_hot_start_cmd() -> (Option<String>, Vec<String>, bool) {
     let candidates = discover_muse_candidates(&default_muse_launcher_dir());
-    let mut nonempty = Vec::with_capacity(candidates.len());
-    for cmd in &candidates {
-        nonempty.push(probe_muse_catalogue_nonempty(cmd).await);
-    }
-    let best = select_muse_first_nonempty(&candidates, &nonempty);
+    select_muse_with_probe(&candidates, MUSE_SELECTION_BUDGET, |cmd| async move {
+        probe_muse_catalogue_nonempty(&cmd).await
+    })
+    .await
+}
+
+async fn select_muse_with_probe<F, Fut>(
+    candidates: &[String],
+    budget: std::time::Duration,
+    mut probe: F,
+) -> (Option<String>, Vec<String>, bool)
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
     let mut skipped = Vec::new();
-    match &best {
-        Some(cmd) => {
-            for (c, ok) in candidates.iter().zip(nonempty.iter()) {
-                if c == cmd {
-                    break;
-                }
-                if !ok {
-                    skipped.push(c.clone());
-                }
-            }
+    for cmd in candidates {
+        if tokio::time::Instant::now() >= deadline {
+            return (None, skipped, true);
         }
-        None => {
-            for (c, ok) in candidates.iter().zip(nonempty.iter()) {
-                if !ok {
-                    skipped.push(c.clone());
-                }
+        match tokio::time::timeout_at(deadline, probe(cmd.clone())).await {
+            Ok(true) => return (Some(cmd.clone()), skipped, false),
+            Ok(false) => skipped.push(cmd.clone()),
+            Err(_) => {
+                skipped.push(cmd.clone());
+                return (None, skipped, true);
             }
         }
     }
-    (best, skipped)
+    (None, skipped, false)
 }
 
 fn discover_antigravity_cmd() -> core::Result<String> {
@@ -1501,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn muse_hot_start_prefers_newest_nonempty_catalogue() {
+    fn muse_hot_start_discovers_newest_build_first() {
         let dir = std::env::temp_dir().join(format!(
             "eliot-adhoc-muse-catalogue-{}",
             std::time::SystemTime::now()
@@ -1518,15 +1508,140 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0], new.to_string_lossy());
         assert_eq!(candidates[1], old.to_string_lossy());
-        // Fixture: newest 1.4.20 serves an empty catalogue, 1.4.0 is live.
-        let best = select_muse_first_nonempty(&candidates, &[false, true]);
-        assert_eq!(best, Some(old.to_string_lossy().into_owned()));
-        // All empty stays None so no hot-start muse profile is written.
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn muse_selection_stops_at_first_good_build_and_has_one_budget() {
+        use std::{cell::RefCell, time::Duration};
+        let candidates = vec![
+            "new-empty".to_owned(),
+            "good".to_owned(),
+            "older".to_owned(),
+        ];
+        let called = RefCell::new(Vec::new());
+        let selection = select_muse_with_probe(&candidates, Duration::from_secs(1), |cmd| {
+            called.borrow_mut().push(cmd.clone());
+            async move { cmd == "good" }
+        })
+        .await;
         assert_eq!(
-            select_muse_first_nonempty(&candidates, &[false, false]),
+            selection,
+            (Some("good".to_owned()), vec!["new-empty".to_owned()], false)
+        );
+        assert_eq!(*called.borrow(), candidates[..2]);
+
+        let started = tokio::time::Instant::now();
+        let called = RefCell::new(Vec::new());
+        let selection = select_muse_with_probe(&candidates, Duration::from_millis(50), |cmd| {
+            called.borrow_mut().push(cmd);
+            async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                false
+            }
+        })
+        .await;
+        assert_eq!(selection, (None, candidates[..2].to_vec(), true));
+        assert_eq!(*called.borrow(), candidates[..2]);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn muse_probe_refuses_oversize_line_before_reading_the_rest() {
+        let bytes = vec![b'x'; MUSE_PROBE_FRAME_BYTES * 4];
+        let mut input = bytes.as_slice();
+        assert_eq!(
+            muse_probe_catalogue(tokio::io::sink(), &mut input).await,
             None
         );
-        std::fs::remove_dir_all(&dir).ok();
+        let consumed = bytes.len() - input.len();
+        assert!(consumed > MUSE_PROBE_FRAME_BYTES);
+        // FramedRead may read one buffer beyond the threshold, but never the
+        // complete oversized line, nor a String/JSON value for it.
+        assert!(consumed <= MUSE_PROBE_FRAME_BYTES * 2);
+    }
+
+    #[tokio::test]
+    async fn muse_probe_caps_frames_during_initialize_and_catalogue() {
+        let notification = "{\"jsonrpc\":\"2.0\",\"method\":\"noise\"}\n";
+        let init = "{\"id\":\"muse-bootstrap-1\",\"result\":{}}\n";
+        let catalogue =
+            "{\"id\":\"muse-bootstrap-2\",\"result\":{\"models\":[{\"id\":\"model\"}]}}\n";
+        for prefix in ["", init] {
+            let input = format!(
+                "{prefix}{}{init}{catalogue}",
+                notification.repeat(MUSE_PROBE_FRAMES)
+            );
+            assert_eq!(
+                muse_probe_catalogue(tokio::io::sink(), input.as_bytes()).await,
+                None
+            );
+        }
+        let input = format!("{init}{catalogue}");
+        assert_eq!(
+            muse_probe_catalogue(tokio::io::sink(), input.as_bytes()).await,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn muse_probe_caps_total_input_bytes() {
+        let line = format!(
+            "{{\"method\":\"noise\",\"padding\":\"{}\"}}\n",
+            "x".repeat(700_000)
+        );
+        let bytes = line.repeat(8);
+        let mut input = bytes.as_bytes();
+        assert_eq!(
+            muse_probe_catalogue(tokio::io::sink(), &mut input).await,
+            None
+        );
+        assert_eq!((bytes.len() - input.len()) as u64, MUSE_PROBE_TOTAL_BYTES);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn muse_probe_timeout_and_cancellation_leave_no_child() {
+        use crate::platform::windows::{process_start_time, recorded_process_alive};
+        use std::time::Duration;
+        for cancel in [false, true] {
+            let pid_file =
+                std::env::temp_dir().join(format!("eliot-muse-probe-{}.pid", ulid::Ulid::new()));
+            // A real waiting OS process, not a native harness/model fixture.
+            let mut command = tokio::process::Command::new("powershell.exe");
+            command.args(["-NoProfile", "-NonInteractive", "-Command",
+                "[IO.File]::WriteAllText($env:ELIOT_MUSE_PROBE_WAIT_PID, [string]$PID); Start-Sleep -Seconds 60"])
+                .env("ELIOT_MUSE_PROBE_WAIT_PID", &pid_file);
+            let task = tokio::spawn(probe_muse_command(command, Duration::from_secs(3)));
+            let pid = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file)
+                        && let Ok(pid) = text.parse::<u32>()
+                    {
+                        break pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("probe process starts");
+            let birth = process_start_time(pid);
+            assert!(recorded_process_alive(pid, birth).unwrap());
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(!task.await.unwrap());
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while recorded_process_alive(pid, birth).unwrap() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("probe child must be gone, including on cancellation");
+            std::fs::remove_file(&pid_file).unwrap();
+        }
     }
 
     #[test]

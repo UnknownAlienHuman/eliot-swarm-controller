@@ -35,12 +35,20 @@ pub(crate) async fn ensure_hot_start(
             bootstrap_needed(data_root, &mut store, policy)?
         };
         let muse_cmd = if needs {
-            let (cmd, skipped) = crate::adhoc::select_muse_hot_start_cmd().await;
+            let (cmd, skipped, budget_exhausted) = crate::adhoc::select_muse_hot_start_cmd().await;
             for cmd in &skipped {
                 crate::logging::record(
                     policy,
                     "bootstrap.muse_empty_catalogue_skipped",
                     &[("cmd", cmd.as_str())],
+                    None,
+                );
+            }
+            if budget_exhausted {
+                crate::logging::record(
+                    policy,
+                    "bootstrap.muse_catalogue_budget_exhausted",
+                    &[],
                     None,
                 );
             }
