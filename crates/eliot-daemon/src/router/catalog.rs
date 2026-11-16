@@ -7,7 +7,10 @@
 //! (harness, profile label, route/binding names); credential values,
 //! `pass_env` resolutions and literal environment bodies are never read here.
 
-use eliot_core::api::{HARNESS_READ_TTL_MS, HarnessModelsResponse, HarnessQuotaResponse};
+use eliot_core::api::{
+    HARNESS_READ_TTL_MS, HarnessEntry, HarnessModelsResponse, HarnessQuotaResponse,
+    ModelsCatalogEntry,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -112,19 +115,65 @@ fn endpoint_authority(url: &str) -> &str {
 pub(crate) struct CatalogCache {
     models: HashMap<String, HarnessModelsResponse>,
     quotas: HashMap<String, HarnessQuotaResponse>,
+    /// One aggregated `models.catalog` entry keyed by harness
+    /// executable+version. Concurrent callers coalesce on the daemon
+    /// `catalog_aggregate` async lock: the first rebuilds, the rest share the
+    /// fresh entry until its TTL lapses.
+    aggregate: Option<CachedAggregate>,
+}
+
+/// Aggregated `models.catalog` behind the paged response: the full sorted
+/// model list plus the harness inventory it was built from, keyed by the
+/// nonsecret executable+version fingerprint.
+#[derive(Clone, Debug)]
+pub(crate) struct CachedAggregate {
+    /// `harness\0cmd\0version` per harness, sorted; a version or executable
+    /// change invalidates the entry.
+    pub(crate) key: String,
+    pub(crate) harnesses: Vec<HarnessEntry>,
+    pub(crate) models: Vec<ModelsCatalogEntry>,
+    pub(crate) fetched_at_ms: i64,
+    pub(crate) ttl_ms: u64,
+}
+
+impl CachedAggregate {
+    pub(crate) fn fresh(&self, now: i64) -> bool {
+        self.fetched_at_ms >= 0
+            && now >= 0
+            && (now.saturating_sub(self.fetched_at_ms) as u64) <= self.ttl_ms
+    }
+}
+
+/// Fingerprint for the aggregate cache: per-harness executable and version.
+/// Status-only changes (uninstalled with no executable) still fingerprint by
+/// harness code so a later install invalidates.
+pub(crate) fn aggregate_key(harnesses: &[HarnessEntry]) -> String {
+    let mut parts: Vec<String> = harnesses
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}\0{}\0{}",
+                entry.harness,
+                entry.cmd.as_deref().unwrap_or(""),
+                entry.version.as_deref().unwrap_or("")
+            )
+        })
+        .collect();
+    parts.sort();
+    parts.join("\n")
 }
 
 impl CatalogCache {
-    pub(crate) fn get_models(&self, scope: &str, now: i64) -> Option<HarnessModelsResponse> {
+    pub(crate) fn get_models(&self, key: &str, now: i64) -> Option<HarnessModelsResponse> {
         self.models
-            .get(scope)
+            .get(key)
             .filter(|entry| fresh(entry.fetched_at_ms, entry.ttl_ms, now))
             .cloned()
     }
 
-    pub(crate) fn insert_models(&mut self, entry: HarnessModelsResponse) {
+    pub(crate) fn insert_models(&mut self, key: String, entry: HarnessModelsResponse) {
         evict_models(&mut self.models, entry.fetched_at_ms);
-        self.models.insert(entry.scope.clone(), entry);
+        self.models.insert(key, entry);
     }
 
     pub(crate) fn get_quota(&self, scope: &str, now: i64) -> Option<HarnessQuotaResponse> {
@@ -139,9 +188,94 @@ impl CatalogCache {
         self.quotas.insert(entry.scope.clone(), entry);
     }
 
+    pub(crate) fn get_aggregate(&self, key: &str, now: i64) -> Option<CachedAggregate> {
+        self.aggregate
+            .as_ref()
+            .filter(|entry| entry.key == key && entry.fresh(now))
+            .cloned()
+    }
+
+    pub(crate) fn insert_aggregate(&mut self, entry: CachedAggregate) {
+        self.aggregate = Some(entry);
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> (usize, usize) {
         (self.models.len(), self.quotas.len())
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn aggregate_len(&self) -> usize {
+        usize::from(self.aggregate.is_some())
+    }
+}
+
+/// The private native-read key includes executable/version identity without
+/// changing the public account scope. A failed version probe cannot reuse
+/// a previously cached native read.
+pub(crate) fn models_key(scope: &str, cmd: &str, version: Option<&str>) -> Option<String> {
+    version.map(|version| format!("{scope}\0{cmd}\0{version}"))
+}
+
+/// Catalogue membership establishes identity, not account availability.
+/// Only complete hold readback plus affirmative, fresh native quota signals
+/// can establish availability. Unsupported and missing signals stay unknown.
+pub(crate) fn availability(
+    held: Option<bool>,
+    quota: Option<&HarnessQuotaResponse>,
+    model: &str,
+    now: i64,
+) -> &'static str {
+    use eliot_core::api::harness::{CATALOG_AVAILABLE, CATALOG_HELD, CATALOG_UNKNOWN};
+    if held == Some(true) {
+        return CATALOG_HELD;
+    }
+    let Some(quota) = quota.filter(|quota| {
+        held == Some(false)
+            && quota.status == "supported"
+            && fresh(quota.fetched_at_ms, quota.ttl_ms, now)
+    }) else {
+        return CATALOG_UNKNOWN;
+    };
+    let Some(details) = quota.details.as_ref() else {
+        return CATALOG_UNKNOWN;
+    };
+    let headroom = |window: &Value| {
+        window["usedPercent"]
+            .as_i64()
+            .is_some_and(|used| (0..100).contains(&used))
+            && window["resetsAtMs"]
+                .as_i64()
+                .or_else(|| {
+                    window["resetsAt"]
+                        .as_i64()
+                        .map(|time| time.saturating_mul(1000))
+                })
+                .is_some_and(|reset| reset > now)
+    };
+    let available = match quota.harness.as_str() {
+        "muse" => headroom(&details["window"]) && headroom(&details["weekly"]),
+        "codex" => {
+            let rates = &details["rateLimits"];
+            details["ordinaryUsageAllowed"].as_bool() == Some(true)
+                && headroom(&rates["primary"])
+                && headroom(&rates["secondary"])
+                && match details.get("rateLimitsByLimitId") {
+                    None | Some(Value::Null) => true,
+                    Some(Value::Object(limits)) if limits.is_empty() => true,
+                    Some(Value::Object(limits)) => limits.get(model).is_some_and(|rates| {
+                        headroom(&rates["primary"]) && headroom(&rates["secondary"])
+                    }),
+                    _ => false,
+                }
+        }
+        _ => false,
+    };
+    if available {
+        CATALOG_AVAILABLE
+    } else {
+        CATALOG_UNKNOWN
     }
 }
 
@@ -177,6 +311,97 @@ fn evict_quotas(map: &mut HashMap<String, HarnessQuotaResponse>, now: i64) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_model_cache_invalidates_inside_ttl_on_executable_or_version_change() {
+        let scope = "profile:adhoc harness:codex route:direct";
+        let mut cache = CatalogCache::default();
+        let key = models_key(scope, "C:/v1/codex.exe", Some("1.0")).unwrap();
+        cache.insert_models(
+            key.clone(),
+            HarnessModelsResponse {
+                harness: "codex".to_owned(),
+                catalogue: "native".to_owned(),
+                models: Vec::new(),
+                default: Some("old-model".to_owned()),
+                note: None,
+                scope: scope.to_owned(),
+                fetched_at_ms: 1_000,
+                ttl_ms: CATALOG_TTL_MS,
+                credential: "ambient".to_owned(),
+                configure: Default::default(),
+            },
+        );
+        assert_eq!(
+            cache.get_models(&key, 1_001).unwrap().default.as_deref(),
+            Some("old-model")
+        );
+        for (cmd, version) in [("C:/v1/codex.exe", "1.1"), ("C:/v2/codex.exe", "1.0")] {
+            let changed = models_key(scope, cmd, Some(version)).unwrap();
+            assert!(cache.get_models(&changed, 1_001).is_none());
+        }
+        assert!(models_key(scope, "C:/v1/codex.exe", None).is_none());
+    }
+
+    #[test]
+    fn availability_requires_complete_holds_and_affirmative_fresh_quota() {
+        let now = 1_000;
+        let mut quota = HarnessQuotaResponse {
+            harness: "muse".to_owned(),
+            scope: "profile:adhoc harness:muse".to_owned(),
+            fetched_at_ms: now,
+            ttl_ms: CATALOG_TTL_MS,
+            credential: "ambient".to_owned(),
+            status: "supported".to_owned(),
+            note: None,
+            details: Some(json!({"window":{"usedPercent":10,"resetsAtMs":2_000},
+                "weekly":{"usedPercent":20,"resetsAtMs":3_000}})),
+        };
+        assert_eq!(
+            availability(Some(false), Some(&quota), "m", now),
+            "available"
+        );
+        assert_eq!(availability(None, Some(&quota), "m", now), "unknown");
+        assert_eq!(availability(Some(true), None, "m", now), "held");
+        assert_eq!(availability(Some(false), None, "m", now), "unknown");
+        for status in ["unsupported", "unknown"] {
+            quota.status = status.to_owned();
+            assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+        }
+        quota.status = "supported".to_owned();
+        for details in [
+            json!({}),
+            json!({"window":{"usedPercent":0,"resetsAtMs":2_000}}),
+            json!({"window":{"usedPercent":0,"resetsAtMs":2_000},"weekly":{"usedPercent":100,"resetsAtMs":3_000}}),
+            json!({"window":{"usedPercent":0,"resetsAtMs":999},"weekly":{"usedPercent":0,"resetsAtMs":3_000}}),
+        ] {
+            quota.details = Some(details);
+            assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+        }
+        quota.harness = "codex".to_owned();
+        quota.details = Some(json!({"ordinaryUsageAllowed":true,
+            "rateLimits":{"primary":{"usedPercent":0,"resetsAt":2},"secondary":{"usedPercent":0,"resetsAt":3}}}));
+        assert_eq!(
+            availability(Some(false), Some(&quota), "m", now),
+            "available"
+        );
+        assert_eq!(
+            availability(
+                Some(false),
+                Some(&quota),
+                "m",
+                now + CATALOG_TTL_MS as i64 + 1
+            ),
+            "unknown"
+        );
+        quota.details.as_mut().unwrap()["ordinaryUsageAllowed"] = Value::Bool(false);
+        assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+        quota.details.as_mut().unwrap()["ordinaryUsageAllowed"] = Value::Bool(true);
+        quota.details.as_mut().unwrap()["rateLimitsByLimitId"] = json!({"other":{}});
+        assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+        quota.harness = "opencode".to_owned();
+        assert_eq!(availability(Some(false), Some(&quota), "m", now), "unknown");
+    }
 
     #[test]
     fn codex_direct_scope_uses_ambient_identity() {
@@ -282,5 +507,78 @@ mod tests {
             });
         }
         assert!(cache.len().1 <= MAX_CACHED_SCOPES);
+    }
+
+    fn harness_entry(harness: &str, cmd: &str, version: &str) -> HarnessEntry {
+        HarnessEntry {
+            harness: harness.to_owned(),
+            installed: true,
+            cmd: Some(cmd.to_owned()),
+            version: Some(version.to_owned()),
+            code: None,
+            error: None,
+            candidates: None,
+        }
+    }
+
+    #[test]
+    fn aggregate_key_follows_executable_and_version() {
+        let first = vec![
+            harness_entry("codex", "codex", "1.0"),
+            harness_entry("muse", "C:/Tools/muse.exe", "1.4.0"),
+        ];
+        let same = vec![
+            harness_entry("muse", "C:/Tools/muse.exe", "1.4.0"),
+            harness_entry("codex", "codex", "1.0"),
+        ];
+        assert_eq!(aggregate_key(&first), aggregate_key(&same));
+        let upgraded = vec![
+            harness_entry("codex", "codex", "1.1"),
+            harness_entry("muse", "C:/Tools/muse.exe", "1.4.0"),
+        ];
+        assert_ne!(aggregate_key(&first), aggregate_key(&upgraded));
+    }
+
+    #[test]
+    fn aggregate_cache_coalesces_until_ttl_and_version_change() {
+        let mut cache = CatalogCache::default();
+        let harnesses = vec![harness_entry("codex", "codex", "1.0")];
+        let key = aggregate_key(&harnesses);
+        let entry = CachedAggregate {
+            key: key.clone(),
+            harnesses: harnesses.clone(),
+            models: Vec::new(),
+            fetched_at_ms: 1_000,
+            ttl_ms: CATALOG_TTL_MS,
+        };
+        cache.insert_aggregate(entry);
+        assert_eq!(cache.aggregate_len(), 1);
+        // Concurrent callers share the fresh entry: the same key hits.
+        assert!(cache.get_aggregate(&key, 1_000).is_some());
+        assert!(
+            cache
+                .get_aggregate(&key, 1_000 + CATALOG_TTL_MS as i64)
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_aggregate(&key, 1_000 + CATALOG_TTL_MS as i64 + 1)
+                .is_none()
+        );
+        let upgraded = vec![harness_entry("codex", "codex", "1.1")];
+        assert!(
+            cache
+                .get_aggregate(&aggregate_key(&upgraded), 1_000)
+                .is_none()
+        );
+        // A rebuild replaces the single bounded entry, never grows it.
+        cache.insert_aggregate(CachedAggregate {
+            key: aggregate_key(&upgraded),
+            harnesses: upgraded,
+            models: Vec::new(),
+            fetched_at_ms: 2_000,
+            ttl_ms: CATALOG_TTL_MS,
+        });
+        assert_eq!(cache.aggregate_len(), 1);
     }
 }

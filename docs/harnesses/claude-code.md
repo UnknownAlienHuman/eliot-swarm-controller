@@ -376,3 +376,13 @@ Implementation: `plugins/claude/src/host.rs` (`native_subagents_argv`,
 2.1.325; the installed binary in this worktree reports 2.1.278, and the flag
 was verified there.
 
+## Access levels (`--access ask|auto|full`)
+
+Ad-hoc mapping to the CLI `--permission-mode` argv, frozen as
+`permission_mode` and reported in effective settings: `ask` is `manual`
+(`can_use_tool` produces pending requests decided with `swarm approve`/`deny`);
+`auto` is `auto`; `full` is `bypassPermissions`, the full-access posture.
+Implementation:
+[`crates/eliot-daemon/src/adhoc.rs`](../../crates/eliot-daemon/src/adhoc.rs)
+(`apply_adhoc_access`).
+

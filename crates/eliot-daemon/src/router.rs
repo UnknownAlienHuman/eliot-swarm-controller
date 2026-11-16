@@ -122,6 +122,7 @@ struct RouterInner {
     unknown_causes: Mutex<HashMap<String, String>>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
     catalog_cache: Mutex<catalog::CatalogCache>,
+    catalog_aggregate_lock: AsyncMutex<()>,
     var_writes: Mutex<coordination::VarWriteQueue>,
     var_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     plugin_host: PluginHost,
@@ -253,6 +254,7 @@ impl Router {
                 unknown_causes: Mutex::new(HashMap::new()),
                 rule_definitions: Mutex::new(HashMap::new()),
                 catalog_cache: Mutex::new(catalog::CatalogCache::default()),
+                catalog_aggregate_lock: AsyncMutex::new(()),
                 var_writes: Mutex::new(coordination::VarWriteQueue::default()),
                 var_worker: AsyncMutex::new(None),
                 plugin_host,
@@ -340,6 +342,7 @@ impl Router {
             "harness.models" => self.harness_models(&params, &principal).await,
             "harness.quota" => self.harness_quota(&params, &principal).await,
             "harness.doctor" => self.harness_doctor(&params, &principal).await,
+            "models.catalog" => self.models_catalog(&params, &principal).await,
             "agent.history" => self.agent_history(&params, &principal).await,
             "agent.list" => self.agent_list(&params, &principal).await,
             "agent.result" => self.agent_result(&params, &principal).await,
@@ -1885,6 +1888,19 @@ impl Router {
                     "launch cmd must be an executable path string",
                 ));
             }
+            if let Some(access) = request.args.get("access")
+                && !access.is_string()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "launch access must be ask, auto or full",
+                ));
+            }
+            let access = request
+                .args
+                .get("access")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let explicit_cmd = request
                 .args
                 .get("cmd")
@@ -1904,6 +1920,7 @@ impl Router {
                 effort.as_deref(),
                 cmd,
                 crate::adhoc::AdhocAuth::Resolve(auth.as_deref()),
+                access.as_deref(),
             )?;
             crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
@@ -1916,8 +1933,8 @@ impl Router {
                 .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
                 .to_owned();
             let profile_name = crate::adhoc::adhoc_profile_name(&harness);
-            // Keep the requested harness/model/effort/cmd/auth beside the
-            // frozen snapshot: same-ID retries bind the exact requested
+            // Keep the requested harness/model/effort/cmd/auth/access beside
+            // the frozen snapshot: same-ID retries bind the exact requested
             // payload (a changed model is id_conflict), while the frozen
             // snapshot stays the replay-stable source for dispatch.
             if let Some(args) = request.args.as_object_mut() {
@@ -2801,6 +2818,7 @@ impl Router {
                 None,
                 cmd,
                 crate::adhoc::AdhocAuth::Skip,
+                None,
             )?;
             crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
@@ -2867,12 +2885,31 @@ impl Router {
             None => self.resolve_catalog_snapshot(&harness, profile, true)?,
         };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+        let cmd = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("cmd"))
+            .and_then(Value::as_str)
+            .unwrap_or(&harness);
+        let executable = if std::path::Path::new(cmd).is_absolute() {
+            Some(PathBuf::from(cmd))
+        } else {
+            crate::adhoc::find_on_path(&format!("{cmd}.exe"))
+                .or_else(|| crate::adhoc::find_on_path(cmd))
+        };
+        let cmd = executable
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| cmd.to_owned());
+        let version = if harness == "claude" {
+            Some("static-aliases".to_owned())
+        } else {
+            crate::adhoc::native_version_string(&cmd)
+        };
+        let cache_key = catalog::models_key(&scope, &cmd, version.as_deref());
         let now = now_ms();
-        if let Some(hit) = self
-            .inner
-            .catalog_cache
-            .lock_recover()
-            .get_models(&scope, now)
+        if let Some(hit) = cache_key
+            .as_deref()
+            .and_then(|key| self.inner.catalog_cache.lock_recover().get_models(key, now))
         {
             request.validate_response(&hit)?;
             return serde_json::to_value(hit)
@@ -3006,10 +3043,12 @@ impl Router {
             }
         };
         request.validate_response(&response)?;
-        self.inner
-            .catalog_cache
-            .lock_recover()
-            .insert_models(response.clone());
+        if let Some(key) = cache_key {
+            self.inner
+                .catalog_cache
+                .lock_recover()
+                .insert_models(key, response.clone());
+        }
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "harness models could not be encoded"))
     }
@@ -3213,6 +3252,204 @@ impl Router {
             note: Some(note),
             details: None,
         }
+    }
+
+    /// One owner-scoped read-only search over every installed harness
+    /// catalogue. Results are cached per harness executable and version with
+    /// a bounded TTL; concurrent callers coalesce on the aggregate lock. The
+    /// optional query filters case-insensitively over model id, display
+    /// name, provider and harness. The response is bounded and paginated.
+    async fn models_catalog(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        use eliot_core::api::{
+            ModelsCatalogEntry, ModelsCatalogRequest, catalog_display_name, catalog_provider,
+        };
+        require_owner(principal)?;
+        let request: ModelsCatalogRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+            return Err(Error::new(
+                "unavailable",
+                "daemon is shutting down and rejects new discovery",
+            ));
+        }
+        let query = request.query.as_deref().unwrap_or("").to_owned();
+        let limit = request.effective_limit();
+        let after = request.after.clone();
+        // Coalesce concurrent callers: the first rebuilds, the rest share
+        // the fresh aggregate until its TTL lapses.
+        let _coalesce = self.inner.catalog_aggregate_lock.lock().await;
+        // Harness inventory with versions for the aggregate key.
+        let harnesses_value = self.harness_list(&json!({}), principal).await?;
+        let harnesses_response: eliot_core::api::HarnessListResponse =
+            serde_json::from_value(harnesses_value)
+                .map_err(|_| Error::new("internal", "harness list could not be decoded"))?;
+        let harnesses = harnesses_response.harnesses;
+        let key = catalog::aggregate_key(&harnesses);
+        let now = now_ms();
+        if let Some(hit) = self
+            .inner
+            .catalog_cache
+            .lock_recover()
+            .get_aggregate(&key, now)
+        {
+            return Self::catalog_page(
+                &request,
+                &hit.harnesses,
+                &hit.models,
+                &query,
+                limit,
+                after.as_deref(),
+                hit.fetched_at_ms,
+                hit.ttl_ms,
+            );
+        }
+        // Provider holds for availability: a hold whose scope names the
+        // harness marks that harness's models held.
+        const HOLD_LIMIT: usize = 1000;
+        let holds = {
+            let store = self.inner.store.lock().await;
+            store.list_provider_holds(None, HOLD_LIMIT).ok()
+        };
+        let held_harness = |harness: &str| {
+            let page = holds.as_ref()?;
+            let scope = format!("profile:{}", crate::adhoc::adhoc_profile_name(harness));
+            if page.holds.iter().any(|hold| {
+                hold.scope == scope
+                    && matches!(
+                        hold.state,
+                        eliot_core::ProviderHoldState::Held
+                            | eliot_core::ProviderHoldState::Probing
+                    )
+            }) {
+                Some(true)
+            } else if page.holds.len() < HOLD_LIMIT {
+                Some(false)
+            } else {
+                None
+            }
+        };
+        let mut models: Vec<ModelsCatalogEntry> = Vec::new();
+        for entry in &harnesses {
+            let harness = entry.harness.as_str();
+            if !entry.installed {
+                continue;
+            }
+            // Reuse the per-scope cached `harness.models` path so one live
+            // native read serves every caller until its TTL lapses.
+            let params = match harness {
+                "claude" => {
+                    // Claude exposes aliases plus the CLI default, no live
+                    // catalogue: no models to aggregate.
+                    continue;
+                }
+                _ => json!({"harness": harness}),
+            };
+            let response_value = match self.harness_models(&params, principal).await {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let response: eliot_core::api::HarnessModelsResponse =
+                serde_json::from_value(response_value)
+                    .map_err(|_| Error::new("internal", "harness models could not be decoded"))?;
+            let held = held_harness(harness);
+            let quota = self
+                .harness_quota(&params, principal)
+                .await
+                .ok()
+                .and_then(|value| {
+                    serde_json::from_value::<eliot_core::api::HarnessQuotaResponse>(value).ok()
+                });
+            for model in response.models {
+                let provider = catalog_provider(harness, &model.id);
+                let availability =
+                    catalog::availability(held, quota.as_ref(), &model.id, now_ms()).to_owned();
+                models.push(ModelsCatalogEntry {
+                    harness: harness.to_owned(),
+                    id: model.id.clone(),
+                    display_name: catalog_display_name(&model.id),
+                    provider,
+                    efforts: model.efforts,
+                    default_effort: model.default_effort,
+                    default: model.default,
+                    availability,
+                });
+            }
+        }
+        models.sort_by(|left, right| {
+            (left.harness.as_str(), left.id.as_str())
+                .cmp(&(right.harness.as_str(), right.id.as_str()))
+        });
+        let fetched_at_ms = now_ms();
+        self.inner
+            .catalog_cache
+            .lock_recover()
+            .insert_aggregate(catalog::CachedAggregate {
+                key: key.clone(),
+                harnesses: harnesses.clone(),
+                models: models.clone(),
+                fetched_at_ms,
+                ttl_ms: catalog::CATALOG_TTL_MS,
+            });
+        Self::catalog_page(
+            &request,
+            &harnesses,
+            &models,
+            &query,
+            limit,
+            after.as_deref(),
+            fetched_at_ms,
+            catalog::CATALOG_TTL_MS,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn catalog_page(
+        request: &eliot_core::api::ModelsCatalogRequest,
+        harnesses: &[eliot_core::api::HarnessEntry],
+        models: &[eliot_core::api::ModelsCatalogEntry],
+        query: &str,
+        limit: usize,
+        after: Option<&str>,
+        fetched_at_ms: i64,
+        ttl_ms: u64,
+    ) -> Result<Value> {
+        use eliot_core::api::{ModelsCatalogResponse, catalog_cursor, catalog_matches};
+        let mut filtered: Vec<eliot_core::api::ModelsCatalogEntry> = models
+            .iter()
+            .filter(|entry| catalog_matches(entry, query))
+            .cloned()
+            .collect();
+        filtered.sort_by(|left, right| {
+            (left.harness.as_str(), left.id.as_str())
+                .cmp(&(right.harness.as_str(), right.id.as_str()))
+        });
+        let start = match after {
+            None => 0,
+            Some(cursor) => filtered
+                .iter()
+                .position(|entry| catalog_cursor(&entry.harness, &entry.id) == cursor)
+                .map(|index| index + 1)
+                .unwrap_or(0),
+        };
+        let page: Vec<eliot_core::api::ModelsCatalogEntry> =
+            filtered.into_iter().skip(start).take(limit).collect();
+        let next = if page.len() == limit {
+            page.last()
+                .map(|entry| catalog_cursor(&entry.harness, &entry.id))
+        } else {
+            None
+        };
+        let response = ModelsCatalogResponse {
+            harnesses: harnesses.to_owned(),
+            models: page,
+            next,
+            fetched_at_ms,
+            ttl_ms,
+        };
+        request.validate_response(&response)?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "unified catalogue could not be encoded"))
     }
 
     async fn agent_history(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -5968,7 +6205,7 @@ fn normalize_launch(request: &mut SubmitCommand, _principal: &Principal) -> Resu
         if args.get("parent").is_some() {
             return Err(Error::new("invalid", "ad-hoc launch cannot have a parent"));
         }
-        for field in ["model", "effort", "auth"] {
+        for field in ["model", "effort", "auth", "access"] {
             if let Some(value) = args.get(field)
                 && value.as_str().is_none_or(|text| text.trim().is_empty())
             {
@@ -5978,8 +6215,11 @@ fn normalize_launch(request: &mut SubmitCommand, _principal: &Principal) -> Resu
                 ));
             }
         }
+        if let Some(access) = args.get("access").and_then(Value::as_str) {
+            crate::adhoc::validate_adhoc_access(access)?;
+        }
     } else {
-        for field in ["model", "effort", "auth"] {
+        for field in ["model", "effort", "auth", "access"] {
             if args.get(field).is_some() {
                 return Err(Error::new(
                     "invalid",
@@ -13635,6 +13875,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     }
 
     pub(super) fn result_fixture(store: &mut eliot_store::Store) -> (String, String) {
+        result_fixture_with_snapshot(store, json!({}))
+    }
+
+    fn result_fixture_with_snapshot(
+        store: &mut eliot_store::Store,
+        snapshot: Value,
+    ) -> (String, String) {
         let launch_id = ulid::Ulid::new().to_string();
         let agent = store
             .submit(
@@ -13646,7 +13893,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                     verb: "launch".to_owned(),
                     args: json!({
                         "project":"typed-results", "workspace":"synthetic-workspace",
-                        "harness":"codex", "profile":"synthetic", "profile_snapshot":{},
+                        "harness":"codex", "profile":"synthetic", "profile_snapshot":snapshot,
                     }),
                     expected_generation: Some(0),
                     expected_turn_id: None,
@@ -13665,7 +13912,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             store,
             &agent,
             "session.ready",
-            json!({"native_scope":"fixture-scope", "native_ref":"fixture-ref"}),
+            json!({"native_scope":"fixture-scope", "native_ref":format!("fixture-ref-{agent}")}),
         );
         store
             .settle(&launch_id, CommandState::Applied, None, now_ms())
@@ -13696,6 +13943,90 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             json!({"command_id":send_id, "turn_id":"turn-1"}),
         );
         (agent, send_id)
+    }
+
+    #[tokio::test]
+    async fn ask_replies_refuse_self_and_manager_but_owner_and_other_access_work() {
+        for access in ["ask", "auto", "full"] {
+            for verb in ["approve", "deny", "answer"] {
+                let router = router();
+                let (agent, manager) = {
+                    let mut store = router.inner.store.lock().await;
+                    let (manager, _) =
+                        result_fixture_with_snapshot(&mut store, json!({"control":"project"}));
+                    let (agent, send) =
+                        result_fixture_with_snapshot(&mut store, json!({"access":access}));
+                    read_fixture_event(
+                        &mut store,
+                        &agent,
+                        "request.opened",
+                        json!({
+                            "command_id":send, "request_id":"access-request", "turn_id":"turn-1",
+                            "kind":"request_user_input", "details":{"questions":[{
+                                "id":"q1", "header":"Continue", "question":"Continue?",
+                                "options":[{"label":"Yes", "description":"Continue"}]
+                            }]}
+                        }),
+                    );
+                    (agent, manager)
+                };
+                let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), verb);
+                request.target = Some(agent.clone());
+                request.expected_generation = Some(1);
+                request.expected_turn_id = Some("turn-1".to_owned());
+                request.request_id = Some("access-request".to_owned());
+                if verb == "answer" {
+                    request.args = json!({"answers":{"q1":{"answers":["Yes"]}}});
+                }
+                // These are the authenticated principals used by CLI/MCP.
+                for caller in [&agent, &manager] {
+                    let principal = Principal::Agent {
+                        id: caller.clone(),
+                        generation: 1,
+                    };
+                    if access == "ask" {
+                        let value = serde_json::to_value(&request).unwrap();
+                        let error = router.submit(&value, &principal).await.unwrap_err();
+                        assert_eq!(error.code, "not_allowed", "{verb} {caller}");
+                        assert!(error.message.contains("Owner"));
+                    } else {
+                        // Verify hierarchy scope, then admit and dispatch without
+                        // scheduling any native effect in this source regression.
+                        let mut request = request.clone();
+                        request.id = ulid::Ulid::new().to_string();
+                        router
+                            .authorize_submission_scope(&mut request, &principal)
+                            .await
+                            .unwrap();
+                        let mut store = router.inner.store.lock().await;
+                        let admission = store
+                            .submit(&principal_name(&principal), request, now_ms())
+                            .unwrap();
+                        assert_eq!(
+                            store
+                                .dispatch(&admission.command.id, now_ms())
+                                .unwrap()
+                                .value
+                                .state,
+                            CommandState::Dispatched
+                        );
+                        store
+                            .settle(&admission.command.id, CommandState::Failed, None, now_ms())
+                            .unwrap();
+                    }
+                }
+                let mut store = router.inner.store.lock().await;
+                let admitted = store.submit("owner", request, now_ms()).unwrap();
+                assert_eq!(
+                    store
+                        .dispatch(&admitted.command.id, now_ms())
+                        .unwrap()
+                        .value
+                        .state,
+                    CommandState::Dispatched
+                );
+            }
+        }
     }
 
     #[tokio::test]
