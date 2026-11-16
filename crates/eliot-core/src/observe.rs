@@ -179,8 +179,13 @@ pub const BUILD_WORKER_PROGRAMS: &[&str] = &["rustc", "cc", "link", "sccache", "
 /// Wrapper keywords taking a wrapper-option value (never a command): the
 /// value after one of these is skipped while unwrapping.
 const WRAPPER_VALUE_KEYWORDS: &[&str] = &["executionpolicy", "windowstyle"];
-/// Bare wrapper keywords (never programs) skipped while unwrapping.
-const WRAPPER_BARE_KEYWORDS: &[&str] = &["command", "file", "c", "d"];
+/// Bare wrapper keywords (never programs) skipped while unwrapping: the
+/// wrapper's own verbs plus shell control keywords (`powershell -Command
+/// "try { cargo build }"` attributes to `cargo build`, never to `try`).
+const WRAPPER_BARE_KEYWORDS: &[&str] = &[
+    "command", "file", "c", "d", "try", "catch", "finally", "foreach", "for", "while", "do",
+    "until", "if", "else", "elseif", "switch", "function", "return", "throw", "break", "continue",
+];
 
 /// First program-like word of one shell-wrapper arg: alphanumeric-led,
 /// bounded, not a flag and not a bare wrapper keyword. Quoted payloads
@@ -1018,6 +1023,18 @@ mod observe_tests {
         assert_eq!(
             resolve_heavy_category(&sleeper, &[]),
             Some("start-sleep 30".to_owned())
+        );
+        // Shell control keywords are plumbing too: `try { cargo build }`
+        // attributes to the build.
+        let guarded = argv(&[
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            "try { cargo build } catch { exit 1 }",
+        ]);
+        assert_eq!(
+            resolve_heavy_category(&guarded, &[]),
+            Some("cargo build".to_owned())
         );
         // A wrapper with flags alone and no payload keeps its own program.
         let bare = argv(&["powershell.exe", "-NoProfile", "-NonInteractive"]);
