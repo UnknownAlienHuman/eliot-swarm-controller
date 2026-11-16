@@ -162,8 +162,14 @@ fn ensure_bootstrap_settings(
         profile_names = profiles.keys().cloned().collect();
         let default_profile = bootstrap_default_profile(&profile_names);
         if let Some(profile) = profiles.get_mut(&default_profile) {
-            profile["child_profiles"] =
-                json!(bootstrap_worker_profiles(&profile_names, &default_profile));
+            let workers = bootstrap_worker_profiles(&profile_names, &default_profile);
+            // A manager whose harness cannot disable native subagents keeps
+            // them explicitly; the derived `deny` would make the whole
+            // bootstrap settings save (and daemon startup) fail.
+            if !workers.is_empty() && !manager_supports_native_deny(&default_profile) {
+                profile["native_subagents"] = json!("allow");
+            }
+            profile["child_profiles"] = json!(workers);
             profile["control"] = json!("tree");
         }
         if !profiles.is_empty() {
@@ -213,13 +219,25 @@ fn ensure_bootstrap_settings(
     Ok(())
 }
 
+/// Harnesses whose native subagents can be turned off per session
+/// (`native_subagents = "deny"`), in bootstrap manager preference order. A
+/// manager on one of them delegates through Swarm by default.
+const DENY_CAPABLE_MANAGERS: [&str; 3] = ["codex", "claude", "opencode"];
+
+/// The hot-start manager: the first installed deny-capable harness, else the
+/// first installed profile (Muse or Antigravity, which keep native subagents).
 fn bootstrap_default_profile(names: &[String]) -> String {
-    names
+    DENY_CAPABLE_MANAGERS
         .iter()
-        .find(|name| name.as_str() == "codex")
+        .find_map(|preferred| names.iter().find(|name| name.as_str() == *preferred))
         .or_else(|| names.first())
         .cloned()
         .unwrap_or_default()
+}
+
+/// Whether a hot-start manager on this profile can disable native subagents.
+fn manager_supports_native_deny(profile: &str) -> bool {
+    DENY_CAPABLE_MANAGERS.contains(&profile)
 }
 
 fn bootstrap_worker_profiles(names: &[String], manager: &str) -> Vec<String> {
@@ -364,6 +382,66 @@ fn project_id(checkout: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_manager_prefers_deny_capable_harnesses() {
+        let names = |list: &[&str]| list.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            bootstrap_default_profile(&names(&["antigravity", "codex", "muse"])),
+            "codex"
+        );
+        assert_eq!(
+            bootstrap_default_profile(&names(&["antigravity", "claude", "muse"])),
+            "claude"
+        );
+        assert_eq!(
+            bootstrap_default_profile(&names(&["antigravity", "muse", "opencode"])),
+            "opencode"
+        );
+        // Only harnesses without a native-subagent switch: the first one
+        // manages and keeps native subagents explicitly (see ensure_bootstrap_settings).
+        let only = names(&["antigravity", "muse"]);
+        assert_eq!(bootstrap_default_profile(&only), "antigravity");
+        assert!(!manager_supports_native_deny("antigravity"));
+        assert!(!manager_supports_native_deny("muse"));
+        assert!(manager_supports_native_deny("codex"));
+    }
+
+    #[test]
+    fn non_deny_manager_with_children_resolves_with_explicit_allow() {
+        // The audited failure: an Antigravity manager granted a Muse child
+        // derived `deny`, which Antigravity rejects, aborting startup. The
+        // bootstrap now writes `native_subagents = "allow"` for it; the
+        // resulting profiles must resolve, and the derived form must not.
+        let root = std::env::temp_dir().join(format!("eliot-bootstrap-deny-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let explicit = "[profiles.antigravity]
+harness = \"antigravity\"
+model = \"test-model\"
+cmd = \"C:/Tools/Agy/agy.exe\"
+child_profiles = [\"muse\"]
+control = \"tree\"
+native_subagents = \"allow\"
+[profiles.muse]
+harness = \"muse\"
+model = \"m\"
+cmd = \"C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe\"
+";
+        std::fs::write(root.join("config.toml"), explicit).unwrap();
+        let snapshot = crate::config::resolve_profile(&root, "antigravity")
+            .expect("explicit allow keeps the Antigravity manager valid");
+        assert_eq!(snapshot["native_subagents"], "allow");
+        let derived = explicit.replace(
+            "native_subagents = \"allow\"
+",
+            "",
+        );
+        std::fs::write(root.join("config.toml"), derived).unwrap();
+        let error = crate::config::resolve_profile(&root, "antigravity")
+            .expect_err("derived deny is unsupported on Antigravity");
+        assert_eq!(error.code, "unsupported");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn fresh_bootstrap_grants_only_installed_worker_profiles_and_preserves_edits() {

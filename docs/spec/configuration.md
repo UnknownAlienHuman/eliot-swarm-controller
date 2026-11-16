@@ -83,10 +83,13 @@ and Antigravity. Each profile selects one `harness` explicitly and may pin an ex
 the other four adapters require an explicit native executable in `cmd` in a
 stored profile. First use writes visible, editable native-default profiles for
 installed harnesses through the settings writer as `bootstrap`. On a fresh root,
-the default is `codex` when installed,
-otherwise the first installed profile in name order. It has `control = "tree"`
-and `child_profiles` listing the other installed bootstrap profiles (so its
-omitted `native_subagents` resolves to `deny`). The `worker`
+the default is the first installed of `codex`, `claude` and `opencode` (the
+harnesses that can disable native subagents per session), otherwise the first
+installed profile in name order. It has `control = "tree"` and `child_profiles`
+listing the other installed bootstrap profiles, so on those harnesses its omitted
+`native_subagents` resolves to `deny`. A Muse or Antigravity default, which has
+no per-session switch, is written with `native_subagents = "allow"` so the
+bootstrap settings stay valid. The `worker`
 routing role lists those profiles in name order (or the inherited default profile
 when it is the only installed harness). This makes Swarm delegation available on
 first use; existing profiles and routing choices are preserved. An omitted model
