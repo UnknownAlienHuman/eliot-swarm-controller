@@ -1042,7 +1042,7 @@ mod tests {
             serde_json::to_vec(&metadata).expect("encode fixture daemon metadata"),
         )
         .expect("write fixture daemon metadata");
-        super::super::windows::set_test_untrusted_file_acl(&metadata_path)
+        super::super::windows::set_test_untrusted_file_acl(&metadata_path, false)
             .expect("install deterministic Everyone DACL");
 
         assert_eq!(
@@ -1069,7 +1069,7 @@ mod tests {
     fn existing_unsafe_root_acl_is_rejected_without_repair() {
         let root = TestRoot::new();
         let data = DataDir::open(&root.path).expect("initialize private data directory");
-        super::super::windows::set_test_untrusted_file_acl(data.path())
+        super::super::windows::set_test_untrusted_file_acl(data.path(), true)
             .expect("install deterministic Everyone DACL");
 
         assert_eq!(
