@@ -39,7 +39,8 @@ pub use agent_views::{
     PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectDiscoverRequest, ProjectDiscoverResponse,
     ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary, RetentionView,
     RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
-    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
+    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView, activity_state_name,
+    agent_state_name,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
