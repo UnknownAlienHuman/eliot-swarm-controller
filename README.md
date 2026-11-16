@@ -106,8 +106,11 @@ $agent = 'AGENT_ID_FROM_OUTPUT'
 retained events after an exact exclusive cursor. A pruned cursor returns `history_gap`
 and is never clamped; see [event replay](docs/spec/api.md#event-replay).
 
-On Unix, the built binary is `./target/debug/swarm`; pass the same `--data-dir` to each
-invocation.
+Linux is supported through one [Docker image](docker/README.md) (linux/amd64,
+Debian bookworm). Build with `docker build -f docker/Dockerfile -t eliot:linux .`,
+run with a private data volume and `--init`, then use `docker exec eliot swarm …`.
+The guide documents pinned native CLIs, explicit credential mounts, container paths
+and degraded process custody. The Windows desktop cannot attach to this daemon.
 
 `launch` takes `--profile` for one of the five native adapters and an existing
 workspace, or omits `--profile` to route by `--role` through the ordered `[routing]`

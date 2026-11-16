@@ -558,14 +558,25 @@ fn response_error(error: Error) -> RpcError {
     let mut data = json!({"code": semantic});
     // Core serializes optional data using its shared encoded budget. A failed
     // optional conversion must never replace the primary code or message.
-    if let Ok(encoded) = serde_json::to_value(&error)
-        && let Some(diagnostics) = encoded.get("diagnostics")
-    {
-        data["diagnostics"] = diagnostics.clone();
+    // The typed failure location and origin ride along so the daemon can
+    // report why and where without guessing from free text.
+    if let Ok(encoded) = serde_json::to_value(&error) {
+        for key in [
+            "where",
+            "origin",
+            "origin_evidence",
+            "exit_code",
+            "ntstatus",
+            "diagnostics",
+        ] {
+            if let Some(field) = encoded.get(key) {
+                data[key] = field.clone();
+            }
+        }
     }
     RpcError {
         code: wire_code,
-        message: error.message,
+        message: *error.message,
         data: Some(data),
     }
 }
@@ -582,17 +593,28 @@ fn call_error(error: RpcError) -> Error {
 }
 
 fn decode_error_diagnostics(primary: Error, data: Option<&Value>) -> Error {
-    let Some(diagnostics) = data.and_then(|data| data.get("diagnostics")) else {
+    let Some(data) = data else {
         return primary;
     };
     // Core's deserializer validates sources/counts/shapes and omits malformed
     // optional data. Mandatory fields here are our already-decoded originals.
-    serde_json::from_value(json!({
+    let mut value = json!({
         "code": primary.code,
         "message": primary.message,
-        "diagnostics": diagnostics,
-    }))
-    .unwrap_or(primary)
+    });
+    for key in [
+        "where",
+        "origin",
+        "origin_evidence",
+        "exit_code",
+        "ntstatus",
+        "diagnostics",
+    ] {
+        if let Some(field) = data.get(key) {
+            value[key] = field.clone();
+        }
+    }
+    serde_json::from_value(value).unwrap_or(primary)
 }
 
 fn bound_response_diagnostics(response: &mut RpcResponse) {
@@ -998,7 +1020,7 @@ mod tests {
                 data: Some(json!({"code": "unknown", "diagnostics": diagnostics})),
             });
             assert_eq!(error.code, "unknown");
-            assert_eq!(error.message, "original failure");
+            assert_eq!(error.message.as_ref(), "original failure");
             assert!(error.diagnostics.is_empty());
         }
     }

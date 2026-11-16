@@ -1551,6 +1551,15 @@ impl State {
         let truncated = self.text_truncated;
         let mut data = json!({"command_id": command, "turn_id": turn,
             "status": status, "outcome": outcome, "native_status": result.stop_reason});
+        if failed {
+            eliot_plugin::session::attach_failure_origin(
+                &mut data,
+                "antigravity",
+                eliot_core::FailureOrigin::Harness,
+                "native ACP terminal refusal; documented ACP surface exposes no structured upstream error",
+                &self.policy,
+            );
+        }
         self.policy.redact_values(&mut data);
         if !text.is_empty() && !truncated {
             self.commit(

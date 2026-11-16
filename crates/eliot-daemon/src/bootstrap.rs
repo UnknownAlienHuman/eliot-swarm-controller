@@ -30,8 +30,34 @@ pub(crate) async fn ensure_hot_start(
     cwd: Option<&Path>,
 ) -> Result<()> {
     {
+        let needs = {
+            let mut store = store.lock().await;
+            bootstrap_needed(data_root, &mut store, policy)?
+        };
+        let muse_cmd = if needs {
+            let (cmd, skipped, budget_exhausted) = crate::adhoc::select_muse_hot_start_cmd().await;
+            for cmd in &skipped {
+                crate::logging::record(
+                    policy,
+                    "bootstrap.muse_empty_catalogue_skipped",
+                    &[("cmd", cmd.as_str())],
+                    None,
+                );
+            }
+            if budget_exhausted {
+                crate::logging::record(
+                    policy,
+                    "bootstrap.muse_catalogue_budget_exhausted",
+                    &[],
+                    None,
+                );
+            }
+            cmd
+        } else {
+            None
+        };
         let mut store = store.lock().await;
-        ensure_bootstrap_settings(data_root, &mut store, policy)?;
+        ensure_bootstrap_settings(data_root, &mut store, policy, muse_cmd)?;
     }
     if let Some(cwd) = cwd
         && let Some((checkout, common_dir)) = workspace_identity(cwd).await?
@@ -132,15 +158,32 @@ async fn workspace_identity(workspace: &Path) -> Result<Option<(String, String)>
     }
 }
 
+fn bootstrap_needed(data_root: &Path, store: &mut Store, policy: &SecretPolicy) -> Result<bool> {
+    use crate::config::settings::{self};
+    use eliot_core::api::SettingsSection::{Profiles, Routing};
+    let read = settings::read_internal(data_root, store, Some(&[Profiles, Routing]), policy)?;
+    let current_profiles = read
+        .sections
+        .get(&Profiles)
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let profile_names = current_profiles
+        .as_object()
+        .map(|profiles| profiles.keys().len())
+        .unwrap_or_default();
+    Ok(read.revision.is_none() && profile_names == 0)
+}
+
 fn ensure_bootstrap_settings(
     data_root: &Path,
     store: &mut Store,
     policy: &SecretPolicy,
+    muse_cmd: Option<String>,
 ) -> Result<()> {
     use crate::config::settings::{self, SettingsAuthor};
     use eliot_core::api::SettingsSection::{Profiles, Routing};
 
-    let read = settings::read_internal(data_root, store, Some(&[Profiles, Routing]), policy)?;
+    let read = settings::read_internal(data_root, &*store, Some(&[Profiles, Routing]), policy)?;
     let current_profiles = read
         .sections
         .get(&Profiles)
@@ -158,7 +201,7 @@ fn ensure_bootstrap_settings(
         .unwrap_or_default();
 
     if read.revision.is_none() && profile_names.is_empty() {
-        let mut profiles = installed_default_profiles();
+        let mut profiles = installed_default_profiles(muse_cmd);
         profile_names = profiles.keys().cloned().collect();
         let default_profile = bootstrap_default_profile(&profile_names);
         if let Some(profile) = profiles.get_mut(&default_profile) {
@@ -248,9 +291,20 @@ fn bootstrap_worker_profiles(names: &[String], manager: &str) -> Vec<String> {
         .collect()
 }
 
-fn installed_default_profiles() -> serde_json::Map<String, Value> {
+fn installed_default_profiles(muse_cmd: Option<String>) -> serde_json::Map<String, Value> {
     let mut profiles = serde_json::Map::new();
     for harness in crate::adhoc::SUPPORTED_HARNESSES {
+        if *harness == "muse" {
+            let Some(cmd) = muse_cmd.clone() else {
+                continue;
+            };
+            let mut profile = serde_json::Map::new();
+            profile.insert("harness".to_owned(), Value::String("muse".to_owned()));
+            profile.insert("mcp".to_owned(), Value::String("inherit".to_owned()));
+            profile.insert("cmd".to_owned(), Value::String(cmd));
+            profiles.insert("muse".to_owned(), Value::Object(profile));
+            continue;
+        }
         let discovered = crate::adhoc::harness_installation(harness);
         if discovered.get("installed").and_then(Value::as_bool) != Some(true) {
             continue;
@@ -288,7 +342,7 @@ fn ensure_project_identity(
     use crate::config::settings::{self, SettingsAuthor};
     use eliot_core::api::SettingsSection::{Profiles, Projects};
 
-    let read = settings::read_internal(data_root, store, Some(&[Profiles, Projects]), policy)?;
+    let read = settings::read_internal(data_root, &*store, Some(&[Profiles, Projects]), policy)?;
     let profiles = read
         .sections
         .get(&Profiles)
@@ -449,7 +503,7 @@ cmd = \"C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe\"
         std::fs::create_dir_all(&root).unwrap();
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         let policy = SecretPolicy::default();
-        ensure_bootstrap_settings(&root, &mut store, &policy).unwrap();
+        ensure_bootstrap_settings(&root, &mut store, &policy, None).unwrap();
         if root.join("config.toml").is_file() {
             let source = std::fs::read_to_string(root.join("config.toml")).unwrap();
             let config: toml::Value = toml::from_str(&source).unwrap();
@@ -479,7 +533,7 @@ cmd = \"C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe\"
             // Restart never adds a new grant or overwrites an Owner edit.
             let edited = "[profiles.only]\nharness='codex'\nchild_profiles=[]\n[routing]\ndefault=['only']\nworker=['only']\n";
             std::fs::write(root.join("config.toml"), edited).unwrap();
-            ensure_bootstrap_settings(&root, &mut store, &policy).unwrap();
+            ensure_bootstrap_settings(&root, &mut store, &policy, None).unwrap();
             assert_eq!(
                 std::fs::read_to_string(root.join("config.toml")).unwrap(),
                 edited

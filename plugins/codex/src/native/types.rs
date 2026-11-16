@@ -228,6 +228,12 @@ pub(crate) struct NativeThreadListResponse {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeThreadArchiveParams {
+    pub thread_id: String,
+}
+
 /// Deliberately excludes preview, name and turns, even when the native response has them.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -422,6 +428,43 @@ pub struct NativeTurnError {
 }
 
 impl NativeTurnError {
+    /// Installed codex-cli 0.167.1 CodexErrorInfo. HTTP status is forwarded
+    /// from upstream; sandbox/local protocol errors are not provider evidence.
+    pub(crate) fn failure_origin(&self) -> eliot_core::FailureOrigin {
+        use eliot_core::FailureOrigin;
+        let provider = match self.codex_error_info.as_ref() {
+            Some(serde_json::Value::String(code)) => matches!(
+                code.as_str(),
+                "rateLimitExceeded"
+                    | "usageLimitExceeded"
+                    | "unauthorized"
+                    | "modelNotFound"
+                    | "serverOverloaded"
+                    | "internalServerError"
+            ),
+            Some(serde_json::Value::Object(variants)) if variants.len() == 1 => {
+                variants.iter().any(|(variant, details)| {
+                    matches!(
+                        variant.as_str(),
+                        "httpConnectionFailed"
+                            | "responseStreamConnectionFailed"
+                            | "responseStreamDisconnected"
+                            | "responseTooManyFailedAttempts"
+                    ) && details
+                        .get("httpStatusCode")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|status| (400..600).contains(&status))
+                })
+            }
+            _ => false,
+        };
+        if provider {
+            FailureOrigin::Provider
+        } else {
+            FailureOrigin::Harness
+        }
+    }
+
     /// Project only installed 0.161 structured restriction codes. Free text,
     /// extra details, unrelated statuses and unknown future variants stay inert.
     pub(crate) fn provider_restriction(&self) -> Option<ProviderRestriction> {

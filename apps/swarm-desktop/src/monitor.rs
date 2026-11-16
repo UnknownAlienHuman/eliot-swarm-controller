@@ -439,6 +439,7 @@ fn rate(previous: &Sample, current: &Sample) -> (Option<f64>, bool) {
 pub struct DetailRead {
     pub agent: AgentGetResponse,
     pub usage: Result<UsageSummaryResponse, String>,
+    pub diagnosis: Result<String, String>,
 }
 
 /// Everything one refresh read.
@@ -630,7 +631,15 @@ pub async fn refresh(
                 let usage = client::usage_summary(data_dir, &agent)
                     .await
                     .map_err(|error| error.to_string());
-                Ok(DetailRead { agent: read, usage })
+                let diagnosis = client::diagnose(data_dir, &agent)
+                    .await
+                    .map(|reply| reply.summary)
+                    .map_err(|error| error.to_string());
+                Ok(DetailRead {
+                    agent: read,
+                    usage,
+                    diagnosis,
+                })
             };
             Read::Detail(Box::new(detail.await))
         }));
@@ -806,6 +815,8 @@ mod tests {
                 usage: None,
                 usage_scope: None,
                 updated_at: 0,
+                heavy: None,
+                session_growth: None,
             },
             observation: None,
         };
@@ -853,6 +864,8 @@ mod tests {
             usage,
             usage_scope: usage_scope.map(str::to_owned),
             updated_at: 0,
+            heavy: None,
+            session_growth: None,
         };
         let make_row = |usage: Option<TurnUsage>, usage_scope: Option<&str>| {
             MonitorRow::from_list(&AgentListRow {

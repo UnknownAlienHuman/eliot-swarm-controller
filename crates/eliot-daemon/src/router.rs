@@ -2,10 +2,12 @@ mod attention;
 mod attribution;
 mod auth;
 mod catalog;
+mod cleanup;
 mod command;
 mod config_ops;
 mod context;
 mod coordination;
+mod diagnose;
 mod digests;
 pub(crate) mod discovery;
 mod goals;
@@ -27,7 +29,7 @@ use crate::{
     automation::RuleDefinition,
     bus::Bus,
     common::{now_ms, valid_environment_name},
-    monitor::Monitoring,
+    monitor::{Monitoring, ObserveThresholds},
     plugin_host::{AgentCredentials, PluginHost, PluginHostOptions, SecretSet, UnknownCommands},
     scripts::auth::{RunCredentialGuard, RunCredentialRegistry, SavedRunPrincipal},
     workspaces::WorkspaceManager,
@@ -43,13 +45,15 @@ use eliot_core::{
         AgentListRequest, AgentListResponse, AgentListRow, AgentProcessesRequest,
         AgentProcessesResponse, AgentResultRequest, AgentResultResponse, AgentStatsRequest,
         AgentStatsResponse, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
-        CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse,
-        DaemonStatusRequest, DaemonStatusResponse, DiscoverPage, DrainReport, EmitDefinitionArgs,
-        EventsBoundsRequest, EventsFilter, EventsReadRequest, EventsReadResponse,
-        EventsSubscribeRequest, EventsSubscribeResponse, GitFetchDefinitionArgs, GitView,
-        MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
-        MaintenanceRunRequest, MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage,
-        ObservationQuery, ObservationView, OwnedProcessKind, OwnedProcessSummary,
+        CommandSubmitRequest, CommandSubmitResponse, CrashMarker, DaemonShutdownRequest,
+        DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, DiscoverPage,
+        DoctorHarnessEntry, DrainReport, EmitDefinitionArgs, EventsBoundsRequest, EventsFilter,
+        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+        GitFetchDefinitionArgs, GitView, HarnessDoctorRequest, HarnessDoctorResponse,
+        HeavyAgentTotals, HeavyEpisodeView, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS,
+        MAX_SWARM_WAIT_TARGETS, MaintenanceRunRequest, MaintenanceRunResponse,
+        NotifyDefinitionArgs, ObservationPage, ObservationQuery, ObservationView,
+        ObserveHeavyRequest, ObserveHeavyResponse, OwnedProcessKind, OwnedProcessSummary,
         ProcessPageCursor, ProjectDiscoverRequest, ProjectRegistrationView,
         ProviderClearHoldRequest, ProviderHoldsRequest, RetainedUnknownSummary, RetentionView,
         RuleGetRequest, RuleStateView, RunningTurnSummary, ShutdownMode, SourceState,
@@ -120,13 +124,16 @@ struct RouterInner {
     unknown_causes: Mutex<HashMap<String, String>>,
     rule_definitions: Mutex<HashMap<(String, String), (i64, RuleDefinition)>>,
     catalog_cache: Mutex<catalog::CatalogCache>,
+    profile_cache: Mutex<crate::config::ProfileCache>,
     catalog_aggregate_lock: AsyncMutex<()>,
     var_writes: Mutex<coordination::VarWriteQueue>,
     var_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     plugin_host: PluginHost,
     monitoring: Monitoring,
+    observe: Mutex<ObserveThresholds>,
     workspaces: WorkspaceManager,
     workspace_recovery_error: Mutex<Option<String>>,
+    previous_crash: Mutex<Option<CrashMarker>>,
     automation_tasks: Mutex<Vec<(String, WorkerTaskHealth, Option<String>)>>,
     mode: AtomicU8,
     shutdown_ready: AtomicBool,
@@ -251,13 +258,16 @@ impl Router {
                 unknown_causes: Mutex::new(HashMap::new()),
                 rule_definitions: Mutex::new(HashMap::new()),
                 catalog_cache: Mutex::new(catalog::CatalogCache::default()),
+                profile_cache: Mutex::new(crate::config::ProfileCache::default()),
                 catalog_aggregate_lock: AsyncMutex::new(()),
                 var_writes: Mutex::new(coordination::VarWriteQueue::default()),
                 var_worker: AsyncMutex::new(None),
                 plugin_host,
                 monitoring,
+                observe: Mutex::new(ObserveThresholds::default()),
                 workspaces,
                 workspace_recovery_error: Mutex::new(None),
+                previous_crash: Mutex::new(None),
                 automation_tasks: Mutex::new(vec![
                     ("rule_worker".to_owned(), WorkerTaskHealth::Starting, None),
                     ("goal_driver".to_owned(), WorkerTaskHealth::Starting, None),
@@ -287,6 +297,10 @@ impl Router {
             .transpose()
             .map_err(|_| Error::new("not_allowed", "invalid remote context"))?;
         authorize_rpc_method(&principal, method)?;
+        // Debug mode times every RPC at this single choke point. Standard
+        // mode pays one Instant read and a branch; no parameters, prompts or
+        // results ever enter the record.
+        let started = std::time::Instant::now();
         let result = match method {
             "client.identity" => self.inference_identity(&params, &principal).await,
             "inference.client.install" => {
@@ -324,10 +338,41 @@ impl Router {
                 require_owner(&principal)?;
                 self.shutdown(&params, &principal).await
             }
+            // Debug-only forced daemon panic for crash-capture tests.
+            // Compiled out of release builds: the detached thread panic
+            // aborts the process after the hook writes its marker.
+            #[cfg(debug_assertions)]
+            "daemon.panic_test" => {
+                require_owner(&principal)?;
+                std::thread::spawn(|| {
+                    panic!("debug daemon panic-test trigger");
+                });
+                Ok(json!({"state": "panicking"}))
+            }
             "maintenance.run" => self.maintenance_run(&params, &principal).await,
+            "artifact.register" => self.artifact_register(&params, &principal).await,
+            "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
+            "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
             "command.submit" => {
-                self.submit_bound(&params, &principal, remote.as_ref())
-                    .await
+                let result = self
+                    .submit_bound(&params, &principal, remote.as_ref())
+                    .await;
+                // Capacity preflight can refuse before a command exists.
+                // Retain diagnostic metadata under the caller's exact ID in
+                // the existing bounded log; this grants no replay authority.
+                if let Err(error) = &result
+                    && error.code == "capacity_unavailable"
+                    && let Some(id) = params.get("id").and_then(Value::as_str)
+                    && ulid::Ulid::from_string(id).is_ok()
+                {
+                    crate::logging::record(
+                        &self.secret_policy_snapshot(),
+                        crate::logging::CAPACITY_REFUSAL_CODE,
+                        &[("command", id)],
+                        Some(error),
+                    );
+                }
+                result
             }
             "command.get" => self.command_get(&params, &principal).await,
             "command.children" => self.command_children(&params, &principal).await,
@@ -337,6 +382,7 @@ impl Router {
             "harness.list" => self.harness_list(&params, &principal).await,
             "harness.models" => self.harness_models(&params, &principal).await,
             "harness.quota" => self.harness_quota(&params, &principal).await,
+            "harness.doctor" => self.harness_doctor(&params, &principal).await,
             "models.catalog" => self.models_catalog(&params, &principal).await,
             "agent.history" => self.agent_history(&params, &principal).await,
             "agent.list" => self.agent_list(&params, &principal).await,
@@ -344,10 +390,12 @@ impl Router {
             "agent.processes" => self.agent_processes(&params, &principal).await,
             "agent.stats" => self.agent_stats(&params, &principal).await,
             "usage.summary" => self.usage_summary(&params, &principal).await,
+            "observe.heavy" => self.observe_heavy(&params, &principal).await,
             "agent.git" => self.agent_git(&params, &principal).await,
             "agent.edits" => self.agent_edits(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,
             "turn.resolve" => self.turn_resolve(&params, &principal).await,
+            "diagnose" => self.diagnose(&params, &principal).await,
             "events.bounds" => self.events_bounds(&params, &principal).await,
             "events.read" => self.events_read(&params, &principal).await,
             "events.subscribe" => self.events_subscribe(&params, &principal).await,
@@ -396,7 +444,35 @@ impl Router {
                 "unsupported",
                 format!("daemon method {method} is not implemented"),
             )),
-        }?;
+        };
+        // Every RPC is timed here for debug mode: method, elapsed
+        // milliseconds and ok/error. The method vocabulary is ours; params
+        // and results never enter the record.
+        if crate::logging::is_debug() {
+            let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let mut fields: [(&str, u64); 2] = [("elapsed_ms", elapsed_ms), ("ok", 0)];
+            if result.is_ok() {
+                fields[1].1 = 1;
+            }
+            let policy = SecretPolicy::new(self.daemon_secrets());
+            let (code, ids) = match &result {
+                Ok(_) => (
+                    "rpc.handled",
+                    [("method", method.to_owned()), ("code", String::new())],
+                ),
+                Err(error) => (
+                    "rpc.failed",
+                    [("method", method.to_owned()), ("code", error.code.clone())],
+                ),
+            };
+            crate::logging::record_debug(
+                &policy,
+                code,
+                &[("method", &ids[0].1), ("code", &ids[1].1)],
+                &fields,
+            );
+        }
+        let result = result?;
         Ok(match remote {
             Some(remote) => json!({"result": result, "remote_call": remote}),
             None => result,
@@ -424,6 +500,13 @@ impl Router {
 
     pub(crate) fn monitoring(&self) -> Monitoring {
         self.inner.monitoring.clone()
+    }
+
+    /// Install the [daemon] observe thresholds once at startup, on the
+    /// Router readbacks and the monitor sweeps together.
+    pub(crate) fn set_observe_thresholds(&self, thresholds: ObserveThresholds) {
+        *self.inner.observe.lock_recover() = thresholds;
+        self.inner.monitoring.set_observe_thresholds(thresholds);
     }
 
     pub(crate) fn response_finished(&self, shutdown_requested: bool) {
@@ -1627,7 +1710,11 @@ impl Router {
         } else if request.verb == "attach" {
             normalize_attach(&request)?;
             if !self.hydrate_retained_attach(&mut request).await?
-                && let Err(error) = freeze_attach_profile(&self.inner.data_root, &mut request)
+                && let Err(error) = freeze_attach_profile(
+                    &self.inner.profile_cache,
+                    &self.inner.data_root,
+                    &mut request,
+                )
                 && !self.hydrate_retained_attach(&mut request).await?
             {
                 return Err(error);
@@ -1913,6 +2000,7 @@ impl Router {
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
             })?;
+            crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
             let harness = snapshot
                 .get("harness")
                 .and_then(Value::as_str)
@@ -1994,10 +2082,11 @@ impl Router {
                         ),
                     ));
                 }
-                let mut snapshot = crate::config::resolve_profile(&self.inner.data_root, name)?;
+                let mut snapshot = self.resolve_profile_cached(name)?;
                 crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                     std::env::var_os(name)
                 })?;
+                crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
                 let harness = snapshot
                     .get("harness")
                     .and_then(Value::as_str)
@@ -2024,11 +2113,11 @@ impl Router {
                     Some(_) => required_text(&request.args, "profile")?.to_owned(),
                     None => required_text(&request.args, "profile")?.to_owned(),
                 };
-                let mut snapshot =
-                    crate::config::resolve_profile(&self.inner.data_root, &profile_name)?;
+                let mut snapshot = self.resolve_profile_cached(&profile_name)?;
                 crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                     std::env::var_os(name)
                 })?;
+                crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
                 let harness = snapshot
                     .get("harness")
                     .and_then(Value::as_str)
@@ -2544,7 +2633,7 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
-        let mut profile = crate::config::resolve_profile(&self.inner.data_root, &request.profile)?;
+        let mut profile = self.resolve_profile_cached(&request.profile)?;
         crate::config::capture_native_store_inputs(&mut profile, |name| std::env::var_os(name))?;
         if request
             .harness
@@ -2624,6 +2713,151 @@ impl Router {
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "harness list could not be encoded"))
     }
+    /// Fleet heavy-work readback over a window: closed `activity.heavy`
+    /// episodes per Agent with totals, newest episodes first. The Owner reads
+    /// every Agent; an Agent principal reads itself or one scope-authorized
+    /// Agent, exactly like the other Agent reads.
+    async fn observe_heavy(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        let request: ObserveHeavyRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let filter: Option<Vec<String>> = match principal {
+            Principal::Owner => request.agent.clone().map(|agent| vec![agent]),
+            Principal::Agent { id, .. } => {
+                if let Some(target) = request.agent.as_deref() {
+                    let store = self.inner.store.lock().await;
+                    hierarchy::authorize_agent_read(&store, principal, target, request.generation)?;
+                    Some(vec![target.to_owned()])
+                } else {
+                    Some(vec![id.clone()])
+                }
+            }
+            Principal::Run { .. }
+            | Principal::ProjectRule { .. }
+            | Principal::MemoryInference { .. } => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "heavy work needs the owner or an Agent principal",
+                ));
+            }
+        };
+        let window_secs = request.effective_window_secs();
+        let since =
+            now_ms().saturating_sub(i64::try_from(window_secs).unwrap_or(0).saturating_mul(1000));
+        let (rows, truncated) = {
+            let store = self.inner.store.lock().await;
+            store.heavy_episodes(
+                filter.as_deref(),
+                request.generation,
+                since,
+                eliot_core::api::MAX_HEAVY_EPISODES,
+            )?
+        };
+        let mut by_agent: HashMap<String, Vec<HeavyEpisodeView>> = HashMap::new();
+        for row in rows {
+            match HeavyEpisodeView::from_record(&row.agent, row.generation, &row.data) {
+                Ok(view) => by_agent.entry(row.agent).or_default().push(view),
+                Err(_) => {
+                    return Err(Error::new("internal", "heavy episode journal is malformed"));
+                }
+            }
+        }
+        let mut agents = Vec::new();
+        for (agent, mut episodes) in by_agent {
+            episodes.sort_by(|left, right| {
+                right
+                    .ended_at
+                    .cmp(&left.ended_at)
+                    .then(right.started_at.cmp(&left.started_at))
+            });
+            let mut total_duration_ms: u64 = 0;
+            let mut total_cpu_ms: u64 = 0;
+            let mut peak_rss_bytes: u64 = 0;
+            for episode in &episodes {
+                total_duration_ms = total_duration_ms
+                    .saturating_add(u64::try_from(episode.duration_ms).unwrap_or(0));
+                total_cpu_ms =
+                    total_cpu_ms.saturating_add(u64::try_from(episode.cpu_ms).unwrap_or(0));
+                peak_rss_bytes = peak_rss_bytes.max(episode.peak_rss_bytes);
+            }
+            agents.push(HeavyAgentTotals {
+                agent,
+                episodes,
+                total_duration_ms,
+                total_cpu_ms,
+                peak_rss_bytes,
+            });
+        }
+        agents.sort_by(|left, right| left.agent.cmp(&right.agent));
+        let response = ObserveHeavyResponse {
+            window_secs,
+            since,
+            agents,
+            truncated,
+        };
+        request
+            .validate_response(&response)
+            .map_err(|_| Error::new("internal", "heavy work is invalid"))?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "heavy work could not be encoded"))
+    }
+
+    /// Read-only harness installation, version and contract report per
+    /// harness: installed probe facts, the verified-against record, drift
+    /// yes or no with the doc section to re-verify, and the last
+    /// `harness_contract_mismatch` seen (absent while k68 is unmerged).
+    /// Owner only, like `harness.list`; starts no model turn and performs
+    /// no inference. Manifest versions stay unset: manifests report at
+    /// actor init and the daemon retains no central copy.
+    async fn harness_doctor(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: HarnessDoctorRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let mut probes = Vec::new();
+        for verified in eliot_core::VERIFIED_HARNESSES {
+            probes.push((
+                verified.harness,
+                crate::adhoc::harness_installation(verified.harness),
+            ));
+        }
+        let store = self.inner.store.lock().await;
+        let mut harnesses = Vec::new();
+        for (harness, entry) in &probes {
+            let verified = eliot_core::verified_harness(harness).expect("table covers probes");
+            let installed = entry
+                .get("installed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let version = entry
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let drift = eliot_core::check_harness_drift(harness, version.as_deref(), None);
+            let contract_mismatch = store
+                .latest_event_data("harness_contract_mismatch")?
+                .and_then(|data| doctor_mismatch_text(&data));
+            harnesses.push(DoctorHarnessEntry {
+                harness: (*harness).to_owned(),
+                installed,
+                version,
+                manifest_version: None,
+                verified_version: verified.verified_version.to_owned(),
+                verified_marker: verified.verified_marker.to_owned(),
+                drift: drift.is_some(),
+                drift_message: drift.map(|drift| drift.message),
+                doc_section: verified.doc_section.to_owned(),
+                contract_mismatch,
+            });
+        }
+        drop(store);
+        let response = HarnessDoctorResponse { harnesses };
+        request
+            .validate_response(&response)
+            .map_err(|_| Error::new("internal", "harness doctor is invalid"))?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "harness doctor could not be encoded"))
+    }
 
     /// Resolve the frozen snapshot for a catalogue/quota read. A named
     /// profile must exist and its frozen harness must match; otherwise the
@@ -2638,7 +2872,7 @@ impl Router {
         live_antigravity: bool,
     ) -> Result<(Option<Value>, String)> {
         if let Some(name) = profile {
-            let mut snapshot = crate::config::resolve_profile(&self.inner.data_root, name)?;
+            let mut snapshot = self.resolve_profile_cached(name)?;
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
             })?;
@@ -3525,6 +3759,20 @@ impl Router {
             let store = self.inner.store.lock().await;
             store.get_session_usage(&agent.id, agent.generation)?
         };
+        // Heavy-work and growth readbacks stay advisory: a degraded journal
+        // never fails the Agent view.
+        let (heavy, session_growth) = {
+            let growth = self.inner.observe.lock_recover().growth;
+            let store = self.inner.store.lock().await;
+            (
+                store
+                    .heavy_rollup(&agent.id, agent.generation)
+                    .unwrap_or(None),
+                store
+                    .session_growth_view(&agent.harness, &agent.id, agent.generation, &growth)
+                    .unwrap_or(None),
+            )
+        };
         // Current model/effort overlay for `swarm show`: the latest
         // retained revision with its effective values plus the original
         // frozen profile values and provenance. `profile` repeats the
@@ -3565,6 +3813,8 @@ impl Router {
             source_states,
             session_usage,
             config,
+            heavy,
+            session_growth,
         })
         .map_err(|_| Error::new("internal", "Agent view could not be encoded"))
     }
@@ -3754,11 +4004,27 @@ impl Router {
             let store = self.inner.store.lock().await;
             store.get_session_usage(&agent.id, agent.generation)?
         };
+        // Heavy-work and growth readbacks stay advisory: a degraded journal
+        // never fails the Agent view.
+        let (heavy, session_growth) = {
+            let growth = self.inner.observe.lock_recover().growth;
+            let store = self.inner.store.lock().await;
+            (
+                store
+                    .heavy_rollup(&agent.id, agent.generation)
+                    .unwrap_or(None),
+                store
+                    .session_growth_view(&agent.harness, &agent.id, agent.generation, &growth)
+                    .unwrap_or(None),
+            )
+        };
         serde_json::to_value(AgentStatsResponse {
             agent: agent.id,
             generation: agent.generation,
             observation,
             session_usage,
+            heavy,
+            session_growth,
         })
         .map_err(|_| Error::new("internal", "stats view could not be encoded"))
     }
@@ -3860,6 +4126,7 @@ impl Router {
                     request.after.as_deref(),
                     limit,
                     now_ms(),
+                    &self.inner.observe.lock_recover().growth,
                 )?,
                 Principal::Agent { id, .. } => {
                     let caller = store.get_agent(id)?.ok_or_else(|| {
@@ -3871,6 +4138,7 @@ impl Router {
                         request.after.as_deref(),
                         limit,
                         now_ms(),
+                        &self.inner.observe.lock_recover().growth,
                     )?
                 }
                 Principal::Run { .. } | Principal::MemoryInference { .. } => {
@@ -4456,6 +4724,10 @@ impl Router {
             .map_err(|_| Error::new("internal", "maintenance.run result could not be encoded"))
     }
 
+    pub(super) fn set_previous_crash(&self, crash: Option<CrashMarker>) {
+        *self.inner.previous_crash.lock_recover() = crash;
+    }
+
     async fn status(&self) -> Result<Value> {
         let blockers = self.status_blockers().await?;
         let drain = self.drain_report().await?;
@@ -4521,6 +4793,7 @@ impl Router {
             blockers,
             drain: Some(drain),
             retention,
+            previous_crash: self.inner.previous_crash.lock_recover().clone(),
         })
         .map_err(|_| Error::new("internal", "daemon status could not be encoded"))
     }
@@ -5398,10 +5671,24 @@ fn normalize_attach(request: &SubmitCommand) -> Result<()> {
     Ok(())
 }
 
-fn freeze_attach_profile(data_root: &std::path::Path, request: &mut SubmitCommand) -> Result<()> {
+impl Router {
+    fn resolve_profile_cached(&self, name: &str) -> Result<Value> {
+        crate::config::resolve_profile_cached(
+            &self.inner.profile_cache,
+            &self.inner.data_root,
+            name,
+        )
+    }
+}
+
+fn freeze_attach_profile(
+    cache: &Mutex<crate::config::ProfileCache>,
+    data_root: &std::path::Path,
+    request: &mut SubmitCommand,
+) -> Result<()> {
     let profile_name = required_text(&request.args, "profile")?;
     let harness = required_text(&request.args, "harness")?.to_owned();
-    let mut snapshot = crate::config::resolve_profile(data_root, profile_name)?;
+    let mut snapshot = crate::config::resolve_profile_cached(cache, data_root, profile_name)?;
     if snapshot.get("harness").and_then(Value::as_str) != Some(harness.as_str()) {
         return Err(Error::new(
             "invalid",
@@ -6140,6 +6427,24 @@ fn validate_plugin_command_args(request: &SubmitCommand) -> Result<()> {
     Ok(())
 }
 
+/// Bounded mismatch text for the doctor: the payload's message when present,
+/// else the compact payload truncated to one short line. Shapes belong to
+/// k68; the doctor never assumes them.
+fn doctor_mismatch_text(data: &Value) -> Option<String> {
+    if let Some(message) = data
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty())
+    {
+        return Some(message.chars().take(256).collect());
+    }
+    let compact = serde_json::to_string(data).ok()?;
+    if compact.is_empty() {
+        return None;
+    }
+    Some(compact.chars().take(256).collect())
+}
+
 fn validate_answer_request(store: &eliot_store::Store, request: &SubmitCommand) -> Result<()> {
     if store.get_command(&request.id)?.is_some() {
         // Store enforces the retained principal/payload binding on this retry.
@@ -6772,6 +7077,7 @@ fn reject_unknown_map_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_core::FailureOrigin;
     use eliot_core::api::{FrozenGitFetch, RuleCatchUpRequest};
     use eliot_store::RuleCatchUpAction;
 
@@ -7567,6 +7873,9 @@ mod tests {
                     eliot_core::WorkspaceCreationOutcome::Unknown {
                         code: "preflight_inspection_unknown".to_owned(),
                         message: "read-only workspace inspection did not complete".to_owned(),
+                        failure_where: Some("store.dispatch.workspace_gate".to_owned()),
+                        origin: Some(eliot_core::FailureOrigin::Unknown),
+                        origin_evidence: Some("preflight inspection state unresolved".to_owned()),
                     },
                     now + 4,
                 )
@@ -7941,7 +8250,14 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .unwrap()
                 .is_new
         );
-        router.reject_undispatched(&second_id, "test_cleanup").await;
+        router
+            .reject_undispatched_error(
+                &second_id,
+                &Error::new("test_cleanup", "test_cleanup")
+                    .with_where("router.dispatch.test")
+                    .with_origin(FailureOrigin::Swarm, "test-only cleanup rejection"),
+            )
+            .await;
         let drained = router
             .shutdown(
                 &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
@@ -9787,7 +10103,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .await
             .unwrap_err();
         assert_eq!(error.code, "internal");
-        assert_eq!(error.message, "retained shutdown result is invalid");
+        assert_eq!(
+            error.message.as_str(),
+            "retained shutdown result is invalid"
+        );
         assert!(
             !serde_json::to_string(&error)
                 .unwrap()
@@ -9856,7 +10175,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .await
             .unwrap_err();
         assert_eq!(error.code, "invalid");
-        assert_eq!(error.message, "command args must be a JSON object");
+        assert_eq!(error.message.as_str(), "command args must be a JSON object");
         assert_eq!(
             router
                 .submit(
@@ -10015,7 +10334,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let store = router.inner.store.lock().await;
         let command = store.get_command(&id).unwrap().unwrap();
         assert_eq!(command.state, CommandState::Rejected);
-        assert_eq!(command.outcome, Some(json!({"reason":"provider_held"})));
+        assert_eq!(
+            command.outcome,
+            Some(
+                json!({"reason":"provider_held", "message":"provider scope is held", "where":"router.dispatch.unknown", "origin":"unknown", "origin_evidence":"no origin classified where this error was created"})
+            )
+        );
         let events = store.read_events(0, 100, None).unwrap();
         assert!(events.iter().any(|event| event.kind == "command.rejected"));
         assert!(
@@ -10271,7 +10595,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             (command, events)
         };
         assert_eq!(rejected.state, CommandState::Rejected);
-        assert_eq!(rejected.outcome, Some(json!({"reason":"not_allowed"})));
+        assert_eq!(
+            rejected.outcome,
+            Some(
+                json!({"reason":"not_allowed", "message":"project registration changed after command admission", "where":"router.dispatch.unknown", "origin":"unknown", "origin_evidence":"no origin classified where this error was created"})
+            )
+        );
         assert_eq!(
             events_after_rejection
                 .iter()
@@ -10481,7 +10810,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             (command, events)
         };
         assert_eq!(rejected.state, CommandState::Rejected);
-        assert_eq!(rejected.outcome, Some(json!({"reason":"not_allowed"})));
+        assert_eq!(
+            rejected.outcome,
+            Some(
+                json!({"reason":"not_allowed", "message":"frozen global interpreter is no longer approved", "where":"router.dispatch.unknown", "origin":"unknown", "origin_evidence":"no origin classified where this error was created"})
+            )
+        );
         assert_eq!(
             events_after_rejection
                 .iter()
@@ -10552,7 +10886,14 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
 
         // A losing preflight must not overwrite the command after the winning
         // processor has committed its dispatch decision.
-        router.reject_undispatched(&id, "preflight_failed").await;
+        router
+            .reject_undispatched_error(
+                &id,
+                &Error::new("preflight_failed", "preflight_failed")
+                    .with_where("router.dispatch.test")
+                    .with_origin(FailureOrigin::Swarm, "test-only losing preflight"),
+            )
+            .await;
         {
             let store = router.inner.store.lock().await;
             assert_eq!(
@@ -10768,7 +11109,14 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             (agent, launch_id, resume_id, linked_id, previous_workspace)
         };
 
-        router.reject_undispatched(&resume_id, "not_allowed").await;
+        router
+            .reject_undispatched_error(
+                &resume_id,
+                &Error::new("not_allowed", "test-only resume refusal")
+                    .with_where("router.dispatch.test")
+                    .with_origin(FailureOrigin::Swarm, "test-only resume refusal"),
+            )
+            .await;
 
         let store = router.inner.store.lock().await;
         assert_eq!(

@@ -108,39 +108,16 @@ mod process_birth {
 
     // Microsoft documents this NT telemetry record, but ships no public SDK
     // header for it. Keep the local C-layout declaration aligned with that
-    // documented field order; use only the process key and birth-time prefix.
-    #[repr(C)]
-    #[derive(Default)]
-    #[allow(dead_code)]
-    struct ProcessTelemetryIdInformation {
-        header_size: u32,
-        process_id: u32,
-        process_start_key: u64,
-        create_time: u64,
-        create_interrupt_time: u64,
-        create_unbiased_interrupt_time: u64,
-        process_sequence_number: u64,
-        session_create_time: u64,
-        session_id: u32,
-        boot_id: u32,
-        image_checksum: u32,
-        image_time_date_stamp: u32,
-        user_sid_offset: u32,
-        image_path_offset: u32,
-        package_name_offset: u32,
-        relative_app_name_offset: u32,
-        command_line_offset: u32,
-    }
-
+    // documented field order; only the process key and birth-time prefix are
+    // read. The two middle timestamps are unread padding preserving the C
+    // offsets Windows fills.
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
-    #[allow(dead_code)]
     struct ProcessTelemetryBirthPrefix {
         header_size: u32,
         process_id: u32,
         process_start_key: u64,
-        create_time: u64,
-        create_interrupt_time: u64,
+        _reserved: [u64; 2],
         create_unbiased_interrupt_time: u64,
     }
 
@@ -209,7 +186,7 @@ mod process_birth {
         // function is resolved dynamically as Microsoft requires for ntdll.
         let query: NtQueryInformationProcess = unsafe { std::mem::transmute(raw) };
 
-        let record_size = size_of::<ProcessTelemetryIdInformation>();
+        let record_size = size_of::<ProcessTelemetryBirthPrefix>();
         let mut output = vec![0u64; record_size.div_ceil(size_of::<u64>())];
 
         for attempt in 0..MAX_PROCESS_TELEMETRY_QUERY_ATTEMPTS {
@@ -805,11 +782,18 @@ pub struct NativeWriter {
 /// protocol layer decides the wire envelope and the response mapping.
 #[derive(Clone)]
 pub struct PendingCalls {
-    calls: Arc<StdMutex<HashMap<String, oneshot::Sender<Result<Value>>>>>,
+    calls: Arc<StdMutex<HashMap<String, PendingEntry>>>,
     next_id: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
     id_prefix: &'static str,
     labels: NativeLabels,
+}
+
+struct PendingEntry {
+    sender: oneshot::Sender<Result<Value>>,
+    method: String,
+    request_bytes: usize,
+    started: std::time::Instant,
 }
 
 pub struct PendingGuard {
@@ -893,6 +877,14 @@ impl NativeChild {
                     labels.server
                 )),
             )
+            .with_where(format!(
+                "plugin.{}.start.spawn",
+                labels.short.to_ascii_lowercase()
+            ))
+            .with_origin(
+                eliot_core::FailureOrigin::Environment,
+                "OS refused native process creation",
+            )
         })?;
         let stdin = child.stdin.take().ok_or_else(|| {
             Error::new(
@@ -914,8 +906,27 @@ impl NativeChild {
         })?;
         let stderr = spawn_stderr(stderr, Arc::new(policy.clone()));
         let pid = child.id();
+        {
+            // Metadata only: exe basename, argv count, pid. Never argv
+            // values, cwd, or environment.
+            let exe = std::path::Path::new(&launch.program)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| launch.program.to_string_lossy().into_owned());
+            let exe: String = exe.chars().take(128).collect();
+            crate::debug::record(
+                "plugin.process.start",
+                &[("server", labels.server), ("exe", exe.as_str())],
+                &[
+                    ("argv", launch.args.len().min(u64::MAX as usize) as u64),
+                    ("pid", u64::from(pid.unwrap_or(0))),
+                    ("has_pid", u64::from(pid.is_some())),
+                ],
+            );
+        }
         let (exit_tx, process_exit) = watch::channel(None);
         let (kill, mut kill_rx) = oneshot::channel();
+        let server = labels.server;
         let writer = NativeWriter::new(stdin, labels);
         let exit_writer = writer.clone();
         let process_task = tokio::spawn(async move {
@@ -933,6 +944,32 @@ impl NativeChild {
                 }
             };
             exit_writer.mark_process_exited();
+            {
+                // Metadata only: exit code or signal, never output.
+                let (outcome, success) = match &result {
+                    Ok(status) => (
+                        format!(
+                            "code={} success={}",
+                            status
+                                .code()
+                                .map(|code| code.to_string())
+                                .unwrap_or_else(|| "signal".to_string()),
+                            status.success(),
+                        ),
+                        status.success(),
+                    ),
+                    Err(error) => {
+                        let detail: String = error.to_string().chars().take(128).collect();
+                        (format!("wait failed: {detail}"), false)
+                    }
+                };
+                let outcome: String = outcome.chars().take(256).collect();
+                crate::debug::record(
+                    "plugin.process.exit",
+                    &[("server", server), ("outcome", outcome.as_str())],
+                    &[("success", u64::from(success))],
+                );
+            }
             if let Ok(status) = result {
                 exit_tx.send_replace(Some(ProcessExit {
                     status,
@@ -1018,7 +1055,7 @@ impl NativeChild {
     }
 
     pub fn diagnostic_error(&self, mut error: Error) -> Error {
-        error.message = self.policy.redact_text(&error.message);
+        error.message = self.policy.redact_text(&error.message).into();
         error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
     }
 
@@ -1404,9 +1441,22 @@ impl PendingCalls {
 
     /// Register one pending reply; the guard unregisters it unless the reply
     /// arrives first.
-    pub fn insert(&self, id: String) -> (PendingGuard, oneshot::Receiver<Result<Value>>) {
+    pub fn insert(
+        &self,
+        id: String,
+        method: &str,
+        request_bytes: usize,
+    ) -> (PendingGuard, oneshot::Receiver<Result<Value>>) {
         let (response_tx, response_rx) = oneshot::channel();
-        self.calls.lock_recover().insert(id.clone(), response_tx);
+        self.calls.lock_recover().insert(
+            id.clone(),
+            PendingEntry {
+                sender: response_tx,
+                method: method.to_owned(),
+                request_bytes,
+                started: std::time::Instant::now(),
+            },
+        );
         (
             PendingGuard {
                 pending: self.clone(),
@@ -1416,10 +1466,30 @@ impl PendingCalls {
         )
     }
 
-    pub fn route(&self, key: &str, result: Result<Value>) {
-        let sender = self.calls.lock_recover().remove(key);
-        if let Some(sender) = sender {
-            let _ = sender.send(result);
+    pub fn route(&self, key: &str, result: Result<Value>, response_bytes: usize) {
+        let entry = self.calls.lock_recover().remove(key);
+        if let Some(entry) = entry {
+            // One metadata-only debug record per correlated native reply:
+            // method, direction, both sizes, latency, success. Never frame
+            // content, prompts or output.
+            let elapsed_ms = entry.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            crate::debug::record(
+                "plugin.frame",
+                &[("method", entry.method.as_str()), ("direction", "in")],
+                &[
+                    ("elapsed_ms", elapsed_ms),
+                    (
+                        "request_bytes",
+                        entry.request_bytes.min(u64::MAX as usize) as u64,
+                    ),
+                    (
+                        "response_bytes",
+                        response_bytes.min(u64::MAX as usize) as u64,
+                    ),
+                    ("ok", u64::from(result.is_ok())),
+                ],
+            );
+            let _ = entry.sender.send(result);
         }
     }
 
@@ -1439,8 +1509,8 @@ impl PendingCalls {
             self.closed.store(true, Ordering::Release);
             std::mem::take(&mut *pending)
         };
-        for (_, sender) in pending {
-            let _ = sender.send(Err(error.clone()));
+        for (_, entry) in pending {
+            let _ = entry.sender.send(Err(error.clone()));
         }
     }
 
@@ -1451,8 +1521,8 @@ impl PendingCalls {
             let mut pending = self.calls.lock_recover();
             std::mem::take(&mut *pending)
         };
-        for (_, sender) in pending {
-            let _ = sender.send(Err(error.clone()));
+        for (_, entry) in pending {
+            let _ = entry.sender.send(Err(error.clone()));
         }
     }
 }
@@ -1933,8 +2003,30 @@ where
             }
         };
         let mut receiver_closed = false;
+        // Inbound frame metadata for debug mode: method, direction, size
+        // and envelope IDs from the decoded value. Never frame content.
+        // The correlated-reply path records latency at routing instead.
+        let frame_method = value
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .map(|method| method.chars().take(64).collect::<String>());
+        let frame_envelope = crate::debug::envelope_ids(&value);
+        let frame_bytes = line.len();
         match classify(value) {
             PumpAction::Emit(frame) => {
+                {
+                    let mut refs: Vec<(&str, &str)> = Vec::with_capacity(3 + frame_envelope.len());
+                    refs.push(("method", frame_method.as_deref().unwrap_or("event")));
+                    refs.push(("direction", "in"));
+                    for (name, id) in &frame_envelope {
+                        refs.push((*name, id.as_str()));
+                    }
+                    crate::debug::record(
+                        "plugin.frame",
+                        &refs,
+                        &[("frame_bytes", frame_bytes.min(u64::MAX as usize) as u64)],
+                    );
+                }
                 if overflowed {
                     continue;
                 }
@@ -1957,7 +2049,7 @@ where
                 }
             }
             PumpAction::Route { key, result } => {
-                pending.route(&key, result);
+                pending.route(&key, result, line.len());
             }
             PumpAction::Malformed(message) => {
                 // Record-local envelope fault: same bounded-line boundary as

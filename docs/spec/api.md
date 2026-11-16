@@ -10,6 +10,13 @@ JSON-RPC 2.0 over UTF-8 NDJSON. Windows uses a current-user-only named pipe; Uni
 mode-0600 socket under the private data root. One daemon owns the data-directory lock.
 `daemon.json` records boot id, PID/birth identity, endpoint and diagnostic version.
 
+For the supported [Linux Docker image](../../docker/README.md), use
+`docker exec <container> swarm …` to reach its private socket. The Windows desktop
+uses named pipes and cannot attach. `workspace_custody` remains `degraded`;
+container cgroup membership does not establish exact per-Agent custody.
+The existing MCP HTTP listener binds container loopback, which ordinary Docker
+port publishing cannot reach. The image exposes no host HTTP/authentication surface.
+
 Every call has an explicit principal. Owner CLI outside a managed Agent/rule environment
 reads the private owner token automatically. Agents send id/generation/token; managed
 scripts use scoped run tokens; plugins have instance credentials. Missing/incomplete/
@@ -984,6 +991,17 @@ work. Richer command/resolution metadata remains deferred; turn usage is connect
 the harness reports it. `agent.result` requires
 an array of turn objects and an object for Agent metadata, not positional records.
 
+### Diagnosis
+
+`diagnose` (owner only) takes a command id, Agent id or `agent:turn` and returns
+the causal chain: the command outcome with code, message, `where`, `origin` and
+exit data; the related turn outcomes with `preceded_by`; process steps from the
+`agent.lost`/`agent.failed` events with exit code, NTSTATUS and the redacted
+stderr tail; and the previous-run crash marker when the terminal failure is
+unclassified. The one-line `summary` always starts with the failure origin
+(`provider origin: <target> <code> at <where>: <message>`). At most 16 steps;
+no new store, only existing event and record readbacks.
+
 For every failed terminal turn, with or without a structured provider restriction, status
 and exact command/turn binding remain authoritative when final text exceeds the event
 budget. The event omits oversized final text rather than exposing a truncated string as
@@ -1762,6 +1780,7 @@ swarm approve|deny A [--request R] [--choice ID] [--feedback TEXT] | answer ... 
 swarm configure A [--model MODEL] [--effort EFFORT] [--generation N]
 swarm compact|fork|background ...
 swarm cmd show|children|cancel|resolve ...
+swarm why CMD|AGENT|AGENT:TURN
 swarm events [--since SEQ] [--allow-gap]
 swarm msg send ... | msg show ... | msg ack ... | inbox [AGENT] [--wait SECS]
 swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | who [--project P] [--history] | claim set|list|release ...

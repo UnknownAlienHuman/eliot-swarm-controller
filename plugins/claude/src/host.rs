@@ -136,7 +136,8 @@ fn start_failure_is_proven_no_effect(phase: StartPhase, _code: &str) -> bool {
 /// retires the plugin instead of pinning an unknown Agent.
 struct PhaseFailure {
     phase: StartPhase,
-    error: Error,
+    // Boxed: the diagnostics-carrying Error is large (clippy result_large_err).
+    error: Box<Error>,
 }
 
 /// Typed reason for one proven-no-effect failed start. Static per phase
@@ -668,18 +669,8 @@ impl ClaudePlugin {
     /// launch is definitely failed, never unknown. The reason names the
     /// failed check in short non-secret words; it is persisted in the daemon
     /// outcome, so it must never carry endpoints, ids, values, or secrets.
-    fn retain_proven_no_effect_start(
-        &mut self,
-        params: &AgentStartParams,
-        reason: impl Into<String>,
-    ) -> Value {
-        let value = json!({
-            "agent_id": params.agent_id,
-            "generation": params.generation,
-            "command_id": params.command_id,
-            "state": "failed",
-            "reason": reason.into(),
-        });
+    fn retain_proven_no_effect_start(&mut self, params: &AgentStartParams, error: Error) -> Value {
+        let value = eliot_plugin::session::failed_start_value(params, error);
         self.failed_start = Some(FailedStart {
             agent_id: params.agent_id.clone(),
             generation: params.generation,
@@ -706,7 +697,28 @@ impl ClaudePlugin {
             &failure.error.code
         ));
         let reason = prespawn_reason(failure.phase, &failure.error.code);
-        self.retain_proven_no_effect_start(params, reason)
+        let phase = match failure.phase {
+            StartPhase::Plan => "plan",
+            StartPhase::McpConfig => "mcp_config",
+            StartPhase::Skill => "skill",
+            StartPhase::Login => "login",
+            StartPhase::Spawn => "spawn",
+            StartPhase::PostSpawn => "post_spawn",
+        };
+        let mut error = *failure.error;
+        if error.origin.is_none()
+            && matches!(
+                failure.phase,
+                StartPhase::McpConfig | StartPhase::Skill | StartPhase::Login | StartPhase::Spawn
+            )
+        {
+            error = error.with_origin(
+                eliot_core::FailureOrigin::Environment,
+                "native executable, private file or external login operation failed",
+            );
+        }
+        let error = eliot_plugin::session::classify_start_failure(error, "claude", phase);
+        self.retain_proven_no_effect_start(params, error.with_message(reason))
     }
 
     async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> DispatchOutcome {
@@ -1307,7 +1319,14 @@ impl ClaudePlugin {
                     "Claude session.ready was definitely rejected ({}); the batch was never committed",
                     error.code
                 );
-                return Ok(self.retain_proven_no_effect_start(params, reason));
+                let error = error
+                    .with_message(reason)
+                    .with_where("plugin.claude.start.session_ready")
+                    .with_origin(
+                        eliot_core::FailureOrigin::Swarm,
+                        "daemon rejected the session.ready batch before its transaction",
+                    );
+                return Ok(self.retain_proven_no_effect_start(params, error));
             }
             session.phase = SessionPhase::Unknown;
             self.session = Some(session);
@@ -1364,7 +1383,7 @@ impl ClaudePlugin {
                     &params,
                     PhaseFailure {
                         phase: StartPhase::Plan,
-                        error,
+                        error: Box::new(error),
                     },
                 ));
             }
@@ -1375,7 +1394,7 @@ impl ClaudePlugin {
                 if start_failure_is_proven_no_effect(failure.phase, &failure.error.code) {
                     return Ok(self.proven_no_effect_start(&params, failure));
                 }
-                return Err(failure.error);
+                return Err(*failure.error);
             }
         };
         if let Err(error) = register_native_process(
@@ -2362,7 +2381,7 @@ async fn launch_session(
         ClaudeMcpConfigFile::create(&plan.instance_dir, &plan.swarm_binary, &plan.data_root)
             .map_err(|error| PhaseFailure {
                 phase: StartPhase::McpConfig,
-                error,
+                error: Box::new(error),
             })?;
     // Approvals always travel over stdio so every `can_use_tool` ask
     // reaches Eliot. Resume continues the exact retained session id; the
@@ -2415,7 +2434,10 @@ async fn launch_session(
     if !skill_root.is_dir() {
         return Err(PhaseFailure {
             phase: StartPhase::Skill,
-            error: Error::new("unavailable", "Claude skill root is unavailable"),
+            error: Box::new(Error::new(
+                "unavailable",
+                "Claude skill root is unavailable",
+            )),
         });
     }
     argv.push(OsString::from("--plugin-dir"));
@@ -2427,7 +2449,7 @@ async fn launch_session(
         .await
         .map_err(|error| PhaseFailure {
             phase: StartPhase::Login,
-            error,
+            error: Box::new(error),
         })?;
     let launch = NativeLaunch {
         program: plan.program.clone(),
@@ -2439,7 +2461,7 @@ async fn launch_session(
         .await
         .map_err(|error| PhaseFailure {
             phase: StartPhase::Spawn,
-            error,
+            error: Box::new(error),
         })?;
     let frames = match native.take_frames() {
         Ok(frames) => frames,
@@ -2447,7 +2469,7 @@ async fn launch_session(
             let _ = native.terminate(false, Instant::now() + RPC_TIMEOUT).await;
             return Err(PhaseFailure {
                 phase: StartPhase::PostSpawn,
-                error,
+                error: Box::new(error),
             });
         }
     };
@@ -2657,14 +2679,27 @@ fn new_uuid() -> String {
     )
 }
 
-/// Native scope names the CLI config identity: the canonical
+/// Native scope names the CLI config identity: the hashed canonical
 /// `CLAUDE_CONFIG_DIR` when the target environment sets one, else the CLI
-/// default resolution, which the plugin must not guess at.
+/// default resolution, which the plugin must not guess at. The raw directory
+/// is also a pass_env secret value on the daemon, and committed scope
+/// metadata must never collide with it: the daemon rejects secret-bearing
+/// immutable metadata, which used to wedge the launch unknown on its very
+/// first batch. Same FNV-1a shape as the Codex home scope.
 fn claude_scope(config_dir: Option<&str>) -> String {
     match config_dir.filter(|dir| !dir.trim().is_empty()) {
         Some(dir) => {
             let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
-            format!("claude-config:{}", canonical.to_string_lossy())
+            let mut canonical = canonical.to_string_lossy().into_owned();
+            if cfg!(windows) {
+                canonical = canonical.to_lowercase();
+            }
+            let mut hash = 0xcbf29ce484222325u64;
+            for byte in canonical.bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            format!("claude-config:{hash:016x}")
         }
         None => "claude-config:default".to_owned(),
     }
@@ -2970,13 +3005,22 @@ mod tests {
     }
 
     #[test]
-    fn scope_names_the_config_identity() {
+    fn scope_hashes_the_config_identity() {
         assert_eq!(claude_scope(None), "claude-config:default");
         assert_eq!(claude_scope(Some("  ")), "claude-config:default");
         let dir = std::env::temp_dir();
-        let scope = claude_scope(Some(&dir.to_string_lossy()));
-        assert!(scope.starts_with("claude-config:"), "{scope}");
-        assert!(scope.len() > "claude-config:".len());
+        let raw = dir.to_string_lossy().into_owned();
+        let scope = claude_scope(Some(&raw));
+        let suffix = scope.strip_prefix("claude-config:").expect("scope prefix");
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        // The raw directory must not survive in committed scope metadata:
+        // the daemon also holds the pass_env directory as a secret and
+        // rejects secret-bearing immutable metadata.
+        assert!(!scope.contains(raw.as_str()));
+        assert_eq!(scope, claude_scope(Some(&raw)));
+        let other = dir.join("eliot-claude-scope-probe");
+        assert_ne!(scope, claude_scope(Some(&other.to_string_lossy())));
     }
 
     #[test]
@@ -3247,16 +3291,18 @@ mod tests {
         let mut plugin = ClaudePlugin::default();
         let failure = PhaseFailure {
             phase: StartPhase::Plan,
-            error: Error::new(
+            error: Box::new(Error::new(
                 "profile_error",
                 "Claude inherit MCP keeps the owner Swarm MCP server \"swarm\" from project .mcp.json",
-            ),
+            )),
         };
         let value = plugin.proven_no_effect_start(&params, failure);
         assert_eq!(value["state"], "failed");
         assert_eq!(value["agent_id"], "agent-9");
         assert_eq!(value["generation"], 1);
         assert_eq!(value["command_id"], "0199-owner-scan");
+        assert_eq!(value["origin"], "swarm");
+        assert_eq!(value["where"], "plugin.claude.start.plan");
         let reason = value["reason"].as_str().expect("typed reason");
         assert!(reason.contains("profile_error"));
         assert!(!reason.contains("swarm"));

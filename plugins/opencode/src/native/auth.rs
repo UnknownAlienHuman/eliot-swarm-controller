@@ -195,7 +195,8 @@ pub async fn transfer_selected_integration(
             return Err(Error::new(
                 "profile_error",
                 "OpenCode auth integration selection does not hold exactly one canonical credential",
-            ));
+            ).with_where("plugin.opencode.start.auth_transfer")
+             .with_origin(eliot_core::FailureOrigin::Environment, "selected external credential is absent or ambiguous"));
         }
     }
     let secret = export_selected(transfer, deadline).await?;

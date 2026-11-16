@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 pub(crate) mod profiles_edit;
 pub(crate) mod settings;
 
@@ -128,6 +129,46 @@ fn capture_native_store_inputs_inner(
     *profile = snapshot;
     // The augmented snapshot is bounded by the existing Store admission/frame
     // checks. This capture proves inputs, never an effective native root/scope.
+    Ok(())
+}
+
+/// Freeze an Agent's exact build output directory when the profile admits it
+/// through `pass_env`. Only the literal `CARGO_TARGET_DIR` name is captured;
+/// the value must be an absolute local path or it is skipped. Skipped means
+/// absent: cleanup backfills only what is frozen here, and Agents may always
+/// register their own target directory through `artifact.register`.
+pub(crate) fn capture_build_inputs(
+    profile: &mut Value,
+    mut lookup: impl FnMut(&str) -> Option<OsString>,
+) -> core::Result<()> {
+    let names = profile
+        .get("pass_env")
+        .and_then(Value::as_array)
+        .ok_or_else(|| core::Error::new("invalid", "resolved profile pass_env must be an array"))?;
+    let admitted = names
+        .iter()
+        .any(|name| name.as_str() == Some("CARGO_TARGET_DIR"));
+    if !admitted {
+        return Ok(());
+    }
+    let Some(value) = lookup("CARGO_TARGET_DIR") else {
+        return Ok(());
+    };
+    let Ok(value) = value.into_string() else {
+        return Ok(());
+    };
+    if value.is_empty()
+        || value.len() > 4096
+        || value.contains('\0')
+        || value.chars().any(char::is_control)
+        || !std::path::Path::new(&value).is_absolute()
+    {
+        return Ok(());
+    }
+    profile
+        .as_object_mut()
+        .ok_or_else(|| core::Error::new("invalid", "resolved profile must be an object"))?
+        .insert("target_dir".to_owned(), Value::String(value));
     Ok(())
 }
 #[derive(Deserialize)]
@@ -370,6 +411,11 @@ pub(crate) struct AssignmentConfig {
     pub(crate) role: String,
     pub(crate) max_busy: u32,
     pub(crate) interval: String,
+    /// Clean up build/temp directories and managed worktrees after an
+    /// applied stop retires an assignment Agent, through the existing
+    /// completion-rule stop path. Off by default; not a second executor.
+    #[serde(default)]
+    pub(crate) cleanup_on_retire: bool,
 }
 
 impl Default for AutomationConfig {
@@ -541,7 +587,15 @@ fn default_max_unread_messages_per_agent() -> i64 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct DaemonConfig {
     #[serde(default)]
+    pub(crate) artifact_roots: Vec<String>,
+    #[serde(default)]
     pub(crate) retention: RetentionConfig,
+    /// Daemon log verbosity: `standard` (working mode) or `debug`
+    /// (everything mode). Hot-reloadable through `settings.save`; changing
+    /// only this key never requires a restart. See
+    /// docs/spec/configuration.md: daemon logging.
+    #[serde(default = "default_log_level")]
+    pub(crate) log_level: String,
     /// Hierarchy fanout bounds consumed by launch/selector admission. See
     /// docs/spec/configuration.md: daemon limits. Deserialized directly as
     /// the core type: unlike retention windows these always apply, so an
@@ -552,14 +606,42 @@ pub(crate) struct DaemonConfig {
     /// docs/spec/monitoring.md; this is advisory and never infers agent death.
     #[serde(default = "default_attention_suspicion_secs")]
     pub(crate) attention_suspicion_secs: i64,
+    /// Heavy-episode thresholds for one `activity.heavy` event: a child
+    /// process tree whose wall time, consumed CPU or peak RSS crosses any one
+    /// threshold. See docs/spec/monitoring.md; defaults tune from real data.
+    #[serde(default = "default_heavy_wall_secs")]
+    pub(crate) heavy_wall_secs: i64,
+    #[serde(default = "default_heavy_cpu_secs")]
+    pub(crate) heavy_cpu_secs: i64,
+    #[serde(default = "default_heavy_rss_bytes")]
+    pub(crate) heavy_rss_bytes: i64,
+    /// Context occupancy that warns, in thousandths (800 is 0.8). Integer
+    /// for TOML simplicity; validated to the (0, 1000] range.
+    #[serde(default = "default_session_growth_ratio_permille")]
+    pub(crate) session_growth_ratio_permille: i64,
+    /// Native session file size that warns, in bytes, where the harness
+    /// exposes a documented size source.
+    #[serde(default = "default_session_file_bytes")]
+    pub(crate) session_file_bytes: i64,
+}
+
+fn default_log_level() -> String {
+    "standard".to_owned()
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
+            artifact_roots: Vec::new(),
             retention: RetentionConfig::default(),
+            log_level: default_log_level(),
             limits: core::api::HierarchyLimits::default(),
             attention_suspicion_secs: default_attention_suspicion_secs(),
+            heavy_wall_secs: default_heavy_wall_secs(),
+            heavy_cpu_secs: default_heavy_cpu_secs(),
+            heavy_rss_bytes: default_heavy_rss_bytes(),
+            session_growth_ratio_permille: default_session_growth_ratio_permille(),
+            session_file_bytes: default_session_file_bytes(),
         }
     }
 }
@@ -568,8 +650,39 @@ fn default_attention_suspicion_secs() -> i64 {
     15 * 60
 }
 
+fn default_heavy_wall_secs() -> i64 {
+    core::DEFAULT_HEAVY_WALL_SECS as i64
+}
+
+fn default_heavy_cpu_secs() -> i64 {
+    core::DEFAULT_HEAVY_CPU_SECS as i64
+}
+
+fn default_heavy_rss_bytes() -> i64 {
+    core::DEFAULT_HEAVY_RSS_BYTES as i64
+}
+
+fn default_session_growth_ratio_permille() -> i64 {
+    (core::DEFAULT_SESSION_GROWTH_RATIO * 1000.0) as i64
+}
+
+fn default_session_file_bytes() -> i64 {
+    core::DEFAULT_SESSION_FILE_BYTES as i64
+}
+
 impl DaemonConfig {
     fn validate(self) -> core::Result<Self> {
+        if self.artifact_roots.len() > 32
+            || self
+                .artifact_roots
+                .iter()
+                .any(|p| p.len() > 4096 || !std::path::Path::new(p).is_absolute())
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "daemon.artifact_roots must contain at most 32 absolute local roots",
+            ));
+        }
         self.limits.validate().map_err(|error| {
             core::Error::new("profile_error", format!("config.toml: {}", error.message))
         })?;
@@ -579,11 +692,93 @@ impl DaemonConfig {
                 "config.toml: daemon.attention_suspicion_secs must be a positive integer whose millisecond value fits in i64",
             ));
         }
+        // Parse here so an invalid level is a config error, not a silent
+        // fallback. The live value is applied at startup and on every
+        // `settings.save` through `crate::logging`.
+        crate::logging::LogLevel::parse(&self.log_level)?;
+        if self.heavy_wall_secs <= 0 || self.heavy_wall_secs > 31_536_000 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.heavy_wall_secs must be a positive integer within one year",
+            ));
+        }
+        if self.heavy_cpu_secs <= 0 || self.heavy_cpu_secs > 31_536_000 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.heavy_cpu_secs must be a positive integer within one year",
+            ));
+        }
+        if self.heavy_rss_bytes <= 0 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.heavy_rss_bytes must be a positive integer",
+            ));
+        }
+        if self.session_growth_ratio_permille <= 0 || self.session_growth_ratio_permille > 1000 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.session_growth_ratio_permille must be within (0, 1000]",
+            ));
+        }
+        if self.session_file_bytes <= 0 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.session_file_bytes must be a positive integer",
+            ));
+        }
         Ok(Self {
+            artifact_roots: self.artifact_roots,
             retention: self.retention.validate()?,
             limits: self.limits,
             attention_suspicion_secs: self.attention_suspicion_secs,
+            log_level: self.log_level,
+            heavy_wall_secs: self.heavy_wall_secs,
+            heavy_cpu_secs: self.heavy_cpu_secs,
+            heavy_rss_bytes: self.heavy_rss_bytes,
+            session_growth_ratio_permille: self.session_growth_ratio_permille,
+            session_file_bytes: self.session_file_bytes,
         })
+    }
+
+    pub(crate) fn heavy_thresholds(&self) -> core::Result<core::HeavyThresholds> {
+        let thresholds = core::HeavyThresholds {
+            wall_secs: u64::try_from(self.heavy_wall_secs).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe heavy wall threshold is out of range",
+                )
+            })?,
+            cpu_secs: u64::try_from(self.heavy_cpu_secs).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe heavy CPU threshold is out of range",
+                )
+            })?,
+            rss_bytes: u64::try_from(self.heavy_rss_bytes).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe heavy RSS threshold is out of range",
+                )
+            })?,
+        };
+        thresholds.validate()?;
+        Ok(thresholds)
+    }
+
+    pub(crate) fn session_growth_thresholds(&self) -> core::Result<core::SessionGrowthThresholds> {
+        let thresholds = core::SessionGrowthThresholds {
+            context_ratio: f64::from(
+                i32::try_from(self.session_growth_ratio_permille).unwrap_or(1000),
+            ) / 1000.0,
+            file_bytes: u64::try_from(self.session_file_bytes).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe session file threshold is out of range",
+                )
+            })?,
+        };
+        thresholds.validate()?;
+        Ok(thresholds)
     }
 }
 
@@ -1068,15 +1263,96 @@ fn has_git_remote_helper_delimiter(endpoint: &str) -> bool {
         .is_some_and(|delimiter| endpoint.find("://").is_none_or(|scheme| delimiter < scheme))
 }
 
+/// Test-only uncached entry point: a fresh cache per call behaves like a cold
+/// router on its first launch, so existing tests keep asserting launch
+/// behavior without touching router state.
+#[cfg(test)]
 pub(crate) fn resolve_profile(data_root: &Path, name: &str) -> core::Result<Value> {
+    let cache = Mutex::new(ProfileCache::default());
+    resolve_profile_cached(&cache, data_root, name)
+}
+/// Validated profile snapshot cache keyed by file content revision.
+///
+/// The router holds one of these (never a global). Launch admission still
+/// resolves per launch, but file reads plus full validation run once per
+/// content revision: any byte change re-validates, errors stay typed.
+#[derive(Default)]
+pub(crate) struct ProfileCache {
+    cached: Option<CachedProfileConfig>,
+}
+struct CachedProfileConfig {
+    revision: Option<String>,
+    source: String,
+    config: Option<FileConfig>,
+    snapshots: HashMap<String, Value>,
+}
+/// Router launch-admission entry point: reuse the validated snapshot when the
+/// file revision matches, otherwise re-read, re-validate and re-cache.
+/// A missing file caches the miss until it appears; parse failures are never
+/// cached, so the next launch re-validates the same bytes identically.
+pub(crate) fn resolve_profile_cached(
+    cache: &Mutex<ProfileCache>,
+    data_root: &Path,
+    name: &str,
+) -> core::Result<Value> {
     validate_profile_name(name)?;
-    let Some((config, source)) = read_config(data_root)? else {
+    let current_source = read_config_source(data_root)?;
+    let current_revision = current_source.as_deref().map(profiles_edit::revision_of);
+    {
+        let guard = cache
+            .lock()
+            .map_err(|_| core::Error::new("internal", "profile cache poisoned"))?;
+        if let Some(cached) = guard.cached.as_ref()
+            && cached.revision == current_revision
+        {
+            if let Some(hit) = cached.snapshots.get(name) {
+                return Ok(hit.clone());
+            }
+            if let (Some(config), source) = (cached.config.as_ref(), cached.source.as_str()) {
+                return resolve_profile_in(config, source, name);
+            }
+            return Err(core::Error::new(
+                "profile_error",
+                format!("config.toml: profiles.{name}: profile not found"),
+            ));
+        }
+    }
+    let Some(source) = current_source else {
+        let mut guard = cache
+            .lock()
+            .map_err(|_| core::Error::new("internal", "profile cache poisoned"))?;
+        guard.cached = Some(CachedProfileConfig {
+            revision: None,
+            source: String::new(),
+            config: None,
+            snapshots: HashMap::new(),
+        });
         return Err(core::Error::new(
             "profile_error",
             format!("config.toml: profiles.{name}: profile not found"),
         ));
     };
-    resolve_profile_in(&config, &source, name)
+    let config = parse_config(&source)?;
+    let snapshot = resolve_profile_in(&config, &source, name)?;
+    let mut guard = cache
+        .lock()
+        .map_err(|_| core::Error::new("internal", "profile cache poisoned"))?;
+    match guard.cached.as_mut() {
+        Some(cached) if cached.revision == current_revision => {
+            cached.snapshots.insert(name.to_owned(), snapshot.clone());
+        }
+        _ => {
+            let mut snapshots = HashMap::new();
+            snapshots.insert(name.to_owned(), snapshot.clone());
+            guard.cached = Some(CachedProfileConfig {
+                revision: current_revision,
+                source,
+                config: Some(config),
+                snapshots,
+            });
+        }
+    }
+    Ok(snapshot)
 }
 
 /// Launch-time profile resolution over already parsed source text. The same
@@ -3439,6 +3715,22 @@ mod tests {
         assert_eq!(assignment.role, "worker");
         assert_eq!(assignment.max_busy, 2);
         assert_eq!(assignment.interval, "30s");
+        assert!(
+            !assignment.cleanup_on_retire,
+            "retirement cleanup stays off unless the assignment opts in"
+        );
+
+        fixture.write(
+            "[automation.assignments.review-queue]\n\
+             folder='C:/work/briefs'\nworkspace='C:/work/eliot'\n\
+             role='worker'\nmax_busy=2\ninterval='30s'\ncleanup_on_retire=true\n",
+        );
+        let opted = load_automation_config(&fixture.root)
+            .unwrap()
+            .assignments
+            .remove("review-queue")
+            .unwrap();
+        assert!(opted.cleanup_on_retire);
 
         fixture.write(
             "[automation.assignments.review-queue]\n\
@@ -3472,6 +3764,7 @@ mod tests {
         assert_eq!(
             load_daemon_config(&fixture.root).unwrap(),
             DaemonConfig {
+                artifact_roots: Vec::new(),
                 retention: RetentionConfig {
                     events_days: Some(7),
                     commands_days: Some(14),
@@ -3479,6 +3772,12 @@ mod tests {
                 },
                 limits: core::api::HierarchyLimits::default(),
                 attention_suspicion_secs: 15 * 60,
+                log_level: default_log_level(),
+                heavy_wall_secs: default_heavy_wall_secs(),
+                heavy_cpu_secs: default_heavy_cpu_secs(),
+                heavy_rss_bytes: default_heavy_rss_bytes(),
+                session_growth_ratio_permille: default_session_growth_ratio_permille(),
+                session_file_bytes: default_session_file_bytes(),
             }
         );
 
@@ -3486,6 +3785,7 @@ mod tests {
         assert_eq!(
             load_daemon_config(&fixture.root).unwrap(),
             DaemonConfig {
+                artifact_roots: Vec::new(),
                 retention: RetentionConfig {
                     events_days: Some(7),
                     commands_days: None,
@@ -3493,8 +3793,37 @@ mod tests {
                 },
                 limits: core::api::HierarchyLimits::default(),
                 attention_suspicion_secs: 15 * 60,
+                log_level: default_log_level(),
+                heavy_wall_secs: default_heavy_wall_secs(),
+                heavy_cpu_secs: default_heavy_cpu_secs(),
+                heavy_rss_bytes: default_heavy_rss_bytes(),
+                session_growth_ratio_permille: default_session_growth_ratio_permille(),
+                session_file_bytes: default_session_file_bytes(),
             }
         );
+    }
+
+    #[test]
+    fn daemon_log_level_defaults_parses_and_rejects() {
+        let fixture = AutomationConfigFixture::new();
+        assert_eq!(DaemonConfig::default().log_level, "standard");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap().log_level,
+            "standard"
+        );
+        fixture.write("[daemon]\nlog_level = \"debug\"\n");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap().log_level,
+            "debug"
+        );
+        for source in [
+            "[daemon]\nlog_level = \"verbose\"\n",
+            "[daemon]\nlog_level = 1\n",
+        ] {
+            fixture.write(source);
+            let error = load_daemon_config(&fixture.root).unwrap_err();
+            assert_eq!(error.code, "profile_error", "source: {source}");
+        }
     }
 
     #[test]
@@ -3538,6 +3867,23 @@ mod tests {
             let error = load_daemon_config(&fixture.root).unwrap_err();
             assert_eq!(error.code, "profile_error", "source: {source}");
         }
+    }
+
+    #[test]
+    fn profile_cache_reuses_revision_and_revalidates_on_edit() {
+        let fixture = AutomationConfigFixture::new();
+        fixture.write("[profiles.solo]\nharness = \"codex\"\nmodel = \"m1\"\n");
+        let cache = Mutex::new(ProfileCache::default());
+        let first = resolve_profile_cached(&cache, &fixture.root, "solo").unwrap();
+        assert_eq!(first.get("model").and_then(Value::as_str), Some("m1"));
+        let second = resolve_profile_cached(&cache, &fixture.root, "solo").unwrap();
+        assert_eq!(first, second);
+        fixture.write("[profiles.solo]\nharness = \"codex\"\nmodel = \"m2\"\n");
+        let third = resolve_profile_cached(&cache, &fixture.root, "solo").unwrap();
+        assert_eq!(third.get("model").and_then(Value::as_str), Some("m2"));
+        fixture.write("[profiles.solo]\nharness = \"nope\"\nmodel = \"m2\"\n");
+        let error = resolve_profile_cached(&cache, &fixture.root, "solo").unwrap_err();
+        assert_eq!(error.code, "unsupported");
     }
 
     #[test]
@@ -4198,6 +4544,37 @@ mod tests {
                 "invalid"
             );
             assert_eq!(profile, original);
+        }
+    }
+
+    #[test]
+    fn build_inputs_freeze_exact_target_dir_only_when_admitted() {
+        let mut admitted = json!({"pass_env":["CODEX_HOME", "CARGO_TARGET_DIR"]});
+        capture_build_inputs(&mut admitted, |name| match name {
+            "CARGO_TARGET_DIR" => Some(OsString::from("C:/targets/wt-proof")),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(admitted["target_dir"], "C:/targets/wt-proof");
+
+        let mut unadmitted = json!({"pass_env":["CODEX_HOME"]});
+        capture_build_inputs(&mut unadmitted, |_| {
+            Some(OsString::from("C:/targets/wt-proof"))
+        })
+        .unwrap();
+        assert!(unadmitted.get("target_dir").is_none());
+
+        let mut unset = json!({"pass_env":["CARGO_TARGET_DIR"]});
+        capture_build_inputs(&mut unset, |_| None).unwrap();
+        assert!(unset.get("target_dir").is_none());
+
+        for bad in ["relative/target", ""] {
+            let mut profile = json!({"pass_env":["CARGO_TARGET_DIR"]});
+            capture_build_inputs(&mut profile, |_| Some(OsString::from(bad))).unwrap();
+            assert!(
+                profile.get("target_dir").is_none(),
+                "refused value must stay absent: {bad}"
+            );
         }
     }
 

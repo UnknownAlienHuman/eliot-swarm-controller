@@ -167,6 +167,11 @@ sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
       exact-subject attach; gap-backed `observe` to `transcript` handoff and bounded
       reconciliation. Commit ownership/cursor boundaries before publication; keep
       private history private and never replay an uncertain external effect.
+- [x] **L3.3d Observe what matters.** `activity.heavy` episodes with basename-only
+      categories, `session.growth` warnings with no auto-compact, and `harness.drift`
+      against pinned verified contracts surface in `swarm top` (`OBS`), `swarm stats`,
+      `swarm heavy`, `swarm doctor` and the desktop Details Observe section.
+
 - [x] **L3.4 Proxy/capacity.** First attach to an already-running OpenCodex endpoint.
       Add managed service launch only when actually needed. Add account/proxy caps and
       persistent provider holds with that route; freeze admitted nonsecret route/store
@@ -329,6 +334,15 @@ qualification is incomplete; do not describe it as feature complete.
       owner-global configuration edits or automatic harness/model/account
       fallback. Codex against these backends stays unsupported.
 
+- [ ] **Failure diagnostics that say why and where (#384).** Typed `where`/`origin`
+      on every settled failure, sanitized daemon log with standard/debug modes,
+      crash markers surfaced in `daemon.status`, startup output and `swarm why`,
+      owner-scoped `diagnose` plus `swarm why <command|Agent|agent:turn>` with a
+      causal chain and one-line summary, `preceded_by` on turn outcomes, and the
+      same summary in desktop Agent details. Qualify on a private daemon:
+      nonexistent command, killed turn, invalid model, `max_live`, plugin panic
+      and forced daemon panic with the marker consumed exactly once.
+
 ## L7 — Qualification, repair and release
 
 Implement the bounded retention path first, then build/run the complete campaign against
@@ -365,8 +379,17 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       at or past the process-creation limit are refused with the OS error; the pipe and
       data root are current-user-only and inherited ACLs are refused; `pass_env` values
       never reach the data dir or readbacks; `max_live`, frame and page bounds hold.
-- [ ] Supported Linux behavior and honest degraded custody; adopted-service isolation
-      (with the local adopted backends). Deferred by the owner.
+- [x] Linux via the supported Docker image, with real native Agent turns, private
+      IPC/data permissions and honest degraded process custody. See [Docker](../docker/README.md).
+      Image built and Codex/Luna launch, tool turn, follow-up send and OpenCode free-model
+      tool turn qualified on 2026-11-16, including space/percent/non-ASCII paths.
+      Claude 2.1.325 with `claude-haiku-5-5` qualified on 2026-11-16 after the
+      scope-hash fix: launch, one-line tool turn (`pwd` plus `hello.txt`), follow-up
+      `send` (append `world`, verified on disk), and stop, all with the documented
+      `CLAUDE_CONFIG_DIR` credential mount; readiness commits, never unknown.
+      Muse/Antigravity Linux binaries install and run, but their authenticated
+      turns are not qualified here. Custody stays honestly degraded (see Docker README).
+- [ ] Adopted-service isolation (with the local adopted backends). Deferred by the owner.
 - [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent,
       2,000-events/s owner run is a release capacity check, not a prerequisite to L2.
 
@@ -456,59 +479,94 @@ of the explicitly selected release scope.
       for a held or failed brief and an ordinary handoff to finish a switch.
 - [x] **D7 One shell.** The rail of separate screens is replaced by one shell
       (owner review 2026-11-15, the Codex app as reference). A sidebar holds
-      Search tasks (Ctrl+K: title, project and harness, through WinUI's
-      AutoSuggestBox), one tonal New task row (Ctrl+N), collapsible projects
-      with their Agents nested (manager, then workers, collapsed), Recents, a
-      calm fleet line that opens the monitor ("6 running"), a separate "N need
-      attention" row that lists only Agents waiting on a request or controlled
-      Agents in `unknown` (observe-only native children never count), and
-      Settings. A project is a repository: checkouts registered with the same
-      Git common directory group under the repository's name, and a task row
-      names its worktree only where the project spans several. Running tasks
-      stay on top, then newest first; stopped tasks last changed before today
-      fold into "Show N older"; a collapsed project shows its running count.
-      Titles come with each `agent.list` page (the first meaningful line of
-      the summary `preview`, Markdown removed, else the name, else
-      `<harness> · <profile>`). Collapsed projects live in memory until
-      `[desktop] collapsed_projects` exists. Reactor 0.100.0 has no key events
-      and no N/K accelerator keys, so the two shortcuts come from a keyboard
-      hook scoped to the window's thread. The conversation has a one-line header
-      (title, status dot, details toggle, a "…" menu for Hand off/Switch, Change
-      manager, Resume, Detach, Stop and Force stop); coverage, ids and readback
-      live in the details panel. One composer carries the project and
-      Auto/profile/harness chips, the model-and-effort and access chips, Send,
-      and Interrupt/Steer only while a turn runs. Auto is daemon routing (D8).
-      Settings has General, Models and profiles, Routing, Projects, Automation,
-      Scripts, Cloud MCP and Advanced, all through one client module
-      (`config_client`); while open it replaces the sidebar with its own
-      navigation (a Back row, then the pages) and shows one centred page of at
-      most 840 DIPs with a 200-DIP form label column. One component system at
-      Codex density with Material 3 color roles (owner reviews 2026-11-15 and
-      2026-11-16), every size from one tokens module: corners 8 for controls
-      and row highlights, 12 for containers (cards, menus, Details sections,
-      dialogs), 16 for the composer, a circle only for the icon-only Send;
-      heights 32 for controls and rows, 36 for form rows, 28 for tasks under a
-      project; four type styles (20/600, 14/600, 14/400, 12/400); a 4/8
-      spacing grid; 16/20-DIP icons. One action pattern: filled primary (one
-      per page), outlined secondary, text tertiary, destructive text in the
-      error color. The Details panel has only a close button. (Refs #407)
-- [x] **D8 Settings and routing in the desktop.** Every Settings section reads and
+      one tonal New task row (Ctrl+N), Search tasks (Ctrl+K: title, project and
+      harness, through WinUI's AutoSuggestBox), Automations and Usage,
+      collapsible projects with their Agents nested (manager, then workers,
+      collapsed), Recents, a calm fleet line that opens the monitor ("6
+      running"), a separate "N need attention" row that lists only Agents
+      waiting on a request or controlled Agents in `unknown` (observe-only
+      native children never count), and Settings. A project is a repository:
+      checkouts registered with the same Git common directory group under the
+      repository's name, and a task row names its worktree only where the
+      project spans several. Running tasks stay on top, then newest first;
+      stopped tasks last changed before today fold into "Show N older"; a
+      collapsed project shows its running count, and `[desktop]
+      collapsed_projects` keeps the collapse across restarts. Titles come with
+      each `agent.list` page (the first meaningful line of the summary
+      `preview`, Markdown removed, else the name, else `<harness> · <profile>`).
+      Reactor 0.100.0 has no key events and no N/K accelerator keys, so the
+      shortcuts and popover keys come from hooks scoped to the window's thread;
+      a search suggestion reached with ↑/↓ is only highlighted, and Enter or a
+      click opens it. The conversation has a one-line header (title, status
+      dot, details toggle, a "…" menu for Hand off/Switch, Change manager,
+      Resume, Detach, Stop and Force stop); coverage, ids and readback live in
+      the details panel. The composer of a conversation carries its project,
+      the model-and-effort and access chips, Send, and Interrupt/Steer only
+      while a turn runs; a new task's composer is D9. Settings replaces the
+      sidebar with its own navigation and shows one centred page of at most
+      840 DIPs (D9). One component system at Codex density with Material 3
+      color roles (owner reviews 2026-11-15 and 2026-11-16), every size from
+      one tokens module: corners 8 for controls and row highlights, 12 for
+      containers (cards, menus, popovers, Details sections, dialogs), 16 for
+      the composer, a circle only for the icon-only Send; heights 32 for
+      controls and rows, 36 for form rows, 28 for tasks under a project; four
+      type styles (20/600, 14/600, 14/400, 12/400); a 4/8 spacing grid;
+      16/20-DIP icons. One action pattern: filled primary (one per page),
+      outlined secondary, text tertiary, destructive text in the error color;
+      orange and red appear only for the Full access warning and destructive
+      actions. The Details panel has only a close button. (Refs #407)
+- [x] **D8 Settings and routing in the desktop.** Every Settings page reads and
       writes the unified `settings.read/save` (S1) through `config_client`; the
-      desktop has no other store. General writes `[desktop]` theme and startup
-      ("reopen the last conversation" opens the most recently active Agent).
-      Routing edits each role's ordered candidates; Projects edits path, allowed
-      profiles and Agent actions; Automation edits assignments ("keep N busy from
-      folder X", S4) above the read-only rules; Scripts edits the script
-      entries; Cloud MCP edits its six fields; Advanced holds every section as
-      JSON and the settings history
-      (author, time, sections, revision). Each save shows its result, revision
-      and restart need; a fresh read keeps drafts with unsaved edits. Main's
-      startup behaviors stay: Owner daemon autostart, the opened checkout's
+      desktop has no other store. Appearance and Startup write `[desktop]`
+      theme and startup ("reopen the last task" opens the most recently active
+      Agent). Routing edits each role's ordered candidates; Projects edits
+      path, allowed profiles and Agent actions; Automations edits assignments
+      ("keep N busy from folder X", S4) above the read-only rules and timers,
+      and the script entries; Cloud MCP edits its six fields; Advanced holds
+      every section as JSON and the settings history (author, time, sections,
+      revision). Each save shows its result and restart need (revisions only in
+      Advanced); a fresh read keeps drafts with unsaved edits. Main's startup
+      behaviors stay: Owner daemon autostart, the opened checkout's
       `project.discover`, the fresh private directory remedy and the one-time
-      legacy `swarm-desktop.json` import. The composer's Auto chip launches with
-      no profile, so admission routes (S3); before launch it shows
-      `routing.preview`'s pick, reason and skipped candidates, and the Agent
-      details show the recorded `profile_choice`. (Refs #407)
+      legacy `swarm-desktop.json` import. Auto launches with no profile, so
+      admission routes (S3); before launch the model picker shows
+      `routing.preview`'s pick and reason, and the Agent details show the
+      recorded `profile_choice`. (Refs #407)
+- [x] **D9 A desktop you can work in.** Owner review 2026-11-16, the Codex,
+      OpenCode and Antigravity apps as references. A new task's composer has
+      no profiles: the project chip (a searchable project list and "Other
+      folder…") on top, "Describe a task…", then the model chip
+      (`Harness · Model · effort`), the access chip and Send. The model chip
+      (Ctrl+M) opens OpenCode's picker pattern fed by `models.catalog` (k76a):
+      a search over harnesses, providers and models; Auto with Swarm's pick
+      and reason; Favorites and Recent (`[desktop]` `favorite_models` /
+      `recent_models`); then Codex, Claude Code, OpenCode (by provider), Muse
+      and Antigravity, each row with its provider, effort, a `default` badge
+      and a check on the current one; held models are greyed with the reason
+      and a missing harness says "not installed" once. Claude Code has no live
+      catalogue, so its group offers the CLI default and the model id typed in
+      the search, with the documented effort vocabulary. ↑/↓ move, ←/→ change
+      the effort (or click it on the highlighted row), Enter chooses, Ctrl+F
+      marks a favorite, Esc closes; saved presets are a group at the end. A
+      model choice is an Owner ad-hoc launch with `harness`, `model`, `effort`
+      and `access`. The access chip opens Codex's menu (Ask for approval /
+      Approve for me / Full access → `ask` / `auto` / `full`, Full in the
+      warning color, refused up front for OpenCode), remembered in
+      `[desktop] last_access`. The popovers are drawn above the composer, not
+      as WinUI flyouts (Reactor 0.100.0 cannot close a flyout it opened).
+      Settings follows Codex: a Search field over the settings of every page,
+      then the groups General (Appearance, Startup, Keyboard shortcuts),
+      Agents (Models & presets, Default access, Routing, Usage), Work
+      (Projects, Automations, Worktrees & cleanup), Integrations (Cloud MCP)
+      and Advanced (the settings file and history); each page has a title, a
+      one-line subtitle and cards of rows with the control on the right, and
+      "Open config.toml" where a section backs it. Usage shows each harness's
+      remaining provider quota as rings (weekly and 5-hour where `harness.quota`
+      reports them, "Not supported" otherwise), running Agents and the tokens
+      of Agents active today. Worktrees & cleanup lists the managed worktrees
+      under the data directory by project with Open; cleanup waits for
+      `cleanup.plan` / `cleanup.apply`. Shortcuts: Ctrl+N, Ctrl+K, Ctrl+M,
+      Ctrl+,. (Refs #407)
 
 ## M1 — Memory one-shot inference (#199)
 
@@ -527,6 +585,29 @@ of the explicitly selected release scope.
       and evidence exist. Embeddings remain unsupported.
 
 ## Later
+
+- [ ] **K69 manager cleanup (owner clarification 2026-11-16, #384).**
+      Implemented generation/tree artifact custody, bounded plan/apply, handle
+      deletion, branch verification, native archive, retirement opt-in, CLI and
+      Advanced Settings. The audit repair binds exclusive per-generation roots,
+      refuses hard links/repositories/configuration, requires a fresh remote
+      default, and preserves frozen native scope and uncertain archive fences.
+      Requalified on 2026-11-16 with a private release daemon and real Muse
+      `muse-spark-1.3-contributor`/low: manager a1 stopped children a2/a3 and
+      applied two plans, removing both managed worktrees, the merged branch,
+      temp/source artifacts and a released held directory (2,715 logical bytes).
+      The unmerged branch, initially dirty worktree, live-held directory, nested
+      repository, hard-linked Cargo targets and a substituted junction were
+      kept/refused as appropriate; sibling registration was denied. Static gate:
+      fmt, locked workspace all-targets build, warnings-denied Clippy and 2,014
+      tests passed. All owned processes exited and the private daemon drained.
+      Keep this item open: existing Agent policy prohibits managed-worktree
+      launches, so the private Owner created the children under the manager;
+      the exact manager-created-worktree scenario remains unqualified. Frozen
+      Codex archive scope and malformed acknowledgements have source/regression
+      coverage, without a native fault-injection run. Automatic approval review
+      blocked deletion of the private proof directory and five scratch directories
+      left by failing-before tests.
 
 Service continuity across daemon replacement requires an actual use case. The
 current contracts are not instructions to build that product in advance.

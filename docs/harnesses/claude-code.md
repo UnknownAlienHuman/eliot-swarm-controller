@@ -52,7 +52,7 @@ replies and unexpected echoes remain `unknown`.
 
 ## Native identity and generation
 
-Subject is `(canonical CLAUDE_CONFIG_DIR + project/store identity, exact session id)`.
+Subject is `(hashed canonical CLAUDE_CONFIG_DIR + project/store identity, exact session id)`; the raw directory never enters committed metadata because the daemon also holds that pass_env value as a secret.
 Resume uses that session in a new Eliot generation. Late stream-json records belong to
 the old generation and cannot affect replacement work. Native subagents normally share parent
 environment; no independent Eliot token without actual isolated environment support.
@@ -272,7 +272,12 @@ the current user turn's main loop (subagents excluded). Cumulative/estimated
 `modelUsage` is never a turn total: it sums per model into the
 session-scoped `cumulative_tokens` in `session.usage`; `total_cost_usd`
 is persisted only as the session-scoped `cumulative_cost` in `session.usage`,
-never as usage or billing; unavailable/malformed individual counters stay null
+never as usage or billing; the turn's input-side `usage` counters sample
+session occupancy (`context_used_tokens`) and the frame-reported model window
+(`context_window` on the init or result frame) fills `context_window_tokens`;
+the transcript file size (`<config>/projects/*/<session>.jsonl`, found by
+exact-filename scan, never a guessed slug) fills `session_file_bytes`.
+Unavailable/malformed individual counters stay null
 (other valid counters are retained), and no valid native counters means
 the corresponding fact is omitted — never blocks or gaps the terminal.
 Callbacks own missing permission/question decisions; hooks never mirror the same

@@ -10,8 +10,9 @@ use crate::{
     plugin_host::SecretSet,
 };
 use eliot_core::{
-    Agent, Error, FileChangeHint, GitBaseline, GitHintPage, GitSnapshot, ProcessRecord,
-    ProcessSnapshot, ProcessState, Result, SourceGap, WorkspacePreparation,
+    Agent, Error, FileChangeHint, GitBaseline, GitHintPage, GitSnapshot, ProcessIdentity,
+    ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result, SourceGap,
+    WorkspacePreparation,
     api::{
         FilesystemInvalidationState, FilesystemInvalidationView, GitObservation, GitView,
         LivenessBasis, LivenessView, MonitoringSourceState, ObservationData, ObservationView,
@@ -96,6 +97,42 @@ struct State {
     git_bindings: Mutex<HashMap<Key, String>>,
     git_workspaces: Mutex<HashMap<String, Arc<GitWorkspace>>>,
     git_unavailable: Mutex<Option<String>>,
+    observe: Mutex<ObserveThresholds>,
+}
+
+/// Observe thresholds carried from `[daemon]` config and installed once at
+/// startup. Defaults match the core constants; the daemon never re-reads
+/// the config file per sweep.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ObserveThresholds {
+    pub heavy: eliot_core::HeavyThresholds,
+    pub growth: eliot_core::SessionGrowthThresholds,
+}
+
+/// In-memory observe state for one target: open heavy episodes, warned
+/// growth bands, committed episode keys and the cached harness name.
+/// Episodes are keyed by process identity (boot id, pid, start time) so PID
+/// reuse never merges two episodes.
+#[derive(Debug, Default)]
+struct ObserveTracker {
+    episodes: HashMap<String, OpenHeavyEpisode>,
+    warned_growth: HashSet<&'static str>,
+    emitted_heavy: HashSet<String>,
+    harness: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct OpenHeavyEpisode {
+    category: String,
+    category_source: String,
+    start_ms: i64,
+    last_ms: i64,
+    first_cpu_ns: Option<u64>,
+    last_cpu_ns: Option<u64>,
+    peak_rss_bytes: u64,
+    exit_code: Option<i32>,
+    exited: bool,
+    misses: u8,
 }
 
 struct Target {
@@ -107,6 +144,7 @@ struct Target {
     sampling: AsyncMutex<()>,
     cache: Mutex<Cache>,
     workspace: Option<WorkspaceProcessContext>,
+    observe: Mutex<ObserveTracker>,
 }
 
 #[derive(Clone, Default)]
@@ -222,6 +260,7 @@ impl Monitoring {
                 git_bindings: Mutex::new(HashMap::new()),
                 git_workspaces: Mutex::new(HashMap::new()),
                 git_unavailable: Mutex::new(None),
+                observe: Mutex::new(ObserveThresholds::default()),
             }),
         }
     }
@@ -229,6 +268,12 @@ impl Monitoring {
     pub(crate) fn mark_unavailable(&self, code: &str) {
         *self.inner.unavailable.lock_recover() = Some(code.to_owned());
         self.mark_git_unavailable(code);
+    }
+
+    /// Install the [daemon] observe thresholds once at startup. Sweeps read
+    /// them from memory; the daemon never re-reads the config file per sweep.
+    pub(crate) fn set_observe_thresholds(&self, thresholds: ObserveThresholds) {
+        *self.inner.observe.lock_recover() = thresholds;
     }
 
     /// An owned observer reader has OS custody but no native control token or
@@ -274,6 +319,7 @@ impl Monitoring {
             sampling: AsyncMutex::new(()),
             cache: Mutex::new(Cache::default()),
             workspace: None,
+            observe: Mutex::new(ObserveTracker::default()),
         });
         {
             let mut targets = self.inner.targets.lock_recover();
@@ -345,6 +391,7 @@ impl Monitoring {
             sampling: AsyncMutex::new(()),
             cache: Mutex::new(Cache::default()),
             workspace: Some(context),
+            observe: Mutex::new(ObserveTracker::default()),
         });
         {
             let mut targets = self.inner.targets.lock_recover();
@@ -1575,6 +1622,8 @@ impl Monitoring {
             target.cache.lock_recover().error = Some(error.code.clone());
             return Err(error);
         }
+        self.observe_sampled(target, &snapshot.samples, sampled_at)
+            .await;
         *target.cache.lock_recover() = Cache {
             snapshot: Some(snapshot),
             sampled_at: Some(sampled_at),
@@ -1591,6 +1640,226 @@ impl Monitoring {
             }
         }
         Ok(())
+    }
+
+    /// Observe one sampled agent target: close heavy child-process episodes
+    /// and evaluate session growth. Workspace targets are out of scope: their
+    /// setup runner owns its own lifecycle. Failures here never fail the
+    /// sample; the next sweep retries.
+    async fn observe_sampled(&self, target: &Arc<Target>, samples: &[ProcessSample], now: i64) {
+        if target.workspace.is_some() {
+            return;
+        }
+        let thresholds = *self.inner.observe.lock_recover();
+        let mut seen = HashSet::new();
+        let mut probes = Vec::new();
+        {
+            let mut tracker = target.observe.lock_recover();
+            for sample in samples {
+                if sample.record.role != "child" {
+                    continue;
+                }
+                let key = episode_key(&sample.record.identity);
+                seen.insert(key.clone());
+                if let Some(open) = tracker.episodes.get_mut(&key) {
+                    apply_sample(open, sample, now);
+                } else if !tracker.emitted_heavy.contains(&key)
+                    && !probes.iter().any(|(known, _)| known == &key)
+                {
+                    probes.push((key, sample.record.identity.pid));
+                }
+            }
+        }
+        // Classify new identities outside the lock: one quick read-only
+        // query per new child; failures fail closed (no episode opened).
+        let mut classified = Vec::new();
+        for (key, pid) in probes {
+            if let Some(class) = command_class_for(pid) {
+                classified.push((key, class));
+            }
+        }
+        let mut closing = Vec::new();
+        {
+            let mut tracker = target.observe.lock_recover();
+            for (key, class) in classified {
+                tracker
+                    .episodes
+                    .entry(key)
+                    .or_insert_with(|| OpenHeavyEpisode {
+                        category: class.category,
+                        category_source: class.source.to_owned(),
+                        start_ms: now,
+                        last_ms: now,
+                        first_cpu_ns: None,
+                        last_cpu_ns: None,
+                        peak_rss_bytes: 0,
+                        exit_code: None,
+                        exited: false,
+                        misses: 0,
+                    });
+            }
+            // New episodes missed the first update pass; apply this sweep.
+            for sample in samples {
+                if sample.record.role != "child" {
+                    continue;
+                }
+                let key = episode_key(&sample.record.identity);
+                if let Some(open) = tracker.episodes.get_mut(&key)
+                    && open.start_ms == now
+                {
+                    apply_sample(open, sample, now);
+                }
+            }
+            tracker.episodes.retain(|key, open| {
+                if seen.contains(key) {
+                    return true;
+                }
+                open.misses = open.misses.saturating_add(1);
+                if open.exited || open.misses >= 2 {
+                    closing.push((key.clone(), std::mem::take(open)));
+                    return false;
+                }
+                true
+            });
+        }
+        // Hold back closing episodes whose category still has an open episode:
+        // that command is still running, and this tail belongs to its single
+        // episode. Held episodes rejoin the open map with their state intact.
+        let mut ready: Vec<(String, OpenHeavyEpisode)> = Vec::new();
+        {
+            let mut tracker = target.observe.lock_recover();
+            let open_categories: HashSet<String> = tracker
+                .episodes
+                .values()
+                .map(|open| open.category.clone())
+                .collect();
+            for (key, open) in closing {
+                if open_categories.contains(open.category.as_str()) {
+                    tracker.episodes.insert(key, open);
+                } else {
+                    ready.push((key, open));
+                }
+            }
+        }
+        let mut episodes = Vec::with_capacity(ready.len());
+        for (key, open) in ready {
+            let end_source = if open.exited {
+                "observed_exit"
+            } else {
+                "last_seen"
+            };
+            let episode = eliot_core::HeavyEpisode {
+                category: open.category,
+                category_source: open.category_source,
+                started_at: open.start_ms,
+                ended_at: open.last_ms.max(open.start_ms),
+                end_source: end_source.to_owned(),
+                duration_ms: open.last_ms.max(open.start_ms) - open.start_ms,
+                cpu_ms: open
+                    .first_cpu_ns
+                    .and_then(|first| {
+                        open.last_cpu_ns
+                            .map(|last| last.saturating_sub(first) / 1_000_000)
+                    })
+                    .unwrap_or(0) as i64,
+                peak_rss_bytes: open.peak_rss_bytes,
+                exit_code: open.exit_code,
+            };
+            if episode.validate().is_ok() {
+                target.observe.lock_recover().emitted_heavy.insert(key);
+                episodes.push(episode);
+            }
+        }
+        // Overlapping episodes from one command (wrapper, driver, compiler,
+        // console host) merge into one episode per command.
+        let mut heavy = Vec::new();
+        for episode in eliot_core::merge_heavy_episodes(episodes) {
+            if episode.crosses(&thresholds.heavy) {
+                heavy.push(episode);
+            }
+        }
+        // Session growth from the retained snapshot; warn once per basis per
+        // generation until the signal clears, then record the recovery.
+        let mut growth_events = Vec::new();
+        {
+            let (harness, usage) = {
+                let store = self.inner.store.lock().await;
+                let harness = match target.observe.lock_recover().harness.clone() {
+                    Some(harness) => harness,
+                    None => match store.get_agent(&target.agent).unwrap_or(None) {
+                        Some(agent) => agent.harness.clone(),
+                        None => return,
+                    },
+                };
+                let usage = store
+                    .get_session_usage(&target.agent, target.generation)
+                    .unwrap_or(None);
+                (harness, usage)
+            };
+            target.observe.lock_recover().harness = Some(harness.clone());
+            let mut tracker = target.observe.lock_recover();
+            // The retained session snapshot carries the native session file
+            // size where the harness exposes a documented size source
+            // (transcript/rollout scan); absent sizes never warn.
+            let session_bytes = usage.as_ref().and_then(|usage| usage.session_file_bytes);
+            match eliot_core::evaluate_session_growth(
+                &harness,
+                usage.as_ref(),
+                session_bytes,
+                &thresholds.growth,
+            ) {
+                Some(warn) => {
+                    if tracker.warned_growth.insert(warn.basis_name()) {
+                        growth_events.push((eliot_core::SESSION_GROWTH_KIND, warn.payload()));
+                    }
+                }
+                None => {
+                    for basis in tracker.warned_growth.drain().collect::<Vec<_>>() {
+                        growth_events.push((
+                            eliot_core::SESSION_GROWTH_KIND,
+                            serde_json::json!({
+                                "basis": basis,
+                                "warn": false,
+                                "message": "session growth cleared; signal is back under threshold",
+                                "level": eliot_core::OBSERVE_LEVEL_STANDARD,
+                            }),
+                        ));
+                    }
+                }
+            }
+        }
+        if heavy.is_empty() && growth_events.is_empty() {
+            return;
+        }
+        let mut published = Vec::new();
+        {
+            let mut store = self.inner.store.lock().await;
+            for episode in heavy {
+                if let Ok(event) = store.commit_observe_event(
+                    Some(&target.agent),
+                    Some(target.generation),
+                    eliot_core::ACTIVITY_HEAVY_KIND,
+                    episode.payload(),
+                    now,
+                ) {
+                    published.push(event);
+                }
+            }
+            for (kind, data) in growth_events {
+                if let Ok(event) = store.commit_observe_event(
+                    Some(&target.agent),
+                    Some(target.generation),
+                    kind,
+                    data,
+                    now,
+                ) {
+                    published.push(event);
+                }
+            }
+        }
+        if !published.is_empty() {
+            self.inner.bus.publish(&published);
+        }
     }
 
     async fn set_source_status(&self, target: &Target, health: &str, closed: bool) -> Result<()> {
@@ -1766,6 +2035,53 @@ fn stats_view(cache: &Cache, unavailable: Option<String>, now: i64) -> ProcessSt
 
 pub(crate) fn workspace_owner(agent: &str, target_generation: i64) -> String {
     format!("workspace:{agent}#{target_generation}")
+}
+
+fn episode_key(identity: &ProcessIdentity) -> String {
+    format!(
+        "{}/{}/{}",
+        identity.host_boot_id, identity.pid, identity.start_time
+    )
+}
+
+fn apply_sample(open: &mut OpenHeavyEpisode, sample: &ProcessSample, now: i64) {
+    open.last_ms = now;
+    open.misses = 0;
+    if let Some(cpu) = sample.cpu_time_ns {
+        if open.first_cpu_ns.is_none() {
+            open.first_cpu_ns = Some(cpu);
+        }
+        open.last_cpu_ns = Some(cpu);
+    }
+    if let Some(rss) = sample.rss_bytes {
+        open.peak_rss_bytes = open.peak_rss_bytes.max(rss);
+    }
+    if sample.record.state == ProcessState::Exited {
+        open.exited = true;
+        open.exit_code = sample.record.exit_code;
+    }
+}
+
+/// Read-only program identity for one owned child process: its own argv plus
+/// ancestors' argv resolve through harness plumbing (console hosts, the
+/// shell wrapper) to the program that actually consumed the resources. The
+/// Windows probe uses `QueryFullProcessImageNameW` plus best-effort
+/// `NtQueryInformationProcess` command-line and parent reads; Linux reads
+/// `/proc/<pid>/cmdline` and `/proc/<pid>/stat`. Plumbing alone fails closed
+/// to `None` so no episode opens on it.
+#[cfg(windows)]
+fn command_class_for(pid: u32) -> Option<crate::platform::CommandClass> {
+    crate::platform::windows::resolve_heavy_category(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn command_class_for(pid: u32) -> Option<crate::platform::CommandClass> {
+    crate::platform::unix::resolve_heavy_category(pid)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn command_class_for(_pid: u32) -> Option<crate::platform::CommandClass> {
+    None
 }
 
 fn owner(agent: &str, generation: i64) -> String {

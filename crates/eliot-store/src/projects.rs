@@ -936,6 +936,7 @@ fn is_supported_project_action(action: &str) -> bool {
             | "send"
             | "interrupt"
             | "steer"
+            | "inject"
             | "approve"
             | "deny"
             | "answer"

@@ -1,8 +1,9 @@
 //! Owner configuration screens' RPCs: the sanitized profile list, the
 //! `[profiles.*]` source read and its validated save, and the rule list.
 //!
-//! Profiles are resolved from `config.toml` at every launch admission, so
-//! these reads report exactly what the next launch will use; the save
+//! Profiles resolve from `config.toml` at every launch admission against a
+//! revision-keyed validated snapshot, so these reads report exactly what the
+//! next launch will use; file validation runs once per content revision. The save
 //! delegates to `config::profiles_edit`, which reuses the launch parser and
 //! resolution. `rule.list` pages the stored rule states of one namespace with
 //! their canonical definitions and timer states; it changes nothing.
@@ -16,6 +17,18 @@ use eliot_core::{
     },
 };
 use serde_json::Value;
+
+impl Router {
+    fn apply_saved_log_level(data_root: &std::path::Path) {
+        // Best effort: a read failure keeps the current level; the next
+        // save or restart repairs it. Never fails the save itself.
+        if let Ok(config) = crate::config::load_daemon_config(data_root)
+            && let Ok(level) = crate::logging::LogLevel::parse(&config.log_level)
+        {
+            crate::logging::set_log_level(level);
+        }
+    }
+}
 
 fn encode<T: serde::Serialize>(value: &T, what: &str) -> Result<Value> {
     serde_json::to_value(value)
@@ -84,10 +97,10 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let policy = self.secret_policy_snapshot();
-        let mut store = self.inner.store.lock().await;
+        let store = self.inner.store.lock().await;
         let reply = crate::config::settings::read_internal(
             &self.inner.data_root,
-            &mut store,
+            &store,
             request.sections.as_deref(),
             &policy,
         )?;
@@ -139,6 +152,14 @@ impl Router {
             projects.as_ref(),
         )?;
         self.publish_locked(&events);
+        // `[daemon] log_level` applies live: refresh it from the saved
+        // file so standard/debug switches without a restart. Other daemon
+        // keys still report through `restart_required`.
+        if reply.saved {
+            Self::apply_saved_log_level(&self.inner.data_root);
+        }
+        // Publication and application share the Store writer lock. A later
+        // save cannot publish or apply a newer level before this one applies.
         drop(store);
         if !events.is_empty() {
             self.signal_progress();
@@ -316,6 +337,46 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_log_level_saves_apply_in_publication_order() {
+        let root = SettingsRoot::new();
+        let router = crate::router::tests::router_with_data_root(root.0.clone());
+        let request = |path: &std::path::Path, level: &str| {
+            let source = std::fs::read_to_string(path.join("config.toml")).unwrap();
+            serde_json::to_value(SettingsSaveRequest {
+                expected_revision: Some(crate::config::profiles_edit::revision_of(&source)),
+                sections: [(
+                    eliot_core::api::SettingsSection::Daemon,
+                    json!({"log_level":level}),
+                )]
+                .into(),
+                dry_run: false,
+                client: eliot_core::api::SettingsClientSource::Cli,
+            })
+            .unwrap()
+        };
+        let a = router.clone();
+        let b = router.clone();
+        let first = tokio::spawn(async move {
+            a.settings_save(&request(&a.inner.data_root, "debug"), &Principal::Owner)
+                .await
+        });
+        let second = tokio::spawn(async move {
+            b.settings_save(&request(&b.inner.data_root, "standard"), &Principal::Owner)
+                .await
+        });
+        let results = [first.await.unwrap(), second.await.unwrap()];
+        assert!(results.iter().any(Result::is_ok));
+        for result in results {
+            if let Err(error) = result {
+                assert_eq!(error.code, "conflict");
+            }
+        }
+        let config = crate::config::load_daemon_config(&root.0).unwrap();
+        assert_eq!(crate::logging::is_debug(), config.log_level == "debug");
+        crate::logging::set_log_level(crate::logging::LogLevel::Standard);
     }
 
     fn project_request(

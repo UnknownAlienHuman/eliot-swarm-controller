@@ -159,6 +159,14 @@ struct ResumeActionDefinition {
     text: Option<Value>,
 }
 
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InjectActionDefinition {
+    target: Value,
+    at: String,
+    text: Value,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum AgentActionDefinition {
@@ -182,6 +190,7 @@ enum ActionDefinition {
     Emit { definition: EmitDefinitionArgs },
     Mail { definition: MailDefinitionArgs },
     Var { definition: VarDefinitionArgs },
+    Inject { definition: InjectActionDefinition },
 }
 
 impl<'de> Deserialize<'de> for ActionDefinition {
@@ -244,6 +253,13 @@ impl ActionDefinition {
             let definition =
                 eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::Var { definition });
+        }
+        if action == "inject" {
+            let mut fields = object.clone();
+            fields.remove("action");
+            let definition: InjectActionDefinition =
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
+            return Ok(Self::Inject { definition });
         }
         let mut fields = object.clone();
         fields.remove("action");
@@ -370,6 +386,19 @@ impl Serialize for ActionDefinition {
                         }
                     };
                 fields.insert("action".to_owned(), Value::String("var.set".to_owned()));
+                Value::Object(fields).serialize(serializer)
+            }
+            Self::Inject { definition } => {
+                let mut fields =
+                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
+                        Value::Object(fields) => fields,
+                        _ => {
+                            return Err(serde::ser::Error::custom(
+                                "inject definition must serialize as an object",
+                            ));
+                        }
+                    };
+                fields.insert("action".to_owned(), Value::String("inject".to_owned()));
                 Value::Object(fields).serialize(serializer)
             }
         }
@@ -779,6 +808,16 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         ActionDefinition::Var { definition } => {
             return submit_var_command(definition).map(Some);
         }
+        ActionDefinition::Inject { definition } => {
+            return submit_inject_event_command(
+                definition,
+                event,
+                &event_value,
+                subject,
+                &event.data,
+            )
+            .map(Some);
+        }
         ActionDefinition::Agent(action) => action,
     };
     let roots = TemplateRoots {
@@ -1007,6 +1046,107 @@ fn submit_var_command(definition: &VarDefinitionArgs) -> Result<SubmitCommand, E
     Ok(command)
 }
 
+fn validate_inject_action(definition: &InjectActionDefinition) -> Result<(), Error> {
+    let target = definition
+        .target
+        .as_str()
+        .ok_or_else(|| Error::new("invalid", "inject action requires a string target"))?;
+    validate_template(target, true)?;
+    if definition.at.trim().is_empty()
+        || has_templates(&parse_template(&definition.at)?)
+        || !matches!(definition.at.as_str(), "turn_safe_point" | "next_input")
+    {
+        return Err(Error::new(
+            "invalid",
+            "inject at must be turn_safe_point or next_input without templates",
+        ));
+    }
+    validate_text_template(
+        &definition.text,
+        true,
+        MAX_TEXT_BYTES,
+        "inject",
+        "512 KiB text bound",
+    )?;
+    Ok(())
+}
+
+fn submit_inject_event_command(
+    definition: &InjectActionDefinition,
+    event: &Event,
+    event_value: &Value,
+    subject: Option<&Value>,
+    data: &Value,
+) -> Result<SubmitCommand, Error> {
+    if !matches!(definition.at.as_str(), "turn_safe_point" | "next_input") {
+        return Err(Error::new(
+            "invalid",
+            "inject at must be turn_safe_point or next_input",
+        ));
+    }
+    if has_templates(&parse_template(&definition.at)?) {
+        return Err(Error::new("invalid", "inject at cannot use templates"));
+    }
+    let roots = TemplateRoots {
+        event: event_value,
+        subject,
+        data,
+    };
+    let target_source = definition
+        .target
+        .as_str()
+        .ok_or_else(|| Error::new("invalid", "inject action requires a string target"))?;
+    let target = render_agent_target(&Value::String(target_source.to_owned()), &roots)?;
+    parse_agent_id(&target)
+        .map_err(|_| Error::new("invalid", "inject target is not a canonical Agent id"))?;
+    let event_target = event
+        .agent
+        .as_deref()
+        .ok_or_else(|| Error::new("invalid", "inject rule requires an event-time Agent"))?;
+    if target != event_target {
+        return Err(Error::new(
+            "invalid",
+            "inject target must match the event-time Agent",
+        ));
+    }
+    let generation = event
+        .generation
+        .ok_or_else(|| Error::new("invalid", "inject rule requires an event-time generation"))?;
+    let text = render_text(
+        &definition.text,
+        &roots,
+        MAX_TEXT_BYTES,
+        "inject",
+        "512 KiB text bound",
+    )?;
+    if text.trim().is_empty() {
+        return Err(Error::new("invalid", "inject text cannot be empty"));
+    }
+    let expected_turn_id = if definition.at == "turn_safe_point" {
+        let turn_id = event
+            .data
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .filter(|turn_id| !turn_id.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "turn_safe_point inject requires event.data.turn_id",
+                )
+            })?;
+        Some(turn_id.to_owned())
+    } else {
+        None
+    };
+    let mut command = CommandSubmitRequest::new(String::new(), "inject");
+    command.target = Some(target);
+    command.expected_generation = Some(generation);
+    command.expected_turn_id = expected_turn_id;
+    command.args = json!({"text": text, "point": definition.at});
+    command.validate()?;
+    Ok(command)
+}
+
 fn submit_git_fetch_command(definition: &GitFetchDefinitionArgs) -> Result<SubmitCommand, Error> {
     validate_git_fetch_definition(definition)?;
     let args = serde_json::to_value(definition)
@@ -1127,6 +1267,7 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                                     | "mail.send"
                                     | "msg.send"
                                     | "var.set"
+                                    | "inject"
                             )
                         })
                 })
@@ -1320,6 +1461,9 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
                 )
             });
         }
+        ActionDefinition::Inject { definition } => {
+            return validate_inject_action(definition);
+        }
         ActionDefinition::Agent(action) => action,
     };
     if let AgentActionDefinition::Launch(LaunchActionDefinition {
@@ -1504,6 +1648,12 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         ActionDefinition::Emit { definition } => return submit_emit_command(definition),
         ActionDefinition::Mail { definition } => return submit_mail_command(definition),
         ActionDefinition::Var { definition } => return submit_var_command(definition),
+        ActionDefinition::Inject { .. } => {
+            return Err(Error::new(
+                "unsupported",
+                "inject actions require an event trigger",
+            ));
+        }
         ActionDefinition::Agent(action) => action,
     };
     let (target_value, generation_value, args) = match action {
@@ -2896,7 +3046,7 @@ do = [{ action = 'launch', role = 'worker', workspace = 'C:/work', assignment = 
         let error = evaluate(&oversized, &event).unwrap_err();
         assert_eq!(error.code, "invalid");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "rendered send text exceeds the 64 KiB persisted-text bound"
         );
     }
@@ -3074,7 +3224,7 @@ do = [{ action = 'launch', role = 'worker', workspace = 'C:/work', assignment = 
         let error = evaluate(&rule, &event).unwrap_err();
         assert_eq!(error.code, "invalid");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "steer expected_turn_id must match event.data.turn_id"
         );
     }
@@ -3117,7 +3267,7 @@ do = [{ action = 'launch', role = 'worker', workspace = 'C:/work', assignment = 
         let error = evaluate(&oversized, &event).unwrap_err();
         assert_eq!(error.code, "invalid");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "rendered steer text exceeds the 512 KiB text bound"
         );
     }
@@ -3432,7 +3582,7 @@ do = [{ action = 'launch', role = 'worker', workspace = 'C:/work', assignment = 
         let error = evaluate(&rule, &event).unwrap_err();
         assert_eq!(error.code, "invalid");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "rendered action target exceeds Agent id bounds"
         );
     }
@@ -3718,5 +3868,65 @@ do = [{ action = 'var.set', scope = 'project:app', key = 'k', value = 'v' }]
         let error = load(Cursor::new(bad_var)).unwrap_err();
         assert_eq!(error.code, "invalid");
         assert!(error.message.contains("var.set"), "{error:?}");
+    }
+
+    #[test]
+    fn inject_binds_exact_event_turn_and_rejects_timers() {
+        fn hook_event() -> Event {
+            let mut e = event();
+            e.kind = "hook.before_tool".to_owned();
+            e.generation = Some(2);
+            e.data = json!({"turn_id": "turn-1", "tool": "read"});
+            e
+        }
+        const INJECT_RULE: &str = r#"
+[[rule]]
+id = 'hook-context'
+on = { event = 'hook.before_tool' }
+do = [{ action = 'inject', target = '${event.agent}', at = 'turn_safe_point', text = 'ctx ${event.data.turn_id}' }]
+"#;
+        const NEXT_RULE: &str = r#"
+[[rule]]
+id = 'hook-next'
+on = { event = 'hook.before_tool' }
+do = [{ action = 'inject', target = '${event.agent}', at = 'next_input', text = 'queued' }]
+"#;
+        let rules = load(Cursor::new(INJECT_RULE)).expect("inject rule loads");
+        let action = evaluate(&rules[0], &hook_event())
+            .expect("inject evaluates")
+            .expect("inject matches");
+        assert_eq!(action.verb, "inject");
+        assert_eq!(action.target.as_deref(), Some("a7"));
+        assert_eq!(action.expected_generation, Some(2));
+        assert_eq!(action.expected_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(action.args["point"], serde_json::json!("turn_safe_point"));
+        assert_eq!(action.args["text"], serde_json::json!("ctx turn-1"));
+        let rules = load(Cursor::new(NEXT_RULE)).expect("next_input loads");
+        let action = evaluate(&rules[0], &hook_event())
+            .expect("next evaluates")
+            .expect("next matches");
+        assert_eq!(action.expected_turn_id, None);
+        assert_eq!(action.expected_generation, Some(2));
+        assert_eq!(action.args["point"], serde_json::json!("next_input"));
+        let mut missing_generation = hook_event();
+        missing_generation.generation = None;
+        assert_eq!(
+            evaluate(&rules[0], &missing_generation).unwrap_err().code,
+            "invalid"
+        );
+        // Timer context has no event: inject is event-only.
+        let timer_err = load(Cursor::new(
+            "[[rule]]\nid = 't'\non = { every = '30m' }\ndo = [{ action = 'inject', target = 'a7', at = 'turn_safe_point', text = 'x' }]\n",
+        ))
+        .unwrap_err();
+        assert_eq!(timer_err.code, "unsupported");
+        // Wrong point and template at are invalid.
+        for bad in [
+            "[[rule]]\nid = 'b'\non = { event = 'hook.before_tool' }\ndo = [{ action = 'inject', target = '${event.agent}', at = 'active_turn', text = 'x' }]\n",
+            "[[rule]]\nid = 'b'\non = { event = 'hook.before_tool' }\ndo = [{ action = 'inject', target = '${event.agent}', at = '${event.agent}', text = 'x' }]\n",
+        ] {
+            let err = load(Cursor::new(bad)).unwrap_err();
+            assert_eq!(err.code, "invalid", "{bad}");
+        }
     }
 }

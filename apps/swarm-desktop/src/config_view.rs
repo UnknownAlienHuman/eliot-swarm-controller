@@ -111,9 +111,9 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
         rows.push(KeyedView::new(
             "none",
             small(if data.editable {
-                "No profiles yet: add one with Edit as TOML."
+                "No presets yet: add one with Edit as TOML (a [profiles.NAME] table)."
             } else {
-                "Profiles cannot be shown."
+                "Presets cannot be shown."
             }),
         ));
     }
@@ -195,14 +195,14 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 "Duplicate as",
                 crate::m3::field()
                     .text(data.duplicate_name.to_owned())
-                    .placeholder_text("New profile name")
+                    .placeholder_text("New preset name")
                     .automation_name("Duplicate as")
                     .on_text_changed(actions.duplicate_name_changed)
                     .into(),
                 Some(
                     crate::m3::outlined(palette)
                         .is_enabled(!data.busy)
-                        .automation_name("Duplicate profile")
+                        .automation_name("Duplicate preset")
                         .on_click(actions.duplicate)
                         .content(crate::m3::label("Duplicate")),
                 ),

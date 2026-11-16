@@ -57,6 +57,7 @@ mod configure_ui;
 mod handoff_ui;
 mod launch_ui;
 mod monitor_ui;
+mod picker_ui;
 mod profiles_ui;
 mod scripts_ui;
 mod settings_ui;
@@ -507,7 +508,7 @@ impl Component for DesktopApp {
             in_flight_key: None,
             main: Main::Conversation,
             panel: Panel::Closed,
-            settings_page: Page::General,
+            settings_page: Page::Appearance,
             configure: configure_ui::ConfigureState::default(),
             editor: profiles_ui::ProfilesEditor::default(),
             settings: settings_ui::SettingsState::default(),

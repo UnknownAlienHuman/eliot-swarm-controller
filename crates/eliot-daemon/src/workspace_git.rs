@@ -264,8 +264,17 @@ impl WorkspaceGit {
         match self.inspect_created(preparation).await {
             Ok(outcome) => outcome,
             Err(error) => WorkspaceCreationOutcome::Unknown {
-                code: error.code,
-                message: error.message,
+                code: error.code.clone(),
+                message: (*error.message).clone(),
+                failure_where: Some(
+                    error
+                        .failure_where
+                        .clone()
+                        .map(String::from)
+                        .unwrap_or_else(|| "store.dispatch.workspace_gate".to_owned()),
+                ),
+                origin: Some(error.origin_or_unknown()),
+                origin_evidence: error.origin_evidence.clone().map(String::from),
             },
         }
     }
@@ -294,8 +303,17 @@ impl WorkspaceGit {
         match readback {
             Ok(outcome) => outcome,
             Err(error) => WorkspaceCreationOutcome::Unknown {
-                code: error.code,
-                message: error.message,
+                code: error.code.clone(),
+                message: (*error.message).clone(),
+                failure_where: Some(
+                    error
+                        .failure_where
+                        .clone()
+                        .map(String::from)
+                        .unwrap_or_else(|| "store.dispatch.workspace_gate".to_owned()),
+                ),
+                origin: Some(error.origin_or_unknown()),
+                origin_evidence: error.origin_evidence.clone().map(String::from),
             },
         }
     }
@@ -317,6 +335,11 @@ impl WorkspaceGit {
             return Ok(WorkspaceCreationOutcome::Failed {
                 code: "not_created".to_owned(),
                 message: "no workspace path, branch, or registration exists".to_owned(),
+                failure_where: Some("store.dispatch.workspace_gate".to_owned()),
+                origin: Some(eliot_core::FailureOrigin::Swarm),
+                origin_evidence: Some(
+                    "managed workspace preparation gate found no subject".to_owned(),
+                ),
             });
         }
         let subject = self.subject(preparation, deadline).await?;
@@ -515,7 +538,7 @@ impl WorkspaceGit {
             Ok(outcome) => outcome,
             Err(error) => WorkspaceRemovalOutcome::Unknown {
                 code: error.code,
-                message: error.message,
+                message: *error.message,
             },
         }
     }

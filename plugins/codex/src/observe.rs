@@ -1129,6 +1129,8 @@ pub(crate) fn validate_attach_preparation(
 }
 
 pub(crate) fn failed_attach_result(params: &ObserverAttachParams, reason: &'static str) -> Value {
+    // The observer attach gate is ours: a failed attach never touched
+    // native state, so the value carries its own location and origin.
     json!({
         "agent_id": params.agent_id,
         "generation": params.generation,
@@ -1138,6 +1140,9 @@ pub(crate) fn failed_attach_result(params: &ObserverAttachParams, reason: &'stat
         "state": "failed",
         "observation_state": "unknown",
         "reason": reason,
+        "where": "plugin.codex.command.observe_attach",
+        "origin": "swarm",
+        "origin_evidence": "observer attach gate refused before any native read",
     })
 }
 

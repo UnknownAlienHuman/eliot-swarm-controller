@@ -60,6 +60,7 @@ impl DesktopApp {
                                 updated_at: 0,
                                 title: row.title.clone(),
                                 native_child: row.activity.is_some(),
+                                tokens: row.tokens,
                             })
                     });
                 if let Some(agent) = agent {
@@ -307,6 +308,19 @@ impl DesktopApp {
             section(palette, "Agent", &agent_lines),
         ));
 
+        // The failure diagnosis summary: why and where the Agent last
+        // failed, from the same monitor read as the identity above. The
+        // full causal chain lives behind `swarm why`.
+        if let Some(summary) = read
+            .and_then(|read| read.diagnosis.as_ref().ok())
+            .filter(|summary| !summary.trim().is_empty())
+        {
+            sections.push(KeyedView::new(
+                "diagnosis",
+                section(palette, "Diagnosis", std::slice::from_ref(summary)),
+            ));
+        }
+
         // How the profile was chosen: the routing decision frozen at
         // admission, with every skipped candidate.
         let choice = match (detail, read) {
@@ -364,6 +378,15 @@ impl DesktopApp {
             None => vec!["Reading…".to_owned()],
         };
         sections.push(KeyedView::new("usage", section(palette, "Usage", &usage)));
+
+        let observe = match read {
+            Some(read) => monitor_view::observe_lines(read),
+            None => vec!["Reading.".to_owned()],
+        };
+        sections.push(KeyedView::new(
+            "observe",
+            section(palette, "Observe", &observe),
+        ));
 
         // Change manager: one row per possible manager, each button bound
         // to that row's generation and the shown source generation.

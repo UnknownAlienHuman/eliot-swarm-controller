@@ -1094,6 +1094,7 @@ fn admit_resume_tx(
     let agent_num = parse_agent_id(target)?;
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
+    cleanup::require_no_cleanup_attempt(tx, &agent)?;
     if let Some(path) = &agent.workspace {
         workspace::require_managed_path_ready(tx, path)?;
     }

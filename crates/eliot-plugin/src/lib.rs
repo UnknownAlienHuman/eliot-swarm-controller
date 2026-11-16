@@ -1,3 +1,4 @@
+pub mod debug;
 mod file_identity;
 pub mod native_lifecycle;
 pub mod native_stdio;
@@ -9,6 +10,7 @@ pub mod skill;
 mod stderr;
 pub mod sync;
 
+pub use debug::{DebugRecord, parse_debug_line};
 pub use file_identity::{FileIdentity, file_final_path, file_identity};
 pub use peer::{
     CommitSink, Peer, PeerClient, SnapshotDispatch, is_definite_batch_rejection,
@@ -20,7 +22,7 @@ pub use protocol::{
     ObserverDetachParams, ObserverSnapshotParams, PluginManifest, RpcError, RpcRequest,
     RpcResponse,
 };
-pub use stderr::{StderrCapture, StderrSnapshot, StderrView, spawn_stderr};
+pub use stderr::{StderrCapture, StderrSnapshot, StderrView, spawn_plugin_stderr, spawn_stderr};
 
 #[cfg(test)]
 mod agent_start_frame {

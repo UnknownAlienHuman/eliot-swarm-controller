@@ -148,11 +148,38 @@ pub fn spawn_stderr<R>(reader: R, policy: Arc<SecretPolicy>) -> StderrCapture
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
+    spawn_stderr_inner(reader, policy, None)
+}
+
+/// Plugin-owned telemetry channel. Filter before the diagnostic tail, including
+/// malformed and oversized telemetry lines. Native harness stderr uses the
+/// ordinary capture and cannot impersonate plugin telemetry.
+pub fn spawn_plugin_stderr<R>(
+    reader: R,
+    policy: Arc<SecretPolicy>,
+    telemetry: impl Fn(&str) + Send + Sync + 'static,
+) -> StderrCapture
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    spawn_stderr_inner(reader, policy, Some(Box::new(telemetry)))
+}
+
+type Telemetry = Box<dyn Fn(&str) + Send + Sync>;
+
+fn spawn_stderr_inner<R>(
+    reader: R,
+    policy: Arc<SecretPolicy>,
+    telemetry: Option<Telemetry>,
+) -> StderrCapture
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     let view = StderrView {
         state: Arc::new(Mutex::new(TailState::default())),
     };
     let state = Arc::clone(&view.state);
-    let task = tokio::spawn(drain(reader, policy, state));
+    let task = tokio::spawn(drain(reader, policy, state, telemetry));
     StderrCapture {
         view,
         task: Some(task),
@@ -163,11 +190,13 @@ async fn drain<R: AsyncRead + Unpin>(
     mut reader: R,
     policy: Arc<SecretPolicy>,
     state: Arc<Mutex<TailState>>,
+    telemetry: Option<Telemetry>,
 ) {
     let mut input = [0_u8; READ_BYTES];
     // The raw suffix is local to this task. Its maximum carry is determined by
     // the longest value in the fixed, already-bounded source secret snapshot.
     let mut pending = Vec::new();
+    let mut filter = TelemetryFilter::default();
     loop {
         let count = match reader.read(&mut input).await {
             Ok(0) => {
@@ -180,7 +209,14 @@ async fn drain<R: AsyncRead + Unpin>(
                 return;
             }
         };
-        pending.extend_from_slice(&input[..count]);
+        let filtered;
+        let bytes = if let Some(telemetry) = telemetry.as_ref() {
+            filtered = filter.push(&input[..count], telemetry.as_ref());
+            filtered.as_slice()
+        } else {
+            &input[..count]
+        };
+        pending.extend_from_slice(bytes);
         let (sanitized, consumed) = policy.redact_prefix(&pending, false);
         if consumed > pending.len() {
             state.lock_recover().end(false, true);
@@ -190,6 +226,46 @@ async fn drain<R: AsyncRead + Unpin>(
         let mut tail = state.lock_recover();
         tail.append(&sanitized);
         tail.pending_bytes = pending.len();
+    }
+}
+
+#[derive(Default)]
+struct TelemetryFilter {
+    line: Vec<u8>,
+    ordinary: bool,
+    oversized: bool,
+}
+
+impl TelemetryFilter {
+    fn push(&mut self, bytes: &[u8], telemetry: &dyn Fn(&str)) -> Vec<u8> {
+        const PREFIX: &[u8] = b"ELIOT_DEBUG ";
+        let mut output = Vec::new();
+        for &byte in bytes {
+            if self.ordinary {
+                output.push(byte);
+            } else if !self.oversized {
+                self.line.push(byte);
+                if self.line.len() <= PREFIX.len() && !PREFIX.starts_with(&self.line) {
+                    output.append(&mut self.line);
+                    self.ordinary = true;
+                } else if self.line.len() > 4110 {
+                    self.line.clear();
+                    self.oversized = true;
+                }
+            }
+            if byte == b'\n' {
+                if !self.ordinary
+                    && !self.oversized
+                    && let Ok(line) = std::str::from_utf8(&self.line)
+                {
+                    telemetry(line);
+                }
+                self.line.clear();
+                self.ordinary = false;
+                self.oversized = false;
+            }
+        }
+        output
     }
 }
 
@@ -203,6 +279,33 @@ mod tests {
         time::Duration,
     };
     use tokio::io::{AsyncWriteExt, ReadBuf, duplex};
+
+    #[tokio::test]
+    async fn plugin_telemetry_is_routed_and_never_retained() {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&records);
+        let input = format!(
+            "before\nELIOT_DEBUG {{\"code\":\"plugin.frame\",\"fields\":{{\"bytes\":7}}}}\nELIOT_DEBUG malformed\nELIOT_DEBUG {}\nafter\n",
+            "x".repeat(6000)
+        );
+        let capture = spawn_plugin_stderr(
+            io::Cursor::new(input.into_bytes()),
+            policy(&[]),
+            move |line| {
+                if let Some(record) = crate::parse_debug_line(line) {
+                    received.lock().unwrap().push(record);
+                }
+            },
+        );
+        let snapshot = capture
+            .finish(Instant::now() + Duration::from_secs(5))
+            .await;
+        assert_eq!(snapshot.text, "before\nafter\n");
+        assert_eq!(records.lock().unwrap().len(), 1);
+        let mut filter = TelemetryFilter::default();
+        assert!(filter.push(b"ELIOT_", &|_| {}).is_empty());
+        assert!(filter.push(b"DEBUG broken\n", &|_| {}).is_empty());
+    }
 
     fn policy(values: &[&str]) -> Arc<SecretPolicy> {
         Arc::new(SecretPolicy::new(

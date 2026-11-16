@@ -54,7 +54,12 @@ impl NativeStdioConfig for CodexStdioConfig {
     ];
 
     fn map_response_error(error: NativeJsonRpcErrorBody) -> Result<Value> {
-        Err(Error::new("native_rejected", error.message))
+        Err(Error::new("native_rejected", error.message)
+            .with_where("plugin.codex.native.response")
+            .with_origin(
+                eliot_core::FailureOrigin::Harness,
+                "native JSON-RPC refusal; no structured upstream error",
+            ))
     }
 
     /// The exact notification methods the Codex event task consumes today

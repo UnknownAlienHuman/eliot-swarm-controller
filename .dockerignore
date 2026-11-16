@@ -1,0 +1,15 @@
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!crates/**
+!plugins/
+!plugins/**
+!apps/
+!apps/swarm-desktop/
+!apps/swarm-desktop/Cargo.toml
+!apps/swarm-desktop/src/
+!apps/swarm-desktop/src/**
+!skills/
+!skills/**

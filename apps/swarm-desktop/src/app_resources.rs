@@ -159,6 +159,13 @@ fn accent(s: &Scheme) -> Vec<(&'static str, Value)> {
             "TextOnAccentFillColorSelectedTextBrush",
             opaque(s.on_primary),
         ),
+        // The Usage page's quota rings: WinUI's ProgressRing reads its own
+        // key (the Windows accent otherwise), and its track.
+        ("ProgressRingForegroundThemeBrush", opaque(s.primary)),
+        (
+            "ProgressRingBackgroundThemeBrush",
+            opaque(s.surface_container_highest),
+        ),
         // The M3 focus indicator: secondary, on the surface.
         ("FocusStrokeColorOuter", Value::Color(s.secondary)),
         ("FocusStrokeColorInner", Value::Color(s.surface)),

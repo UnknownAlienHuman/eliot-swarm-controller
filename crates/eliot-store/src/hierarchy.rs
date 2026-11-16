@@ -1591,7 +1591,8 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "DROP INDEX commands_turn_unknown;
+                    "DROP TABLE artifacts; DROP TABLE cleanup_plans;
+             DROP INDEX commands_turn_unknown;
                      DROP TRIGGER assignment_commands_insert;
                      DROP TRIGGER assignment_commands_update;
                      DROP TRIGGER assignment_commands_delete;
@@ -1609,6 +1610,8 @@ mod tests {
                      DELETE FROM schema_migrations WHERE version = 41;
                      DROP INDEX inference_write_inventory;
                      ALTER TABLE writes DROP COLUMN inference_seq;
+                     ALTER TABLE turns DROP COLUMN preceded_by;
+                     DELETE FROM schema_migrations WHERE version = 45;
                      DELETE FROM schema_migrations WHERE version >= 39;
                      DROP TABLE inference_calls;
                      DROP TABLE inference_clients;

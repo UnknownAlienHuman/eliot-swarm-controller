@@ -601,7 +601,7 @@ mod tests {
         );
         let error = reject_links(&missing).unwrap_err();
         assert_eq!(error.code, "profile_error");
-        assert_eq!(error.message, "setup path cannot be inspected");
+        assert_eq!(error.message.as_str(), "setup path cannot be inspected");
         crate::git_monitor::reject_links(&missing).unwrap();
 
         let frozen = FrozenSetupFile {
