@@ -28,7 +28,7 @@ base64 before envelope overhead), which Eliot never fetches; and the installed
 per-surface text budget, so the true `view/page` maximum is unverified.
 `session/resume` with `excludeItems=true` serves `history.mode: "none"` (no items),
 so the resume response itself stays small when the host honors the option, which
-Eliot verifies before proceeding. A frame over the cap ends the session with an
+Eliot verifies before proceeding. A frame over the cap ends live stream delivery with an
 explicit `source.gap` carrying a bounded, secret-free diagnosis (byte length with
 a `>=` lower-bound marker when the fault published at the threshold, limit,
 envelope kind, allowlisted method); responses to Eliot's own calls are never
@@ -46,6 +46,12 @@ Use supported typed APIs, not an inferred method list from a different host vers
 
 ## Native mapping
 
+The installed `turn/steer` result must echo the submitted `commandId`, the exact
+`expectedTurnId` as `turnId`, and `status="accepted"` (1.4.0-R4161.1 exported
+MSP schema). A malformed result or contradictory echo is a diagnostic
+`harness_contract_mismatch` at this section; the effect remains unknown. A
+native refusal alone does not prove a contract mismatch or an upstream failure.
+
 | Eliot verb | Installed MSP mechanism to verify |
 | --- | --- |
 | launch/send | session/start then turn/start; readiness, input association and result separate |
@@ -56,6 +62,18 @@ Use supported typed APIs, not an inferred method list from a different host vers
 | configure | effort rides per-turn `reasoningEffort` in `turn/start`, resolved from the retained revision at send dispatch; a model change needs a new native session and is refused as `unsupported` (the frozen snapshot never changes) |
 | goal | native set/edit/pause/resume/clear where installed schema supports them |
 | compact/fork/background | native-only, advertised after implementation |
+
+Before `turn/steer` (including `inject active_turn`), the adapter makes a bounded,
+read-only `session/read` with `excludeItems: true`. It requires a readable
+history envelope and the exact session and running turn, then rechecks the event
+actor immediately before writing. A failed read, unavailable projection, or
+unproven binding refuses the steer before dispatch and retains that refusal for
+the same Eliot command; it never changes the turn outcome or retries the input.
+This guards the observed long-log origin-read failure without inventing a
+checkpoint parameter: the installed `turn/steer` schema accepts no origin or
+checkpoint authority. A successful read is a point-in-time observation, not a
+guarantee against a later vendor failure; an already admitted steer still keeps
+its honest applied/unknown result and is never retroactively called rejected.
 
 Owned-host stop drops MSP stdin before its graceful wait. One absolute stop RPC
 deadline bounds waits for control preparation, native exit/output drain, event
@@ -165,8 +183,8 @@ records that lower bound and the returned subscription head (when available)
 on the source gap before processing replay. When the gap lands before turn
 association (while `turn/start` awaits its reply), the acknowledged association
 attempts the same subscribe and arms the same recovery deadline, so the turn
-cannot stay busy with no settlement. Replay uses the same event actor and
-exact session/turn/command binding as live delivery; a replayed cursor that was
+has bounded readback retries while its source is stale. Replay uses the same
+event actor and exact session/turn/command binding as live delivery; a cursor that was
 already applied skips normalization instead of committing twice. Only a
 successfully processed cursor after the observed subscription head, followed by
 acknowledged `ok` source health, can restore live observation; the historical
@@ -187,8 +205,8 @@ plane, independently of its unavailable history. An exact-session `running`
 response naming the exact active turn preserves that binding and schedules
 another bounded read after the recovery interval. A view reconstructed from
 an unfinished source prefix can contain a synthetic failed terminal while
-the native run continues; it is not sufficient terminal proof. Each retry
-requires a new exact running observation; a timer alone never renews it.
+the native run continues; it is not sufficient terminal proof. A timer alone
+never supplies a native state or terminal outcome.
 Only explicit `idle` with a present-null `activeTurnId` permits a fresh scan
 of the retained view backward (at most four `view/page` reads of up to 1000
 events, reversed within each ascending wire page) for the exact active
@@ -203,25 +221,26 @@ so a later live replay of the same revision skips instead of recommitting,
 retires the recovery deadline, and keeps the recorded gap and stale health
 latched. A readback that proves nothing (a failed `session/read`, an
 unexpected shape, or an idle scan with no durable terminal) never settles the
-turn: it re-arms one more bounded `session/read` after a backoff (5s, 10s,
-20s, then the 30s recovery interval). Only the fifth consecutive unproven
-readback settles the active turn `unknown` through the shared turn-unknown
-path (`turn.unknown` with the exact command/turn binding, the recorded gap
-label and the exact readback failure), never as success or failure. An exact
-`running` observation resets that count: while the native turn is still
-active the Swarm turn stays active with the source stale, the Agent never
-goes idle, and a new send is rejected or queued behind the running turn,
-never delivered into it. The turn binding clears only after that terminal
-write is acknowledged; a failed write keeps the binding and retries on the
-next opportunity instead of stranding the Store turn. The plugin host stays
-alive and the Agent is not marked lost; the session remains for stop/readback
-and owner resolution, while a later send queues behind the unknown-turn gate
-until that turn is explicitly resolved (core.md turn/input gates). Later facts for that turn gap instead of resurrecting it, and
-interrupt/stop afterwards behave as for any unknown turn. Subscription
-admission alone, or a timer, never proves native turn completion or
-process/session exit; a bounded durable page proving the exact terminal does.
-Live recovery after projection failure remains unqualified until exercised
-through Swarm by the controller.
+turn. It re-arms a bounded `session/read` after a backoff (5s, 10s, 20s,
+then at most the 30s recovery interval), with no attempt-count cutoff. An exact
+`running` observation resets that cadence. The turn stays open and the Agent
+stays busy across read failures; a new send cannot enter that turn. A timer,
+subscription admission, or exhausted read budget never proves completion or
+process death. A failed terminal commit keeps the binding for another attempt.
+Only acknowledged native terminal proof clears it in recovery. Actual endpoint
+exit still uses the existing host/daemon custody and source-drain path: drain
+queued facts first, then preserve an unestablished outcome as unknown and settle
+loss only after exact generation custody is empty, per monitoring.md's Liveness
+table. A disconnected stream alone leaves source health stale and state unchanged.
+
+Installed Muse 1.4.0-R4161.1 stable and experimental schemas (exported
+2026-11-16) expose only `sessionId` and `excludeItems` on `session/read`.
+There is no caller-supplied origin/checkpoint/full-replay authority to repair
+there; `excludeItems: true` omits returned items, not the underlying fold.
+`view/page` remains the documented cursor-paged source, but a failed read cannot
+be replaced with an unfenced projection terminal: an unfinished log prefix may
+still synthesize a failure while the native turn runs. No prompt, steer, resume,
+or other session mutation is replayed to repair a read.
 After a proven terminal, a fresh send checks the event actor before any
 `turn/start` write. If observation is still unavailable or its check fails,
 that send is rejected as not dispatched; the previous turn's native verdict
@@ -239,8 +258,8 @@ episode alone therefore does not justify changing consumer bounds or claiming
 that batching repairs the native failure.
 PR #422's shared native-exit lifecycle helper still applies only after actual
 endpoint exit; projection unavailability alone cannot invoke that exit path.
-The projection path reuses the turn-unknown settlement without retiring the
-plugin or reporting a stopped session to stand in for lost observation.
+The projection path keeps retrying without retiring the plugin or reporting a
+stopped session to stand in for lost observation.
 
 Guard a pending-request snapshot with a local observation counter so a newer stream
 resolution cannot be overwritten by stale snapshot data. This is an in-memory race guard,
@@ -703,4 +722,15 @@ per-session switch to turn off native subagents, so
 load (typed, matching the existing pattern for unmapped fields). `allow` is
 accepted and preserves today's behavior. Implementation:
 `crates/eliot-daemon/src/config.rs` (`freeze_native_subagents`).
+
+## Access levels (`--access ask|auto|full`)
+
+Ad-hoc mapping, frozen in the snapshot and reported in effective settings:
+`ask` is `approval=onRequest` + `workspace-write` (pending
+`approval/request` decided with `swarm approve`/`deny`); `auto` is
+`approval=promptUnmatched` + `workspace-write`; `full` is
+`approval=allowAll` + `danger-full-access` (`--disable-sandbox`), exactly the
+current full-access posture. Implementation:
+[`crates/eliot-daemon/src/adhoc.rs`](../../crates/eliot-daemon/src/adhoc.rs)
+(`apply_adhoc_access`).
 

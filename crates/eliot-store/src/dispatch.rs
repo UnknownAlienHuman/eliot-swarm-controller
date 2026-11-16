@@ -762,6 +762,7 @@ fn dispatch_control_tx(
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
+    admission::require_reply_authority(&command.command.principal, &command.command.verb, agent)?;
     if command_generation != agent.generation
         || command
             .command

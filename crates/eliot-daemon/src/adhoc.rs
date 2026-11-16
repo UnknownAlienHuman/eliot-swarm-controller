@@ -93,6 +93,185 @@ fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
     Ok(trimmed.to_owned())
 }
 
+/// Ad-hoc access levels for Owner launch: `ask` routes every tool or
+/// permission request to the Owner through the existing pending-request
+/// path (`swarm approve`/`deny`); `auto` lets the harness apply its safe
+/// automatic posture; `full` selects the harness's full-access posture,
+/// exactly the current full-access profiles. Documented in
+/// `docs/spec/configuration.md` (access mapping) and per harness in
+/// `docs/harnesses/*.md`.
+pub(crate) const ADHOC_ACCESS_LEVELS: &[&str] = &["ask", "auto", "full"];
+
+pub(crate) fn validate_adhoc_access(access: &str) -> core::Result<String> {
+    let trimmed = access.trim();
+    if ADHOC_ACCESS_LEVELS.contains(&trimmed) {
+        Ok(trimmed.to_owned())
+    } else {
+        Err(core::Error::new(
+            "invalid",
+            "ad-hoc access must be ask, auto or full",
+        ))
+    }
+}
+
+/// Freeze the native permission result for one access level into the ad-hoc
+/// snapshot. The frozen native fields are exactly the profile fields a
+/// stored full-access profile uses, so launch-time effective settings report
+/// the same values. `ask` always routes approvals through the existing
+/// pending-request path; levels a harness cannot express refuse with a typed
+/// `unsupported` instead of silently weakening.
+fn apply_adhoc_access(
+    snapshot: &mut Map<String, Value>,
+    harness: &str,
+    access: &str,
+    profile_name: &str,
+) -> core::Result<()> {
+    snapshot.insert("access".to_owned(), Value::String(access.to_owned()));
+    match harness {
+        "codex" => match access {
+            "ask" => {
+                snapshot.insert(
+                    "permissions".to_owned(),
+                    Value::String("workspace-write".to_owned()),
+                );
+                snapshot.insert(
+                    "approval_policy".to_owned(),
+                    Value::String("on-request".to_owned()),
+                );
+                Ok(())
+            }
+            "auto" => {
+                snapshot.insert(
+                    "permissions".to_owned(),
+                    Value::String("workspace-write".to_owned()),
+                );
+                snapshot.insert(
+                    "approval_policy".to_owned(),
+                    Value::String("never".to_owned()),
+                );
+                Ok(())
+            }
+            "full" => {
+                snapshot.insert(
+                    "permissions".to_owned(),
+                    Value::String("danger-full-access".to_owned()),
+                );
+                snapshot.insert(
+                    "approval_policy".to_owned(),
+                    Value::String("never".to_owned()),
+                );
+                Ok(())
+            }
+            _ => Err(core::Error::new(
+                "invalid",
+                "ad-hoc access must be ask, auto or full",
+            )),
+        },
+        "claude" => {
+            // The frozen `permission_mode` is the CLI `--permission-mode`
+            // argv the Claude plugin pushes; `manual` routes `can_use_tool`
+            // through the pending-request path, `auto` approves safe edits,
+            // `bypassPermissions` is the full-access posture.
+            let mode = match access {
+                "ask" => "manual",
+                "auto" => "auto",
+                "full" => "bypassPermissions",
+                _ => {
+                    return Err(core::Error::new(
+                        "invalid",
+                        "ad-hoc access must be ask, auto or full",
+                    ));
+                }
+            };
+            snapshot.insert("permission_mode".to_owned(), Value::String(mode.to_owned()));
+            Ok(())
+        }
+        "muse" => match access {
+            "ask" => {
+                snapshot.insert("approval".to_owned(), Value::String("onRequest".to_owned()));
+                snapshot.insert(
+                    "permissions".to_owned(),
+                    Value::String("workspace-write".to_owned()),
+                );
+                Ok(())
+            }
+            "auto" => {
+                snapshot.insert(
+                    "approval".to_owned(),
+                    Value::String("promptUnmatched".to_owned()),
+                );
+                snapshot.insert(
+                    "permissions".to_owned(),
+                    Value::String("workspace-write".to_owned()),
+                );
+                Ok(())
+            }
+            "full" => {
+                snapshot.insert("approval".to_owned(), Value::String("allowAll".to_owned()));
+                snapshot.insert(
+                    "permissions".to_owned(),
+                    Value::String("danger-full-access".to_owned()),
+                );
+                Ok(())
+            }
+            _ => Err(core::Error::new(
+                "invalid",
+                "ad-hoc access must be ask, auto or full",
+            )),
+        },
+        "opencode" => match access {
+            // OpenCode exposes no verified distinct native permission knob
+            // today: ask and auto share the native permission-reply surface
+            // (permission requests stay pending for the Owner). `full` has no
+            // full-access profile mapping, so it refuses instead of silently
+            // widening.
+            "ask" | "auto" => Ok(()),
+            "full" => Err(core::Error::new(
+                "unsupported",
+                "the opencode slice has no full-access permission mapping",
+            )),
+            _ => Err(core::Error::new(
+                "invalid",
+                "ad-hoc access must be ask, auto or full",
+            )),
+        },
+        "antigravity" => match access {
+            // `false` keeps the ACP `session/request_permission` round-trip
+            // that bridges to `swarm approve`/`deny`; `true` is the
+            // full-access skip flag.
+            "ask" | "auto" => {
+                snapshot.insert(
+                    "dangerously_skip_permissions".to_owned(),
+                    Value::Bool(false),
+                );
+                Ok(())
+            }
+            "full" => {
+                snapshot.insert("dangerously_skip_permissions".to_owned(), Value::Bool(true));
+                Ok(())
+            }
+            _ => Err(core::Error::new(
+                "invalid",
+                "ad-hoc access must be ask, auto or full",
+            )),
+        },
+        _ => Err(core::Error::new(
+            "unsupported",
+            format!("unsupported launch harness {harness}"),
+        )),
+    }
+    .map_err(|error| {
+        if error.code == "invalid" {
+            error
+        } else {
+            core::Error::new(
+                error.code.clone(),
+                format!("ad-hoc {profile_name}: {}", error.message),
+            )
+        }
+    })
+}
+
 /// Longest accepted ad-hoc auth selector, in bytes. Mirrors the plugin's
 /// `IntegrationSelector` rule so the frozen value always passes the
 /// profile-side check.
@@ -148,6 +327,7 @@ pub(crate) fn adhoc_snapshot(
     effort: Option<&str>,
     cmd: Option<String>,
     auth: AdhocAuth<'_>,
+    access: Option<&str>,
 ) -> core::Result<Value> {
     let harness = validate_adhoc_harness(harness)?;
     let model = model
@@ -187,6 +367,16 @@ pub(crate) fn adhoc_snapshot(
         ));
     }
 
+    let access = access
+        .filter(|value| !value.trim().is_empty())
+        .map(validate_adhoc_access)
+        .transpose()?;
+    if catalogue_only && access.is_some() {
+        return Err(core::Error::new(
+            "invalid",
+            "catalogue reads take no access level",
+        ));
+    }
     let profile_name = adhoc_profile_name(&harness);
     let mut snapshot = Map::new();
     snapshot.insert("harness".to_owned(), Value::String(harness.clone()));
@@ -323,6 +513,12 @@ pub(crate) fn adhoc_snapshot(
             ));
         }
     }
+    // Access mapping overwrites the safe defaults above with the exact
+    // native permission result for the requested level, freezing both the
+    // level and its native fields. Omitted access keeps the safe defaults.
+    if let Some(access) = access.as_deref() {
+        apply_adhoc_access(&mut snapshot, &harness, access, &profile_name)?;
+    }
     // Safe defaults shared by every ad-hoc snapshot: an explicit `inherit`
     // MCP opt-in (ad-hoc spans harnesses without a minimal mapping, so the
     // new minimal default cannot apply here), no allow list, no child
@@ -446,7 +642,7 @@ fn path_search_dirs() -> Vec<PathBuf> {
     std::env::var_os("PATH").map_or_else(Vec::new, |paths| std::env::split_paths(&paths).collect())
 }
 
-fn find_on_path(file: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(file: &str) -> Option<PathBuf> {
     let target = file.to_ascii_lowercase();
     for dir in path_search_dirs() {
         let candidate = dir.join(file);
@@ -1062,7 +1258,7 @@ const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Bounded `<exe> --version` first line, or `None` when the probe fails.
 /// A hung native executable must not stall `harness.list`: only the child
 /// this probe started is ever killed on timeout.
-fn native_version_string(program: &str) -> Option<String> {
+pub(crate) fn native_version_string(program: &str) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let Ok(mut child) = Command::new(program)
@@ -1225,6 +1421,7 @@ mod tests {
             Some("medium"),
             None,
             AdhocAuth::Resolve(None),
+            None,
         )
         .unwrap();
         assert_eq!(snapshot["harness"], json!("codex"));
@@ -1246,7 +1443,8 @@ mod tests {
 
     #[test]
     fn adhoc_snapshot_omits_absent_model_and_effort_for_native_default() {
-        let snapshot = adhoc_snapshot("codex", None, None, None, AdhocAuth::Resolve(None)).unwrap();
+        let snapshot =
+            adhoc_snapshot("codex", None, None, None, AdhocAuth::Resolve(None), None).unwrap();
         assert!(snapshot.get("model").is_none());
         assert!(snapshot.get("effort").is_none());
         let snapshot = adhoc_snapshot(
@@ -1255,6 +1453,7 @@ mod tests {
             None,
             Some(r"C:\Tools\MuseCode\muse-bin-1.exe".to_owned()),
             AdhocAuth::Resolve(None),
+            None,
         )
         .unwrap();
         assert!(snapshot.get("model").is_none());
@@ -1266,6 +1465,7 @@ mod tests {
             None,
             Some(r"C:\bin\claude.exe".to_owned()),
             AdhocAuth::Resolve(None),
+            None,
         )
         .unwrap();
         assert!(snapshot.get("model").is_none());
@@ -1281,6 +1481,7 @@ mod tests {
                 Some("medium"),
                 Some(r"C:\bin\native.exe".to_owned()),
                 AdhocAuth::Resolve(None),
+                None,
             )
             .unwrap_err();
             assert_eq!(error.code, "unsupported", "{harness}");
@@ -1296,6 +1497,7 @@ mod tests {
                 Some(level),
                 Some(r"C:\bin\claude.exe".to_owned()),
                 AdhocAuth::Resolve(None),
+                None,
             )
             .unwrap();
             assert_eq!(snapshot["effort"], json!(level));
@@ -1306,6 +1508,7 @@ mod tests {
             Some("extreme"),
             Some(r"C:\bin\claude.exe".to_owned()),
             AdhocAuth::Resolve(None),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");
@@ -1313,7 +1516,8 @@ mod tests {
 
     #[test]
     fn adhoc_snapshot_rejects_unknown_harness() {
-        let error = adhoc_snapshot("fake", None, None, None, AdhocAuth::Resolve(None)).unwrap_err();
+        let error =
+            adhoc_snapshot("fake", None, None, None, AdhocAuth::Resolve(None), None).unwrap_err();
         assert_eq!(error.code, "unsupported");
     }
 
@@ -1325,6 +1529,7 @@ mod tests {
             None,
             Some(r"C:\bin\Antigravity.exe".to_owned()),
             AdhocAuth::Resolve(None),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");
@@ -1338,6 +1543,7 @@ mod tests {
             None,
             Some(r"C:\bin\opencode.exe".to_owned()),
             AdhocAuth::Resolve(None),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");
@@ -1353,6 +1559,7 @@ mod tests {
             None,
             Some(r"C:\bin\opencode.exe".to_owned()),
             AdhocAuth::Resolve(Some("opencode-go")),
+            None,
         )
         .unwrap();
         assert_eq!(snapshot["auth_integration"], json!("opencode-go"));
@@ -1383,6 +1590,7 @@ mod tests {
             None,
             Some(r"C:\bin\agy.exe".to_owned()),
             AdhocAuth::Skip,
+            None,
         )
         .unwrap();
         assert_eq!(snapshot["harness"], json!("antigravity"));
@@ -1400,6 +1608,7 @@ mod tests {
             None,
             Some(r"C:\bin\opencode.exe".to_owned()),
             AdhocAuth::Skip,
+            None,
         )
         .unwrap();
         assert!(snapshot.get("auth_integration").is_none());
@@ -1465,6 +1674,7 @@ mod tests {
             None,
             Some(r"C:\bin\claude.cmd".to_owned()),
             AdhocAuth::Resolve(None),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");
@@ -1671,6 +1881,7 @@ mod tests {
             None,
             Some(pinned.to_owned()),
             AdhocAuth::Resolve(None),
+            None,
         )
         .unwrap();
         assert_eq!(snapshot["cmd"], json!(pinned));
@@ -1680,6 +1891,7 @@ mod tests {
             None,
             Some(r"C:\Tools\MuseCode\muse.cmd".to_owned()),
             AdhocAuth::Resolve(None),
+            None,
         )
         .unwrap_err();
         assert_eq!(error.code, "profile_error");
@@ -1776,6 +1988,145 @@ mod tests {
         );
         assert_eq!(parse_cli_version("not a version"), None);
         assert_eq!(parse_cli_version(""), None);
+    }
+
+    #[test]
+    fn access_mapping_freezes_each_harness_snapshot() {
+        // Codex maps ask/auto/full to approval_policy plus sandbox.
+        let ask = adhoc_snapshot(
+            "codex",
+            Some("gpt-6-luna"),
+            Some("low"),
+            None,
+            AdhocAuth::Resolve(None),
+            Some("ask"),
+        )
+        .unwrap();
+        assert_eq!(ask["access"], json!("ask"));
+        assert_eq!(ask["permissions"], json!("workspace-write"));
+        assert_eq!(ask["approval_policy"], json!("on-request"));
+        let auto = adhoc_snapshot(
+            "codex",
+            Some("gpt-6-luna"),
+            Some("low"),
+            None,
+            AdhocAuth::Resolve(None),
+            Some("auto"),
+        )
+        .unwrap();
+        assert_eq!(auto["permissions"], json!("workspace-write"));
+        assert_eq!(auto["approval_policy"], json!("never"));
+        let full = adhoc_snapshot(
+            "codex",
+            Some("gpt-6-luna"),
+            Some("low"),
+            None,
+            AdhocAuth::Resolve(None),
+            Some("full"),
+        )
+        .unwrap();
+        assert_eq!(full["permissions"], json!("danger-full-access"));
+        assert_eq!(full["approval_policy"], json!("never"));
+        // Claude maps to permission_mode.
+        let ask = adhoc_snapshot(
+            "claude",
+            Some("claude-haiku-5-5"),
+            None,
+            Some(r"C:\Tools\claude.exe".to_owned()),
+            AdhocAuth::Resolve(None),
+            Some("ask"),
+        )
+        .unwrap();
+        assert_eq!(ask["permission_mode"], json!("manual"));
+        let full = adhoc_snapshot(
+            "claude",
+            Some("claude-haiku-5-5"),
+            None,
+            Some(r"C:\Tools\claude.exe".to_owned()),
+            AdhocAuth::Resolve(None),
+            Some("full"),
+        )
+        .unwrap();
+        assert_eq!(full["permission_mode"], json!("bypassPermissions"));
+        // Muse maps to approval plus permissions.
+        let ask = adhoc_snapshot(
+            "muse",
+            Some("muse-spark-1.3"),
+            None,
+            Some(r"C:\Tools\muse.exe".to_owned()),
+            AdhocAuth::Resolve(None),
+            Some("ask"),
+        )
+        .unwrap();
+        assert_eq!(ask["approval"], json!("onRequest"));
+        assert_eq!(ask["permissions"], json!("workspace-write"));
+        let full = adhoc_snapshot(
+            "muse",
+            Some("muse-spark-1.3"),
+            None,
+            Some(r"C:\Tools\muse.exe".to_owned()),
+            AdhocAuth::Resolve(None),
+            Some("full"),
+        )
+        .unwrap();
+        assert_eq!(full["approval"], json!("allowAll"));
+        assert_eq!(full["permissions"], json!("danger-full-access"));
+        // Antigravity maps ask/auto to the ACP permission path and full to skip.
+        let ask = adhoc_snapshot(
+            "antigravity",
+            Some("gemini-4-hydrogen-low"),
+            None,
+            Some(r"C:\Tools\agy.exe".to_owned()),
+            AdhocAuth::Resolve(None),
+            Some("ask"),
+        )
+        .unwrap();
+        assert_eq!(ask["dangerously_skip_permissions"], json!(false));
+        let full = adhoc_snapshot(
+            "antigravity",
+            Some("gemini-4-hydrogen-low"),
+            None,
+            Some(r"C:\Tools\agy.exe".to_owned()),
+            AdhocAuth::Resolve(None),
+            Some("full"),
+        )
+        .unwrap();
+        assert_eq!(full["dangerously_skip_permissions"], json!(true));
+        // OpenCode ask/auto share the permission-reply surface.
+        let auto = adhoc_snapshot(
+            "opencode",
+            Some("opencode/deepseek-v4.1-flash-free"),
+            None,
+            Some(r"C:\Tools\opencode.exe".to_owned()),
+            AdhocAuth::Resolve(Some("opencode-go")),
+            Some("auto"),
+        )
+        .unwrap();
+        assert_eq!(auto["access"], json!("auto"));
+    }
+
+    #[test]
+    fn access_refuses_unsupported_levels_without_silent_weakening() {
+        let error = adhoc_snapshot(
+            "opencode",
+            Some("opencode/deepseek-v4.1-flash-free"),
+            None,
+            Some(r"C:\Tools\opencode.exe".to_owned()),
+            AdhocAuth::Resolve(Some("opencode-go")),
+            Some("full"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "unsupported");
+        let error = adhoc_snapshot(
+            "codex",
+            Some("gpt-6-luna"),
+            None,
+            None,
+            AdhocAuth::Resolve(None),
+            Some("sometimes"),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid");
     }
 
     #[test]

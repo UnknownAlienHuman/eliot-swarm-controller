@@ -1,8 +1,8 @@
 //! Read-only agent views and their table rendering.
 use super::args::{
-    EditsArgs, EventsArgs, GenerationArgs, GitStatusArgs, HistoryArgs, ListFilterArgs, LsArgs,
-    PageArgs, ProcessesArgs, ReadGenerationArgs, ResultArgs, ShowArgs, StatsArgs, TopArgs,
-    UsageArgs, WatchArgs,
+    EditsArgs, EventsArgs, GenerationArgs, GitStatusArgs, HeavyArgs, HistoryArgs, ListFilterArgs,
+    LsArgs, PageArgs, ProcessesArgs, ReadGenerationArgs, ResultArgs, ShowArgs, StatsArgs, TopArgs,
+    UsageArgs, WatchArgs, WhyArgs,
 };
 use super::support::read_and_print;
 use super::support::{Failure, PAGE_SIZE, print_value, validate_limit};
@@ -11,9 +11,11 @@ use eliot_core::api::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse,
     AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest, AgentResultResponse,
-    AgentStatsRequest, AgentStatsResponse, EventsBoundsRequest, EventsBoundsResponse, EventsFilter,
-    EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
-    ObservationPage, TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse,
+    AgentStatsRequest, AgentStatsResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
+    EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
+    EventsSubscribeRequest, EventsSubscribeResponse, HarnessDoctorRequest, HarnessDoctorResponse,
+    ObservationPage, ObserveHeavyRequest, ObserveHeavyResponse, TurnCounterMissing,
+    UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{AgentState, Error as CoreError, NativeChildActivityState};
 use serde_json::Value;
@@ -77,13 +79,37 @@ pub(crate) async fn run_show(
     data_dir: PathBuf,
     json_output: bool,
 ) -> Result<u8, Failure> {
-    read_and_print!(
-        &data_dir,
-        json_output,
-        "agent.get",
-        AgentGetRequest::new(agent),
-        AgentGetResponse
-    )
+    if json_output {
+        read_and_print!(
+            &data_dir,
+            json_output,
+            "agent.get",
+            AgentGetRequest::new(agent),
+            AgentGetResponse
+        )
+    } else {
+        let params = AgentGetRequest::new(agent);
+        params
+            .validate()
+            .map_err(|error| Failure::from_core(error, false))?;
+        let response: AgentGetResponse =
+            eliot_daemon::client_call_typed(&data_dir, "agent.get", &params)
+                .await
+                .map_err(|error| Failure::from_core(error, false))?;
+        params
+            .validate_response(&response)
+            .map_err(|error| Failure::from_core(error, false))?;
+        if let Some(activity) = response.agent.activity.as_ref() {
+            println!(
+                "state: {} (observed) (lifecycle state=unknown)",
+                activity_state_name(activity.state)
+            );
+        }
+        let value = serde_json::to_value(response)
+            .map_err(|_| Failure::new(4, "agent.get response is invalid"))?;
+        print_value(&value, false);
+        Ok(0)
+    }
 }
 
 pub(crate) async fn run_processes(
@@ -126,13 +152,83 @@ pub(crate) async fn run_stats(
         id: agent,
         generation,
     };
-    read_and_print!(
-        &data_dir,
-        json_output,
-        "agent.stats",
-        params,
-        AgentStatsResponse
-    )
+    if json_output {
+        read_and_print!(
+            &data_dir,
+            json_output,
+            "agent.stats",
+            params,
+            AgentStatsResponse
+        )
+    } else {
+        params
+            .validate()
+            .map_err(|error| Failure::from_core(error, false))?;
+        let response: AgentStatsResponse =
+            eliot_daemon::client_call_typed(&data_dir, "agent.stats", &params)
+                .await
+                .map_err(|error| Failure::from_core(error, false))?;
+        params
+            .validate_response(&response)
+            .map_err(|error| Failure::from_core(error, false))?;
+        print_stats_table(&response);
+        Ok(0)
+    }
+}
+
+/// Observe readback for `swarm stats`: the heavy-work rollup and the live
+/// session-growth state. `--json` keeps the raw response; this table never
+/// replaces it.
+pub(crate) fn print_stats_table(response: &AgentStatsResponse) {
+    println!(
+        "stats {}#{} heavy {} growth {}",
+        response.agent,
+        response.generation,
+        heavy_cell(response.heavy.as_ref()),
+        growth_cell(response.session_growth.as_ref()),
+    );
+    if let Some(heavy) = &response.heavy {
+        println!(
+            "  heavy episodes {} latest {} cpu_ms {}",
+            heavy.episodes,
+            heavy.latest_category.as_deref().unwrap_or("-"),
+            heavy.total_cpu_ms,
+        );
+    }
+    if let Some(growth) = &response.session_growth {
+        println!(
+            "  growth basis {} message {}",
+            growth.basis.as_deref().unwrap_or("-"),
+            growth.message.as_deref().unwrap_or("-"),
+        );
+    }
+}
+
+/// Compact heavy cell for agent tables: - when no heavy episode was ever
+/// recorded, otherwise `<episodes>:<category>` (for example `3:cargo-build`).
+pub(crate) fn heavy_cell(heavy: Option<&eliot_core::api::HeavySummaryView>) -> String {
+    match heavy {
+        None => "-".to_owned(),
+        Some(heavy) => format!(
+            "{}{}",
+            heavy.episodes,
+            heavy
+                .latest_category
+                .as_deref()
+                .map(|category| format!(":{category}"))
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// Compact growth cell for agent tables: - while the retained session
+/// signal sits below every threshold, otherwise `!<basis>` (for example
+/// `!tokens`).
+pub(crate) fn growth_cell(growth: Option<&eliot_core::api::SessionGrowthView>) -> String {
+    match growth {
+        None => "-".to_owned(),
+        Some(growth) => format!("!{}", growth.basis.as_deref().unwrap_or("growth")),
+    }
 }
 
 pub(crate) async fn run_usage(
@@ -172,6 +268,126 @@ pub(crate) async fn run_usage(
             .map_err(|error| Failure::from_core(error, false))?;
         print_usage_table(&response);
         Ok(0)
+    }
+}
+
+pub(crate) async fn run_doctor(data_dir: PathBuf, json_output: bool) -> Result<u8, Failure> {
+    let params = HarnessDoctorRequest {};
+    if json_output {
+        read_and_print!(
+            &data_dir,
+            json_output,
+            "harness.doctor",
+            params,
+            HarnessDoctorResponse
+        )
+    } else {
+        params
+            .validate()
+            .map_err(|error| Failure::from_core(error, false))?;
+        let response: HarnessDoctorResponse =
+            eliot_daemon::client_call_typed(&data_dir, "harness.doctor", &params)
+                .await
+                .map_err(|error| Failure::from_core(error, false))?;
+        params
+            .validate_response(&response)
+            .map_err(|error| Failure::from_core(error, false))?;
+        print_doctor_table(&response);
+        Ok(0)
+    }
+}
+
+pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
+    println!(
+        "{:<12} {:<9} {:<14} {:<16} {:<5} DOC",
+        "HARNESS", "INSTALLED", "VERSION", "VERIFIED", "DRIFT"
+    );
+    for entry in &response.harnesses {
+        println!(
+            "{:<12} {:<9} {:<14} {:<16} {:<5} {}",
+            entry.harness,
+            yes_no(entry.installed),
+            entry.version.as_deref().unwrap_or("-"),
+            entry.verified_version,
+            yes_no(entry.drift),
+            entry.doc_section,
+        );
+        if let Some(message) = &entry.drift_message {
+            println!("  drift: {message}");
+        }
+        if let Some(mismatch) = &entry.contract_mismatch {
+            println!("  contract mismatch: {mismatch}");
+        }
+    }
+}
+
+pub(crate) async fn run_heavy(
+    HeavyArgs {
+        agent,
+        generation: ReadGenerationArgs { generation },
+        window_secs,
+    }: HeavyArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let params = ObserveHeavyRequest {
+        agent,
+        generation,
+        window_secs,
+    };
+    if json_output {
+        read_and_print!(
+            &data_dir,
+            json_output,
+            "observe.heavy",
+            params,
+            ObserveHeavyResponse
+        )
+    } else {
+        params
+            .validate()
+            .map_err(|error| Failure::from_core(error, false))?;
+        let response: ObserveHeavyResponse =
+            eliot_daemon::client_call_typed(&data_dir, "observe.heavy", &params)
+                .await
+                .map_err(|error| Failure::from_core(error, false))?;
+        params
+            .validate_response(&response)
+            .map_err(|error| Failure::from_core(error, false))?;
+        print_heavy_table(&response);
+        Ok(0)
+    }
+}
+
+pub(crate) fn print_heavy_table(response: &ObserveHeavyResponse) {
+    println!(
+        "Heavy work over the last {} s (since {}):",
+        response.window_secs, response.since
+    );
+    println!(
+        "{:<8} {:<8} {:<10} {:<10} {:<12} LATEST",
+        "AGENT", "EPISODES", "WALL_S", "CPU_S", "PEAK_RSS_B"
+    );
+    for totals in &response.agents {
+        println!(
+            "{:<8} {:<8} {:<10} {:<10} {:<12} {}",
+            totals.agent,
+            totals.episodes.len(),
+            totals.total_duration_ms / 1000,
+            totals.total_cpu_ms / 1000,
+            totals.peak_rss_bytes,
+            totals
+                .episodes
+                .first()
+                .map(|episode| episode.category.as_str())
+                .unwrap_or("-"),
+        );
+    }
+    if response.truncated {
+        println!("truncated: the window holds more episodes than shown");
+    }
+    if response.agents.is_empty() {
+        println!("no heavy episodes in this window");
     }
 }
 
@@ -626,15 +842,28 @@ pub(crate) async fn read_agent_list(
 /// `DATA` reports observation data availability only, never freshness or
 /// liveness. `--json` keeps printing the raw response; this table never
 /// replaces it.
+/// Compact observe cell for `swarm top`: `-` when no heavy episode was ever
+/// recorded and growth sits below every threshold, otherwise the heavy and
+/// growth cells (for example `3:cargo-build -` or `- !tokens`).
+pub(crate) fn observe_cell(summary: &AgentSummary) -> String {
+    let heavy = heavy_cell(summary.heavy.as_ref());
+    let growth = growth_cell(summary.session_growth.as_ref());
+    if heavy == "-" && growth == "-" {
+        "-".to_owned()
+    } else {
+        format!("{heavy} {growth}")
+    }
+}
+
 pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations: bool) {
     if with_observations {
         println!(
-            "{:<6} {:<4} {:<9} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12}",
-            "ID", "GEN", "STATE", "ACTIVITY", "ACT_TURN", "AGE", "LAST_OUT", "USAGE", "DATA"
+            "{:<6} {:<4} {:<22} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12} {:<14}",
+            "ID", "GEN", "STATE", "ACTIVITY", "ACT_TURN", "AGE", "LAST_OUT", "USAGE", "DATA", "OBS"
         );
     } else {
         println!(
-            "{:<6} {:<4} {:<9} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
+            "{:<6} {:<4} {:<22} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
             "ID",
             "GEN",
             "STATE",
@@ -676,16 +905,17 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                 })
                 .unwrap_or_else(|| "-".to_owned());
             println!(
-                "{:<6} {:<4} {:<9} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12}",
+                "{:<6} {:<4} {:<22} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12} {:<14}",
                 truncate_cell(&summary.id, 6),
                 summary.generation,
-                state_cell(summary.state),
+                truncate_cell(&summary.display_state(), 22),
                 activity,
                 truncate_cell(turn, 12),
                 age,
                 outcome,
                 fleet_usage_cell(summary),
                 observation,
+                truncate_cell(&observe_cell(summary), 14),
             );
         } else {
             let seen = age_cell(
@@ -694,10 +924,10 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                     .filter(|age| *age >= 0),
             );
             println!(
-                "{:<6} {:<4} {:<9} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
+                "{:<6} {:<4} {:<22} {:<14} {:<9} {:<12} {:<6} {:<11} {:<11} {:<6}",
                 truncate_cell(&summary.id, 6),
                 summary.generation,
-                state_cell(summary.state),
+                truncate_cell(&summary.display_state(), 22),
                 truncate_cell(&summary.project, 14),
                 truncate_cell(&summary.harness, 9),
                 truncate_cell(turn, 12),
@@ -863,20 +1093,6 @@ pub(crate) fn missing_cell(missing: &TurnCounterMissing) -> String {
     )
 }
 
-pub(crate) fn state_cell(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Unknown => "unknown",
-        AgentState::Created => "created",
-        AgentState::Starting => "starting",
-        AgentState::Idle => "idle",
-        AgentState::Busy => "busy",
-        AgentState::Waiting => "waiting",
-        AgentState::Stopped => "stopped",
-        AgentState::Failed => "failed",
-        AgentState::Lost => "lost",
-    }
-}
-
 pub(crate) fn activity_state_name(state: NativeChildActivityState) -> &'static str {
     match state {
         NativeChildActivityState::Running => "running",
@@ -920,6 +1136,62 @@ pub(crate) fn truncate_cell(value: &str, width: usize) -> String {
         + "~"
 }
 
+pub(crate) async fn run_why(
+    WhyArgs { target }: WhyArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let params = DiagnoseRequest { target };
+    if json_output {
+        read_and_print!(&data_dir, json_output, "diagnose", params, DiagnoseResponse)
+    } else {
+        params
+            .validate()
+            .map_err(|error| Failure::from_core(error, false))?;
+        let response: DiagnoseResponse =
+            eliot_daemon::client_call_typed(&data_dir, "diagnose", &params)
+                .await
+                .map_err(|error| Failure::from_core(error, false))?;
+        params
+            .validate_response(&response)
+            .map_err(|error| Failure::from_core(error, false))?;
+        print_why_diagnosis(&response);
+        Ok(0)
+    }
+}
+
+fn print_why_diagnosis(response: &DiagnoseResponse) {
+    println!("{}", response.summary);
+    for step in &response.steps {
+        let mut line = format!("  [{}]", step.kind);
+        if let Some(code) = step.code.as_deref() {
+            line.push_str(&format!(" {code}"));
+        }
+        if let Some(where_) = step.failure_where.as_deref() {
+            line.push_str(&format!(" at {where_}"));
+        }
+        if let Some(exit) = step.exit_code {
+            line.push_str(&format!(" exit {exit}"));
+        }
+        if let Some(ntstatus) = step.ntstatus.as_deref() {
+            line.push_str(&format!(" {ntstatus}"));
+        }
+        if let Some(message) = step.message.as_deref() {
+            line.push_str(&format!(": {message}"));
+        }
+        println!("{line}");
+        if let Some(origin) = step.origin.as_deref() {
+            println!("    origin: {origin}");
+        }
+    }
+    if let Some(preceded_by) = response.preceded_by.as_deref() {
+        println!("  preceded by: {preceded_by}");
+    }
+    if let Some(crash) = response.previous_crash.as_ref() {
+        println!("  previous crash: {}", crash.summary());
+    }
+}
+
 pub(crate) fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -928,7 +1200,7 @@ pub(crate) fn yes_no(value: bool) -> &'static str {
 mod tests {
     use super::{
         activity_state_name, age_cell, fleet_usage_cell, is_transient_watch_error, list_params,
-        print_usage_table, state_cell, truncate_cell, watch_retry_delay, with_watch_resume_cursor,
+        print_usage_table, truncate_cell, watch_retry_delay, with_watch_resume_cursor,
     };
     use crate::cli::args::ListFilterArgs;
     use crate::cli::support::Failure;
@@ -1024,6 +1296,9 @@ mod tests {
             generation: 0,
             project: "p".to_owned(),
             harness: "muse".to_owned(),
+            name: None,
+            profile: None,
+            preview: None,
             state: AgentState::Idle,
             parent: None,
             root: "a1".to_owned(),
@@ -1036,6 +1311,8 @@ mod tests {
             usage,
             usage_scope: usage_scope.map(str::to_owned),
             updated_at: 7,
+            heavy: None,
+            session_growth: None,
         }
     }
 
@@ -1074,6 +1351,34 @@ mod tests {
     }
 
     #[test]
+    fn observed_rows_display_activity_with_marker() {
+        use eliot_core::NativeChildActivity;
+        let mut observed = fleet_summary(None, None);
+        observed.state = AgentState::Unknown;
+        observed.activity = Some(NativeChildActivity {
+            state: NativeChildActivityState::Idle,
+            has_open_turn: false,
+            last_progress_at: None,
+        });
+        assert_eq!(observed.display_state(), "idle (observed)");
+        assert_eq!(observed.fleet_bucket(), "idle");
+        observed.activity.as_mut().unwrap().state = NativeChildActivityState::Running;
+        observed.activity.as_mut().unwrap().has_open_turn = true;
+        assert_eq!(observed.display_state(), "running (observed)");
+        assert_eq!(observed.fleet_bucket(), "running");
+        observed.activity.as_mut().unwrap().state = NativeChildActivityState::Lost;
+        assert_eq!(observed.display_state(), "lost (observed)");
+        assert_eq!(observed.fleet_bucket(), "unknown");
+        let controlled = fleet_summary(None, None);
+        assert_eq!(controlled.display_state(), "idle");
+        assert_eq!(
+            eliot_core::api::agent_state_name(AgentState::Unknown),
+            "unknown"
+        );
+        assert_eq!(activity_state_name(NativeChildActivityState::Idle), "idle");
+    }
+
+    #[test]
     fn fleet_table_cells_stay_compact() {
         assert_eq!(age_cell(None), "-");
         assert_eq!(age_cell(Some(-1)), "-");
@@ -1083,7 +1388,7 @@ mod tests {
         assert_eq!(age_cell(Some(172_800_000)), "2d");
         assert_eq!(truncate_cell("a1", 6), "a1");
         assert_eq!(truncate_cell("alongprojectname", 6), "along~");
-        assert_eq!(state_cell(AgentState::Busy), "busy");
+        assert_eq!(eliot_core::api::agent_state_name(AgentState::Busy), "busy");
         assert_eq!(activity_state_name(NativeChildActivityState::Lost), "lost");
     }
 

@@ -36,7 +36,7 @@ pub use rules::{
 pub use scripts::ScriptRunAdmission;
 pub use usage::ResolvedUsageScope;
 
-use eliot_core::api::{AgentConfigView, AgentSummary};
+use eliot_core::api::{AgentConfigView, AgentSummary, HeavySummaryView, SessionGrowthView};
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
@@ -54,6 +54,7 @@ use std::{
     cell::Cell,
     collections::{BTreeMap, HashSet},
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 use ulid::Ulid;
@@ -180,10 +181,34 @@ fn validate_remote_command_context(
     Ok(())
 }
 
+/// Process-lifetime commit telemetry: every store transaction counts
+/// here, success and failure, with total commit milliseconds. Metadata
+/// only: no payloads, ids, or SQL text ever enter these counters. The
+/// daemon exposes the snapshot through `diagnose` so a slow or failing
+/// disk shows up as store evidence, not a guessed origin.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxnStats {
+    pub commits: u64,
+    pub commit_errors: u64,
+    pub commit_ms_total: u64,
+}
+
+static TXN_COMMITS: AtomicU64 = AtomicU64::new(0);
+static TXN_COMMIT_ERRORS: AtomicU64 = AtomicU64::new(0);
+static TXN_COMMIT_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 fn commit_transaction(tx: Transaction<'_>, write_faulted: &Cell<bool>) -> Result<()> {
-    match tx.commit() {
+    let started = std::time::Instant::now();
+    let result = tx.commit();
+    TXN_COMMITS.fetch_add(1, Ordering::Relaxed);
+    TXN_COMMIT_MS_TOTAL.fetch_add(
+        started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        Ordering::Relaxed,
+    );
+    match result {
         Ok(()) => Ok(()),
         Err(error) => {
+            TXN_COMMIT_ERRORS.fetch_add(1, Ordering::Relaxed);
             write_faulted.set(true);
             Err(sql_error(error))
         }
@@ -263,6 +288,17 @@ pub enum StoreOpenPhase {
 }
 
 impl Store {
+    /// Process-lifetime commit counters for debug and `diagnose` evidence.
+    /// Daemon reads are racy by design: exact per-RPC attribution comes
+    /// from the daemon log, these counters show store health over time.
+    pub fn txn_stats(&self) -> TxnStats {
+        TxnStats {
+            commits: TXN_COMMITS.load(Ordering::Relaxed),
+            commit_errors: TXN_COMMIT_ERRORS.load(Ordering::Relaxed),
+            commit_ms_total: TXN_COMMIT_MS_TOTAL.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_observer(path, |_| {})
     }
@@ -861,8 +897,9 @@ impl Store {
         after: Option<&str>,
         limit: usize,
         now_ms: i64,
+        growth_thresholds: &core::SessionGrowthThresholds,
     ) -> Result<AgentListPage> {
-        self.list_agent_summaries_inner(None, filter, after, limit, now_ms)
+        self.list_agent_summaries_inner(None, filter, after, limit, now_ms, growth_thresholds)
     }
 
     /// Scope-checked fleet projection for an Agent caller: itself for `self`
@@ -875,8 +912,16 @@ impl Store {
         after: Option<&str>,
         limit: usize,
         now_ms: i64,
+        growth_thresholds: &core::SessionGrowthThresholds,
     ) -> Result<AgentListPage> {
-        self.list_agent_summaries_inner(Some(caller), filter, after, limit, now_ms)
+        self.list_agent_summaries_inner(
+            Some(caller),
+            filter,
+            after,
+            limit,
+            now_ms,
+            growth_thresholds,
+        )
     }
 
     fn list_agent_summaries_inner(
@@ -886,6 +931,7 @@ impl Store {
         after: Option<&str>,
         limit: usize,
         now_ms: i64,
+        growth_thresholds: &core::SessionGrowthThresholds,
     ) -> Result<AgentListPage> {
         validate_limit(limit)?;
         filter.validate()?;
@@ -904,7 +950,11 @@ impl Store {
             .map_err(sql_error)?;
         let mut summaries = Vec::new();
         for row in rows {
-            summaries.push(self.summary_from_record(row.map_err(sql_error)?, now_ms)?);
+            summaries.push(self.summary_from_record(
+                row.map_err(sql_error)?,
+                now_ms,
+                growth_thresholds,
+            )?);
         }
         let total_page = agent_list_select(filter, caller, None, None, true)?;
         let total: i64 = self
@@ -929,7 +979,12 @@ impl Store {
         })
     }
 
-    fn summary_from_record(&self, record: AgentRecord, now_ms: i64) -> Result<AgentSummary> {
+    fn summary_from_record(
+        &self,
+        record: AgentRecord,
+        now_ms: i64,
+        growth_thresholds: &core::SessionGrowthThresholds,
+    ) -> Result<AgentSummary> {
         let state: AgentState = parse_enum(&record.state, "Agent state")?;
         let id = format_agent_id(record.id);
         let terminal = self.last_terminal_turn(record.id, record.generation, &record.harness)?;
@@ -955,11 +1010,18 @@ impl Store {
                 (fallback, scope)
             }
         };
+        let heavy = self.heavy_rollup(&id, record.generation)?;
+        let session_growth =
+            self.session_growth_view(&record.harness, &id, record.generation, growth_thresholds)?;
+        let preview = self.first_input_preview(record.id)?;
         Ok(AgentSummary {
             id,
             generation: record.generation,
             project: record.project,
             harness: record.harness,
+            name: record.name.filter(|name| !name.trim().is_empty()),
+            profile: Some(record.profile).filter(|profile| !profile.trim().is_empty()),
+            preview,
             state,
             parent: record.parent.map(format_agent_id),
             // A NULL root only arises from raw test rows without hierarchy
@@ -984,7 +1046,31 @@ impl Store {
             usage,
             usage_scope,
             updated_at: record.updated_at,
+            heavy,
+            session_growth,
         })
+    }
+
+    /// The opening characters of the Agent's oldest retained `send` text (a
+    /// launch's linked first input included): one seek on
+    /// `commands_target`. `None` when no send with text is retained.
+    fn first_input_preview(&self, agent: i64) -> Result<Option<String>> {
+        let preview: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT substr(json_extract(args, '$.text'), 1, ?2)
+                 FROM commands INDEXED BY commands_target
+                 WHERE target = ?1 AND verb = 'send'
+                   AND json_type(args, '$.text') = 'text'
+                 ORDER BY created_at, rowid LIMIT 1",
+                params![agent, core::api::AGENT_PREVIEW_CHARS as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        Ok(preview
+            .flatten()
+            .filter(|preview| !preview.trim().is_empty()))
     }
 
     /// Newest terminal turn for one Agent generation: its canonical outcome
@@ -1418,6 +1504,40 @@ impl Store {
         Ok(load_command_record(&self.connection, id)?.map(|record| record.command))
     }
 
+    /// Exact current-generation start, including a failed launch with no turn.
+    /// Generation is unique for launch/resume; never substitute another Agent
+    /// or a timestamp-near command when retention removed the causal command.
+    pub fn generation_start_command(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<Command>> {
+        let id: Option<String> = self.connection.query_row(
+            "SELECT id FROM commands WHERE target = ?1 AND generation = ?2 AND verb IN ('launch', 'resume') ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![parse_agent_id(agent)?, generation], |row| row.get(0),
+        ).optional().map_err(sql_error)?;
+        id.map(|id| self.get_command(&id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Latest retained terminal for this exact turn, for diagnostic fields
+    /// that are deliberately not a second persisted Turn projection.
+    pub fn turn_terminal_event(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+    ) -> Result<Option<Event>> {
+        let record = self.connection.query_row(
+            "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause FROM events
+             WHERE agent = ?1 AND generation = ?2 AND kind IN ('turn.completed', 'turn.unknown')
+               AND json_extract(data, '$.turn_id') = ?3 ORDER BY seq DESC LIMIT 1",
+            params![parse_agent_id(agent)?, generation, turn_id], event_record_from_row,
+        ).optional().map_err(sql_error)?;
+        record.map(event_from_record).transpose()
+    }
+
     pub fn get_turn(&self, agent: &str, generation: i64, turn_id: &str) -> Result<Option<Turn>> {
         let agent_num = parse_agent_id(agent)?;
         load_turn(&self.connection, agent_num, generation, turn_id)
@@ -1702,7 +1822,7 @@ impl Store {
             .connection
             .prepare(
                 "SELECT agent, generation, turn_id, state, status, outcome, native_status,
-                        final_text, started_at, completed_at, usage, config_revision
+                        final_text, started_at, completed_at, usage, config_revision, preceded_by
                  FROM turns WHERE agent = ?1 AND generation = ?2
                  ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
                  LIMIT ?3",
@@ -1720,6 +1840,40 @@ impl Store {
         }
         enforce_page_bytes(&mut turns)?;
         Ok(turns)
+    }
+
+    /// Latest terminal agent events (`agent.lost`, `agent.failed`) for one
+    /// generation, newest first. Powers `diagnose` process/exit steps: the
+    /// exit code, NTSTATUS and redacted stderr tail ride on these events.
+    /// Bounded like every other page; at most `limit` rows.
+    pub fn latest_agent_terminal_events(
+        &self,
+        agent: &str,
+        generation: i64,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        validate_limit(limit)?;
+        let agent_num = parse_agent_id(agent)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
+                 FROM events
+                 WHERE agent = ?1 AND generation = ?2 AND kind IN ('agent.lost', 'agent.failed')
+                 ORDER BY seq DESC LIMIT ?3",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![agent_num, generation, limit as i64],
+                event_record_from_row,
+            )
+            .map_err(sql_error)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(event_from_record(row.map_err(sql_error)?)?);
+        }
+        Ok(events)
     }
 
     pub fn read_events(
@@ -1896,6 +2050,8 @@ impl Store {
                 generation,
                 now,
                 "daemon_restart",
+                None,
+                None,
                 &mut events,
             )?;
         }
@@ -1947,13 +2103,36 @@ impl Store {
     }
 
     pub fn mark_lost(&mut self, agent: &str, generation: i64, now: i64) -> Result<Vec<Event>> {
+        self.mark_lost_with_exit(agent, generation, now, None, None)
+    }
+
+    /// Mark an agent generation lost with its process exit evidence: the
+    /// numeric exit code, the Windows NTSTATUS hex for crash statuses, and
+    /// the bounded redacted stderr tail. Numbers and the already-redacted
+    /// tail only; no argv, environment or output framing.
+    pub fn mark_lost_with_exit(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        now: i64,
+        exit: Option<eliot_core::ProcessExit>,
+        stderr_tail: Option<String>,
+    ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
-        let result = self.mark_lost_inner(agent, generation, now);
+        let result = self.mark_lost_inner(agent, generation, now, exit, stderr_tail);
         self.fault_on_persistence_error(&result);
         result
     }
 
-    fn mark_lost_inner(&mut self, agent: &str, generation: i64, now: i64) -> Result<Vec<Event>> {
+    #[allow(clippy::too_many_arguments)]
+    fn mark_lost_inner(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        now: i64,
+        exit: Option<eliot_core::ProcessExit>,
+        stderr_tail: Option<String>,
+    ) -> Result<Vec<Event>> {
         let agent_num = parse_agent_id(agent)?;
         let tx = self
             .connection
@@ -1974,6 +2153,8 @@ impl Store {
             generation,
             now,
             "owner_marked_lost",
+            exit.as_ref(),
+            stderr_tail.as_deref(),
             &mut events,
         )?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -3140,6 +3321,10 @@ struct TurnRecord {
     /// Configuration revision the turn ran under, copied from its bound
     /// send command at turn creation. 0 when no overlay applied.
     config_revision: i64,
+    /// Causal predecessor of a non-success terminal outcome: the command
+    /// whose terminal event settled the turn. NULL for success, running
+    /// turns and rows settled before predecessors were recorded.
+    preceded_by: Option<String>,
 }
 
 struct SourceStateRecord {
@@ -3339,6 +3524,7 @@ struct TurnInsert<'a> {
     completed_at: Option<i64>,
     usage: Option<&'a str>,
     config_revision: i64,
+    preceded_by: Option<&'a str>,
 }
 
 /// Indexed equality filters for the compact `agent.list` fleet projection.
@@ -4639,6 +4825,7 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
         completed_at: row.get(9)?,
         usage: row.get(10)?,
         config_revision: row.get(11)?,
+        preceded_by: row.get(12)?,
     })
 }
 
@@ -4673,6 +4860,7 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
         usage,
         config_revision: record.config_revision,
         config: None,
+        preceded_by: record.preceded_by.filter(|value| !value.is_empty()),
     })
 }
 
@@ -4716,6 +4904,14 @@ fn session_fallback_usage(snapshot: &SessionUsage) -> Option<TurnUsage> {
     })
 }
 
+/// One heavy episode row for the fleet readback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeavyWindowRow {
+    pub agent: String,
+    pub generation: i64,
+    pub data: Value,
+}
+
 impl Store {
     /// Latest retained `session.usage` snapshot for one Agent generation, or
     /// `None` when no session fact was ever committed. Only the latest
@@ -4734,6 +4930,177 @@ impl Store {
         snapshot
             .map(|value| decode_session_usage(&value))
             .transpose()
+    }
+    /// Heavy-work rollup for one Agent generation, or `None` when no heavy
+    /// episode was ever recorded. The count is exact; the CPU total sums the
+    /// latest 201 episodes so one pathological agent cannot stall a fleet
+    /// page. Malformed own-journal data fails loud as internal, never quiet.
+    pub fn heavy_rollup(&self, agent: &str, generation: i64) -> Result<Option<HeavySummaryView>> {
+        let agent_num = parse_agent_id(agent)?;
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'activity.heavy' AND agent = ?1 AND generation = ?2",
+                params![agent_num, generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if count <= 0 {
+            return Ok(None);
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT data FROM events WHERE kind = 'activity.heavy' AND agent = ?1 AND generation = ?2 ORDER BY seq DESC LIMIT 201",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![agent_num, generation], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error)?;
+        let mut latest_category = None;
+        let mut latest_ended_at = None;
+        let mut total_cpu_ms: u64 = 0;
+        for row in rows {
+            let raw = row.map_err(sql_error)?;
+            let data: Value = serde_json::from_str(&raw)
+                .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
+            if latest_category.is_none() {
+                latest_category = data
+                    .get("category")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                latest_ended_at = data.get("ended_at").and_then(Value::as_i64);
+            }
+            total_cpu_ms = total_cpu_ms.saturating_add(
+                data.get("cpu_ms")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Error::new("internal", "heavy episode data is malformed"))?,
+            );
+        }
+        let Some(category) = latest_category.filter(|category| !category.trim().is_empty()) else {
+            return Err(Error::new("internal", "heavy episode data is malformed"));
+        };
+        Ok(Some(HeavySummaryView {
+            episodes: count as u64,
+            latest_category: Some(category),
+            latest_ended_at,
+            total_cpu_ms,
+        }))
+    }
+
+    /// Newest journal payload for one kind, if any. Used for diagnostic
+    /// readbacks (for example the last `harness_contract_mismatch`); never
+    /// for control flow.
+    pub fn latest_event_data(&self, kind: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT data FROM events WHERE kind = ?1 ORDER BY seq DESC LIMIT 1",
+                params![kind],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        raw.map(|raw| {
+            serde_json::from_str(&raw)
+                .map_err(|_| Error::new("internal", "event data is malformed"))
+        })
+        .transpose()
+    }
+    /// Bounded heavy episodes in a window, newest first. The row cap keeps
+    /// one pathological fleet from stalling the readback; `truncated` names
+    /// the cut. Agent filters carry `"a<num>"` ids validated by the caller.
+    pub fn heavy_episodes(
+        &self,
+        agents: Option<&[String]>,
+        generation: Option<i64>,
+        since: i64,
+        limit: usize,
+    ) -> Result<(Vec<HeavyWindowRow>, bool)> {
+        let mut sql = String::from(
+            "SELECT agent, generation, data FROM events WHERE kind = 'activity.heavy' AND ts >= ?1",
+        );
+        let mut nums = Vec::new();
+        if let Some(agents) = agents {
+            if agents.is_empty() {
+                return Ok((Vec::new(), false));
+            }
+            for agent in agents {
+                nums.push(parse_agent_id(agent)?);
+            }
+            let placeholders = nums
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(&format!(" AND agent IN ({placeholders})"));
+        }
+        let generation_index = nums.len() + 2;
+        if generation.is_some() {
+            sql.push_str(&format!(" AND generation = ?{generation_index}"));
+        }
+        sql.push_str(" ORDER BY seq DESC LIMIT ?");
+        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&since];
+        // `params!` cannot spell a dynamic list; bind positionally instead.
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for num in &nums {
+            bound.push(Box::new(*num));
+        }
+        if let Some(generation) = generation {
+            bound.push(Box::new(generation));
+        }
+        let cap = limit.saturating_add(1);
+        bound.push(Box::new(i64::try_from(cap).unwrap_or(i64::MAX)));
+        for value in &bound {
+            params.push(value.as_ref());
+        }
+        let rows = statement
+            .query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sql_error)?;
+        let mut episodes = Vec::new();
+        for row in rows {
+            let (agent, generation, raw) = row.map_err(sql_error)?;
+            let data: Value = serde_json::from_str(&raw)
+                .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
+            episodes.push(HeavyWindowRow {
+                agent: format_agent_id(agent),
+                generation,
+                data,
+            });
+        }
+        let truncated = episodes.len() > limit;
+        episodes.truncate(limit);
+        Ok((episodes, truncated))
+    }
+    /// Live session-growth state for one Agent generation from the retained
+    /// snapshot: `Some` exactly while the signal crosses `thresholds`. File
+    /// bytes stay unset where the harness exposes no documented size source.
+    pub fn session_growth_view(
+        &self,
+        harness: &str,
+        agent: &str,
+        generation: i64,
+        thresholds: &core::SessionGrowthThresholds,
+    ) -> Result<Option<SessionGrowthView>> {
+        let usage = self.get_session_usage(agent, generation)?;
+        let session_bytes = usage.as_ref().and_then(|usage| usage.session_file_bytes);
+        let growth =
+            core::evaluate_session_growth(harness, usage.as_ref(), session_bytes, thresholds);
+        Ok(growth.map(|warn| SessionGrowthView {
+            warn: true,
+            basis: Some(warn.basis_name().to_owned()),
+            message: Some(warn.message),
+        }))
     }
 }
 
@@ -5253,7 +5620,7 @@ fn load_turn(
     let record = connection
         .query_row(
             "SELECT agent, generation, turn_id, state, status, outcome, native_status,
-                    final_text, started_at, completed_at, usage, config_revision
+                    final_text, started_at, completed_at, usage, config_revision, preceded_by
              FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
             params![agent, generation, turn_id],
             turn_record_from_row,
@@ -5283,8 +5650,9 @@ fn load_harness_by_num(connection: &Connection, agent: i64) -> Result<String> {
 fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
     db!(tx.execute(
         "INSERT INTO turns(agent, generation, turn_id, state, status, outcome, native_status,
-                           final_text, started_at, completed_at, usage, config_revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                           final_text, started_at, completed_at, usage, config_revision,
+                           preceded_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             turn.agent,
             turn.generation,
@@ -5298,6 +5666,7 @@ fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
             turn.completed_at,
             turn.usage,
             turn.config_revision,
+            turn.preceded_by,
         ],
     ));
     Ok(())

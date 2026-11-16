@@ -310,7 +310,7 @@ impl AgyClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id.clone(), kind);
-        let (guard, _receiver) = self.pending.insert(id.clone());
+        let (guard, _receiver) = self.pending.insert(id.clone(), method, encoded.len());
         let registration = FencedGuard {
             _guard: guard,
             fenced: Arc::clone(&self.fenced),
@@ -426,7 +426,7 @@ impl AgyClient {
     }
 
     pub fn diagnostic_error(&self, mut error: Error) -> Error {
-        error.message = self.policy.redact_text(&error.message);
+        error.message = self.policy.redact_text(&error.message).into();
         error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
     }
 
@@ -447,7 +447,7 @@ impl AgyClient {
                 params,
             },
         )?;
-        let (_guard, response_rx) = self.pending.insert(id);
+        let (_guard, response_rx) = self.pending.insert(id, method, encoded.len());
         if let Err(error) = self.write_encoded(encoded, deadline).await {
             if error.code == "native_not_dispatched" {
                 return Err(error);
@@ -486,11 +486,21 @@ impl AgyClient {
 /// unruled-out and stays unknown. The message is never surfaced.
 fn map_response_error(code: i64, message: String) -> Result<Value> {
     if matches!(code, -32602..=-32600) {
-        Err(Error::new("native_rejected", message))
+        Err(Error::new("native_rejected", message)
+            .with_where("plugin.antigravity.native.response")
+            .with_origin(
+                eliot_core::FailureOrigin::Harness,
+                "ACP validation refusal; no documented upstream error shape",
+            ))
     } else {
         Err(Error::new(
             "unknown",
             format!("Antigravity ACP call failed with native code {code}"),
+        )
+        .with_where("plugin.antigravity.native.response")
+        .with_origin(
+            eliot_core::FailureOrigin::Harness,
+            "native ACP error; upstream origin not documented",
         ))
     }
 }

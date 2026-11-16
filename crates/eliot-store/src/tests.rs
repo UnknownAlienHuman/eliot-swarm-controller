@@ -7,9 +7,10 @@ use eliot_core::api::{
     TurnResolveRequest, TurnResolveStatus,
 };
 use eliot_core::{
-    AgentControl, AgentState, CommandState, EventCause, NativeEvent, NativeStoreBinding,
-    ProcessIdentity, ProcessRecord, ProcessState, ProviderHoldState, ProviderRestrictionKind,
-    SourceBatch, SourceGap, SubmitCommand, TurnOutcome, TurnState,
+    AgentControl, AgentState, CommandState, EventCause, HeavyEpisode, NativeEvent,
+    NativeStoreBinding, ProcessIdentity, ProcessRecord, ProcessState, ProviderHoldState,
+    ProviderRestrictionKind, SessionGrowthThresholds, SourceBatch, SourceGap, SubmitCommand,
+    TurnOutcome, TurnState,
 };
 use eliot_core::{
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparationInput,
@@ -22,6 +23,155 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use ulid::Ulid;
+
+#[test]
+fn failed_turn_records_its_command_as_preceded_by() {
+    // A non-success terminal turn links the command whose terminal event
+    // settled it; success links nothing. Legacy rows read back as None.
+    let mut store = Store::open(Path::new(":memory:")).expect("open store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let launch_id = Ulid::new().to_string();
+    let admission = store
+        .submit(
+            "owner",
+            SubmitCommand {
+                id: launch_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({"project":"preceded-turn", "workspace":"synthetic-workspace", "harness":"codex", "profile":"codex-fixture", "profile_snapshot":{}}),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            now,
+        )
+        .expect("admit launch");
+    let agent = admission.command.target.expect("launch target");
+    store.dispatch(&launch_id, now).expect("dispatch launch");
+    let plan = ["session", "turn", "message", "tool", "request"]
+        .into_iter()
+        .map(|family| (family.to_owned(), "stream".to_owned()))
+        .collect();
+    store
+        .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
+        .expect("install stream source owners");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "ready".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "ready".to_owned(),
+                    data: json!({"command_id":launch_id}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit ready");
+    store
+        .settle(&launch_id, CommandState::Applied, None, now)
+        .expect("settle start");
+    let run_turn = |store: &mut Store, status: &str, outcome: Option<&str>| -> (String, String) {
+        let send_id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: send_id.clone(),
+                    target: Some(agent.clone()),
+                    selector: None,
+                    verb: "send".to_owned(),
+                    args: json!({"text":"hi"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit send");
+        store.dispatch(&send_id, now).expect("dispatch send");
+        let turn_id = format!("turn-{send_id}");
+        for (kind, suffix, with_outcome) in [
+            ("turn.started", "started", false),
+            ("turn.completed", "terminal", true),
+        ] {
+            let mut data = json!({"command_id":send_id, "turn_id":turn_id, "status":status});
+            if with_outcome && let Some(outcome) = outcome {
+                data["outcome"] = json!(outcome);
+            }
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: format!("{turn_id}:{suffix}"),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: kind.to_owned(),
+                            native_id: format!("{turn_id}:{suffix}"),
+                            data,
+                        }],
+                        cursor: None,
+                    },
+                    now,
+                )
+                .expect("commit turn event");
+        }
+        (send_id, turn_id)
+    };
+    let (failed_send, failed_turn) = run_turn(&mut store, "error", Some("failure"));
+    let turn = store
+        .get_turn(&agent, 1, &failed_turn)
+        .expect("read failed turn")
+        .expect("failed turn present");
+    assert_eq!(turn.outcome, Some(TurnOutcome::Failure));
+    assert_eq!(turn.preceded_by.as_deref(), Some(failed_send.as_str()));
+    let (ok_send, ok_turn) = run_turn(&mut store, "completed", Some("success"));
+    let _ = ok_send;
+    let turn = store
+        .get_turn(&agent, 1, &ok_turn)
+        .expect("read success turn")
+        .expect("success turn present");
+    assert_eq!(turn.outcome, Some(TurnOutcome::Success));
+    assert_eq!(turn.preceded_by, None);
+}
+
+#[test]
+fn txn_stats_count_every_committed_transaction() {
+    let before = Store::open(Path::new(":memory:"))
+        .expect("open store")
+        .txn_stats();
+    let mut store = Store::open(Path::new(":memory:")).expect("open store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    store
+        .record_write(
+            &Ulid::new().to_string(),
+            "owner",
+            "test.method",
+            &json!({}),
+            &json!({}),
+            now,
+        )
+        .expect("record write");
+    let after = store.txn_stats();
+    assert!(
+        after.commits > before.commits,
+        "one write commits at least one transaction: {before:?} -> {after:?}"
+    );
+    assert_eq!(
+        after.commit_errors, before.commit_errors,
+        "the write must not fail its commit"
+    );
+}
 
 fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
     let launch_id = Ulid::new().to_string();
@@ -3243,7 +3393,14 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
             1,
             WorkspaceCreationOutcome::Unknown {
                 code: "creation_readback_unknown".to_owned(),
+
                 message: "synthetic uncertainty".to_owned(),
+
+                failure_where: None,
+
+                origin: None,
+
+                origin_evidence: None,
             },
             now,
         )
@@ -7173,7 +7330,9 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
                      DELETE FROM schema_migrations WHERE version = 41;
                      DROP INDEX inference_write_inventory;
                      ALTER TABLE writes DROP COLUMN inference_seq;
-                     DELETE FROM schema_migrations WHERE version >= 39;
+                     ALTER TABLE turns DROP COLUMN preceded_by;
+             DELETE FROM schema_migrations WHERE version = 45;
+             DELETE FROM schema_migrations WHERE version >= 39;
                      DROP TABLE inference_calls;
              DROP TABLE inference_clients;
              DELETE FROM schema_migrations WHERE version = 38;
@@ -7762,7 +7921,14 @@ fn ready_retained_resume_unknown_is_typed_and_dispatched_winner_is_refused() {
                 2,
                 WorkspaceCreationOutcome::Unknown {
                     code: "retained_inspection_unknown".to_owned(),
+
                     message: "retained checkout inspection did not complete".to_owned(),
+
+                    failure_where: None,
+
+                    origin: None,
+
+                    origin_evidence: None,
                 },
                 now + 8,
             )
@@ -7880,7 +8046,14 @@ fn ready_retained_resume_unknown_is_typed_and_dispatched_winner_is_refused() {
                 2,
                 WorkspaceCreationOutcome::Unknown {
                     code: "late_retained_inspection_error".to_owned(),
+
                     message: "losing inspection completed after native dispatch".to_owned(),
+
+                    failure_where: None,
+
+                    origin: None,
+
+                    origin_evidence: None,
                 },
                 now + 9,
             )
@@ -11792,6 +11965,74 @@ fn local_user_event_atomic_commit_rejects_mismatch_and_leaves_unknown() {
 }
 
 #[test]
+fn agent_summaries_carry_name_profile_and_first_send_preview() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let brief = format!(
+        "# k75: sidebar titles
+
+{}",
+        "word ".repeat(100)
+    );
+    let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    launch.expected_generation = Some(0);
+    launch.args = json!({"harness": "codex", "profile": "codex-lite",
+        "profile_snapshot": {}, "project": "p", "workspace": "w", "text": brief});
+    let titled = store
+        .submit("owner", launch, now)
+        .expect("admit launch with text")
+        .command
+        .target
+        .expect("launch target");
+    let mut bare = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    bare.expected_generation = Some(0);
+    bare.args = json!({"harness": "muse", "profile": "muse",
+        "profile_snapshot": {}, "project": "p", "workspace": "w"});
+    let untitled = store
+        .submit("owner", bare, now + 1)
+        .expect("admit launch without text")
+        .command
+        .target
+        .expect("launch target");
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET name = 'planner' WHERE id = ?1",
+            [eliot_core::parse_agent_id(&untitled).expect("parse id")],
+        )
+        .expect("name the Agent");
+
+    let page = store
+        .list_agent_summaries(
+            &super::AgentListFilter::default(),
+            None,
+            10,
+            now + 2,
+            &SessionGrowthThresholds::default(),
+        )
+        .expect("list summaries");
+    let row = |id: &str| {
+        page.summaries
+            .iter()
+            .find(|summary| summary.id == id)
+            .expect("listed")
+    };
+    let first = row(&titled);
+    let expected: String = brief
+        .chars()
+        .take(eliot_core::api::AGENT_PREVIEW_CHARS)
+        .collect();
+    assert_eq!(first.preview.as_deref(), Some(expected.as_str()));
+    assert_eq!(first.profile.as_deref(), Some("codex-lite"));
+    assert_eq!(first.name, None);
+    first.validate().expect("bounded preview validates");
+    let second = row(&untitled);
+    assert_eq!(second.preview, None);
+    assert_eq!(second.name.as_deref(), Some("planner"));
+    assert_eq!(second.profile.as_deref(), Some("muse"));
+}
+
+#[test]
 fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
     use super::{AgentListFilter, agent_list_select};
 
@@ -11893,7 +12134,13 @@ fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
     let mut seen = Vec::new();
     for last in [false, false, true] {
         let page = store
-            .list_agent_summaries(&filter, after.as_deref(), 1, now + 9)
+            .list_agent_summaries(
+                &filter,
+                after.as_deref(),
+                1,
+                now + 9,
+                &SessionGrowthThresholds::default(),
+            )
             .expect("page the fleet");
         assert_eq!(page.total, 3);
         assert_eq!(page.truncated, !last);
@@ -11908,7 +12155,13 @@ fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
     }
     assert!(seen.windows(2).all(|pair| pair[0] < pair[1]));
     let drained = store
-        .list_agent_summaries(&filter, after.as_deref(), 1, now + 9)
+        .list_agent_summaries(
+            &filter,
+            after.as_deref(),
+            1,
+            now + 9,
+            &SessionGrowthThresholds::default(),
+        )
         .expect("drain the fleet");
     assert!(drained.summaries.is_empty());
     assert_eq!(drained.total, 3);
@@ -11924,6 +12177,7 @@ fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
             Some(seen[1].as_str()),
             10,
             now + 9,
+            &SessionGrowthThresholds::default(),
         )
         .expect("filter the fleet by project");
     assert_eq!(project.total, 2);
@@ -11937,6 +12191,7 @@ fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
             None,
             10,
             now + 9,
+            &SessionGrowthThresholds::default(),
         )
         .expect("filter the fleet by root");
     assert_eq!(root.total, 2);
@@ -11949,6 +12204,7 @@ fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
             None,
             10,
             now + 9,
+            &SessionGrowthThresholds::default(),
         )
         .expect("filter the fleet by parent");
     assert_eq!(parent.total, 1);
@@ -11971,7 +12227,14 @@ fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
     let mut tree = agent.clone();
     tree.control = AgentControl::Tree;
     let scoped = store
-        .list_agent_summaries_scoped(&tree, &AgentListFilter::default(), None, 10, now + 9)
+        .list_agent_summaries_scoped(
+            &tree,
+            &AgentListFilter::default(),
+            None,
+            10,
+            now + 9,
+            &SessionGrowthThresholds::default(),
+        )
         .expect("list the fleet subtree");
     assert_eq!(scoped.total, 2);
     let mut project_caller = agent.clone();
@@ -11983,11 +12246,19 @@ fn agent_list_filters_use_indexes_and_pages_stay_ordered() {
             None,
             10,
             now + 9,
+            &SessionGrowthThresholds::default(),
         )
         .expect("list the fleet project");
     assert_eq!(scoped.total, 2);
     let scoped = store
-        .list_agent_summaries_scoped(&agent, &AgentListFilter::default(), None, 10, now + 9)
+        .list_agent_summaries_scoped(
+            &agent,
+            &AgentListFilter::default(),
+            None,
+            10,
+            now + 9,
+            &SessionGrowthThresholds::default(),
+        )
         .expect("list the fleet self row");
     assert_eq!(scoped.total, 1);
     assert_eq!(scoped.summaries[0].id, first);
@@ -12650,6 +12921,53 @@ fn session_usage_keeps_only_the_latest_snapshot() {
 }
 
 #[test]
+fn session_growth_view_reads_retained_file_bytes() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_agent(&mut store, "growth-bytes-probe", now);
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "session-usage:bytes".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.usage".to_owned(),
+                    native_id: "session-usage:nbytes".to_owned(),
+                    data: json!({"usage": {
+                        "context_used_tokens": 10,
+                        "context_window_tokens": null,
+                        "source": "claude:result",
+                        "session_file_bytes": 2048,
+                    }}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit session usage");
+    let low = SessionGrowthThresholds {
+        file_bytes: 1024,
+        ..SessionGrowthThresholds::default()
+    };
+    let warned = store
+        .session_growth_view("claude", &agent, 1, &low)
+        .expect("growth view")
+        .expect("retained file bytes warn under a low threshold");
+    assert_eq!(warned.basis.as_deref(), Some("session_file_bytes"));
+    assert!(warned.warn);
+    // Default thresholds stay quiet: only an exposed, crossed size warns.
+    assert!(
+        store
+            .session_growth_view("claude", &agent, 1, &SessionGrowthThresholds::default())
+            .expect("growth view")
+            .is_none()
+    );
+}
+
+#[test]
 fn session_fallback_projects_cumulative_counters_only() {
     use eliot_core::{SessionCost, SessionTokenTotals, SessionUsage};
 
@@ -12666,6 +12984,7 @@ fn session_fallback_projects_cumulative_counters_only() {
             amount: Some(0.5),
             unit: Some("usd_estimate".to_owned()),
         }),
+        session_file_bytes: None,
         source: Some("muse:session/tokenUsage".to_owned()),
         observed_at: Some(7),
     };
@@ -14570,4 +14889,81 @@ fn exact_turn_unknown_mask_uses_covering_index_and_matches_per_turn() {
         !plan.iter().any(|line| line.contains("SCAN commands")),
         "plan avoids full scan: {plan:?}"
     );
+}
+
+#[test]
+fn observe_events_commit_with_closed_kinds_and_roll_up() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_agent(&mut store, "observe-probe", now);
+
+    // Unknown kinds never commit.
+    let rejected =
+        store.commit_observe_event(Some(&agent), Some(1), "agent.attention", json!({}), now);
+    assert_eq!(rejected.expect_err("unknown kind rejects").code, "invalid");
+
+    // Targetless drift commits without an Agent binding.
+    let drifted = eliot_core::check_harness_drift("muse", Some("1.4.20"), None)
+        .expect("drift fixture")
+        .payload();
+    let event = store
+        .commit_observe_event(None, None, eliot_core::HARNESS_DRIFT_KIND, drifted, now)
+        .expect("commit drift");
+    assert_eq!(event.kind, "harness.drift");
+    assert_eq!(event.agent, None);
+
+    // A drifted generation never commits under a dead binding.
+    let stale = store.commit_observe_event(
+        Some(&agent),
+        Some(9),
+        eliot_core::ACTIVITY_HEAVY_KIND,
+        json!({}),
+        now,
+    );
+    assert_eq!(
+        stale.expect_err("drifted generation rejects").code,
+        "stale_generation"
+    );
+
+    let episode = HeavyEpisode {
+        category: "cargo build".to_owned(),
+        category_source: eliot_core::CATEGORY_SOURCE_CMDLINE.to_owned(),
+        started_at: now,
+        ended_at: now + 45_000,
+        end_source: "observed_exit".to_owned(),
+        duration_ms: 45_000,
+        cpu_ms: 65_000,
+        peak_rss_bytes: 10,
+        exit_code: Some(0),
+    };
+    assert!(episode.crosses(&eliot_core::HeavyThresholds::default()));
+    let committed = store
+        .commit_observe_event(
+            Some(&agent),
+            Some(1),
+            eliot_core::ACTIVITY_HEAVY_KIND,
+            episode.payload(),
+            now + 1,
+        )
+        .expect("commit episode");
+    assert_eq!(committed.agent.as_deref(), Some(agent.as_str()));
+
+    let rollup = store
+        .heavy_rollup(&agent, 1)
+        .expect("roll up")
+        .expect("one episode");
+    assert_eq!(rollup.episodes, 1);
+    assert_eq!(rollup.latest_category.as_deref(), Some("cargo build"));
+    assert_eq!(rollup.total_cpu_ms, 65_000);
+    assert!(
+        store
+            .heavy_rollup(&agent, 2)
+            .expect("empty generation")
+            .is_none()
+    );
+
+    let growth = store
+        .session_growth_view("codex", &agent, 1, &SessionGrowthThresholds::default())
+        .expect("growth view");
+    assert!(growth.is_none());
 }

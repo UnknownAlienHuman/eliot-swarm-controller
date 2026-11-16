@@ -275,6 +275,82 @@ fn io_error(action: &str, error: std::io::Error) -> Error {
     Error::new("platform_io", format!("{action}: {error}"))
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    struct Root(PathBuf);
+
+    impl Root {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("eliot-ipc-{}", ulid::Ulid::new())))
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn private_socket_supports_spaces_and_unicode_and_removes_only_its_inode() {
+        let root = Root::new();
+        let data = DataDir::open(root.0.join("space é")).expect("private Unicode root");
+        let lock = data.acquire_daemon_lock().expect("daemon lock");
+        let listener = IpcListener::bind(&data, &lock).await.expect("bind");
+        let socket = data.path().join("daemon.sock");
+        let metadata = std::fs::symlink_metadata(&socket).expect("socket exists");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), super::super::unix::effective_uid());
+        assert_eq!(
+            std::fs::metadata(data.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let client = IpcStream::connect(
+            listener.endpoint(),
+            Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("connect to Unicode endpoint");
+        drop(client);
+        std::fs::remove_file(&socket).expect("unlink original endpoint");
+        std::fs::write(&socket, b"replacement").expect("replace endpoint");
+        drop(listener);
+        assert_eq!(std::fs::read(&socket).unwrap(), b"replacement");
+    }
+
+    #[tokio::test]
+    async fn endpoint_refuses_files_and_reclaims_stale_owned_sockets() {
+        let root = Root::new();
+        let data = DataDir::open(&root.0).expect("private root");
+        let lock = data.acquire_daemon_lock().expect("daemon lock");
+        let socket = data.path().join("daemon.sock");
+        std::fs::write(&socket, b"keep").expect("existing file");
+        let error = IpcListener::bind(&data, &lock).await.err().unwrap();
+        assert_eq!(error.code, "unsafe_ipc_endpoint");
+        assert_eq!(std::fs::read(&socket).unwrap(), b"keep");
+        std::fs::remove_file(&socket).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("stale socket"));
+        let listener = IpcListener::bind(&data, &lock)
+            .await
+            .expect("reclaim stale");
+        drop(listener);
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn endpoint_limit_counts_utf8_bytes_before_binding() {
+        let root = Root::new();
+        let data = DataDir::open(root.0.join("é".repeat(40))).expect("private root");
+        let lock = data.acquire_daemon_lock().expect("daemon lock");
+        let error = IpcListener::bind(&data, &lock).await.err().unwrap();
+        assert_eq!(error.code, "invalid_endpoint");
+        assert!(!data.path().join("daemon.sock").exists());
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -376,7 +452,7 @@ mod tests {
         };
         assert_eq!(error.code, "unavailable");
         assert_eq!(
-            error.message,
+            error.message.as_str(),
             "daemon IPC connect deadline elapsed before any request was sent"
         );
     }

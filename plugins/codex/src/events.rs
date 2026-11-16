@@ -775,7 +775,7 @@ impl EventProcessor {
                             .await;
                     }
                     if self.status.failure.is_none() {
-                        self.status.failure = Some(error.message);
+                        self.status.failure = Some(*error.message);
                     }
                 }
             }
@@ -797,7 +797,7 @@ impl EventProcessor {
                         let _ = self.record_gap(&reason).await;
                     }
                     if self.status.failure.is_none() {
-                        self.status.failure = Some(error.message);
+                        self.status.failure = Some(*error.message);
                     }
                 }
             }
@@ -1274,7 +1274,7 @@ impl EventProcessor {
                         .await;
                 }
                 if self.status.failure.is_none() {
-                    self.status.failure = Some(error.message);
+                    self.status.failure = Some(*error.message);
                 }
                 return Err(Error::new(
                     "unknown",
@@ -1944,6 +1944,24 @@ impl EventProcessor {
             "native_status": turn_status(&notification.turn.status),
         });
         // The semantic hold signal gets first claim on the bounded terminal data.
+        if notification.turn.status == NativeTurnStatus::Failed {
+            let origin = notification
+                .turn
+                .error
+                .as_ref()
+                .map(|error| error.failure_origin())
+                .unwrap_or(eliot_core::FailureOrigin::Unknown);
+            let evidence = if origin == eliot_core::FailureOrigin::Provider {
+                "CodexErrorInfo reports structured upstream rate, quota, auth, model or HTTP failure"
+            } else if origin == eliot_core::FailureOrigin::Harness {
+                "native turn error without a structured upstream signal"
+            } else {
+                "native failed terminal omitted its error classification"
+            };
+            eliot_plugin::session::attach_failure_origin(
+                &mut data, "codex", origin, evidence, &secrets,
+            );
+        }
         if let Some(restriction) = provider_restriction {
             attach_provider_restriction(&mut data, restriction, &secrets);
         }
@@ -2221,7 +2239,7 @@ impl EventProcessor {
                     error.code
                 );
                 if state.failure.is_none() {
-                    state.failure = Some(error.message);
+                    state.failure = Some(*error.message);
                 }
                 (!state.gap_reported && !state.writes_blocked, reason)
             };
@@ -2347,7 +2365,7 @@ impl EventProcessor {
                     error.code
                 );
                 if state.failure.is_none() {
-                    state.failure = Some(error.message);
+                    state.failure = Some(*error.message);
                 }
                 (!state.gap_reported && !state.writes_blocked, reason)
             };
@@ -2638,7 +2656,7 @@ impl EventProcessor {
                             state.source_unknown = true;
                             let code = error.code.clone();
                             if state.failure.is_none() {
-                                state.failure = Some(error.message);
+                                state.failure = Some(*error.message);
                             }
                             (!state.gap_reported && !state.writes_blocked, code)
                         };
@@ -3273,6 +3291,7 @@ fn session_usage_from_token_usage(
         context_window_tokens: None,
         cumulative_tokens: None,
         cumulative_cost: None,
+        session_file_bytes: None,
         source: None,
         observed_at: None,
     });
@@ -3291,6 +3310,15 @@ fn session_usage_from_token_usage(
             && merged.cumulative_tokens.as_ref() != Some(&totals)
         {
             merged.cumulative_tokens = Some(totals);
+            changed = true;
+        }
+        // The cumulative per-thread `total` is the installed schema's only
+        // occupancy signal, so it projects to `context_used_tokens` against
+        // `modelContextWindow` (never derived into turn expenditure above).
+        if let Some(used) = counter(total.total_tokens)
+            && merged.context_used_tokens != Some(used)
+        {
+            merged.context_used_tokens = Some(used);
             changed = true;
         }
     }
@@ -3974,7 +4002,7 @@ mod tests {
     }
 
     #[test]
-    fn session_usage_from_token_usage_maps_cumulative_and_capacity_only() {
+    fn session_usage_from_token_usage_maps_cumulative_capacity_and_occupancy() {
         let body = NativeThreadTokenUsage {
             last: breakdown(Some(1), Some(1)),
             total: Some(NativeTokenUsageDelta {
@@ -3997,7 +4025,7 @@ mod tests {
         assert_eq!(totals.cache_read_tokens, Some(53));
         assert_eq!(totals.cache_write_tokens, Some(9));
         assert_eq!(merged.context_window_tokens, Some(200_000));
-        assert_eq!(merged.context_used_tokens, None);
+        assert_eq!(merged.context_used_tokens, Some(165));
         assert_eq!(merged.cumulative_cost, None);
         assert_eq!(
             merged.source.as_deref(),
@@ -4015,6 +4043,11 @@ mod tests {
         let resized = session_usage_from_token_usage(&window_only, Some(&merged))
             .expect("capacity change merges");
         assert_eq!(resized.context_window_tokens, Some(100_000));
+        assert_eq!(
+            resized.context_used_tokens,
+            Some(165),
+            "capacity update must keep the retained occupancy"
+        );
         assert_eq!(
             resized
                 .cumulative_tokens

@@ -32,8 +32,9 @@ use crate::native::{
         CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
         HookCallbackResponse, InitMcpServer, OutboundControlResponse, OutboundControlResponseBody,
         PermissionResult, ResultRecord, assistant_model, assistant_text, assistant_tool_use_count,
-        assistant_tool_use_ids, assistant_tool_uses, attach_mcp_readback, init_mcp_servers,
-        result_session_usage, result_usage, user_tool_results,
+        assistant_tool_use_ids, assistant_tool_uses, attach_mcp_readback, frame_context_window,
+        init_mcp_servers, result_session_usage, result_usage, transcript_bytes_in,
+        transcript_config_roots, user_tool_results,
     },
 };
 
@@ -584,11 +585,17 @@ struct EventProcessor {
     pending_fault_gap: Option<String>,
     final_text: Option<String>,
     final_text_unavailable: bool,
+    native_failure: Option<Error>,
     /// Proven MCP surface from the owned stream's `system`/`init` record
     /// (names plus statuses). Retained on observation and attached to the
     /// next turn terminal so the reducer merges it into the effective set;
     /// absent until the first post-input init arrives.
     init_mcp_servers: Option<Vec<InitMcpServer>>,
+    /// Model context window from the owned stream's `system`/`init` record
+    /// where the harness reports one. Retained on observation and merged
+    /// into the terminal session fact when the result frame carries none;
+    /// absent until observed, never guessed.
+    init_context_window: Option<i64>,
     closed: bool,
     native: Option<ClaudeClient>,
     status_tx: watch::Sender<EventStatus>,
@@ -1009,7 +1016,7 @@ async fn dispatch_control(
             if let Err(error) = processor.finish_hook_callback(&request_id, result).await {
                 processor.status.source_unknown = true;
                 if processor.status.failure.is_none() {
-                    processor.status.failure = Some(error.message);
+                    processor.status.failure = Some(*error.message);
                 }
             }
             publish(processor, status);
@@ -1103,7 +1110,9 @@ impl EventProcessor {
             pending_fault_gap: None,
             final_text: None,
             final_text_unavailable: false,
+            native_failure: None,
             init_mcp_servers: None,
+            init_context_window: None,
             closed: false,
             native: None,
             status_tx,
@@ -1389,7 +1398,7 @@ impl EventProcessor {
                         .await;
                 }
                 if self.status.failure.is_none() {
-                    self.status.failure = Some(error.message);
+                    self.status.failure = Some(*error.message);
                 }
                 return Err(Error::new(
                     "unknown",
@@ -1437,7 +1446,7 @@ impl EventProcessor {
         if let Err(error) = self.process_record(record).await {
             self.status.source_unknown = true;
             if self.status.failure.is_none() {
-                self.status.failure = Some(error.message);
+                self.status.failure = Some(*error.message);
             }
             return;
         }
@@ -1445,7 +1454,7 @@ impl EventProcessor {
         if let Err(error) = self.flush_buffer().await
             && self.status.failure.is_none()
         {
-            self.status.failure = Some(error.message);
+            self.status.failure = Some(*error.message);
         }
     }
 
@@ -1534,6 +1543,9 @@ impl EventProcessor {
     fn retain_init_mcp_servers(&mut self, record: &Value) {
         if record.get("subtype").and_then(Value::as_str) != Some("init") {
             return;
+        }
+        if let Some(window) = frame_context_window(record) {
+            self.init_context_window = Some(window);
         }
         let Some(servers) = init_mcp_servers(record) else {
             return;
@@ -1624,6 +1636,7 @@ impl EventProcessor {
                 }
                 self.status.active_command_id = Some(command_id.clone());
                 self.status.active_turn_id = Some(turn_id.clone());
+                self.native_failure = None;
                 self.final_text = None;
                 self.final_text_unavailable = false;
                 self.publish_now();
@@ -1638,7 +1651,7 @@ impl EventProcessor {
                     data["context_outcomes"] = json!(context_outcomes);
                 }
                 if let Err(error) = self.commit_event("turn.started", native_id, data).await {
-                    settle(outcome, TurnOutcome::Unknown(error.message.clone()));
+                    settle(outcome, TurnOutcome::Unknown((*error.message).clone()));
                     return Err(error);
                 }
                 settle(outcome, TurnOutcome::Associated);
@@ -1702,6 +1715,9 @@ impl EventProcessor {
                 .await;
         };
         if is_main_thread_assistant(record) {
+            if let Some(kind) = record.get("error").and_then(Value::as_str) {
+                self.native_failure = claude_api_failure(kind);
+            }
             self.bind_tool_uses(record, &turn_id);
             self.observe_tool_uses(record).await?;
         }
@@ -3183,6 +3199,22 @@ impl EventProcessor {
             "native_status": terminal_reason.clone(),
         });
         // Optional native main-loop turn usage: absent/malformed usage never
+        if outcome == "failure" {
+            let error = self.native_failure.take();
+            eliot_plugin::session::attach_failure_origin(
+                &mut data,
+                "claude",
+                error
+                    .as_ref()
+                    .and_then(|error| error.origin)
+                    .unwrap_or(eliot_core::FailureOrigin::Unknown),
+                error
+                    .as_ref()
+                    .and_then(|error| error.origin_evidence.as_deref())
+                    .unwrap_or("terminal reason lacks a structured assistant API error"),
+                &secrets,
+            );
+        }
         // blocks or gaps this terminal; it simply leaves `data.usage` unset.
         // Attaches before `attach_final_text` so the existing bounded
         // terminal-text accounting includes the usage bytes.
@@ -3194,12 +3226,30 @@ impl EventProcessor {
         // carries the readback into the effective set. Unobserved stays
         // unattached and the effective set stays unknown.
         attach_mcp_readback(&mut data, self.init_mcp_servers.as_deref());
-        // Optional session-scoped fact from the terminal record
-        // (`modelUsage` token counters plus `total_cost_usd`), held for the
-        // session fact that commits after the accepted terminal. Absent or
-        // unusable halves simply contribute nothing; with neither half there
+        // Optional session-scoped fact from the terminal record (occupancy
+        // sample from `usage`, cumulative `modelUsage` counters, cumulative
+        // `total_cost_usd`, model window where a frame reports one), held
+        // for the session fact that commits after the accepted terminal.
+        // The window prefers the terminal frame and falls back to the
+        // retained init value; the transcript file size comes from a
+        // read-only scan for the exact session filename (never a guessed
+        // slug). Absent quarters simply contribute nothing; with none there
         // is no session fact.
-        let session_usage = result_session_usage(record);
+        let mut session_usage = result_session_usage(record);
+        if let Some(usage) = session_usage.as_mut() {
+            if usage.context_window_tokens.is_none() {
+                usage.context_window_tokens = self.init_context_window;
+            }
+            let session_id = self.status.session_id.clone().unwrap_or_default();
+            if !session_id.is_empty() {
+                let roots = transcript_config_roots();
+                usage.session_file_bytes =
+                    tokio::task::spawn_blocking(move || transcript_bytes_in(&roots, &session_id))
+                        .await
+                        .ok()
+                        .flatten();
+            }
+        }
         let final_text = self.final_text.take();
         if self.final_text_unavailable {
             attach_final_text_unavailable(&mut data, &secrets);
@@ -3300,7 +3350,7 @@ impl EventProcessor {
         if let Err(error) = self.flush_buffer().await
             && self.status.failure.is_none()
         {
-            self.status.failure = Some(error.message);
+            self.status.failure = Some(*error.message);
         }
         if !self.gap_reported && !self.writes_blocked {
             let reason = self
@@ -3523,6 +3573,66 @@ fn assistant_prompt_id(record: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|id| !id.trim().is_empty())
         .map(ToOwned::to_owned)
+}
+
+/// SDKAssistantMessage.error enum, verified in the vendor stream-json/SDK
+/// reference on 2026-11-16. Free text and generic api_error are not evidence.
+fn claude_api_failure(kind: &str) -> Option<Error> {
+    use eliot_core::FailureOrigin;
+    let (origin, evidence) = match kind {
+        "authentication_failed" | "oauth_org_not_allowed" | "account_on_hold" => (
+            FailureOrigin::Provider,
+            "assistant.error upstream authentication refusal",
+        ),
+        "billing_error" => (
+            FailureOrigin::Provider,
+            "assistant.error upstream billing/quota refusal",
+        ),
+        "rate_limit" | "overloaded" => (
+            FailureOrigin::Provider,
+            "assistant.error upstream rate/capacity refusal",
+        ),
+        "model_not_found" => (
+            FailureOrigin::Provider,
+            "assistant.error upstream model refusal",
+        ),
+        "server_error" => (
+            FailureOrigin::Provider,
+            "assistant.error upstream server failure",
+        ),
+        "cloud_credential_error" => (
+            FailureOrigin::Environment,
+            "local AWS or Google credential acquisition failed before an upstream request",
+        ),
+        "invalid_request" | "max_output_tokens" => (
+            FailureOrigin::Harness,
+            "native refusal without structured upstream evidence",
+        ),
+        _ => return None,
+    };
+    Some(Error::new("native_failure", "native API failure").with_origin(origin, evidence))
+}
+
+#[cfg(test)]
+#[test]
+fn structured_claude_api_errors_classify_without_message_guessing() {
+    for kind in [
+        "rate_limit",
+        "billing_error",
+        "authentication_failed",
+        "model_not_found",
+        "server_error",
+    ] {
+        assert_eq!(
+            claude_api_failure(kind).unwrap().origin,
+            Some(eliot_core::FailureOrigin::Provider)
+        );
+    }
+    assert_eq!(
+        claude_api_failure("cloud_credential_error").unwrap().origin,
+        Some(eliot_core::FailureOrigin::Environment)
+    );
+    assert!(claude_api_failure("api_error provider quota text").is_none());
 }
 
 fn hook_deadline(deadline_ms: Option<u64>) -> Instant {

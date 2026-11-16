@@ -95,6 +95,16 @@ const METHODS: &[Method] = &[
         {}
     ),
     method!("daemon.shutdown", DaemonShutdownRequest, DaemonShutdownResponse, true, true, "Request drain or force shutdown; acknowledgement is not process-exit proof.", {"id":EXAMPLE_ID,"mode":"drain"}),
+    #[cfg(debug_assertions)]
+    method!(
+        "daemon.panic_test",
+        DaemonPanicTestRequest,
+        DaemonPanicTestResponse,
+        true,
+        false,
+        "Debug builds only: force a daemon panic to test crash capture (Owner).",
+        {}
+    ),
     method!(
         "maintenance.run",
         MaintenanceRunRequest,
@@ -121,16 +131,36 @@ const METHODS: &[Method] = &[
     ),
     method!("harness.models", HarnessModelsRequest, HarnessModelsResponse, true, false, "Read a harness native model catalogue (read-only).", {"harness":"codex"}),
     method!("harness.quota", HarnessQuotaRequest, HarnessQuotaResponse, true, false, "Read provider-supported account quota when supported.", {"harness":"codex"}),
+    method!("models.catalog", ModelsCatalogRequest, ModelsCatalogResponse, true, false, "Search one unified model catalogue across every installed harness (read-only).", {"query":"luna"}),
     method!("agent.history", AgentHistoryRequest, ObservationPage, true, false, "Read a bounded native history view advertised by agent.get.", {"id":"a1","source":"native","view":"turns","limit":20}),
     method!("agent.list", AgentListRequest, AgentListResponse, false, false, "List scoped compact Agent summaries with filters and counts.", {"limit":20,"state":"busy"}),
     method!("agent.result", AgentResultRequest, AgentResultResponse, false, false, "Read retained turns/results for one Agent.", {"id":"a1","limit":20}),
     method!("agent.processes", AgentProcessesRequest, AgentProcessesResponse, false, false, "Read bounded process observations for one Agent.", {"id":"a1"}),
     method!("agent.stats", AgentStatsRequest, AgentStatsResponse, false, false, "Read sampled Agent statistics with freshness metadata.", {"id":"a1"}),
+    method!(
+        "observe.heavy",
+        ObserveHeavyRequest,
+        ObserveHeavyResponse,
+        false,
+        false,
+        "Read the windowed heavy-work episode rollup per Agent generation.",
+        {}
+    ),
+    method!(
+        "harness.doctor",
+        HarnessDoctorRequest,
+        HarnessDoctorResponse,
+        true,
+        false,
+        "Read installed-vs-verified harness versions and contract markers without launching.",
+        {}
+    ),
     method!("usage.summary", UsageSummaryRequest, UsageSummaryResponse, false, false, "Read bounded usage totals over one Agent, project or tree scope.", {"agent":"a1"}),
     method!("agent.git", AgentGitRequest, AgentGitResponse, false, false, "Read Git observations for one Agent's workspace.", {"id":"a1"}),
     method!("agent.edits", AgentEditsRequest, AgentEditsResponse, false, false, "Read a bounded page of observed workspace edits.", {"id":"a1","limit":20}),
     method!("turn.get", TurnGetRequest, Turn, false, false, "Read one exact Agent/generation/turn binding.", {"agent":"a1","generation":1,"turn_id":"turn-1"}),
     method!("turn.resolve", TurnResolveRequest, TurnResolveResponse, true, true, "Record an owner resolution for one uncertain exact turn.", {"id":EXAMPLE_ID,"agent":"a1","generation":1,"turn_id":"turn-1","status":"completed","reason":"Owner verified completion."}),
+    method!("diagnose", DiagnoseRequest, DiagnoseResponse, true, false, "Explain a failed command, Agent or agent:turn: origin, where, exits, stderr tail (Owner).", {"target":"a1"}),
     method!(
         "events.bounds",
         EventsBoundsRequest,

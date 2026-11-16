@@ -74,6 +74,11 @@ pub(crate) enum CliCommand {
     /// List installed harness executables with versions. Starts no model
     /// turn and performs no inference.
     Harnesses,
+    /// Read the per-harness installed-vs-verified drift report. Read-only;
+    /// starts no model turn and performs no inference.
+    Doctor,
+    /// Read heavy child-process episodes with per-Agent totals over a window.
+    Heavy(HeavyArgs),
     /// Read a harness native model catalogue through its own read-only
     /// method. Starts no model turn and performs no inference.
     Models(ModelsArgs),
@@ -136,6 +141,8 @@ pub(crate) enum CliCommand {
     Cmd(CmdArgs),
     /// Resolve an unknown turn with an exact owner assertion.
     Turn(TurnArgs),
+    /// Explain why and where a command, Agent or turn failed (owner only).
+    Why(WhyArgs),
     /// Read committed events after a sequence number.
     Events(EventsArgs),
     /// Wait for a frozen set of child commands/turns with all/any semantics.
@@ -252,13 +259,24 @@ pub(crate) struct DiscoverArgs {
 
 #[derive(Args)]
 pub(crate) struct ModelsArgs {
-    /// Harness code: codex|claude|muse|opencode|antigravity.
+    /// Harness code: codex|claude|muse|opencode|antigravity. Omitted lists
+    /// every harness through the unified catalogue.
     #[arg(long, value_name = "HARNESS")]
-    pub(crate) harness: String,
+    pub(crate) harness: Option<String>,
     /// Optional named profile selecting the native route/account. Omitted
-    /// means ad-hoc daemon defaults for the harness.
+    /// means ad-hoc daemon defaults for the harness. Only with --harness.
     #[arg(long, value_name = "PROFILE")]
     pub(crate) profile: Option<String>,
+    /// Case-insensitive filter over model id, display name, provider and
+    /// harness. Only without --harness (unified catalogue).
+    #[arg(long, value_name = "QUERY")]
+    pub(crate) query: Option<String>,
+    /// Continue after the last `harness:id` cursor. Only without --harness.
+    #[arg(long, value_name = "CURSOR")]
+    pub(crate) after: Option<String>,
+    /// Catalogue page size. Only without --harness.
+    #[arg(long, value_name = "LIMIT")]
+    pub(crate) limit: Option<usize>,
 }
 
 #[derive(Args)]
@@ -318,6 +336,11 @@ pub(crate) struct LaunchArgs {
     /// that id. Requires --harness.
     #[arg(long, value_name = "INTEGRATION")]
     pub(crate) auth: Option<String>,
+    /// Ad-hoc access level: ask routes approvals to the Owner, auto uses the
+    /// harness safe automatic posture, full selects full-access. Requires
+    /// --harness.
+    #[arg(long, value_name = "LEVEL", value_parser = ["ask", "auto", "full"])]
+    pub(crate) access: Option<String>,
     /// Explicit native executable, overriding discovery (e.g. to pin the
     /// Muse binary version the launcher marks current). Requires --harness.
     #[arg(long, value_name = "PATH")]
@@ -517,6 +540,17 @@ pub(crate) struct StatsArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct HeavyArgs {
+    #[arg(long, value_name = "AGENT")]
+    pub(crate) agent: Option<String>,
+    #[command(flatten)]
+    pub(crate) generation: ReadGenerationArgs,
+    /// Window in seconds; defaults to 3600.
+    #[arg(long, value_name = "SECS")]
+    pub(crate) window_secs: Option<u64>,
+}
+
+#[derive(Args)]
 pub(crate) struct UsageArgs {
     #[arg(
         long,
@@ -643,6 +677,12 @@ pub(crate) struct TurnArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct WhyArgs {
+    /// Command id, Agent id, or Agent id with turn id as agent:turn.
+    pub(crate) target: String,
+}
+
+#[derive(Args)]
 pub(crate) struct EventsArgs {
     #[arg(long, value_name = "SEQ")]
     pub(crate) since: Option<i64>,
@@ -690,6 +730,8 @@ pub(crate) struct SwitchArgs {
     pub(crate) auth: Option<String>,
     #[arg(long, requires = "harness")]
     pub(crate) cmd: Option<String>,
+    #[arg(long, requires = "harness", value_parser = ["ask", "auto", "full"])]
+    pub(crate) access: Option<String>,
     /// Omitted uses A's retained workspace; normal launch workspace checks apply.
     #[arg(long)]
     pub(crate) workspace: Option<String>,
@@ -1317,10 +1359,17 @@ mod tests {
     #[test]
     fn models_and_quota_cli_scope_catalog_and_quota_by_profile() {
         let cli = Cli::try_parse_from(["swarm", "models", "--harness", "codex"]).unwrap();
-        let Some(CliCommand::Models(ModelsArgs { harness, profile })) = cli.command else {
+        let Some(CliCommand::Models(ModelsArgs {
+            harness,
+            profile,
+            query: _,
+            after: _,
+            limit: _,
+        })) = cli.command
+        else {
             panic!("models command required");
         };
-        assert_eq!(harness, "codex");
+        assert_eq!(harness.as_deref(), Some("codex"));
         assert_eq!(profile, None);
         let cli = Cli::try_parse_from([
             "swarm",
@@ -1331,10 +1380,17 @@ mod tests {
             "codex-main",
         ])
         .unwrap();
-        let Some(CliCommand::Models(ModelsArgs { harness, profile })) = cli.command else {
+        let Some(CliCommand::Models(ModelsArgs {
+            harness,
+            profile,
+            query: _,
+            after: _,
+            limit: _,
+        })) = cli.command
+        else {
             panic!("models command required");
         };
-        assert_eq!(harness, "codex");
+        assert_eq!(harness.as_deref(), Some("codex"));
         assert_eq!(profile.as_deref(), Some("codex-main"));
         let cli = Cli::try_parse_from(["swarm", "quota", "--harness", "muse"]).unwrap();
         let Some(CliCommand::Quota(QuotaArgs { harness, profile })) = cli.command else {
@@ -1343,6 +1399,68 @@ mod tests {
         assert_eq!(harness, "muse");
         assert_eq!(profile, None);
         assert!(Cli::try_parse_from(["swarm", "quota"]).is_err());
+    }
+
+    #[test]
+    fn models_catalog_cli_accepts_query_without_harness() {
+        let cli = Cli::try_parse_from(["swarm", "models", "--query", "luna"]).unwrap();
+        let Some(CliCommand::Models(ModelsArgs {
+            harness,
+            profile,
+            query,
+            after,
+            limit,
+        })) = cli.command
+        else {
+            panic!("models command required");
+        };
+        assert_eq!(harness, None);
+        assert_eq!(profile, None);
+        assert_eq!(query.as_deref(), Some("luna"));
+        assert_eq!(after, None);
+        assert_eq!(limit, None);
+        assert!(Cli::try_parse_from(["swarm", "models"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["swarm", "models", "--harness", "codex", "--query", "luna"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn launch_cli_accepts_access_with_harness() {
+        let cli = Cli::try_parse_from([
+            "swarm",
+            "launch",
+            "--harness",
+            "codex",
+            "--model",
+            "gpt-6-luna",
+            "--effort",
+            "low",
+            "--access",
+            "full",
+            "--workspace",
+            ".",
+            "hello",
+        ])
+        .unwrap();
+        let Some(CliCommand::Launch(args)) = cli.command else {
+            panic!("launch required");
+        };
+        assert_eq!(args.access.as_deref(), Some("full"));
+        assert!(
+            Cli::try_parse_from([
+                "swarm",
+                "launch",
+                "--harness",
+                "codex",
+                "--access",
+                "sometimes",
+                "--workspace",
+                ".",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

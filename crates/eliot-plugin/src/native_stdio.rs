@@ -262,7 +262,7 @@ impl<C: NativeStdioConfig> StdioClient<C> {
     }
 
     pub fn diagnostic_error(&self, mut error: Error) -> Error {
-        error.message = self.policy.redact_text(&error.message);
+        error.message = self.policy.redact_text(&error.message).into();
         error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
     }
 
@@ -275,6 +275,9 @@ impl<C: NativeStdioConfig> StdioClient<C> {
         }
 
         let id = self.pending.mint_id()?;
+        // Envelope IDs are our own routing metadata (turn/command/agent),
+        // extracted before the params move into the frame. Never content.
+        let envelope = crate::debug::envelope_ids(&params);
         let encoded = encode_frame(
             C::SERVER,
             &OutboundRequest {
@@ -308,7 +311,8 @@ impl<C: NativeStdioConfig> StdioClient<C> {
                 format!("{} response router closed before dispatch", C::SHORT),
             ));
         }
-        let (_guard, response_rx) = self.pending.insert(id);
+        let request_bytes = encoded.len();
+        let (_guard, response_rx) = self.pending.insert(id, method, request_bytes);
         if let Err(error) = self.write_encoded(encoded, deadline).await {
             if error.code == "native_not_dispatched" {
                 return Err(error);
@@ -317,6 +321,22 @@ impl<C: NativeStdioConfig> StdioClient<C> {
                 "unknown",
                 format!("{} {method} dispatch outcome is unknown", C::SHORT),
             ));
+        }
+        // One metadata-only debug record per native request: method,
+        // direction, size and envelope IDs. The correlated reply is recorded
+        // at routing with both sizes and latency. Never frame content.
+        {
+            let mut refs: Vec<(&str, &str)> = Vec::with_capacity(2 + envelope.len());
+            refs.push(("method", method));
+            refs.push(("direction", "out"));
+            for (key, value) in &envelope {
+                refs.push((*key, value.as_str()));
+            }
+            crate::debug::record(
+                "plugin.frame",
+                &refs,
+                &[("request_bytes", request_bytes.min(u64::MAX as usize) as u64)],
+            );
         }
         timeout_at(deadline, response_rx)
             .await
@@ -346,6 +366,10 @@ impl<C: NativeStdioConfig> StdioClient<C> {
                 format!("{} notification has invalid method or params", C::SERVER),
             ));
         }
+        let envelope = params
+            .as_ref()
+            .map(crate::debug::envelope_ids)
+            .unwrap_or_default();
         let encoded = encode_frame(
             C::SERVER,
             &OutboundNotification {
@@ -354,6 +378,20 @@ impl<C: NativeStdioConfig> StdioClient<C> {
                 params,
             },
         )?;
+        {
+            let request_bytes = encoded.len();
+            let mut refs: Vec<(&str, &str)> = Vec::with_capacity(2 + envelope.len());
+            refs.push(("method", method));
+            refs.push(("direction", "out"));
+            for (key, value) in &envelope {
+                refs.push((*key, value.as_str()));
+            }
+            crate::debug::record(
+                "plugin.frame",
+                &refs,
+                &[("request_bytes", request_bytes.min(u64::MAX as usize) as u64)],
+            );
+        }
         self.write_encoded(encoded, deadline).await
     }
 

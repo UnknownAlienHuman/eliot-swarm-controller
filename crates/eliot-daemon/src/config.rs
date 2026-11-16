@@ -199,6 +199,22 @@ struct DesktopWindow {
     height: u32,
 }
 
+/// One desktop model favorite or recent entry.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DesktopModelRef {
+    #[serde(default)]
+    harness: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    effort: Option<String>,
+}
+
+/// Bounded desktop preferences for the new-task picker: favorite models,
+/// recent models (most recent first), collapsed projects and the last used
+/// access level. Stored in the unified `[desktop]` section via the existing
+/// settings writer.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct DesktopSettings {
@@ -208,7 +224,20 @@ struct DesktopSettings {
     window: Option<DesktopWindow>,
     #[serde(default)]
     startup: DesktopStartup,
+    #[serde(default)]
+    favorite_models: Vec<DesktopModelRef>,
+    #[serde(default)]
+    recent_models: Vec<DesktopModelRef>,
+    #[serde(default)]
+    collapsed_projects: Vec<String>,
+    #[serde(default)]
+    last_access: Option<String>,
 }
+
+/// Bounds for the `[desktop]` picker lists.
+const MAX_DESKTOP_FAVORITES: usize = 50;
+const MAX_DESKTOP_RECENTS: usize = 20;
+const MAX_DESKTOP_COLLAPSED: usize = 100;
 
 impl DesktopSettings {
     fn validate(&self) -> core::Result<()> {
@@ -220,6 +249,78 @@ impl DesktopSettings {
             return Err(core::Error::new(
                 "profile_error",
                 "config.toml: desktop window must be at least 640 by 480",
+            ));
+        }
+        if self.favorite_models.len() > MAX_DESKTOP_FAVORITES {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: desktop favorite_models exceeds 50 entries",
+            ));
+        }
+        if self.recent_models.len() > MAX_DESKTOP_RECENTS {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: desktop recent_models exceeds 20 entries",
+            ));
+        }
+        if self.collapsed_projects.len() > MAX_DESKTOP_COLLAPSED {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: desktop collapsed_projects exceeds 100 entries",
+            ));
+        }
+        for entry in self.favorite_models.iter().chain(self.recent_models.iter()) {
+            let harness = entry.harness.as_str();
+            if !matches!(
+                harness,
+                "codex" | "claude" | "muse" | "opencode" | "antigravity"
+            ) {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: desktop model harness must be codex, claude, muse, opencode or antigravity",
+                ));
+            }
+            let model = entry.model.as_str();
+            if model.is_empty()
+                || model.len() > 256
+                || model.chars().any(char::is_control)
+                || model != model.trim()
+            {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: desktop model must be 1-256 bytes with no controls or surrounding whitespace",
+                ));
+            }
+            if let Some(effort) = entry.effort.as_deref()
+                && (effort.is_empty()
+                    || effort.len() > 128
+                    || effort.chars().any(char::is_control)
+                    || effort != effort.trim())
+            {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: desktop model effort must be 1-128 characters with no controls",
+                ));
+            }
+        }
+        for project in &self.collapsed_projects {
+            if project.is_empty()
+                || project.len() > 256
+                || project.chars().any(char::is_control)
+                || project != project.trim()
+            {
+                return Err(core::Error::new(
+                    "profile_error",
+                    "config.toml: desktop collapsed_projects entries must be 1-256 characters with no controls",
+                ));
+            }
+        }
+        if let Some(access) = self.last_access.as_deref()
+            && !matches!(access, "ask" | "auto" | "full")
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: desktop last_access must be ask, auto or full",
             ));
         }
         Ok(())
@@ -441,6 +542,12 @@ fn default_max_unread_messages_per_agent() -> i64 {
 pub(crate) struct DaemonConfig {
     #[serde(default)]
     pub(crate) retention: RetentionConfig,
+    /// Daemon log verbosity: `standard` (working mode) or `debug`
+    /// (everything mode). Hot-reloadable through `settings.save`; changing
+    /// only this key never requires a restart. See
+    /// docs/spec/configuration.md: daemon logging.
+    #[serde(default = "default_log_level")]
+    pub(crate) log_level: String,
     /// Hierarchy fanout bounds consumed by launch/selector admission. See
     /// docs/spec/configuration.md: daemon limits. Deserialized directly as
     /// the core type: unlike retention windows these always apply, so an
@@ -451,20 +558,67 @@ pub(crate) struct DaemonConfig {
     /// docs/spec/monitoring.md; this is advisory and never infers agent death.
     #[serde(default = "default_attention_suspicion_secs")]
     pub(crate) attention_suspicion_secs: i64,
+    /// Heavy-episode thresholds for one `activity.heavy` event: a child
+    /// process tree whose wall time, consumed CPU or peak RSS crosses any one
+    /// threshold. See docs/spec/monitoring.md; defaults tune from real data.
+    #[serde(default = "default_heavy_wall_secs")]
+    pub(crate) heavy_wall_secs: i64,
+    #[serde(default = "default_heavy_cpu_secs")]
+    pub(crate) heavy_cpu_secs: i64,
+    #[serde(default = "default_heavy_rss_bytes")]
+    pub(crate) heavy_rss_bytes: i64,
+    /// Context occupancy that warns, in thousandths (800 is 0.8). Integer
+    /// for TOML simplicity; validated to the (0, 1000] range.
+    #[serde(default = "default_session_growth_ratio_permille")]
+    pub(crate) session_growth_ratio_permille: i64,
+    /// Native session file size that warns, in bytes, where the harness
+    /// exposes a documented size source.
+    #[serde(default = "default_session_file_bytes")]
+    pub(crate) session_file_bytes: i64,
+}
+
+fn default_log_level() -> String {
+    "standard".to_owned()
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             retention: RetentionConfig::default(),
+            log_level: default_log_level(),
             limits: core::api::HierarchyLimits::default(),
             attention_suspicion_secs: default_attention_suspicion_secs(),
+            heavy_wall_secs: default_heavy_wall_secs(),
+            heavy_cpu_secs: default_heavy_cpu_secs(),
+            heavy_rss_bytes: default_heavy_rss_bytes(),
+            session_growth_ratio_permille: default_session_growth_ratio_permille(),
+            session_file_bytes: default_session_file_bytes(),
         }
     }
 }
 
 fn default_attention_suspicion_secs() -> i64 {
     15 * 60
+}
+
+fn default_heavy_wall_secs() -> i64 {
+    core::DEFAULT_HEAVY_WALL_SECS as i64
+}
+
+fn default_heavy_cpu_secs() -> i64 {
+    core::DEFAULT_HEAVY_CPU_SECS as i64
+}
+
+fn default_heavy_rss_bytes() -> i64 {
+    core::DEFAULT_HEAVY_RSS_BYTES as i64
+}
+
+fn default_session_growth_ratio_permille() -> i64 {
+    (core::DEFAULT_SESSION_GROWTH_RATIO * 1000.0) as i64
+}
+
+fn default_session_file_bytes() -> i64 {
+    core::DEFAULT_SESSION_FILE_BYTES as i64
 }
 
 impl DaemonConfig {
@@ -478,11 +632,92 @@ impl DaemonConfig {
                 "config.toml: daemon.attention_suspicion_secs must be a positive integer whose millisecond value fits in i64",
             ));
         }
+        // Parse here so an invalid level is a config error, not a silent
+        // fallback. The live value is applied at startup and on every
+        // `settings.save` through `crate::logging`.
+        crate::logging::LogLevel::parse(&self.log_level)?;
+        if self.heavy_wall_secs <= 0 || self.heavy_wall_secs > 31_536_000 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.heavy_wall_secs must be a positive integer within one year",
+            ));
+        }
+        if self.heavy_cpu_secs <= 0 || self.heavy_cpu_secs > 31_536_000 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.heavy_cpu_secs must be a positive integer within one year",
+            ));
+        }
+        if self.heavy_rss_bytes <= 0 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.heavy_rss_bytes must be a positive integer",
+            ));
+        }
+        if self.session_growth_ratio_permille <= 0 || self.session_growth_ratio_permille > 1000 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.session_growth_ratio_permille must be within (0, 1000]",
+            ));
+        }
+        if self.session_file_bytes <= 0 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.session_file_bytes must be a positive integer",
+            ));
+        }
         Ok(Self {
             retention: self.retention.validate()?,
             limits: self.limits,
             attention_suspicion_secs: self.attention_suspicion_secs,
+            log_level: self.log_level,
+            heavy_wall_secs: self.heavy_wall_secs,
+            heavy_cpu_secs: self.heavy_cpu_secs,
+            heavy_rss_bytes: self.heavy_rss_bytes,
+            session_growth_ratio_permille: self.session_growth_ratio_permille,
+            session_file_bytes: self.session_file_bytes,
         })
+    }
+
+    pub(crate) fn heavy_thresholds(&self) -> core::Result<core::HeavyThresholds> {
+        let thresholds = core::HeavyThresholds {
+            wall_secs: u64::try_from(self.heavy_wall_secs).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe heavy wall threshold is out of range",
+                )
+            })?,
+            cpu_secs: u64::try_from(self.heavy_cpu_secs).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe heavy CPU threshold is out of range",
+                )
+            })?,
+            rss_bytes: u64::try_from(self.heavy_rss_bytes).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe heavy RSS threshold is out of range",
+                )
+            })?,
+        };
+        thresholds.validate()?;
+        Ok(thresholds)
+    }
+
+    pub(crate) fn session_growth_thresholds(&self) -> core::Result<core::SessionGrowthThresholds> {
+        let thresholds = core::SessionGrowthThresholds {
+            context_ratio: f64::from(
+                i32::try_from(self.session_growth_ratio_permille).unwrap_or(1000),
+            ) / 1000.0,
+            file_bytes: u64::try_from(self.session_file_bytes).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe session file threshold is out of range",
+                )
+            })?,
+        };
+        thresholds.validate()?;
+        Ok(thresholds)
     }
 }
 
@@ -3378,6 +3613,12 @@ mod tests {
                 },
                 limits: core::api::HierarchyLimits::default(),
                 attention_suspicion_secs: 15 * 60,
+                log_level: default_log_level(),
+                heavy_wall_secs: default_heavy_wall_secs(),
+                heavy_cpu_secs: default_heavy_cpu_secs(),
+                heavy_rss_bytes: default_heavy_rss_bytes(),
+                session_growth_ratio_permille: default_session_growth_ratio_permille(),
+                session_file_bytes: default_session_file_bytes(),
             }
         );
 
@@ -3392,8 +3633,37 @@ mod tests {
                 },
                 limits: core::api::HierarchyLimits::default(),
                 attention_suspicion_secs: 15 * 60,
+                log_level: default_log_level(),
+                heavy_wall_secs: default_heavy_wall_secs(),
+                heavy_cpu_secs: default_heavy_cpu_secs(),
+                heavy_rss_bytes: default_heavy_rss_bytes(),
+                session_growth_ratio_permille: default_session_growth_ratio_permille(),
+                session_file_bytes: default_session_file_bytes(),
             }
         );
+    }
+
+    #[test]
+    fn daemon_log_level_defaults_parses_and_rejects() {
+        let fixture = AutomationConfigFixture::new();
+        assert_eq!(DaemonConfig::default().log_level, "standard");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap().log_level,
+            "standard"
+        );
+        fixture.write("[daemon]\nlog_level = \"debug\"\n");
+        assert_eq!(
+            load_daemon_config(&fixture.root).unwrap().log_level,
+            "debug"
+        );
+        for source in [
+            "[daemon]\nlog_level = \"verbose\"\n",
+            "[daemon]\nlog_level = 1\n",
+        ] {
+            fixture.write(source);
+            let error = load_daemon_config(&fixture.root).unwrap_err();
+            assert_eq!(error.code, "profile_error", "source: {source}");
+        }
     }
 
     #[test]
@@ -4997,5 +5267,124 @@ output_limit = 4096
                 .message
                 .contains("unsupported configuration field")
         );
+    }
+
+    fn desktop_settings(source: &str) -> DesktopSettings {
+        let config: FileConfig = toml::from_str(source).expect("valid TOML");
+        config.desktop
+    }
+
+    #[test]
+    fn desktop_picker_rejects_raw_whitespace_controls_and_oversize_strings() {
+        for list in ["favorite_models", "recent_models"] {
+            for (field, value) in [
+                ("harness", " codex".to_owned()),
+                ("harness", "codex\n".to_owned()),
+                ("harness", format!("{}codex", " ".repeat(300))),
+                ("model", " m".to_owned()),
+                ("model", "m\t".to_owned()),
+                ("model", format!("m{}", " ".repeat(256))),
+                ("model", "é".repeat(129)),
+                ("effort", "low ".to_owned()),
+            ] {
+                let mut entry = DesktopModelRef {
+                    harness: "codex".to_owned(),
+                    model: "m".to_owned(),
+                    effort: None,
+                };
+                match field {
+                    "harness" => entry.harness = value,
+                    "model" => entry.model = value,
+                    _ => entry.effort = Some(value),
+                }
+                let settings = if list == "favorite_models" {
+                    DesktopSettings {
+                        favorite_models: vec![entry],
+                        ..Default::default()
+                    }
+                } else {
+                    DesktopSettings {
+                        recent_models: vec![entry],
+                        ..Default::default()
+                    }
+                };
+                assert_eq!(
+                    settings.validate().unwrap_err().code,
+                    "profile_error",
+                    "{list} {field}"
+                );
+            }
+        }
+        for access in [" ask", "full\n", "auto "] {
+            assert!(
+                DesktopSettings {
+                    last_access: Some(access.to_owned()),
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            DesktopSettings {
+                collapsed_projects: vec![" app".to_owned()],
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn desktop_picker_lists_validate_bounds_and_harness() {
+        desktop_settings("[desktop]\n").validate().unwrap();
+        let valid = desktop_settings(
+            "[desktop]\nfavorite_models = [{harness = 'codex', model = 'gpt-6-luna', effort = 'low'}]\nrecent_models = [{harness = 'opencode', model = 'opencode/deepseek-v4.1-flash-free'}]\ncollapsed_projects = ['app']\nlast_access = 'auto'\n",
+        );
+        valid.validate().unwrap();
+        let too_many_favorites = DesktopSettings {
+            favorite_models: vec![
+                DesktopModelRef {
+                    harness: "codex".to_owned(),
+                    model: "m".to_owned(),
+                    effort: None,
+                };
+                MAX_DESKTOP_FAVORITES + 1
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            too_many_favorites.validate().unwrap_err().code,
+            "profile_error"
+        );
+        let too_many_recents = DesktopSettings {
+            recent_models: vec![
+                DesktopModelRef {
+                    harness: "codex".to_owned(),
+                    model: "m".to_owned(),
+                    effort: None,
+                };
+                MAX_DESKTOP_RECENTS + 1
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            too_many_recents.validate().unwrap_err().code,
+            "profile_error"
+        );
+        let bad_harness = DesktopSettings {
+            favorite_models: vec![DesktopModelRef {
+                harness: "fake".to_owned(),
+                model: "m".to_owned(),
+                effort: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(bad_harness.validate().unwrap_err().code, "profile_error");
+        let bad_access = DesktopSettings {
+            last_access: Some("sometimes".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(bad_access.validate().unwrap_err().code, "profile_error");
     }
 }

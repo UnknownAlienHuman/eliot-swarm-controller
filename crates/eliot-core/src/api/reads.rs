@@ -578,6 +578,7 @@ mod tests {
             usage: None,
             config_revision: 0,
             config: None,
+            preceded_by: None,
         };
         serde_json::to_value(AgentResultResponse {
             agent: "a1".to_owned(),

@@ -104,6 +104,65 @@ impl Store {
         })
     }
 
+    /// Commit one daemon-observed diagnostic event (`activity.heavy`,
+    /// `session.growth`, `harness.drift`) with optional Agent/generation
+    /// binding, in a single transaction. Kinds are closed: anything else
+    /// rejects as invalid so no new surface can smuggle one in. A bound
+    /// generation must equal the Agent's current generation; drifted evidence
+    /// rejects with `stale_generation` instead of committing under a dead
+    /// binding. Targetless drift carries neither agent nor generation.
+    /// Returns the committed event for bus publication.
+    pub fn commit_observe_event(
+        &mut self,
+        agent: Option<&str>,
+        generation: Option<i64>,
+        kind: &str,
+        data: Value,
+        now: i64,
+    ) -> Result<Event> {
+        if !matches!(
+            kind,
+            core::ACTIVITY_HEAVY_KIND | core::SESSION_GROWTH_KIND | core::HARNESS_DRIFT_KIND
+        ) {
+            return Err(Error::new("invalid", "unknown observe event kind"));
+        }
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let (agent_num, generation) = match (agent, generation) {
+                (Some(id), Some(bound)) => {
+                    let num = core::parse_agent_id(id)?;
+                    let current = load_agent_by_num(&tx, num)?.ok_or_else(|| {
+                        Error::new("not_found", "observe event Agent was not found")
+                    })?;
+                    if current.generation != bound {
+                        return Err(Error::new(
+                            "stale_generation",
+                            "observe event generation is no longer current",
+                        ));
+                    }
+                    (Some(num), Some(bound))
+                }
+                (None, None) => (None, None),
+                _ => {
+                    return Err(Error::new(
+                        "invalid",
+                        "observe event needs both agent and generation or neither",
+                    ));
+                }
+            };
+            let event =
+                insert_daemon_event(&tx, now, kind, "observe", agent_num, generation, data)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(event)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Commit one local `notify`/`emit` user event together with its Applied
     /// settlement in a single transaction: validate the Dispatched command
     /// and its verb/kind, insert the bounded `x.user.*` event, record
@@ -1228,12 +1287,15 @@ fn validate_control_applied_outcome(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn transition_lost_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
     generation: i64,
     now: i64,
     reason: &str,
+    exit: Option<&eliot_core::ProcessExit>,
+    stderr_tail: Option<&str>,
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let Some(agent) = load_agent_by_num(tx, agent_num)? else {
@@ -1305,6 +1367,18 @@ pub(super) fn transition_lost_tx(
          WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",
         params![now, agent_num, generation],
     ));
+    let mut data = json!({"agent_id": agent.id, "reason": reason});
+    if let Some(exit) = exit.filter(|exit| !exit.is_empty()) {
+        if let Some(exit_code) = exit.exit_code {
+            data["exit_code"] = json!(exit_code);
+        }
+        if let Some(ntstatus) = exit.ntstatus.as_deref() {
+            data["ntstatus"] = json!(ntstatus);
+        }
+    }
+    if let Some(tail) = stderr_tail.filter(|tail| !tail.trim().is_empty()) {
+        data["stderr_tail"] = json!(tail);
+    }
     events.push(insert_daemon_event(
         tx,
         now,
@@ -1312,7 +1386,7 @@ pub(super) fn transition_lost_tx(
         "agent",
         Some(agent_num),
         Some(generation),
-        json!({"agent_id": agent.id, "reason": reason}),
+        data,
     )?);
     Ok(())
 }
@@ -1350,6 +1424,7 @@ fn mark_lost_turn_unknown_tx(
                     completed_at: Some(now),
                     usage: None,
                     config_revision: current_config_revision_tx(tx, agent_num, generation)?,
+                    preceded_by: None,
                 },
             )?;
         }
@@ -1406,6 +1481,25 @@ fn fail_start_tx(
          WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",
         params![now, agent_num, generation],
     ));
+    // The failed command's outcome is the process evidence: a recorded
+    // harness exit (exit_code/NTSTATUS) rides from the outcome into the
+    // `agent.failed` event. The outcome's own stderr tails stay on the
+    // command outcome that `swarm why` already correlates.
+    let mut data = json!({"agent_id": agent.id, "command_id": command_id, "reason": reason});
+    if let Some(record) = super::load_command_record(tx, command_id)?
+        && let Some(outcome) = record.command.outcome
+    {
+        if let Some(exit_code) = outcome.get("exit_code").and_then(Value::as_i64) {
+            data["exit_code"] = json!(exit_code);
+        }
+        if let Some(ntstatus) = outcome
+            .get("ntstatus")
+            .and_then(Value::as_str)
+            .filter(|ntstatus| !ntstatus.is_empty())
+        {
+            data["ntstatus"] = json!(ntstatus.chars().take(16).collect::<String>());
+        }
+    }
     events.push(insert_daemon_event_for_command(
         tx,
         command_id,
@@ -1415,7 +1509,7 @@ fn fail_start_tx(
             "agent",
             Some(agent_num),
             Some(generation),
-            json!({"agent_id": agent.id, "command_id": command_id, "reason": reason}),
+            data,
         ),
     )?);
     Ok(())

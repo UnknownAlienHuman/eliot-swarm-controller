@@ -100,7 +100,15 @@ fn section_json(source: &str, name: &str) -> core::Result<JsonValue> {
     let Some(value) = parsed.get(name) else {
         return Ok(match name {
             "routing" => serde_json::json!({"default": []}),
-            "desktop" => serde_json::json!({"theme": "system", "window": null}),
+            "desktop" => serde_json::json!({
+                "theme": "system",
+                "window": null,
+                "startup": "new_task",
+                "favorite_models": [],
+                "recent_models": [],
+                "collapsed_projects": [],
+                "last_access": null,
+            }),
             _ => empty_object(),
         });
     };
@@ -111,6 +119,19 @@ fn section_json(source: &str, name: &str) -> core::Result<JsonValue> {
             core::Error::new("source_integrity", "desktop settings are not an object")
         })?;
         object.entry("window").or_insert(JsonValue::Null);
+        object
+            .entry("startup")
+            .or_insert(serde_json::json!("new_task"));
+        object
+            .entry("favorite_models")
+            .or_insert(JsonValue::Array(Vec::new()));
+        object
+            .entry("recent_models")
+            .or_insert(JsonValue::Array(Vec::new()));
+        object
+            .entry("collapsed_projects")
+            .or_insert(JsonValue::Array(Vec::new()));
+        object.entry("last_access").or_insert(JsonValue::Null);
     }
     Ok(value)
 }
@@ -427,13 +448,16 @@ fn replacements(
         }
         let mut normalized = value.clone();
         if *section == SettingsSection::Desktop
-            && let Some(window) = normalized.get("window")
-            && window.is_null()
+            && let Some(object) = normalized.as_object_mut()
         {
-            normalized
-                .as_object_mut()
-                .expect("validated settings object")
-                .remove("window");
+            // TOML has no null: omit null window/last_access like the
+            // pre-existing window handling, so a JSON null round-trips.
+            if object.get("window").is_some_and(JsonValue::is_null) {
+                object.remove("window");
+            }
+            if object.get("last_access").is_some_and(JsonValue::is_null) {
+                object.remove("last_access");
+            }
         }
         let section_value = toml::Value::try_from(normalized).map_err(|_| {
             core::Error::new(
@@ -479,7 +503,17 @@ fn is_default_section(section: SettingsSection, value: &JsonValue) -> bool {
     match section {
         SettingsSection::Routing => value == &serde_json::json!({"default": []}),
         SettingsSection::Desktop => {
-            value == &serde_json::json!({"theme": "system", "window": null})
+            value
+                == &serde_json::json!({
+                    "theme": "system",
+                    "window": null,
+                    "startup": "new_task",
+                    "favorite_models": [],
+                    "recent_models": [],
+                    "collapsed_projects": [],
+                    "last_access": null,
+                })
+                || value == &serde_json::json!({"theme": "system", "window": null})
         }
         _ => false,
     }
@@ -505,11 +539,15 @@ fn restart_required_for_change(
                     needs_restart.push(*section);
                     continue;
                 };
+                // Retention windows and the log level apply live: they are
+                // never a restart gate on their own.
                 if let Some(object) = before.as_object_mut() {
                     object.remove("retention");
+                    object.remove("log_level");
                 }
                 if let Some(object) = after.as_object_mut() {
                     object.remove("retention");
+                    object.remove("log_level");
                 }
                 if before != after {
                     needs_restart.push(*section);

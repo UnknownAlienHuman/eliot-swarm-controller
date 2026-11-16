@@ -10,6 +10,14 @@ Default `%LOCALAPPDATA%\Eliot` or `~/.local/share/eliot`; override with `ELIOT_H
 `--data-dir`. Root and private files are current-user-only. Do not accept redirected
 symlink/reparse roots or unsafe ownership.
 
+Linux is distributed as the [supported Docker image](../../docker/README.md).
+It runs as UID/GID 10001 with `ELIOT_HOME=/data`, an owned mode-0700 volume;
+existing unsafe mounts are refused without chmod/chown repair. Native executable
+and workspace paths are absolute container paths. Credentials enter only through
+explicit runtime mounts/environment allowlists, never image layers. The Docker
+guide specifies per-vendor mounts and the risk of exposing credentials to Agents.
+Keep the root short enough for `<data-dir>/daemon.sock` (107 UTF-8 bytes total).
+
 On first use, create the directory with a protected current-user ACL before publishing
 private files. Owner and ACL checks open the root by handle through the verbatim form,
 so roots past the Win32 parse limit keep the same current-user-only protection.
@@ -133,8 +141,8 @@ pass_env = ["CODEX_HOME"]
 ## Ad-hoc Owner launch (no stored profile)
 
 `swarm launch --harness <codex|claude|muse|opencode|antigravity>
-[--model M] [--effort E] [--auth I] [--cmd PATH] --workspace W "prompt"` (and the same in
-`command.submit` `launch` args, where `cmd` rides beside `model`/`effort` in
+[--model M] [--effort E] [--auth I] [--access ask|auto|full] [--cmd PATH] --workspace W "prompt"` (and the same in
+`command.submit` `launch` args, where `cmd` and `access` ride beside `model`/`effort` in
 the exact retry-bound payload) is an Owner-only tool that builds and freezes
 a profile-equivalent snapshot exactly like a stored profile: built-in safe
 defaults for that harness plus the supplied flags, reproducible and
@@ -168,6 +176,24 @@ omitted one defaults to the model provider prefix only when the native
 refuses before spawning with a typed `profile_error` naming `--auth` and
 listing the available integration ids; another provider's credential is never
 picked silently, and the plugin's pre-serve transfer gate is unchanged.
+`--access` selects the Owner access level next to `harness`/`model`/`effort`
+(`swarm launch --access …`, `swarm switch --access …`, `command.submit`
+`launch` `access`). Omitted keeps the safe defaults. The level freezes its
+native permission result in the snapshot and the effective settings report it
+truthfully. `ask` routes every approval through the existing pending-request
+path (`swarm approve`/`deny`). For a generation frozen with `access=ask`,
+only the Owner may `approve`, `deny` or `answer`: self, manager and other
+non-Owner replies refuse with `not_allowed` through CLI and MCP alike.
+The Agent-scoped Swarm MCP tool may be auto-approved because it cannot
+authorize these replies. A level a
+harness cannot express refuses with a typed `unsupported` reason.
+
+| Level | Codex | Claude | OpenCode | Muse | Antigravity |
+| --- | --- | --- | --- | --- | --- |
+| `ask` (Owner replies only) | `approval_policy=on-request` + `workspace-write` (pending-request) | `permission_mode=manual` (pending `can_use_tool`) | native permission-reply surface (pending) | `approval=onRequest` + `workspace-write` (pending `approval/request`) | `dangerously_skip_permissions=false` (ACP `session/request_permission`) |
+| `auto` | `approval_policy=never` + `workspace-write` | `permission_mode=auto` | native permission-reply surface (pending) | `approval=promptUnmatched` + `workspace-write` | `dangerously_skip_permissions=false` (ACP permission path) |
+| `full` | `approval_policy=never` + `danger-full-access` (exactly current full-access profiles) | `permission_mode=bypassPermissions` (full-access) | `unsupported` (no full-access mapping; refuses instead of widening) | `approval=allowAll` + `danger-full-access` (exactly current full-access) | `dangerously_skip_permissions=true` (exactly current full-access skip) |
+
 Agent principals keep
 the profile and `child_profiles` rules; they cannot ad-hoc launch
 (`not_allowed`).
@@ -546,6 +572,24 @@ millisecond value fits in `i64`. This setting only controls when a busy Agent
 with a healthy native source and no known request/tool activity is diagnosed;
 source-health failures are diagnosed promptly regardless of this window.
 
+Observe-what-matters thresholds are optional:
+
+```toml
+[daemon]
+heavy_wall_secs = 30
+heavy_cpu_secs = 60
+heavy_rss_bytes = 1073741824
+session_growth_ratio_permille = 800
+session_file_bytes = 67108864
+```
+
+A child-process tree whose wall time, consumed CPU or peak RSS crosses any one
+heavy threshold closes as one `activity.heavy` event (defaults: 30 s wall, 60 s CPU,
+1 GiB RSS). Session growth warns at 0.8 context occupancy or a 64 MiB native session
+file where the harness exposes a documented size source; there is no auto-compact.
+`swarm doctor` compares live installed harness versions and contract markers against
+the pinned `VERIFIED_HARNESSES` table without blocking launch.
+
 Cloud MCP is disabled when `[cloud_mcp]` is absent. When present, all fields are
 required. The HTTP MCP executable is the running daemon executable (`current_exe`);
 it is not a separate setting. The hostname is a bare DNS host; Eliot constructs
@@ -871,8 +915,15 @@ accounts and proxies.
 Rules/scripts remain files owned by their existing APIs; settings references and
 automation policy do not create a second executor. Desktop preferences use
 `[desktop]`: `theme` (`system`, `light`, `dark`), `window` (`width`/`height`, at least
-640 by 480) and `startup` (`new_task`, or `last_conversation` to reopen the most
-recently active Agent's conversation). The desktop keeps no other preference store. The desktop writes `window` back once when the window closes, and only when the size changed.
+640 by 480), `startup` (`new_task`, or `last_conversation` to reopen the most
+recently active Agent's conversation), `favorite_models` (bounded list of
+`{harness, model, effort?}`, at most 50), `recent_models` (bounded most-recent-first
+list of `{harness, model, effort?}`, at most 20), `collapsed_projects` (bounded
+list of project ids, at most 100) and `last_access` (`ask`, `auto` or `full`).
+Picker strings are stored verbatim: harness and access values must match their
+closed vocabularies exactly. Model ids and collapsed project ids are 1–256
+bytes, and effort is 1–128 bytes; these reject controls and surrounding whitespace.
+The desktop keeps no other preference store. The desktop writes `window` back once when the window closes, and only when the size changed.
 If that table is absent, the desktop imports the legacy per-user
 `swarm-desktop.json` preferences through the revision-guarded settings writer once.
 It retires the legacy file only after successful publication; an existing `[desktop]`
@@ -1161,6 +1212,35 @@ the adopted service. Agent stop owns only the Agent's controlled process tree. M
 service launch and service-management APIs remain `unsupported`. Readiness and effective
 configuration readback do not verify runtime authentication, inference or all traffic;
 report those facts as unverified. The owner remains responsible for service lifecycle.
+
+## Logging, crash capture and diagnosis
+
+`log_level` (`standard`, `debug`) applies live through the daemon settings
+section, never as a restart gate on its own. Standard mode keeps operational
+lines: structured request/settlement codes and bounded IDs, typed `where`, origin,
+classified sanitized origin evidence and approved sanitized stderr tails. Neither
+level persists `Error.message` or other unclassified free text. Debug mode adds numeric
+timing records: every RPC at the router choke point (`rpc.handled` /
+`rpc.failed` with method, elapsed milliseconds and ok), every
+daemon-to-plugin call (`plugin.call.ok` / `plugin.call.error`), and plugin
+frame, channel, process start/exit and stderr records over `ELIOT_DEBUG`.
+Plugin `ELIOT_DEBUG` lines, including malformed or oversized telemetry, are
+excluded from retained diagnostic tails in both modes. Only parsed metadata is
+routed to the bounded rotated daemon log when the current level is `debug`.
+Debug never logs payloads: ids are our own vocabulary, messages stay in the
+sanitized store, params and results never enter a record. Settings publication
+and live log-level application share the Store writer lock, preserving order.
+
+On panic the daemon writes a `daemon.panicked` marker and plugins write a
+`plugin.panicked` marker. Arbitrary payloads and unclassified thread names are
+omitted before either disk or stderr; source location, approved thread name and
+payload-free backtrace are sanitized and bounded first. Publication uses the
+existing private temporary-file/write/sync/atomic-rename primitive (bounded
+file/count); readers ignore temporary or incomplete files. The previous daemon
+marker is consumed once and reported in `daemon.status`, in `swarm daemon`
+startup output, and in `swarm why` when the diagnosed failure is otherwise
+unclassified. The desktop Agent details view shows the same one-line
+diagnosis summary; the full chain lives behind `swarm why`.
 
 ## Paths and platform defaults
 

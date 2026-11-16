@@ -1,16 +1,19 @@
 //! Public Agent/daemon read grammar and pure reply binding checks.
 //! Store authorization and the exact workspace target remain Router decisions.
 
-use super::{GitView, ObservationView, ScriptInterpreter};
+use super::{GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView};
 use crate::{
-    Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity, ProcessIdentity,
-    ProcessRecord, Result, SessionUsage, TurnOutcome, TurnUsage,
+    Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
+    NativeChildActivityState, ProcessIdentity, ProcessRecord, Result, SessionUsage, TurnOutcome,
+    TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PROCESS_CURSOR_MAX_BYTES: usize = 2_048;
+/// Most characters of [`AgentSummary::preview`].
+pub const AGENT_PREVIEW_CHARS: usize = 256;
 const EDIT_CURSOR_MAX_BYTES: usize = 64 * 1_024;
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +45,14 @@ impl AgentGetRequest {
                 .config
                 .as_ref()
                 .is_some_and(|config| config.validate().is_err())
+            || reply
+                .heavy
+                .as_ref()
+                .is_some_and(|heavy| heavy.validate().is_err())
+            || reply
+                .session_growth
+                .as_ref()
+                .is_some_and(|growth| growth.validate().is_err())
             || reply.source_states.iter().any(|source| {
                 source.agent_id != self.id
                     || source.generation < 0
@@ -225,6 +236,14 @@ impl AgentListRequest {
 /// `updated_at` is the last controller-observed write: for detached or
 /// restarted sources it is freshness metadata, not proof of liveness. Full
 /// records stay available through `agent.get`.
+///
+/// `name`, `profile` and `preview` let a list show what the Agent is for
+/// without a read per row (the pattern of Codex app-server `thread/list`,
+/// whose threads carry `name` and a first-message `preview`): the Agent's
+/// name when one was set, its frozen profile name, and the first
+/// [`AGENT_PREVIEW_CHARS`] characters of its oldest retained `send` text (a
+/// launch's linked first input included). Each is absent when the Store has
+/// none; the same scope that lists the row may already read that command.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSummary {
     pub id: String,
@@ -232,6 +251,13 @@ pub struct AgentSummary {
     pub generation: i64,
     pub project: String,
     pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 256))]
+    pub preview: Option<String>,
     pub state: AgentState,
     #[serde(deserialize_with = "nullable")]
     pub parent: Option<String>,
@@ -257,6 +283,15 @@ pub struct AgentSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_scope: Option<String>,
     pub updated_at: i64,
+    /// Heavy-work rollup for the Agent generation, when at least one heavy
+    /// episode was ever recorded. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy: Option<HeavySummaryView>,
+    /// Live session-growth state for the Agent generation, present exactly
+    /// while the retained signal crosses a configured threshold. Trailing
+    /// field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_growth: Option<SessionGrowthView>,
 }
 
 impl AgentSummary {
@@ -268,6 +303,19 @@ impl AgentSummary {
         }
         text(&self.project)?;
         text(&self.harness)?;
+        for value in [&self.name, &self.profile, &self.preview]
+            .into_iter()
+            .flatten()
+        {
+            text(value)?;
+        }
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.chars().count() > AGENT_PREVIEW_CHARS)
+        {
+            return Err(Error::new("invalid", "Agent summary preview is too long"));
+        }
         text(&self.root)?;
         crate::parse_agent_id(&self.root)?;
         if let Some(parent) = &self.parent {
@@ -318,6 +366,12 @@ impl AgentSummary {
                 "Agent summary observation time is invalid",
             ));
         }
+        if let Some(heavy) = &self.heavy {
+            heavy.validate()?;
+        }
+        if let Some(growth) = &self.session_growth {
+            growth.validate()?;
+        }
         Ok(())
     }
 
@@ -352,6 +406,53 @@ impl AgentSummary {
             _ => "turn",
         };
         Some((tokens, scope))
+    }
+
+    /// Human-readable fleet STATE cell.
+    pub fn display_state(&self) -> String {
+        match &self.activity {
+            Some(activity) => format!("{} (observed)", activity_state_name(activity.state)),
+            None => agent_state_name(self.state).to_owned(),
+        }
+    }
+
+    /// Fleet counting bucket for one summary.
+    pub fn fleet_bucket(&self) -> &'static str {
+        match &self.activity {
+            Some(activity) => match activity.state {
+                NativeChildActivityState::Running => "running",
+                NativeChildActivityState::Idle => "idle",
+                NativeChildActivityState::Interrupted => "interrupted",
+                NativeChildActivityState::Unknown | NativeChildActivityState::Lost => "unknown",
+            },
+            None => agent_state_name(self.state),
+        }
+    }
+}
+
+/// Lifecycle state name shared by fleet displays and counts.
+pub fn agent_state_name(state: AgentState) -> &'static str {
+    match state {
+        AgentState::Unknown => "unknown",
+        AgentState::Created => "created",
+        AgentState::Starting => "starting",
+        AgentState::Idle => "idle",
+        AgentState::Busy => "busy",
+        AgentState::Waiting => "waiting",
+        AgentState::Stopped => "stopped",
+        AgentState::Failed => "failed",
+        AgentState::Lost => "lost",
+    }
+}
+
+/// Read-only native observed-child activity name.
+pub fn activity_state_name(state: NativeChildActivityState) -> &'static str {
+    match state {
+        NativeChildActivityState::Running => "running",
+        NativeChildActivityState::Idle => "idle",
+        NativeChildActivityState::Interrupted => "interrupted",
+        NativeChildActivityState::Lost => "lost",
+        NativeChildActivityState::Unknown => "unknown",
     }
 }
 
@@ -504,6 +605,14 @@ impl AgentStatsRequest {
                 .session_usage
                 .as_ref()
                 .is_some_and(|usage| usage.validate().is_err())
+            || reply
+                .heavy
+                .as_ref()
+                .is_some_and(|heavy| heavy.validate().is_err())
+            || reply
+                .session_growth
+                .as_ref()
+                .is_some_and(|growth| growth.validate().is_err())
         {
             return Err(invalid_response());
         }
@@ -623,6 +732,40 @@ impl AgentEditsRequest {
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusRequest {}
 
+/// Debug-only forced daemon panic for crash-capture tests. Compiled out of
+/// release builds together with its router arm.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonPanicTestRequest {}
+
+impl DaemonPanicTestRequest {
+    pub fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+    pub fn validate_response(&self, reply: &DaemonPanicTestResponse) -> Result<()> {
+        if reply.state != "panicking" {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonPanicTestResponse {
+    #[serde(deserialize_with = "required_text")]
+    #[schemars(
+        description = "Always \"panicking\": the hook acknowledged before the panic aborts the process."
+    )]
+    pub state: String,
+}
+
+impl DaemonPanicTestResponse {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.state)
+    }
+}
+
 impl DaemonStatusRequest {
     pub fn validate(&self) -> Result<()> {
         Ok(())
@@ -664,6 +807,10 @@ impl DaemonStatusRequest {
                     || text(&command.verb).is_err()
                     || command.generation.is_some_and(|generation| generation < 0)
             })
+            || reply
+                .previous_crash
+                .as_ref()
+                .is_some_and(|crash| crash.validate().is_err())
         {
             return Err(invalid_response());
         }
@@ -694,6 +841,15 @@ pub struct AgentGetResponse {
         deserialize_with = "optional_object"
     )]
     pub config: Option<AgentConfigView>,
+    /// Heavy-work rollup for the Agent generation, when at least one heavy
+    /// episode was ever recorded. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy: Option<HeavySummaryView>,
+    /// Live session-growth state for the Agent generation, present exactly
+    /// while the retained signal crosses a configured threshold. Trailing
+    /// field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_growth: Option<SessionGrowthView>,
 }
 
 /// Retained model/effort overlay readback for one Agent generation. The
@@ -823,6 +979,15 @@ pub struct AgentStatsResponse {
     /// committed. Never a turn total and never billing.
     #[serde(default, deserialize_with = "optional_object")]
     pub session_usage: Option<SessionUsage>,
+    /// Heavy-work rollup for the Agent generation, when at least one heavy
+    /// episode was ever recorded. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heavy: Option<HeavySummaryView>,
+    /// Live session-growth state for the Agent generation, present exactly
+    /// while the retained signal crosses a configured threshold. Trailing
+    /// field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_growth: Option<SessionGrowthView>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1385,6 +1550,188 @@ pub struct DaemonStatusResponse {
     pub drain: Option<DrainReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionView>,
+    /// The previous run's crash, loaded once at daemon startup from the
+    /// private crash marker and consumed. Absent when the previous run did
+    /// not panic. `swarm daemon` startup output reports the same marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_crash: Option<CrashMarker>,
+}
+
+/// One captured process panic. Written by the panic hook (daemon and every
+/// plugin binary) to the private crash directory as `daemon.panicked` or
+/// `plugin.panicked`, with the thread, `file:line`, the redacted panic
+/// message and a bounded backtrace. The daemon reports the previous run's
+/// marker once: in `daemon.status`, in `swarm daemon` startup output, and in
+/// `swarm why` when relevant. Bounded; the message is control-stripped at
+/// capture and redacted with the daemon secrets at load.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrashMarker {
+    #[serde(deserialize_with = "required_text")]
+    pub code: String,
+    pub thread: String,
+    pub location: String,
+    pub message: String,
+    pub backtrace: String,
+    pub timestamp: i64,
+}
+
+impl CrashMarker {
+    pub const MAX_THREAD_CHARS: usize = 128;
+    pub const MAX_LOCATION_CHARS: usize = 256;
+    pub const MAX_MESSAGE_CHARS: usize = 1024;
+    pub const MAX_BACKTRACE_CHARS: usize = 8192;
+
+    pub fn validate(&self) -> Result<()> {
+        if self.code != "daemon.panicked" && self.code != "plugin.panicked" {
+            return Err(invalid_response());
+        }
+        if self.thread.chars().count() > Self::MAX_THREAD_CHARS
+            || self.location.chars().count() > Self::MAX_LOCATION_CHARS
+            || self.message.chars().count() > Self::MAX_MESSAGE_CHARS
+            || self.backtrace.chars().count() > Self::MAX_BACKTRACE_CHARS
+            || self.timestamp < 0
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+
+    /// One-line plain-language crash note for startup output and `swarm why`.
+    pub fn summary(&self) -> String {
+        let message = self.message.trim();
+        let short = message.chars().take(160).collect::<String>();
+        format!("{} at {}: {}", self.code, self.location, short)
+    }
+}
+
+/// Owner-scoped read-only failure diagnosis: `swarm why <command-id | agent
+/// | agent:turn>`. Assembles a bounded causal chain from existing events and
+/// readbacks, with no new store of record: the command lifecycle with code,
+/// message and `where`; the related turn outcome and native error; process
+/// exits with codes; the last stderr lines (redacted); a previous-run crash
+/// marker if relevant; and a one-line plain-language summary that starts
+/// with the failure origin.
+pub const MAX_DIAGNOSE_STEPS: usize = 16;
+pub const MAX_DIAGNOSE_SUMMARY_CHARS: usize = 512;
+pub const MAX_DIAGNOSE_MESSAGE_CHARS: usize = 1024;
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnoseRequest {
+    #[serde(deserialize_with = "required_text")]
+    #[schemars(description = "Command id, Agent id, or Agent id with turn id as agent:turn.")]
+    pub target: String,
+}
+
+impl DiagnoseRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.target.chars().count() > 256 {
+            return Err(Error::new("invalid", "diagnose target exceeds its bound"));
+        }
+        text(&self.target)
+    }
+
+    pub fn validate_response(&self, reply: &DiagnoseResponse) -> Result<()> {
+        reply.validate()
+    }
+}
+
+/// One link of the causal chain: a command, turn, process exit, crash marker,
+/// control command or stderr tail. String fields are bounded and redacted;
+/// `origin` names the failure origin vocabulary.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnoseStep {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
+    pub failure_where: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_evidence: Option<String>,
+    /// Captured process exit for `process` steps: numeric code, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    /// Windows NTSTATUS hex for crash statuses (for example `0xC0000005`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ntstatus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<i64>,
+}
+
+impl DiagnoseStep {
+    pub fn validate(&self) -> Result<()> {
+        if self.kind.chars().count() > 64
+            || self
+                .code
+                .as_deref()
+                .is_some_and(|code| code.chars().count() > 128)
+            || self
+                .message
+                .as_deref()
+                .is_some_and(|message| message.chars().count() > MAX_DIAGNOSE_MESSAGE_CHARS)
+            || self
+                .failure_where
+                .as_deref()
+                .is_some_and(|where_| where_.chars().count() > 128)
+            || self
+                .origin
+                .as_deref()
+                .is_some_and(|origin| origin.chars().count() > 32)
+            || self
+                .origin_evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.chars().count() > 512)
+            || self
+                .ntstatus
+                .as_deref()
+                .is_some_and(|ntstatus| ntstatus.chars().count() > 16)
+            || self.at.is_some_and(|at| at < 0)
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnoseResponse {
+    pub target: String,
+    pub summary: String,
+    pub steps: Vec<DiagnoseStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preceded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_crash: Option<CrashMarker>,
+}
+
+impl DiagnoseResponse {
+    pub fn validate(&self) -> Result<()> {
+        if text(&self.target).is_err()
+            || self.target.chars().count() > 256
+            || self.summary.chars().count() > MAX_DIAGNOSE_SUMMARY_CHARS
+            || self.summary.trim().is_empty()
+            || self.steps.len() > MAX_DIAGNOSE_STEPS
+            || self.steps.iter().any(|step| step.validate().is_err())
+            || self
+                .preceded_by
+                .as_deref()
+                .is_some_and(|id| text(id).is_err() || id.chars().count() > 64)
+            || self
+                .previous_crash
+                .as_ref()
+                .is_some_and(|crash| crash.validate().is_err())
+        {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
 }
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1760,7 +2107,7 @@ mod tests {
     fn unknown(result: Result<()>) {
         let error = result.unwrap_err();
         assert_eq!(error.code, "unknown");
-        assert_eq!(error.message, "Agent view response is invalid");
+        assert_eq!(error.message.as_ref(), "Agent view response is invalid");
         assert!(error.diagnostics.is_empty());
     }
 
@@ -2095,6 +2442,8 @@ mod tests {
             source_states: vec![],
             session_usage: None,
             config: None,
+            heavy: None,
+            session_growth: None,
         };
         let wire = serde_json::to_value(&reply).unwrap();
         assert_eq!(wire["id"], "a1");
@@ -2155,6 +2504,9 @@ mod tests {
             generation: 0,
             project: "p".to_owned(),
             harness: "fake".to_owned(),
+            name: None,
+            profile: None,
+            preview: None,
             state: AgentState::Idle,
             parent: None,
             root: "a1".to_owned(),
@@ -2167,7 +2519,36 @@ mod tests {
             usage: None,
             usage_scope: None,
             updated_at: 7,
+            heavy: None,
+            session_growth: None,
         }
+    }
+
+    #[test]
+    fn summary_title_sources_are_optional_nonblank_and_bounded() {
+        let mut row = summary();
+        let wire = serde_json::to_value(&row).unwrap();
+        for absent in ["name", "profile", "preview"] {
+            assert!(wire.get(absent).is_none(), "{absent}");
+        }
+        row.name = Some("planner".to_owned());
+        row.profile = Some("codex-lite".to_owned());
+        row.preview = Some("é".repeat(AGENT_PREVIEW_CHARS));
+        row.validate().unwrap();
+        let read: AgentSummary =
+            serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+        assert_eq!(read, row);
+        row.preview = Some("x".repeat(AGENT_PREVIEW_CHARS + 1));
+        assert!(row.validate().is_err());
+        row.preview = Some(
+            " 
+ "
+            .to_owned(),
+        );
+        assert!(row.validate().is_err());
+        row.preview = None;
+        row.name = Some(String::new());
+        assert!(row.validate().is_err());
     }
 
     #[test]
@@ -2246,6 +2627,52 @@ mod tests {
         scoped.usage = Some(session);
         scoped.usage_scope = Some("session".to_owned());
         assert_eq!(scoped.fleet_usage(), Some((47_231, "session")));
+    }
+
+    #[test]
+    fn observed_display_and_bucket_follow_activity_not_lifecycle_state() {
+        use crate::NativeChildActivity;
+        use crate::NativeChildActivityState as Activity;
+        let observed = |state: Activity| {
+            let mut row = summary();
+            row.state = AgentState::Unknown;
+            row.activity = Some(NativeChildActivity {
+                state,
+                has_open_turn: matches!(state, Activity::Running | Activity::Lost),
+                last_progress_at: None,
+            });
+            row
+        };
+        assert_eq!(observed(Activity::Idle).display_state(), "idle (observed)");
+        assert_eq!(
+            observed(Activity::Running).display_state(),
+            "running (observed)"
+        );
+        assert_eq!(
+            observed(Activity::Interrupted).display_state(),
+            "interrupted (observed)"
+        );
+        assert_eq!(
+            observed(Activity::Unknown).display_state(),
+            "unknown (observed)"
+        );
+        assert_eq!(observed(Activity::Lost).display_state(), "lost (observed)");
+        assert_eq!(summary().display_state(), "idle");
+        assert_eq!(observed(Activity::Idle).fleet_bucket(), "idle");
+        assert_eq!(observed(Activity::Running).fleet_bucket(), "running");
+        assert_eq!(
+            observed(Activity::Interrupted).fleet_bucket(),
+            "interrupted"
+        );
+        assert_eq!(observed(Activity::Unknown).fleet_bucket(), "unknown");
+        assert_eq!(observed(Activity::Lost).fleet_bucket(), "unknown");
+        assert_eq!(summary().fleet_bucket(), "idle");
+        let mut unknown = summary();
+        unknown.state = AgentState::Unknown;
+        assert_eq!(unknown.fleet_bucket(), "unknown");
+        let wire = serde_json::to_value(observed(Activity::Idle)).unwrap();
+        assert_eq!(wire["state"], "unknown");
+        assert_eq!(wire["activity"]["state"], "idle");
     }
 
     #[test]
@@ -2457,6 +2884,8 @@ mod tests {
             generation: 4,
             observation: observation(),
             session_usage: None,
+            heavy: None,
+            session_growth: None,
         };
         let wire = serde_json::to_value(&reply).unwrap();
         assert_eq!(wire["available"], false);
@@ -2724,6 +3153,8 @@ mod tests {
             source_states: vec![source],
             session_usage: None,
             config: None,
+            heavy: None,
+            session_growth: None,
         };
         AgentGetRequest::new("a1")
             .validate_response(&reply)

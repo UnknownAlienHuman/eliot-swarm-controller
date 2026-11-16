@@ -126,12 +126,14 @@ pub fn bound_stderr_diagnostics(values: &mut Vec<StderrDiagnostic>, max_encoded_
     }
 }
 
+// Boxed so the owning `Error.diagnostics` field stays 8 bytes.
+#[allow(clippy::box_collection)]
 pub(crate) fn deserialize_diagnostics<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<Vec<StderrDiagnostic>, D::Error> {
+) -> Result<Box<Vec<StderrDiagnostic>>, D::Error> {
     let raw = serde_json::Value::deserialize(deserializer)?;
     let Some(raw) = raw.as_array() else {
-        return Ok(Vec::new());
+        return Ok(Box::default());
     };
     let mut values = Vec::with_capacity(2);
     let mut malformed = raw.len() > 2;
@@ -160,5 +162,5 @@ pub(crate) fn deserialize_diagnostics<'de, D: serde::Deserializer<'de>>(
         }
     }
     bound_stderr_diagnostics(&mut values, MAX_STDERR_DIAGNOSTIC_BYTES);
-    Ok(values)
+    Ok(values.into())
 }

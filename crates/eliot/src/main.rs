@@ -13,7 +13,18 @@ use cli::support::Failure;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if matches!(&cli.command, Some(CliCommand::Plugin(_))) {
+    let is_plugin = matches!(&cli.command, Some(CliCommand::Plugin(_)));
+    // One hook for both binaries: the daemon and every plugin share this
+    // executable, so the code is mode-aware. A WMI-started daemon has no
+    // console, so the marker file under ELIOT_CRASH_DIR is the durable path.
+    eliot_daemon::crash::install_panic_hook(is_plugin);
+    // Debug-only panic trigger for crash-capture tests. Compiled out of
+    // release builds: release binaries cannot panic on demand.
+    #[cfg(debug_assertions)]
+    if is_plugin && std::env::var("ELIOT_DEBUG_PLUGIN_PANIC").is_ok_and(|value| value == "1") {
+        panic!("debug plugin panic trigger");
+    }
+    if is_plugin {
         match eliot_plugin::native_lifecycle::run_plugin_entry(run_inner(cli)) {
             Ok(exit_code) => exit_code,
             Err(error) => report_failure(Failure::new(1, error.to_string())),
@@ -33,6 +44,9 @@ async fn run_inner(cli: Cli) -> ExitCode {
         Ok(path) => path,
         Err(failure) => return report_failure(failure),
     };
+    // Read lazily by the panic hook: markers land in the private crash
+    // directory of the data root this process serves.
+    eliot_daemon::crash::set_crash_dir(&eliot_daemon::crash::crash_dir(&data_dir));
 
     let Cli {
         json: json_output,
@@ -128,5 +142,5 @@ fn report_failure(failure: Failure) -> ExitCode {
 }
 
 fn resolve_data_dir(argument: Option<&Path>) -> Result<PathBuf, Failure> {
-    eliot_daemon::resolve_data_dir(argument).map_err(|error| Failure::new(1, error.message))
+    eliot_daemon::resolve_data_dir(argument).map_err(|error| Failure::new(1, *error.message))
 }

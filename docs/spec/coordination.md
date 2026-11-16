@@ -28,6 +28,13 @@ may grant a different manager control through [Handoff](#handoff). A native chil
 environment has no independent Eliot principal; calls from its parent environment are
 attributed to that parent and this limitation is shown.
 
+Pending request replies (`approve`, `deny`, `answer`) for a generation whose
+frozen launch snapshot has `access=ask` require the Owner. The Agent itself,
+its manager (including tree/project control), and non-Owner automation cannot
+reply, through CLI or MCP. Admission and dispatch enforce `not_allowed` before
+any native reply. For `auto`, `full`, and omitted access, existing frozen
+control scope governs self and manager answers; this rule grants no new rights.
+
 Queue mail is communication, not control. Full-text `send|steer|inject` presentation
 requires ordinary command rights. No message content is executed as a router instruction.
 

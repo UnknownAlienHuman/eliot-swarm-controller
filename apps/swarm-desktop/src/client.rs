@@ -14,11 +14,11 @@ use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentResultRequest,
     AgentResultResponse, CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest,
     CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
-    CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, EventsBoundsRequest,
-    EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
-    EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest, HandoffResponse,
-    HarnessModelsRequest, HarnessModelsResponse, ReparentRequest, ReparentResponse, SwitchRequest,
-    SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
+    CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest,
+    DiagnoseResponse, EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest,
+    EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest,
+    HandoffResponse, HarnessModelsRequest, HarnessModelsResponse, ReparentRequest,
+    ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -87,6 +87,20 @@ pub async fn get_agent(data_dir: &Path, id: &str) -> Result<AgentGetResponse> {
     params.validate()?;
     let reply: AgentGetResponse =
         eliot_daemon::client_call_typed(data_dir, "agent.get", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// Owner-scoped failure diagnosis for one command, Agent or agent:turn.
+/// The desktop shows the one-line summary in Agent details; the full chain
+/// lives behind `swarm why`.
+pub async fn diagnose(data_dir: &Path, target: &str) -> Result<DiagnoseResponse> {
+    let params = DiagnoseRequest {
+        target: target.to_owned(),
+    };
+    params.validate()?;
+    let reply: DiagnoseResponse =
+        eliot_daemon::client_call_typed(data_dir, "diagnose", &params).await?;
     params.validate_response(&reply)?;
     Ok(reply)
 }
@@ -401,35 +415,6 @@ pub async fn agent_sends(data_dir: &Path, agent: &str) -> Result<(Vec<Command>, 
         .collect()
         .await;
     Ok((reads.into_iter().collect::<Result<_>>()?, omitted))
-}
-
-/// Admission events read to find an Agent's first SEND for its title.
-const FIRST_INPUT_SCAN: usize = 64;
-
-/// The text of an Agent's oldest retained SEND (a launch's linked first
-/// input included), for its title in the sidebar: the first admission
-/// events after the retention floor, then that command's text. `None` when
-/// none is retained.
-pub async fn first_input(data_dir: &Path, agent: &str) -> Result<Option<String>> {
-    let filter = EventsFilter {
-        agents: vec![agent.to_owned()],
-        kinds: crate::handoff::ADMISSION_KINDS.map(str::to_owned).to_vec(),
-        sources: Vec::new(),
-    };
-    let bounds = events_bounds(data_dir, &filter).await?;
-    let page = events_read(data_dir, bounds.pruned_through, FIRST_INPUT_SCAN, &filter).await?;
-    let Some(id) = crate::handoff::send_ids(&page.events, agent)
-        .into_iter()
-        .next()
-    else {
-        return Ok(None);
-    };
-    let command = read_command(data_dir, &id).await?;
-    Ok(command
-        .args
-        .get("text")
-        .and_then(Value::as_str)
-        .map(str::to_owned))
 }
 
 /// Owner task transfer to an existing Agent. The same request (id
