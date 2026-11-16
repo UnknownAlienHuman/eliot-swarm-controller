@@ -87,3 +87,19 @@ harness = "antigravity"
 cmd = "C:/Tools/Antigravity/antigravity.exe"
 model = "antigravity-model"
 # mode = "auto"
+
+# Ordered routing candidates. Roles are extensible; each candidate must name
+# a profile above. Replace or extend these lists for the work you assign.
+[routing]
+default = ["codex-luna"]
+manager = ["codex-luna"]
+worker = ["codex-luna"]
+audit = ["codex-luna"]
+
+# Optional settings-managed backlog assignment. The key is the assignment id.
+# [automation.assignments.review-queue]
+# folder = "C:/work/briefs"
+# workspace = "C:/work/eliot"
+# role = "worker"
+# max_busy = 2
+# interval = "30s"

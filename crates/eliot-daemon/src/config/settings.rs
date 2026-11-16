@@ -831,10 +831,27 @@ mod tests {
         let root = TestRoot::new();
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         let policy = SecretPolicy::new(Vec::<String>::new());
-        let sections = BTreeMap::from([(
-            SettingsSection::Automation,
-            serde_json::json!({"max_event_backlog":123,"run":{"interpreters":{},"run_env":[]}}),
-        )]);
+        let sections = BTreeMap::from([
+            (
+                SettingsSection::Automation,
+                serde_json::json!({
+                    "max_event_backlog":123,
+                    "run":{"interpreters":{},"run_env":[]},
+                    "assignments":{"queue-a":{
+                        "folder":"C:/work/briefs",
+                        "workspace":"C:/work/eliot",
+                        "role":"worker",
+                        "max_busy":2,
+                        "interval":"30s"
+                    }}
+                }),
+            ),
+            (SettingsSection::Profiles, profile_section("gpt-6-luna")),
+            (
+                SettingsSection::Routing,
+                serde_json::json!({"default":["codex"],"worker":["codex"]}),
+            ),
+        ]);
         let saved = save_internal(
             &root.0,
             &mut store,
@@ -850,7 +867,7 @@ mod tests {
         let read = read_internal(
             &root.0,
             &mut store,
-            Some(&[SettingsSection::Automation]),
+            Some(&[SettingsSection::Automation, SettingsSection::Routing]),
             &policy,
         )
         .unwrap();
@@ -858,6 +875,14 @@ mod tests {
         assert_eq!(
             load_automation_config(&root.0).unwrap().max_event_backlog,
             123
+        );
+        assert_eq!(
+            load_automation_config(&root.0).unwrap().assignments["queue-a"].max_busy,
+            2
+        );
+        assert_eq!(
+            read.sections[&SettingsSection::Routing]["worker"][0],
+            "codex"
         );
         assert!(
             restart_required_for_change(

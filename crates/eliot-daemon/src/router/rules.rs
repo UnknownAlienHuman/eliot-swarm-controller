@@ -28,6 +28,13 @@ use serde_json::Value;
 use std::sync::atomic::Ordering;
 
 impl Router {
+    pub(crate) async fn assignment_status(
+        &self,
+        key: &str,
+    ) -> Result<eliot_store::AssignmentStatus> {
+        self.inner.store.lock().await.assignment_status(key)
+    }
+
     pub(super) async fn rule_catch_up(
         &self,
         params: &Value,
@@ -338,6 +345,18 @@ impl Router {
                 ),
             )
             .await
+        } else if command.args.get("assignment").is_some() {
+            if project_view.is_some() {
+                Err(Error::new(
+                    "not_allowed",
+                    "assignments require an Owner timer",
+                ))
+            } else {
+                match crate::automation::assignment::prepare(self, command).await {
+                    Ok(command) => self.prepare_owner_submission(command).await,
+                    Err(error) => Err(error),
+                }
+            }
         } else {
             match project_view.as_ref() {
                 Some(project) => self.prepare_project_rule_submission(command, project).await,

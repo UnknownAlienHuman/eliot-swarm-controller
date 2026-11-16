@@ -1591,7 +1591,9 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "DROP INDEX settings_history_created;
+                    "DROP INDEX commands_assignment;
+                     ALTER TABLE agents DROP COLUMN profile_choice;
+                     DROP INDEX settings_history_created;
                      DROP TABLE settings_history;
                      DELETE FROM schema_migrations WHERE version = 41;
                      DROP INDEX inference_write_inventory;

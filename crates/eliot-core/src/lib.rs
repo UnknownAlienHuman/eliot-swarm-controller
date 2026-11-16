@@ -51,7 +51,8 @@ pub use native_store::NativeStoreBinding;
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
     CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind,
-    RouteBinding, frozen_provider_scope,
+    RouteBinding, RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision,
+    frozen_provider_scope,
 };
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};
@@ -397,6 +398,9 @@ pub struct Agent {
     /// inherited, and a child on an allowed different profile is neither.
     #[serde(default)]
     pub profile_inherited: bool,
+    /// Admission-time routing decision, retained independently of command history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_choice: Option<RoutingDecision>,
     #[serde(default)]
     pub native_scope: Option<String>,
     #[serde(default)]
@@ -447,6 +451,7 @@ impl Agent {
             profile: profile.into(),
             profile_snapshot: empty_object(),
             profile_inherited: false,
+            profile_choice: None,
             native_scope: None,
             native_ref: None,
             workspace: None,
@@ -1073,7 +1078,11 @@ pub struct Error {
     pub diagnostics: Vec<StderrDiagnostic>,
     #[serde(default)]
     #[schemars(skip_serializing_if = "Option::is_none")]
-    pub details: Option<InvalidParam>,
+    pub details: Option<Box<InvalidParam>>,
+    /// Typed admission refusal; also used by desktop routing readback.
+    #[serde(default)]
+    #[schemars(skip_serializing_if = "Option::is_none")]
+    pub routing: Option<Box<RoutingDecision>>,
 }
 
 /// Parameter diagnostics contain schema-owned names/expectations, never values.
@@ -1105,7 +1114,7 @@ impl Error {
         let field: String = field.into().chars().take(256).collect();
         let expected: String = expected.into().chars().take(512).collect();
         self.message = format!("{field}: expected {expected}");
-        self.details = Some(InvalidParam { field, expected });
+        self.details = Some(Box::new(InvalidParam { field, expected }));
         self
     }
 
@@ -1115,6 +1124,7 @@ impl Error {
             message: message.into(),
             diagnostics: Vec::new(),
             details: None,
+            routing: None,
         }
     }
 
@@ -1173,6 +1183,8 @@ impl Serialize for Error {
             diagnostics: Vec<StderrDiagnostic>,
             #[serde(skip_serializing_if = "Option::is_none")]
             details: Option<InvalidParam>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            routing: Option<&'a RoutingDecision>,
         }
         let mut diagnostics = self.diagnostics.clone();
         bound_stderr_diagnostics(
@@ -1187,6 +1199,7 @@ impl Serialize for Error {
                 field: detail.field.chars().take(256).collect(),
                 expected: detail.expected.chars().take(512).collect(),
             }),
+            routing: self.routing.as_deref(),
         }
         .serialize(serializer)
     }

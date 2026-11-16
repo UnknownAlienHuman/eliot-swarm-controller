@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 41;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 42;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -986,6 +986,20 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 42 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE agents ADD COLUMN profile_choice TEXT;
+                 CREATE INDEX commands_assignment ON commands(json_extract(args,'$.assignment.key'))
+                     WHERE verb='launch';
+                 INSERT INTO schema_migrations(version) VALUES (42);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1000,7 +1014,10 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX settings_history_created;
+                "DROP INDEX commands_assignment;
+             ALTER TABLE agents DROP COLUMN profile_choice;
+             DELETE FROM schema_migrations WHERE version=42;
+             DROP INDEX settings_history_created;
              DROP TABLE settings_history;
              DELETE FROM schema_migrations WHERE version=41;
              ALTER TABLE inference_clients DROP COLUMN expired_id_through_ms;
@@ -1055,7 +1072,10 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX settings_history_created;
+                "DROP INDEX commands_assignment;
+             ALTER TABLE agents DROP COLUMN profile_choice;
+             DELETE FROM schema_migrations WHERE version=42;
+             DROP INDEX settings_history_created;
              DROP TABLE settings_history;
              DELETE FROM schema_migrations WHERE version=41;
              DROP INDEX inference_write_inventory;

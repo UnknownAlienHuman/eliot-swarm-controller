@@ -237,8 +237,9 @@ Scheduled and manual timer actions have no event or subject context, so Agent-ac
 `target` names the retained Agent and `expected_generation` is its literal old generation
 `N`. Timer `send` requires literal `text`; timer `resume` text is optional and literal.
 Neither text value can use event or subject templates.
-A timer `launch` also requires literal profile and workspace values; its optional text is
-literal and cannot use event or subject templates.
+A timer `launch` uses the same literal profile or role and workspace fields; its optional
+text is literal and cannot use event or subject templates. Folder assignment is supported
+only by the settings-generated timer path.
 
 An interval `every` value uses the humantime duration grammar and must be positive with
 whole-millisecond precision; it is normalized to signed `period_ms`. An explicit interval
@@ -411,21 +412,56 @@ Cause-depth suppression is silent and does not emit an endlessly retriggerable r
 
 ### Targetless launch
 
-S4 extends this existing action with a routing role when a literal profile is omitted;
-explicit profiles remain supported. Candidate selection and its recorded reason follow
-the configuration routing contract at first admission. Project/child authority is
-intersected before selection; retries retain the original choice. Until S4 this action
-continues to require a literal profile.
+Candidate selection and its recorded reason follow the configuration routing contract at
+first admission. Project/child authority is intersected before selection; retries retain
+the original choice.
 
-Queue assignment uses settings-managed rules/timers and the existing bounded `run`
-action to read one brief and emit an ordinary launch. A configured concurrency bound
-counts unresolved launches and live Agents; an unknown command holds its slot. Advance
-the brief cursor only with its durable admitted command identity, never infer completion
-from process liveness or replay an uncertain launch. This is an automation increment,
-not a Task/Issue/acceptance engine. S4 supplies only missing routing/admission plumbing
-after S3; the external backlog runner is retired when that connected path is proven.
+Queue assignment is configured in the unified settings file and runs through the existing
+timer and ordinary `launch` path. Each firing reads the next bounded `.md` brief by
+filename and emits one routing-aware launch. `max_busy` counts unresolved launches,
+linked initial sends and live Agents; an unknown command holds its slot. Store advances
+the filename cursor only in the transaction that admits the durable launch command.
+An unknown launch is never rerouted or replayed. No brief is moved or marked started in
+the filesystem, so a crash or restart leaves the durable cursor and command as authority.
+This is an automation increment, not a Task/Issue/acceptance engine.
 
-The `launch` action submits the existing ordinary launch command with flat fields:
+The owner configures a global assignment under `[automation.assignments.<key>]`:
+
+```toml
+[automation.assignments.muse-backlog]
+folder = "C:/Development/Rust/agent-briefs/20261114/backlog"
+workspace = "C:/Development/Rust/worktrees/main-20261113"
+role = "worker"
+max_busy = 2
+interval = "30s"
+```
+
+`key` is a stable identity; changing it starts a separate cursor. On each interval the
+daemon selects the lexicographically first regular `.md` file whose filename is after the
+retained cursor. New queue entries must sort after the cursor. The folder scan is bounded
+to 500 entries per firing; overflow fails closed rather than skipping an unseen earlier
+brief. Each brief is
+limited to the ordinary 64 KiB launch-text bound. Unsafe, oversized or invalid UTF-8
+briefs fail the slot visibly. At capacity or when no next brief exists, the timer slot is
+skipped and a later interval checks again. Settings generate a global interval timer
+rule and an ordinary completion rule. The completion rule matches the Store-verified
+`event.cause.rule` of that assignment and stops only its captured Agent/generation,
+releasing native live capacity after custody closes. Native `data.cause` is not a match
+authority. Assigned Agents own one brief; they are retired after their terminal turn.
+Manual timer runs use the same admission and cursor checks. Multiple firings race
+through the same retained cursor and are serialized by Store's cursor compare-and-swap.
+The ordinary command ID remains the timer child ID, preserving exact same-ID replay.
+
+An assignment launch selects `role` instead of `profile`; routing evaluates its frozen
+candidate order at admission. The selected brief filename, previous cursor, assignment
+key and capacity bound accompany the normal launch command for Store validation. Store
+counts unresolved assignment launches, unresolved linked initial sends, and starting,
+running or unknown native turns. A terminal turn releases the slot; process liveness by
+itself does not establish completion. If Store reports a stale cursor or full capacity,
+the command is not admitted and the next timer firing retries from retained state.
+
+The `launch` action submits the existing ordinary launch command with flat fields. An
+explicit `profile` or a routing `role` may be supplied; they are mutually exclusive.
 
 ```toml
 [[rule]]
@@ -434,10 +470,14 @@ on = { event = "turn.completed", match = { "subject.harness" = "codex" } }
 do = [{ action = "launch", profile = "codex-luna", workspace = "/work/eliot", text = "Review ${data.status}" }]
 ```
 
-`profile` is a nonempty literal profile name and `workspace` is a nonempty literal path
-to an existing workspace. Neither accepts templates. `text` is optional; for event rules,
+`workspace` is a nonempty literal path to an existing workspace. `profile`, when present,
+is a nonempty literal profile name; `role`, when present, is a nonempty literal routing
+role. Neither accepts templates. Both may be omitted to use the routing default.
+`text` is optional; for event rules,
 its value is rendered once from the captured event context and frozen into the launch
 command. Timer launch uses the same action shape, but its optional text must be literal.
+Settings-generated assignment timers add `assignment = { key, folder, max_busy }`; this
+form requires a role and obtains `text` from the next brief at timer admission.
 Launch text follows the ordinary launch/linked-send 64 KiB persisted-text bound. A
 nonblank text value uses the normal linked `send` admission and dispatch path. The launch
 and its linked initial `send` are one configured launch action and consume one configured-

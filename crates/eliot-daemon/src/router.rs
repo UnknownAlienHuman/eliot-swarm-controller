@@ -13,6 +13,7 @@ mod handoff;
 mod hierarchy;
 mod inference;
 mod resolution;
+mod routing;
 mod rules;
 mod switch;
 
@@ -1915,6 +1916,15 @@ impl Router {
             return Ok(false);
         }
 
+        if request.args.get("profile").is_none() {
+            let (name, harness, snapshot) = self.route_launch_profile(principal, request).await?;
+            request.args["profile"] = Value::String(name);
+            install_frozen_profile(request, &harness, snapshot, true)?;
+            let store = self.inner.store.lock().await;
+            hierarchy::check_agent_launch_authority(&store, principal, request)?;
+            return Ok(false);
+        }
+
         // Agent-principal child launches default to the parent profile and
         // reuse the parent's frozen snapshot verbatim (including the
         // dispatch-derived `native_store_binding` the parent gained at its
@@ -2003,16 +2013,10 @@ impl Router {
         let (profile_name, snapshot, harness) = match agent_child_snapshot {
             Some((name, harness, snapshot)) => (name, snapshot, harness),
             None => {
-                let (profile_name, profile_choice) = match request.args.get("profile") {
-                    Some(Value::String(name)) => (name.to_owned(), None),
-                    Some(_) => (required_text(&request.args, "profile")?.to_owned(), None),
-                    None if matches!(principal, Principal::Owner)
-                        && request.args.get("harness").is_none() =>
-                    {
-                        let (name, choice) = self.default_profile_choice().await?;
-                        (name, Some(choice))
-                    }
-                    None => (required_text(&request.args, "profile")?.to_owned(), None),
+                let profile_name = match request.args.get("profile") {
+                    Some(Value::String(name)) => name.to_owned(),
+                    Some(_) => required_text(&request.args, "profile")?.to_owned(),
+                    None => required_text(&request.args, "profile")?.to_owned(),
                 };
                 let mut snapshot =
                     crate::config::resolve_profile(&self.inner.data_root, &profile_name)?;
@@ -2025,11 +2029,6 @@ impl Router {
                     .filter(|harness| !harness.trim().is_empty())
                     .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
                     .to_owned();
-                if let Some(choice) = profile_choice
-                    && let Some(args) = request.args.as_object_mut()
-                {
-                    args.insert("profile_choice".to_owned(), choice);
-                }
                 (profile_name, snapshot, harness)
             }
         };
@@ -2044,37 +2043,6 @@ impl Router {
             hierarchy::check_agent_launch_authority(&store, principal, request)?;
         }
         Ok(false)
-    }
-
-    async fn default_profile_choice(&self) -> Result<(String, Value)> {
-        let policy = self.secret_policy_snapshot();
-        let mut store = self.inner.store.lock().await;
-        let settings = crate::config::settings::read_internal(
-            &self.inner.data_root,
-            &mut store,
-            Some(&[eliot_core::api::SettingsSection::Routing]),
-            &policy,
-        )?;
-        let candidates = settings
-            .sections
-            .get(&eliot_core::api::SettingsSection::Routing)
-            .and_then(|routing| routing.get("default"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| Error::new("not_found", "no default launch profile is configured"))?;
-        let profile = candidates
-            .first()
-            .and_then(Value::as_str)
-            .filter(|name| !name.trim().is_empty())
-            .ok_or_else(|| Error::new("not_found", "no default launch profile is configured"))?
-            .to_owned();
-        Ok((
-            profile.clone(),
-            json!({
-                "profile": profile,
-                "source": "settings.routing.default",
-                "reason": "first configured default candidate",
-            }),
-        ))
     }
 
     async fn provider_holds(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -2922,6 +2890,19 @@ impl Router {
         }
         let profile = request.profile.as_deref().map(str::trim);
         let (snapshot, label) = self.resolve_catalog_snapshot(&harness, profile, false)?;
+        self.quota_for_snapshot(harness, snapshot, label).await
+    }
+
+    async fn quota_for_snapshot(
+        &self,
+        harness: String,
+        snapshot: Option<Value>,
+        label: String,
+    ) -> Result<Value> {
+        let request = eliot_core::api::HarnessQuotaRequest {
+            harness: harness.clone(),
+            profile: None,
+        };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
         let now = now_ms();
         if let Some(hit) = self
@@ -5277,24 +5258,45 @@ fn validate_rule_launch_action(
         .args
         .as_object()
         .ok_or_else(|| Error::new("invalid", "rule launch args must be an object"))?;
-    if args
-        .keys()
-        .any(|key| !matches!(key.as_str(), "profile" | "workspace" | "text"))
-    {
+    if args.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "profile" | "role" | "workspace" | "text" | "assignment"
+        )
+    }) {
         return Err(Error::new(
             "invalid",
-            "rule launch accepts only profile, workspace, and optional text",
+            "rule launch accepts profile or role, workspace, optional text and assignment",
         ));
     }
     let profile = args
         .get("profile")
-        .and_then(Value::as_str)
-        .filter(|profile| {
-            !profile.trim().is_empty()
-                && profile.trim() == *profile
-                && !profile.contains(concat!("$", "{"))
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|name| {
+                    !name.trim().is_empty()
+                        && name.trim() == *name
+                        && !name.contains(concat!("$", "{"))
+                })
+                .ok_or_else(|| Error::new("invalid", "rule launch profile must be a literal name"))
         })
-        .ok_or_else(|| Error::new("invalid", "rule launch profile must be a literal name"))?;
+        .transpose()?;
+    if let Some(role) = args.get("role") {
+        crate::config::validate_routing_role(
+            role.as_str()
+                .ok_or_else(|| Error::new("invalid", "rule launch role must be a literal name"))?,
+        )?;
+        if profile.is_some() {
+            return Err(Error::new("invalid", "rule launch uses profile or role"));
+        }
+    }
+    if args.contains_key("assignment") && project.is_some() {
+        return Err(Error::new(
+            "not_allowed",
+            "folder assignment requires Owner automation",
+        ));
+    }
     let workspace = args
         .get("workspace")
         .and_then(Value::as_str)
@@ -5321,11 +5323,12 @@ fn validate_rule_launch_action(
                 "project rule is not approved for launch",
             ));
         }
-        if !registration
-            .profiles
-            .iter()
-            .any(|approved| approved == profile)
-        {
+        if profile.is_some_and(|profile| {
+            !registration
+                .profiles
+                .iter()
+                .any(|approved| approved == profile)
+        }) {
             return Err(Error::new(
                 "not_allowed",
                 "project registration does not approve the launch profile",
@@ -5727,6 +5730,18 @@ fn normalize_launch(request: &mut SubmitCommand, _principal: &Principal) -> Resu
         return Ok(());
     }
     reject_launch_derived_keys(&request.args)?;
+    if let Some(role) = request.args.get("role") {
+        let role = role
+            .as_str()
+            .ok_or_else(|| Error::new("invalid", "launch role must be a name"))?;
+        crate::config::validate_routing_role(role)?;
+        if request.args.get("profile").is_some() || request.args.get("harness").is_some() {
+            return Err(Error::new(
+                "invalid",
+                "launch role requires an omitted profile and harness",
+            ));
+        }
+    }
     if let Some(worktree) = request.args.get("worktree") {
         if worktree
             .as_str()

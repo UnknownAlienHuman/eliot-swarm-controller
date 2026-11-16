@@ -164,6 +164,10 @@ pub(super) fn require_unheld_tx(tx: &Transaction<'_>, agent: &Agent) -> Result<(
     Ok(())
 }
 
+pub(super) fn profile_held(connection: &rusqlite::Connection, agent: &Agent) -> Result<bool> {
+    Ok(get(connection, &core::frozen_provider_scope(agent)?)?.is_some())
+}
+
 /// Bind a probe claim only after its accepted command row exists in this same
 /// admission transaction. Ordinary sends remain pre-binding rejections.
 pub(super) fn admit_send_tx(

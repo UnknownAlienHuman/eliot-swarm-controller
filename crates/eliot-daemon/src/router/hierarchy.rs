@@ -1103,19 +1103,22 @@ mod tests {
     );
 
     async fn launch_manager(router: &Router, workspace: &std::path::Path, profile: &str) -> String {
-        let response = router
-            .submit(
-                &json!({
-                    "id": ulid::Ulid::new().to_string(),
-                    "verb": "launch",
-                    "args": {"workspace": workspace, "profile": profile},
-                }),
-                &Principal::Owner,
-            )
+        // These tests exercise admission authority, not native dispatch. Keep
+        // the parent at its admitted generation while asynchronous routing
+        // reads run; a scheduled worker could otherwise advance it mid-test.
+        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        request.args = json!({"workspace":workspace,"profile":profile});
+        let prepared = router
+            .prepare_submission(request, &Principal::Owner)
             .await
             .unwrap();
-        let typed: CommandSubmitResponse = serde_json::from_value(response).unwrap();
-        typed.agent.unwrap()
+        let mut store = router.inner.store.lock().await;
+        router
+            .admit_prepared_submission(&mut store, "owner", prepared, None)
+            .unwrap()
+            .command
+            .target
+            .unwrap()
     }
 
     async fn launch_child(

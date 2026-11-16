@@ -76,10 +76,23 @@ struct TriggerDefinition {
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LaunchActionDefinition {
-    profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
     workspace: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignment: Option<AssignmentActionDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<Value>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssignmentActionDefinition {
+    key: String,
+    folder: String,
+    max_busy: usize,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
@@ -774,7 +787,11 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
         data: &event.data,
     };
     if let AgentActionDefinition::Launch(LaunchActionDefinition {
-        profile, workspace, ..
+        profile,
+        workspace,
+        role,
+        assignment,
+        ..
     }) = action
     {
         let text = action
@@ -783,7 +800,14 @@ pub fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<Option<SubmitCom
                 render_text(text, &roots, max_bytes, action.verb(), limit_label)
             })
             .transpose()?;
-        return submit_launch_command(profile, workspace, text).map(Some);
+        return submit_launch_command(
+            profile.as_deref(),
+            workspace,
+            role.as_deref(),
+            assignment.as_ref(),
+            text,
+        )
+        .map(Some);
     }
     let target_source = action
         .target()
@@ -994,13 +1018,28 @@ fn submit_git_fetch_command(definition: &GitFetchDefinitionArgs) -> Result<Submi
 }
 
 fn submit_launch_command(
-    profile: &str,
+    profile: Option<&str>,
     workspace: &str,
+    role: Option<&str>,
+    assignment: Option<&AssignmentActionDefinition>,
     text: Option<String>,
 ) -> Result<SubmitCommand, Error> {
     let mut command = CommandSubmitRequest::new(String::new(), "launch");
     command.expected_generation = Some(0);
-    command.args = json!({"profile": profile, "workspace": workspace});
+    command.args = json!({"workspace": workspace});
+    if let Some(profile) = profile {
+        command.args["profile"] = Value::String(profile.to_owned());
+    }
+    if let Some(role) = role {
+        command.args["role"] = Value::String(role.to_owned());
+    }
+    if let Some(assignment) = assignment {
+        command.args["assignment"] = json!({
+            "key": assignment.key,
+            "folder": assignment.folder,
+            "max_busy": assignment.max_busy,
+        });
+    }
     if let Some(text) = text {
         command.args["text"] = Value::String(text);
     }
@@ -1095,7 +1134,7 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
     if has_unsupported_launch_option {
         return Err(Error::new(
             "unsupported",
-            "launch accepts only profile, workspace, and optional text; worktree and per-action overrides are unsupported",
+            "launch accepts profile or role, workspace, optional text, and bounded assignment fields; worktree and per-action overrides are unsupported",
         ));
     }
     if has_unsupported_trigger || has_unsupported_selector || has_unsupported_action {
@@ -1145,6 +1184,18 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
             return Err(Error::new(
                 "invalid",
                 "request reply actions require a request.opened trigger",
+            ));
+        }
+        if matches!(
+            action,
+            ActionDefinition::Agent(AgentActionDefinition::Launch(LaunchActionDefinition {
+                assignment: Some(_),
+                ..
+            }))
+        ) {
+            return Err(Error::new(
+                "unsupported",
+                "folder assignment launches require a timer trigger",
             ));
         }
         validate_event_matches(&mut rule.trigger)?;
@@ -1274,10 +1325,19 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
     if let AgentActionDefinition::Launch(LaunchActionDefinition {
         profile,
         workspace,
+        role,
+        assignment,
         text,
     }) = action
     {
-        return validate_launch_action(profile, workspace, text.as_ref(), true);
+        return validate_launch_action(
+            profile.as_deref(),
+            workspace,
+            role.as_deref(),
+            assignment.as_ref(),
+            text.as_ref(),
+            true,
+        );
     }
     let target = action
         .target()
@@ -1342,13 +1402,50 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
 }
 
 fn validate_launch_action(
-    profile: &str,
+    profile: Option<&str>,
     workspace: &str,
+    role: Option<&str>,
+    assignment: Option<&AssignmentActionDefinition>,
     text: Option<&Value>,
     allow_text_templates: bool,
 ) -> Result<(), Error> {
-    validate_launch_literal(profile, "profile")?;
+    if let Some(profile) = profile {
+        validate_launch_literal(profile, "profile")?;
+    }
     validate_launch_literal(workspace, "workspace")?;
+    if let Some(role) = role {
+        validate_launch_literal(role, "role")?;
+        crate::config::validate_routing_role(role)?;
+    }
+    if profile.is_some() && role.is_some() {
+        return Err(Error::new(
+            "invalid",
+            "launch profile and role are mutually exclusive",
+        ));
+    }
+    if let Some(assignment) = assignment {
+        if assignment.key.trim().is_empty()
+            || assignment.key.len() > 128
+            || !assignment.key.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+            || assignment.max_busy == 0
+            || assignment.max_busy > 1_000
+        {
+            return Err(Error::new(
+                "invalid",
+                "launch assignment requires a valid key and max_busy from 1 through 1000",
+            ));
+        }
+        validate_launch_literal(&assignment.key, "assignment key")?;
+        validate_launch_literal(&assignment.folder, "assignment folder")?;
+        if role.is_none() || profile.is_some() || text.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "assignment launch requires a role and cannot set profile or text",
+            ));
+        }
+    }
     if let Some(text) = text {
         validate_text_template(
             text,
@@ -1471,13 +1568,28 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         AgentActionDefinition::Launch(LaunchActionDefinition {
             profile,
             workspace,
+            role,
+            assignment,
             text,
         }) => {
-            validate_launch_action(profile, workspace, text.as_ref(), false)?;
+            validate_launch_action(
+                profile.as_deref(),
+                workspace,
+                role.as_deref(),
+                assignment.as_ref(),
+                text.as_ref(),
+                false,
+            )?;
             let text = text
                 .as_ref()
                 .map(|text| text.as_str().expect("validated launch text").to_owned());
-            return submit_launch_command(profile, workspace, text);
+            return submit_launch_command(
+                profile.as_deref(),
+                workspace,
+                role.as_deref(),
+                assignment.as_ref(),
+                text,
+            );
         }
     };
     let target = target_value
@@ -2657,6 +2769,25 @@ do = [{ action = 'git.fetch', repository = 'project-one', remote = 'origin', sou
             "action = 'launch', profile = 'fake', workspace = '/work/eliot', text = '${data.status}'",
         );
         assert_eq!(load(Cursor::new(templated)).unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn timer_assignment_launch_uses_role_and_preserves_settings_hint() {
+        let source = r#"
+[[rule]]
+id = 'assignment-muse-backlog'
+on = { every = '30s' }
+do = [{ action = 'launch', role = 'worker', workspace = 'C:/work', assignment = { key = 'muse-backlog', folder = 'C:/briefs', max_busy = 2 } }]
+"#;
+        let rule = load(Cursor::new(source)).unwrap().remove(0);
+        let command = rule.evaluate_timer().unwrap();
+        assert_eq!(command.verb, "launch");
+        assert_eq!(command.args["role"], "worker");
+        assert_eq!(command.args["workspace"], "C:/work");
+        assert_eq!(command.args["assignment"]["key"], "muse-backlog");
+        assert_eq!(command.args["assignment"]["folder"], "C:/briefs");
+        assert_eq!(command.args["assignment"]["max_busy"], 2);
+        assert!(command.args.get("profile").is_none());
     }
 
     #[test]

@@ -63,7 +63,7 @@ pub(super) fn command_payload_digest(request: &SubmitCommand) -> Result<Vec<u8>>
             .and_then(Value::as_object)
             .and_then(|choice| choice.get("source"))
             .and_then(Value::as_str)
-            == Some("settings.routing.default")
+            .is_some_and(|source| source.starts_with("settings.routing."))
     {
         let args = semantic_args
             .as_object_mut()
@@ -909,6 +909,21 @@ fn admit_launch_tx(
         ],
     ));
     let agent_num = tx.last_insert_rowid();
+    if let Some(choice) = request.args.get("profile_choice") {
+        let choice: core::RoutingDecision = serde_json::from_value(choice.clone())
+            .map_err(|_| Error::new("invalid", "invalid routing decision"))?;
+        if choice.profile.as_deref() != Some(profile.as_str()) {
+            return Err(Error::new(
+                "invalid",
+                "routing decision differs from launch profile",
+            ));
+        }
+        db!(tx.execute(
+            "UPDATE agents SET profile_choice=?1 WHERE id=?2",
+            params![encode_json(&choice)?, agent_num]
+        ));
+    }
+    assignment::commit_cursor_tx(tx, principal, request, now)?;
     let root_num = parent_link
         .as_ref()
         .map_or(agent_num, |parent| parent.root_num);
