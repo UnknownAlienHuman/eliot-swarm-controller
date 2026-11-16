@@ -171,10 +171,9 @@ impl Router {
         };
         let harness = required_text(&snapshot, "harness")?.to_owned();
         if let Some(parent) = parent {
-            if harness != parent.harness {
+            if hierarchy::inherit_child_launch_bounds(&mut snapshot, parent).is_err() {
                 return Ok(Err(RouteSkipReason::Unauthorized));
             }
-            hierarchy::inherit_parent_launch_bindings(&mut snapshot, &parent.profile_snapshot);
             let mut candidate = request.clone();
             candidate.args["profile"] = Value::String(name.to_owned());
             install_frozen_profile(&mut candidate, &harness, snapshot.clone(), true)?;
