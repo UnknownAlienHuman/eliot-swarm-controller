@@ -1069,6 +1069,11 @@ impl Router {
         resume_source_state: Option<Value>,
         linked_id: Option<String>,
     ) {
+        if let Err(error) = self.prepare_agent_artifact_root(&agent).await {
+            self.settle_plugin_error(id, &Error::new("native_not_dispatched", error.message))
+                .await;
+            return;
+        }
         let artifact_agent = agent.id.clone();
         let start = self
             .inner

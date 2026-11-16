@@ -437,10 +437,12 @@ impl PluginHost {
         known.extend([self.state.owner_token.clone(), reader.credential.clone()]);
         let metadata_secrets = metadata_secret_snapshot(&profile, &environment, known);
         let until = Instant::now() + READER_DEADLINE;
+        let mut archive_dispatched = false;
         let read = async {
             let manifest = reader.initialize(&harness, until).await?;
             require_proxy_capability(&profile, &manifest)?;
             let request = serde_json::json!({"profile": profile, "native_ref": native_ref});
+            archive_dispatched = true;
             let value = reader.client.call("native.archive", request, until).await?;
             if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
                 return Err(Error::new(
@@ -468,6 +470,11 @@ impl PluginHost {
             _ = stop.changed() => Err(Error::new("cancelled", "native.archive was cancelled")),
         };
         let result = result.map_err(|error| {
+            let error = if archive_dispatched {
+                Error::new("unknown", "native.archive may have taken effect; no replay")
+            } else {
+                error
+            };
             let message = error.message.clone();
             if message.contains("native.archive") {
                 error

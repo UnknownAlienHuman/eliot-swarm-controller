@@ -3,9 +3,12 @@
 ### Artifact roots
 
 `[daemon].artifact_roots` is an optional array of at most 32 absolute local
-directories (default empty). Agent artifact registration accepts descendants of
-these Owner-configured roots, in addition to its workspace and generation's
-private artifact root. Configured roots themselves and user/native configuration
+directories (default empty). Before native startup Swarm exclusively creates and
+durably binds `<first-root>/<agent>-<generation>/`; without a configured root it
+uses `<data-dir>/artifacts/<agent>-<generation>/`. `ELIOT_ARTIFACT_ROOT` hands this
+path to the Agent. Registration accepts only strict descendants of that exact
+generation root. Existing unbound directories are never adopted. Shared
+configured roots, workspace paths alone and user/native configuration
 remain protected. This does not scan or adopt existing unregistered files. See
 [registered artifacts and cleanup](coordination.md#registered-artifacts-and-cleanup-k69).
 The setting is available through the existing Daemon settings section. A folder assignment opts in with `[automation.assignments.<key>] cleanup_on_retire = true`
@@ -716,10 +719,10 @@ leaves other `pass_env` resolution unchanged. When `pass_env` admits the
 literal name `CARGO_TARGET_DIR`, admission also freezes its exact value in
 `profile_snapshot.target_dir` (absolute local path only; skipped otherwise).
 Cleanup backfills that frozen directory as a build artifact when it lies
-outside the Agent workspace and inside a configured artifact root. A shared
-daemon-wide value is exact for every Agent only when every Agent of the
-profile really builds there; per-Agent target directories must be registered
-by the Agent itself through `artifact.register`.
+outside the Agent workspace and inside its durably bound artifact root. A
+shared daemon-wide target is kept rather than attributed to an Agent. Agents
+should place their own target under `ELIOT_ARTIFACT_ROOT` and register it through
+`artifact.register`; targets containing hard-linked files stay `keep(hard_link)`.
 
 Retained mutation IDs hydrate their stored snapshot before any new capture. Admitted
 selector inputs are frozen at admission and are neither rewritten nor backfilled:

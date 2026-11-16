@@ -65,13 +65,16 @@ Register directories you create for an assignment with `artifact.register`
 `--purpose <short-description>`). Register your own `CARGO_TARGET_DIR` when
 it lies outside your checkout, temporary folders, screenshots, and any
 private daemon data directory you start through the `swarm` CLI. The
-directory must already exist inside your workspace, an Owner-configured
-`daemon.artifact_roots` entry, or your generation's private artifact root.
+directory must be one you create under `ELIOT_ARTIFACT_ROOT`, the new directory
+Swarm exclusively creates and durably binds before native startup. Use a child
+such as `$env:ELIOT_ARTIFACT_ROOT/target`; never register the root itself. A
+workspace or shared `daemon.artifact_roots` location alone is not ownership.
 Data directories stay `keep` while a private daemon lock or a live process
 holds them. Never register user/native configuration or stores. Swarm
 records managed worktrees and branches, declared scratch directories, and
 the frozen `CARGO_TARGET_DIR` passed through your profile from retained
-launch facts.
+launch facts only when inside this generation's bound root. Hard-linked files,
+nested repositories, `.git` and protected configuration keep the whole tree.
 
 A manager can review its subtree with `cleanup.plan {scope:"self_tree"}`
 (`swarm cleanup plan`), then consume that exact plan with

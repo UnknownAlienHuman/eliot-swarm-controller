@@ -531,8 +531,13 @@ impl CodexPlugin {
                 )
             })?;
         let (launch, secrets, metadata_secrets) = self.reader_launch(profile, &json!({}))?;
+        let binding =
+            frozen_store_binding(profile.as_object().ok_or_else(|| {
+                Error::new("profile_error", "archive requires a frozen profile")
+            })?)?;
         crate::discovery::archive_thread(
             launch,
+            &binding,
             native_ref.to_owned(),
             &metadata_secrets,
             &secrets,

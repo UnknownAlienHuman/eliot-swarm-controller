@@ -12,6 +12,60 @@ fn encoded(value: impl serde::Serialize) -> Result<Value> {
 }
 
 impl Router {
+    pub(super) async fn prepare_agent_artifact_root(&self, agent: &Agent) -> Result<()> {
+        let mut store = self.inner.store.lock().await;
+        if let Some(root) = store.agent_artifact_root(&agent.id, agent.generation)? {
+            if directory_identity(Path::new(&root.path))? != root.identity {
+                return Err(Error::new(
+                    "identity_changed",
+                    "Agent artifact root changed",
+                ));
+            }
+            return Ok(());
+        }
+        let config = crate::config::load_daemon_config(&self.inner.data_root)?;
+        let parent = match config.artifact_roots.first() {
+            Some(root) => std::fs::canonicalize(root)
+                .map_err(|_| Error::new("unavailable", "artifact root unavailable"))?,
+            None => {
+                let root = self.inner.data_root.join("artifacts");
+                std::fs::create_dir_all(&root)
+                    .map_err(|_| Error::new("unavailable", "artifact parent unavailable"))?;
+                std::fs::canonicalize(root)
+                    .map_err(|_| Error::new("unavailable", "artifact parent unavailable"))?
+            }
+        };
+        let parent = crate::platform::script_file::Directory::open(&parent)?;
+        let directory = parent.create_directory(&format!("{}-{}", agent.id, agent.generation))?;
+        let root = ArtifactView {
+            id: ulid::Ulid::new().to_string(),
+            agent: agent.id.clone(),
+            generation: agent.generation,
+            project: agent.project.clone(),
+            tree: Vec::new(),
+            path: directory.path.to_string_lossy().into_owned(),
+            kind: ArtifactKind::Other,
+            purpose: "Swarm artifact root".to_owned(),
+            identity: directory.identity()?,
+            created_at: now_ms(),
+            state: "ownership_root".to_owned(),
+            git: None,
+        };
+        store.record_known_artifact(root.clone())?;
+        if store
+            .agent_artifact_root(&agent.id, agent.generation)?
+            .as_ref()
+            .map(|row| (&row.path, &row.identity))
+            != Some((&root.path, &root.identity))
+        {
+            return Err(Error::new(
+                "conflict",
+                "artifact root custody could not be committed",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn record_agent_artifacts(&self, agent: &Agent) -> Result<()> {
         let workspace = self.inner.store.lock().await.get_workspace(&agent.id)?;
         let mut known = Vec::new();
@@ -111,7 +165,9 @@ impl Router {
             {
                 let path = Path::new(root).join(relative);
                 if let Ok(identity) = directory_identity(&path)
-                    && let Ok(path) = self.checked_artifact_path(agent, &path.to_string_lossy())
+                    && let Ok(path) = self
+                        .checked_artifact_path(agent, &path.to_string_lossy())
+                        .await
                 {
                     known.push(ArtifactView {
                         id: ulid::Ulid::new().to_string(),
@@ -153,7 +209,9 @@ impl Router {
             };
             if outside
                 && let Ok(identity) = directory_identity(target_path)
-                && let Ok(path) = self.checked_artifact_path(agent, &target_path.to_string_lossy())
+                && let Ok(path) = self
+                    .checked_artifact_path(agent, &target_path.to_string_lossy())
+                    .await
             {
                 known.push(ArtifactView {
                     id: ulid::Ulid::new().to_string(),
@@ -231,7 +289,7 @@ impl Router {
         }
         Ok(())
     }
-    fn checked_artifact_path(&self, agent: &Agent, path: &str) -> Result<PathBuf> {
+    async fn checked_artifact_path(&self, agent: &Agent, path: &str) -> Result<PathBuf> {
         let path = Path::new(path);
         if !path.is_absolute()
             || path.components().any(|p| match p {
@@ -239,9 +297,7 @@ impl Router {
                 Component::Normal(name) => name.to_str().is_none_or(|n| {
                     n.contains(':')
                         || n.ends_with(['.', ' '])
-                        || [".git", ".codex", ".claude", ".config", ".ssh"]
-                            .iter()
-                            .any(|x| n.eq_ignore_ascii_case(x))
+                        || crate::platform::script_file::protected_cleanup_name(n)
                 }),
                 _ => false,
             })
@@ -256,10 +312,20 @@ impl Router {
             .map_err(|_| Error::new("not_allowed", "artifact directory unavailable"))?;
         let daemon_root = std::fs::canonicalize(&self.inner.data_root)
             .map_err(|_| Error::new("unavailable", "daemon root unavailable"))?;
-        let own_temp = daemon_root
-            .join("artifacts")
-            .join(&agent.id)
-            .join(agent.generation.to_string());
+        let owned = self
+            .inner
+            .store
+            .lock()
+            .await
+            .agent_artifact_root(&agent.id, agent.generation)?
+            .ok_or_else(|| Error::new("not_allowed", "Agent has no Swarm-created artifact root"))?;
+        let own_temp = PathBuf::from(&owned.path);
+        if directory_identity(&own_temp)? != owned.identity {
+            return Err(Error::new(
+                "identity_changed",
+                "Agent artifact root changed",
+            ));
+        }
         if (canonical == daemon_root || daemon_root.starts_with(&canonical))
             || (canonical.starts_with(&daemon_root) && !canonical.starts_with(&own_temp))
         {
@@ -289,25 +355,10 @@ impl Router {
                 ));
             }
         }
-        let config = crate::config::load_daemon_config(&self.inner.data_root)?;
-        let mut roots: Vec<PathBuf> = config
-            .artifact_roots
-            .iter()
-            .filter_map(|p| std::fs::canonicalize(p).ok())
-            .collect();
-        roots.push(own_temp);
-        if let Some(workspace) = &agent.workspace
-            && let Ok(workspace) = std::fs::canonicalize(workspace)
-        {
-            roots.push(workspace);
-        }
-        if !roots
-            .iter()
-            .any(|root| canonical != *root && canonical.starts_with(root))
-        {
+        if canonical == own_temp || !canonical.starts_with(&own_temp) {
             return Err(Error::new(
                 "not_allowed",
-                "artifact is outside the Agent workspace, configured artifact roots and own temp root",
+                "artifact is outside the Agent generation's Swarm-created root",
             ));
         }
         Ok(canonical)
@@ -341,9 +392,9 @@ impl Router {
         if agent.generation != *generation {
             return Err(Error::new("stale_generation", "Agent generation changed"));
         }
-        let path = self.checked_artifact_path(&agent, &request.path)?;
-        let identity = directory_identity(&path)?;
         drop(store);
+        let path = self.checked_artifact_path(&agent, &request.path).await?;
+        let identity = directory_identity(&path)?;
         self.cleanup_check_git(&agent, &path).await?;
         let mut store = self.inner.store.lock().await;
         encoded(
@@ -495,14 +546,14 @@ impl Router {
 
     async fn cleanup_preflight(&self, artifact: &ArtifactView) -> Result<u64> {
         if artifact.kind == ArtifactKind::Worktree {
-            self.cleanup_worktree_clean(artifact).await?;
+            let marker = self.cleanup_worktree_clean(artifact).await?;
             #[cfg(windows)]
             {
                 let git = artifact
                     .git
                     .as_ref()
                     .ok_or_else(|| Error::new("invalid", "worktree Git binding absent"))?;
-                let tree = CleanupTree::open(Path::new(&artifact.path))?;
+                let tree = CleanupTree::open_worktree(Path::new(&artifact.path), &marker)?;
                 let admin = CleanupTree::open(Path::new(&git.admin))?;
                 if tree.identity != artifact.identity || admin.identity != git.admin_identity {
                     return Err(Error::new(
@@ -514,6 +565,7 @@ impl Router {
             }
             #[cfg(not(windows))]
             {
+                let _ = marker;
                 return Err(Error::new(
                     "unsupported",
                     "handle deletion unavailable on this platform",
@@ -543,16 +595,11 @@ impl Router {
             .await
             .get_agent(&artifact.agent)?
             .ok_or_else(|| Error::new("not_found", "Agent absent"))?;
-        let path = self.checked_artifact_path(&agent, &artifact.path)?;
+        let path = self.checked_artifact_path(&agent, &artifact.path).await?;
         self.cleanup_check_git(&agent, &path).await?;
         #[cfg(windows)]
         {
-            let tree = CleanupTree::open(&path).map_err(|_| {
-                Error::new(
-                    "busy_or_unsafe",
-                    "directory is held, linked or exceeds cleanup bounds",
-                )
-            })?;
+            let tree = CleanupTree::open(&path)?;
             if tree.identity != artifact.identity {
                 return Err(Error::new(
                     "identity_changed",
@@ -712,12 +759,7 @@ impl Router {
                     ));
                 }
             }
-            let native_ref = native_session_reference(artifact)?;
-            let mut profile =
-                crate::config::resolve_profile(&self.inner.data_root, &agent.profile)?;
-            crate::config::capture_native_store_inputs(&mut profile, |name| {
-                std::env::var_os(name)
-            })?;
+            let (profile, native_ref) = frozen_archive_profile(&agent, artifact)?;
             return self
                 .inner
                 .plugin_host
@@ -726,7 +768,13 @@ impl Router {
                 .map_err(|error| {
                     if matches!(
                         error.code.as_str(),
-                        "unavailable" | "unknown" | "cancelled" | "busy"
+                        "unavailable"
+                            | "unknown"
+                            | "cancelled"
+                            | "busy"
+                            | "native_readback"
+                            | "source_integrity"
+                            | "native_archive_failed"
                     ) {
                         // Transport, timeout or shutdown: the archive may or
                         // may not have happened. Never claim a skip.
@@ -738,14 +786,14 @@ impl Router {
                 .map(|()| 0);
         }
         if artifact.kind == ArtifactKind::Worktree {
-            self.cleanup_worktree_clean(artifact).await?;
+            let marker = self.cleanup_worktree_clean(artifact).await?;
             #[cfg(windows)]
             {
                 let git = artifact
                     .git
                     .as_ref()
                     .ok_or_else(|| Error::new("source_integrity", "worktree binding absent"))?;
-                let root = CleanupTree::open(Path::new(&artifact.path))?;
+                let root = CleanupTree::open_worktree(Path::new(&artifact.path), &marker)?;
                 let admin = CleanupTree::open(Path::new(&git.admin))?;
                 if root.identity != artifact.identity || admin.identity != git.admin_identity {
                     return Err(Error::new("identity_changed", "worktree identity changed"));
@@ -769,6 +817,7 @@ impl Router {
             }
             #[cfg(not(windows))]
             {
+                let _ = marker;
                 return Err(Error::new("unsupported", "handle deletion unavailable"));
             }
         }
@@ -779,16 +828,11 @@ impl Router {
             .await
             .get_agent(&artifact.agent)?
             .ok_or_else(|| Error::new("not_found", "Agent absent"))?;
-        let path = self.checked_artifact_path(&agent, &artifact.path)?;
+        let path = self.checked_artifact_path(&agent, &artifact.path).await?;
         self.cleanup_check_git(&agent, &path).await?;
         #[cfg(windows)]
         {
-            let tree = CleanupTree::open(&path).map_err(|_| {
-                Error::new(
-                    "busy_or_unsafe",
-                    "directory is held, linked or exceeds cleanup bounds",
-                )
-            })?;
+            let tree = CleanupTree::open(&path)?;
             if tree.identity != artifact.identity {
                 return Err(Error::new(
                     "identity_changed",
@@ -823,6 +867,9 @@ impl Router {
     }
 
     async fn cleanup_check_git(&self, agent: &Agent, path: &Path) -> Result<()> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|_| Error::new("unavailable", "artifact directory unavailable"))?;
+        let path = canonical.as_path();
         let workspace = agent
             .workspace
             .as_deref()
@@ -842,52 +889,59 @@ impl Router {
         };
         let probe = crate::git_monitor::GitProbe::new()?;
         let deadline = Instant::now() + Duration::from_secs(10);
-        let top = probe
-            .workspace_command(
-                root,
-                &["rev-parse", "--path-format=absolute", "--show-toplevel"],
-                deadline,
-            )
-            .await?;
-        if top.code != 0 {
-            return Err(Error::new(
-                "unavailable",
-                "artifact workspace Git identity unavailable",
-            ));
-        }
-        let top = std::str::from_utf8(&top.stdout)
-            .map_err(|_| Error::new("unavailable", "Git path unavailable"))?
-            .trim_end_matches(['\r', '\n']);
-        let top = std::fs::canonicalize(top)
-            .map_err(|_| Error::new("unavailable", "Git root unavailable"))?;
-        if path == top || top.starts_with(path) {
-            return Err(Error::new(
-                "tracked_content",
-                "repository root is protected",
-            ));
-        }
-        if path.starts_with(&top) {
-            let argument = crate::git_monitor::git_path_argument(path)?;
-            let files = probe
-                .workspace_command(root, &["ls-files", "-z", "--", &argument], deadline)
+        // Check both the retained workspace and the candidate's actual containing
+        // repository. Another checkout's tracked descendants are protected too.
+        for (location, required) in [(root, true), (path, false)] {
+            let top = probe
+                .workspace_command(
+                    location,
+                    &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+                    deadline,
+                )
                 .await?;
-            if files.code != 0 {
+            if top.code != 0 {
+                if !required && top.code == 128 {
+                    continue;
+                }
                 return Err(Error::new(
                     "unavailable",
-                    "tracked content check unavailable",
+                    "artifact Git identity unavailable",
                 ));
             }
-            if !files.stdout.is_empty() {
+            let top = std::str::from_utf8(&top.stdout)
+                .map_err(|_| Error::new("unavailable", "Git path unavailable"))?
+                .trim_end_matches(['\r', '\n']);
+            let top = std::fs::canonicalize(top)
+                .map_err(|_| Error::new("unavailable", "Git root unavailable"))?;
+            if path == top || top.starts_with(path) {
                 return Err(Error::new(
                     "tracked_content",
-                    "artifact contains tracked source",
+                    "repository root is protected",
                 ));
+            }
+            if path.starts_with(&top) {
+                let argument = crate::git_monitor::git_path_argument(path)?;
+                let files = probe
+                    .workspace_command(location, &["ls-files", "-z", "--", &argument], deadline)
+                    .await?;
+                if files.code != 0 {
+                    return Err(Error::new(
+                        "unavailable",
+                        "tracked content check unavailable",
+                    ));
+                }
+                if !files.stdout.is_empty() {
+                    return Err(Error::new(
+                        "tracked_content",
+                        "artifact contains tracked source",
+                    ));
+                }
             }
         }
         Ok(())
     }
 
-    async fn cleanup_worktree_clean(&self, artifact: &ArtifactView) -> Result<()> {
+    async fn cleanup_worktree_clean(&self, artifact: &ArtifactView) -> Result<String> {
         let git = artifact
             .git
             .as_ref()
@@ -908,6 +962,21 @@ impl Router {
         }
         let probe = crate::git_monitor::GitProbe::new()?;
         let root = Path::new(&git.worktree);
+        let directory = crate::platform::script_file::Directory::open(root)?;
+        let mut marker = directory.file(".git")?;
+        let marker_identity = serde_json::to_string(
+            &eliot_plugin::file_identity(&marker)
+                .map_err(|_| Error::new("identity_changed", "worktree pointer unavailable"))?,
+        )
+        .map_err(|_| Error::new("identity_changed", "worktree pointer unavailable"))?;
+        let pointer = crate::platform::script_file::read(&mut marker)?;
+        let pointer = std::str::from_utf8(&pointer)
+            .ok()
+            .and_then(|text| text.trim_end_matches(['\r', '\n']).strip_prefix("gitdir: "))
+            .ok_or_else(|| Error::new("identity_changed", "worktree pointer malformed"))?;
+        if std::fs::canonicalize(pointer).ok().as_deref() != Some(Path::new(&git.admin)) {
+            return Err(Error::new("identity_changed", "worktree pointer changed"));
+        }
         let admin = crate::platform::script_file::Directory::open(Path::new(&git.admin))?;
         let mut reverse = admin.file("gitdir")?;
         let reverse = crate::platform::script_file::read(&mut reverse)?;
@@ -969,7 +1038,7 @@ impl Router {
                 "worktree has tracked, untracked or ignored content",
             ));
         }
-        Ok(())
+        Ok(marker_identity)
     }
 
     /// Fetch the branch upstream and classify the local branch. `safe` means
@@ -1029,8 +1098,7 @@ impl Router {
             ));
         }
         let default_name =
-            Self::branch_default_name(data_root, &probe, repo, git, &remote, &url, deadline)
-                .await?;
+            Self::branch_default_name(data_root, git, &remote, &url, deadline).await?;
         let default_ref = format!("refs/remotes/{remote}/{default_name}");
         let default_tip =
             Self::branch_rev_parse(&probe, repo, &default_ref, "no_default_branch", deadline)
@@ -1206,8 +1274,6 @@ impl Router {
 
     async fn branch_default_name(
         data_root: &Path,
-        probe: &crate::git_monitor::GitProbe,
-        repo: &Path,
         git: &CleanupGitBinding,
         remote: &str,
         url: &str,
@@ -1234,6 +1300,7 @@ impl Router {
             let output = String::from_utf8_lossy(&symref.stdout);
             for line in output.lines() {
                 if let Some(rest) = line.strip_prefix("ref: ")
+                    && rest.split_whitespace().nth(1) == Some("HEAD")
                     && let Some(name) = rest
                         .split_whitespace()
                         .next()
@@ -1242,26 +1309,6 @@ impl Router {
                 {
                     return Ok(name.to_owned());
                 }
-            }
-        }
-        let local = probe
-            .workspace_command(
-                repo,
-                &["symbolic-ref", &format!("refs/remotes/{remote}/HEAD")],
-                deadline,
-            )
-            .await
-            .map_err(|_| {
-                Error::new("no_default_branch", "upstream default branch is unreadable")
-            })?;
-        if local.code == 0 {
-            let output = String::from_utf8_lossy(&local.stdout);
-            if let Some(name) = output
-                .trim()
-                .strip_prefix(&format!("refs/remotes/{remote}/"))
-                && crate::git_actions::valid_cleanup_branch(name)
-            {
-                return Ok(name.to_owned());
             }
         }
         Err(Error::new(
@@ -1529,6 +1576,42 @@ fn native_session_reference(artifact: &ArtifactView) -> Result<String> {
     Ok(reference.to_owned())
 }
 
+fn frozen_archive_profile(agent: &Agent, artifact: &ArtifactView) -> Result<(Value, String)> {
+    let reference = native_session_reference(artifact)?;
+    let profile = agent.profile_snapshot.clone();
+    let binding: eliot_core::NativeStoreBinding = profile
+        .get("native_store_binding")
+        .cloned()
+        .ok_or_else(|| {
+            Error::new(
+                "native_scope_unverified",
+                "archive requires the frozen native store",
+            )
+        })
+        .and_then(|value| {
+            serde_json::from_value(value).map_err(|_| {
+                Error::new(
+                    "native_scope_unverified",
+                    "frozen archive store is malformed",
+                )
+            })
+        })?;
+    if agent.id != artifact.agent
+        || agent.generation != artifact.generation
+        || agent.native_scope.as_deref() != Some(artifact.identity.as_str())
+        || agent.native_ref.as_deref() != Some(reference.as_str())
+        || binding.native_scope != artifact.identity
+        || agent.harness != "codex"
+        || profile["harness"] != "codex"
+    {
+        return Err(Error::new(
+            "native_scope_unverified",
+            "archive identity differs from the frozen native store",
+        ));
+    }
+    Ok((profile, reference))
+}
+
 impl Router {
     /// Keep a registered data directory while a private daemon lock or a
     /// live process holds it. A present `daemon.lock` with a live owner
@@ -1763,6 +1846,97 @@ mod tests {
     use super::*;
     use std::process::Command as OsCommand;
 
+    #[tokio::test]
+    async fn artifact_root_is_created_exclusively_and_bound_to_generation() {
+        let root = std::env::temp_dir().join(format!("eliot-root-{}", ulid::Ulid::new()));
+        std::fs::create_dir(&root).unwrap();
+        let router = super::super::tests::router_with_data_root(root.clone());
+        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        request.expected_generation = Some(0);
+        request.args = json!({"project":"p", "workspace":root, "harness":"codex", "profile":"fixture", "profile_snapshot":{}});
+        let agent = {
+            let mut store = router.inner.store.lock().await;
+            let admitted = store.submit("owner", request.clone(), now_ms()).unwrap();
+            store.dispatch(&admitted.command.id, now_ms()).unwrap();
+            store
+                .get_agent(admitted.command.target.as_deref().unwrap())
+                .unwrap()
+                .unwrap()
+        };
+        let path = root
+            .join("artifacts")
+            .join(format!("{}-{}", agent.id, agent.generation));
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(router.prepare_agent_artifact_root(&agent).await.is_err());
+        assert!(
+            router
+                .inner
+                .store
+                .lock()
+                .await
+                .agent_artifact_root(&agent.id, agent.generation)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir(&path).unwrap();
+        router.prepare_agent_artifact_root(&agent).await.unwrap();
+        let bound = router
+            .inner
+            .store
+            .lock()
+            .await
+            .agent_artifact_root(&agent.id, agent.generation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(directory_identity(&path).unwrap(), bound.identity);
+        router.prepare_agent_artifact_root(&agent).await.unwrap();
+        let child = path.join("output");
+        std::fs::create_dir(&child).unwrap();
+        assert!(
+            router
+                .checked_artifact_path(&agent, &child.to_string_lossy())
+                .await
+                .is_ok()
+        );
+        for reserved in [
+            ".git",
+            ".codex",
+            ".claude",
+            ".config",
+            ".ssh",
+            ".muse",
+            ".opencode",
+            ".antigravity",
+        ] {
+            let protected = path.join(reserved).join("descendant");
+            std::fs::create_dir_all(&protected).unwrap();
+            assert!(
+                router
+                    .checked_artifact_path(&agent, &protected.to_string_lossy())
+                    .await
+                    .is_err()
+            );
+        }
+        let sibling = root.join("artifacts").join("a999-1").join("output");
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(
+            router
+                .checked_artifact_path(&agent, &sibling.to_string_lossy())
+                .await
+                .is_err()
+        );
+        let mut later = agent;
+        later.generation += 1;
+        assert!(
+            router
+                .checked_artifact_path(&later, &child.to_string_lossy())
+                .await
+                .is_err()
+        );
+        drop(router);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn git(dir: &Path, args: &[&str]) -> String {
         let output = OsCommand::new("git")
             .arg("-C")
@@ -1893,6 +2067,38 @@ mod tests {
     }
 
     #[test]
+    fn archive_uses_frozen_profile_and_rejects_different_scope() {
+        let mut agent = Agent::new("a1", "p", "codex", "profile-removed-from-config", 1);
+        agent.generation = 1;
+        agent.native_scope = Some("frozen-scope".to_owned());
+        agent.native_ref = Some("thread".to_owned());
+        agent.profile_snapshot = json!({"harness":"codex", "pass_env":[], "pass_env_values":{"CODEX_HOME":null,"CODEX_SQLITE_HOME":null}, "native_store_binding":{"home":"C:/private/home", "root":"C:/private/sqlite", "native_scope":"frozen-scope"}});
+        let mut artifact = ArtifactView {
+            id: "artifact".to_owned(),
+            agent: agent.id.clone(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: Vec::new(),
+            path: "native:frozen-scope:thread".to_owned(),
+            kind: ArtifactKind::NativeSession,
+            purpose: "codex".to_owned(),
+            identity: "frozen-scope".to_owned(),
+            created_at: 1,
+            state: "registered".to_owned(),
+            git: None,
+        };
+        let (profile, reference) = frozen_archive_profile(&agent, &artifact).unwrap();
+        assert_eq!(profile, agent.profile_snapshot);
+        assert_eq!(reference, "thread");
+        artifact.identity = "other-scope".to_owned();
+        artifact.path = "native:other-scope:thread".to_owned();
+        assert_eq!(
+            frozen_archive_profile(&agent, &artifact).unwrap_err().code,
+            "native_scope_unverified"
+        );
+    }
+
+    #[test]
     fn daemon_lock_absent_is_clean_and_live_owner_keeps() {
         let dir = std::env::temp_dir().join(format!("eliot-lock-test-{}", ulid::Ulid::new()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1919,6 +2125,50 @@ mod tests {
             "daemon_lock_held"
         );
         finish(&dir);
+    }
+
+    #[tokio::test]
+    async fn another_repositories_tracked_descendants_are_protected() {
+        let (root, work) = scratch_repo("primary");
+        let other = root.join("other");
+        std::fs::create_dir_all(other.join("sources")).unwrap();
+        git(&other, &["init", "-b", "main"]);
+        std::fs::write(other.join("sources/code.rs"), "fn main() {}\n").unwrap();
+        git(&other, &["add", "-A"]);
+        git(&other, &["commit", "-m", "tracked"]);
+        let router = super::super::tests::router_with_data_root(root.clone());
+        let mut agent = Agent::new("a1", "p", "codex", "fixture", 1);
+        agent.workspace = Some(work.to_string_lossy().into_owned());
+        for candidate in [&other, &other.join("sources")] {
+            assert_eq!(
+                router
+                    .cleanup_check_git(&agent, candidate)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "tracked_content"
+            );
+        }
+        drop(router);
+        finish(&root);
+    }
+
+    #[tokio::test]
+    async fn stale_remote_head_cannot_replace_fresh_default_discovery() {
+        let (root, work) = scratch_repo("stale-head");
+        assert_eq!(
+            git(&work, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+            "refs/remotes/origin/main"
+        );
+        git(&work, &["branch", "merged"]);
+        // Fetch still succeeds, but the remote no longer advertises a default.
+        git(
+            &root.join("remote.git"),
+            &["symbolic-ref", "HEAD", "refs/heads/missing"],
+        );
+        let result = Router::classify_branch(&root, &binding(&work, "merged")).await;
+        assert_eq!(result.err().unwrap().code, "no_default_branch");
+        finish(&root);
     }
 
     #[tokio::test]

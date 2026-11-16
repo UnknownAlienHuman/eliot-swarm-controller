@@ -514,22 +514,28 @@ of the explicitly selected release scope.
 
 ## Later
 
-- [x] **K69 manager cleanup (owner clarification 2026-11-16, #384).**
-      Generation/tree artifact ledger, bounded plan/apply, handle deletion,
-      managed worktree cleanup, CLI and Advanced Settings are implemented.
-      Finish fresh-fetch branch merge verification/deletion, native archive
-      adapters, retirement-rule opt-in and exact target/private-daemon capture;
-      complete the manager/two-child live qualification before ticking K69.
-      Live qualification on 2026-11-16 (private release-build daemon, manager a1
-      with children a2/a3/a4 on scratch repos): merged branch k69-a removed after
-      second fresh-fetch re-verification; unmerged k69-b kept (unmerged); merged
-      k69-c kept (branch_checked_out: dirty worktree kept); both clean worktrees
-      removed; three cargo target dirs removed; live-held temp dir kept
-      (busy_or_unsafe); substituted junction refused at apply (not_allowed);
-      three Codex threads archived through thread/archive (verified in the native
-      store); 4,836,710 bytes reclaimed. Gate: fmt, locked all-targets build,
-      warnings-denied Clippy and 1,653 tests green across the six affected
-      packages. Private daemon drained; all scratch deleted.
+- [ ] **K69 manager cleanup (owner clarification 2026-11-16, #384).**
+      Implemented generation/tree artifact custody, bounded plan/apply, handle
+      deletion, branch verification, native archive, retirement opt-in, CLI and
+      Advanced Settings. The audit repair binds exclusive per-generation roots,
+      refuses hard links/repositories/configuration, requires a fresh remote
+      default, and preserves frozen native scope and uncertain archive fences.
+      Requalified on 2026-11-16 with a private release daemon and real Muse
+      `muse-spark-1.3-contributor`/low: manager a1 stopped children a2/a3 and
+      applied two plans, removing both managed worktrees, the merged branch,
+      temp/source artifacts and a released held directory (2,715 logical bytes).
+      The unmerged branch, initially dirty worktree, live-held directory, nested
+      repository, hard-linked Cargo targets and a substituted junction were
+      kept/refused as appropriate; sibling registration was denied. Static gate:
+      fmt, locked workspace all-targets build, warnings-denied Clippy and 2,014
+      tests passed. All owned processes exited and the private daemon drained.
+      Keep this item open: existing Agent policy prohibits managed-worktree
+      launches, so the private Owner created the children under the manager;
+      the exact manager-created-worktree scenario remains unqualified. Frozen
+      Codex archive scope and malformed acknowledgements have source/regression
+      coverage, without a native fault-injection run. Automatic approval review
+      blocked deletion of the private proof directory and five scratch directories
+      left by failing-before tests.
 
 Service continuity across daemon replacement requires an actual use case. The
 current contracts are not instructions to build that product in advance.

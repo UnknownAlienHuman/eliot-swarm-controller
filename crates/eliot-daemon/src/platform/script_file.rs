@@ -93,6 +93,30 @@ impl Directory {
         Ok(file)
     }
 
+    /// Create a new directory relative to the pinned parent. Never adopt an
+    /// existing directory as an Agent ownership root.
+    pub(crate) fn create_directory(&self, name: &str) -> Result<Self> {
+        plain(name)?;
+        let file = native::open(self.handle(), name.as_ref(), true, true).map_err(io)?;
+        check(&file, true)?;
+        let mut chain = self
+            .chain
+            .iter()
+            .map(File::try_clone)
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(io)?;
+        chain.push(file);
+        Ok(Self {
+            chain,
+            path: self.path.join(name),
+        })
+    }
+
+    pub(crate) fn identity(&self) -> Result<String> {
+        serde_json::to_string(&eliot_plugin::file_identity(self.handle()).map_err(io)?)
+            .map_err(|_| refused())
+    }
+
     /// Temp write/sync precedes the final handle identity/revision recheck.
     /// Caller holds the daemon save mutex through this entire operation.
     pub(crate) fn replace(
@@ -162,13 +186,24 @@ pub(crate) struct CleanupTree {
     entries: Vec<File>,
     pub(crate) identity: String,
     pub(crate) bytes: u64,
-    // (logical bytes, total links, names seen inside this tree) per identity.
-    shared: std::collections::HashMap<eliot_plugin::FileIdentity, (u64, u64, u64)>,
 }
 
 #[cfg(windows)]
 impl CleanupTree {
     pub(crate) fn open(path: &Path) -> Result<Self> {
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            cleanup_name(name)?;
+        }
+        Self::open_inner(path, None)
+    }
+
+    /// Only the exact reciprocal .git pointer already read through a held
+    /// handle may accompany a retained, clean Swarm worktree.
+    pub(crate) fn open_worktree(path: &Path, marker_identity: &str) -> Result<Self> {
+        Self::open_inner(path, Some(marker_identity))
+    }
+
+    fn open_inner(path: &Path, marker_identity: Option<&str>) -> Result<Self> {
         let parent = Directory::open(path.parent().ok_or_else(refused)?)?;
         let name = path.file_name().ok_or_else(refused)?;
         let root = native::open_cleanup(parent.handle(), name, true).map_err(|_| refused())?;
@@ -180,48 +215,65 @@ impl CleanupTree {
             entries: Vec::new(),
             identity,
             bytes: 0,
-            shared: std::collections::HashMap::new(),
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        tree.visit(root, 0, deadline)?;
-        // Shared inodes count once, and only when every link lives inside
-        // this tree; names with surviving outside links free no bytes.
-        tree.bytes = tree
-            .shared
-            .values()
-            .filter(|entry| entry.2 >= entry.1)
-            .try_fold(0u64, |total, entry| total.checked_add(entry.0))
-            .ok_or_else(refused)?;
+        tree.visit(root, 0, deadline, marker_identity)?;
         Ok(tree)
     }
 
-    fn visit(&mut self, directory: File, depth: usize, deadline: std::time::Instant) -> Result<()> {
+    fn visit(
+        &mut self,
+        directory: File,
+        depth: usize,
+        deadline: std::time::Instant,
+        marker_identity: Option<&str>,
+    ) -> Result<()> {
         if depth >= 64 {
             return Err(Error::new("unavailable", "cleanup depth bound"));
         }
-        for (name, is_dir) in native::children(&directory).map_err(io)? {
+        let children = native::children(&directory).map_err(io)?;
+        if ["HEAD", "objects", "refs"].iter().all(|expected| {
+            children
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(expected))
+        }) {
+            return Err(Error::new(
+                "protected_content",
+                "repository root is protected",
+            ));
+        }
+        for (name, is_dir) in children {
             if self.entries.len() >= 10_000 || std::time::Instant::now() >= deadline {
                 return Err(Error::new("unavailable", "cleanup tree exceeds scan bound"));
             }
-            plain(name.to_str().ok_or_else(refused)?)?;
+            let text = name.to_str().ok_or_else(refused)?;
+            plain(text)?;
+            let marker = depth == 0 && !is_dir && text == ".git" && marker_identity.is_some();
+            if !marker {
+                cleanup_name(text)?;
+            }
             let child = native::open_cleanup(&directory, &name, is_dir).map_err(|_| refused())?;
             if is_dir {
                 check(&child, true)?;
             } else {
                 check_cleanup_file(&child)?;
+                if marker
+                    && serde_json::to_string(&eliot_plugin::file_identity(&child).map_err(io)?)
+                        .map_err(|_| refused())?
+                        .as_str()
+                        != marker_identity.unwrap()
+                {
+                    return Err(Error::new(
+                        "identity_changed",
+                        "worktree .git pointer changed",
+                    ));
+                }
             }
             if is_dir {
-                self.visit(child, depth + 1, deadline)?;
+                self.visit(child, depth + 1, deadline, None)?;
             } else {
-                // Hard links share one identity and every name is deleted by
-                // handle, so deletion never disturbs names outside the tree.
-                let identity = eliot_plugin::file_identity(&child).map_err(|_| refused())?;
-                let links = native::links(&child).map_err(|_| refused())?;
                 let len = child.metadata().map_err(io)?.len();
-                self.shared
-                    .entry(identity)
-                    .and_modify(|slot| slot.2 = slot.2.saturating_add(1))
-                    .or_insert((len, links, 1));
+                self.bytes = self.bytes.checked_add(len).ok_or_else(refused)?;
                 self.entries.push(child);
             }
         }
@@ -232,6 +284,20 @@ impl CleanupTree {
     /// Every error after the first attempted disposition is unknown. No retry.
     pub(crate) fn remove(mut self) -> Result<u64> {
         for file in self.entries.drain(..) {
+            let unknown = |_| {
+                Error::new(
+                    "unknown",
+                    "cleanup validation failed after reservation; no replay",
+                )
+            };
+            if file.metadata().map_err(unknown)?.is_file()
+                && native::links(&file).map_err(unknown)? != 1
+            {
+                return Err(Error::new(
+                    "unknown",
+                    "link count changed after preflight; no replay",
+                ));
+            }
             native::delete_handle(&file)
                 .map_err(|_| Error::new("unknown", "partial cleanup; no replay"))?;
             drop(file);
@@ -273,31 +339,62 @@ mod cleanup_tests {
     }
 
     #[test]
-    fn hardlinked_pair_inside_tree_counts_shared_bytes_once() {
+    fn hardlinked_pair_inside_tree_is_kept() {
         let root = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("first"), b"1234567").unwrap();
         std::fs::hard_link(root.join("first"), root.join("second")).unwrap();
-        let tree = CleanupTree::open(&root).unwrap();
-        assert_eq!(tree.bytes, 7);
-        assert_eq!(tree.remove().unwrap(), 7);
-        assert!(!root.exists());
+        assert_eq!(CleanupTree::open(&root).err().unwrap().code, "hard_link");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn externally_linked_file_removes_names_but_claims_no_bytes() {
+    fn externally_linked_file_is_kept() {
         let parent = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
         let root = parent.join("tree");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("inner"), b"1234567").unwrap();
         std::fs::hard_link(root.join("inner"), parent.join("outer")).unwrap();
-        let tree = CleanupTree::open(&root).unwrap();
-        assert_eq!(tree.bytes, 0);
-        assert_eq!(tree.remove().unwrap(), 0);
-        assert!(!root.exists());
+        assert_eq!(CleanupTree::open(&root).err().unwrap().code, "hard_link");
+        assert!(root.join("inner").exists());
         assert_eq!(std::fs::read(parent.join("outer")).unwrap(), b"1234567");
+        std::fs::remove_file(root.join("inner")).unwrap();
+        std::fs::remove_dir(&root).unwrap();
         std::fs::remove_file(parent.join("outer")).unwrap();
         std::fs::remove_dir(&parent).unwrap();
+    }
+
+    #[test]
+    fn cleanup_handles_prevent_leaf_and_ancestor_rename() {
+        assert_eq!(
+            native::CLEANUP_SHARE_MODE & windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+            0
+        );
+        let parent = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+        let root = parent.join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("leaf"), b"owned").unwrap();
+        let tree = CleanupTree::open(&root).unwrap();
+        assert!(std::fs::rename(root.join("leaf"), parent.join("escaped")).is_err());
+        assert!(std::fs::rename(&root, parent.join("moved")).is_err());
+        tree.remove().unwrap();
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn cleanup_refuses_nested_repository_and_protected_config_entries() {
+        for name in [".git", ".codex", ".claude", ".config", ".ssh"] {
+            let root = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+            std::fs::create_dir_all(root.join("nested")).unwrap();
+            drop(CleanupTree::open(&root).unwrap());
+            std::fs::write(root.join("nested").join(name), b"protected").unwrap();
+            assert_eq!(
+                CleanupTree::open(&root).err().unwrap().code,
+                "protected_content"
+            );
+            assert!(root.join("nested").join(name).exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -342,13 +439,43 @@ fn check(file: &File, directory: bool) -> Result<()> {
     Ok(())
 }
 
-// Cleanup-tree file check: reparse points stay refused, but hard links are
-// tolerated because every name is opened and deleted by handle. Callers count
-// shared bytes once per identity and only when all links live inside the tree.
+#[cfg(windows)]
+fn cleanup_name(name: &str) -> Result<()> {
+    if protected_cleanup_name(name) {
+        return Err(Error::new(
+            "protected_content",
+            "repository or configuration entry is protected",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn protected_cleanup_name(name: &str) -> bool {
+    [
+        ".git",
+        ".codex",
+        ".claude",
+        ".config",
+        ".ssh",
+        ".muse",
+        ".opencode",
+        ".antigravity",
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
+#[cfg(windows)]
 fn check_cleanup_file(file: &File) -> Result<()> {
     let metadata = file.metadata().map_err(|_| refused())?;
     if crate::platform::is_reparse_point(&metadata) || !metadata.is_file() {
         return Err(refused());
+    }
+    if native::links(file).map_err(|_| refused())? != 1 {
+        return Err(Error::new(
+            "hard_link",
+            "cleanup refuses files with multiple links",
+        ));
     }
     Ok(())
 }
@@ -400,6 +527,8 @@ mod native {
     };
     use windows_sys::Win32::Storage::FileSystem::*;
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    pub(super) const CLEANUP_SHARE_MODE: u32 = 0;
 
     pub(super) fn anchor(path: &Path) -> io::Result<File> {
         // GetDriveTypeW return value from Microsoft Learn; the binding's named
@@ -466,12 +595,9 @@ mod native {
         };
         // Deny ordinary file writes while read/revision handles remain open;
         // delete sharing is necessary for atomic replacement of an open entry.
-        // Cleanup file opens share reads and deletes so every hardlink name
-        // of one file can be held at once; writes stay denied.
-        let share = if cleanup && !directory {
-            FILE_SHARE_READ | FILE_SHARE_DELETE
-        } else if cleanup {
-            0
+        // Cleanup excludes rename/delete and writes until disposition/close.
+        let share = if cleanup {
+            CLEANUP_SHARE_MODE
         } else if directory {
             FILE_SHARE_READ | FILE_SHARE_WRITE
         } else {
@@ -694,6 +820,12 @@ mod native {
         create: bool,
     ) -> io::Result<File> {
         let name = name(raw)?;
+        if directory
+            && create
+            && unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         let flags = libc::O_CLOEXEC
             | libc::O_NOFOLLOW
             | libc::O_NONBLOCK

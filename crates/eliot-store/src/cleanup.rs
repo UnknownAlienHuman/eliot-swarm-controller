@@ -4,6 +4,23 @@ use super::*;
 use eliot_core::api::*;
 
 impl Store {
+    /// Internal, non-deletable custody row committed before the native Agent
+    /// receives its new directory. Legacy paths are never adopted as roots.
+    pub fn agent_artifact_root(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<ArtifactView>> {
+        let body: Option<String> = self.connection.query_row(
+            "SELECT body FROM artifacts WHERE agent=?1 AND generation=?2 AND json_extract(body,'$.state')='ownership_root'",
+            params![parse_agent_id(agent)?, generation], |row| row.get(0),
+        ).optional().map_err(sql_error)?;
+        body.map(|body| {
+            serde_json::from_str(&body)
+                .map_err(|_| Error::new("source_integrity", "invalid artifact root"))
+        })
+        .transpose()
+    }
     pub fn cleanup_visible_agent(&self, principal: &str, agent: &Agent) -> Result<bool> {
         match parse_sender(principal, "cleanup")? {
             Sender::Owner => Ok(true),
@@ -205,6 +222,9 @@ impl Store {
         for body in bodies {
             let artifact: ArtifactView = serde_json::from_str(&body.map_err(sql_error)?)
                 .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
+            if artifact.state == "ownership_root" {
+                continue;
+            }
             if request
                 .project
                 .as_ref()
@@ -286,6 +306,24 @@ impl Store {
                 "artifact needs a current live Agent",
             ));
         }
+        let root = self
+            .agent_artifact_root(&agent.id, generation)?
+            .ok_or_else(|| Error::new("not_allowed", "Agent has no Swarm-created artifact root"))?;
+        let normalized = |value: &str| {
+            std::path::PathBuf::from(if cfg!(windows) {
+                value.to_lowercase()
+            } else {
+                value.to_owned()
+            })
+        };
+        let proposed = normalized(path);
+        let owned = normalized(&root.path);
+        if proposed == owned || !proposed.starts_with(&owned) {
+            return Err(Error::new(
+                "not_allowed",
+                "artifact is outside the Agent generation's durable root",
+            ));
+        }
         let mut tree = Vec::new();
         let mut current = Some(agent.clone());
         while let Some(row) = current {
@@ -327,6 +365,9 @@ impl Store {
                 .map_err(sql_error)?;
             for existing in paths {
                 let existing = existing.map_err(sql_error)?;
+                if existing == root.path {
+                    continue;
+                }
                 let existing = std::path::PathBuf::from(if cfg!(windows) {
                     existing.to_lowercase()
                 } else {
@@ -627,6 +668,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registration_requires_durable_generation_root() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','idle',1,?1,?1)",[now]).unwrap();
+        let root = ArtifactView {
+            id: Ulid::new().to_string(),
+            agent: "a1".to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: Vec::new(),
+            path: "C:/scratch/a1-1".to_owned(),
+            kind: ArtifactKind::Other,
+            purpose: "Swarm artifact root".to_owned(),
+            identity: "root".to_owned(),
+            created_at: now,
+            state: "ownership_root".to_owned(),
+            git: None,
+        };
+        store.record_known_artifact(root).unwrap();
+        for path in [
+            "C:/scratch/a2-1/output",
+            "C:/scratch/owner/output",
+            "C:/scratch/a1-1",
+        ] {
+            let request = ArtifactRegisterRequest {
+                id: Ulid::new().to_string(),
+                path: path.to_owned(),
+                kind: ArtifactKind::Temp,
+                purpose: "scratch".to_owned(),
+            };
+            assert!(
+                store
+                    .register_artifact("agent:a1:1", &request, path, "leaf", now)
+                    .is_err(),
+                "claimed {path}"
+            );
+        }
+        let path = "C:/scratch/a1-1/output";
+        let request = ArtifactRegisterRequest {
+            id: Ulid::new().to_string(),
+            path: path.to_owned(),
+            kind: ArtifactKind::Temp,
+            purpose: "scratch".to_owned(),
+        };
+        store
+            .register_artifact("agent:a1:1", &request, path, "leaf", now)
+            .unwrap();
+    }
+
+    #[test]
     fn consumed_plan_replays_unknown_and_blocks_another_attempt() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
@@ -666,9 +757,14 @@ mod tests {
             plan_id: plan.plan_id.clone(),
             delete_remote: false,
         };
-        let (_, first, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
+        let (_, mut first, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
         assert!(is_new);
         assert_eq!(first.items[0].outcome, "unknown");
+        first.items[0].reason = Some("malformed_archive_acknowledgement".to_owned());
+        let outcome = first.items[0].clone();
+        store
+            .settle_cleanup_item("owner", &request, &first, &artifact, &outcome)
+            .unwrap();
         let (_, replay, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
         assert!(!is_new);
         assert_eq!(
