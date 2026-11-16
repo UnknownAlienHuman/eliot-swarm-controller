@@ -74,6 +74,11 @@ pub(crate) enum CliCommand {
     /// List installed harness executables with versions. Starts no model
     /// turn and performs no inference.
     Harnesses,
+    /// Read the per-harness installed-vs-verified drift report. Read-only;
+    /// starts no model turn and performs no inference.
+    Doctor,
+    /// Read heavy child-process episodes with per-Agent totals over a window.
+    Heavy(HeavyArgs),
     /// Read a harness native model catalogue through its own read-only
     /// method. Starts no model turn and performs no inference.
     Models(ModelsArgs),
@@ -530,6 +535,17 @@ pub(crate) struct StatsArgs {
     pub(crate) agent: String,
     #[command(flatten)]
     pub(crate) generation: ReadGenerationArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct HeavyArgs {
+    #[arg(long, value_name = "AGENT")]
+    pub(crate) agent: Option<String>,
+    #[command(flatten)]
+    pub(crate) generation: ReadGenerationArgs,
+    /// Window in seconds; defaults to 3600.
+    #[arg(long, value_name = "SECS")]
+    pub(crate) window_secs: Option<u64>,
 }
 
 #[derive(Args)]

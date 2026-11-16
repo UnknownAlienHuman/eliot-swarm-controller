@@ -159,6 +159,12 @@ async fn run_owned(
     let cloud_mcp_config = crate::config::load_cloud_mcp_config(data_dir.path())?;
     let attention_suspicion_window =
         Duration::from_secs(daemon_config.attention_suspicion_secs as u64);
+    // Install [daemon] observe thresholds once: monitor sweeps and Router
+    // readbacks share them; the daemon never re-reads the file per sweep.
+    router.set_observe_thresholds(crate::monitor::ObserveThresholds {
+        heavy: daemon_config.heavy_thresholds()?,
+        growth: daemon_config.session_growth_thresholds()?,
+    });
     // Install `[daemon.limits]` once, before IPC binds: every launch and
     // selector admission in this run checks these bounds.
     {

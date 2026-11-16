@@ -3,7 +3,8 @@
 use super::process_observation::unknown_sample;
 #[cfg(target_os = "linux")]
 use super::process_observation::{
-    LinuxProcessStat, MAX_PROCESS_SAMPLES, SweepEntry, exited_sample, select_sweep_members,
+    CommandClass, LinuxProcessStat, MAX_PROCESS_SAMPLES, SweepEntry, exited_sample,
+    select_sweep_members,
 };
 use eliot_core::{Error, ProcessSample, ProcessSnapshot, Result};
 #[cfg(target_os = "linux")]
@@ -1020,6 +1021,88 @@ fn check_path_components(path: &Path) -> Result<()> {
 
 fn io_error(action: &str, error: std::io::Error) -> Error {
     Error::new("platform_io", format!("{action}: {error}"))
+}
+
+/// Ancestor depth bound for heavy attribution: the harness wrapper, driver
+/// and compiler sit within a few levels; anything deeper is not one command.
+#[cfg(target_os = "linux")]
+const HEAVY_ANCESTOR_DEPTH: usize = 8;
+/// Cap on one argv read: only the program plus its first tokens ever matter
+/// downstream, and the full body never persists.
+#[cfg(target_os = "linux")]
+const MAX_HEAVY_ARGV_TOKENS: usize = 64;
+
+/// Bounded argv for one Linux process from `/proc/<pid>/cmdline`
+/// (`proc(5)`). Missing, unreadable, empty, overlong or exited processes
+/// fail closed to None; only the first 64 KiB of cmdline are ever read.
+#[cfg(target_os = "linux")]
+fn proc_argv(pid: u32) -> Option<Vec<String>> {
+    if pid == 0 {
+        return None;
+    }
+    let mut body = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    body.truncate(64 * 1024);
+    let mut args = eliot_core::split_unix_cmdline(&body);
+    if args.is_empty() || args.len() > MAX_HEAVY_ARGV_TOKENS {
+        return None;
+    }
+    if args.iter().any(|token| token.len() > 32_768) {
+        return None;
+    }
+    args.truncate(MAX_HEAVY_ARGV_TOKENS);
+    Some(args)
+}
+
+/// Parent pid for heavy attribution from `/proc/<pid>/stat` (`proc(5)`):
+/// the comm field may hold spaces and parens, so the fields after the last
+/// `)` are read and the ppid is the second one. Missing or unparsable
+/// results fail closed to None.
+#[cfg(target_os = "linux")]
+fn proc_parent_pid(pid: u32) -> Option<u32> {
+    if pid == 0 {
+        return None;
+    }
+    let body = fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let text = std::str::from_utf8(&body).ok()?;
+    let after = text.rsplit(')').next()?;
+    let mut fields = after.split_whitespace();
+    let _state = fields.next()?;
+    let ppid: u32 = fields.next()?.parse().ok()?;
+    if ppid == 0 {
+        return None;
+    }
+    Some(ppid)
+}
+
+/// Bounded program identity for one Linux process: its own argv plus
+/// ancestors' argv (nearest first) resolve through harness plumbing (console
+/// hosts, the shell wrapper) to the program that actually consumed the
+/// resources, via `eliot_core::resolve_heavy_category`. Missing, unreadable
+/// or exited processes fail closed to None; only the first 64 KiB of each
+/// cmdline are ever read and full argv never persists.
+#[cfg(target_os = "linux")]
+pub(crate) fn resolve_heavy_category(pid: u32) -> Option<CommandClass> {
+    let own = proc_argv(pid)?;
+    let mut ancestors: Vec<Vec<String>> = Vec::new();
+    let mut seen: Vec<u32> = vec![pid];
+    let mut cursor = proc_parent_pid(pid);
+    while let Some(ppid) = cursor {
+        if ancestors.len() >= HEAVY_ANCESTOR_DEPTH || seen.contains(&ppid) || ppid == 0 {
+            break;
+        }
+        seen.push(ppid);
+        match proc_argv(ppid) {
+            Some(argv) => {
+                ancestors.push(argv);
+                cursor = proc_parent_pid(ppid);
+            }
+            None => break,
+        }
+    }
+    eliot_core::resolve_heavy_category(&own, &ancestors).map(|category| CommandClass {
+        category,
+        source: eliot_core::CATEGORY_SOURCE_CMDLINE,
+    })
 }
 
 #[cfg(test)]

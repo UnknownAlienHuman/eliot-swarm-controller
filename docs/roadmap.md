@@ -167,6 +167,11 @@ sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
       exact-subject attach; gap-backed `observe` to `transcript` handoff and bounded
       reconciliation. Commit ownership/cursor boundaries before publication; keep
       private history private and never replay an uncertain external effect.
+- [x] **L3.3d Observe what matters.** `activity.heavy` episodes with basename-only
+      categories, `session.growth` warnings with no auto-compact, and `harness.drift`
+      against pinned verified contracts surface in `swarm top` (`OBS`), `swarm stats`,
+      `swarm heavy`, `swarm doctor` and the desktop Details Observe section.
+
 - [x] **L3.4 Proxy/capacity.** First attach to an already-running OpenCodex endpoint.
       Add managed service launch only when actually needed. Add account/proxy caps and
       persistent provider holds with that route; freeze admitted nonsecret route/store

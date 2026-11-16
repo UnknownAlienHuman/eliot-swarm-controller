@@ -806,6 +806,8 @@ mod tests {
                 usage: None,
                 usage_scope: None,
                 updated_at: 0,
+                heavy: None,
+                session_growth: None,
             },
             observation: None,
         };
@@ -853,6 +855,8 @@ mod tests {
             usage,
             usage_scope: usage_scope.map(str::to_owned),
             updated_at: 0,
+            heavy: None,
+            session_growth: None,
         };
         let make_row = |usage: Option<TurnUsage>, usage_scope: Option<&str>| {
             MonitorRow::from_list(&AgentListRow {

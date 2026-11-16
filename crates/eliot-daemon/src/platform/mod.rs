@@ -16,6 +16,7 @@ pub(crate) mod windows;
 pub use custody::{CustodyGuarantee, OwnedChild, RestartCustody, restart_custody};
 pub use data_dir::DataDir;
 pub use ipc::{IpcListener, IpcStream};
+pub(crate) use process_observation::CommandClass;
 pub use process_observation::CustodyObserver;
 
 pub(crate) fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {

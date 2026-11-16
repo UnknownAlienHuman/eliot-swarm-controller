@@ -1,7 +1,7 @@
 //! Read-only agent views and their table rendering.
 use super::args::{
-    EditsArgs, EventsArgs, GenerationArgs, GitStatusArgs, HistoryArgs, ListFilterArgs, LsArgs,
-    PageArgs, ProcessesArgs, ReadGenerationArgs, ResultArgs, ShowArgs, StatsArgs, TopArgs,
+    EditsArgs, EventsArgs, GenerationArgs, GitStatusArgs, HeavyArgs, HistoryArgs, ListFilterArgs,
+    LsArgs, PageArgs, ProcessesArgs, ReadGenerationArgs, ResultArgs, ShowArgs, StatsArgs, TopArgs,
     UsageArgs, WatchArgs,
 };
 use super::support::read_and_print;
@@ -13,7 +13,8 @@ use eliot_core::api::{
     AgentProcessesRequest, AgentProcessesResponse, AgentResultRequest, AgentResultResponse,
     AgentStatsRequest, AgentStatsResponse, EventsBoundsRequest, EventsBoundsResponse, EventsFilter,
     EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
-    ObservationPage, TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse,
+    HarnessDoctorRequest, HarnessDoctorResponse, ObservationPage, ObserveHeavyRequest,
+    ObserveHeavyResponse, TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{AgentState, Error as CoreError, NativeChildActivityState};
 use serde_json::Value;
@@ -150,13 +151,83 @@ pub(crate) async fn run_stats(
         id: agent,
         generation,
     };
-    read_and_print!(
-        &data_dir,
-        json_output,
-        "agent.stats",
-        params,
-        AgentStatsResponse
-    )
+    if json_output {
+        read_and_print!(
+            &data_dir,
+            json_output,
+            "agent.stats",
+            params,
+            AgentStatsResponse
+        )
+    } else {
+        params
+            .validate()
+            .map_err(|error| Failure::from_core(error, false))?;
+        let response: AgentStatsResponse =
+            eliot_daemon::client_call_typed(&data_dir, "agent.stats", &params)
+                .await
+                .map_err(|error| Failure::from_core(error, false))?;
+        params
+            .validate_response(&response)
+            .map_err(|error| Failure::from_core(error, false))?;
+        print_stats_table(&response);
+        Ok(0)
+    }
+}
+
+/// Observe readback for `swarm stats`: the heavy-work rollup and the live
+/// session-growth state. `--json` keeps the raw response; this table never
+/// replaces it.
+pub(crate) fn print_stats_table(response: &AgentStatsResponse) {
+    println!(
+        "stats {}#{} heavy {} growth {}",
+        response.agent,
+        response.generation,
+        heavy_cell(response.heavy.as_ref()),
+        growth_cell(response.session_growth.as_ref()),
+    );
+    if let Some(heavy) = &response.heavy {
+        println!(
+            "  heavy episodes {} latest {} cpu_ms {}",
+            heavy.episodes,
+            heavy.latest_category.as_deref().unwrap_or("-"),
+            heavy.total_cpu_ms,
+        );
+    }
+    if let Some(growth) = &response.session_growth {
+        println!(
+            "  growth basis {} message {}",
+            growth.basis.as_deref().unwrap_or("-"),
+            growth.message.as_deref().unwrap_or("-"),
+        );
+    }
+}
+
+/// Compact heavy cell for agent tables: - when no heavy episode was ever
+/// recorded, otherwise `<episodes>:<category>` (for example `3:cargo-build`).
+pub(crate) fn heavy_cell(heavy: Option<&eliot_core::api::HeavySummaryView>) -> String {
+    match heavy {
+        None => "-".to_owned(),
+        Some(heavy) => format!(
+            "{}{}",
+            heavy.episodes,
+            heavy
+                .latest_category
+                .as_deref()
+                .map(|category| format!(":{category}"))
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// Compact growth cell for agent tables: - while the retained session
+/// signal sits below every threshold, otherwise `!<basis>` (for example
+/// `!tokens`).
+pub(crate) fn growth_cell(growth: Option<&eliot_core::api::SessionGrowthView>) -> String {
+    match growth {
+        None => "-".to_owned(),
+        Some(growth) => format!("!{}", growth.basis.as_deref().unwrap_or("growth")),
+    }
 }
 
 pub(crate) async fn run_usage(
@@ -196,6 +267,126 @@ pub(crate) async fn run_usage(
             .map_err(|error| Failure::from_core(error, false))?;
         print_usage_table(&response);
         Ok(0)
+    }
+}
+
+pub(crate) async fn run_doctor(data_dir: PathBuf, json_output: bool) -> Result<u8, Failure> {
+    let params = HarnessDoctorRequest {};
+    if json_output {
+        read_and_print!(
+            &data_dir,
+            json_output,
+            "harness.doctor",
+            params,
+            HarnessDoctorResponse
+        )
+    } else {
+        params
+            .validate()
+            .map_err(|error| Failure::from_core(error, false))?;
+        let response: HarnessDoctorResponse =
+            eliot_daemon::client_call_typed(&data_dir, "harness.doctor", &params)
+                .await
+                .map_err(|error| Failure::from_core(error, false))?;
+        params
+            .validate_response(&response)
+            .map_err(|error| Failure::from_core(error, false))?;
+        print_doctor_table(&response);
+        Ok(0)
+    }
+}
+
+pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
+    println!(
+        "{:<12} {:<9} {:<14} {:<16} {:<5} DOC",
+        "HARNESS", "INSTALLED", "VERSION", "VERIFIED", "DRIFT"
+    );
+    for entry in &response.harnesses {
+        println!(
+            "{:<12} {:<9} {:<14} {:<16} {:<5} {}",
+            entry.harness,
+            yes_no(entry.installed),
+            entry.version.as_deref().unwrap_or("-"),
+            entry.verified_version,
+            yes_no(entry.drift),
+            entry.doc_section,
+        );
+        if let Some(message) = &entry.drift_message {
+            println!("  drift: {message}");
+        }
+        if let Some(mismatch) = &entry.contract_mismatch {
+            println!("  contract mismatch: {mismatch}");
+        }
+    }
+}
+
+pub(crate) async fn run_heavy(
+    HeavyArgs {
+        agent,
+        generation: ReadGenerationArgs { generation },
+        window_secs,
+    }: HeavyArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let params = ObserveHeavyRequest {
+        agent,
+        generation,
+        window_secs,
+    };
+    if json_output {
+        read_and_print!(
+            &data_dir,
+            json_output,
+            "observe.heavy",
+            params,
+            ObserveHeavyResponse
+        )
+    } else {
+        params
+            .validate()
+            .map_err(|error| Failure::from_core(error, false))?;
+        let response: ObserveHeavyResponse =
+            eliot_daemon::client_call_typed(&data_dir, "observe.heavy", &params)
+                .await
+                .map_err(|error| Failure::from_core(error, false))?;
+        params
+            .validate_response(&response)
+            .map_err(|error| Failure::from_core(error, false))?;
+        print_heavy_table(&response);
+        Ok(0)
+    }
+}
+
+pub(crate) fn print_heavy_table(response: &ObserveHeavyResponse) {
+    println!(
+        "Heavy work over the last {} s (since {}):",
+        response.window_secs, response.since
+    );
+    println!(
+        "{:<8} {:<8} {:<10} {:<10} {:<12} LATEST",
+        "AGENT", "EPISODES", "WALL_S", "CPU_S", "PEAK_RSS_B"
+    );
+    for totals in &response.agents {
+        println!(
+            "{:<8} {:<8} {:<10} {:<10} {:<12} {}",
+            totals.agent,
+            totals.episodes.len(),
+            totals.total_duration_ms / 1000,
+            totals.total_cpu_ms / 1000,
+            totals.peak_rss_bytes,
+            totals
+                .episodes
+                .first()
+                .map(|episode| episode.category.as_str())
+                .unwrap_or("-"),
+        );
+    }
+    if response.truncated {
+        println!("truncated: the window holds more episodes than shown");
+    }
+    if response.agents.is_empty() {
+        println!("no heavy episodes in this window");
     }
 }
 
@@ -650,11 +841,24 @@ pub(crate) async fn read_agent_list(
 /// `DATA` reports observation data availability only, never freshness or
 /// liveness. `--json` keeps printing the raw response; this table never
 /// replaces it.
+/// Compact observe cell for `swarm top`: `-` when no heavy episode was ever
+/// recorded and growth sits below every threshold, otherwise the heavy and
+/// growth cells (for example `3:cargo-build -` or `- !tokens`).
+pub(crate) fn observe_cell(summary: &AgentSummary) -> String {
+    let heavy = heavy_cell(summary.heavy.as_ref());
+    let growth = growth_cell(summary.session_growth.as_ref());
+    if heavy == "-" && growth == "-" {
+        "-".to_owned()
+    } else {
+        format!("{heavy} {growth}")
+    }
+}
+
 pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations: bool) {
     if with_observations {
         println!(
-            "{:<6} {:<4} {:<22} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12}",
-            "ID", "GEN", "STATE", "ACTIVITY", "ACT_TURN", "AGE", "LAST_OUT", "USAGE", "DATA"
+            "{:<6} {:<4} {:<22} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12} {:<14}",
+            "ID", "GEN", "STATE", "ACTIVITY", "ACT_TURN", "AGE", "LAST_OUT", "USAGE", "DATA", "OBS"
         );
     } else {
         println!(
@@ -700,7 +904,7 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                 })
                 .unwrap_or_else(|| "-".to_owned());
             println!(
-                "{:<6} {:<4} {:<22} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12}",
+                "{:<6} {:<4} {:<22} {:<11} {:<12} {:<6} {:<11} {:<11} {:<12} {:<14}",
                 truncate_cell(&summary.id, 6),
                 summary.generation,
                 truncate_cell(&summary.display_state(), 22),
@@ -710,6 +914,7 @@ pub(crate) fn print_agent_table(response: &AgentListResponse, with_observations:
                 outcome,
                 fleet_usage_cell(summary),
                 observation,
+                truncate_cell(&observe_cell(summary), 14),
             );
         } else {
             let seen = age_cell(
@@ -1049,6 +1254,8 @@ mod tests {
             usage,
             usage_scope: usage_scope.map(str::to_owned),
             updated_at: 7,
+            heavy: None,
+            session_growth: None,
         }
     }
 

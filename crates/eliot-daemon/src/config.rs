@@ -552,6 +552,23 @@ pub(crate) struct DaemonConfig {
     /// docs/spec/monitoring.md; this is advisory and never infers agent death.
     #[serde(default = "default_attention_suspicion_secs")]
     pub(crate) attention_suspicion_secs: i64,
+    /// Heavy-episode thresholds for one `activity.heavy` event: a child
+    /// process tree whose wall time, consumed CPU or peak RSS crosses any one
+    /// threshold. See docs/spec/monitoring.md; defaults tune from real data.
+    #[serde(default = "default_heavy_wall_secs")]
+    pub(crate) heavy_wall_secs: i64,
+    #[serde(default = "default_heavy_cpu_secs")]
+    pub(crate) heavy_cpu_secs: i64,
+    #[serde(default = "default_heavy_rss_bytes")]
+    pub(crate) heavy_rss_bytes: i64,
+    /// Context occupancy that warns, in thousandths (800 is 0.8). Integer
+    /// for TOML simplicity; validated to the (0, 1000] range.
+    #[serde(default = "default_session_growth_ratio_permille")]
+    pub(crate) session_growth_ratio_permille: i64,
+    /// Native session file size that warns, in bytes, where the harness
+    /// exposes a documented size source.
+    #[serde(default = "default_session_file_bytes")]
+    pub(crate) session_file_bytes: i64,
 }
 
 impl Default for DaemonConfig {
@@ -560,12 +577,37 @@ impl Default for DaemonConfig {
             retention: RetentionConfig::default(),
             limits: core::api::HierarchyLimits::default(),
             attention_suspicion_secs: default_attention_suspicion_secs(),
+            heavy_wall_secs: default_heavy_wall_secs(),
+            heavy_cpu_secs: default_heavy_cpu_secs(),
+            heavy_rss_bytes: default_heavy_rss_bytes(),
+            session_growth_ratio_permille: default_session_growth_ratio_permille(),
+            session_file_bytes: default_session_file_bytes(),
         }
     }
 }
 
 fn default_attention_suspicion_secs() -> i64 {
     15 * 60
+}
+
+fn default_heavy_wall_secs() -> i64 {
+    core::DEFAULT_HEAVY_WALL_SECS as i64
+}
+
+fn default_heavy_cpu_secs() -> i64 {
+    core::DEFAULT_HEAVY_CPU_SECS as i64
+}
+
+fn default_heavy_rss_bytes() -> i64 {
+    core::DEFAULT_HEAVY_RSS_BYTES as i64
+}
+
+fn default_session_growth_ratio_permille() -> i64 {
+    (core::DEFAULT_SESSION_GROWTH_RATIO * 1000.0) as i64
+}
+
+fn default_session_file_bytes() -> i64 {
+    core::DEFAULT_SESSION_FILE_BYTES as i64
 }
 
 impl DaemonConfig {
@@ -579,11 +621,87 @@ impl DaemonConfig {
                 "config.toml: daemon.attention_suspicion_secs must be a positive integer whose millisecond value fits in i64",
             ));
         }
+        if self.heavy_wall_secs <= 0 || self.heavy_wall_secs > 31_536_000 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.heavy_wall_secs must be a positive integer within one year",
+            ));
+        }
+        if self.heavy_cpu_secs <= 0 || self.heavy_cpu_secs > 31_536_000 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.heavy_cpu_secs must be a positive integer within one year",
+            ));
+        }
+        if self.heavy_rss_bytes <= 0 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.heavy_rss_bytes must be a positive integer",
+            ));
+        }
+        if self.session_growth_ratio_permille <= 0 || self.session_growth_ratio_permille > 1000 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.session_growth_ratio_permille must be within (0, 1000]",
+            ));
+        }
+        if self.session_file_bytes <= 0 {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: daemon.session_file_bytes must be a positive integer",
+            ));
+        }
         Ok(Self {
             retention: self.retention.validate()?,
             limits: self.limits,
             attention_suspicion_secs: self.attention_suspicion_secs,
+            heavy_wall_secs: self.heavy_wall_secs,
+            heavy_cpu_secs: self.heavy_cpu_secs,
+            heavy_rss_bytes: self.heavy_rss_bytes,
+            session_growth_ratio_permille: self.session_growth_ratio_permille,
+            session_file_bytes: self.session_file_bytes,
         })
+    }
+
+    pub(crate) fn heavy_thresholds(&self) -> core::Result<core::HeavyThresholds> {
+        let thresholds = core::HeavyThresholds {
+            wall_secs: u64::try_from(self.heavy_wall_secs).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe heavy wall threshold is out of range",
+                )
+            })?,
+            cpu_secs: u64::try_from(self.heavy_cpu_secs).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe heavy CPU threshold is out of range",
+                )
+            })?,
+            rss_bytes: u64::try_from(self.heavy_rss_bytes).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe heavy RSS threshold is out of range",
+                )
+            })?,
+        };
+        thresholds.validate()?;
+        Ok(thresholds)
+    }
+
+    pub(crate) fn session_growth_thresholds(&self) -> core::Result<core::SessionGrowthThresholds> {
+        let thresholds = core::SessionGrowthThresholds {
+            context_ratio: f64::from(
+                i32::try_from(self.session_growth_ratio_permille).unwrap_or(1000),
+            ) / 1000.0,
+            file_bytes: u64::try_from(self.session_file_bytes).map_err(|_| {
+                core::Error::new(
+                    "config_error",
+                    "observe session file threshold is out of range",
+                )
+            })?,
+        };
+        thresholds.validate()?;
+        Ok(thresholds)
     }
 }
 
@@ -3479,6 +3597,11 @@ mod tests {
                 },
                 limits: core::api::HierarchyLimits::default(),
                 attention_suspicion_secs: 15 * 60,
+                heavy_wall_secs: default_heavy_wall_secs(),
+                heavy_cpu_secs: default_heavy_cpu_secs(),
+                heavy_rss_bytes: default_heavy_rss_bytes(),
+                session_growth_ratio_permille: default_session_growth_ratio_permille(),
+                session_file_bytes: default_session_file_bytes(),
             }
         );
 
@@ -3493,6 +3616,11 @@ mod tests {
                 },
                 limits: core::api::HierarchyLimits::default(),
                 attention_suspicion_secs: 15 * 60,
+                heavy_wall_secs: default_heavy_wall_secs(),
+                heavy_cpu_secs: default_heavy_cpu_secs(),
+                heavy_rss_bytes: default_heavy_rss_bytes(),
+                session_growth_ratio_permille: default_session_growth_ratio_permille(),
+                session_file_bytes: default_session_file_bytes(),
             }
         );
     }

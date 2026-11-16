@@ -104,6 +104,65 @@ impl Store {
         })
     }
 
+    /// Commit one daemon-observed diagnostic event (`activity.heavy`,
+    /// `session.growth`, `harness.drift`) with optional Agent/generation
+    /// binding, in a single transaction. Kinds are closed: anything else
+    /// rejects as invalid so no new surface can smuggle one in. A bound
+    /// generation must equal the Agent's current generation; drifted evidence
+    /// rejects with `stale_generation` instead of committing under a dead
+    /// binding. Targetless drift carries neither agent nor generation.
+    /// Returns the committed event for bus publication.
+    pub fn commit_observe_event(
+        &mut self,
+        agent: Option<&str>,
+        generation: Option<i64>,
+        kind: &str,
+        data: Value,
+        now: i64,
+    ) -> Result<Event> {
+        if !matches!(
+            kind,
+            core::ACTIVITY_HEAVY_KIND | core::SESSION_GROWTH_KIND | core::HARNESS_DRIFT_KIND
+        ) {
+            return Err(Error::new("invalid", "unknown observe event kind"));
+        }
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let (agent_num, generation) = match (agent, generation) {
+                (Some(id), Some(bound)) => {
+                    let num = core::parse_agent_id(id)?;
+                    let current = load_agent_by_num(&tx, num)?.ok_or_else(|| {
+                        Error::new("not_found", "observe event Agent was not found")
+                    })?;
+                    if current.generation != bound {
+                        return Err(Error::new(
+                            "stale_generation",
+                            "observe event generation is no longer current",
+                        ));
+                    }
+                    (Some(num), Some(bound))
+                }
+                (None, None) => (None, None),
+                _ => {
+                    return Err(Error::new(
+                        "invalid",
+                        "observe event needs both agent and generation or neither",
+                    ));
+                }
+            };
+            let event =
+                insert_daemon_event(&tx, now, kind, "observe", agent_num, generation, data)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(event)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Commit one local `notify`/`emit` user event together with its Applied
     /// settlement in a single transaction: validate the Dispatched command
     /// and its verb/kind, insert the bounded `x.user.*` event, record

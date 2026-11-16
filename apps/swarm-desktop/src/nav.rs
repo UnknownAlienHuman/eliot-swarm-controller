@@ -1259,6 +1259,8 @@ mod tests {
             usage: None,
             usage_scope: None,
             updated_at: 0,
+            heavy: None,
+            session_growth: None,
         }
     }
 

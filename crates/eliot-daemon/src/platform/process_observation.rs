@@ -276,6 +276,15 @@ impl ObservationState {
     }
 }
 
+/// Bounded program identity for one owned process: the episode category plus
+/// how it was observed. The daemon classifies at read time; full command
+/// lines never persist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommandClass {
+    pub category: String,
+    pub source: &'static str,
+}
+
 pub(crate) fn same_identity(left: &ProcessIdentity, right: &ProcessIdentity) -> bool {
     left.host_boot_id == right.host_boot_id
         && left.pid == right.pid

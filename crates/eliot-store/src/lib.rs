@@ -36,7 +36,7 @@ pub use rules::{
 pub use scripts::ScriptRunAdmission;
 pub use usage::ResolvedUsageScope;
 
-use eliot_core::api::{AgentConfigView, AgentSummary};
+use eliot_core::api::{AgentConfigView, AgentSummary, HeavySummaryView, SessionGrowthView};
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
@@ -861,8 +861,9 @@ impl Store {
         after: Option<&str>,
         limit: usize,
         now_ms: i64,
+        growth_thresholds: &core::SessionGrowthThresholds,
     ) -> Result<AgentListPage> {
-        self.list_agent_summaries_inner(None, filter, after, limit, now_ms)
+        self.list_agent_summaries_inner(None, filter, after, limit, now_ms, growth_thresholds)
     }
 
     /// Scope-checked fleet projection for an Agent caller: itself for `self`
@@ -875,8 +876,16 @@ impl Store {
         after: Option<&str>,
         limit: usize,
         now_ms: i64,
+        growth_thresholds: &core::SessionGrowthThresholds,
     ) -> Result<AgentListPage> {
-        self.list_agent_summaries_inner(Some(caller), filter, after, limit, now_ms)
+        self.list_agent_summaries_inner(
+            Some(caller),
+            filter,
+            after,
+            limit,
+            now_ms,
+            growth_thresholds,
+        )
     }
 
     fn list_agent_summaries_inner(
@@ -886,6 +895,7 @@ impl Store {
         after: Option<&str>,
         limit: usize,
         now_ms: i64,
+        growth_thresholds: &core::SessionGrowthThresholds,
     ) -> Result<AgentListPage> {
         validate_limit(limit)?;
         filter.validate()?;
@@ -904,7 +914,11 @@ impl Store {
             .map_err(sql_error)?;
         let mut summaries = Vec::new();
         for row in rows {
-            summaries.push(self.summary_from_record(row.map_err(sql_error)?, now_ms)?);
+            summaries.push(self.summary_from_record(
+                row.map_err(sql_error)?,
+                now_ms,
+                growth_thresholds,
+            )?);
         }
         let total_page = agent_list_select(filter, caller, None, None, true)?;
         let total: i64 = self
@@ -929,7 +943,12 @@ impl Store {
         })
     }
 
-    fn summary_from_record(&self, record: AgentRecord, now_ms: i64) -> Result<AgentSummary> {
+    fn summary_from_record(
+        &self,
+        record: AgentRecord,
+        now_ms: i64,
+        growth_thresholds: &core::SessionGrowthThresholds,
+    ) -> Result<AgentSummary> {
         let state: AgentState = parse_enum(&record.state, "Agent state")?;
         let id = format_agent_id(record.id);
         let terminal = self.last_terminal_turn(record.id, record.generation, &record.harness)?;
@@ -955,6 +974,9 @@ impl Store {
                 (fallback, scope)
             }
         };
+        let heavy = self.heavy_rollup(&id, record.generation)?;
+        let session_growth =
+            self.session_growth_view(&record.harness, &id, record.generation, growth_thresholds)?;
         let preview = self.first_input_preview(record.id)?;
         Ok(AgentSummary {
             id,
@@ -988,6 +1010,8 @@ impl Store {
             usage,
             usage_scope,
             updated_at: record.updated_at,
+            heavy,
+            session_growth,
         })
     }
 
@@ -4742,6 +4766,14 @@ fn session_fallback_usage(snapshot: &SessionUsage) -> Option<TurnUsage> {
     })
 }
 
+/// One heavy episode row for the fleet readback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeavyWindowRow {
+    pub agent: String,
+    pub generation: i64,
+    pub data: Value,
+}
+
 impl Store {
     /// Latest retained `session.usage` snapshot for one Agent generation, or
     /// `None` when no session fact was ever committed. Only the latest
@@ -4760,6 +4792,177 @@ impl Store {
         snapshot
             .map(|value| decode_session_usage(&value))
             .transpose()
+    }
+    /// Heavy-work rollup for one Agent generation, or `None` when no heavy
+    /// episode was ever recorded. The count is exact; the CPU total sums the
+    /// latest 201 episodes so one pathological agent cannot stall a fleet
+    /// page. Malformed own-journal data fails loud as internal, never quiet.
+    pub fn heavy_rollup(&self, agent: &str, generation: i64) -> Result<Option<HeavySummaryView>> {
+        let agent_num = parse_agent_id(agent)?;
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'activity.heavy' AND agent = ?1 AND generation = ?2",
+                params![agent_num, generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if count <= 0 {
+            return Ok(None);
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT data FROM events WHERE kind = 'activity.heavy' AND agent = ?1 AND generation = ?2 ORDER BY seq DESC LIMIT 201",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![agent_num, generation], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error)?;
+        let mut latest_category = None;
+        let mut latest_ended_at = None;
+        let mut total_cpu_ms: u64 = 0;
+        for row in rows {
+            let raw = row.map_err(sql_error)?;
+            let data: Value = serde_json::from_str(&raw)
+                .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
+            if latest_category.is_none() {
+                latest_category = data
+                    .get("category")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                latest_ended_at = data.get("ended_at").and_then(Value::as_i64);
+            }
+            total_cpu_ms = total_cpu_ms.saturating_add(
+                data.get("cpu_ms")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Error::new("internal", "heavy episode data is malformed"))?,
+            );
+        }
+        let Some(category) = latest_category.filter(|category| !category.trim().is_empty()) else {
+            return Err(Error::new("internal", "heavy episode data is malformed"));
+        };
+        Ok(Some(HeavySummaryView {
+            episodes: count as u64,
+            latest_category: Some(category),
+            latest_ended_at,
+            total_cpu_ms,
+        }))
+    }
+
+    /// Newest journal payload for one kind, if any. Used for diagnostic
+    /// readbacks (for example the last `harness_contract_mismatch`); never
+    /// for control flow.
+    pub fn latest_event_data(&self, kind: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT data FROM events WHERE kind = ?1 ORDER BY seq DESC LIMIT 1",
+                params![kind],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        raw.map(|raw| {
+            serde_json::from_str(&raw)
+                .map_err(|_| Error::new("internal", "event data is malformed"))
+        })
+        .transpose()
+    }
+    /// Bounded heavy episodes in a window, newest first. The row cap keeps
+    /// one pathological fleet from stalling the readback; `truncated` names
+    /// the cut. Agent filters carry `"a<num>"` ids validated by the caller.
+    pub fn heavy_episodes(
+        &self,
+        agents: Option<&[String]>,
+        generation: Option<i64>,
+        since: i64,
+        limit: usize,
+    ) -> Result<(Vec<HeavyWindowRow>, bool)> {
+        let mut sql = String::from(
+            "SELECT agent, generation, data FROM events WHERE kind = 'activity.heavy' AND ts >= ?1",
+        );
+        let mut nums = Vec::new();
+        if let Some(agents) = agents {
+            if agents.is_empty() {
+                return Ok((Vec::new(), false));
+            }
+            for agent in agents {
+                nums.push(parse_agent_id(agent)?);
+            }
+            let placeholders = nums
+                .iter()
+                .enumerate()
+                .map(|(index, _)| format!("?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(&format!(" AND agent IN ({placeholders})"));
+        }
+        let generation_index = nums.len() + 2;
+        if generation.is_some() {
+            sql.push_str(&format!(" AND generation = ?{generation_index}"));
+        }
+        sql.push_str(" ORDER BY seq DESC LIMIT ?");
+        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = vec![&since];
+        // `params!` cannot spell a dynamic list; bind positionally instead.
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        for num in &nums {
+            bound.push(Box::new(*num));
+        }
+        if let Some(generation) = generation {
+            bound.push(Box::new(generation));
+        }
+        let cap = limit.saturating_add(1);
+        bound.push(Box::new(i64::try_from(cap).unwrap_or(i64::MAX)));
+        for value in &bound {
+            params.push(value.as_ref());
+        }
+        let rows = statement
+            .query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(sql_error)?;
+        let mut episodes = Vec::new();
+        for row in rows {
+            let (agent, generation, raw) = row.map_err(sql_error)?;
+            let data: Value = serde_json::from_str(&raw)
+                .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
+            episodes.push(HeavyWindowRow {
+                agent: format_agent_id(agent),
+                generation,
+                data,
+            });
+        }
+        let truncated = episodes.len() > limit;
+        episodes.truncate(limit);
+        Ok((episodes, truncated))
+    }
+    /// Live session-growth state for one Agent generation from the retained
+    /// snapshot: `Some` exactly while the signal crosses `thresholds`. File
+    /// bytes stay unset where the harness exposes no documented size source.
+    pub fn session_growth_view(
+        &self,
+        harness: &str,
+        agent: &str,
+        generation: i64,
+        thresholds: &core::SessionGrowthThresholds,
+    ) -> Result<Option<SessionGrowthView>> {
+        let usage = self.get_session_usage(agent, generation)?;
+        let session_bytes = usage.as_ref().and_then(|usage| usage.session_file_bytes);
+        let growth =
+            core::evaluate_session_growth(harness, usage.as_ref(), session_bytes, thresholds);
+        Ok(growth.map(|warn| SessionGrowthView {
+            warn: true,
+            basis: Some(warn.basis_name().to_owned()),
+            message: Some(warn.message),
+        }))
     }
 }
 
