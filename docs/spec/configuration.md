@@ -833,7 +833,7 @@ Rules/scripts remain files owned by their existing APIs; settings references and
 automation policy do not create a second executor. Desktop preferences use
 `[desktop]`: `theme` (`system`, `light`, `dark`), `window` (`width`/`height`, at least
 640 by 480) and `startup` (`new_task`, or `last_conversation` to reopen the most
-recently active Agent's conversation). The desktop keeps no other preference store.
+recently active Agent's conversation). The desktop keeps no other preference store. The desktop writes `window` back once when the window closes, and only when the size changed.
 If that table is absent, the desktop imports the legacy per-user
 `swarm-desktop.json` preferences through the revision-guarded settings writer once.
 It retires the legacy file only after successful publication; an existing `[desktop]`
@@ -931,13 +931,17 @@ Each named section is a complete replacement; leave unmodified sections out of t
 request. The desktop Settings screen uses the same read/save contract and reports
 conflicts without discarding the draft.
 
-## Profile editing
+## Legacy profile-only editing (`config.profiles.*`)
 
-Launch admission resolves its profile from `config.toml` at admission (above), so the
-saved file is what the next launch uses and running or queued work keeps its frozen
-snapshot; only a successful `configure` changes a live Agent's next-turn model/effort.
-Daemon settings loaded once at startup (`[daemon]` worker limits and `[mail]`) are not
-edited through this path.
+`settings.save` is the primary editing path and covers every section; `config.profiles.*`
+is the legacy profile-only path over the same writer (see
+[unified settings](#unified-settings)). Launch admission resolves its profile from
+`config.toml` at admission (above), so the saved file is what the next launch uses and
+running or queued work keeps its frozen snapshot; only a successful `configure` changes
+a live Agent's next-turn model/effort. Daemon settings loaded once at startup (`[daemon]`
+worker limits and `[mail]`) still require a restart after the save (see [unified
+settings](#unified-settings)).
+
 
 `config.profiles.read` returns the file revision (lowercase hex SHA-256 of its bytes)
 and the verbatim text of the `[profiles.*]` table blocks in file order. Every other
