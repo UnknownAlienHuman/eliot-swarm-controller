@@ -29,16 +29,18 @@
 
 use std::path::{Path, PathBuf};
 
-use eliot_core::{Error, Result};
+use eliot_core::Result;
 use serde_json::Value;
+
+use eliot_plugin::owner_scan as shared_scan;
 
 /// Bound for one owner MCP source file read. Larger, unreadable or
 /// unparseable files fail the start closed instead of scanning blind.
-pub const MAX_OWNER_SCAN_BYTES: usize = 256 * 1024;
+pub const MAX_OWNER_SCAN_BYTES: usize = shared_scan::MAX_SCAN_BYTES;
 
 /// Bound for one owner MCP source: more entries fail closed instead of
 /// truncating the scan.
-pub const MAX_OWNER_SERVERS: usize = 1024;
+pub const MAX_OWNER_SERVERS: usize = shared_scan::MAX_SCAN_SERVERS;
 
 /// One owner-side MCP server entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,12 +90,11 @@ fn scan_owner_mcp_sources_with_home(
         )?);
         entries.extend(read_source(&home.join(".claude.json"), "user config")?);
     }
-    if entries.len() > MAX_OWNER_SERVERS {
-        return Err(Error::new(
-            "profile_error",
-            "Claude owner MCP sources exceed their bound",
-        ));
-    }
+    shared_scan::ensure_total_entries(
+        entries.len(),
+        MAX_OWNER_SERVERS,
+        "Claude owner MCP sources exceed their bound",
+    )?;
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(entries)
 }
@@ -110,7 +111,7 @@ pub fn find_owner_entries<'a>(
     entries
         .iter()
         .filter(|entry| {
-            eliot_core::is_owner_swarm_server(
+            shared_scan::is_owner_transport(
                 entry.command.as_deref(),
                 entry.args.as_deref(),
                 entry.url.as_deref(),
@@ -146,12 +147,10 @@ fn refuse_owner_mcp_sources_with_home(
     let entries = scan_owner_mcp_sources_with_home(workspace, home)?;
     let hits = find_owner_entries(&entries, controller_executable.to_str(), cloud_mcp_hostname);
     if let Some(hit) = hits.first() {
-        return Err(Error::new(
-            "profile_error",
-            format!(
-                "Claude inherit MCP keeps the owner Swarm MCP server {:?} from {}",
-                hit.name, hit.source
-            ),
+        return Err(shared_scan::refusal_error(
+            "Claude inherit MCP keeps the owner Swarm MCP server",
+            &hit.name,
+            hit.source,
         ));
     }
     Ok(())
@@ -159,36 +158,11 @@ fn refuse_owner_mcp_sources_with_home(
 
 /// Read one owner MCP source file. Absent files contribute nothing.
 fn read_source(path: &Path, source: &'static str) -> Result<Vec<OwnerMcpEntry>> {
-    let bytes = match std::fs::read(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => {
-            return Err(Error::new(
-                "profile_error",
-                format!("Claude owner MCP source {source} could not be read"),
-            ));
-        }
-        Ok(bytes) => bytes,
+    let label = format!("Claude owner MCP source {source}");
+    let Some(document) = shared_scan::read_jsonc_document(path, &label, MAX_OWNER_SCAN_BYTES)?
+    else {
+        return Ok(Vec::new());
     };
-    if bytes.len() > MAX_OWNER_SCAN_BYTES {
-        return Err(Error::new(
-            "profile_error",
-            format!("Claude owner MCP source {source} exceeds its bound"),
-        ));
-    }
-    let text = String::from_utf8(bytes).map_err(|_| {
-        Error::new(
-            "profile_error",
-            format!("Claude owner MCP source {source} is not UTF-8"),
-        )
-    })?;
-    let stripped =
-        eliot_core::strip_jsonc_trailing_commas(&eliot_core::strip_jsonc_comments(&text));
-    let document: Value = serde_json::from_str(&stripped).map_err(|_| {
-        Error::new(
-            "profile_error",
-            format!("Claude owner MCP source {source} could not be parsed"),
-        )
-    })?;
     source_entries(&document, source)
 }
 
@@ -197,18 +171,10 @@ fn read_source(path: &Path, source: &'static str) -> Result<Vec<OwnerMcpEntry>> 
 /// Non-object entries are skipped: only the documented table shape
 /// (`command` string, `args` array, `url` string) is evaluated.
 fn source_entries(document: &Value, source: &'static str) -> Result<Vec<OwnerMcpEntry>> {
-    let Some(table) = document.get("mcpServers") else {
+    let label = format!("Claude owner MCP source {source}");
+    let Some(table) = shared_scan::table_object(document.get("mcpServers"), &label)? else {
         return Ok(Vec::new());
     };
-    if table.is_null() {
-        return Ok(Vec::new());
-    }
-    let table = table.as_object().ok_or_else(|| {
-        Error::new(
-            "profile_error",
-            format!("Claude owner MCP source {source} is not an object"),
-        )
-    })?;
     let mut entries = Vec::with_capacity(table.len().min(MAX_OWNER_SERVERS));
     for (name, entry) in table {
         let Some(object) = entry.as_object() else {
@@ -235,31 +201,7 @@ fn project_command(
     command: Option<&Value>,
     args: Option<&Value>,
 ) -> (Option<String>, Option<Vec<String>>) {
-    const MAX_ARGS: usize = 256;
-    const MAX_ARG_BYTES: usize = 2048;
-    let Some(command) = command.and_then(Value::as_str) else {
-        return (None, None);
-    };
-    let Some(args) = args else {
-        return (Some(command.to_owned()), Some(Vec::new()));
-    };
-    if args.is_null() {
-        return (Some(command.to_owned()), Some(Vec::new()));
-    }
-    let Some(items) = args.as_array() else {
-        return (Some(command.to_owned()), None);
-    };
-    if items.len() > MAX_ARGS {
-        return (Some(command.to_owned()), None);
-    }
-    let mut projected = Vec::with_capacity(items.len());
-    for item in items {
-        match item.as_str() {
-            Some(arg) if arg.len() <= MAX_ARG_BYTES => projected.push(arg.to_owned()),
-            _ => return (Some(command.to_owned()), None),
-        }
-    }
-    (Some(command.to_owned()), Some(projected))
+    shared_scan::project_string_command_args(command, args)
 }
 
 #[cfg(test)]
