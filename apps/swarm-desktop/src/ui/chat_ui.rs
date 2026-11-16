@@ -55,6 +55,9 @@ const MENU_DETACH: &str = "Detach";
 const MENU_STOP: &str = "Stop";
 const MENU_FORCE: &str = "Force stop…";
 
+/// WinUI's own left text padding inside a TextBox
+/// (`TextControlThemePadding`, 10,5,6,6).
+const WINUI_TEXT_PADDING: f64 = 10.0;
 /// Follow-latest retries while the newest turn is not realized yet.
 const FOLLOW_TRIES: u32 = 20;
 const FOLLOW_DELAY_MS: u64 = 50;
@@ -939,11 +942,11 @@ impl DesktopApp {
     /// empty state of a new task), pending requests and the composer.
     pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let agent = self.selected_agent_id();
+        let column = self.reading_width();
         let header: View = match agent.as_deref() {
-            Some(agent) => self.header_view(agent, context, palette),
+            Some(agent) => self.header_view(agent, column, context, palette),
             None => View::empty(),
         };
-        let column = self.reading_width();
         let body: View = match agent {
             Some(_) => self.transcript_view(column, context, palette),
             None => {
@@ -958,7 +961,7 @@ impl DesktopApp {
                     Some(project) => format!("What should we build in {project}?"),
                     None => "What should we build?".to_owned(),
                 };
-                m3::title(line, theme::type_scale::HEADLINE_SMALL)
+                m3::page_title(line)
                     .grid_row(1)
                     .horizontal_alignment(HorizontalAlignment::Center)
                     .vertical_alignment(VerticalAlignment::Center)
@@ -967,10 +970,10 @@ impl DesktopApp {
         };
         let jump: View = if self.chat.unseen > 0 && !self.chat.items.is_empty() {
             let label = format!("{} new", self.chat.unseen);
-            m3::tonal(palette)
+            m3::outlined(palette)
                 .grid_row(2)
                 .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(0.0, theme::spacing::SM, 0.0, 0.0))
+                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
                 .automation_name(format!("Jump to latest, {label}"))
                 .on_click(context.message(Message::Chat(ChatMsg::JumpToLatest)))
                 .content(m3::icon_label(m3::glyph::ARROW_DOWN, &label))
@@ -985,23 +988,23 @@ impl DesktopApp {
             (None, Some(text)) => Border::new()
                 .grid_row(4)
                 .width(column)
-                .max_width(theme::layout::READING_WIDTH)
+                .max_width(tokens::layout::READING_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(0.0, theme::spacing::SM, 0.0, 0.0))
+                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
                 .background(palette.card())
-                .corner_radius(theme::shape::MD)
+                .corner_radius(tokens::radius::CONTAINER)
                 .padding(Thickness::new(
-                    theme::spacing::MD,
-                    theme::spacing::XS,
-                    theme::spacing::XS,
-                    theme::spacing::XS,
+                    tokens::spacing::MD,
+                    tokens::spacing::XS,
+                    tokens::spacing::XS,
+                    tokens::spacing::XS,
                 ))
                 .content(
                     Grid::new()
                         .columns([GridLength::STAR, GridLength::Auto])
-                        .column_spacing(theme::spacing::SM)
+                        .column_spacing(tokens::spacing::SM)
                         .children((
-                            m3::text(text.clone(), theme::type_scale::BODY_MEDIUM)
+                            m3::body(text.clone())
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_wrapping(TextWrapping::Wrap)
                                 .is_text_selection_enabled(true),
@@ -1043,14 +1046,20 @@ impl DesktopApp {
     /// column gets an explicit width.
     fn reading_width(&self) -> Option<f64> {
         self.main_width().map(|width| {
-            (width - 2.0 * theme::spacing::LG - theme::spacing::MD)
-                .clamp(240.0, theme::layout::READING_WIDTH)
+            (width - 2.0 * tokens::spacing::LG - tokens::spacing::MD)
+                .clamp(tokens::layout::MIN_COLUMN, tokens::layout::READING_WIDTH)
         })
     }
 
     /// One line: the title, the status dot, a connection note when not live,
     /// then the details toggle and the "…" menu.
-    fn header_view(&self, agent: &str, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn header_view(
+        &self,
+        agent: &str,
+        column: Option<f64>,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
         let title = self.agent_title(agent);
         let detail = self.chat.detail.as_ref();
         let state = detail.map_or("reading", |detail| detail.state.as_str());
@@ -1088,7 +1097,7 @@ impl DesktopApp {
                 }
                 m3::icon_button(palette)
                     .automation_name("More actions")
-                    .content(m3::icon(m3::glyph::MORE))
+                    .content(m3::toolbar_icon(m3::glyph::MORE))
                     .menu(Menu::new(
                         items,
                         // Capture-free, so the callback keeps one identity
@@ -1101,7 +1110,7 @@ impl DesktopApp {
             None => m3::icon_button(palette)
                 .is_enabled(false)
                 .automation_name("More actions")
-                .content(m3::icon(m3::glyph::MORE)),
+                .content(m3::toolbar_icon(m3::glyph::MORE)),
         };
         let details_open = self.panel == Panel::Details;
         Grid::new()
@@ -1114,16 +1123,21 @@ impl DesktopApp {
                 GridLength::Auto,
                 GridLength::Auto,
             ])
-            .column_spacing(theme::spacing::SM)
-            .margin(Thickness::new(
-                theme::spacing::LG,
-                theme::spacing::SM,
-                theme::spacing::SM,
-                theme::spacing::SM,
-            ))
+            .column_spacing(tokens::spacing::SM)
+            // On the reading column, so the title starts and the toolbar
+            // ends where the messages and the composer do.
+            .width(column)
+            .max_width(tokens::layout::READING_WIDTH)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .margin(Thickness::xy(0.0, tokens::spacing::SM))
             .children((
-                m3::title(title.clone(), theme::type_scale::TITLE_MEDIUM)
-                    .max_width(560.0)
+                m3::section_title(title.clone())
+                    .max_width(
+                        column.unwrap_or(tokens::layout::READING_WIDTH)
+                            - 2.0 * tokens::height::CONTROL
+                            - 4.0 * tokens::spacing::SM
+                            - tokens::layout::DOT,
+                    )
                     .vertical_alignment(VerticalAlignment::Center)
                     .text_trimming(TextTrimming::CharacterEllipsis)
                     .is_text_selection_enabled(true),
@@ -1132,7 +1146,7 @@ impl DesktopApp {
                     .vertical_alignment(VerticalAlignment::Center)
                     .automation_name(format!("State: {state}"))
                     .content(m3::dot(palette.header_dot(tone))),
-                m3::muted(note, theme::type_scale::BODY_SMALL)
+                m3::secondary(note)
                     .grid_column(2)
                     .vertical_alignment(VerticalAlignment::Center),
                 m3::icon_button(palette)
@@ -1145,7 +1159,7 @@ impl DesktopApp {
                     .on_click(
                         context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Details))),
                     )
-                    .content(m3::icon(m3::glyph::INFO)),
+                    .content(m3::toolbar_icon(m3::glyph::INFO)),
                 Border::new().grid_column(5).content(menu),
             ))
     }
@@ -1162,19 +1176,16 @@ impl DesktopApp {
             Some(convo) if convo.coverage().can_load_older() => m3::text_button(palette)
                 .is_enabled(!matches!(self.chat.live, LiveStatus::Loading))
                 .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(0.0, 0.0, 0.0, theme::spacing::MD))
+                .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::MD))
                 .on_click(context.message(Message::Chat(ChatMsg::LoadOlderRequested)))
                 .content(m3::label("Load older messages")),
             _ => View::empty(),
         };
         let empty: View = if self.chat.items.is_empty() {
-            m3::muted(
-                match self.chat.live {
-                    LiveStatus::Loading => "Loading…",
-                    _ => "No messages yet.",
-                },
-                theme::type_scale::BODY_MEDIUM,
-            )
+            m3::secondary(match self.chat.live {
+                LiveStatus::Loading => "Loading…",
+                _ => "No messages yet.",
+            })
             .horizontal_alignment(HorizontalAlignment::Center)
             .into()
         } else {
@@ -1234,9 +1245,9 @@ impl DesktopApp {
             .content(
                 StackPanel::new()
                     .width(column)
-                    .max_width(theme::layout::READING_WIDTH)
+                    .max_width(tokens::layout::READING_WIDTH)
                     .horizontal_alignment(HorizontalAlignment::Center)
-                    .margin(Thickness::xy(0.0, theme::spacing::MD))
+                    .margin(Thickness::xy(0.0, tokens::spacing::MD))
                     .children((
                         load_older,
                         empty,
@@ -1277,15 +1288,12 @@ impl DesktopApp {
                     key,
                     Border::new()
                         .background(fill)
-                        .corner_radius(theme::shape::MD)
-                        .padding(Thickness::uniform(theme::spacing::MD))
+                        .corner_radius(tokens::radius::CONTAINER)
+                        .padding(Thickness::uniform(tokens::spacing::MD))
                         .content(
-                            StackPanel::new().spacing(theme::spacing::SM).children((
-                                m3::text(
-                                    format!("The Agent asks: {}", request.kind),
-                                    theme::type_scale::TITLE_SMALL,
-                                )
-                                .foreground(on),
+                            StackPanel::new().spacing(tokens::spacing::SM).children((
+                                m3::section_title(format!("The Agent asks: {}", request.kind))
+                                    .foreground(on),
                                 TextBlock::new()
                                     .text(request.summary.clone())
                                     .foreground(on)
@@ -1294,20 +1302,20 @@ impl DesktopApp {
                                 answer_box,
                                 StackPanel::new()
                                     .orientation(Orientation::Horizontal)
-                                    .spacing(theme::spacing::SM)
+                                    .spacing(tokens::spacing::SM)
                                     .children((
                                         m3::filled(palette)
                                             .is_enabled(!self.submitting())
                                             .on_click(context.message(Message::Chat(
                                                 ChatMsg::ApprovalRequested(request.clone(), true),
                                             )))
-                                            .content(TextBlock::new().text("Approve")),
-                                        m3::tonal(palette)
+                                            .content(m3::label("Approve")),
+                                        m3::outlined(palette)
                                             .is_enabled(!self.submitting())
                                             .on_click(context.message(Message::Chat(
                                                 ChatMsg::ApprovalRequested(request.clone(), false),
                                             )))
-                                            .content(TextBlock::new().text("Deny")),
+                                            .content(m3::label("Deny")),
                                         m3::text_button(palette)
                                             .is_enabled(!self.submitting())
                                             .on_click(context.message(Message::Chat(
@@ -1322,9 +1330,9 @@ impl DesktopApp {
             .collect();
         StackPanel::new()
             .grid_row(3)
-            .spacing(theme::spacing::SM)
+            .spacing(tokens::spacing::SM)
             .width(column)
-            .max_width(theme::layout::READING_WIDTH)
+            .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
             .keyed_children(pending_rows)
     }
@@ -1348,7 +1356,7 @@ impl DesktopApp {
             (Some(_), Some(detail)) => (
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
+                    .spacing(tokens::spacing::SM)
                     .children((
                         m3::chip_static(
                             palette,
@@ -1367,7 +1375,7 @@ impl DesktopApp {
                     )),
                 StackPanel::new()
                     .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::SM)
+                    .spacing(tokens::spacing::SM)
                     .children((
                         self.model_chip(detail, context, palette),
                         m3::chip_static(
@@ -1390,13 +1398,20 @@ impl DesktopApp {
             .text(self.primed(&self.composer_text()).to_owned())
             .placeholder_text(placeholder)
             .automation_name("Message")
-            // Its text starts where the chips' icons do.
-            .margin(Thickness::new(-6.0, 0.0, 0.0, 0.0))
+            // Its text starts where the chips' icons do: the chips' content
+            // inset less WinUI's own left text padding.
+            .margin(Thickness::new(
+                tokens::spacing::INSET - WINUI_TEXT_PADDING,
+                0.0,
+                0.0,
+                0.0,
+            ))
             .background(Brush::Solid(Color::transparent()))
             .border_thickness(Thickness::uniform(0.0))
             .accepts_return(true)
             .text_wrapping(TextWrapping::Wrap)
-            .height(theme::layout::COMPOSER_FIELD_HEIGHT)
+            .min_height(tokens::height::CONTROL)
+            .max_height(tokens::layout::COMPOSER_MAX_HEIGHT)
             .on_text_changed(
                 context.callback(|value| Message::Chat(ChatMsg::ComposerChanged(value))),
             );
@@ -1404,34 +1419,29 @@ impl DesktopApp {
         Border::new()
             .grid_row(5)
             .width(column)
-            .max_width(theme::layout::READING_WIDTH)
+            .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
             .margin(Thickness::new(
                 0.0,
-                theme::spacing::SM,
+                tokens::spacing::SM,
                 0.0,
-                theme::spacing::LG,
+                tokens::spacing::LG,
             ))
-            // An M3 search bar: surface-container-high, extra-large corner.
+            // The composer: surface-container-high, its own 16-DIP corner.
             .background(palette.raised())
-            .corner_radius(theme::shape::XL)
-            .padding(Thickness::new(
-                theme::spacing::MD,
-                12.0,
-                theme::spacing::SM,
-                theme::spacing::SM,
-            ))
+            .corner_radius(tokens::radius::COMPOSER)
+            .padding(Thickness::uniform(tokens::spacing::SM))
             .content(
                 Grid::new()
                     .rows([GridLength::Auto, GridLength::Auto, GridLength::Auto])
-                    .row_spacing(theme::spacing::XS)
+                    .row_spacing(tokens::spacing::SM)
                     .children((
                         context_row,
                         field,
                         Grid::new()
                             .grid_row(2)
                             .columns([GridLength::STAR, GridLength::Auto])
-                            .column_spacing(theme::spacing::SM)
+                            .column_spacing(tokens::spacing::SM)
                             .children((
                                 Border::new()
                                     .vertical_alignment(VerticalAlignment::Center)
@@ -1492,7 +1502,7 @@ impl DesktopApp {
         }
         m3::chip(palette)
             .automation_name(format!("Model and effort: {label}"))
-            .content(m3::chip_label(m3::glyph::MODEL, &label))
+            .content(m3::icon_label(m3::glyph::MODEL, &label))
             .menu(Menu::new(
                 items,
                 // Capture-free for a stable menu identity (see the "…" menu).
@@ -1537,8 +1547,8 @@ impl DesktopApp {
                         generation: detail.generation,
                     },
                 ))))
-                .content(TextBlock::new().text("Resume")),
-            (Some(agent), _) => m3::filled_icon(palette)
+                .content(m3::label("Resume")),
+            (Some(agent), _) => m3::send_button(palette)
                 .is_enabled(enabled && !draft_blank)
                 .automation_name(if active_turn.is_some() {
                     "Queue message"
@@ -1549,7 +1559,7 @@ impl DesktopApp {
                     DraftAction::Send { agent },
                 ))))
                 .content(m3::icon(m3::glyph::SEND)),
-            (None, _) => m3::filled_icon(palette)
+            (None, _) => m3::send_button(palette)
                 .is_enabled(enabled && !draft_blank)
                 .automation_name("Start task")
                 .on_click(context.message(Message::Launch(LaunchMsg::LaunchRequested)))
@@ -1561,7 +1571,7 @@ impl DesktopApp {
                     let bound = BoundAction::turn_control(agent, detail.generation, turn);
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
-                        .spacing(theme::spacing::XS)
+                        .spacing(tokens::spacing::XS)
                         .children((
                             m3::text_button(palette)
                                 .is_enabled(enabled)
@@ -1569,8 +1579,8 @@ impl DesktopApp {
                                 .on_click(context.message(Message::Chat(
                                     ChatMsg::InterruptRequested(bound.clone()),
                                 )))
-                                .content(m3::text_icon_label(m3::glyph::STOP, "Interrupt")),
-                            m3::tonal(palette)
+                                .content(m3::icon_label(m3::glyph::STOP, "Interrupt")),
+                            m3::outlined(palette)
                                 .is_enabled(enabled && !draft_blank)
                                 .automation_name(format!("Steer turn {turn} with the message"))
                                 .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
@@ -1583,7 +1593,7 @@ impl DesktopApp {
             };
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(theme::spacing::SM)
+            .spacing(tokens::spacing::SM)
             .children((turn_actions, primary))
     }
 
@@ -1601,33 +1611,30 @@ impl DesktopApp {
         Border::new()
             .grid_row(4)
             .width(column)
-            .max_width(theme::layout::READING_WIDTH)
+            .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
-            .margin(Thickness::new(0.0, theme::spacing::SM, 0.0, 0.0))
+            .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
             .background(palette.error_container())
-            .corner_radius(theme::shape::MD)
-            .padding(Thickness::uniform(theme::spacing::MD))
+            .corner_radius(tokens::radius::CONTAINER)
+            .padding(Thickness::uniform(tokens::spacing::MD))
             .content(
                 Grid::new()
                     .columns([GridLength::STAR, GridLength::Auto])
-                    .column_spacing(theme::spacing::MD)
+                    .column_spacing(tokens::spacing::MD)
                     .children((
                         StackPanel::new()
-                            .spacing(2.0)
+                            .spacing(tokens::spacing::XS)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
-                                m3::text(
-                                    format!("Force stop {title}?"),
-                                    theme::type_scale::TITLE_SMALL,
-                                )
-                                .foreground(palette.on_error_container())
-                                .text_trimming(TextTrimming::CharacterEllipsis),
+                                m3::section_title(format!("Force stop {title}?"))
+                                    .foreground(palette.on_error_container())
+                                    .text_trimming(TextTrimming::CharacterEllipsis),
                                 m3::text(
                                     format!(
                                         "Ends Agent {} (generation {}) at once instead of a clean stop; an active turn is cut off.",
                                         bound.agent, bound.generation
                                     ),
-                                    theme::type_scale::BODY_SMALL,
+                                    tokens::text::SECONDARY,
                                 )
                                 .foreground(palette.on_error_container())
                                 .text_wrapping(TextWrapping::Wrap),
@@ -1635,7 +1642,7 @@ impl DesktopApp {
                         StackPanel::new()
                             .grid_column(1)
                             .orientation(Orientation::Horizontal)
-                            .spacing(theme::spacing::SM)
+                            .spacing(tokens::spacing::SM)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
                                 m3::error_text_button(palette)
@@ -1644,7 +1651,7 @@ impl DesktopApp {
                                         ChatMsg::ForceStopAnswered(false),
                                     )))
                                     .content(m3::label("Cancel")),
-                                m3::danger(palette)
+                                m3::destructive(palette)
                                     .is_enabled(!self.submitting())
                                     .automation_name(format!(
                                         "Force stop {} generation {}",
@@ -1653,7 +1660,7 @@ impl DesktopApp {
                                     .on_click(context.message(Message::Chat(
                                         ChatMsg::ForceStopAnswered(true),
                                     )))
-                                    .content(TextBlock::new().text("Force stop")),
+                                    .content(m3::label("Force stop")),
                             )),
                     )),
             )

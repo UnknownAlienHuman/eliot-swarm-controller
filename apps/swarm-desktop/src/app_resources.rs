@@ -10,9 +10,9 @@
 //! - **Roles.** WinUI's own keys (`microsoft.windowsappsdk.winui` 2.3.0
 //!   `Themes/generic.xaml`) from the window's scheme: the accent ramp, list
 //!   selection, the text box as an M3 outlined text field, the combo box as
-//!   an M3 exposed dropdown menu, the toggle switch, radio buttons and check
-//!   boxes in M3 selection-control roles, menus
-//!   and combo-box popups on surface-container, the dialog on
+//!   an M3 exposed dropdown menu, radio buttons and check boxes in M3
+//!   selection-control roles, menus and combo-box popups on
+//!   surface-container, the dialog on
 //!   surface-container-high, the tooltip on inverse-surface and the focus
 //!   ring in secondary. WinUI resolves a ThemeResource through the
 //!   application's own entries before its merged `XamlControlsResources`,
@@ -24,25 +24,31 @@
 //!   the shown scheme are written as own entries and rewritten when the
 //!   scheme changes ([`apply_scheme`]); under High Contrast they are
 //!   removed and the system colors apply.
-//! - **Styles.** The M3 shapes and paddings that WinUI's own styles fix
-//!   (`Padding="{StaticResource ButtonPadding}"`, one `ControlCornerRadius`
-//!   for every control): one button style per M3 shape under the keys
-//!   Reactor's `ButtonStyle` looks up (see [`styles_xaml`]), text fields and
-//!   combo boxes with the extra-small corner, dialogs with the extra-large
-//!   corner, switches without the On/Off words, and menus without the
-//!   acrylic backdrop, on the solid M3 container. A Reactor `Thickness` or
-//!   `CornerRadius` resource override reaches WinUI as zero (observed live),
-//!   so shapes cannot be per button.
+//! - **Styles.** The shapes, heights and paddings of `ui::tokens` that
+//!   WinUI's own styles fix (`Padding="{StaticResource ButtonPadding}"`,
+//!   one `ControlCornerRadius` for every control): one button style per
+//!   shape under the keys Reactor's `ButtonStyle` looks up (see
+//!   [`styles_xaml`]), text fields, combo boxes and check boxes, menu items
+//!   as control-height rows, dialogs and menus with the container corner,
+//!   and menus without the acrylic backdrop, on the solid M3 container. A
+//!   Reactor `Thickness` or `CornerRadius` resource override reaches WinUI as
+//!   zero (observed live), so shapes cannot be per button.
 //!
 //! Reactor 0.100.0 applies [`windows_reactor::ResourceOverrides`] only to a
 //! `Button` (`native/winui/mod.rs` `set_resource_overrides` writes into that
 //! element's own `Resources`); everything else here has no Reactor property.
 //!
+//! The window's title bar takes the same surface role ([`apply_title_bar`]).
+//!
 //! Interface ids and vtable slots are those of `Microsoft.UI.Xaml.winmd`
 //! (WinUI 2.3.0 metadata): `IApplicationStatics` slot 6 `get_Current`,
 //! `IApplication` slot 6 `get_Resources`, `IXamlReaderStatics` slot 6
-//! `Load`. Only these three calls are declared; Reactor's own bindings are
-//! crate-private.
+//! `Load`; and of `Microsoft.UI.winmd` (Windows App SDK 2.1.3, read with
+//! System.Reflection.Metadata; the `IAppWindow` and `IAppWindowTitleBar` ids
+//! match Reactor's own bindings): `IAppWindowStatics` slot 9
+//! `GetFromWindowId`, `IAppWindow` slot 16 `get_TitleBar` and the
+//! `IAppWindowTitleBar` color setters listed in [`title_bar_colors`]. Only
+//! these calls are declared; Reactor's own bindings are crate-private.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
@@ -51,8 +57,15 @@ use std::fmt::Write as _;
 use windows_collections::IMap;
 use windows_core::{GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface, RuntimeName};
 use windows_reference::IReference;
+use windows_sys::Win32::Foundation::{HWND, LPARAM};
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible,
+};
+use windows_sys::core::BOOL;
 
-use crate::theme::{self, Rgb8, Scheme, shape, state};
+use crate::theme::{Rgb8, Scheme, state};
+use crate::ui::tokens::{height, radius, spacing};
 
 /// A theme resource value.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -101,7 +114,6 @@ pub fn entries(s: &Scheme) -> Vec<(&'static str, Value)> {
     all.extend(lists(s));
     all.extend(text_field(s));
     all.extend(dropdown(s));
-    all.extend(switch(s));
     all.extend(selection_controls(s));
     all.extend(overlays(s));
     all
@@ -641,93 +653,11 @@ fn selection_controls(s: &Scheme) -> Vec<(&'static str, Value)> {
     all
 }
 
-/// The toggle switch in M3 switch roles: an outlined surface track with an
-/// outline handle when off, a primary track with an on-primary handle when
-/// on (primary-container on hover and press). WinUI keeps its geometry.
-fn switch(s: &Scheme) -> Vec<(&'static str, Value)> {
-    let track_off = s.surface_container_highest;
-    let mut all = vec![
-        ("ToggleSwitchFillOff", opaque(track_off)),
-        (
-            "ToggleSwitchFillOffPointerOver",
-            opaque(track_off.mix(s.on_surface, state::HOVER)),
-        ),
-        (
-            "ToggleSwitchFillOffPressed",
-            opaque(track_off.mix(s.on_surface, state::PRESSED)),
-        ),
-        (
-            "ToggleSwitchFillOffDisabled",
-            layer(s.surface_container_highest, state::DISABLED_CONTAINER),
-        ),
-        ("ToggleSwitchKnobFillOff", opaque(s.outline)),
-        (
-            "ToggleSwitchKnobFillOffPointerOver",
-            opaque(s.on_surface_variant),
-        ),
-        (
-            "ToggleSwitchKnobFillOffPressed",
-            opaque(s.on_surface_variant),
-        ),
-        (
-            "ToggleSwitchKnobFillOffDisabled",
-            layer(s.on_surface, state::DISABLED_CONTENT),
-        ),
-        (
-            "ToggleSwitchStrokeOffDisabled",
-            layer(s.on_surface, state::DISABLED_CONTAINER),
-        ),
-        ("ToggleSwitchFillOn", opaque(s.primary)),
-        ("ToggleSwitchFillOnPointerOver", opaque(s.primary)),
-        ("ToggleSwitchFillOnPressed", opaque(s.primary)),
-        (
-            "ToggleSwitchFillOnDisabled",
-            layer(s.on_surface, state::DISABLED_CONTAINER),
-        ),
-        ("ToggleSwitchKnobFillOn", opaque(s.on_primary)),
-        (
-            "ToggleSwitchKnobFillOnPointerOver",
-            opaque(s.primary_container),
-        ),
-        ("ToggleSwitchKnobFillOnPressed", opaque(s.primary_container)),
-        ("ToggleSwitchKnobFillOnDisabled", opaque(s.surface)),
-        ("ToggleSwitchContentForeground", opaque(s.on_surface)),
-        ("ToggleSwitchHeaderForeground", opaque(s.on_surface)),
-    ];
-    all.extend(every(
-        &[
-            "ToggleSwitchStrokeOff",
-            "ToggleSwitchStrokeOffPointerOver",
-            "ToggleSwitchStrokeOffPressed",
-        ],
-        opaque(s.outline),
-    ));
-    all.extend(every(
-        &[
-            "ToggleSwitchStrokeOn",
-            "ToggleSwitchStrokeOnPointerOver",
-            "ToggleSwitchStrokeOnPressed",
-        ],
-        opaque(s.primary),
-    ));
-    all.extend(every(
-        &[
-            "ToggleSwitchStrokeOnDisabled",
-            "ToggleSwitchKnobStrokeOn",
-            "ToggleSwitchContainerBackground",
-            "ToggleSwitchContainerBackgroundPointerOver",
-            "ToggleSwitchContainerBackgroundPressed",
-            "ToggleSwitchContainerBackgroundDisabled",
-        ],
-        clear(s),
-    ));
-    all
-}
-
 /// Menus and popups: menus on surface-container (M3 menu), the dialog on
 /// surface-container-high with the M3 scrim, the plain tooltip on
-/// inverse-surface; the extra-small corner for controls and overlays (the
-/// dialog's extra-large corner is in its implicit style).
+/// inverse-surface; the control corner for every control template that
+/// reads `ControlCornerRadius` and the container corner for the popups
+/// that read `OverlayCornerRadius` (flyouts, the combo-box list).
 fn overlays(s: &Scheme) -> Vec<(&'static str, Value)> {
     let mut all = vec![
         ("MenuFlyoutPresenterBackground", opaque(s.surface_container)),
@@ -780,8 +710,8 @@ fn overlays(s: &Scheme) -> Vec<(&'static str, Value)> {
         ("ContentDialogBorderWidth", uniform(0.0)),
         ("ToolTipBackground", opaque(s.inverse_surface)),
         ("ToolTipForeground", opaque(s.inverse_on_surface)),
-        ("ControlCornerRadius", Value::Radius(shape::XS)),
-        ("OverlayCornerRadius", Value::Radius(shape::XS)),
+        ("ControlCornerRadius", Value::Radius(radius::CONTROL)),
+        ("OverlayCornerRadius", Value::Radius(radius::CONTAINER)),
     ];
     all.extend(every(
         &[
@@ -858,61 +788,79 @@ pub fn dictionary_xaml(scheme: &Scheme) -> String {
     xaml
 }
 
-/// The button styles by M3 shape, under the keys Reactor's `ButtonStyle`
-/// looks up (`native/winui/generated.rs`: Accent, Subtle, TextLink), and
-/// the implicit styles of the other controls. Button colors stay with the
-/// theme keys and the button families.
+/// The control styles from `ui::tokens`: the button styles under the keys
+/// Reactor's `ButtonStyle` looks up (`native/winui/generated.rs`: Accent,
+/// Subtle, TextLink), and the implicit styles of the other controls.
+/// Button colors stay with the theme keys and the button families.
 ///
-/// - implicit `Button`: common buttons, navigation items and segments (full
-///   corner, 24-DIP sides, label-large weight);
-/// - `SubtleButtonStyle`: icon buttons (full corner, no padding);
-/// - `TextBlockButtonStyle`: chips (small corner, 8/16-DIP sides);
-/// - `AccentButtonStyle`: the extended FAB and card buttons (large corner),
-///   based on WinUI's own AccentButtonStyle so a button without a family
-///   (the hand-off dialog's primary) keeps its theme's filled colors.
+/// - implicit `Button`: every labelled button, row, chip and segment
+///   (control corner, 12-DIP content inset, 32 DIPs, body weight);
+/// - `SubtleButtonStyle`: icon buttons (control corner, no padding);
+/// - `TextBlockButtonStyle`: the one circle, the icon-only Send button;
+/// - `AccentButtonStyle`: the hand-off dialog's primary, which keeps the
+///   theme's filled colors there (based on WinUI's own AccentButtonStyle).
 ///
-/// None of these sets a template: WinUI applies the control's built-in
-/// style underneath, so every button keeps its states and focus visuals.
+/// Text fields, dropdowns and number boxes take the control corner and
+/// height, check boxes the M3 default corner, menu items the control
+/// height, menus and dialogs the container corner. None of these sets a template: WinUI applies the
+/// control's built-in style underneath, so every control keeps its states
+/// and focus visuals.
 pub fn styles_xaml() -> String {
-    let (xs, sm, lg, xl, full) = (shape::XS, shape::SM, shape::LG, shape::XL, shape::FULL);
-    let icon = theme::layout::ICON_BUTTON / 2.0;
+    let (control, container, circle, check) = (
+        radius::CONTROL,
+        radius::CONTAINER,
+        radius::CIRCLE,
+        radius::CHECK_BOX,
+    );
+    // Menu items are control-height rows: WinUI pads them from a
+    // StaticResource (11,9,11,10), so only a style sets their height.
+    let (min, inset) = (height::CONTROL, spacing::INSET);
     format!(
         "{XAML_ROOT}\
          <Style TargetType=\"Button\">\
-           <Setter Property=\"CornerRadius\" Value=\"{full}\"/>\
-           <Setter Property=\"Padding\" Value=\"24,0,24,0\"/>\
-           <Setter Property=\"FontWeight\" Value=\"Medium\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
+           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style x:Key=\"SubtleButtonStyle\" TargetType=\"Button\">\
-           <Setter Property=\"CornerRadius\" Value=\"{icon}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
            <Setter Property=\"Padding\" Value=\"0\"/>\
          </Style>\
          <Style x:Key=\"TextBlockButtonStyle\" TargetType=\"Button\">\
-           <Setter Property=\"CornerRadius\" Value=\"{sm}\"/>\
-           <Setter Property=\"Padding\" Value=\"8,0,16,0\"/>\
-           <Setter Property=\"FontWeight\" Value=\"Medium\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{circle}\"/>\
+           <Setter Property=\"Padding\" Value=\"0\"/>\
          </Style>\
          <Style x:Key=\"AccentButtonStyle\" TargetType=\"Button\" \
                 BasedOn=\"{{StaticResource AccentButtonStyle}}\">\
-           <Setter Property=\"CornerRadius\" Value=\"{lg}\"/>\
-           <Setter Property=\"Padding\" Value=\"16,0,20,0\"/>\
-           <Setter Property=\"FontWeight\" Value=\"Medium\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
+           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"TextBox\">\
-           <Setter Property=\"CornerRadius\" Value=\"{xs}\"/>\
-           <Setter Property=\"Padding\" Value=\"14,10,10,10\"/>\
-           <Setter Property=\"MinHeight\" Value=\"44\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"ComboBox\">\
-           <Setter Property=\"CornerRadius\" Value=\"{xs}\"/>\
-           <Setter Property=\"MinHeight\" Value=\"44\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{control}\"/>\
+           <Setter Property=\"MinHeight\" Value=\"{min}\"/>\
          </Style>\
-         <Style TargetType=\"ToggleSwitch\">           <Setter Property=\"OnContent\" Value=\"\"/>           <Setter Property=\"OffContent\" Value=\"\"/>           <Setter Property=\"MinWidth\" Value=\"0\"/>         </Style>         <Style TargetType=\"ContentDialog\">\
-           <Setter Property=\"CornerRadius\" Value=\"{xl}\"/>\
+         <Style TargetType=\"CheckBox\">\
+           <Setter Property=\"CornerRadius\" Value=\"{check}\"/>\
+         </Style>\
+         <Style TargetType=\"ContentDialog\">\
+           <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
+         </Style>\
+         <Style TargetType=\"MenuFlyoutItem\">\
+           <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
+           <Setter Property=\"Height\" Value=\"{min}\"/>\
+         </Style>\
+         <Style TargetType=\"MenuFlyoutSubItem\">\
+           <Setter Property=\"Padding\" Value=\"{inset},0,{inset},0\"/>\
+           <Setter Property=\"Height\" Value=\"{min}\"/>\
          </Style>\
          <Style TargetType=\"MenuFlyoutPresenter\">\
            <Setter Property=\"SystemBackdrop\" Value=\"{{x:Null}}\"/>\
-           <Setter Property=\"CornerRadius\" Value=\"{xs}\"/>\
+           <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
          </Style>\
          </ResourceDictionary>"
     )
@@ -1094,6 +1042,234 @@ fn load_xaml(xaml: &str) -> windows_core::Result<IInspectable> {
     Ok(unsafe { IInspectable::from_raw(out) })
 }
 
+/// `Windows.UI.Color`, the value of the title bar's color properties.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UiColor {
+    a: u8,
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl windows_core::imp::TypeKind for UiColor {
+    type TypeKind = windows_core::imp::CopyType;
+}
+
+impl windows_core::RuntimeType for UiColor {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::from_slice(b"struct(Windows.UI.Color;u1;u1;u1;u1)");
+}
+
+impl From<Rgb8> for UiColor {
+    fn from(value: Rgb8) -> Self {
+        Self {
+            a: 255,
+            r: value.r,
+            g: value.g,
+            b: value.b,
+        }
+    }
+}
+
+/// `IAppWindowTitleBar` setter slots (`Microsoft.UI.winmd`, Windows App SDK
+/// 2.1.3) and the M3 role each takes: the window content's surface with
+/// on-surface text, M3 state layers on the caption buttons, on-surface-variant
+/// text while the window is inactive. Windows keeps its own close-button
+/// hover and press colors.
+pub fn title_bar_colors(s: &Scheme) -> [(usize, Rgb8); 12] {
+    let hover = s.surface.mix(s.on_surface, state::HOVER);
+    let pressed = s.surface.mix(s.on_surface, state::PRESSED);
+    [
+        (7, s.surface),             // put_BackgroundColor
+        (9, s.surface),             // put_ButtonBackgroundColor
+        (11, s.on_surface),         // put_ButtonForegroundColor
+        (13, hover),                // put_ButtonHoverBackgroundColor
+        (15, s.on_surface),         // put_ButtonHoverForegroundColor
+        (17, s.surface),            // put_ButtonInactiveBackgroundColor
+        (19, s.on_surface_variant), // put_ButtonInactiveForegroundColor
+        (21, pressed),              // put_ButtonPressedBackgroundColor
+        (23, s.on_surface),         // put_ButtonPressedForegroundColor
+        (27, s.on_surface),         // put_ForegroundColor
+        (32, s.surface),            // put_InactiveBackgroundColor
+        (34, s.on_surface_variant), // put_InactiveForegroundColor
+    ]
+}
+
+/// Color the window's title bar in the shown scheme's surface role, so it
+/// reads as part of the content in both schemes (Windows draws its own light
+/// caption, a warm grey, beside the M3 surface otherwise). `None` (High
+/// Contrast) clears the colors, so the system colors apply.
+///
+/// Reactor 0.100.0 sets only `AppWindowTitleBar.PreferredTheme` and exposes
+/// neither the window handle nor its `AppWindow`, so this follows the Windows
+/// App SDK's own interop path (`Microsoft.UI.Interop.h`): the process's
+/// WinUI window, `Windowing_GetWindowIdFromWindow` from
+/// `Microsoft.Internal.FrameworkUdk.dll`, `AppWindow.GetFromWindowId`, then
+/// the `AppWindowTitleBar` color properties (supported for the default
+/// title bar on Windows 11).
+pub fn apply_title_bar(scheme: Option<&Scheme>) -> Result<(), String> {
+    let hwnd = own_window().ok_or("the window is not shown yet")?;
+    let window_id = window_id(hwnd)?;
+    let run = || -> windows_core::Result<()> {
+        let statics = windows_core::factory::<AppWindow, IAppWindowStatics>()?;
+        let mut out = std::ptr::null_mut();
+        // SAFETY: slot 9 of IAppWindowStatics is GetFromWindowId(WindowId,
+        // out AppWindow); WindowId is one UInt64 passed by value.
+        unsafe { (statics.vtable().get_from_window_id)(statics.as_raw(), window_id, &mut out) }
+            .ok()?;
+        if out.is_null() {
+            return Err(windows_core::Error::empty());
+        }
+        // SAFETY: GetFromWindowId returned one owned reference.
+        let app_window: IAppWindow = unsafe { IInspectable::from_raw(out) }.cast()?;
+        // SAFETY: slot 16 of IAppWindow is get_TitleBar.
+        let title_bar: IAppWindowTitleBar =
+            unsafe { get(&app_window, app_window.vtable().title_bar) }?.cast()?;
+        let colors: Vec<(usize, Option<IReference<UiColor>>)> = match scheme {
+            Some(scheme) => title_bar_colors(scheme)
+                .into_iter()
+                .map(|(slot, color)| (slot, Some(IReference::from(UiColor::from(color)))))
+                .collect(),
+            None => title_bar_colors(Scheme::of(false))
+                .into_iter()
+                .map(|(slot, _)| (slot, None))
+                .collect(),
+        };
+        for (slot, value) in colors {
+            let raw = title_bar.vtable().methods[slot - 6];
+            // SAFETY: every listed slot of IAppWindowTitleBar is a
+            // put_*Color(IReference<Windows.UI.Color>) setter; null clears it.
+            let setter: Setter = unsafe { std::mem::transmute::<usize, Setter>(raw) };
+            let argument = value
+                .as_ref()
+                .map_or(std::ptr::null_mut(), Interface::as_raw);
+            // SAFETY: the setter belongs to this title bar's vtable and only
+            // borrows the reference for the call.
+            unsafe { setter(title_bar.as_raw(), argument) }.ok()?;
+        }
+        Ok(())
+    };
+    run().map_err(|error| format!("{error} ({:#010X})", error.code().0))
+}
+
+/// This process's visible WinUI window (the desktop has one).
+fn own_window() -> Option<HWND> {
+    struct Search {
+        pid: u32,
+        found: HWND,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, search: LPARAM) -> BOOL {
+        // SAFETY: `search` is the `Search` passed to EnumWindows below, alive
+        // for the whole enumeration.
+        let search = unsafe { &mut *(search as *mut Search) };
+        let mut pid = 0;
+        // SAFETY: plain Win32 queries on a window handle EnumWindows gave us.
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        // SAFETY: as above.
+        if pid != search.pid || unsafe { IsWindowVisible(hwnd) } == 0 {
+            return 1;
+        }
+        let mut class = [0u16; 64];
+        // SAFETY: the buffer and its length match.
+        let length = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32) };
+        if String::from_utf16_lossy(&class[..length.max(0) as usize]) == WINUI_WINDOW_CLASS {
+            search.found = hwnd;
+            return 0;
+        }
+        1
+    }
+    let mut search = Search {
+        pid: std::process::id(),
+        found: std::ptr::null_mut(),
+    };
+    // SAFETY: the callback only reads and writes `search`, which outlives the
+    // call.
+    unsafe { EnumWindows(Some(visit), &mut search as *mut Search as LPARAM) };
+    (!search.found.is_null()).then_some(search.found)
+}
+
+/// The window class of a WinUI 3 desktop window.
+const WINUI_WINDOW_CLASS: &str = "WinUIDesktopWin32WindowClass";
+
+/// `Windowing_GetWindowIdFromWindow`, as `Microsoft.UI.Interop.h` loads it.
+fn window_id(hwnd: HWND) -> Result<u64, String> {
+    type GetWindowId = unsafe extern "system" fn(HWND, *mut u64) -> HRESULT;
+    let dll: Vec<u16> = "Microsoft.Internal.FrameworkUdk.dll\0"
+        .encode_utf16()
+        .collect();
+    // SAFETY: a NUL-terminated wide string; the module is the Windows App
+    // SDK runtime WinUI already loaded (the header falls back to loading it).
+    let mut module = unsafe { GetModuleHandleW(dll.as_ptr()) };
+    if module.is_null() {
+        // SAFETY: as above.
+        module = unsafe { LoadLibraryW(dll.as_ptr()) };
+    }
+    if module.is_null() {
+        return Err("Microsoft.Internal.FrameworkUdk.dll is not loaded".to_owned());
+    }
+    // SAFETY: a NUL-terminated export name of a loaded module.
+    let export =
+        unsafe { GetProcAddress(module, c"Windowing_GetWindowIdFromWindow".as_ptr().cast()) }
+            .ok_or("Windowing_GetWindowIdFromWindow is not exported")?;
+    // SAFETY: the export has the `PfnGetWindowIdFromWindow` signature of
+    // Microsoft.UI.Interop.h (HWND, WindowId*) -> HRESULT; WindowId is one
+    // UInt64.
+    let get_window_id: GetWindowId = unsafe { std::mem::transmute(export) };
+    let mut id = 0u64;
+    // SAFETY: `id` is a valid out pointer for the call.
+    unsafe { get_window_id(hwnd, &mut id) }
+        .ok()
+        .map_err(|error| error.to_string())?;
+    Ok(id)
+}
+
+type Setter = unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT;
+
+#[repr(C)]
+struct AppWindowStaticsVtbl {
+    base: InspectableSlots,
+    create: [usize; 3],
+    get_from_window_id: unsafe extern "system" fn(*mut c_void, u64, *mut *mut c_void) -> HRESULT,
+}
+
+#[repr(C)]
+struct AppWindowVtbl {
+    base: InspectableSlots,
+    /// get_Id … put_Title (slots 6–15).
+    before_title_bar: [usize; 10],
+    title_bar: Getter,
+}
+
+#[repr(C)]
+struct AppWindowTitleBarVtbl {
+    base: InspectableSlots,
+    /// Slots 6–38: the color properties, ExtendsContentIntoTitleBar, Height,
+    /// IconShowOptions, insets, ResetToDefault and SetDragRectangles.
+    methods: [usize; 33],
+}
+
+winrt_interface!(
+    IAppWindowStatics,
+    AppWindowStaticsVtbl,
+    0x3c315c24_d540_5d72_b518_b226b83627cb
+);
+winrt_interface!(
+    IAppWindow,
+    AppWindowVtbl,
+    0xcfa788b3_643b_5c5e_ad4e_321d48a82acd
+);
+winrt_interface!(
+    IAppWindowTitleBar,
+    AppWindowTitleBarVtbl,
+    0x5574efa2_c91c_5700_a363_539c71a7aaf4
+);
+
+struct AppWindow;
+impl RuntimeName for AppWindow {
+    const NAME: &'static str = "Microsoft.UI.Windowing.AppWindow";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1112,7 +1288,6 @@ mod tests {
                 "ListViewItemBackgroundSelected",
                 "TextControlBorderBrushFocused",
                 "ComboBoxDropDownBackground",
-                "ToggleSwitchFillOn",
                 "MenuFlyoutPresenterBackground",
                 "ContentDialogBackground",
             ] {
@@ -1174,7 +1349,34 @@ mod tests {
         assert!(xaml.contains(
             "<Thickness x:Key=\"TextControlBorderThemeThicknessFocused\">2,2,2,2</Thickness>"
         ));
-        assert!(xaml.contains("<CornerRadius x:Key=\"OverlayCornerRadius\">4</CornerRadius>"));
+        assert!(xaml.contains("<CornerRadius x:Key=\"ControlCornerRadius\">8</CornerRadius>"));
+        assert!(xaml.contains("<CornerRadius x:Key=\"OverlayCornerRadius\">12</CornerRadius>"));
+    }
+
+    #[test]
+    fn the_title_bar_takes_the_content_surface_on_setter_slots() {
+        for dark in [false, true] {
+            let s = Scheme::of(dark);
+            let colors = title_bar_colors(s);
+            // put_BackgroundColor and put_InactiveBackgroundColor: the surface.
+            for slot in [7, 32] {
+                let color = colors.iter().find(|(at, _)| *at == slot).map(|(_, c)| *c);
+                assert_eq!(color, Some(s.surface), "slot {slot} dark={dark}");
+            }
+            let mut slots: Vec<usize> = colors.iter().map(|(slot, _)| *slot).collect();
+            slots.sort_unstable();
+            slots.dedup();
+            assert_eq!(slots.len(), colors.len());
+            // Every setter is an odd slot (put_ after get_) in 7..=34, the
+            // color properties of IAppWindowTitleBar.
+            assert!(slots.iter().all(|slot| (7..=34).contains(slot)));
+            assert!(
+                slots
+                    .iter()
+                    .filter(|slot| **slot < 24)
+                    .all(|slot| slot % 2 == 1)
+            );
+        }
     }
 
     #[test]
@@ -1190,6 +1392,15 @@ mod tests {
             assert!(xaml.contains(&format!("x:Key=\"{key}\"")), "{key}");
         }
         assert!(!xaml.contains("ThemeResource"));
-        assert_eq!(xaml.matches("<Style ").count(), 9);
+        assert_eq!(xaml.matches("<Style ").count(), 11);
+        // Only the token radii appear: control, container, the Send circle
+        // and the M3 check box.
+        for radius in xaml
+            .split("Property=\"CornerRadius\" Value=\"")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap_or_default())
+        {
+            assert!(["8", "12", "16", "2"].contains(&radius), "{radius}");
+        }
     }
 }

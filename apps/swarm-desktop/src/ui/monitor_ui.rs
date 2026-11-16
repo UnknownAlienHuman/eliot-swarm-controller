@@ -10,8 +10,6 @@ pub(super) enum MonitorMsg {
     MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
     /// A monitor card: open its conversation and its details.
     CardOpened(String),
-    /// Back from the details to the monitor cards.
-    BackToMonitor,
     ReparentRequested(reparent::MoveBinding),
     ReparentSettled(reparent::MoveBinding, Fallible<ReparentResponse>),
 }
@@ -66,9 +64,6 @@ impl DesktopApp {
                     self.shell_update(ShellMsg::AgentOpened(agent.clone()), context);
                     self.show_details(&agent.id, context);
                 }
-            }
-            MonitorMsg::BackToMonitor => {
-                self.panel = Panel::Monitor;
             }
             MonitorMsg::ReparentRequested(binding) => {
                 if self.submitting() {
@@ -171,43 +166,25 @@ impl DesktopApp {
         }));
     }
 
-    /// The panel's header: a title, an optional back button and close.
-    fn panel_header(
-        &self,
-        title: &str,
-        back: Option<Callback<()>>,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
-        let back: View = match back {
-            Some(back) => m3::icon_button(palette)
-                .automation_name("Back to the monitor")
-                .on_click(back)
-                .content(m3::icon(m3::glyph::BACK)),
-            None => View::empty(),
-        };
+    /// The panel's header: its title and the one close button.
+    fn panel_header(&self, title: &str, context: &mut ViewContext<Self>, palette: Palette) -> View {
         Grid::new()
-            .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-            .column_spacing(theme::spacing::XS)
+            .columns([GridLength::STAR, GridLength::Auto])
             .margin(Thickness::new(
-                theme::spacing::SM,
-                theme::spacing::SM,
-                theme::spacing::SM,
-                theme::spacing::SM,
+                tokens::spacing::MD,
+                tokens::spacing::SM,
+                tokens::spacing::SM,
+                tokens::spacing::SM,
             ))
             .children((
-                back,
-                m3::title(title, theme::type_scale::TITLE_MEDIUM)
-                    .grid_column(1)
-                    .margin(Thickness::new(theme::spacing::SM, 0.0, 0.0, 0.0))
-                    .vertical_alignment(VerticalAlignment::Center),
+                m3::section_title(title).vertical_alignment(VerticalAlignment::Center),
                 m3::icon_button(palette)
-                    .grid_column(2)
+                    .grid_column(1)
                     .automation_name("Close panel")
                     .on_click(
                         context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Closed))),
                     )
-                    .content(m3::icon(m3::glyph::CLOSE)),
+                    .content(m3::toolbar_icon(m3::glyph::CLOSE)),
             ))
     }
 
@@ -218,7 +195,7 @@ impl DesktopApp {
         if data.read_at_ms.is_none() {
             cards.push(KeyedView::new(
                 "reading",
-                m3::muted("Reading the swarm…", theme::type_scale::BODY_SMALL),
+                m3::secondary("Reading the swarm…"),
             ));
         }
         if !data.errors.is_empty() {
@@ -226,7 +203,7 @@ impl DesktopApp {
                 "errors",
                 m3::text(
                     format!("Some reads failed: {}", data.errors.join("; ")),
-                    theme::type_scale::BODY_SMALL,
+                    tokens::text::BODY,
                 )
                 .foreground(palette.error())
                 .text_wrapping(TextWrapping::Wrap),
@@ -245,23 +222,20 @@ impl DesktopApp {
             ));
         }
         if data.read_at_ms.is_some() && data.rows.is_empty() {
-            cards.push(KeyedView::new(
-                "none",
-                m3::muted("No Agents to show.", theme::type_scale::BODY_SMALL),
-            ));
+            cards.push(KeyedView::new("none", m3::secondary("No Agents to show.")));
         }
         Grid::new()
             .rows([GridLength::Auto, GridLength::Auto, GridLength::STAR])
             .children((
-                self.panel_header("Monitor", None, context, palette),
-                m3::muted(data.counter_line(), theme::type_scale::BODY_SMALL)
+                self.panel_header("Monitor", context, palette),
+                m3::secondary(data.counter_line())
                     .grid_row(1)
                     .text_wrapping(TextWrapping::Wrap)
                     .margin(Thickness::new(
-                        theme::spacing::MD,
+                        tokens::spacing::MD,
                         0.0,
-                        theme::spacing::MD,
-                        theme::spacing::SM,
+                        tokens::spacing::MD,
+                        tokens::spacing::SM,
                     )),
                 ScrollViewer::new()
                     .grid_row(2)
@@ -269,12 +243,12 @@ impl DesktopApp {
                     .automation_name("Monitored Agents")
                     .content(
                         StackPanel::new()
-                            .spacing(theme::spacing::SM)
+                            .spacing(tokens::spacing::SM)
                             .margin(Thickness::new(
-                                theme::spacing::SM,
+                                tokens::spacing::MD,
                                 0.0,
-                                theme::spacing::SM,
-                                theme::spacing::MD,
+                                tokens::spacing::MD,
+                                tokens::spacing::MD,
                             ))
                             .keyed_children(cards),
                     ),
@@ -374,11 +348,10 @@ impl DesktopApp {
         sections.push(KeyedView::new(
             "resources",
             m3::card_high(palette).content(
-                StackPanel::new().spacing(theme::spacing::SM).children((
-                    m3::text("Resources", theme::type_scale::TITLE_SMALL)
-                        .automation_heading_level(AutomationHeadingLevel::Level3),
+                StackPanel::new().spacing(tokens::spacing::SM).children((
+                    m3::section_title("Resources"),
                     StackPanel::new()
-                        .spacing(theme::spacing::MD)
+                        .spacing(tokens::spacing::MD)
                         .keyed_children(resources),
                 )),
             ),
@@ -436,24 +409,19 @@ impl DesktopApp {
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])
             .children((
-                self.panel_header(
-                    "Details",
-                    Some(context.message(Message::Monitor(MonitorMsg::BackToMonitor))),
-                    context,
-                    palette,
-                ),
+                self.panel_header("Details", context, palette),
                 ScrollViewer::new()
                     .grid_row(1)
                     .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                     .automation_name("Agent details")
                     .content(
                         StackPanel::new()
-                            .spacing(theme::spacing::SM)
+                            .spacing(tokens::spacing::SM)
                             .margin(Thickness::new(
-                                theme::spacing::SM,
+                                tokens::spacing::MD,
                                 0.0,
-                                theme::spacing::SM,
-                                theme::spacing::MD,
+                                tokens::spacing::MD,
+                                tokens::spacing::MD,
                             ))
                             .keyed_children(sections),
                     ),
@@ -461,13 +429,13 @@ impl DesktopApp {
     }
 }
 
-/// A details card: a title and selectable lines.
+/// A details section: a container-corner card, its title and its lines
+/// in body text.
 fn section(palette: Palette, title: &str, lines: &[String]) -> View {
     m3::card_high(palette).content(
-        StackPanel::new().spacing(theme::spacing::XS).children((
-            m3::text(title, theme::type_scale::TITLE_SMALL)
-                .automation_heading_level(AutomationHeadingLevel::Level3),
-            m3::muted(lines.join("\n"), theme::type_scale::BODY_SMALL)
+        StackPanel::new().spacing(tokens::spacing::SM).children((
+            m3::section_title(title),
+            m3::body(lines.join("\n"))
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true),
         )),

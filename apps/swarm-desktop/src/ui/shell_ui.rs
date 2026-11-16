@@ -44,6 +44,8 @@ pub(super) enum ShellMsg {
     NewTask,
     MoreAgentsRequested,
     SettingsOpened,
+    /// The Settings navigation's Back row: the conversation again.
+    SettingsClosed,
     PanelToggled(Panel),
     /// The window's actual Light/Dark scheme (Reactor `on_color_scheme`).
     SchemeObserved(ColorScheme),
@@ -78,17 +80,8 @@ pub(super) enum ShellMsg {
 const HIGH_CONTRAST_POLL_MS: u64 = 2_000;
 /// Re-check for the empty editor render one frame later.
 const PRIME_RETRY_MS: u64 = 16;
-/// Indent per tree level in the sidebar.
-const TREE_INDENT: f64 = 16.0;
-/// The expand chevron column left of an Agent item (a 32 x 32 icon button).
-const CHEVRON: f64 = 32.0;
-/// The M3 navigation drawer's padding around its items.
-const DRAWER_PADDING: f64 = 12.0;
-/// The start inset of a navigation item's content (and of the headers).
-const ITEM_INSET: f64 = 16.0;
-/// The left edge of an Agent item: its title lines up with its project's
-/// label (16 inset + 20 icon + 12 gap = 48 = 32 + 16).
-const CHILD_INSET: f64 = 32.0;
+/// The sidebar's padding around its rows.
+const SIDEBAR_PADDING: f64 = tokens::spacing::SM;
 /// Rows in Recents.
 const RECENTS: usize = 8;
 /// Titles read per background batch.
@@ -333,6 +326,12 @@ impl DesktopApp {
                     self.settings_entered(context);
                 }
             }
+            ShellMsg::SettingsClosed => {
+                if self.main != Main::Conversation {
+                    self.main = Main::Conversation;
+                    self.reprime_fields(context);
+                }
+            }
             ShellMsg::PanelToggled(panel) => match panel {
                 Panel::Details => match self.selected_agent_id() {
                     Some(agent) if self.panel != Panel::Details => {
@@ -355,9 +354,13 @@ impl DesktopApp {
                     self.apply_scheme();
                     self.reprime_fields(context);
                 }
+                // The first observation colors the title bar even when the
+                // palette is the starting one.
+                self.sync_title_bar();
             }
             ShellMsg::WindowResized(size) => {
                 self.window_width = Some(size.width);
+                self.sync_title_bar();
                 if size.width >= 640.0 && size.height >= 480.0 {
                     let window = (size.width as u32, size.height as u32);
                     if self.window_size != Some(window) {
@@ -443,6 +446,22 @@ impl DesktopApp {
     fn apply_scheme(&mut self) {
         if let Err(error) = crate::app_resources::apply_scheme(self.palette().scheme()) {
             self.set_status(format!("WinUI M3 resources not applied: {error}"));
+        }
+        self.sync_title_bar();
+    }
+
+    /// Color the title bar in the shown palette once the window exists and
+    /// whenever the palette changes (a runtime theme switch, High Contrast).
+    /// Until the window is shown the colors stay pending and the next scheme
+    /// or size observation tries again.
+    fn sync_title_bar(&mut self) {
+        let palette = self.palette();
+        if self.title_bar == Some(palette) {
+            return;
+        }
+        match crate::app_resources::apply_title_bar(palette.scheme()) {
+            Ok(()) => self.title_bar = Some(palette),
+            Err(error) => self.set_status(format!("Title bar colors not applied: {error}")),
         }
     }
 
@@ -633,16 +652,23 @@ impl DesktopApp {
         });
     }
 
-    /// The main area's width from the window width, the sidebar and the
-    /// open panel, or None until the first size observation.
+    /// The main area's width from the window width, the sidebar (or the
+    /// Settings navigation in its place) and the open panel, or None until
+    /// the first size observation.
     pub(super) fn main_width(&self) -> Option<f64> {
-        let panel = if self.panel == Panel::Closed {
-            0.0
+        let panel = if self.panel_shown() {
+            tokens::layout::PANEL_WIDTH
         } else {
-            theme::layout::PANEL_WIDTH
+            0.0
         };
         self.window_width
-            .map(|width| width - theme::layout::SIDEBAR_WIDTH - panel)
+            .map(|width| width - tokens::layout::SIDEBAR_WIDTH - panel)
+    }
+
+    /// The right panel belongs to the conversation: Settings shows two
+    /// columns (its navigation and the page), as in the Codex app.
+    fn panel_shown(&self) -> bool {
+        self.panel != Panel::Closed && self.main == Main::Conversation && !self.startup_error
     }
 
     /// Write an explicit theme or startup choice into `[desktop]` at once,
@@ -776,9 +802,9 @@ impl DesktopApp {
             WindowVisuals::new()
                 .client_size(
                     self.preferred_window
-                        .map_or(theme::layout::WINDOW_WIDTH, |w| f64::from(w.0)),
+                        .map_or(tokens::layout::WINDOW_WIDTH, |w| f64::from(w.0)),
                     self.preferred_window
-                        .map_or(theme::layout::WINDOW_HEIGHT, |w| f64::from(w.1)),
+                        .map_or(tokens::layout::WINDOW_HEIGHT, |w| f64::from(w.1)),
                 )
                 .theme(window_theme(self.prefs.theme)),
         );
@@ -795,17 +821,22 @@ impl DesktopApp {
             Main::Settings => self.settings_view(context, palette),
         };
         let mut columns = vec![
-            GridLength::Pixel(theme::layout::SIDEBAR_WIDTH),
+            GridLength::Pixel(tokens::layout::SIDEBAR_WIDTH),
             GridLength::STAR,
         ];
-        let panel: View = if self.panel == Panel::Closed {
+        let panel: View = if !self.panel_shown() {
             View::empty()
         } else {
-            columns.push(GridLength::Pixel(theme::layout::PANEL_WIDTH));
+            columns.push(GridLength::Pixel(tokens::layout::PANEL_WIDTH));
             Border::new()
                 .grid_column(2)
                 .background(palette.sidebar())
                 .content(self.panel_view(context, palette))
+        };
+        // Settings replaces the sidebar with its own navigation.
+        let side: View = match self.main {
+            Main::Settings if !self.startup_error => self.settings_nav(context, palette),
+            _ => self.sidebar_view(context, palette),
         };
         let window = Grid::new()
             .background(palette.surface())
@@ -814,7 +845,7 @@ impl DesktopApp {
                 Border::new()
                     .grid_column(0)
                     .background(palette.sidebar())
-                    .content(self.sidebar_view(context, palette)),
+                    .content(side),
                 Border::new().grid_column(1).content(main),
                 panel,
             ));
@@ -832,45 +863,32 @@ impl DesktopApp {
         Grid::new().keyed_children(vec![KeyedView::new(palette_key.to_owned(), window)])
     }
 
-    /// The navigation drawer: the app name, the New task FAB, the projects
-    /// with their Agents, Recents, then the fleet status and Settings at the
-    /// bottom. M3 navigation-drawer metrics: 12-DIP container padding,
-    /// 56-DIP items, title-small section headers at the items' 16-DIP inset.
+    /// The sidebar at Codex density: the app name, a New task row, the
+    /// projects (32-DIP rows) with their tasks nested (28-DIP rows indented
+    /// 24 DIPs), Recents, then the fleet status and Settings rows at the
+    /// bottom. Section labels are secondary text at the rows' content inset.
     fn sidebar_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let gutter = DRAWER_PADDING;
-        let header = Grid::new()
-            .columns([GridLength::STAR, GridLength::Auto])
+        let pad = SIDEBAR_PADDING;
+        let header = m3::section_title("Eliot Swarm")
+            .height(tokens::height::CONTROL)
             .margin(Thickness::new(
-                gutter + theme::spacing::MD,
-                theme::spacing::MD,
-                gutter,
-                theme::spacing::SM,
+                pad + tokens::spacing::INSET,
+                tokens::spacing::SM,
+                pad,
+                0.0,
             ))
-            .children((
-                m3::title("Eliot Swarm", theme::type_scale::TITLE_MEDIUM)
-                    .vertical_alignment(VerticalAlignment::Center),
-                m3::icon_button(palette)
-                    .grid_column(1)
-                    .automation_name("Refresh")
-                    .on_click(context.message(Message::Shell(ShellMsg::RefreshRequested)))
-                    .content(m3::icon(m3::glyph::REFRESH)),
-            ));
-        let new_task = m3::fab(palette)
+            .vertical_alignment(VerticalAlignment::Center);
+        let new_task_selected = self.main == Main::Conversation && self.chat.convo.is_none();
+        let new_task = m3::row(palette, false)
             .grid_row(1)
-            .margin(Thickness::new(
-                gutter,
-                theme::spacing::XS,
-                gutter,
-                theme::spacing::SM,
-            ))
+            .margin(Thickness::new(pad, tokens::spacing::XS, pad, 0.0))
             .automation_name("New task")
             .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
             .content(m3::icon_label(m3::glyph::NEW_TASK, "New task"));
-        let new_task_selected = self.main == Main::Conversation && self.chat.convo.is_none();
 
         let mut items: Vec<KeyedView> = vec![KeyedView::new(
             "projects-caption",
-            section_header("Projects"),
+            section_label("Projects"),
         )];
         let registered: Vec<(String, String)> = self
             .nav
@@ -889,12 +907,14 @@ impl DesktopApp {
         if sections.is_empty() {
             items.push(KeyedView::new(
                 "no-projects",
-                quiet_line(if self.nav.agents_loading {
-                    "Loading…"
-                } else {
-                    "No projects yet"
-                })
-                .margin(Thickness::new(ITEM_INSET, 0.0, 0.0, theme::spacing::SM)),
+                quiet_row(
+                    if self.nav.agents_loading {
+                        "Loading…"
+                    } else {
+                        "No projects yet"
+                    },
+                    0.0,
+                ),
             ));
         }
         for section in &sections {
@@ -906,12 +926,7 @@ impl DesktopApp {
             if section.rows.is_empty() {
                 items.push(KeyedView::new(
                     format!("empty:{}", section.checkout),
-                    quiet_line("No tasks").margin(Thickness::new(
-                        CHILD_INSET + ITEM_INSET,
-                        0.0,
-                        0.0,
-                        theme::spacing::SM,
-                    )),
+                    quiet_row("No tasks", tokens::layout::TREE_INDENT),
                 ));
             }
             for row in &section.rows {
@@ -926,16 +941,11 @@ impl DesktopApp {
         if self.nav.agents.len() < self.nav.agents_total && self.nav.agents_next.is_some() {
             items.push(KeyedView::new(
                 "more",
-                m3::text_button(palette)
+                m3::sub_row(palette, false)
                     .is_enabled(!self.nav.agents_loading)
-                    .margin(Thickness::new(
-                        CHILD_INSET + ITEM_INSET - 12.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                    ))
+                    .margin(Thickness::new(tokens::layout::TREE_INDENT, 0.0, 0.0, 0.0))
                     .on_click(context.message(Message::Shell(ShellMsg::MoreAgentsRequested)))
-                    .content(m3::label(&format!(
+                    .content(m3::secondary(format!(
                         "Show more ({} of {})",
                         self.nav.agents.len(),
                         self.nav.agents_total
@@ -944,7 +954,7 @@ impl DesktopApp {
         }
         let recents = nav::recents(&self.nav.agents, RECENTS);
         if !recents.is_empty() {
-            items.push(KeyedView::new("recents-caption", section_header("Recents")));
+            items.push(KeyedView::new("recents-caption", section_label("Recents")));
             for agent in recents {
                 items.push(KeyedView::new(
                     format!("recent:{}", agent.id),
@@ -958,41 +968,34 @@ impl DesktopApp {
             .automation_name("Projects and Agents")
             .content(
                 StackPanel::new()
-                    .margin(Thickness::new(gutter, 0.0, gutter, gutter))
+                    .margin(Thickness::new(pad, 0.0, pad, pad))
                     .keyed_children(items),
             );
 
-        let settings_open = self.main == Main::Settings;
         let monitor_open = self.panel == Panel::Monitor;
         let bottom = StackPanel::new()
             .grid_row(3)
-            .margin(Thickness::new(gutter, 0.0, gutter, gutter))
+            .margin(Thickness::new(pad, 0.0, pad, pad))
             .keyed_children(vec![
                 KeyedView::new(
                     "divider",
-                    Border::new()
-                        .height(1.0)
-                        .margin(Thickness::new(
-                            theme::spacing::MD,
-                            0.0,
-                            theme::spacing::MD,
-                            theme::spacing::SM,
-                        ))
-                        .background(palette.outline_variant()),
+                    m3::divider(palette).margin(Thickness::new(
+                        tokens::spacing::INSET,
+                        0.0,
+                        tokens::spacing::INSET,
+                        tokens::spacing::SM,
+                    )),
                 ),
                 KeyedView::new(
                     format!("fleet:{monitor_open}"),
                     self.fleet_row(context, palette),
                 ),
                 KeyedView::new(
-                    format!("settings:{settings_open}"),
-                    m3::nav_item(palette, settings_open)
+                    "settings",
+                    m3::row(palette, false)
                         .automation_name("Settings")
                         .on_click(context.message(Message::Shell(ShellMsg::SettingsOpened)))
-                        .content(m3::nav_content(m3::icon_label(
-                            m3::glyph::SETTINGS,
-                            "Settings",
-                        ))),
+                        .content(m3::icon_label(m3::glyph::SETTINGS, "Settings")),
                 ),
             ]);
 
@@ -1006,7 +1009,7 @@ impl DesktopApp {
             .children((header, new_task, list, bottom))
     }
 
-    /// A project item: a new task in that project.
+    /// A project row: a new task in that project.
     fn project_row(
         &self,
         section: &Section,
@@ -1014,20 +1017,18 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        m3::nav_item(palette, selected)
+        m3::row(palette, selected)
             .automation_name(format!("New task in {}", section.name))
             .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
                 section.checkout.clone(),
             ))))
-            .content(m3::nav_content(m3::icon_label(
-                m3::glyph::FOLDER,
-                &section.name,
-            )))
+            .content(m3::icon_label(m3::glyph::FOLDER, &section.name))
     }
 
-    /// An Agent item under its project: indented to the project's label,
-    /// the expand chevron when it has workers, its title and a status dot
-    /// when its state needs a look.
+    /// A task row under its project: indented 24 DIPs per level, so its
+    /// title lines up with the project's label (12 inset + 16 icon + 8 gap =
+    /// 36 = 24 + 12). A manager with workers carries its expand chevron in
+    /// that indent.
     fn agent_row(
         &self,
         row: &Row,
@@ -1037,6 +1038,7 @@ impl DesktopApp {
     ) -> View {
         let agent = &row.agent;
         let title = self.agent_title(&agent.id);
+        let indent = tokens::layout::TREE_INDENT;
         let chevron: View = if row.expandable() {
             let (glyph, name) = if row.expanded {
                 (
@@ -1050,15 +1052,14 @@ impl DesktopApp {
                 )
             };
             m3::icon_button(palette)
-                .width(CHEVRON)
-                .height(CHEVRON)
-                .vertical_alignment(VerticalAlignment::Center)
+                .width(indent)
+                .height(tokens::height::SUB_ROW)
                 .automation_name(name)
                 .on_click(context.message(Message::Shell(ShellMsg::ExpandToggled(
                     agent.id.clone(),
                     !row.expanded,
                 ))))
-                .content(m3::icon_sized(glyph, 12.0))
+                .content(m3::icon(glyph))
         } else {
             View::empty()
         };
@@ -1067,12 +1068,13 @@ impl DesktopApp {
             name.push_str(&format!(", worker level {}", row.depth));
         }
         let note: View = match &row.note {
-            Some(note) => quiet_line(note)
+            Some(note) => m3::secondary(note.clone())
+                .text_trimming(TextTrimming::CharacterEllipsis)
                 .margin(Thickness::new(
-                    theme::spacing::MD,
+                    tokens::spacing::INSET,
                     0.0,
                     0.0,
-                    theme::spacing::XS,
+                    tokens::spacing::XS,
                 ))
                 .grid_row(1)
                 .grid_column(1)
@@ -1080,31 +1082,28 @@ impl DesktopApp {
             None => View::empty(),
         };
         Grid::new()
-            .margin(Thickness::new(
-                CHILD_INSET - CHEVRON + row.depth as f64 * TREE_INDENT,
-                0.0,
-                0.0,
-                0.0,
-            ))
-            .columns([GridLength::Pixel(CHEVRON), GridLength::STAR])
+            .margin(Thickness::new(row.depth as f64 * indent, 0.0, 0.0, 0.0))
+            .columns([GridLength::Pixel(indent), GridLength::STAR])
             .rows([GridLength::Auto, GridLength::Auto])
             .children((
                 Border::new()
                     .vertical_alignment(VerticalAlignment::Center)
                     .content(chevron),
-                m3::nav_item(palette, selected)
+                m3::sub_row(palette, selected)
                     .grid_column(1)
                     .automation_name(name)
                     .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
-                    .content(m3::nav_content(row_content(
+                    .content(m3::row_content(
+                        None,
                         &title,
+                        "",
                         m3::list_dot(palette, &agent.state),
-                    ))),
+                    )),
                 note,
             ))
     }
 
-    /// A Recents item: the title and its dot, no tree.
+    /// A Recents row: the title and its dot, no tree.
     fn recent_row(
         &self,
         agent: &UiAgent,
@@ -1112,41 +1111,49 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let title = self.agent_title(&agent.id);
-        m3::nav_item(palette, false)
+        m3::sub_row(palette, false)
             .automation_name(format!("Recent: {title}, {}", agent.state))
             .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
-            .content(m3::nav_content(row_content(
+            .content(m3::row_content(
+                None,
                 &title,
+                "",
                 m3::list_dot(palette, &agent.state),
-            )))
+            ))
     }
 
-    /// The fleet in one line ("2 running · 1 waiting"); it opens the
+    /// The fleet in one row ("2 running · 1 waiting"); it opens the
     /// monitor.
     fn fleet_row(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let (summary, tone) = fleet_summary(&self.nav.agents, self.nav.agents_total);
         let dot = palette.dot(tone).map_or_else(View::empty, m3::dot);
         let open = self.panel == Panel::Monitor;
-        m3::nav_item(palette, open)
+        m3::row(palette, open)
             .automation_name(format!(
                 "Monitor: {summary} ({})",
                 if open { "open" } else { "closed" }
             ))
             .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Monitor))))
-            .content(m3::nav_content(
-                Grid::new()
-                    .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                    .column_spacing(12.0)
-                    .children((
-                        m3::icon(m3::glyph::PULSE),
-                        TextBlock::new()
-                            .grid_column(1)
-                            .text(summary)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis),
-                        Border::new().grid_column(2).content(dot),
-                    )),
-            ))
+            .content(m3::row_content(Some(m3::glyph::PULSE), &summary, "", dot))
+    }
+
+    /// Settings in the sidebar's place: a Back row, then one row per page.
+    fn settings_nav(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let pad = SIDEBAR_PADDING;
+        let mut rows: Vec<KeyedView> = vec![
+            KeyedView::new(
+                "back",
+                m3::row(palette, false)
+                    .automation_name("Back to the conversation")
+                    .on_click(context.message(Message::Shell(ShellMsg::SettingsClosed)))
+                    .content(m3::icon_label(m3::glyph::BACK, "Back")),
+            ),
+            KeyedView::new("caption", section_label("Settings")),
+        ];
+        rows.extend(self.settings_rows(context, palette));
+        StackPanel::new()
+            .margin(Thickness::new(pad, tokens::spacing::SM, pad, pad))
+            .keyed_children(rows)
     }
 
     /// Show a short notice above the composer (refusals, uncertain
@@ -1163,19 +1170,19 @@ impl DesktopApp {
     fn startup_error_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let error = self.alert.clone().unwrap_or_default();
         StackPanel::new()
-            .max_width(theme::layout::READING_WIDTH)
+            .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
             .vertical_alignment(VerticalAlignment::Center)
-            .spacing(theme::spacing::MD)
-            .margin(Thickness::uniform(theme::spacing::LG))
+            .spacing(tokens::spacing::MD)
+            .margin(Thickness::uniform(tokens::spacing::LG))
             .children((
-                m3::title("Swarm could not start here", theme::type_scale::HEADLINE_SMALL),
+                m3::page_title("Swarm could not start here"),
                 m3::text(
                     "Swarm could not open this data directory. Existing settings have not been moved.",
-                    theme::type_scale::BODY_LARGE,
+                    tokens::text::BODY,
                 )
                 .text_wrapping(TextWrapping::Wrap),
-                m3::muted(error, theme::type_scale::BODY_MEDIUM)
+                m3::secondary(error)
                     .text_wrapping(TextWrapping::Wrap)
                     .is_text_selection_enabled(true),
                 m3::filled(palette)
@@ -1195,36 +1202,30 @@ impl DesktopApp {
     }
 }
 
-/// A navigation-drawer section header: title-small at the items' inset.
-fn section_header(text: &str) -> TextBlock {
-    m3::caption(text).margin(Thickness::new(
-        ITEM_INSET,
-        theme::spacing::MD,
+/// A sidebar section label: secondary text at the rows' content inset, 16
+/// DIPs below the group above it.
+fn section_label(text: &str) -> TextBlock {
+    m3::section_label(text).margin(Thickness::new(
+        tokens::spacing::INSET,
+        tokens::spacing::MD,
         0.0,
-        theme::spacing::SM,
+        tokens::spacing::XS,
     ))
 }
 
-/// A muted one-line note in a list.
-fn quiet_line(text: &str) -> TextBlock {
-    m3::muted(text, theme::type_scale::BODY_SMALL).text_trimming(TextTrimming::CharacterEllipsis)
-}
-
-/// A row's content: the title, trimmed, and an optional trailing mark.
-fn row_content(title: &str, trailing: View) -> View {
-    Grid::new()
-        .columns([GridLength::STAR, GridLength::Auto])
-        .column_spacing(theme::spacing::SM)
-        .children((
-            TextBlock::new()
-                .text(title.to_owned())
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
-            Border::new()
-                .grid_column(1)
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(trailing),
+/// A muted sub-row that is not a control ("No tasks"), its text where an
+/// indented task row's title starts.
+fn quiet_row(text: &str, indent: f64) -> View {
+    m3::secondary(text.to_owned())
+        .height(tokens::height::SUB_ROW)
+        .text_trimming(TextTrimming::CharacterEllipsis)
+        .margin(Thickness::new(
+            indent + tokens::spacing::INSET,
+            0.0,
+            0.0,
+            0.0,
         ))
+        .into()
 }
 
 // The fleet line and its most urgent tone, from the listed Agents.
