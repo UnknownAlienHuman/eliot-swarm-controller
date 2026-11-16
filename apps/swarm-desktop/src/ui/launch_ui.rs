@@ -270,16 +270,14 @@ impl DesktopApp {
                             self.chat.pending_local =
                                 Some((outcome.agent.clone(), linked, outcome.text.clone()));
                         }
-                        // The title is the first message, known now.
-                        self.nav
-                            .titles
-                            .insert(outcome.agent.clone(), nav::title(&outcome.text));
                         self.set_status(format!(
                             "Launched {} ({}); its first input is {}.",
                             outcome.agent,
                             outcome.command_id,
                             outcome.linked_command.as_deref().unwrap_or("not linked")
                         ));
+                        // Until the list reads it back, the title is the
+                        // first message, known now.
                         self.nav.pending_select = Some(UiAgent {
                             id: outcome.agent.clone(),
                             generation: outcome.generation,
@@ -288,6 +286,9 @@ impl DesktopApp {
                             project: self.launch.workspace.clone(),
                             parent: None,
                             updated_at: handoff_now_ms(),
+                            title: nav::title(&outcome.text)
+                                .unwrap_or_else(|| outcome.agent.clone()),
+                            native_child: false,
                         });
                         self.nav.selection.select_agent(Some(outcome.agent));
                         self.load_agents(context, None);
