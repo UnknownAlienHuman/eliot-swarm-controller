@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 43;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 44;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1103,6 +1103,20 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 44 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX commands_turn_unknown
+                    ON commands(target, generation, turn_id, state, id)
+                    WHERE state IN ('accepted','queued','dispatched','unknown');
+                  INSERT INTO schema_migrations(version) VALUES (44);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1117,7 +1131,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TRIGGER assignment_commands_insert;
+                "DROP INDEX commands_turn_unknown;
+              DELETE FROM schema_migrations WHERE version=44;
+              DROP TRIGGER assignment_commands_insert;
              DROP TRIGGER assignment_commands_update;
              DROP TRIGGER assignment_commands_delete;
              DROP TRIGGER assignment_turns_insert;
@@ -1185,7 +1201,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TRIGGER assignment_commands_insert;
+                "DROP INDEX commands_turn_unknown;
+              DELETE FROM schema_migrations WHERE version=44;
+              DROP TRIGGER assignment_commands_insert;
              DROP TRIGGER assignment_commands_update;
              DROP TRIGGER assignment_commands_delete;
              DROP TRIGGER assignment_turns_insert;

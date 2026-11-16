@@ -3,10 +3,12 @@
 //! settings (`settings.read` / `settings.save`, one store with a revision
 //! and author history) through [`crate::config_client`]:
 //! General (`[desktop]`), Models and profiles (`[profiles]`), Routing
-//! (`[routing]`), Projects (`[projects]`), Automation and scripts
-//! (`[automation]` assignments; rules and scripts keep their own files and
-//! APIs), Cloud MCP (`[cloud_mcp]`) and Advanced (every section as JSON,
-//! and the settings history). Each save shows its result and revision.
+//! (`[routing]`), Projects (`[projects]`), Automation (`[automation]`
+//! assignments above the read-only rules), Scripts (their own files and
+//! API), Cloud MCP (`[cloud_mcp]`) and Advanced (every section as JSON, and
+//! the settings history). Each save shows its result and revision. The
+//! pages replace the sidebar with their own navigation (`settings_nav`) and
+//! show one centred column, one filled Save per page.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -28,17 +30,19 @@ pub(super) enum Page {
     Routing,
     Projects,
     Automation,
+    Scripts,
     CloudMcp,
     Advanced,
 }
 
 impl Page {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::General,
         Self::Models,
         Self::Routing,
         Self::Projects,
         Self::Automation,
+        Self::Scripts,
         Self::CloudMcp,
         Self::Advanced,
     ];
@@ -49,7 +53,8 @@ impl Page {
             Self::Models => "Models and profiles",
             Self::Routing => "Routing",
             Self::Projects => "Projects",
-            Self::Automation => "Automation and scripts",
+            Self::Automation => "Automation",
+            Self::Scripts => "Scripts",
             Self::CloudMcp => "Cloud MCP",
             Self::Advanced => "Advanced",
         }
@@ -197,6 +202,7 @@ impl SettingsState {
                 Ok(sections)
             }
             Page::General => Err("General saves as you choose.".to_owned()),
+            Page::Scripts => Err("Scripts save from their own editor.".to_owned()),
         }
     }
 
@@ -210,15 +216,10 @@ impl SettingsState {
             Page::Automation => self.automation != self.base(Section::Automation),
             Page::CloudMcp => self.cloud != self.base(Section::CloudMcp),
             Page::Advanced => self.all != self.all_base,
-            Page::General | Page::Models => false,
+            Page::General | Page::Models | Page::Scripts => false,
         }
     }
 }
-
-/// The section list beside the shown section.
-const SECTION_LIST_WIDTH: f64 = 280.0;
-/// The label column of the forms.
-const LABEL_WIDTH: f64 = 180.0;
 
 impl DesktopApp {
     pub(super) fn settings_update(&mut self, msg: SettingsMsg, context: &ComponentContext<Self>) {
@@ -279,7 +280,7 @@ impl DesktopApp {
                     Page::Automation => s.automation = s.base(Section::Automation),
                     Page::CloudMcp => s.cloud = s.base(Section::CloudMcp),
                     Page::Advanced => s.all = s.all_base.clone(),
-                    Page::General => {}
+                    Page::General | Page::Scripts => {}
                 }
                 self.settings.notes.remove(&page);
                 self.reprime_fields(context);
@@ -524,11 +525,9 @@ impl DesktopApp {
         }
         match self.settings_page {
             Page::Models | Page::Routing | Page::Projects => self.load_profile_list(context),
-            Page::Automation => {
-                if !self.scripts.listed {
-                    self.load_scripts(context);
-                }
-                self.load_rules(context);
+            Page::Automation => self.load_rules(context),
+            Page::Scripts if !self.scripts.listed => {
+                self.load_scripts(context);
             }
             _ => {}
         }
@@ -557,16 +556,20 @@ impl DesktopApp {
         }
     }
 
-    /// The Settings page: the section list (navigation items), then the
-    /// shown section under its title-large title.
-    pub(super) fn settings_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let rows: Vec<KeyedView> = Page::ALL
+    /// The Settings navigation's page rows (the sidebar's place, see
+    /// `settings_nav`).
+    pub(super) fn settings_rows(
+        &self,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> Vec<KeyedView> {
+        Page::ALL
             .iter()
             .map(|page| {
                 let selected = *page == self.settings_page;
                 KeyedView::new(
                     format!("{}:{selected}", page.label()),
-                    m3::nav_item(palette, selected)
+                    m3::row(palette, selected)
                         .automation_name(if selected {
                             format!("{} (shown)", page.label())
                         } else {
@@ -575,90 +578,79 @@ impl DesktopApp {
                         .on_click(
                             context.message(Message::Settings(SettingsMsg::PageSelected(*page))),
                         )
-                        .content(m3::nav_content(
+                        .content(
                             TextBlock::new()
                                 .text(page.label())
+                                .vertical_alignment(VerticalAlignment::Center)
                                 .text_trimming(TextTrimming::CharacterEllipsis),
-                        )),
+                        ),
                 )
             })
-            .collect();
-        let nav = StackPanel::new()
-            .margin(Thickness::new(
-                12.0,
-                theme::spacing::LG,
-                theme::spacing::SM,
-                theme::spacing::MD,
-            ))
-            .children((
-                m3::title("Settings", theme::type_scale::TITLE_LARGE).margin(Thickness::new(
-                    theme::spacing::MD,
-                    0.0,
-                    0.0,
-                    theme::spacing::MD,
-                )),
-                StackPanel::new().keyed_children(rows),
-            ));
+            .collect()
+    }
+
+    /// The shown Settings page: its title, then its groups, in one centred
+    /// column of at most 840 DIPs with the 24-DIP page padding.
+    pub(super) fn settings_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let page = self.settings_page;
         let body: View = if let Some(error) = &self.settings.error {
-            scroll(self.read_error(error, context, palette))
+            self.read_error(error, context, palette)
         } else if !self.settings.loaded {
-            m3::muted("Reading settings…", theme::type_scale::BODY_MEDIUM).into()
+            m3::secondary("Reading settings…").into()
         } else {
             match page {
-                Page::General => scroll(self.general_section(context, palette)),
-                Page::Models => scroll(self.models_section(context, palette)),
-                Page::Routing => scroll(self.routing_section(context, palette)),
-                Page::Projects => scroll(self.projects_section(context, palette)),
-                Page::Automation => scroll(self.automation_section(context, palette)),
-                Page::CloudMcp => scroll(self.cloud_section(context, palette)),
-                Page::Advanced => scroll(self.advanced_section(context, palette)),
+                Page::General => self.general_section(context, palette),
+                Page::Models => self.models_section(context, palette),
+                Page::Routing => self.routing_section(context, palette),
+                Page::Projects => self.projects_section(context, palette),
+                Page::Automation => self.automation_section(context, palette),
+                Page::Scripts => self.scripts_view(context, palette),
+                Page::CloudMcp => self.cloud_section(context, palette),
+                Page::Advanced => self.advanced_section(context, palette),
             }
         };
-        // One explicit column width, so every section's groups line up
+        // One explicit column width, so every page's groups line up
         // (content-sized until the window size is observed).
         let width = self.main_width().map(|width| {
-            (width - SECTION_LIST_WIDTH - 2.0 * theme::spacing::LG)
-                .clamp(320.0, theme::layout::READING_WIDTH)
+            (width - 2.0 * tokens::spacing::LG)
+                .clamp(tokens::layout::MIN_COLUMN, tokens::layout::SETTINGS_WIDTH)
         });
-        // The section's tree is keyed by section, so its editors are new
-        // controls (see `reprime_fields`).
-        let content = Grid::new()
-            .grid_column(1)
-            .rows([GridLength::Auto, GridLength::STAR])
-            .row_spacing(theme::spacing::LG)
-            .width(width)
-            .horizontal_alignment(HorizontalAlignment::Left)
-            .margin(Thickness::uniform(theme::spacing::LG))
-            .keyed_children(vec![
-                KeyedView::new(
-                    format!("title:{}", page.label()),
-                    m3::title(page.label(), theme::type_scale::TITLE_LARGE),
-                ),
-                KeyedView::new(
-                    format!("body:{}", page.label()),
-                    Border::new().grid_row(1).content(body),
-                ),
-            ]);
-        Grid::new()
-            .columns([GridLength::Pixel(SECTION_LIST_WIDTH), GridLength::STAR])
-            .children((nav, content))
+        // The page's tree is keyed by page, so its editors are new controls
+        // (see `reprime_fields`).
+        ScrollViewer::new()
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .content(
+                StackPanel::new()
+                    .width(width)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .margin(Thickness::uniform(tokens::spacing::LG))
+                    .spacing(tokens::spacing::MD)
+                    .keyed_children(vec![
+                        KeyedView::new(
+                            format!("title:{}", page.label()),
+                            m3::page_title(page.label()),
+                        ),
+                        KeyedView::new(format!("body:{}", page.label()), body),
+                    ]),
+            )
     }
 
     fn read_error(&self, error: &str, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        StackPanel::new().spacing(theme::spacing::MD).children((
-            m3::text(error.to_owned(), theme::type_scale::BODY_LARGE)
+        StackPanel::new().spacing(tokens::spacing::SM).children((
+            m3::body(error.to_owned())
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true),
             m3::outlined(palette)
+                .horizontal_alignment(HorizontalAlignment::Left)
                 .is_enabled(!self.settings.reading)
                 .on_click(context.message(Message::Settings(SettingsMsg::Reload)))
-                .content(TextBlock::new().text("Read again")),
+                .content(m3::label("Read again")),
         ))
     }
 
-    /// Save / Validate / Discard and the section's last result, under every
-    /// editable section.
+    /// Save / Validate / Discard and the page's last result, under every
+    /// editable page: the page's one filled action, then outlined, then
+    /// text.
     fn save_bar(
         &self,
         page: Page,
@@ -681,10 +673,10 @@ impl DesktopApp {
                 )
             }
         });
-        StackPanel::new().spacing(theme::spacing::SM).children((
+        StackPanel::new().spacing(tokens::spacing::SM).children((
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
-                .spacing(theme::spacing::SM)
+                .spacing(tokens::spacing::SM)
                 .children((
                     m3::filled(palette)
                         .is_enabled(dirty && !busy)
@@ -692,19 +684,19 @@ impl DesktopApp {
                         .on_click(
                             context.message(Message::Settings(SettingsMsg::Save(page, false))),
                         )
-                        .content(TextBlock::new().text(if saving { "Saving…" } else { "Save" })),
+                        .content(m3::label(if saving { "Saving…" } else { "Save" })),
                     m3::outlined(palette)
                         .is_enabled(!busy)
                         .automation_name(format!("Validate {}", page.label()))
                         .on_click(context.message(Message::Settings(SettingsMsg::Save(page, true))))
-                        .content(TextBlock::new().text("Validate")),
+                        .content(m3::label("Validate")),
                     m3::text_button(palette)
                         .is_enabled(dirty && !busy)
                         .automation_name(format!("Discard changes to {}", page.label()))
                         .on_click(context.message(Message::Settings(SettingsMsg::Discard(page))))
                         .content(m3::label("Discard")),
                 )),
-            m3::muted(note, theme::type_scale::BODY_SMALL)
+            m3::secondary(note)
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true),
         ))
@@ -724,23 +716,26 @@ impl DesktopApp {
                             if selected { " (current)" } else { "" }
                         ))
                         .on_click(context.message(Message::Shell(ShellMsg::ThemeChosen(choice))))
-                        .content(m3::segment_label(choice.label(), selected)),
+                        .content(m3::segment_label(choice.label())),
                 )
             })
             .collect();
         let reopen = self.prefs.startup == Startup::LastConversation;
+        // A check box rather than a switch: its shape stays on the scale (a
+        // switch is a pill with a round thumb).
         let switch = Grid::new().keyed_children(vec![KeyedView::new(
             format!("reopen:{reopen}"),
-            ToggleSwitch::new()
-                .is_on(reopen)
+            CheckBox::new()
+                .is_checked(reopen)
                 .automation_name("Reopen the last conversation at start")
-                .on_toggled(context.callback(|on: bool| {
+                .on_is_checked_changed(context.callback(|on: bool| {
                     Message::Shell(ShellMsg::StartupChosen(if on {
                         Startup::LastConversation
                     } else {
                         Startup::NewTask
                     }))
-                })),
+                }))
+                .content(m3::label("Reopen it")),
         )]);
         let note = self
             .settings
@@ -748,37 +743,34 @@ impl DesktopApp {
             .get(&Page::General)
             .cloned()
             .unwrap_or_else(|| "Changes save as you choose them.".to_owned());
-        StackPanel::new().spacing(theme::spacing::SM).children((
-            m3::list_group(
+        StackPanel::new().spacing(tokens::spacing::SM).children((
+            m3::group(
                 palette,
                 vec![
-                    (
-                        "theme".to_owned(),
-                        m3::list_item(
-                            "Theme",
-                            "System follows the Windows setting.",
-                            m3::segmented(palette, segments),
-                        ),
+                    KeyedView::new(
+                        "theme",
+                        m3::form_row("Theme", m3::segmented(palette, segments), None),
                     ),
-                    (
-                        "reopen".to_owned(),
-                        m3::list_item(
-                            "Reopen the last conversation",
+                    KeyedView::new(
+                        "theme-help",
+                        m3::help("System follows the Windows setting."),
+                    ),
+                    KeyedView::new("reopen", m3::form_row("Reopen last task", switch, None)),
+                    KeyedView::new(
+                        "reopen-help",
+                        m3::help(
                             "At start, open the most recently active task instead of a new one.",
-                            switch,
                         ),
                     ),
                 ],
             ),
-            m3::muted(note, theme::type_scale::BODY_SMALL)
-                .margin(Thickness::xy(theme::spacing::MD, 0.0))
-                .text_wrapping(TextWrapping::Wrap),
+            m3::secondary(note).text_wrapping(TextWrapping::Wrap),
         ))
     }
 
     fn models_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let dirty = self.editor.draft != self.editor.base;
-        StackPanel::new().spacing(theme::spacing::MD).children((
+        StackPanel::new().spacing(tokens::spacing::MD).children((
             self.profiles_view(context, palette),
             self.save_bar(Page::Models, dirty, context, palette),
         ))
@@ -788,12 +780,10 @@ impl DesktopApp {
         let busy = self.settings.busy();
         let mut groups: Vec<KeyedView> = vec![KeyedView::new(
             "intro",
-            m3::muted(
+            m3::secondary(
                 "When a task starts on Auto, Swarm tries the role's profiles in order and runs the first one that is installed, not on hold, not out of quota and within capacity. The choice and the skipped profiles are recorded on the task.",
-                theme::type_scale::BODY_MEDIUM,
             )
-            .text_wrapping(TextWrapping::Wrap)
-            .margin(Thickness::xy(theme::spacing::MD, 0.0)),
+            .text_wrapping(TextWrapping::Wrap),
         )];
         // What Auto picks right now, from the saved policy.
         if let Some(Ok(decision)) = &self.launch.preview {
@@ -807,15 +797,13 @@ impl DesktopApp {
             .join("\n");
             groups.push(KeyedView::new(
                 format!("now:{now}"),
-                m3::muted(now, theme::type_scale::BODY_SMALL)
+                m3::body(now)
                     .automation_name("What Auto picks now")
-                    .text_wrapping(TextWrapping::Wrap)
-                    .margin(Thickness::xy(theme::spacing::MD, 0.0)),
+                    .text_wrapping(TextWrapping::Wrap),
             ));
         }
         for role in model::routing_roles(&self.settings.routing) {
             let list = model::candidates(&self.settings.routing, &role);
-            let mut items: Vec<(String, View)> = Vec::new();
             let headline = match role.as_str() {
                 "default" => "Default",
                 "manager" => "Manager",
@@ -829,17 +817,13 @@ impl DesktopApp {
                 (_, true) => "Not set: launches that ask for this role are refused.",
                 (_, false) => "Launches that ask for this role.",
             };
-            items.push((
-                format!("{role}:head"),
-                m3::list_item(headline, supporting, View::empty()),
-            ));
+            let mut rows: Vec<KeyedView> = Vec::new();
             let count = list.len();
             for (index, name) in list.iter().enumerate() {
                 let first = index == 0;
                 let last = index + 1 == count;
                 let buttons = StackPanel::new()
                     .orientation(Orientation::Horizontal)
-                    .spacing(theme::spacing::XS)
                     .children((
                         m3::icon_button(palette)
                             .is_enabled(!busy && !first)
@@ -847,23 +831,23 @@ impl DesktopApp {
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingMoved(role.clone(), index, true),
                             )))
-                            .content(m3::icon_sized(m3::glyph::ARROW_UP, 14.0)),
+                            .content(m3::icon(m3::glyph::ARROW_UP)),
                         m3::icon_button(palette)
                             .is_enabled(!busy && !last)
                             .automation_name(format!("Move {name} later in {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingMoved(role.clone(), index, false),
                             )))
-                            .content(m3::icon_sized(m3::glyph::ARROW_DOWN, 14.0)),
+                            .content(m3::icon(m3::glyph::ARROW_DOWN)),
                         m3::icon_button(palette)
                             .is_enabled(!busy)
                             .automation_name(format!("Remove {name} from {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingRemoved(role.clone(), index),
                             )))
-                            .content(m3::icon_sized(m3::glyph::CLOSE, 14.0)),
+                            .content(m3::icon(m3::glyph::CLOSE)),
                     ));
-                items.push((
+                rows.push(KeyedView::new(
                     format!("{role}:{index}:{name}:{first}:{last}"),
                     candidate_row(index + 1, name, buttons),
                 ));
@@ -872,58 +856,63 @@ impl DesktopApp {
             if !addable.is_empty() {
                 let key = format!("{role}:add:{}", addable.join("\u{1f}"));
                 let callback_role = role.clone();
-                items.push((
+                rows.push(KeyedView::new(
                     key.clone(),
-                    Border::new()
-                        .padding(Thickness::new(
-                            theme::spacing::MD,
-                            theme::spacing::XS,
-                            theme::spacing::MD,
-                            theme::spacing::SM,
-                        ))
-                        .content(Grid::new().keyed_children(vec![KeyedView::new(
+                    Grid::new()
+                        .min_height(tokens::height::FORM_ROW)
+                        .keyed_children(vec![KeyedView::new(
                             key,
-                            ComboBox::new()
+                            m3::enum_width(ComboBox::new())
                                 .items_source(addable)
                                 .selected_index(None)
                                 .placeholder_text("Add a profile")
                                 .is_enabled(!busy)
                                 .automation_name(format!("Add a profile to {role}"))
-                                .min_width(240.0)
+                                .vertical_alignment(VerticalAlignment::Center)
                                 .on_selection_changed(context.callback(move |index| {
                                     Message::Settings(SettingsMsg::RoutingAdded(
                                         callback_role.clone(),
                                         index,
                                     ))
                                 })),
-                        )])),
+                        )]),
                 ));
             }
             groups.push(KeyedView::new(
                 format!("role:{role}"),
-                m3::list_group(palette, items),
+                StackPanel::new().spacing(tokens::spacing::SM).children((
+                    m3::section_heading(headline, supporting, None),
+                    m3::group(palette, rows),
+                )),
             ));
         }
         groups.push(KeyedView::new(
             "new-role",
-            form_row(
-                "Another role",
-                m3::field()
-                    .text(self.settings.new_role.clone())
-                    .placeholder_text("Role name, for example review")
-                    .automation_name("New role name")
-                    .on_text_changed(
-                        context
-                            .callback(|text| Message::Settings(SettingsMsg::NewRoleChanged(text))),
-                    )
-                    .into(),
-                Some(
-                    m3::tonal(palette)
-                        .is_enabled(!busy && !self.settings.new_role.trim().is_empty())
-                        .automation_name("Add role")
-                        .on_click(context.message(Message::Settings(SettingsMsg::RoleAdded)))
-                        .content(TextBlock::new().text("Add role")),
-                ),
+            m3::group(
+                palette,
+                vec![KeyedView::new(
+                    "new-role",
+                    m3::form_row(
+                        "Another role",
+                        m3::field()
+                            .text(self.settings.new_role.clone())
+                            .placeholder_text("Role name, for example review")
+                            .automation_name("New role name")
+                            .on_text_changed(context.callback(|text| {
+                                Message::Settings(SettingsMsg::NewRoleChanged(text))
+                            }))
+                            .into(),
+                        Some(
+                            m3::outlined(palette)
+                                .is_enabled(!busy && !self.settings.new_role.trim().is_empty())
+                                .automation_name("Add role")
+                                .on_click(
+                                    context.message(Message::Settings(SettingsMsg::RoleAdded)),
+                                )
+                                .content(m3::label("Add role")),
+                        ),
+                    ),
+                )],
             ),
         ));
         let dirty = self.settings.dirty(Page::Routing);
@@ -932,7 +921,7 @@ impl DesktopApp {
             self.save_bar(Page::Routing, dirty, context, palette),
         ));
         StackPanel::new()
-            .spacing(theme::spacing::MD)
+            .spacing(tokens::spacing::MD)
             .keyed_children(groups)
     }
 
@@ -940,7 +929,7 @@ impl DesktopApp {
         let busy = self.settings.busy();
         let drafts = &self.settings.projects;
         let profiles = self.known_profiles();
-        let mut items: Vec<(String, View)> = Vec::new();
+        let mut rows: Vec<KeyedView> = Vec::new();
         for id in model::project_ids(drafts) {
             let open = self.settings.project_open.as_deref() == Some(id.as_str());
             let path = model::project_path(drafts, &id);
@@ -951,32 +940,18 @@ impl DesktopApp {
                 allowed.join(", ")
             };
             let name = nav::project_display(&id, &path);
-            items.push((
+            rows.push(KeyedView::new(
                 format!("project:{id}:{open}"),
-                m3::nav_item(palette, open)
+                m3::row(palette, open)
                     .automation_name(format!("Project {name}: {path}"))
                     .on_click(
                         context.message(Message::Settings(SettingsMsg::ProjectOpened(id.clone()))),
                     )
-                    .content(m3::nav_content(
-                        Grid::new()
-                            .columns([GridLength::Auto, GridLength::STAR])
-                            .column_spacing(12.0)
-                            .children((
-                                m3::icon(m3::glyph::FOLDER),
-                                StackPanel::new()
-                                    .grid_column(1)
-                                    .vertical_alignment(VerticalAlignment::Center)
-                                    .children((
-                                        m3::text(name.clone(), theme::type_scale::BODY_LARGE)
-                                            .text_trimming(TextTrimming::CharacterEllipsis),
-                                        m3::muted(
-                                            format!("{} · {summary}", nav::display_path(&path)),
-                                            theme::type_scale::BODY_SMALL,
-                                        )
-                                        .text_trimming(TextTrimming::CharacterEllipsis),
-                                    )),
-                            )),
+                    .content(m3::row_content(
+                        Some(m3::glyph::FOLDER),
+                        &name,
+                        &format!("{} · {summary}", nav::display_path(&path)),
+                        View::empty(),
                     )),
             ));
             if !open {
@@ -1006,16 +981,12 @@ impl DesktopApp {
                     )
                 })
                 .collect();
+            // The list's 8-DIP padding plus these 8 put the labels at the
+            // 16-DIP inset of every other group.
             let editor = StackPanel::new()
-                .spacing(12.0)
-                .margin(Thickness::new(
-                    theme::spacing::MD,
-                    theme::spacing::SM,
-                    theme::spacing::MD,
-                    theme::spacing::MD,
-                ))
+                .margin(Thickness::uniform(tokens::spacing::SM))
                 .children((
-                    form_row(
+                    m3::form_row(
                         "Checkout folder",
                         m3::field()
                             .text(nav::display_path(&path).to_owned())
@@ -1027,15 +998,15 @@ impl DesktopApp {
                             .into(),
                         None,
                     ),
-                    form_row(
+                    m3::form_row(
                         "Rule profiles",
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)
-                            .spacing(theme::spacing::MD)
+                            .spacing(tokens::spacing::MD)
                             .keyed_children(checks),
                         None,
                     ),
-                    form_row(
+                    m3::form_row(
                         "Rule actions",
                         m3::field()
                             .text(model::project_actions(drafts, &id))
@@ -1051,7 +1022,13 @@ impl DesktopApp {
                             .into(),
                         None,
                     ),
-                    m3::error_text_button(palette)
+                    m3::destructive(palette)
+                        .margin(Thickness::new(
+                            tokens::layout::LABEL_WIDTH + tokens::spacing::SM,
+                            tokens::spacing::XS,
+                            0.0,
+                            0.0,
+                        ))
                         .is_enabled(!busy)
                         .automation_name(format!("Remove project {name}"))
                         .on_click(
@@ -1059,70 +1036,77 @@ impl DesktopApp {
                                 id.clone(),
                             ))),
                         )
-                        .content(m3::text_icon_label(m3::glyph::DELETE, "Remove project")),
+                        .content(m3::label("Remove project")),
                 ));
-            items.push((format!("editor:{id}"), editor));
+            rows.push(KeyedView::new(format!("editor:{id}"), editor));
         }
-        if items.is_empty() {
-            items.push((
-                "none".to_owned(),
-                m3::list_item(
-                    "No projects yet",
-                    "Opening Swarm in a Git checkout registers it here.",
-                    View::empty(),
-                ),
+        if rows.is_empty() {
+            rows.push(KeyedView::new(
+                "none",
+                m3::secondary(
+                    "No projects yet. Opening Swarm in a Git checkout registers it here.",
+                )
+                .text_wrapping(TextWrapping::Wrap)
+                .margin(Thickness::uniform(tokens::spacing::SM)),
             ));
         }
-        let add = StackPanel::new()
-            .spacing(12.0)
-            .margin(Thickness::uniform(theme::spacing::MD))
-            .children((
-                m3::text("Add a project", theme::type_scale::TITLE_SMALL),
-                form_row(
-                    "Project id",
-                    m3::field()
-                        .text(self.settings.new_project_id.clone())
-                        .placeholder_text("Letters, digits, - and _")
-                        .automation_name("New project id")
-                        .on_text_changed(
-                            context.callback(|text| {
+        let add = m3::group(
+            palette,
+            vec![
+                KeyedView::new(
+                    "id",
+                    m3::form_row(
+                        "Project id",
+                        m3::field()
+                            .text(self.settings.new_project_id.clone())
+                            .placeholder_text("Letters, digits, - and _")
+                            .automation_name("New project id")
+                            .on_text_changed(context.callback(|text| {
                                 Message::Settings(SettingsMsg::NewProjectId(text))
-                            }),
-                        )
-                        .into(),
-                    None,
-                ),
-                form_row(
-                    "Checkout folder",
-                    m3::field()
-                        .text(self.settings.new_project_path.clone())
-                        .placeholder_text("C:\\path\\to\\checkout")
-                        .automation_name("New project folder")
-                        .on_text_changed(
-                            context.callback(|text| {
-                                Message::Settings(SettingsMsg::NewProjectPath(text))
-                            }),
-                        )
-                        .into(),
-                    Some(
-                        m3::tonal(palette)
-                            .is_enabled(!busy && !self.settings.new_project_id.trim().is_empty())
-                            .automation_name("Add project")
-                            .on_click(context.message(Message::Settings(SettingsMsg::ProjectAdded)))
-                            .content(TextBlock::new().text("Add")),
+                            }))
+                            .into(),
+                        None,
                     ),
                 ),
-            ));
+                KeyedView::new(
+                    "path",
+                    m3::form_row(
+                        "Checkout folder",
+                        m3::field()
+                            .text(self.settings.new_project_path.clone())
+                            .placeholder_text("C:\\path\\to\\checkout")
+                            .automation_name("New project folder")
+                            .on_text_changed(context.callback(|text| {
+                                Message::Settings(SettingsMsg::NewProjectPath(text))
+                            }))
+                            .into(),
+                        Some(
+                            m3::outlined(palette)
+                                .is_enabled(
+                                    !busy && !self.settings.new_project_id.trim().is_empty(),
+                                )
+                                .automation_name("Add project")
+                                .on_click(
+                                    context.message(Message::Settings(SettingsMsg::ProjectAdded)),
+                                )
+                                .content(m3::label("Add")),
+                        ),
+                    ),
+                ),
+            ],
+        );
         let dirty = self.settings.dirty(Page::Projects);
-        StackPanel::new().spacing(theme::spacing::MD).children((
-            m3::list_group(palette, items),
-            m3::list_group(palette, vec![("add".to_owned(), add)]),
+        StackPanel::new().spacing(tokens::spacing::MD).children((
+            m3::list(palette, rows),
+            StackPanel::new()
+                .spacing(tokens::spacing::SM)
+                .children((m3::section_heading("Add a project", "", None), add)),
             self.save_bar(Page::Projects, dirty, context, palette),
         ))
     }
 
     fn automation_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        StackPanel::new().spacing(theme::spacing::LG).children((
+        StackPanel::new().spacing(tokens::spacing::MD).children((
             self.assignments_view(context, palette),
             config_view::automation_screen(
                 &self.automation.rules,
@@ -1132,7 +1116,6 @@ impl DesktopApp {
                 )),
                 palette,
             ),
-            self.scripts_view(context, palette),
         ))
     }
 
@@ -1143,17 +1126,11 @@ impl DesktopApp {
         let roles = model::routing_roles(&self.settings.routing);
         let mut groups: Vec<KeyedView> = vec![KeyedView::new(
             "title",
-            StackPanel::new()
-                .spacing(theme::spacing::XS)
-                .margin(Thickness::xy(theme::spacing::MD, 0.0))
-                .children((
-                    m3::text("Assignments", theme::type_scale::TITLE_MEDIUM),
-                    m3::muted(
-                        "Keep a number of Agents busy with the briefs (.md files) of a folder, in filename order. Each brief starts one Agent through routing; a finished Agent is retired and the next brief starts.",
-                        theme::type_scale::BODY_MEDIUM,
-                    )
-                    .text_wrapping(TextWrapping::Wrap),
-                )),
+            m3::section_heading(
+                "Assignments",
+                "Keep a number of Agents busy with the briefs (.md files) of a folder, in filename order. Each brief starts one Agent through routing; a finished Agent is retired and the next brief starts.",
+                None,
+            ),
         )];
         for key in model::assignment_keys(automation) {
             let busy_count = model::assignment_busy(automation, &key);
@@ -1165,7 +1142,7 @@ impl DesktopApp {
             let role_index = role_items.iter().position(|item| *item == role);
             let text_field = |field: AssignmentField, label: &str, hint: &str| {
                 let callback_key = key.clone();
-                form_row(
+                m3::form_row(
                     label,
                     m3::field()
                         .text(
@@ -1198,34 +1175,22 @@ impl DesktopApp {
             );
             let interval = text_field(AssignmentField::Interval, "Check every", "30s");
             let (busy_key, role_key) = (key.clone(), key.clone());
-            let editor = StackPanel::new()
-                .spacing(12.0)
-                .margin(Thickness::uniform(theme::spacing::MD))
-                .children((
-                    Grid::new()
-                        .columns([GridLength::STAR, GridLength::Auto])
-                        .children((
-                            m3::text(
-                                format!(
-                                    "Keep {} busy · {key}",
-                                    busy_count.map_or("?".to_owned(), |count| count.to_string())
-                                ),
-                                theme::type_scale::TITLE_SMALL,
-                            )
-                            .vertical_alignment(VerticalAlignment::Center),
-                            m3::icon_button(palette)
-                                .grid_column(1)
-                                .is_enabled(!busy)
-                                .automation_name(format!("Remove assignment {key}"))
-                                .on_click(context.message(Message::Settings(
-                                    SettingsMsg::AssignmentRemoved(key.clone()),
-                                )))
-                                .content(m3::icon_sized(m3::glyph::DELETE, 14.0)),
-                        )),
-                    form_row(
+            let rows = vec![
+                KeyedView::new(
+                    "title",
+                    m3::section_title(format!(
+                        "{key} · keep {} busy",
+                        busy_count.map_or("?".to_owned(), |count| count.to_string())
+                    ))
+                    .height(tokens::height::FORM_ROW)
+                    .vertical_alignment(VerticalAlignment::Center),
+                ),
+                KeyedView::new(
+                    "busy",
+                    m3::form_row(
                         "Agents kept busy",
                         NumberBox::new()
-                            .width(120.0)
+                            .width(tokens::layout::NUMBER_WIDTH)
                             .horizontal_alignment(HorizontalAlignment::Left)
                             .minimum(1.0)
                             .maximum(1000.0)
@@ -1241,18 +1206,20 @@ impl DesktopApp {
                             .into(),
                         None,
                     ),
-                    folder,
-                    workspace,
-                    form_row(
+                ),
+                KeyedView::new("folder", folder),
+                KeyedView::new("workspace", workspace),
+                KeyedView::new(
+                    "role",
+                    m3::form_row(
                         "Routing role",
                         Grid::new().keyed_children(vec![KeyedView::new(
                             format!("{}:{role}", role_items.join("\u{1f}")),
-                            ComboBox::new()
+                            m3::enum_width(ComboBox::new())
                                 .items_source(role_items)
                                 .selected_index(role_index)
                                 .is_enabled(!busy)
                                 .automation_name(format!("Routing role of {key}"))
-                                .min_width(200.0)
                                 .on_selection_changed(context.callback(move |index| {
                                     Message::Settings(SettingsMsg::AssignmentRole(
                                         role_key.clone(),
@@ -1262,33 +1229,60 @@ impl DesktopApp {
                         )]),
                         None,
                     ),
-                    interval,
-                ));
+                ),
+                KeyedView::new("interval", interval),
+                KeyedView::new(
+                    "remove",
+                    m3::destructive(palette)
+                        .margin(Thickness::new(
+                            tokens::layout::LABEL_WIDTH + tokens::spacing::SM,
+                            tokens::spacing::XS,
+                            0.0,
+                            0.0,
+                        ))
+                        .is_enabled(!busy)
+                        .automation_name(format!("Remove assignment {key}"))
+                        .on_click(context.message(Message::Settings(
+                            SettingsMsg::AssignmentRemoved(key.clone()),
+                        )))
+                        .content(m3::label("Remove assignment")),
+                ),
+            ];
             groups.push(KeyedView::new(
                 format!("assignment:{key}"),
-                m3::list_group(palette, vec![(key.clone(), editor)]),
+                m3::group(palette, rows),
             ));
         }
         groups.push(KeyedView::new(
             "add",
-            form_row(
-                "New assignment",
-                m3::field()
-                    .text(self.settings.new_assignment.clone())
-                    .placeholder_text("Name, for example backlog")
-                    .automation_name("New assignment name")
-                    .on_text_changed(
-                        context
-                            .callback(|text| Message::Settings(SettingsMsg::NewAssignment(text))),
-                    )
-                    .into(),
-                Some(
-                    m3::tonal(palette)
-                        .is_enabled(!busy && !self.settings.new_assignment.trim().is_empty())
-                        .automation_name("Add assignment")
-                        .on_click(context.message(Message::Settings(SettingsMsg::AssignmentAdded)))
-                        .content(TextBlock::new().text("Add")),
-                ),
+            m3::group(
+                palette,
+                vec![KeyedView::new(
+                    "add",
+                    m3::form_row(
+                        "New assignment",
+                        m3::field()
+                            .text(self.settings.new_assignment.clone())
+                            .placeholder_text("Name, for example backlog")
+                            .automation_name("New assignment name")
+                            .on_text_changed(context.callback(|text| {
+                                Message::Settings(SettingsMsg::NewAssignment(text))
+                            }))
+                            .into(),
+                        Some(
+                            m3::outlined(palette)
+                                .is_enabled(
+                                    !busy && !self.settings.new_assignment.trim().is_empty(),
+                                )
+                                .automation_name("Add assignment")
+                                .on_click(
+                                    context
+                                        .message(Message::Settings(SettingsMsg::AssignmentAdded)),
+                                )
+                                .content(m3::label("Add")),
+                        ),
+                    ),
+                )],
             ),
         ));
         let dirty = self.settings.dirty(Page::Automation);
@@ -1297,7 +1291,7 @@ impl DesktopApp {
             self.save_bar(Page::Automation, dirty, context, palette),
         ));
         StackPanel::new()
-            .spacing(theme::spacing::MD)
+            .spacing(tokens::spacing::MD)
             .keyed_children(groups)
     }
 
@@ -1306,55 +1300,51 @@ impl DesktopApp {
         let enabled = model::cloud_enabled(&self.settings.cloud);
         let switch = Grid::new().keyed_children(vec![KeyedView::new(
             format!("cloud:{enabled}"),
-            ToggleSwitch::new()
-                .is_on(enabled)
+            CheckBox::new()
+                .is_checked(enabled)
                 .is_enabled(!busy)
                 .automation_name("Cloud MCP configured")
-                .on_toggled(
+                .on_is_checked_changed(
                     context.callback(|on: bool| Message::Settings(SettingsMsg::CloudEnabled(on))),
-                ),
+                )
+                .content(m3::label("Configured")),
         )]);
-        let mut items: Vec<(String, View)> = vec![(
-            "enabled".to_owned(),
-            m3::list_item(
-                "Cloud MCP",
-                "Serve Swarm's MCP endpoint through a Cloudflare tunnel behind Cloudflare Access. The daemon applies a change at its next start.",
-                switch,
+        let mut rows: Vec<KeyedView> = vec![
+            KeyedView::new("enabled", m3::form_row("Cloud MCP", switch, None)),
+            KeyedView::new(
+                "help",
+                m3::help(
+                    "Serve Swarm's MCP endpoint through a Cloudflare tunnel behind Cloudflare Access. The daemon applies a change at its next start.",
+                ),
             ),
-        )];
+        ];
         if enabled {
-            let fields: Vec<KeyedView> = model::CLOUD_FIELDS
-                .iter()
-                .enumerate()
-                .map(|(index, (key, label))| {
-                    KeyedView::new(
-                        *key,
-                        form_row(
-                            label,
-                            m3::field()
-                                .text(model::cloud_field(&self.settings.cloud, key))
-                                .automation_name(*label)
-                                .is_enabled(!busy)
-                                .on_text_changed(context.callback(move |text| {
-                                    Message::Settings(SettingsMsg::CloudField(index, text))
-                                }))
-                                .into(),
-                            None,
-                        ),
-                    )
-                })
-                .collect();
-            items.push((
-                "fields".to_owned(),
-                StackPanel::new()
-                    .spacing(12.0)
-                    .margin(Thickness::uniform(theme::spacing::MD))
-                    .keyed_children(fields),
-            ));
+            rows.extend(
+                model::CLOUD_FIELDS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (key, label))| {
+                        KeyedView::new(
+                            *key,
+                            m3::form_row(
+                                label,
+                                m3::field()
+                                    .text(model::cloud_field(&self.settings.cloud, key))
+                                    .automation_name(*label)
+                                    .is_enabled(!busy)
+                                    .on_text_changed(context.callback(move |text| {
+                                        Message::Settings(SettingsMsg::CloudField(index, text))
+                                    }))
+                                    .into(),
+                                None,
+                            ),
+                        )
+                    }),
+            );
         }
         let dirty = self.settings.dirty(Page::CloudMcp);
-        StackPanel::new().spacing(theme::spacing::MD).children((
-            m3::list_group(palette, items),
+        StackPanel::new().spacing(tokens::spacing::MD).children((
+            m3::group(palette, rows),
             self.save_bar(Page::CloudMcp, dirty, context, palette),
         ))
     }
@@ -1365,29 +1355,27 @@ impl DesktopApp {
             Err(error) => format!("unavailable: {error}"),
         };
         let open = self.settings.history_open;
-        let history: Vec<(String, View)> = self
+        let history: Vec<KeyedView> = self
             .settings
             .history
             .iter()
             .map(|entry| {
                 let (headline, supporting) = model::history_lines(entry);
-                (
+                KeyedView::new(
                     format!("history:{}", entry.revision),
-                    m3::list_item(&headline, &supporting, View::empty()),
+                    Border::new()
+                        .height(tokens::height::CONTROL)
+                        .automation_name(format!("{headline}, {supporting}"))
+                        .content(m3::row_content(None, &headline, &supporting, View::empty())),
                 )
             })
             .collect();
         let history_view: View = if !open {
             View::empty()
         } else if history.is_empty() {
-            m3::muted(
-                "No settings changes recorded yet.",
-                theme::type_scale::BODY_MEDIUM,
-            )
-            .margin(Thickness::xy(theme::spacing::MD, 0.0))
-            .into()
+            m3::secondary("No settings changes recorded yet.").into()
         } else {
-            m3::list_group(palette, history)
+            m3::group(palette, history)
         };
         let restart = if self.settings.restart_required.is_empty() {
             "Every section applies without a restart.".to_owned()
@@ -1404,73 +1392,74 @@ impl DesktopApp {
         };
         let dirty = self.settings.dirty(Page::Advanced);
         StackPanel::new()
-            .spacing(theme::spacing::MD)
+            .spacing(tokens::spacing::MD)
             .children((
-                m3::list_group(
+                m3::group(
                     palette,
                     vec![
-                        (
-                            "data".to_owned(),
-                            m3::list_item(
+                        KeyedView::new(
+                            "data",
+                            m3::form_row(
                                 "Daemon data",
-                                &format!(
-                                    "{data_dir}\nSettings live in its config.toml; every change goes through the daemon's checks."
+                                m3::body(data_dir)
+                                    .text_trimming(TextTrimming::CharacterEllipsis)
+                                    .is_text_selection_enabled(true)
+                                    .into(),
+                                Some(
+                                    m3::outlined(palette)
+                                        .automation_name("Reload everything")
+                                        .on_click(context.message(Message::Shell(
+                                            ShellMsg::RefreshRequested,
+                                        )))
+                                        .content(m3::label("Reload")),
                                 ),
-                                m3::outlined(palette)
-                                    .automation_name("Reload everything")
-                                    .on_click(
-                                        context.message(Message::Shell(ShellMsg::RefreshRequested)),
-                                    )
-                                    .content(TextBlock::new().text("Reload")),
                             ),
                         ),
-                        (
-                            "history".to_owned(),
-                            m3::list_item(
+                        KeyedView::new(
+                            "data-help",
+                            m3::help(
+                                "Settings live in its config.toml; every change goes through the daemon's checks.",
+                            ),
+                        ),
+                        KeyedView::new(
+                            "history",
+                            m3::form_row(
                                 "History",
-                                &format!(
-                                    "Who changed which section, and when: {} recent change(s).",
+                                m3::body(format!(
+                                    "{} recent change(s): who changed which section, and when.",
                                     self.settings.history.len()
-                                ),
-                                m3::text_button(palette)
-                                    .automation_name(if open {
-                                        "Hide history"
-                                    } else {
-                                        "Show history"
-                                    })
-                                    .on_click(
-                                        context.message(Message::Settings(
+                                ))
+                                .text_trimming(TextTrimming::CharacterEllipsis)
+                                .into(),
+                                Some(
+                                    m3::text_button(palette)
+                                        .automation_name(if open {
+                                            "Hide history"
+                                        } else {
+                                            "Show history"
+                                        })
+                                        .on_click(context.message(Message::Settings(
                                             SettingsMsg::HistoryToggled,
-                                        )),
-                                    )
-                                    .content(m3::text_icon_label(
-                                        m3::glyph::HISTORY,
-                                        if open { "Hide" } else { "Show" },
-                                    )),
+                                        )))
+                                        .content(m3::label(if open { "Hide" } else { "Show" })),
+                                ),
                             ),
                         ),
                     ],
                 ),
                 history_view,
-                m3::text("All settings", theme::type_scale::TITLE_MEDIUM).margin(Thickness::new(
-                    theme::spacing::MD,
-                    theme::spacing::SM,
-                    0.0,
-                    0.0,
-                )),
-                m3::muted(
-                    format!(
+                m3::section_heading(
+                    "All settings",
+                    &format!(
                         "Every section of config.toml as JSON, including daemon, mail, accounts and proxies. {restart}"
                     ),
-                    theme::type_scale::BODY_MEDIUM,
-                )
-                .text_wrapping(TextWrapping::Wrap)
-                .margin(Thickness::xy(theme::spacing::MD, 0.0)),
+                    None,
+                ),
                 m3::field()
                     .accepts_return(true)
                     .text_wrapping(TextWrapping::NoWrap)
-                    .min_height(240.0)
-                    .max_height(420.0)
+                    .min_height(tokens::layout::SOURCE_MIN_HEIGHT)
+                    .max_height(tokens::layout::SOURCE_MAX_HEIGHT)
                     .automation_name("Settings sections JSON")
                     .text(self.primed(&self.settings.all))
                     .is_enabled(!self.settings.busy())
@@ -1482,55 +1471,24 @@ impl DesktopApp {
     }
 }
 
-/// One routing candidate: its place in the order, its name and the
+/// One routing candidate row: its place in the order, its name and the
 /// reorder / remove buttons.
 fn candidate_row(place: usize, name: &str, buttons: View) -> View {
-    Border::new()
-        .padding(Thickness::new(
-            theme::spacing::MD,
-            2.0,
-            theme::spacing::SM,
-            2.0,
-        ))
-        .content(
-            Grid::new()
-                .columns([GridLength::Pixel(28.0), GridLength::STAR, GridLength::Auto])
-                .children((
-                    m3::muted(format!("{place}"), theme::type_scale::TITLE_SMALL)
-                        .vertical_alignment(VerticalAlignment::Center),
-                    m3::text(name.to_owned(), theme::type_scale::BODY_LARGE)
-                        .grid_column(1)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .text_trimming(TextTrimming::CharacterEllipsis),
-                    Border::new().grid_column(2).content(buttons),
-                )),
-        )
-}
-
-/// A labelled form row: the label column, the control, an optional action.
-fn form_row(label: &str, control: View, action: Option<View>) -> View {
     Grid::new()
+        .height(tokens::height::CONTROL)
         .columns([
-            GridLength::Pixel(LABEL_WIDTH),
+            GridLength::Pixel(tokens::layout::TREE_INDENT),
             GridLength::STAR,
             GridLength::Auto,
         ])
-        .column_spacing(theme::spacing::SM)
         .children((
-            m3::text(label.to_owned(), theme::type_scale::BODY_LARGE)
-                .vertical_alignment(VerticalAlignment::Center),
-            Border::new().grid_column(1).content(control),
-            Border::new()
-                .grid_column(2)
-                .content(action.unwrap_or_else(View::empty)),
+            m3::secondary(format!("{place}")).vertical_alignment(VerticalAlignment::Center),
+            m3::body(name.to_owned())
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+            Border::new().grid_column(2).content(buttons),
         ))
-}
-
-/// A section body that scrolls.
-fn scroll(content: View) -> View {
-    ScrollViewer::new()
-        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-        .content(content)
 }
 
 #[cfg(test)]

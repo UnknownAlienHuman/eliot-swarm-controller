@@ -5079,33 +5079,17 @@ impl Router {
         turns: &mut [Turn],
     ) -> Result<()> {
         self.clear_terminal_unknown_cache().await;
-        let memory_unknown = self.unknown_ids().into_iter().collect::<HashSet<String>>();
-        let (associated, maybe_more) = {
-            let store = self.inner.store.lock().await;
-            let commands = store.list_unsettled_commands(STATUS_BLOCKER_MAX)?;
-            let maybe_more = commands.len() == STATUS_BLOCKER_MAX;
-            let associated = commands
-                .into_iter()
-                .filter(|command| {
-                    command.state == CommandState::Unknown || memory_unknown.contains(&command.id)
-                })
-                .filter(|command| {
-                    command.target.as_deref() == Some(agent)
-                        && command.generation == Some(generation)
-                })
-                .filter_map(|command| command.turn_id)
-                .collect::<HashSet<_>>();
-            (associated, maybe_more)
-        };
-        let found_exact_turn = turns.iter().any(|turn| associated.contains(&turn.turn_id));
-        if maybe_more && !found_exact_turn {
-            return Err(Error::new(
-                "unavailable",
-                "unsettled-command view is truncated; turn completion cannot be confirmed",
-            ));
+        if turns.is_empty() {
+            return Ok(());
         }
+        let memory_unknown = self.unknown_ids();
+        let turn_ids: Vec<String> = turns.iter().map(|turn| turn.turn_id.clone()).collect();
+        let unknown_turns = {
+            let store = self.inner.store.lock().await;
+            store.turns_with_unknown_commands(agent, generation, &turn_ids, &memory_unknown)?
+        };
         for turn in turns {
-            if associated.contains(&turn.turn_id) {
+            if unknown_turns.contains(&turn.turn_id) {
                 turn.state = TurnState::Unknown;
                 turn.status = None;
             }
@@ -7753,7 +7737,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         {
             let mut store = router.inner.store.lock().await;
             let change = store
-                .dispatch_with_native_store_binding(&request.id, now_ms(), &expected, &binding)
+                .dispatch_with_native_store_binding(
+                    &request.id,
+                    now_ms(),
+                    &expected,
+                    &binding,
+                    None,
+                )
                 .unwrap();
             router.publish_locked(&change.events);
             assert_eq!(change.value.state, CommandState::Dispatched);
@@ -7796,7 +7786,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let (error, faulted) = {
             let mut store = router.inner.store.lock().await;
             let error = store
-                .dispatch_with_native_store_binding(&invalid.id, now_ms(), &expected, &oversized)
+                .dispatch_with_native_store_binding(
+                    &invalid.id,
+                    now_ms(),
+                    &expected,
+                    &oversized,
+                    None,
+                )
                 .unwrap_err();
             assert_eq!(error.code, "frame_too_large");
             assert_eq!(
@@ -7904,7 +7900,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .unwrap();
             let expected = store.get_agent(&target).unwrap().unwrap();
             store
-                .dispatch_with_native_store_binding(&launch_id, now_ms(), &expected, &binding)
+                .dispatch_with_native_store_binding(&launch_id, now_ms(), &expected, &binding, None)
                 .unwrap();
             target
         };
@@ -10893,7 +10889,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(retry_workspace.start_command_id, retry_id);
         assert_eq!(retry_workspace.target_generation, 2);
         store
-            .reject_workspace_resume(&retry_id, "test_cleanup", now_ms())
+            .reject_workspace_resume(&retry_id, &json!({"reason":"test_cleanup"}), now_ms())
             .unwrap();
         let final_workspace = store.get_workspace(&agent).unwrap().unwrap();
         assert_eq!(final_workspace.start_command_id, launch_id);
@@ -11717,7 +11713,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 native_scope: "resume-codex-scope".to_owned(),
             };
             store
-                .dispatch_with_native_store_binding(&launch_id, now_ms(), &expected_agent, &binding)
+                .dispatch_with_native_store_binding(
+                    &launch_id,
+                    now_ms(),
+                    &expected_agent,
+                    &binding,
+                    None,
+                )
                 .unwrap();
             crate::test_support::install_fixture_sources(
                 &mut store,
@@ -13484,6 +13486,48 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             json!({"command_id":send_id, "turn_id":"turn-1"}),
         );
         (agent, send_id)
+    }
+
+    #[tokio::test]
+    async fn exact_turn_readback_ignores_unrelated_status_page_overflow() {
+        let router = router();
+        let (agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, _) = result_fixture(&mut store);
+            let send_id = ulid::Ulid::new().to_string();
+            let mut control = SubmitCommand::new(send_id.clone(), "interrupt");
+            control.target = Some(agent.clone());
+            control.expected_generation = Some(1);
+            control.expected_turn_id = Some("turn-1".to_owned());
+            store.submit("owner", control, now_ms()).unwrap();
+            let dispatched = store.dispatch(&send_id, now_ms()).unwrap().value;
+            assert_eq!(dispatched.state, CommandState::Dispatched);
+            assert_eq!(dispatched.turn_id.as_deref(), Some("turn-1"));
+            let subject = (agent, send_id);
+            for _ in 0..STATUS_BLOCKER_MAX + 1 {
+                let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+                request.args = json!({"project":"turn-read-load", "workspace":"synthetic-workspace",
+                    "harness":"codex", "profile":"luna", "profile_snapshot":{}});
+                store.submit("owner", request, now_ms()).unwrap();
+            }
+            subject
+        };
+        let params = json!({"agent":agent, "generation":1, "turn_id":"turn-1"});
+        let running = router.turn_get(&params, &Principal::Owner).await.unwrap();
+        assert_eq!(running["state"], "running");
+        router.note_unknown_id(&send_id, "test_overlay");
+        let unknown = router.turn_get(&params, &Principal::Owner).await.unwrap();
+        assert_eq!(unknown["state"], "unknown");
+        router.clear_unknown_id(&send_id);
+        router
+            .inner
+            .store
+            .lock()
+            .await
+            .settle(&send_id, CommandState::Unknown, None, now_ms())
+            .unwrap();
+        let unknown = router.turn_get(&params, &Principal::Owner).await.unwrap();
+        assert_eq!(unknown["state"], "unknown");
     }
 
     #[tokio::test]

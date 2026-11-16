@@ -44,9 +44,9 @@ url.workspace = true
 # the library is used directly. WinUI staging at runtime uses Reactor's own
 # bootstrap inside App::run; no self-contained exe is promised.
 windows-reactor = "=0.100.0"
-# The same windows-rs 0.100.0 crates Reactor depends on, for the four WinUI
-# calls Reactor does not expose: the application's theme dictionaries
-# (`app_resources`). No new crate versions enter the lockfile.
+# The same windows-rs 0.100.0 crates Reactor depends on, for the WinUI calls
+# Reactor does not expose: the application's resources and the title bar's
+# colors (`app_resources`). No new crate versions enter the lockfile.
 windows-collections = { version = "=0.100.0", default-features = false, features = ["std"] }
 windows-core = { version = "=0.100.0", default-features = false }
 windows-reference = { version = "=0.100.0", default-features = false, features = ["std"] }
@@ -57,6 +57,10 @@ windows-sys = { workspace = true, features = [
     # The per-user settings folder (SHGetKnownFolderPath) and CoTaskMemFree.
     "Win32_System_Com",
     "Win32_System_DataExchange",
+    # The Windows App SDK window id of the desktop's window
+    # (Windowing_GetWindowIdFromWindow, as Microsoft.UI.Interop.h loads it)
+    # for its AppWindowTitleBar colors.
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_UI_Shell",
     # High Contrast detection (SPI_GETHIGHCONTRAST) for the theme fallback.

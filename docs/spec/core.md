@@ -381,6 +381,8 @@ The pure `command_transition_allowed(from,to) -> bool` predicate governs ordinar
 command transitions. `classify_dispatched_error(code:&str) -> CommandState` returns
 `unknown` by default; only the explicit `native_not_dispatched` code proves no native I/O
 and returns `rejected`.
+Pre-dispatch `busy` rejections retain their redacted error message with the reason;
+plugin errors after dispatch retain code and message without changing this classification.
 Generic transport, Store or RPC errors never become `failed`. A separately validated,
 authoritative plugin result state follows its explicit result path, not this error-code
 classifier.

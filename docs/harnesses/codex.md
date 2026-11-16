@@ -131,23 +131,30 @@ hostname): a renamed owner entry is still suppressed, and the exact owner
 names (`eliot_swarm`, `eliot-swarm`) stay covered by synthetic
 transport-carrying stubs as backstop. Swarm names can never be
 allow-listed in any policy, and an allow-listed name that matches the
-identity is rejected at launch (`profile_error`) instead of re-admitted.
+identity is rejected before worker spawn (`profile_error`) instead of
+re-admitted: minimal fresh launches reject an allow-listed match when the
+surface is frozen pre-dispatch, and every other path rejects at launch.
 Entries whose argument vector the native layer does not report count as
 unknown and fail closed toward suppression; an absent vector means the
 entry carries no argv. `minimal` starts only Eliot's
 Agent-scoped server plus the explicitly allowed servers:
 
-- Before spawn, a short-lived metadata reader (initialize, one `config/read`
-  with the worker cwd, close; no thread) enumerates the worker-visible
-  `mcp_servers` entries (key plus `command`/`url` transport) and the
-  `plugins` states (id plus `enabled` flag). The reader is pinned to the
-  frozen native-store binding the same way the worker launch is pinned, and
-  the pin is verified before the enumeration is trusted. Every enumerated
-  server outside the allow list gets its own transport plus
-  `-c mcp_servers.<name>.enabled=false` overrides; a name no `-c` path can
+- For launch, the pre-dispatch `profile.store` reader projects the worker-visible
+  `mcp_servers` entries (key plus `command`/`url` transport, except allow-listed
+  servers which persist by name only) and `plugins` states
+  (id plus `enabled` flag) from the same `config/read` response used for verified
+  store selection, using the actual prepared workspace. Store freezes this projection
+  with the exact launch command ID alongside the store binding at dispatch. The worker
+  consumes only that command's projection; missing or mismatched metadata refuses
+  before worker spawn. No configuration cache or ambient reselection is used.
+  Resume instead enumerates through a reader pinned to its retained store, verifies
+  the pin, and never reuses the old launch projection. Every enumerated
+  server outside the allow list keeps its own transport for its
+  `-c mcp_servers.<name>.enabled=false` override; a name no `-c` path can
   address (Codex splits override paths on literal dots before decoding), a
-  server with no usable transport, or a transport carrying a known secret
-  fails the start closed instead of silently inheriting. Plugin-backed
+  server with no usable transport, or a disable transport carrying a known secret
+  fails the start closed instead of silently inheriting. Allow-listed servers
+  never freeze or emit a transport, so their transports never trip the secret check. Plugin-backed
   builtin servers never appear in `mcp_servers`, so each suppressed bundled
   plugin (`computer-use`, `unified-computer-use`, `codex-app-tools`) gets
   its own `-c plugins.<id>.enabled=false` override when present and
@@ -448,7 +455,10 @@ readback. An unexpected effective route does not authorize further input.
 
 Controlled launch resolves the effective native store through a dedicated read-only
 `profile.store` reader after workspace preparation, then commits its binding with launch
-dispatch. The controlled app-server pins and verifies that same store before
+dispatch, together with the minimal-policy MCP projection from the same config response.
+Read-only readers deliver stdin EOF, then require process reap and complete output
+and notification drainage within their cleanup deadline; unknown cleanup remains fenced.
+The controlled app-server pins and verifies that same store before
 `thread/start` or `thread/resume`. Resume reuses the retained binding; a legacy Agent
 without one refuses before native control. This does not change admitted command
 arguments/digests or replay input. See

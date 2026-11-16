@@ -47,12 +47,15 @@ pub(super) fn is_addressable_override_name(name: &str) -> bool {
 
 /// One worker-visible native MCP server as enumerated from the effective
 /// `config/read` response: the table key plus the transport the native
+/// One worker-visible native MCP server as enumerated from the effective
+/// `config/read` response: the table key plus the transport the native
 /// bootstrap validates and the stdio argument vector the owner-identity
 /// rule screens. Only `command`/`url` re-emit into spawn argv; env,
 /// timeouts and tool gates merge from the owner layers and never reach
 /// argv, while `args` (absent as an empty vector, unreported or malformed
 /// as `None`) only feeds the identity rule and never renders.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveMcpServer {
     pub(super) name: String,
     pub(super) command: Option<String>,
@@ -258,7 +261,8 @@ pub(super) fn is_suppressible_plugin_id(id: &str) -> bool {
 
 /// One worker-visible native plugin as enumerated from the effective
 /// `config/read` response: the plugin id plus whether it is enabled.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveMcpPlugin {
     pub(super) id: String,
     pub(super) enabled: bool,

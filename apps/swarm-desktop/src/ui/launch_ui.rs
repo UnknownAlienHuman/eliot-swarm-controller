@@ -400,7 +400,7 @@ impl DesktopApp {
         project_items.push(MenuItem::item("other", OTHER_FOLDER));
         let project = m3::chip(palette)
             .automation_name(format!("Project: {project_label}"))
-            .content(m3::chip_label(m3::glyph::FOLDER, &project_label))
+            .content(m3::icon_label(m3::glyph::FOLDER, &project_label))
             .menu(Menu::new(
                 project_items,
                 context.callback(|label: String| Message::Launch(LaunchMsg::ProjectMenu(label))),
@@ -410,7 +410,7 @@ impl DesktopApp {
                 .text(self.launch.workspace.clone())
                 .placeholder_text("Folder path")
                 .automation_name("Folder")
-                .width(280.0)
+                .width(tokens::layout::FOLDER_WIDTH)
                 .vertical_alignment(VerticalAlignment::Center)
                 .on_text_changed(
                     context.callback(|value| Message::Launch(LaunchMsg::WorkspaceChanged(value))),
@@ -458,24 +458,24 @@ impl DesktopApp {
                 }
             }));
         }
+        // The harnesses flat, after a separator (a submenu's chevron is drawn
+        // by WinUI at a fixed 12 DIPs, off the icon scale).
         profile_items.push(MenuItem::separator("sep-harness"));
-        profile_items.push(MenuItem::submenu(
-            "harness",
-            "Harness",
+        profile_items.extend(
             ADHOC_HARNESSES.iter().map(|harness| {
                 MenuItem::item(format!("h:{harness}"), format!("{harness} harness"))
             }),
-        ));
+        );
         let profile = m3::chip(palette)
             .automation_name(format!("Profile: {profile_label}. {}", why.join(". ")))
-            .content(m3::chip_label(m3::glyph::PROFILE, &profile_label))
+            .content(m3::icon_label(m3::glyph::PROFILE, &profile_label))
             .menu(Menu::new(
                 profile_items,
                 context.callback(|label: String| Message::Launch(LaunchMsg::ProfileMenu(label))),
             ));
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(theme::spacing::SM)
+            .spacing(tokens::spacing::SM)
             .children((project, folder, profile))
     }
 
@@ -511,7 +511,7 @@ impl DesktopApp {
                 (
                     m3::chip(palette)
                         .automation_name(format!("Model and effort: {label}"))
-                        .content(m3::chip_label(m3::glyph::MODEL, &label))
+                        .content(m3::icon_label(m3::glyph::MODEL, &label))
                         .menu(Menu::new(
                             items,
                             context.callback(|label: String| {
@@ -540,7 +540,7 @@ impl DesktopApp {
         };
         StackPanel::new()
             .orientation(Orientation::Horizontal)
-            .spacing(theme::spacing::SM)
+            .spacing(tokens::spacing::SM)
             .children((
                 model_chip,
                 m3::chip_static(palette, m3::glyph::SHIELD, &access),

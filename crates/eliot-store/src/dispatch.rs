@@ -70,7 +70,7 @@ fn dispatch_launch_tx(
     agent: &Agent,
     agent_num: i64,
     command_generation: i64,
-    native_store: Option<(&Agent, &NativeStoreBinding)>,
+    native_store: Option<(&Agent, &NativeStoreBinding, Option<&Value>)>,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
@@ -87,8 +87,8 @@ fn dispatch_launch_tx(
     workspace::gate_workspace_start(tx, agent, &command.command, 1)?;
     capacity::require_reservation_tx(tx, agent_num, 1)?;
     let snapshot = native_store
-        .map(|(expected, binding)| {
-            workspace::launch_snapshot_with_native_store(agent, expected, binding, id)
+        .map(|(expected, binding, startup)| {
+            workspace::launch_snapshot_with_native_store(agent, expected, binding, startup, id)
         })
         .transpose()?;
     let token = format!("{}{}", Ulid::new(), Ulid::new());
@@ -867,7 +867,7 @@ impl Store {
         &mut self,
         id: &str,
         now: i64,
-        native_store: Option<(&Agent, &NativeStoreBinding)>,
+        native_store: Option<(&Agent, &NativeStoreBinding, Option<&Value>)>,
         context_items: Option<&mut Vec<core::ContextItem>>,
     ) -> Result<Change<Command>> {
         let tx = self

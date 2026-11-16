@@ -584,11 +584,27 @@ impl CodexPlugin {
         let (mut launch, diagnostic_secrets, metadata_secrets) =
             self.reader_launch(&params.profile, &params.target_environment)?;
         launch.cwd = workspace.to_path_buf();
+        let profile_object = params.profile.as_object().ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                "Codex profile.store requires a frozen profile object",
+            )
+        })?;
+        let (mcp_policy, mcp_allow) = policy_from_profile(profile_object)?;
+        let mcp_cloud_hostname = cloud_hostname_from_profile(profile_object);
+        let controller_executable = std::env::current_exe().ok();
+        let controller_executable = controller_executable
+            .as_ref()
+            .and_then(|path| path.to_str());
         let binding = crate::discovery::profile_store(
             &launch,
             &params.target_environment,
             &metadata_secrets,
             &diagnostic_secrets,
+            mcp_policy == McpPolicy::Minimal,
+            &mcp_allow,
+            controller_executable,
+            mcp_cloud_hostname.as_deref(),
             Instant::now() + crate::discovery::READ_TIMEOUT,
         )
         .await?;
@@ -902,46 +918,53 @@ impl CodexPlugin {
             .to_string()
             .to_ascii_lowercase();
         let mcp_server_name = format!("eliot_swarm_{start_command}");
-        // Both policies enumerate the worker-visible native MCP surface
-        // with a short-lived metadata reader, then suppress with
-        // transport-carrying `enabled=false` overrides. A bare
-        // `enabled=false` breaks the native bootstrap for project/plugin
-        // names (verified on 0.167.1), so each disable re-emits the
-        // enumerated `command`/`url`. Plugin-backed builtin servers never
-        // appear in `mcp_servers`, so each suppressed plugin takes its own
-        // `plugins.<id>.enabled=false` override, and the ChatGPT-backed
-        // Apps runtime (likewise absent from `mcp_servers`) takes a
-        // synthetic transport-carrying disable. Minimal suppresses every
-        // non-allowed server with its own transport; inherit keeps the
+        // Both policies enumerate the worker-visible native MCP surface,
+        // then suppress with transport-carrying `enabled=false` overrides.
+        // A bare `enabled=false` breaks the native bootstrap for
+        // project/plugin names (verified on 0.167.1), so each disable
+        // re-emits the enumerated `command`/`url`. Plugin-backed builtin
+        // servers never appear in `mcp_servers`, so each suppressed plugin
+        // takes its own `plugins.<id>.enabled=false` override, and the
+        // ChatGPT-backed Apps runtime (likewise absent from `mcp_servers`)
+        // takes a synthetic transport-carrying disable. Minimal fresh
+        // launches reuse the surface frozen with store selection before
+        // dispatch (allow-listed servers persist there by name only, and
+        // an allow-listed owner-identity entry is rejected at freeze
+        // time); minimal resumes enumerate afresh against the retained
+        // store. Inherit enumerates afresh in both cases and keeps the
         // additive behavior except owner Swarm entries: every enumerated
         // entry that carries the owner Swarm identity by transport is
         // always suppressed, so a worker can never talk to the owner's
         // daemon with the owner's identity in either policy, whatever the
         // entry is named. An allow-listed name that matches the identity
         // is rejected at launch instead of re-admitted.
-        let probe = NativeLaunch {
-            program: program.clone(),
-            args: route.args()?,
-            cwd: workspace.clone(),
-            environment: environment.clone(),
-        };
-        let surface = crate::discovery::read_effective_mcp_surface(
-            &probe,
-            &frozen_store,
-            &metadata_secrets,
-            &secrets,
-            Instant::now() + RPC_TIMEOUT,
-        )
-        .await
-        .map_err(|error| {
-            pre_dispatch_read_error(
-                error,
-                "profile_error",
-                "Codex MCP server enumeration failed before worker spawn",
-            )
-        })?;
         let controller_executable = swarm_executable.to_str();
         let (mcp_disables, plugin_disables) = if mcp_policy == McpPolicy::Minimal {
+            let surface = if resume_subject.is_none() {
+                crate::discovery::frozen_mcp_surface(profile, &params.command_id)?
+            } else {
+                let probe = NativeLaunch {
+                    program: program.clone(),
+                    args: route.args()?,
+                    cwd: workspace.clone(),
+                    environment: environment.clone(),
+                };
+                crate::discovery::read_effective_mcp_surface(
+                    &probe,
+                    &frozen_store,
+                    &metadata_secrets,
+                    &secrets,
+                    Instant::now() + RPC_TIMEOUT,
+                )
+                .await
+                .map_err(|error| {
+                    pre_dispatch_read_error(
+                        error,
+                        "profile_error",
+                        "Codex minimal MCP server enumeration failed before worker spawn",
+                    )
+                })?
+            };
             let mut disables = compute_disables(
                 &surface.servers,
                 &mcp_allow,
@@ -961,6 +984,27 @@ impl CodexPlugin {
             }
             (disables, plugins)
         } else {
+            let probe = NativeLaunch {
+                program: program.clone(),
+                args: route.args()?,
+                cwd: workspace.clone(),
+                environment: environment.clone(),
+            };
+            let surface = crate::discovery::read_effective_mcp_surface(
+                &probe,
+                &frozen_store,
+                &metadata_secrets,
+                &secrets,
+                Instant::now() + RPC_TIMEOUT,
+            )
+            .await
+            .map_err(|error| {
+                pre_dispatch_read_error(
+                    error,
+                    "profile_error",
+                    "Codex MCP server enumeration failed before worker spawn",
+                )
+            })?;
             let mut disables = compute_owner_disables(
                 &surface.servers,
                 &mcp_server_name,

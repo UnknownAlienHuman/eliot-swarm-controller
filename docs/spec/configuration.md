@@ -688,7 +688,12 @@ database root or scope; native configuration can affect selection.
 For a new Codex launch, resolve the effective store only after the actual workspace is
 prepared, including setup. The owned read-only
 [`profile.store`](../../crates/eliot-plugin/src/protocol.rs) reader uses that workspace
-and the admitted inputs. This metadata reader issues no `model/list`, entitlement or
+and the admitted inputs. For `minimal`, that same config response supplies the MCP
+server/plugin projection; Store freezes it as command-bound `native_launch_metadata`
+with the binding. It is consumed only by that launch, never cached across commands
+or used to select a resume's store. A child's fresh generation-zero dispatch replaces
+inherited parent launch metadata with its own command-bound projection; inherited
+profile and store-selection inputs remain frozen. This metadata reader issues no `model/list`, entitlement or
 inference probe; direct ChatGPT control startup uses the catalog lookup described under
 [First profile](#first-profile). Native app-server startup may make a vendor-owned read-only model-catalog GET,
 normally to the selected provider base URL. A supported absolute `model_catalog_url`

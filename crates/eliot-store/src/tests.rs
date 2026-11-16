@@ -6255,6 +6255,42 @@ fn same_scope_restriction_during_probe_survives_exact_probe_completion() {
 }
 
 #[test]
+fn fresh_launch_rebinds_parent_startup_metadata_without_reselecting_profile() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let mut request = native_store_request();
+    request.args["profile_snapshot"]["native_launch_metadata"] =
+        json!({"command_id":"parent-launch", "data":{"servers":[], "plugins":[]}});
+    let admission = store.submit("owner", request.clone(), now).unwrap();
+    let id = admission.command.target.as_deref().unwrap();
+    let expected = store.get_agent(id).unwrap().unwrap();
+    let binding = native_store_binding();
+    let startup = json!({"servers":[], "plugins":[]});
+    store
+        .dispatch_with_native_store_binding(
+            &request.id,
+            now + 1,
+            &expected,
+            &binding,
+            Some(&startup),
+        )
+        .unwrap();
+    let agent = store.get_agent(id).unwrap().unwrap();
+    assert_eq!(
+        agent.profile_snapshot["native_launch_metadata"],
+        json!({"command_id":request.id, "data":startup})
+    );
+    assert_eq!(
+        agent.profile_snapshot["native_store_binding"],
+        json!(binding)
+    );
+    assert_eq!(
+        store.get_command(&request.id).unwrap().unwrap().args,
+        admission.command.args
+    );
+}
+
+#[test]
 fn native_store_binding_commits_without_changing_admitted_input_or_retry_binding() {
     let mut store = Store::open(Path::new(":memory:")).unwrap();
     let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
@@ -6271,8 +6307,15 @@ fn native_store_binding_commits_without_changing_admitted_input_or_retry_binding
         )
         .unwrap();
     let binding = native_store_binding();
+    let startup = json!({"servers":[], "plugins":[]});
     let dispatched = store
-        .dispatch_with_native_store_binding(&request.id, now + 1, &expected, &binding)
+        .dispatch_with_native_store_binding(
+            &request.id,
+            now + 1,
+            &expected,
+            &binding,
+            Some(&startup),
+        )
         .unwrap();
     install_fixture_sources(&mut store, id, &request.id, 1, now + 1);
     assert_eq!(dispatched.value.state, CommandState::Dispatched);
@@ -6284,11 +6327,19 @@ fn native_store_binding_commits_without_changing_admitted_input_or_retry_binding
         agent.profile_snapshot["native_store_binding"],
         json!(binding)
     );
+    assert_eq!(
+        agent.profile_snapshot["native_launch_metadata"],
+        json!({"command_id":request.id, "data":startup})
+    );
     let mut input = agent.profile_snapshot.clone();
     input
         .as_object_mut()
         .unwrap()
         .remove("native_store_binding");
+    input
+        .as_object_mut()
+        .unwrap()
+        .remove("native_launch_metadata");
     assert_eq!(input, expected.profile_snapshot);
     assert_eq!(
         digest,
@@ -6309,7 +6360,7 @@ fn native_store_binding_commits_without_changing_admitted_input_or_retry_binding
     assert_eq!(retained.command, dispatched.value);
     assert_eq!(
         store
-            .dispatch_with_native_store_binding(&request.id, now + 2, &expected, &binding)
+            .dispatch_with_native_store_binding(&request.id, now + 2, &expected, &binding, None)
             .unwrap_err()
             .code,
         "bad_state"
@@ -6386,7 +6437,8 @@ fn native_store_binding_rechecks_probe_identity_and_snapshot_before_dispatch() {
                     &request.id,
                     now + 1,
                     &changed,
-                    &native_store_binding()
+                    &native_store_binding(),
+                    None
                 )
                 .unwrap_err()
                 .code,
@@ -6442,7 +6494,8 @@ fn native_store_binding_preserves_workspace_readiness_and_cancellation_fences() 
                 &request.id,
                 now,
                 &expected,
-                &native_store_binding()
+                &native_store_binding(),
+                None
             )
             .unwrap_err()
             .code,
@@ -6475,7 +6528,8 @@ fn native_store_binding_preserves_workspace_readiness_and_cancellation_fences() 
                 &request.id,
                 now + 3,
                 &expected,
-                &native_store_binding()
+                &native_store_binding(),
+                None
             )
             .unwrap_err()
             .code,
@@ -6564,7 +6618,7 @@ fn native_store_binding_retains_identical_internal_binding_and_rejects_replaceme
     let before = store.high_water().unwrap();
     assert_eq!(
         store
-            .dispatch_with_native_store_binding(&request.id, now + 1, &expected, &replacement)
+            .dispatch_with_native_store_binding(&request.id, now + 1, &expected, &replacement, None)
             .unwrap_err()
             .code,
         "source_integrity"
@@ -6572,7 +6626,7 @@ fn native_store_binding_retains_identical_internal_binding_and_rejects_replaceme
     assert_eq!(store.high_water().unwrap(), before);
     assert_eq!(store.get_agent(id).unwrap().unwrap(), expected);
     store
-        .dispatch_with_native_store_binding(&request.id, now + 2, &expected, &binding)
+        .dispatch_with_native_store_binding(&request.id, now + 2, &expected, &binding, None)
         .unwrap();
     assert_eq!(
         store.get_agent(id).unwrap().unwrap().profile_snapshot,
@@ -6606,7 +6660,7 @@ fn native_store_binding_frame_and_persistence_failures_roll_back_entire_dispatch
         }
         let before = store.high_water().unwrap();
         let error = store
-            .dispatch_with_native_store_binding(&request.id, now + 1, &expected, &binding)
+            .dispatch_with_native_store_binding(&request.id, now + 1, &expected, &binding, None)
             .unwrap_err();
         assert_eq!(
             error.code,
@@ -6671,13 +6725,12 @@ fn configured_capacity_scopes_are_reserved_atomically_and_retries_are_idempotent
         ]),
     );
     let account_blocked_id = account_blocked.id.clone();
-    assert_eq!(
-        account_store
-            .submit("owner", account_blocked, now + 2)
-            .unwrap_err()
-            .code,
-        "capacity_unavailable"
-    );
+    let error = account_store
+        .submit("owner", account_blocked, now + 2)
+        .unwrap_err();
+    assert_eq!(error.code, "capacity_unavailable");
+    assert!(error.message.contains("account:shared-account"));
+    assert!(error.message.contains("max_live=1"));
     assert_eq!(account_store.agent_count().unwrap(), 1);
     assert!(
         account_store
@@ -7102,7 +7155,8 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP TRIGGER assignment_commands_insert;
+            "DROP INDEX commands_turn_unknown;
+             DROP TRIGGER assignment_commands_insert;
              DROP TRIGGER assignment_commands_update;
              DROP TRIGGER assignment_commands_delete;
              DROP TRIGGER assignment_turns_insert;
@@ -7374,7 +7428,11 @@ fn managed_workspace_resume_rejection_restores_ready_after_project_revocation() 
         "generic settlement remains closed for a managed workspace resume"
     );
     let rejected = store
-        .reject_workspace_resume(&resume.id, "project_registration_revoked", now + 10)
+        .reject_workspace_resume(
+            &resume.id,
+            &json!({"reason":"project_registration_revoked"}),
+            now + 10,
+        )
         .expect("withdraw admitted resume without renewed Project authority");
     assert_eq!(rejected.value.state, CommandState::Rejected);
     assert_eq!(
@@ -7560,7 +7618,11 @@ fn managed_catch_up_resume_sibling_cancellation_restores_for_retry() {
         Some(2)
     );
     store
-        .reject_workspace_resume(&first_resume_id, "fixture_pre_dispatch_rejection", now + 23)
+        .reject_workspace_resume(
+            &first_resume_id,
+            &json!({"reason":"fixture_pre_dispatch_rejection"}),
+            now + 23,
+        )
         .expect("withdraw the known no-effect predecessor");
     assert_eq!(
         store.get_command(&first_send_id).unwrap().unwrap().state,
@@ -8110,7 +8172,11 @@ fn managed_resume_sibling_waits_for_exact_workspace_stop_settlement() {
         .request_workspace_cancel(&stop_id, &second_resume_id, 2, now + 24)
         .expect("latch exact Stop ownership on the second Resume");
     store
-        .reject_workspace_resume(&first_resume_id, "fixture_pre_dispatch_rejection", now + 25)
+        .reject_workspace_resume(
+            &first_resume_id,
+            &json!({"reason":"fixture_pre_dispatch_rejection"}),
+            now + 25,
+        )
         .expect("make the first Resume sibling terminal");
 
     let held = store
@@ -8297,7 +8363,11 @@ fn unknown_managed_resume_stop_preserves_marker_input_and_reservation() {
         .unwrap();
     assert_eq!(
         store
-            .reject_workspace_resume(&resume_id, "must_not_override_unknown_stop", now + 10)
+            .reject_workspace_resume(
+                &resume_id,
+                &json!({"reason":"must_not_override_unknown_stop"}),
+                now + 10
+            )
             .unwrap_err()
             .code,
         "bad_state"
@@ -8472,7 +8542,11 @@ fn managed_resume_withdrawal_refuses_uncertain_inputs_and_foreign_markers() {
             .unwrap();
 
         let error = store
-            .reject_workspace_resume(&resume_id, "fixture_rejection", reject_now)
+            .reject_workspace_resume(
+                &resume_id,
+                &json!({"reason":"fixture_rejection"}),
+                reject_now,
+            )
             .expect_err("uncertain or foreign custody must remain fenced");
         assert_eq!(
             error.code,
@@ -14294,5 +14368,206 @@ fn retained_command_and_turn_views_survive_later_revisions() {
             .expect("resolve stop view"),
         None,
         "non-native commands expose no configuration view"
+    );
+}
+
+#[test]
+fn exact_turn_unknown_mask_uses_covering_index_and_matches_per_turn() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_agent(&mut store, "turn-unknown-index", now);
+    let other_agent = ready_agent(&mut store, "turn-unknown-index-other", now + 1);
+    const SETTLED_TURNS: usize = 64;
+    let mut turn_ids = Vec::with_capacity(SETTLED_TURNS + 2);
+    for n in 0..SETTLED_TURNS {
+        let turn_id = format!("page-turn-{n:04}");
+        let send = send_request(&agent, 1, &format!("page turn {n}"));
+        let send_id = send.id.clone();
+        let base = now + 10 + n as i64;
+        store.submit("owner", send, base).expect("admit send");
+        store.dispatch(&send_id, base + 1).expect("dispatch send");
+        for (kind, native_id, data, at) in [
+            (
+                "turn.started",
+                format!("page-turn-{n:04}:started"),
+                json!({"command_id": send_id, "turn_id": turn_id}),
+                base + 2,
+            ),
+            (
+                "turn.completed",
+                format!("page-turn-{n:04}:completed"),
+                json!({"command_id": send_id, "turn_id": turn_id, "status": "completed"}),
+                base + 3,
+            ),
+        ] {
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: format!("page-turn-batch-{n:04}-{kind}"),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: kind.to_owned(),
+                            native_id,
+                            data,
+                        }],
+                        cursor: None,
+                    },
+                    at,
+                )
+                .expect("commit settled turn");
+        }
+        turn_ids.push(turn_id);
+    }
+    let live = now + 100_000;
+    let other_first = send_request(&other_agent, 1, "other agent primer");
+    let other_first_id = other_first.id.clone();
+    store
+        .submit("owner", other_first, live)
+        .expect("admit other primer");
+    store
+        .dispatch(&other_first_id, live + 1)
+        .expect("dispatch other primer");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "other-turn-started".to_owned(),
+                agent_id: other_agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: "other-turn:started".to_owned(),
+                    data: json!({"command_id": other_first_id, "turn_id": "other-turn"}),
+                }],
+                cursor: None,
+            },
+            live + 2,
+        )
+        .expect("commit other turn start");
+    let mut other_send = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    other_send.target = Some(other_agent.clone());
+    other_send.expected_generation = Some(1);
+    other_send.expected_turn_id = Some("other-turn".to_owned());
+    let other_send_id = other_send.id.clone();
+    store
+        .submit("owner", other_send, live + 3)
+        .expect("admit other send");
+    store
+        .dispatch(&other_send_id, live + 4)
+        .expect("dispatch other send");
+    store
+        .settle(&other_send_id, CommandState::Unknown, None, live + 5)
+        .expect("settle other unknown");
+    let first = send_request(&agent, 1, "page active turn");
+    let first_id = first.id.clone();
+    store
+        .submit("owner", first, live + 10)
+        .expect("admit first");
+    store
+        .dispatch(&first_id, live + 11)
+        .expect("dispatch first");
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "page-active-started".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "turn.started".to_owned(),
+                    native_id: "page-active:started".to_owned(),
+                    data: json!({"command_id": first_id, "turn_id": "page-active"}),
+                }],
+                cursor: None,
+            },
+            live + 12,
+        )
+        .expect("commit page active turn");
+    let mut second = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    second.target = Some(agent.clone());
+    second.expected_generation = Some(1);
+    second.expected_turn_id = Some("page-active".to_owned());
+    let second_id = second.id.clone();
+    store
+        .submit("owner", second, live + 13)
+        .expect("admit second");
+    store
+        .dispatch(&second_id, live + 14)
+        .expect("dispatch second");
+    let mut third = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    third.target = Some(agent.clone());
+    third.expected_generation = Some(1);
+    third.expected_turn_id = Some("page-active".to_owned());
+    let third_id = third.id.clone();
+    store
+        .submit("owner", third, live + 15)
+        .expect("admit third");
+    store
+        .dispatch(&third_id, live + 16)
+        .expect("dispatch third");
+    store
+        .settle(&second_id, CommandState::Unknown, None, live + 17)
+        .expect("settle page unknown");
+    let memory_unknown = vec![third_id.clone()];
+    turn_ids.push("page-active".to_owned());
+    turn_ids.push("other-turn".to_owned());
+    let mut expected = std::collections::HashSet::new();
+    for turn_id in &turn_ids {
+        if store
+            .turn_has_unknown_command(&agent, 1, turn_id, &memory_unknown)
+            .expect("per-turn mask")
+        {
+            expected.insert(turn_id.clone());
+        }
+    }
+    assert_eq!(
+        expected,
+        std::collections::HashSet::from(["page-active".to_owned()])
+    );
+    let actual = store
+        .turns_with_unknown_commands(&agent, 1, &turn_ids, &memory_unknown)
+        .expect("page mask");
+    assert_eq!(actual, expected);
+    assert!(
+        store
+            .turns_with_unknown_commands(&agent, 1, &[], &memory_unknown)
+            .expect("empty page")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .turns_with_unknown_commands(&other_agent, 1, &["other-turn".to_owned()], &[])
+            .expect("other agent mask"),
+        std::collections::HashSet::from(["other-turn".to_owned()])
+    );
+    let plan: Vec<String> = store
+        .connection
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT DISTINCT turn_id FROM commands INDEXED BY commands_turn_unknown
+             WHERE target=?1 AND generation=?2 AND turn_id IN (SELECT value FROM json_each(?3))
+               AND state IN ('accepted','queued','dispatched','unknown')
+               AND (state='unknown' OR id IN (SELECT value FROM json_each(?4)))",
+        )
+        .expect("prepare plan")
+        .query_map(rusqlite::params![1_i64, 1_i64, "[]", "[]"], |row| {
+            row.get::<_, String>(3)
+        })
+        .expect("run plan")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read plan");
+    assert!(!plan.is_empty());
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("commands_turn_unknown")),
+        "plan uses covering index: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.contains("SCAN commands")),
+        "plan avoids full scan: {plan:?}"
     );
 }

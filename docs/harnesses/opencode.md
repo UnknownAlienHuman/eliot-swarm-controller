@@ -56,7 +56,7 @@ present selection is reused without re-import; an ambiguous isolated state
 refuses. If an import outcome cannot be proven, it settles to success only
 after the original child is proven exited and an isolated-list readback proves
 the selected state; otherwise it stays `unknown`, no automatic retry is made,
-and no server is started.
+and no server is started. A transfer failure before any import write (refused or ambiguous canonical selection, unreadable export, or a missed deadline) is a definite failed start with a typed reason, never `unknown`.
 
 ## Native identity and process mode
 
@@ -87,7 +87,7 @@ Catalogue preflight may retry only before any session/input may have been admitt
 
 | Eliot operation | Mechanism / settlement |
 | --- | --- |
-| launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; before `serve`, the frozen nonsecret `auth_integration` selector's canonical credential transfers opaquely into the isolated store as described under [Authentication](#authentication), with no modification of owner global auth; exact session/model/directory echo required before Eliot `session.ready` |
+| launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; before `serve`, the frozen nonsecret `auth_integration` selector's canonical credential transfers opaquely into the isolated store as described under [Authentication](#authentication), with no modification of owner global auth; exact session/model/directory echo required before Eliot `session.ready`. Readiness is the installed `GET /api/config` proving the live server honors the per-Agent roots (password plus our config document path), polled to a 60 s bound inside one 75 s start envelope shared with the transfer, spawn, subscribe, registration, and create phases, with every failure cleanup (event close plus owned-server terminate and diagnostics) clamped to the same envelope and 15 s reserved for the daemon's Job retirement and settlement, so a loaded cold start never outlives the daemon `agent.start` budget. Any failure before a native session or prompt exists is a definite failed start with a short typed reason and its processes reaped through the generation Job, except an uncertain auth import (the isolated credential store may already have been written and reconciliation failed), which stays `unknown`; `unknown` otherwise stays reserved for real uncertainty after a session or prompt may have been admitted |
 | send | installed `POST /api/session/{id}/prompt`; the 200 inbox id is intermediate, applied needs the exact input-to-execution association on SSE (`session.inbox.enqueued`/`delivered` plus `session.execution.started`; turn id is the exact `started` event id) |
 | steer | exact-turn `POST /api/session/{id}/prompt` with explicit `delivery: steer` (v2.2.7 `Session.Inbox.Delivery`); the exact-turn gate refuses a finished turn as stale without a write, applied needs the input delivered on SSE while the exact turn stays active (native joins it at a step boundary, never a new turn here); terminal-first, cancelled, unwatched, or timed-out consumption is unknown with an exact `DELETE .../inbox/{inboxID}` whose removal must then be proven by inbox-list absence plus a stream-observed cancel — anything unproven latches the session unknown so no later send/Goal dispatches behind the unresolved input (the native 204 also covers the no-op, so it proves nothing alone) |
 | inject | `next_input` prepends inside the next `POST /api/session/{id}/prompt`; `turn_safe_point` claims through the authenticated `hook.event` channel (`hook=before_model`) and resolves to the vendor-native `context` hook (RPC `eliot-context` v1 `bind`/`next`/`resolve` over the existing authenticated HTTP transport) only after a verified v1 session binding; a hook never binds by copying its last-user message id without proving actual inbox delivery to the current turn, and only a confirmed `applied`/`empty` resolve emits a `hook.before_model` receipt |
@@ -269,7 +269,7 @@ always); `effective` carries `mcp_servers` (installed-inventory names, or
 and the status word are retained — never the failure text. The requested
 set is never echoed as observed. The applied per-Agent config document is
 the qualified record; the inventory observation is best-effort — re-polled
-until `connected`, a terminal refusal, or 20s — and never fails a start.
+until `connected`, a terminal refusal, or 20s — and the Worker MCP policy gate below may still refuse the start on an unexpected or owner-identity server.
 
 ## Worker MCP policy
 
