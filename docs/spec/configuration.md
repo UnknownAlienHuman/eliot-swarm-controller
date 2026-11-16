@@ -10,6 +10,14 @@ Default `%LOCALAPPDATA%\Eliot` or `~/.local/share/eliot`; override with `ELIOT_H
 `--data-dir`. Root and private files are current-user-only. Do not accept redirected
 symlink/reparse roots or unsafe ownership.
 
+Linux is distributed as the [supported Docker image](../../docker/README.md).
+It runs as UID/GID 10001 with `ELIOT_HOME=/data`, an owned mode-0700 volume;
+existing unsafe mounts are refused without chmod/chown repair. Native executable
+and workspace paths are absolute container paths. Credentials enter only through
+explicit runtime mounts/environment allowlists, never image layers. The Docker
+guide specifies per-vendor mounts and the risk of exposing credentials to Agents.
+Keep the root short enough for `<data-dir>/daemon.sock` (107 UTF-8 bytes total).
+
 On first use, create the directory with a protected current-user ACL before publishing
 private files. Owner and ACL checks open the root by handle through the verbatim form,
 so roots past the Win32 parse limit keep the same current-user-only protection.

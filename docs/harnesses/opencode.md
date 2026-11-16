@@ -83,6 +83,11 @@ parameter. Read complete error bodies; only authoritative
 rejection proves no effect. Timeout/ambiguous server response after a write is unknown.
 Catalogue preflight may retry only before any session/input may have been admitted.
 
+The native `x-opencode-directory` header is URI component encoded, including literal
+percent signs, using the same encoder as query values. Installed OpenCode 2.2.7
+decodes it once; raw UTF-8 headers turn non-ASCII directory names into mojibake and
+fail readiness with location-not-found (observed in the Linux Docker image).
+
 ## Native mapping
 
 | Eliot operation | Mechanism / settlement |

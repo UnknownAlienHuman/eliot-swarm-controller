@@ -119,12 +119,16 @@ impl OpenCodeHttp {
         let directory = server_native_directory(directory)
             .map_err(|_| Error::new("invalid", "OpenCode directory could not be canonicalized"))?;
         let directory = directory.to_string_lossy().into_owned();
-        let directory_header = HeaderValue::from_bytes(directory.as_bytes()).map_err(|_| {
-            Error::new(
-                "invalid",
-                "OpenCode directory cannot be used as an HTTP header",
-            )
-        })?;
+        // OpenCode 2.2.7 URI-decodes this header. Raw UTF-8 is read as
+        // Latin-1 by its HTTP stack (observed on Linux), changing the location.
+        // Reuse the query component encoder; a literal '%' must be escaped too.
+        let directory_header =
+            HeaderValue::from_str(&encode_component(&directory)).map_err(|_| {
+                Error::new(
+                    "invalid",
+                    "OpenCode directory cannot be used as an HTTP header",
+                )
+            })?;
         let client = Client::builder()
             .no_proxy()
             .redirect(redirect::Policy::none())
@@ -983,27 +987,29 @@ fn readback_outcome_as_error(outcome: HttpOutcome) -> Error {
     }
 }
 
-/// Percent-encode query pairs (`application/x-www-form-urlencoded`
-/// without the `+`-for-space rule; spaces encode as `%20`).
-fn encode_query(pairs: &[(&str, &str)]) -> String {
-    fn encode(into: &mut String, text: &str) {
-        for byte in text.bytes() {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-                into.push(byte as char);
-            } else {
-                into.push_str(&format!("%{byte:02X}"));
-            }
+/// URI component encoding for native directory headers and query pairs.
+fn encode_component(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
         }
     }
+    out
+}
 
+/// Percent-encode query pairs without the `+`-for-space rule.
+fn encode_query(pairs: &[(&str, &str)]) -> String {
     let mut out = String::new();
     for (index, (key, value)) in pairs.iter().enumerate() {
         if index > 0 {
             out.push('&');
         }
-        encode(&mut out, key);
+        out.push_str(&encode_component(key));
         out.push('=');
-        encode(&mut out, value);
+        out.push_str(&encode_component(value));
     }
     out
 }
@@ -1074,6 +1080,20 @@ async fn pump_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_header_preserves_unicode_and_literal_percent() {
+        let root = std::env::temp_dir().join(format!("eliot-opencode-{}", ulid::Ulid::new()));
+        let directory = root.join("space %20 é 中");
+        std::fs::create_dir_all(&directory).expect("Unicode workspace");
+        let http = OpenCodeHttp::new(1, "unused".to_owned(), &directory).expect("client");
+        let header = http.directory_header.to_str().expect("ASCII header");
+        assert!(header.is_ascii());
+        assert!(header.ends_with("space%20%2520%20%C3%A9%20%E4%B8%AD"));
+        assert!(http.directory.ends_with("space %20 é 中"));
+        std::fs::remove_dir_all(root).expect("remove owned workspace");
+    }
 
     #[test]
     fn installed_write_errors_classify() {
