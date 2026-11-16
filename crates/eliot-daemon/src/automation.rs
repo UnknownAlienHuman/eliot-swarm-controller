@@ -1475,7 +1475,7 @@ async fn process_rule_cursor(
                 }
                 Err(error) => return Err(error),
             };
-            let Some(admission) = router
+            let admission = match router
                 .admit_rule_action(
                     &rule.principal,
                     rule.project.as_ref(),
@@ -1484,9 +1484,23 @@ async fn process_rule_cursor(
                     event.seq,
                     prepared,
                 )
-                .await?
-            else {
-                return Ok(false);
+                .await
+            {
+                Ok(Some(admission)) => admission,
+                Ok(None) => return Ok(false),
+                Err(_) if !router.rule_firings_open() => return Ok(false),
+                Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
+                    advance_rule_cursor(
+                        router,
+                        rule,
+                        retiring,
+                        event.seq,
+                        RuleCursorOutcome::Rejected { code: error.code },
+                    )
+                    .await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             rule.state = admission.state;
             refresh_retiring(rule)?;

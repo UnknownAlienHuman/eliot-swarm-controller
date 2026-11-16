@@ -1756,6 +1756,9 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
     if matches!(request.verb.as_str(), "mail.send" | "var.set") {
         return valid_targetless_coordination_request(request);
     }
+    if request.verb == "inject" {
+        return valid_inject_request(request);
+    }
     let reply = matches!(request.verb.as_str(), "approve" | "deny" | "answer");
     if request.verb != "steer" && !reply {
         return valid_rule_action_request(request, true);
@@ -1787,6 +1790,36 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
             .args
             .as_object()
             .is_some_and(|args| args.len() == 1 && args.get("text").is_some_and(Value::is_string))
+}
+
+fn valid_inject_request(request: &SubmitCommand) -> bool {
+    if request.validate().is_err()
+        || !request
+            .target
+            .as_deref()
+            .is_some_and(|target| core::parse_agent_id(target).is_ok())
+        || request
+            .expected_generation
+            .is_some_and(|generation| generation < 0)
+        || request.request_id.is_some()
+        || request.probe
+    {
+        return false;
+    }
+    if !request.args.is_object() {
+        return false;
+    }
+    let Ok(args) = serde_json::from_value::<eliot_core::InjectArgs>(request.args.clone()) else {
+        return false;
+    };
+    match args.point {
+        eliot_core::InjectPoint::NextInput => request.expected_turn_id.is_none(),
+        eliot_core::InjectPoint::TurnSafePoint => request
+            .expected_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| !turn_id.is_empty()),
+        eliot_core::InjectPoint::ActiveTurn => false,
+    }
 }
 
 fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
@@ -2599,10 +2632,11 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
     }
     if request.target != event.agent.map(format_agent_id)
         || request.expected_generation != event.generation
-        || (matches!(
+        || ((matches!(
             request.verb.as_str(),
             "interrupt" | "steer" | "approve" | "deny" | "answer"
-        ) && request.expected_turn_id.as_deref() != event.turn_id.as_deref())
+        ) || (request.verb == "inject" && request.args["point"] == "turn_safe_point"))
+            && request.expected_turn_id.as_deref() != event.turn_id.as_deref())
         || (matches!(request.verb.as_str(), "approve" | "deny" | "answer")
             && (event.kind != "request.opened"
                 || request.request_id.as_deref() != event.request_id.as_deref()))
@@ -3900,6 +3934,190 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn event_inject_binds_exact_agent_generation_and_turn() {
+        let mut store = store();
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET harness = 'codex', state = 'busy', active_turn = 'turn-captured',
+                 effective = '{\"context_points\":[\"turn_safe_point\",\"next_input\"]}' WHERE id = ?1",
+                [agent],
+            )
+            .unwrap();
+        let rule = definition("inject-rule", true);
+        let state = store.ensure_rule_state("owner", &rule, 60).unwrap();
+        let event_seq =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-captured"), 61);
+        let mut request = SubmitCommand::new("", "inject");
+        request.target = Some(agent_id.clone());
+        request.expected_generation = Some(1);
+        request.expected_turn_id = Some("turn-captured".to_owned());
+        request.args = json!({"text": "ctx", "point": "turn_safe_point"});
+        assert!(valid_event_rule_action_request(&request));
+        let admitted = store
+            .admit_rule_action("owner", &state, event_seq, request, 62)
+            .unwrap();
+        assert!(admitted.is_new);
+        let child = &admitted
+            .child
+            .as_ref()
+            .expect("admitted inject child")
+            .command;
+        assert_eq!(child.verb, "inject");
+        assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(child.expected_generation, Some(1));
+        assert_eq!(child.turn_id.as_deref(), Some("turn-captured"));
+        let child_id = child.id.clone();
+        let retained_expected_turn: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT expected_turn_id FROM commands WHERE id = ?1",
+                [&child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_expected_turn.as_deref(), Some("turn-captured"));
+
+        // A forged turn does not bind the captured event.
+        let current = store.get_rule_state("owner", &rule.id).unwrap().unwrap();
+        let forged_event =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-event"), 63);
+        let mut forged = SubmitCommand::new("", "inject");
+        forged.target = Some(agent_id.clone());
+        forged.expected_generation = Some(1);
+        forged.expected_turn_id = Some("turn-forged".to_owned());
+        forged.args = json!({"text": "ctx", "point": "turn_safe_point"});
+        let rejected = store
+            .admit_rule_action("owner", &current, forged_event, forged, 64)
+            .unwrap();
+        assert!(rejected.child.is_none());
+        assert_eq!(
+            rejected.parent.unwrap().outcome.unwrap()["code"],
+            "rule_action_binding_invalid"
+        );
+    }
+
+    #[test]
+    fn event_inject_cannot_rebind_an_old_event_to_a_resumed_generation() {
+        for point in ["next_input", "turn_safe_point"] {
+            for generation in [None, Some(2), Some(1)] {
+                let mut store = store();
+                let (agent, agent_id) = insert_test_agent(&mut store);
+                let rule = definition("old-inject", true);
+                let state = store.ensure_rule_state("owner", &rule, 60).unwrap();
+                let event =
+                    insert_test_interrupt_event(&mut store, agent, 1, Some("reused-turn"), 61);
+                store.connection.execute(
+                    "UPDATE agents SET generation = 2, harness = 'codex', state = 'busy',
+                     active_turn = 'reused-turn',
+                     effective = '{\"context_points\":[\"turn_safe_point\",\"next_input\"]}' WHERE id = ?1",
+                    [agent],
+                ).unwrap();
+                let mut request = SubmitCommand::new("", "inject");
+                request.target = Some(agent_id);
+                request.expected_generation = generation;
+                request.expected_turn_id =
+                    (point == "turn_safe_point").then(|| "reused-turn".to_owned());
+                request.args = json!({"text": "old context", "point": point});
+                let admission = store
+                    .admit_rule_action("owner", &state, event, request, 62)
+                    .unwrap();
+                assert!(
+                    admission.child.is_none(),
+                    "{point} {generation:?} crossed generations"
+                );
+                assert_eq!(
+                    admission.parent.unwrap().outcome.unwrap()["code"],
+                    if generation == Some(1) {
+                        "stale_generation"
+                    } else {
+                        "rule_action_binding_invalid"
+                    }
+                );
+                assert_eq!(
+                    store
+                        .connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM commands WHERE verb = 'inject'",
+                            [],
+                            |row| row.get::<_, i64>(0)
+                        )
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn project_rule_inject_admits_only_its_live_project_agent() {
+        for in_project in [true, false] {
+            let mut store = store();
+            let (agent, agent_id) = insert_test_agent(&mut store);
+            store
+                .upsert_project_registration(
+                    "owner",
+                    &ProjectRegistrationInput {
+                        id: "alpha".to_owned(),
+                        checkout: "alpha-checkout".to_owned(),
+                        repo_common_dir: "alpha-common".to_owned(),
+                        git: None,
+                        profiles: vec!["fake".to_owned()],
+                        actions: vec!["inject".to_owned()],
+                        interpreters: std::collections::BTreeMap::new(),
+                        run_env: Vec::new(),
+                    },
+                    59,
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE agents SET workspace = ?1, harness = 'codex',
+                 effective = '{\"context_points\":[\"next_input\"]}' WHERE id = ?2",
+                    params![
+                        if in_project {
+                            "alpha-checkout"
+                        } else {
+                            "beta-checkout"
+                        },
+                        agent
+                    ],
+                )
+                .unwrap();
+            let value =
+                json!({"id": "project-inject", "enabled": true, "do": [{"action": "inject"}]});
+            let rule = RuleDefinitionInput {
+                id: "project-inject".to_owned(),
+                canonical_definition: serde_json::to_string(&value).unwrap(),
+                definition_digest: core::canonical_json_sha256(&value).unwrap(),
+                enabled: true,
+            };
+            let state = store.ensure_rule_state("project:alpha", &rule, 60).unwrap();
+            let event = insert_test_interrupt_event(&mut store, agent, 1, Some("turn"), 61);
+            let mut request = SubmitCommand::new("", "inject");
+            request.target = Some(agent_id);
+            request.expected_generation = Some(1);
+            request.args = json!({"text": "project context", "point": "next_input"});
+            let admission = store
+                .admit_rule_action("project:alpha", &state, event, request, 62)
+                .unwrap();
+            if in_project {
+                let child = admission.child.expect("live project inject").command;
+                assert_eq!(child.expected_generation, Some(1));
+                assert_eq!(child.principal, "project:alpha");
+            } else {
+                assert!(admission.child.is_none());
+                assert_eq!(
+                    admission.parent.unwrap().outcome.unwrap()["code"],
+                    "not_allowed"
+                );
+            }
+        }
     }
 
     #[test]

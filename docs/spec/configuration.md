@@ -103,6 +103,18 @@ when it is the only installed harness). This makes Swarm delegation available on
 first use; existing profiles and routing choices are preserved. An omitted model
 in these profiles requests the native default and retains requested/effective
 readback separately, as for an ad-hoc launch. There is no builtin fake profile.
+For Muse hot-start profiles the daemon enumerates installed `muse-bin-*.exe`
+builds newest-first and probes with the existing read-only `model/list`
+catalogue path (no session, turn or inference); it freezes the newest build whose
+catalogue is non-empty and records skipped empty-catalogue builds
+(`bootstrap.muse_empty_catalogue_skipped`). Selection stops at the first nonempty
+catalogue, with an 8-second per-build probe and one 20-second selection budget.
+When that budget expires, `bootstrap.muse_catalogue_budget_exhausted` is recorded
+and startup continues without a Muse default. Each probe uses scoped process
+custody and kill-on-drop, with at most 100 inbound frames, 1 MiB per line and
+4 MiB total before parsing. The launcher-marked 1.4.20 build serves
+an empty `bundledCatalog` and is skipped in favor of the 1.4.0 build with a live
+catalogue; `--cmd` still pins an explicit binary for ad-hoc launch.
 Before admission, an omitted profile selects the first available ordered role candidate. There is no post-dispatch harness/model/route/account
 fallback, no retry of an uncertain outcome and no hold-triggered account switch.
 Profiles stay the durable
