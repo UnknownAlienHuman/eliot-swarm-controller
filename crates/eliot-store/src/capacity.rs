@@ -303,7 +303,10 @@ pub(super) fn scopes(agent: &Agent) -> Result<Vec<CapacityScope>> {
         });
     }
 
-    let mut kinds = HashSet::new();
+    // Cross-harness children keep both their own account/proxy scopes and
+    // inherited shared bounds. Distinct scopes of one kind are legitimate;
+    // duplicate scope identities and another profile's scope are not.
+    let mut seen = HashSet::new();
     for scope in &scopes {
         scope.validate()?;
         let kind = scope
@@ -311,7 +314,7 @@ pub(super) fn scopes(agent: &Agent) -> Result<Vec<CapacityScope>> {
             .split_once(':')
             .map(|(kind, _)| kind)
             .unwrap_or("");
-        if !kinds.insert(kind) || kind == "profile" && scope.scope != profile_scope {
+        if !seen.insert(&scope.scope) || kind == "profile" && scope.scope != profile_scope {
             return Err(Error::new(
                 "invalid",
                 "capacity scopes do not match the frozen profile",
@@ -761,4 +764,63 @@ fn release_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<()> {
     )
     .map_err(sql_error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distinct_inherited_accounts_reserve_together_without_escaping_shared_capacity() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let launch = |profile: &str, scopes: Value| {
+            let mut request = core::SubmitCommand::new(Ulid::new().to_string(), "launch");
+            request.args = json!({
+                "workspace":"capacity-workspace", "project":"capacity-project",
+                "harness":"claude", "profile":profile,
+                "profile_snapshot":{"capacity_scopes":scopes},
+            });
+            request
+        };
+        store
+            .submit(
+                "owner",
+                launch(
+                    "manager",
+                    json!([
+                        {"scope":"profile:manager","max_live":null},
+                        {"scope":"account:shared","max_live":2},
+                    ]),
+                ),
+                now,
+            )
+            .unwrap();
+        let child = launch(
+            "worker",
+            json!([
+                {"scope":"profile:worker","max_live":null},
+                {"scope":"account:worker","max_live":4},
+                {"scope":"account:shared","max_live":2},
+            ]),
+        );
+        store.submit("owner", child.clone(), now + 1).unwrap();
+        let mut blocked = child.clone();
+        blocked.id = Ulid::new().to_string();
+        assert_eq!(
+            store.submit("owner", blocked, now + 2).unwrap_err().code,
+            "capacity_unavailable"
+        );
+        let mut duplicate = child;
+        duplicate.id = Ulid::new().to_string();
+        duplicate.args["profile_snapshot"]["capacity_scopes"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"scope":"account:shared","max_live":2}));
+        assert_eq!(
+            store.submit("owner", duplicate, now + 3).unwrap_err().code,
+            "invalid"
+        );
+        assert_eq!(store.agent_count().unwrap(), 2);
+    }
 }

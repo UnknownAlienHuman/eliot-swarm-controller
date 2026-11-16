@@ -640,3 +640,20 @@ used to discover standalone skills without persisting them", and `skills/list`
 exposes the catalog per `cwd`. Implementation:
 [`plugins/codex/src/host.rs`](../../plugins/codex/src/host.rs)
 (`deliver_swarm_skill`).
+
+## Native subagents (`native_subagents` deny)
+
+Per-session mapping, verified on the installed Codex 0.167.1 binary:
+`codex features list` reports `multi_agent` stable on (default) and
+`multi_agent_v2` stable off. When the frozen profile carries
+`native_subagents = "deny"` (the default for profiles with a non-empty
+`child_profiles`), the plugin appends both
+`-c features.multi_agent=false` and `-c features.multi_agent_v2=false`
+before `app-server` on every Codex spawn for the session (MCP enumeration
+probes and the Agent launch), keeping the v2 switch off too. `allow` adds
+nothing and preserves today's behavior. The `-c key=value` override syntax
+is per `codex --help` (`-c, --config key=value`; `--disable FEATURE` is
+equivalent to `-c features.<name>=false`). Implementation:
+`plugins/codex/src/route.rs` (`native_subagents_argv`,
+`args_with_native_subagents`, `args_with_agent_mcp`) and
+`plugins/codex/src/host.rs` (start/probe launches).
