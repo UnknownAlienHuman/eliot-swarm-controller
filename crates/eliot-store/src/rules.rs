@@ -2630,6 +2630,23 @@ fn rule_action_binding_error(event: &StoredRuleTrigger, request: &SubmitCommand)
     ) {
         return None;
     }
+    if request.verb == "inject" {
+        if request.target != event.agent.map(format_agent_id) {
+            return Some("rule_action_binding_invalid".to_owned());
+        }
+        // Generation stays unbound by design: hook events can report the
+        // turn generation ahead of the retained Agent row, so binding
+        // enforces the exact Agent and (for safe-point) turn instead.
+        let safe_point = request
+            .args
+            .get("point")
+            .and_then(Value::as_str)
+            .is_some_and(|point| point == "turn_safe_point");
+        if safe_point && request.expected_turn_id.as_deref() != event.turn_id.as_deref() {
+            return Some("rule_action_binding_invalid".to_owned());
+        }
+        return None;
+    }
     if request.target != event.agent.map(format_agent_id)
         || request.expected_generation != event.generation
         || (matches!(
@@ -3932,6 +3949,69 @@ mod tests {
                 )
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn event_inject_binds_exact_agent_and_turn_without_generation() {
+        let mut store = store();
+        let (agent, agent_id) = insert_test_agent(&mut store);
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET harness = 'codex', state = 'busy', active_turn = 'turn-captured',
+                 effective = '{\"context_points\":[\"turn_safe_point\",\"next_input\"]}' WHERE id = ?1",
+                [agent],
+            )
+            .unwrap();
+        let rule = definition("inject-rule", true);
+        let state = store.ensure_rule_state("owner", &rule, 60).unwrap();
+        let event_seq =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-captured"), 61);
+        let mut request = SubmitCommand::new("", "inject");
+        request.target = Some(agent_id.clone());
+        request.expected_turn_id = Some("turn-captured".to_owned());
+        request.args = json!({"text": "ctx", "point": "turn_safe_point"});
+        assert!(valid_event_rule_action_request(&request));
+        let admitted = store
+            .admit_rule_action("owner", &state, event_seq, request, 62)
+            .unwrap();
+        assert!(admitted.is_new);
+        let child = &admitted
+            .child
+            .as_ref()
+            .expect("admitted inject child")
+            .command;
+        assert_eq!(child.verb, "inject");
+        assert_eq!(child.target.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(child.expected_generation, None);
+        assert_eq!(child.turn_id.as_deref(), Some("turn-captured"));
+        let child_id = child.id.clone();
+        let retained_expected_turn: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT expected_turn_id FROM commands WHERE id = ?1",
+                [&child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_expected_turn.as_deref(), Some("turn-captured"));
+
+        // A forged turn does not bind the captured event.
+        let current = store.get_rule_state("owner", &rule.id).unwrap().unwrap();
+        let forged_event =
+            insert_test_interrupt_event(&mut store, agent, 1, Some("turn-event"), 63);
+        let mut forged = SubmitCommand::new("", "inject");
+        forged.target = Some(agent_id.clone());
+        forged.expected_turn_id = Some("turn-forged".to_owned());
+        forged.args = json!({"text": "ctx", "point": "turn_safe_point"});
+        let rejected = store
+            .admit_rule_action("owner", &current, forged_event, forged, 64)
+            .unwrap();
+        assert!(rejected.child.is_none());
+        assert_eq!(
+            rejected.parent.unwrap().outcome.unwrap()["code"],
+            "rule_action_binding_invalid"
         );
     }
 
