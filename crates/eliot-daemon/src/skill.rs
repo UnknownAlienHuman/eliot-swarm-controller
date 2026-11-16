@@ -69,6 +69,7 @@ mod tests {
     #[test]
     fn materialize_writes_the_embedded_skill_atomically() {
         let root = scratch_root("write");
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         materialize(&root).unwrap();
         assert_eq!(
             std::fs::read_to_string(shared::skill_body_path(&root)).unwrap(),
@@ -84,7 +85,6 @@ mod tests {
             std::fs::read_to_string(shared::skill_body_path(&root)).unwrap(),
             shared::SKILL_BODY
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

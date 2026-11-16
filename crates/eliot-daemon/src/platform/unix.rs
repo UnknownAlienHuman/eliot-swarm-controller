@@ -1064,14 +1064,16 @@ const MAX_HEAVY_ARGV_TOKENS: usize = 64;
 
 /// Bounded argv for one Linux process from `/proc/<pid>/cmdline`
 /// (`proc(5)`). Missing, unreadable, empty, overlong or exited processes
-/// fail closed to None; only the first 64 KiB of cmdline are ever read.
+/// fail closed to None; the read itself is bounded to 64 KiB plus one probe
+/// byte, so an oversized body is rejected before parsing instead of being
+/// read in full and truncated afterwards.
 #[cfg(target_os = "linux")]
 fn proc_argv(pid: u32) -> Option<Vec<String>> {
     if pid == 0 {
         return None;
     }
-    let mut body = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    body.truncate(64 * 1024);
+    let file = fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
+    let body = super::process_observation::read_bounded_cmdline(file)?;
     let mut args = eliot_core::split_unix_cmdline(&body);
     if args.is_empty() || args.len() > MAX_HEAVY_ARGV_TOKENS {
         return None;
@@ -1092,7 +1094,8 @@ fn proc_parent_pid(pid: u32) -> Option<u32> {
     if pid == 0 {
         return None;
     }
-    let body = fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let file = fs::File::open(format!("/proc/{pid}/stat")).ok()?;
+    let body = super::process_observation::read_bounded_cmdline(file)?;
     let text = std::str::from_utf8(&body).ok()?;
     let after = text.rsplit(')').next()?;
     let mut fields = after.split_whitespace();
