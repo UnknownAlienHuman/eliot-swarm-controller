@@ -1156,10 +1156,14 @@ impl OpenCodePlugin {
             &parsed.swarm_executable,
             parsed.mcp_cloud_hostname.as_deref(),
         ) {
-            let reason = error.message.clone();
+            let reason = (*error.message).clone();
             discard_failed_start(&mut session, error, envelope).await;
             return Ok(CreateOutcome::ProvenFailed(
-                self.retain_proven_no_effect_start(&parsed.params, reason),
+                self.retain_proven_no_effect_start(
+                    &parsed.params,
+                    StartPhase::CreateRefused,
+                    reason,
+                ),
             ));
         }
         let title = format!(

@@ -136,7 +136,8 @@ fn start_failure_is_proven_no_effect(phase: StartPhase, _code: &str) -> bool {
 /// retires the plugin instead of pinning an unknown Agent.
 struct PhaseFailure {
     phase: StartPhase,
-    error: Error,
+    // Boxed: the diagnostics-carrying Error is large (clippy result_large_err).
+    error: Box<Error>,
 }
 
 /// Typed reason for one proven-no-effect failed start. Static per phase
@@ -1329,7 +1330,7 @@ impl ClaudePlugin {
                     &params,
                     PhaseFailure {
                         phase: StartPhase::Plan,
-                        error,
+                        error: Box::new(error),
                     },
                 ));
             }
@@ -1340,7 +1341,7 @@ impl ClaudePlugin {
                 if start_failure_is_proven_no_effect(failure.phase, &failure.error.code) {
                     return Ok(self.proven_no_effect_start(&params, failure));
                 }
-                return Err(failure.error);
+                return Err(*failure.error);
             }
         };
         if let Err(error) = register_native_process(
@@ -2327,7 +2328,7 @@ async fn launch_session(
         ClaudeMcpConfigFile::create(&plan.instance_dir, &plan.swarm_binary, &plan.data_root)
             .map_err(|error| PhaseFailure {
                 phase: StartPhase::McpConfig,
-                error,
+                error: Box::new(error),
             })?;
     // Approvals always travel over stdio so every `can_use_tool` ask
     // reaches Eliot. Resume continues the exact retained session id; the
@@ -2380,7 +2381,10 @@ async fn launch_session(
     if !skill_root.is_dir() {
         return Err(PhaseFailure {
             phase: StartPhase::Skill,
-            error: Error::new("unavailable", "Claude skill root is unavailable"),
+            error: Box::new(Error::new(
+                "unavailable",
+                "Claude skill root is unavailable",
+            )),
         });
     }
     argv.push(OsString::from("--plugin-dir"));
@@ -2392,7 +2396,7 @@ async fn launch_session(
         .await
         .map_err(|error| PhaseFailure {
             phase: StartPhase::Login,
-            error,
+            error: Box::new(error),
         })?;
     let launch = NativeLaunch {
         program: plan.program.clone(),
@@ -2404,7 +2408,7 @@ async fn launch_session(
         .await
         .map_err(|error| PhaseFailure {
             phase: StartPhase::Spawn,
-            error,
+            error: Box::new(error),
         })?;
     let frames = match native.take_frames() {
         Ok(frames) => frames,
@@ -2412,7 +2416,7 @@ async fn launch_session(
             let _ = native.terminate(false, Instant::now() + RPC_TIMEOUT).await;
             return Err(PhaseFailure {
                 phase: StartPhase::PostSpawn,
-                error,
+                error: Box::new(error),
             });
         }
     };
@@ -3212,10 +3216,10 @@ mod tests {
         let mut plugin = ClaudePlugin::default();
         let failure = PhaseFailure {
             phase: StartPhase::Plan,
-            error: Error::new(
+            error: Box::new(Error::new(
                 "profile_error",
                 "Claude inherit MCP keeps the owner Swarm MCP server \"swarm\" from project .mcp.json",
-            ),
+            )),
         };
         let value = plugin.proven_no_effect_start(&params, failure);
         assert_eq!(value["state"], "failed");
