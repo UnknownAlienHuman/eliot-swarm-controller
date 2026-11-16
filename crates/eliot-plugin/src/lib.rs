@@ -7,6 +7,7 @@ pub mod peer;
 pub mod protocol;
 pub mod session;
 pub mod skill;
+pub mod start_classification;
 mod stderr;
 pub mod sync;
 
