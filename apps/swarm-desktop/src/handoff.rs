@@ -130,7 +130,8 @@ pub fn send_row(command: &Command, generation: i64) -> Option<SendRow> {
 #[derive(Clone, Debug)]
 pub enum Submitted {
     Handoff(HandoffRequest),
-    Switch(SwitchRequest),
+    // Boxed: the launch-carrying switch request is much larger than a handoff.
+    Switch(Box<SwitchRequest>),
 }
 
 impl Submitted {

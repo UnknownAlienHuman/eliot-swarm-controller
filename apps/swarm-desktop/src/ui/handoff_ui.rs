@@ -542,14 +542,14 @@ impl DesktopApp {
             access: None,
         };
         let switch = |launch: SwitchLaunch| {
-            Submitted::Switch(SwitchRequest {
+            Submitted::Switch(Box::new(SwitchRequest {
                 id: String::new(),
                 from: state.from.clone(),
                 from_generation: state.from_generation,
                 task_command: task_command.clone(),
                 commands: commands.clone(),
                 launch,
-            })
+            }))
         };
         let mut submitted = match target {
             Target::Existing { agent, generation } => Submitted::Handoff(HandoffRequest {
