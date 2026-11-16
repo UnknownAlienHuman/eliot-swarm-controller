@@ -12681,6 +12681,53 @@ fn session_usage_keeps_only_the_latest_snapshot() {
 }
 
 #[test]
+fn session_growth_view_reads_retained_file_bytes() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let agent = ready_agent(&mut store, "growth-bytes-probe", now);
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "session-usage:bytes".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.usage".to_owned(),
+                    native_id: "session-usage:nbytes".to_owned(),
+                    data: json!({"usage": {
+                        "context_used_tokens": 10,
+                        "context_window_tokens": null,
+                        "source": "claude:result",
+                        "session_file_bytes": 2048,
+                    }}),
+                }],
+                cursor: None,
+            },
+            now,
+        )
+        .expect("commit session usage");
+    let low = SessionGrowthThresholds {
+        file_bytes: 1024,
+        ..SessionGrowthThresholds::default()
+    };
+    let warned = store
+        .session_growth_view("claude", &agent, 1, &low)
+        .expect("growth view")
+        .expect("retained file bytes warn under a low threshold");
+    assert_eq!(warned.basis.as_deref(), Some("session_file_bytes"));
+    assert!(warned.warn);
+    // Default thresholds stay quiet: only an exposed, crossed size warns.
+    assert!(
+        store
+            .session_growth_view("claude", &agent, 1, &SessionGrowthThresholds::default())
+            .expect("growth view")
+            .is_none()
+    );
+}
+
+#[test]
 fn session_fallback_projects_cumulative_counters_only() {
     use eliot_core::{SessionCost, SessionTokenTotals, SessionUsage};
 

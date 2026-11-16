@@ -4929,7 +4929,9 @@ impl Store {
         thresholds: &core::SessionGrowthThresholds,
     ) -> Result<Option<SessionGrowthView>> {
         let usage = self.get_session_usage(agent, generation)?;
-        let growth = core::evaluate_session_growth(harness, usage.as_ref(), None, thresholds);
+        let session_bytes = usage.as_ref().and_then(|usage| usage.session_file_bytes);
+        let growth =
+            core::evaluate_session_growth(harness, usage.as_ref(), session_bytes, thresholds);
         Ok(growth.map(|warn| SessionGrowthView {
             warn: true,
             basis: Some(warn.basis_name().to_owned()),
