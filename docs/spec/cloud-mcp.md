@@ -6,10 +6,44 @@ reuses that handler and the authenticated local daemon API.
 
 External hosted custom connectors using Cloudflare Access Managed OAuth dynamic
 client registration must have the caller's exact hosted OAuth redirect URI in the
-Access application's `allowed_uris`; loopback-only callbacks are insufficient. For
-example, the Muse custom connector's public callback is
-`https://agent.meta.ai/api/hatch/oauth/callback`; omitting this URI can cause HTTP
-400 `invalid_client_metadata`.
+Access application's `allowed_uris`; loopback-only callbacks are insufficient. The
+Meta Muse callback `https://agent.meta.ai/api/hatch/oauth/callback` is a documented
+example, not a value to infer from the current UI origin. Before changing this list,
+obtain the actual `redirect_uri` from the current supported connector authorization
+flow and verify that exact value against the Access application.
+
+### Hosted connector credential recovery
+
+Keep these credentials and sessions distinct:
+
+- A browser `CF_Authorization` cookie is a browser Access session. It is not the
+  hosted connector's Managed OAuth credential and does not replace it in Meta's
+  Muse auth store.
+- The hosted Meta Muse connector stores an opaque Managed OAuth client credential
+  for this MCP resource. Cloudflare resolves it and forwards a signed Access
+  assertion to the origin; Eliot validates that assertion as described below.
+- Eliot's local daemon credentials and any standalone OAuth helper state belong to
+  separate clients. A helper can refresh only credentials it owns; it does not
+  update Meta's auth store unless Meta explicitly provides that supported flow.
+
+When the hosted connector's credential is rejected or its refresh grant expires,
+reauthorize that same connector for the same MCP resource, preserving the user's
+existing Access rights and policy. Start from Meta/Muse's first-party connector flow
+and its supported reconnect/consent action; recreate the connector only if that flow
+requires it. Follow its current browser authorization flow; do not begin by
+disconnecting the connector or copy browser cookies or bearer credentials between
+stores. A helper failure such as `502 token refresh not allowed
+through egress proxy` is a client-side egress/refresh-path failure. Restarting the
+Eliot daemon, copying browser cookies, or adding a second Eliot OAuth server cannot
+repair Meta's stored credential. Do not bypass the proxy or extend token expiry as
+a workaround. [Cloudflare's Managed OAuth documentation](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/),
+updated 2026-11-03, describes short-lived access tokens with refresh grants and
+requires IdP reauthentication after the grant expires.
+
+After reauthorization, acceptance requires a fresh MCP `initialize` followed by a
+harmless `daemon.status` call through the repaired hosted connector. A successful
+browser login, OAuth discovery response, or daemon `Running` state alone does not
+prove the connector credential works end to end.
 
 ## Boundary
 
