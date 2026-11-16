@@ -444,8 +444,11 @@ brief. Each brief is
 limited to the ordinary 64 KiB launch-text bound. Unsafe, oversized or invalid UTF-8
 briefs fail the slot visibly. At capacity or when no next brief exists, the timer slot is
 skipped and a later interval checks again. Settings generate a global interval timer
-rule and an ordinary completion rule. The completion rule matches the Store-verified
-`event.cause.rule` of that assignment and stops only its captured Agent/generation,
+rule and an ordinary completion rule. Before admitting cleanup, Store verifies that
+the captured Agent/generation was launched by this assignment's own launch for the
+same key in the global Owner principal namespace. A matching `event.cause.rule` name
+alone grants no cleanup authority; project rules with the same name remain separate.
+The completion rule stops only that captured Agent/generation,
 releasing native live capacity after custody closes. Native `data.cause` is not a match
 authority. Assigned Agents own one brief; they are retired after their terminal turn.
 Manual timer runs use the same admission and cursor checks. Multiple firings race
@@ -455,10 +458,13 @@ The ordinary command ID remains the timer child ID, preserving exact same-ID rep
 An assignment launch selects `role` instead of `profile`; routing evaluates its frozen
 candidate order at admission. The selected brief filename, previous cursor, assignment
 key and capacity bound accompany the normal launch command for Store validation. Store
-counts unresolved assignment launches, unresolved linked initial sends, and starting,
-running or unknown native turns. A terminal turn releases the slot; process liveness by
-itself does not establish completion. If Store reports a stale cursor or full capacity,
-the command is not admitted and the next timer firing retries from retained state.
+maintains unresolved assignment membership transactionally with command and turn changes.
+It counts indexed unresolved membership, including unresolved launches,
+linked initial sends, and starting, running or unknown native turns. Counting stops
+at `max_busy` and excludes completed history. A terminal turn releases the slot;
+process liveness by itself does not establish completion. If Store reports a stale
+cursor or full capacity, the command is not admitted and the next timer firing retries
+from retained state.
 
 The `launch` action submits the existing ordinary launch command with flat fields. An
 explicit `profile` or a routing `role` may be supplied; they are mutually exclusive.

@@ -31,8 +31,24 @@ impl Router {
     pub(crate) async fn assignment_status(
         &self,
         key: &str,
+        max_busy: u64,
     ) -> Result<eliot_store::AssignmentStatus> {
-        self.inner.store.lock().await.assignment_status(key)
+        self.inner
+            .store
+            .lock()
+            .await
+            .assignment_status(key, max_busy)
+    }
+
+    pub(crate) async fn is_assignment_event(&self, event: &Event, key: &str) -> Result<bool> {
+        let (Some(agent), Some(generation)) = (event.agent.as_deref(), event.generation) else {
+            return Ok(false);
+        };
+        self.inner
+            .store
+            .lock()
+            .await
+            .is_assignment_event(event.seq, key, agent, generation)
     }
 
     pub(super) async fn rule_catch_up(

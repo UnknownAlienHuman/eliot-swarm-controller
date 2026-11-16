@@ -1591,7 +1591,17 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "DROP INDEX commands_assignment;
+                    "DROP TRIGGER assignment_commands_insert;
+                     DROP TRIGGER assignment_commands_update;
+                     DROP TRIGGER assignment_commands_delete;
+                     DROP TRIGGER assignment_turns_insert;
+                     DROP TRIGGER assignment_turns_update;
+                     DROP TRIGGER assignment_turns_delete;
+                     DROP VIEW assignment_busy_membership;
+                     DROP INDEX commands_assignment_busy;
+                     DROP INDEX commands_assignment_turn;
+                     ALTER TABLE commands DROP COLUMN assignment_busy;
+                     DELETE FROM schema_migrations WHERE version = 43;
                      ALTER TABLE agents DROP COLUMN profile_choice;
                      DROP INDEX settings_history_created;
                      DROP TABLE settings_history;

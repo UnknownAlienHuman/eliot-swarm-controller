@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 42;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 43;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1000,6 +1000,109 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 43 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE commands ADD COLUMN assignment_busy INTEGER NOT NULL DEFAULT 0
+                     CHECK(assignment_busy IN (0,1));
+                 DROP INDEX commands_assignment;
+                 CREATE VIEW assignment_busy_membership AS
+                   SELECT l.id AS launch_id FROM commands l
+                   WHERE l.verb='launch'
+                     AND json_extract(l.args,'$.assignment.key') IS NOT NULL
+                     AND (l.state IN ('accepted','queued','dispatched','unknown')
+                       OR EXISTS (
+                         SELECT 1 FROM commands s WHERE s.parent_command=l.id
+                           AND s.link_kind='send' AND (
+                             s.state IN ('accepted','queued','dispatched','unknown')
+                             OR (s.state='applied' AND (s.turn_id IS NULL OR EXISTS (
+                               SELECT 1 FROM turns t WHERE t.agent=s.target
+                                 AND t.generation=s.generation AND t.turn_id=s.turn_id
+                                 AND t.state IN ('starting','running','unknown'))))
+                           )
+                       ));
+                 UPDATE commands SET assignment_busy = EXISTS (
+                     SELECT 1 FROM assignment_busy_membership m
+                     WHERE m.launch_id=commands.id)
+                   WHERE verb='launch' AND json_extract(args,'$.assignment.key') IS NOT NULL;
+                 CREATE INDEX commands_assignment_busy
+                     ON commands(json_extract(args,'$.assignment.key'))
+                     WHERE verb='launch' AND assignment_busy=1;
+                 CREATE INDEX commands_assignment_turn
+                     ON commands(target,generation,turn_id,parent_command)
+                     WHERE link_kind='send' AND state='applied' AND turn_id IS NOT NULL;
+                 CREATE TRIGGER assignment_commands_insert
+                 AFTER INSERT ON commands BEGIN
+                   UPDATE commands SET assignment_busy = EXISTS (
+                     SELECT 1 FROM assignment_busy_membership m
+                     WHERE m.launch_id=commands.id)
+                   WHERE id IN (NEW.id, NEW.parent_command) AND verb='launch';
+                 END;
+                 CREATE TRIGGER assignment_commands_update
+                 AFTER UPDATE OF verb,args,state,parent_command,link_kind,target,generation,turn_id
+                 ON commands BEGIN
+                   UPDATE commands SET assignment_busy = EXISTS (
+                     SELECT 1 FROM assignment_busy_membership m
+                     WHERE m.launch_id=commands.id)
+                   WHERE id IN (NEW.id, NEW.parent_command, OLD.parent_command)
+                     AND verb='launch';
+                 END;
+                 CREATE TRIGGER assignment_commands_delete
+                 AFTER DELETE ON commands BEGIN
+                   UPDATE commands SET assignment_busy = EXISTS (
+                     SELECT 1 FROM assignment_busy_membership m
+                     WHERE m.launch_id=commands.id)
+                   WHERE id=OLD.parent_command AND verb='launch';
+                 END;
+                 CREATE TRIGGER assignment_turns_insert
+                 AFTER INSERT ON turns BEGIN
+                   UPDATE commands SET assignment_busy = EXISTS (
+                     SELECT 1 FROM assignment_busy_membership m
+                     WHERE m.launch_id=commands.id)
+                   WHERE id IN (
+                     SELECT s.parent_command FROM commands s INDEXED BY commands_assignment_turn
+                     WHERE s.link_kind='send' AND s.state='applied' AND s.turn_id IS NOT NULL
+                       AND s.target=NEW.agent AND s.generation=NEW.generation
+                       AND s.turn_id=NEW.turn_id AND s.parent_command IS NOT NULL
+                   ) AND verb='launch';
+                 END;
+                 CREATE TRIGGER assignment_turns_update
+                 AFTER UPDATE OF agent,generation,turn_id,state ON turns BEGIN
+                   UPDATE commands SET assignment_busy = EXISTS (
+                     SELECT 1 FROM assignment_busy_membership m
+                     WHERE m.launch_id=commands.id)
+                   WHERE id IN (
+                     SELECT s.parent_command FROM commands s INDEXED BY commands_assignment_turn
+                     WHERE s.link_kind='send' AND s.state='applied' AND s.turn_id IS NOT NULL
+                       AND s.target=OLD.agent AND s.generation=OLD.generation
+                       AND s.turn_id=OLD.turn_id AND s.parent_command IS NOT NULL
+                     UNION
+                     SELECT s.parent_command FROM commands s INDEXED BY commands_assignment_turn
+                     WHERE s.link_kind='send' AND s.state='applied' AND s.turn_id IS NOT NULL
+                       AND s.target=NEW.agent AND s.generation=NEW.generation
+                       AND s.turn_id=NEW.turn_id AND s.parent_command IS NOT NULL
+                   ) AND verb='launch';
+                 END;
+                 CREATE TRIGGER assignment_turns_delete
+                 AFTER DELETE ON turns BEGIN
+                   UPDATE commands SET assignment_busy = EXISTS (
+                     SELECT 1 FROM assignment_busy_membership m
+                     WHERE m.launch_id=commands.id)
+                   WHERE id IN (
+                     SELECT s.parent_command FROM commands s INDEXED BY commands_assignment_turn
+                     WHERE s.link_kind='send' AND s.state='applied' AND s.turn_id IS NOT NULL
+                       AND s.target=OLD.agent AND s.generation=OLD.generation
+                       AND s.turn_id=OLD.turn_id AND s.parent_command IS NOT NULL
+                   ) AND verb='launch';
+                 END;
+                 INSERT INTO schema_migrations(version) VALUES (43);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1014,7 +1117,17 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX commands_assignment;
+                "DROP TRIGGER assignment_commands_insert;
+             DROP TRIGGER assignment_commands_update;
+             DROP TRIGGER assignment_commands_delete;
+             DROP TRIGGER assignment_turns_insert;
+             DROP TRIGGER assignment_turns_update;
+             DROP TRIGGER assignment_turns_delete;
+             DROP VIEW assignment_busy_membership;
+             DROP INDEX commands_assignment_busy;
+             DROP INDEX commands_assignment_turn;
+             ALTER TABLE commands DROP COLUMN assignment_busy;
+             DELETE FROM schema_migrations WHERE version=43;
              ALTER TABLE agents DROP COLUMN profile_choice;
              DELETE FROM schema_migrations WHERE version=42;
              DROP INDEX settings_history_created;
@@ -1072,7 +1185,17 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX commands_assignment;
+                "DROP TRIGGER assignment_commands_insert;
+             DROP TRIGGER assignment_commands_update;
+             DROP TRIGGER assignment_commands_delete;
+             DROP TRIGGER assignment_turns_insert;
+             DROP TRIGGER assignment_turns_update;
+             DROP TRIGGER assignment_turns_delete;
+             DROP VIEW assignment_busy_membership;
+             DROP INDEX commands_assignment_busy;
+             DROP INDEX commands_assignment_turn;
+             ALTER TABLE commands DROP COLUMN assignment_busy;
+             DELETE FROM schema_migrations WHERE version=43;
              ALTER TABLE agents DROP COLUMN profile_choice;
              DELETE FROM schema_migrations WHERE version=42;
              DROP INDEX settings_history_created;

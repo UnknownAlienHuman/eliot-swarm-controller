@@ -1335,6 +1335,31 @@ async fn reconcile_event_rules(
     Ok(true)
 }
 
+fn assignment_cleanup_key<'a>(
+    principal: &str,
+    project_scoped: bool,
+    rule_id: &'a str,
+    cause_rule: Option<&str>,
+) -> Option<&'a str> {
+    if principal != "owner" || project_scoped {
+        return None;
+    }
+    let key = rule_id
+        .strip_prefix("assignment-")?
+        .strip_suffix(".complete")?;
+    let expected_cause = format!("assignment-{key}");
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        || cause_rule != Some(expected_cause.as_str())
+    {
+        return None;
+    }
+    Some(key)
+}
+
 async fn process_rule_cursor(
     router: &Router,
     rule: &mut ActiveRule,
@@ -1383,6 +1408,18 @@ async fn process_rule_cursor(
                 rule.state = admission.state;
                 refresh_retiring(rule)?;
                 no_match_through = None;
+                continue;
+            }
+            if event.kind == "turn.completed"
+                && let Some(key) = assignment_cleanup_key(
+                    &rule.principal,
+                    rule.project.is_some(),
+                    &definition.id,
+                    event.cause.as_ref().and_then(|cause| cause.rule.as_deref()),
+                )
+                && !router.is_assignment_event(&event, key).await?
+            {
+                no_match_through = Some(event.seq);
                 continue;
             }
             let action = match definition::evaluate(&definition, &event) {
@@ -1998,6 +2035,33 @@ pub(crate) async fn prepare_rule_catch_up_actions(
 mod timer_tests {
     use super::*;
     use eliot_core::SubmitCommand;
+
+    #[test]
+    fn assignment_cleanup_candidate_is_owner_global_only() {
+        let rule_id = "assignment-pool.complete";
+        let cause_rule = Some("assignment-pool");
+        assert_eq!(
+            assignment_cleanup_key("owner", false, rule_id, cause_rule),
+            Some("pool")
+        );
+        assert_eq!(
+            assignment_cleanup_key("project:collision-project", true, rule_id, cause_rule),
+            None
+        );
+        assert_eq!(
+            assignment_cleanup_key("owner", false, rule_id, Some("other-rule")),
+            None
+        );
+        assert_eq!(
+            assignment_cleanup_key(
+                "owner",
+                false,
+                "assignment-pool.extra.complete",
+                Some("assignment-pool.extra"),
+            ),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn empty_project_timer_lane_does_not_list_owner_timers() {

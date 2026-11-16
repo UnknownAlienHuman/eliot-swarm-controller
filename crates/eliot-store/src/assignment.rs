@@ -1,6 +1,7 @@
 //! Folder assignment cursor and slots on ordinary launch commands and variables.
 use super::*;
 use serde::Deserialize;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentStatus {
@@ -29,8 +30,11 @@ fn validate_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn status(connection: &Connection, key: &str) -> Result<AssignmentStatus> {
+fn status(connection: &Connection, key: &str, max_busy: u64) -> Result<AssignmentStatus> {
     validate_key(key)?;
+    if max_busy == 0 || max_busy > 1_000 {
+        return Err(Error::new("invalid", "invalid assignment capacity bound"));
+    }
     let value: Option<String> = connection
         .query_row(
             "SELECT value FROM vars WHERE scope='global' AND key=?1",
@@ -48,21 +52,16 @@ fn status(connection: &Connection, key: &str) -> Result<AssignmentStatus> {
                 .ok_or_else(|| Error::new("source_integrity", "assignment cursor is malformed"))
         })
         .transpose()?;
-    // Commands and native terminal turns own slots. Process silence or an idle
-    // projection never settles an uncertain launch/input.
+    // The partial index contains only durable unresolved membership. LIMIT
+    // bounds each admission/status recount by the configured capacity.
     let busy: i64 = connection
         .query_row(
-            "SELECT COUNT(*) FROM commands c
-         WHERE c.verb='launch' AND json_extract(c.args,'$.assignment.key')=?1
-           AND (c.state IN ('accepted','queued','dispatched','unknown')
-             OR EXISTS (SELECT 1 FROM commands s WHERE s.parent_command=c.id
-                 AND s.link_kind='send' AND
-                 (s.state IN ('accepted','queued','dispatched','unknown')
-                   OR (s.state='applied' AND (s.turn_id IS NULL OR EXISTS (
-                     SELECT 1 FROM turns t WHERE t.agent=s.target
-                       AND t.generation=s.generation AND t.turn_id=s.turn_id
-                       AND t.state IN ('running','unknown')))))))",
-            [key],
+            "SELECT COUNT(*) FROM (
+             SELECT id FROM commands INDEXED BY commands_assignment_busy
+             WHERE verb='launch' AND assignment_busy=1
+               AND json_extract(args,'$.assignment.key')=?1
+             LIMIT ?2)",
+            params![key, max_busy as i64],
             |row| row.get(0),
         )
         .map_err(sql_error)?;
@@ -74,9 +73,128 @@ fn status(connection: &Connection, key: &str) -> Result<AssignmentStatus> {
 }
 
 impl Store {
-    pub fn assignment_status(&self, key: &str) -> Result<AssignmentStatus> {
+    pub fn assignment_status(&self, key: &str, max_busy: u64) -> Result<AssignmentStatus> {
         self.ensure_committed_reads()?;
-        status(&self.connection, key)
+        status(&self.connection, key, max_busy)
+    }
+
+    /// Verifies that an event's retained Store cause descends from an Owner
+    /// assignment launch for the exact Agent generation and assignment key.
+    pub fn is_assignment_event(
+        &self,
+        seq: i64,
+        key: &str,
+        agent: &str,
+        generation: i64,
+    ) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        validate_key(key)?;
+        let agent_num = parse_agent_id(agent)?;
+        if seq <= 0 || generation <= 0 {
+            return Ok(false);
+        }
+        let event = self
+            .connection
+            .query_row(
+                "SELECT kind, agent, generation, cause FROM events WHERE seq=?1",
+                [seq],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some((kind, Some(event_agent), Some(event_generation), Some(cause))) = event else {
+            return Ok(false);
+        };
+        if kind != "turn.completed" || event_agent != agent_num || event_generation != generation {
+            return Ok(false);
+        }
+        let cause: core::EventCause = serde_json::from_str(&cause)
+            .map_err(|_| Error::new("source_integrity", "event cause is malformed"))?;
+        let assignment_rule = format!("assignment-{key}");
+        if cause.rule.as_deref() != Some(assignment_rule.as_str()) {
+            return Ok(false);
+        }
+        let mut command_id = cause.command_id;
+        let mut visited = HashSet::new();
+        for _ in 0..=16 {
+            if !visited.insert(command_id.clone()) {
+                return Ok(false);
+            }
+            let command = self
+                .connection
+                .query_row(
+                    "SELECT principal, verb, args, target, generation, parent_command
+                     FROM commands WHERE id=?1",
+                    [&command_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let Some((principal, verb, args, target, command_generation, parent)) = command else {
+                break;
+            };
+            if verb == "launch" {
+                let launch_args: Value = decode_json(&args)?;
+                let assignment_launch_matches = principal == "owner"
+                    && target == Some(agent_num)
+                    && command_generation == Some(generation)
+                    && launch_args
+                        .get("assignment")
+                        .and_then(|assignment| assignment.get("key"))
+                        .and_then(Value::as_str)
+                        == Some(key);
+                if !assignment_launch_matches {
+                    return Ok(false);
+                }
+                let Some(parent) = parent else {
+                    return Ok(false);
+                };
+                let parent_command = self
+                    .connection
+                    .query_row(
+                        "SELECT principal, verb, args FROM commands WHERE id=?1",
+                        [parent],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(sql_error)?;
+                let Some((parent_principal, parent_verb, parent_args)) = parent_command else {
+                    return Ok(false);
+                };
+                let parent_args: Value = decode_json(&parent_args)?;
+                return Ok(parent_principal == "owner"
+                    && matches!(parent_verb.as_str(), "rule" | "timer.run" | "rule.catch_up")
+                    && parent_args.get("rule").and_then(Value::as_str)
+                        == Some(assignment_rule.as_str()));
+            }
+            let Some(parent) = parent else {
+                break;
+            };
+            command_id = parent;
+        }
+        Ok(false)
     }
 }
 
@@ -121,7 +239,7 @@ pub(super) fn commit_cursor_tx(
             "invalid assignment brief or concurrency",
         ));
     }
-    let current = status(tx, &launch.key)?;
+    let current = status(tx, &launch.key, launch.max_busy)?;
     if current.cursor != launch.previous {
         return Err(Error::new(
             "conflict",
@@ -184,7 +302,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            store.assignment_status("pool").unwrap(),
+            store.assignment_status("pool", 2).unwrap(),
             AssignmentStatus {
                 cursor: Some("02.md".into()),
                 busy: 2
@@ -199,7 +317,11 @@ mod tests {
             "capacity_unavailable"
         );
         assert_eq!(
-            store.assignment_status("pool").unwrap().cursor.as_deref(),
+            store
+                .assignment_status("pool", 2)
+                .unwrap()
+                .cursor
+                .as_deref(),
             Some("02.md")
         );
         assert!(
@@ -217,7 +339,11 @@ mod tests {
             .unwrap();
         store.submit("owner", third, 1_800_000_000_000).unwrap();
         assert_eq!(
-            store.assignment_status("pool").unwrap().cursor.as_deref(),
+            store
+                .assignment_status("pool", 2)
+                .unwrap()
+                .cursor
+                .as_deref(),
             Some("03.md")
         );
     }
@@ -236,7 +362,7 @@ mod tests {
             "capacity_unavailable"
         );
         assert_eq!(
-            store.assignment_status("pool").unwrap(),
+            store.assignment_status("pool", 2).unwrap(),
             AssignmentStatus {
                 cursor: None,
                 busy: 0
@@ -263,11 +389,207 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert_eq!(store.assignment_status("pool").unwrap().busy, 1);
+        assert_eq!(store.assignment_status("pool", 2).unwrap().busy, 1);
         store
             .connection
             .execute("UPDATE turns SET state='completed'", [])
             .unwrap();
-        assert_eq!(store.assignment_status("pool").unwrap().busy, 0);
+        assert_eq!(store.assignment_status("pool", 2).unwrap().busy, 0);
+    }
+
+    #[test]
+    fn assignment_count_uses_bounded_partial_membership_after_large_completed_history() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let request = launch(None, "01.md");
+        let admission = store
+            .submit("owner", request.clone(), 1_800_000_000_000)
+            .unwrap();
+        let agent = admission.command.target.clone().unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE commands SET state='unknown',generation=1 WHERE id=?1",
+                [&request.id],
+            )
+            .unwrap();
+
+        let args = json!({"assignment":{"key":"pool"}}).to_string();
+        let agent_num = parse_agent_id(&agent).unwrap();
+        {
+            let tx = store.connection.transaction().unwrap();
+            for index in 0..5_000 {
+                let launch_id = Ulid::new().to_string();
+                let send_id = Ulid::new().to_string();
+                let turn_id = format!("completed-{index}");
+                tx.execute(
+                    "INSERT INTO commands(id,principal,method,payload_digest,target,
+                         expected_generation,generation,verb,args,state,created_at,updated_at)
+                     VALUES (?1,'owner','command.submit',?2,?3,0,1,'launch',?4,'applied',1,1)",
+                    params![launch_id, [0_u8; 32].as_slice(), agent_num, args],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO turns(agent,generation,turn_id,state) VALUES (?1,1,?2,'completed')",
+                    params![agent_num, turn_id],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO commands(id,principal,method,payload_digest,target,generation,
+                         parent_command,link_kind,ordinal,turn_id,verb,args,state,created_at,updated_at)
+                     VALUES (?1,'owner','command.submit',?2,?3,1,?4,'send',0,?5,'send','{}','applied',1,1)",
+                    params![send_id, [0_u8; 32].as_slice(), agent_num, launch_id, turn_id],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        for _ in 0..2 {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO commands(id,principal,method,payload_digest,target,
+                     expected_generation,generation,verb,args,state,created_at,updated_at)
+                 VALUES (?1,'owner','command.submit',?2,?3,0,1,'launch',?4,'unknown',1,1)",
+                    params![
+                        Ulid::new().to_string(),
+                        [0_u8; 32].as_slice(),
+                        agent_num,
+                        args
+                    ],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.assignment_status("pool", 1).unwrap().busy, 1);
+        assert_eq!(store.assignment_status("pool", 2).unwrap().busy, 2);
+        assert_eq!(store.assignment_status("pool", 3).unwrap().busy, 3);
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT COUNT(*) FROM (
+                 SELECT id FROM commands INDEXED BY commands_assignment_busy
+                 WHERE verb='launch' AND assignment_busy=1
+                   AND json_extract(args,'$.assignment.key')=?1 LIMIT ?2)",
+            )
+            .unwrap();
+        assert_eq!(
+            statement
+                .query_row(params!["pool", 1], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(statement.get_status(rusqlite::StatementStatus::VmStep) < 100);
+        drop(statement);
+
+        let mut statement = store
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT id FROM commands INDEXED BY commands_assignment_busy
+                 WHERE verb='launch' AND assignment_busy=1
+                   AND json_extract(args,'$.assignment.key')=?1 LIMIT ?2",
+            )
+            .unwrap();
+        let plan = statement
+            .query_map(params!["pool", 1], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" ");
+        assert!(
+            plan.contains("SEARCH commands USING INDEX commands_assignment_busy"),
+            "{plan}"
+        );
+        let indexed_members: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM commands INDEXED BY commands_assignment_busy
+                 WHERE verb='launch' AND assignment_busy=1
+                   AND json_extract(args,'$.assignment.key')='pool'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed_members, 3);
+        store
+            .connection
+            .execute(
+                "UPDATE commands SET state='failed'
+             WHERE link_kind='send' AND parent_command IN (
+               SELECT id FROM commands WHERE verb='launch'
+                 AND json_extract(args,'$.assignment.key')='pool')
+               AND state IN ('accepted','queued','dispatched','unknown')",
+                [],
+            )
+            .unwrap();
+        store.connection.execute(
+            "UPDATE commands SET state='failed'
+             WHERE verb='launch' AND json_extract(args,'$.assignment.key')='pool' AND state='unknown'",
+            [],
+        ).unwrap();
+        assert_eq!(store.assignment_status("pool", 1).unwrap().busy, 0);
+    }
+
+    #[test]
+    fn assignment_event_requires_retained_owner_launch_and_matching_rule_parent() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let request = launch(None, "01.md");
+        let admission = store
+            .submit("owner", request.clone(), 1_800_000_000_000)
+            .unwrap();
+        let agent = admission.command.target.clone().unwrap();
+        let linked_send = admission.linked_command.as_ref().unwrap().id.clone();
+        let root_id = Ulid::new().to_string();
+        store.connection.execute(
+            "INSERT INTO commands(id,principal,method,payload_digest,verb,args,state,created_at,updated_at)
+             VALUES (?1,'owner','timer.run',?2,'timer.run',?3,'applied',1,1)",
+            params![root_id, [0_u8;32].as_slice(), json!({"rule":"assignment-pool"}).to_string()],
+        ).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE commands SET parent_command=?1,link_kind='rule_action',ordinal=0,
+                 generation=1 WHERE id=?2",
+                params![root_id, request.id],
+            )
+            .unwrap();
+        let cause =
+            json!({"command_id":linked_send,"rule":"assignment-pool","depth":0}).to_string();
+        store
+            .connection
+            .execute(
+                "INSERT INTO events(ts,kind,family,agent,generation,source,data,cause)
+             VALUES (1,'turn.completed','turn',?1,1,'daemon','{}',?2)",
+                params![parse_agent_id(&agent).unwrap(), cause],
+            )
+            .unwrap();
+        let seq = store.connection.last_insert_rowid();
+        assert!(!store.is_assignment_event(seq, "other", &agent, 1).unwrap());
+        assert!(!store.is_assignment_event(seq, "pool", &agent, 2).unwrap());
+        assert!(store.is_assignment_event(seq, "pool", &agent, 1).unwrap());
+
+        store
+            .connection
+            .execute(
+                "UPDATE commands SET principal='project:p' WHERE id=?1",
+                [&request.id],
+            )
+            .unwrap();
+        assert!(!store.is_assignment_event(seq, "pool", &agent, 1).unwrap());
+        store
+            .connection
+            .execute(
+                "UPDATE commands SET principal='owner' WHERE id=?1",
+                [&request.id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE commands SET principal='project:p' WHERE id=?1",
+                [&root_id],
+            )
+            .unwrap();
+        assert!(!store.is_assignment_event(seq, "pool", &agent, 1).unwrap());
     }
 }

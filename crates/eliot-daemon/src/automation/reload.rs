@@ -61,7 +61,8 @@ pub(crate) fn load(data_root: &Path) -> Result<RuleSnapshot> {
             // Assigned Agents own one brief. Use the existing event-rule stop
             // action to retire the exact generation after its terminal turn,
             // freeing configured live capacity for the next timer launch.
-            // This is the Store-verified cause, never native data.cause.
+            // The rule processor additionally verifies Store launch ancestry;
+            // this cause label alone is not enough to authorize cleanup.
             let completion = format!(
                 "[[rule]]\nid = {}\non = {{ event = 'turn.completed', match = {{ 'event.cause.rule' = {} }} }}\ndo = [{{ action = 'stop', target = '${{event.agent}}', expected_generation = '${{event.generation}}' }}]\n",
                 quote_toml(&format!("{id}.complete")),
@@ -295,7 +296,7 @@ mod assignment_tests {
     use super::*;
 
     #[test]
-    fn settings_assignment_generates_timer_and_cause_bound_cleanup() {
+    fn settings_assignment_generates_timer_and_ancestry_gated_cleanup() {
         let root =
             std::env::temp_dir().join(format!("eliot-assignment-rules-{}", ulid::Ulid::new()));
         fs::create_dir_all(&root).unwrap();

@@ -40,7 +40,7 @@ pub(crate) async fn prepare(
         .filter(|limit| *limit > 0)
         .ok_or_else(|| Error::new("invalid", "assignment max_busy must be positive"))?;
 
-    let status = router.assignment_status(key).await?;
+    let status = router.assignment_status(key, max_busy).await?;
     if status.busy >= usize::try_from(max_busy).unwrap_or(usize::MAX) {
         return Err(Error::new("bad_state", "assignment has reached max_busy"));
     }
