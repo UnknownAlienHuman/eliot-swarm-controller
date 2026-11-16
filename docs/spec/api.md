@@ -1402,7 +1402,11 @@ or reset times. `details.state` is `ready` or `error`; `details.origin` is
 `state:"error"`, a sanitized reason and no windows. Unsupported native integration
 sources remain `unsupported` with a concrete reason. The transport disables
 redirects, bounds each HTTP request to eight seconds and each response to 1 MiB;
-credential reads are bounded to 256 KiB. It never refreshes or writes credentials.
+credential reads are bounded to 256 KiB. Quota calls wait at most eight seconds
+for one of the existing four metadata-reader permits, so a five-harness Usage
+refresh can complete without an arbitrary fifth-read rejection. The wait starts
+no process; shutdown/capacity failure remains an environment error. Reads never
+refresh or write credentials.
 
 Muse has no provider endpoint. The plugin projects MSP `usage/changed` as the
 session-family `quota.observed` event; Store retains the typed observation, and

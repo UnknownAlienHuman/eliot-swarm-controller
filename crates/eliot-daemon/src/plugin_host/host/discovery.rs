@@ -269,7 +269,17 @@ impl PluginHost {
             ));
         }
         let environment = Value::Object(build_process_environment(&profile)?);
-        let (id, stop_rx, done_tx) = self.register_metadata_reader()?;
+        // The Usage page asks all five harnesses together. Keep the four-reader
+        // bound, but let the fifth read wait briefly instead of caching a local
+        // capacity error as provider availability for the entire TTL.
+        let slot = tokio::time::timeout(
+            Duration::from_secs(8),
+            self.state.reader_slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Error::new("busy", "quota reader capacity wait timed out"))?
+        .map_err(|_| Error::new("unavailable", "discovery admission is closed"))?;
+        let (id, stop_rx, done_tx) = self.register_metadata_reader_slot(slot)?;
         let host = self.clone();
         let (reply, response) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {

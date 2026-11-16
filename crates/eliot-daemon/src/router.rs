@@ -812,6 +812,15 @@ impl Router {
             self.schedule_admission(&admission);
         }
         self.signal_progress();
+        crate::logging::record_debug(
+            &self.secret_policy_snapshot(),
+            "command.admitted",
+            &[
+                ("command_id", &admission.command.id),
+                ("verb", &admission.command.verb),
+            ],
+            &[],
+        );
         serde_json::to_value(submit_result(
             &admission.command,
             admission.linked_command.as_ref(),

@@ -119,12 +119,25 @@ impl Router {
             return;
         }
         let mut receiver = self.inner.bus.subscribe();
+        let prepare_started = std::time::Instant::now();
         let Some(prepared) = self
             .prepare_command_dispatch(&id, linked_id.is_some())
             .await
         else {
             return;
         };
+        crate::logging::record_debug(
+            &self.secret_policy_snapshot(),
+            "command.prepared",
+            &[("command_id", &id), ("verb", &prepared.command.verb)],
+            &[(
+                "elapsed_ms",
+                prepare_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            )],
+        );
         let Some((dispatched, dispatch_seq, context_items)) = self
             .dispatch_and_wait_for_effect(
                 &id,
