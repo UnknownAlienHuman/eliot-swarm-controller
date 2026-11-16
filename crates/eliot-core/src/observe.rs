@@ -334,6 +334,21 @@ pub fn classify_heavy_command(argv0: &str, args: &[&str]) -> String {
         let Some(script) = rest.first() else {
             return program;
         };
+        // A flag in script position is never a script (`node -c`, `sh -c`,
+        // `cmd /c`): payload flags evaluate the rest as the command,
+        // anything else leaves the launcher itself as the consumer. A
+        // slash-led token is only a flag when it is one letter (`/c`); a
+        // longer one is an absolute script path (`/opt/.../npm-cli.js`).
+        if script.starts_with('-') || matches!(*script, "/c" | "/C" | "/d" | "/D") {
+            let bare = script.trim_start_matches(['-', '/']).to_ascii_lowercase();
+            if matches!(bare.as_str(), "c" | "e" | "eval")
+                && let Some((wrapped, following)) = unwrap_shell_command(&rest[1..])
+            {
+                let following: Vec<&str> = following.iter().map(String::as_str).collect();
+                return classify_heavy_command(&wrapped, &following);
+            }
+            return program;
+        }
         rest = &rest[1..];
         let Some(stem) = program_stem(script) else {
             return program;
@@ -836,6 +851,27 @@ mod observe_tests {
         assert_eq!(classify_heavy_command("rustc", &["foo.rs"]), "rustc");
         assert_eq!(classify_heavy_command("", &["build"]), "unknown");
         assert_eq!(classify_heavy_command("node", &[]), "node");
+    }
+
+    #[test]
+    fn launcher_flag_in_script_position_is_never_a_program() {
+        // `node -c` / `python -c` / `sh -c` evaluate the rest as the command.
+        assert_eq!(
+            classify_heavy_command("node", &["-c", "cargo", "build"]),
+            "cargo build"
+        );
+        assert_eq!(
+            classify_heavy_command("python", &["-c", "cargo build --locked"]),
+            "cargo build"
+        );
+        assert_eq!(
+            classify_heavy_command("sh", &["-c", "git", "fetch"]),
+            "git fetch"
+        );
+        // Any other flag leaves the launcher itself as the consumer.
+        assert_eq!(classify_heavy_command("node", &["--version"]), "node");
+        assert_eq!(classify_heavy_command("node", &["--check", "x.js"]), "node");
+        assert_eq!(classify_heavy_command("python", &["-V"]), "python");
     }
 
     #[test]
