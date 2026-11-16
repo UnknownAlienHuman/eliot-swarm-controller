@@ -36,6 +36,7 @@ use eliot_plugin::{
         unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
         with_claimed_context, with_context_points,
     },
+    skill,
 };
 use serde_json::{Value, json};
 use std::{
@@ -1254,6 +1255,20 @@ impl CodexPlugin {
                 "unknown",
                 "Codex thread/resume did not prove the resumed thread idle; no input was sent",
             ));
+        }
+        // Expose the daemon-materialized coordination skill before any
+        // input is sent: without it the Agent would start believing it has
+        // no skill. The roots replace nothing on disk; a failed delivery
+        // fails the start like any rejected dispatch.
+        if let Err(error) = deliver_swarm_skill(&session.native_client, &data_dir).await {
+            let error = discard_failed_start(&mut session, error).await;
+            self.failed_start = Some(FailedStart {
+                agent_id: params.agent_id.clone(),
+                generation: params.generation,
+                command_id: params.command_id.clone(),
+                error: error.clone(),
+            });
+            return Err(error);
         }
         // Requested vs observed MCP surface: read the thread-scoped
         // `mcpServerStatus/list` inventory now that the owned thread is
@@ -2523,6 +2538,34 @@ async fn discard_unstarted(session: &mut AgentSession) {
         Ok(_) => SessionPhase::Stopped,
         Err(_) => SessionPhase::Unknown,
     };
+}
+
+/// Expose the daemon-materialized `eliot-swarm` skill to the owned
+/// app-server process. `skills/extraRoots/set` replaces the process-level
+/// extra roots used to discover standalone skills without persisting them
+/// (installed 0.167.1 app-server schema; connection-wide, after
+/// initialize). The plugin owns one app-server per Agent generation, so
+/// the roots are effectively per-session; the checkout and the global
+/// skill locations stay untouched.
+async fn deliver_swarm_skill(native_client: &NativeClient, data_dir: &Path) -> Result<()> {
+    let roots = skill::skill_root(data_dir).join("skills");
+    let roots = roots
+        .to_str()
+        .ok_or_else(|| Error::new("invalid", "Codex skill roots path is not UTF-8"))?;
+    native_client
+        .call(
+            "skills/extraRoots/set",
+            json!({ "extraRoots": [roots] }),
+            Instant::now() + RPC_TIMEOUT,
+        )
+        .await
+        .map_err(|error| {
+            Error::new(
+                "skill_unavailable",
+                format!("Codex skill roots were not delivered: {}", error.message),
+            )
+        })?;
+    Ok(())
 }
 
 async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error {

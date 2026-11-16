@@ -494,8 +494,25 @@ impl Plugin {
             .workspace
             .as_deref()
             .map_or_else(PathBuf::new, PathBuf::from);
+        // The bundled skill stages from the daemon-owned copy resolved
+        // through the frozen launch environment; a missing copy fails the
+        // start rather than starting an Agent without its skill.
+        let data_dir = params
+            .target_environment
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .and_then(|environment| environment.get("ELIOT_HOME"))
+            .and_then(serde_json::Value::as_str)
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .ok_or_else(|| {
+                eliot_core::Error::new(
+                    "not_allowed",
+                    "Antigravity skill staging requires the Agent-bound Eliot data root",
+                )
+            })?;
         let hook_config =
-            crate::session::stage_hook_config(&instance_dir, &workspace_path, &helper)
+            crate::session::stage_hook_config(&instance_dir, &workspace_path, &helper, &data_dir)
                 .map_err(|error| error.with_code("native_not_dispatched"))?;
         let plan =
             crate::profile::Plan::new(&params, &credential, hooks.token(), hook_config.root())?;

@@ -17,6 +17,7 @@ use eliot_plugin::{
         unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
         with_claimed_context, with_context_points,
     },
+    skill,
 };
 use serde_json::{Value, json};
 use std::{
@@ -2176,6 +2177,12 @@ async fn launch_session(
         plan.requested_mcp_policy,
         mcp_config.path().as_os_str(),
     ));
+    // Expose the daemon-materialized coordination skill through the CLI's
+    // own plugin mechanism: the materialized skill root doubles as the
+    // plugin directory, so no checkout or global skill location changes.
+    // A missing or unloadable directory fails the spawn with its cause.
+    argv.push(OsString::from("--plugin-dir"));
+    argv.push(OsString::from(skill::skill_root(&plan.data_root)));
     // The CLI keeps its own login (not the desktop app's): check it, and run
     // its browser login when it is logged out, before any native resource.
     crate::native::ensure_logged_in(&plan.program, &plan.workspace, &plan.environment).await?;

@@ -5,6 +5,7 @@ pub mod native_transport;
 pub mod peer;
 pub mod protocol;
 pub mod session;
+pub mod skill;
 mod stderr;
 pub mod sync;
 
