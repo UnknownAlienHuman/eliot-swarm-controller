@@ -769,9 +769,10 @@ impl Store {
         now: i64,
         expected_agent: &Agent,
         binding: &NativeStoreBinding,
+        startup: Option<&Value>,
     ) -> Result<Change<Command>> {
         self.ensure_writer_healthy()?;
-        let result = self.dispatch_inner(id, now, Some((expected_agent, binding)), None);
+        let result = self.dispatch_inner(id, now, Some((expected_agent, binding, startup)), None);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -1420,6 +1421,75 @@ impl Store {
     pub fn get_turn(&self, agent: &str, generation: i64, turn_id: &str) -> Result<Option<Turn>> {
         let agent_num = parse_agent_id(agent)?;
         load_turn(&self.connection, agent_num, generation, turn_id)
+    }
+
+    /// Whether this exact turn has an unsettled command whose outcome is
+    /// uncertain in Store or the daemon's write-fault overlay. Other Agents'
+    /// commands and status-page limits cannot change this result.
+    pub fn turn_has_unknown_command(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+        memory_unknown: &[String],
+    ) -> Result<bool> {
+        let agent_num = parse_agent_id(agent)?;
+        let memory_unknown = serde_json::to_string(memory_unknown)
+            .map_err(|_| Error::new("internal", "cannot encode unknown command keys"))?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands
+             WHERE target=?1 AND generation=?2 AND turn_id=?3
+               AND state IN ('accepted','queued','dispatched','unknown')
+               AND (state='unknown' OR id IN (SELECT value FROM json_each(?4))))",
+                params![agent_num, generation, turn_id, memory_unknown],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    /// Set-based unknown-turn mask for one exact page: the subset of
+    /// `turn_ids` with an unsettled command whose outcome is uncertain in
+    /// Store or the daemon's write-fault overlay. Both id sets encode once
+    /// per page; the query rides the `commands_turn_unknown` partial covering
+    /// index instead of rescanning command history per turn.
+    pub fn turns_with_unknown_commands(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_ids: &[String],
+        memory_unknown: &[String],
+    ) -> Result<HashSet<String>> {
+        if turn_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let agent_num = parse_agent_id(agent)?;
+        let turn_ids = serde_json::to_string(turn_ids)
+            .map_err(|_| Error::new("internal", "cannot encode unknown turn keys"))?;
+        let memory_unknown = serde_json::to_string(memory_unknown)
+            .map_err(|_| Error::new("internal", "cannot encode unknown command keys"))?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT turn_id FROM commands INDEXED BY commands_turn_unknown
+             WHERE target=?1 AND generation=?2 AND turn_id IN (SELECT value FROM json_each(?3))
+               AND state IN ('accepted','queued','dispatched','unknown')
+               AND (state='unknown' OR id IN (SELECT value FROM json_each(?4)))",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![agent_num, generation, turn_ids, memory_unknown],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(sql_error)?;
+        let mut unknown = HashSet::new();
+        for row in rows {
+            if let Some(turn_id) = row.map_err(sql_error)? {
+                unknown.insert(turn_id);
+            }
+        }
+        Ok(unknown)
     }
 
     /// Return the committed command binding for an exact generation/turn.

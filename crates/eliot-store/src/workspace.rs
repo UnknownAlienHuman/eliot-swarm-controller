@@ -249,6 +249,7 @@ pub(super) fn launch_snapshot_with_native_store(
     agent: &Agent,
     expected: &Agent,
     binding: &NativeStoreBinding,
+    startup: Option<&Value>,
     command_id: &str,
 ) -> Result<String> {
     if expected.id != agent.id
@@ -287,6 +288,16 @@ pub(super) fn launch_snapshot_with_native_store(
             "native_store_binding".to_owned(),
             serde_json::to_value(binding)
                 .map_err(|error| Error::new("invalid", error.to_string()))?,
+        );
+    }
+    // A child may inherit its parent's frozen profile, including that
+    // parent's launch-only metadata. This fresh generation-zero dispatch
+    // binds its own preparation; retained/uncertain commands cannot enter here.
+    object.remove("native_launch_metadata");
+    if let Some(startup) = startup {
+        object.insert(
+            "native_launch_metadata".to_owned(),
+            json!({"command_id":command_id, "data":startup}),
         );
     }
     let encoded = encode_json(&snapshot)?;
@@ -1031,12 +1042,16 @@ impl Store {
     pub fn reject_workspace_resume(
         &mut self,
         command_id: &str,
-        reason: &str,
+        error_outcome: &Value,
         now: i64,
     ) -> Result<Change<Command>> {
         self.ensure_writer_healthy()?;
         let result = (|| {
             require_nonempty(command_id, "command_id")?;
+            let reason = error_outcome
+                .get("reason")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::new("invalid", "rejection requires a reason"))?;
             require_nonempty(reason, "reason")?;
             let tx = self
                 .connection
@@ -1090,12 +1105,10 @@ impl Store {
                 ));
             }
 
-            let outcome = json!({
-                "stage": "workspace_resume_rejected",
-                "reason": reason,
-                "native_dispatched": false,
-                "target_generation": next_generation,
-            });
+            let mut outcome = error_outcome.clone();
+            outcome["stage"] = json!("workspace_resume_rejected");
+            outcome["native_dispatched"] = json!(false);
+            outcome["target_generation"] = json!(next_generation);
             if encode_json(&outcome)?.len() > MAX_EVENT_BYTES {
                 return Err(Error::new(
                     "frame_too_large",

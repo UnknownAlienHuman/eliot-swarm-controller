@@ -38,7 +38,7 @@ use std::{
 };
 use tokio::{
     process::Command as ProcessCommand,
-    sync::{Mutex as AsyncMutex, mpsc, oneshot, watch},
+    sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot, watch},
     time::{Instant, timeout_at},
 };
 use ulid::Ulid;
@@ -225,6 +225,8 @@ struct HostState {
     observers: Mutex<HashMap<AgentKey, Arc<observation::ObserverEntry>>>,
     readers: Mutex<HashMap<String, discovery::Reader>>,
     discovery_closed: AtomicBool,
+    reader_slots: Arc<Semaphore>,
+    launch_reader_slots: Arc<Semaphore>,
     #[cfg(test)]
     snapshot_turn_calls: AtomicUsize,
     #[cfg(test)]
@@ -348,6 +350,8 @@ impl PluginHost {
                 observers: Mutex::new(HashMap::new()),
                 readers: Mutex::new(HashMap::new()),
                 discovery_closed: AtomicBool::new(false),
+                reader_slots: Arc::new(Semaphore::new(discovery::MAX_READERS)),
+                launch_reader_slots: Arc::new(Semaphore::new(discovery::MAX_LAUNCH_READERS)),
                 #[cfg(test)]
                 snapshot_turn_calls: AtomicUsize::new(0),
                 #[cfg(test)]

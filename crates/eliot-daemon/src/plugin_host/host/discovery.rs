@@ -4,10 +4,8 @@ use super::{
     AgentKey, PluginHost, build_process_environment, metadata_secret_snapshot, redact_native_error,
     require_proxy_capability, signal_progress,
 };
-use eliot_core::{
-    Error, NativeStoreBinding, Result, SecretPolicy, StderrSource, api::DiscoverPage,
-};
-use eliot_plugin::protocol::ProfileStoreParams;
+use eliot_core::{Error, Result, SecretPolicy, StderrSource, api::DiscoverPage};
+use eliot_plugin::protocol::{ProfileStoreParams, ProfileStoreResult};
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
 use std::{
@@ -15,15 +13,22 @@ use std::{
     sync::{Mutex, atomic::Ordering},
     time::Duration,
 };
-use tokio::{sync::watch, time::Instant};
+use tokio::{
+    sync::{OwnedSemaphorePermit, watch},
+    time::Instant,
+};
 use ulid::Ulid;
 
-const MAX_READERS: usize = 4;
+pub(super) const MAX_READERS: usize = 4;
+// Launch preparation is independent of interactive discovery. Bound active
+// read-only helpers while admitted commands wait fairly instead of refusing.
+pub(super) const MAX_LAUNCH_READERS: usize = 32;
 const READER_DEADLINE: Duration = Duration::from_secs(25);
 const MAX_CURSOR_BYTES: usize = 16 * 1024;
 const MAX_PAGE_BYTES: usize = 900 * 1024;
 
 pub(super) struct Reader {
+    _slot: OwnedSemaphorePermit,
     stop: watch::Sender<Option<Instant>>,
     done: watch::Receiver<ReaderCleanup>,
 }
@@ -46,6 +51,8 @@ impl PluginHost {
         // passed the Router check immediately before its admission mode changed.
         let _readers = self.state.readers.lock_recover();
         self.state.discovery_closed.store(true, Ordering::SeqCst);
+        self.state.reader_slots.close();
+        self.state.launch_reader_slots.close();
     }
 
     pub(crate) fn reader_count(&self) -> usize {
@@ -58,6 +65,8 @@ impl PluginHost {
         let readers = {
             let readers = self.state.readers.lock_recover();
             self.state.discovery_closed.store(true, Ordering::SeqCst);
+            self.state.reader_slots.close();
+            self.state.launch_reader_slots.close();
             readers
                 .values()
                 .map(|reader| (reader.stop.clone(), reader.done.clone()))
@@ -128,7 +137,7 @@ impl PluginHost {
         &self,
         profile: Value,
         workspace: &str,
-    ) -> Result<NativeStoreBinding> {
+    ) -> Result<ProfileStoreResult> {
         if profile.get("harness").and_then(Value::as_str) != Some("codex") {
             return Err(Error::new(
                 "unsupported",
@@ -153,7 +162,7 @@ impl PluginHost {
             target_environment: environment,
             workspace: workspace.to_owned(),
         };
-        let (id, stop_rx, done_tx) = self.register_metadata_reader()?;
+        let (id, stop_rx, done_tx) = self.wait_metadata_reader().await?;
         let host = self.clone();
         let (reply, response) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -450,6 +459,50 @@ impl PluginHost {
         watch::Receiver<Option<Instant>>,
         watch::Sender<ReaderCleanup>,
     )> {
+        let slot = self
+            .state
+            .reader_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::Closed => {
+                    Error::new("unavailable", "discovery admission is closed")
+                }
+                tokio::sync::TryAcquireError::NoPermits => {
+                    Error::new("busy", "metadata_readers in-flight bound reached (limit=4)")
+                }
+            })?;
+        self.register_metadata_reader_slot(slot)
+    }
+
+    // Admitted launches wait fairly before opening any metadata process. The
+    // permit stays with the reader until confirmed custody closure; unknown
+    // cleanup never frees capacity. Closing admission wakes all queued waiters.
+    async fn wait_metadata_reader(
+        &self,
+    ) -> Result<(
+        String,
+        watch::Receiver<Option<Instant>>,
+        watch::Sender<ReaderCleanup>,
+    )> {
+        let slot = self
+            .state
+            .launch_reader_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::new("unavailable", "discovery admission is closed"))?;
+        self.register_metadata_reader_slot(slot)
+    }
+
+    fn register_metadata_reader_slot(
+        &self,
+        slot: OwnedSemaphorePermit,
+    ) -> Result<(
+        String,
+        watch::Receiver<Option<Instant>>,
+        watch::Sender<ReaderCleanup>,
+    )> {
         let id = Ulid::new().to_string();
         let (stop_tx, stop_rx) = watch::channel(None);
         let (done_tx, done_rx) = watch::channel(ReaderCleanup::Pending);
@@ -457,15 +510,10 @@ impl PluginHost {
         if self.state.discovery_closed.load(Ordering::SeqCst) {
             return Err(Error::new("unavailable", "discovery admission is closed"));
         }
-        if readers.len() >= MAX_READERS {
-            return Err(Error::new(
-                "busy",
-                "discovery readers are at their in-flight bound",
-            ));
-        }
         readers.insert(
             id.clone(),
             Reader {
+                _slot: slot,
                 stop: stop_tx,
                 done: done_rx,
             },
@@ -487,7 +535,7 @@ impl PluginHost {
         &self,
         params: ProfileStoreParams,
         mut stop: watch::Receiver<Option<Instant>>,
-    ) -> MetadataRead<NativeStoreBinding> {
+    ) -> MetadataRead<ProfileStoreResult> {
         if stop.borrow().is_some() {
             return MetadataRead {
                 result: Err(Error::new(
@@ -538,9 +586,10 @@ impl PluginHost {
                     "profile.store metadata contains reserved credentials",
                 ));
             }
-            let binding: NativeStoreBinding = serde_json::from_value(value).map_err(|_| {
+            let preparation: ProfileStoreResult = serde_json::from_value(value).map_err(|_| {
                 Error::new("source_integrity", "profile.store binding is malformed")
             })?;
+            let binding = &preparation.binding;
             if [&binding.home, &binding.root, &binding.native_scope]
                 .into_iter()
                 .any(|value| value.is_empty() || value.chars().any(char::is_control))
@@ -552,7 +601,7 @@ impl PluginHost {
                     "profile.store binding is unverified",
                 ));
             }
-            Ok(binding)
+            Ok(preparation)
         };
         let result = tokio::select! {
             result = tokio::time::timeout_at(until, read) =>
@@ -839,6 +888,102 @@ mod tests {
     use super::*;
     use std::{sync::Arc, time::Duration};
 
+    fn host() -> PluginHost {
+        use crate::{bus::Bus, monitor::Monitoring, plugin_host::host::PluginHostOptions};
+        let store = Arc::new(tokio::sync::Mutex::new(
+            eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap(),
+        ));
+        let bus = Bus::new(64);
+        let secrets = Arc::new(Mutex::new(HashSet::new()));
+        let monitoring = Monitoring::new(store.clone(), bus.clone(), secrets.clone());
+        let (progress, _) = watch::channel(0);
+        PluginHost::new(
+            PluginHostOptions::new(std::path::PathBuf::new(), "owner-test".into()),
+            store,
+            bus,
+            secrets,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashSet::new())),
+            progress,
+            monitoring,
+        )
+    }
+
+    #[tokio::test]
+    async fn concurrent_launches_above_four_wait_for_metadata_slots() {
+        let host = host();
+        let mut held = Vec::new();
+        for _ in 0..MAX_READERS {
+            held.push(host.register_metadata_reader().unwrap());
+        }
+        let error = host.register_metadata_reader().unwrap_err();
+        assert_eq!(error.code, "busy");
+        assert!(error.message.contains("metadata_readers"));
+        assert!(error.message.contains("limit=4"));
+        for _ in 0..MAX_LAUNCH_READERS {
+            held.push(host.wait_metadata_reader().await.unwrap());
+        }
+        let mut launches = tokio::task::JoinSet::new();
+        for _ in 0..50 {
+            let host = host.clone();
+            launches.spawn(async move {
+                // Exercise real Store admission and the same pre-dispatch slot
+                // acquisition as profile.store, without invoking a native agent.
+                let request = eliot_core::SubmitCommand {
+                    args: json!({"harness":"codex", "profile":"luna", "project":"k65-regression", "workspace":".",
+                        "profile_snapshot":{"harness":"codex"}}),
+                    ..eliot_core::SubmitCommand::new(Ulid::new().to_string(), "launch")
+                };
+                let admission = host
+                    .state
+                    .store
+                    .lock()
+                    .await
+                    .submit("owner", request, crate::common::now_ms())
+                    .unwrap();
+                assert_eq!(admission.command.state, eliot_core::CommandState::Accepted);
+                let (id, _, done) = host.wait_metadata_reader().await.unwrap();
+                assert!(host.reader_count() <= MAX_READERS + MAX_LAUNCH_READERS);
+                host.finish_metadata_reader(&id, done, ReaderCleanup::Confirmed);
+            });
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), launches.join_next())
+                .await
+                .is_err()
+        );
+        for (id, _, done) in held {
+            host.finish_metadata_reader(&id, done, ReaderCleanup::Confirmed);
+        }
+        let mut count = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = launches.join_next().await {
+                result.unwrap();
+                count += 1;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(count, 50);
+        assert_eq!(host.reader_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_unknown_cleanup_retains_slot_and_shutdown_wakes_waiters() {
+        let host = host();
+        for _ in 0..MAX_LAUNCH_READERS {
+            let (id, _, done) = host.wait_metadata_reader().await.unwrap();
+            host.finish_metadata_reader(&id, done, ReaderCleanup::Unknown);
+        }
+        let wait = host.wait_metadata_reader();
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        assert_eq!(host.reader_count(), MAX_LAUNCH_READERS);
+        host.close_discovery_admission();
+        assert_eq!(wait.await.unwrap_err().code, "unavailable");
+        assert_eq!(host.reader_count(), MAX_LAUNCH_READERS);
+    }
+
     async fn cancel_after_cleanup(cleanup: ReaderCleanup) -> (bool, usize) {
         let readers = Arc::new(Mutex::new(HashMap::new()));
         let (stop_tx, mut stop_rx) = watch::channel(None);
@@ -846,6 +991,9 @@ mod tests {
         readers.lock_recover().insert(
             "reader".to_owned(),
             Reader {
+                _slot: Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap(),
                 stop: stop_tx.clone(),
                 done: done_rx.clone(),
             },
@@ -881,6 +1029,9 @@ mod tests {
         readers.lock_recover().insert(
             "timed-out-reader".to_owned(),
             Reader {
+                _slot: Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap(),
                 stop: stop_tx.clone(),
                 done: done_rx.clone(),
             },
