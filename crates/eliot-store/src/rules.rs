@@ -1756,6 +1756,9 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
     if matches!(request.verb.as_str(), "mail.send" | "var.set") {
         return valid_targetless_coordination_request(request);
     }
+    if request.verb == "inject" {
+        return valid_inject_request(request);
+    }
     let reply = matches!(request.verb.as_str(), "approve" | "deny" | "answer");
     if request.verb != "steer" && !reply {
         return valid_rule_action_request(request, true);
@@ -1787,6 +1790,36 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
             .args
             .as_object()
             .is_some_and(|args| args.len() == 1 && args.get("text").is_some_and(Value::is_string))
+}
+
+fn valid_inject_request(request: &SubmitCommand) -> bool {
+    if request.validate().is_err()
+        || !request
+            .target
+            .as_deref()
+            .is_some_and(|target| core::parse_agent_id(target).is_ok())
+        || request
+            .expected_generation
+            .is_some_and(|generation| generation < 0)
+        || request.request_id.is_some()
+        || request.probe
+    {
+        return false;
+    }
+    if !request.args.is_object() {
+        return false;
+    }
+    let Ok(args) = serde_json::from_value::<eliot_core::InjectArgs>(request.args.clone()) else {
+        return false;
+    };
+    match args.point {
+        eliot_core::InjectPoint::NextInput => request.expected_turn_id.is_none(),
+        eliot_core::InjectPoint::TurnSafePoint => request
+            .expected_turn_id
+            .as_deref()
+            .is_some_and(|turn_id| !turn_id.is_empty()),
+        eliot_core::InjectPoint::ActiveTurn => false,
+    }
 }
 
 fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {

@@ -369,7 +369,9 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
                 "project rule is not approved for this action",
             ));
         }
-        if request.target.is_none() || request.expected_generation.is_none() {
+        if request.target.is_none()
+            || (request.expected_generation.is_none() && request.verb != "inject")
+        {
             return Err(Error::new(
                 "invalid",
                 "project action requires its frozen Agent and generation",
