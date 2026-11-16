@@ -413,12 +413,16 @@ strictly bounded to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon
 
 ## Worker MCP policy
 
-This harness keeps `inherit` only: the frozen profile always records
-`mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
-at config load. Verified read-only (`agy acp --help`, installed 1.5.9): the ACP server flags
-expose no MCP isolation mechanism (no strict/ignore-MCP flag; the documented
-top-level `--settings` is a session-only settings surface, not a verified isolation
-mechanism), so no `minimal` mechanism is implemented.
+This harness keeps `inherit` only: profiles must set `mcp = "inherit"`
+explicitly (the default is now `minimal`), and a non-`inherit` policy is
+rejected as `unsupported` at config load. Verified read-only
+(`agy acp --help`, installed 1.5.9): the ACP server flags expose no MCP
+isolation mechanism (no strict/ignore-MCP flag; the documented top-level
+`--settings` is a session-only settings surface, not a verified isolation
+mechanism), so no `minimal` mechanism is implemented. The owner's
+`agy mcp list` surface (codebase_memory, eliot-search, windows-mcp on the
+reference machine) contains no Swarm entry, so no owner Swarm server can
+reach a worker through this harness.
 
 ## Permissions and final checks
 
@@ -433,7 +437,7 @@ stays in the plugin spec.
 
 `swarm launch --harness antigravity --model M --workspace W "prompt"` is
 Owner-only and freezes a profile-equivalent snapshot from safe defaults
-(`dangerously_skip_permissions = false`, MCP `inherit`) plus flags. A model
+(`dangerously_skip_permissions = false`, explicit MCP `inherit`) plus flags. A model
 may be omitted to preserve the verified ACP session default described above.
 `cmd` is the installed `agy` CLI when it is on `PATH` (it serves both `acp`
 and `models`), falling back to the installed app at
@@ -448,3 +452,14 @@ effort suffixes (`-low`/`-medium`/`-high`/`-xhigh`) map to the ACP
 `thought_level` selector at launch; any other suffix stays part of the base
 id and is verified against the advertised session options instead of guessed.
 A failing `agy models` child reports an honest typed error naming `models`.
+
+## Minimal-context measurement (k61, 2026-11-16)
+
+Private daemon, identical trivial turn, `gemini-3.8-flash-high`, installed
+1.5.9, `inherit` (explicit; no minimal mapping exists). ACP exposes no MCP
+inventory, so the effective record stays null/unverified; the session carries
+exactly the Agent-scoped server by construction. Turn usage: input 14,934 +
+cache-read 16,837 + output 559 (total 32,330). A follow-up turn called
+`api.identity` through the `swarm` tool (after one Owner approval) and
+reported principal `agent`. `agy acp --help` and `agy mcp --help` expose no
+isolation or tool-deferral surface, so both stay unsupported.

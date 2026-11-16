@@ -273,20 +273,25 @@ until `connected`, a terminal refusal, or 20s — and never fails a start.
 
 ## Worker MCP policy
 
-This harness keeps `inherit` only: the frozen profile always records
-`mcp = "inherit"`, and a non-`inherit` policy is rejected as `unsupported`
-at config load. `inherit` is additive: the worker receives Eliot's
-Agent-scoped `eliot-swarm` server from the generated per-Agent config in
-addition to the owner's native MCP surface. No verified native MCP
-isolation mechanism was established for the installed server, so no
-`minimal` suppression mechanism is implemented.
+Profiles default to `mcp = "minimal"`, frozen in the profile snapshot; the
+owned per-Agent `serve` never sees the owner's global config (isolated
+per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, verified on the installed
+2.2.7 server), and the generated per-Agent config carries only Eliot's
+Agent-scoped `eliot-swarm` server, so both policies serve that surface.
+`inherit` is an explicit opt-in to the same behavior. A non-empty
+`mcp_allow` is rejected as `unsupported` at config load because OpenCode has
+no selective-inclusion mapping. Project-local workspace config still merges
+natively; that is the owner's explicit per-project choice, not global
+inheritance. The requested policy is reported in `effective.mcp_policy` and
+the observed inventory in `effective.mcp_servers` (`GET /api/mcp`).
 
 ## Ad-hoc launch
 
 Ad-hoc OpenCode launch (`swarm launch --harness opencode [--model
 PROVIDER/MODEL] [--auth INTEGRATION] [--cmd PATH] --workspace W "prompt"`)
 is Owner-only and freezes a profile-equivalent snapshot from conservative
-defaults (MCP `inherit`) plus flags, with one extra rule: starting the
+defaults (explicit MCP `inherit`, since ad-hoc spans harnesses without a
+minimal mapping) plus flags, with one extra rule: starting the
 per-Agent server always transfers one stored auth integration into the
 isolated native store, so the frozen snapshot always carries
 `auth_integration`. An explicit `--auth` freezes verbatim like the profile
@@ -304,3 +309,15 @@ explicit install instead. `swarm models --harness opencode` lists the native
 `opencode models` catalogue (`provider/model` ids verbatim; a launch resolves
 the full provider/model pair, an omitted model leaves the configured native
 default, read back from the session echo).
+
+## Minimal-context measurement (k61, 2026-11-16)
+
+Private daemon, identical trivial turn, `opencode/deepseek-v4.1-flash-free`,
+installed 2.2.7. Both `inherit` (explicit) and `minimal` (default) report
+exactly `eliot-swarm`, verified, confirming the owned `serve` never sees the
+owner global config (no owner MCP surface reaches the worker in either
+policy). Turn usage: message input 129 + cache-read 8,320 + output 3 under
+`inherit`; 122 + 8,320 + 3 under `minimal`. A follow-up turn under `minimal`
+called `api.identity` through the `swarm` tool and reported principal
+`agent`. `opencode --help` and `opencode serve --help` expose no
+tool-deferral surface, so deferred loading is unsupported.

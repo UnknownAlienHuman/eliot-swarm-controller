@@ -53,13 +53,13 @@ const METHODS: &[Method] = &[
         "Read the authenticated Memory installation identity; Memory principal only.",
         {}
     ),
-    method!("inference.client.install", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Install one private Memory credential; Owner only; exact replay reconciles the same private publication.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":0}),
-    method!("inference.client.rotate", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Stage one pending Memory credential; Owner only; no version allocation on retry.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":1}),
-    method!("inference.client.promote", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Promote pending credential after its authenticated pre-rotation call read; retain one previous credential.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":1}),
-    method!("inference.client.retire", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Retire the previous credential after restart, current-credential old-call read and release; exact retry reconciles private-file cleanup.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":2}),
-    method!("inference.text", InferenceTextRequest, InferenceReceipt, false, true, "Admit one bounded tool-free text inference; Memory principal only; exact replay never launches again.", {"id":EXAMPLE_ID,"profile":"memory-text-v1","origin":"episode:1","disclosure":"provider_allowed","text":"hello","input_sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","input_bytes":5,"response_format":"text","max_result_bytes":1024,"deadline_ms":30000}),
+    method!("inference.client.install", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Install one private Memory credential; Owner only; exact replay reconciles publication.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":0}),
+    method!("inference.client.rotate", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Stage one pending Memory credential; Owner only; no version allocation.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":1}),
+    method!("inference.client.promote", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Promote the pending credential; retain one previous credential.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":1}),
+    method!("inference.client.retire", InferenceCredentialRequest, InferenceCredentialResponse, true, true, "Retire the previous credential after restart and release.", {"id":EXAMPLE_ID,"client_id":"memory:01ARZ3NDEKTSV4RRFFQ69G5FAV","expected_version":2}),
+    method!("inference.text", InferenceTextRequest, InferenceReceipt, false, true, "Admit one bounded tool-free text inference; Memory principal only.", {"id":EXAMPLE_ID,"profile":"memory-text-v1","origin":"episode:1","disclosure":"provider_allowed","text":"hello","input_sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","input_bytes":5,"response_format":"text","max_result_bytes":1024,"deadline_ms":30000}),
     method!("inference.get", InferenceGetRequest, InferenceCall, false, false, "Read current own-call physical state; Memory principal only.", {"call_id":EXAMPLE_ID}),
-    method!("inference.write.get", InferenceWriteGetRequest, InferenceWriteResponse, false, false, "Read an exact own mutation binding, live absence or history gap without admission.", {"id":EXAMPLE_ID}),
+    method!("inference.write.get", InferenceWriteGetRequest, InferenceWriteResponse, false, false, "Read one exact own mutation binding without admission.", {"id":EXAMPLE_ID}),
     method!(
         "inference.high_water",
         InferenceHighWaterRequest,
@@ -69,11 +69,11 @@ const METHODS: &[Method] = &[
         "Capture own monotonic call/write high-waters and retained membership cuts.",
         {}
     ),
-    method!("inference.list", InferenceListRequest, InferenceListResponse, false, false, "Page own call/write membership in fixed intervals; crossing a pruning cut returns history_gap.", {"call_after_seq":0,"call_through_seq":1,"write_after_seq":0,"write_through_seq":1,"limit":20,"cursor":null}),
-    method!("inference.retention.advance", InferenceRetentionRequest, InferenceRetentionResponse, false, true, "Advance Memory-asserted safe cuts and prune bounded released metadata; preserves live write replay.", {"id":EXAMPLE_ID,"observed_call_high_water_seq":1,"observed_write_high_water_seq":1,"safe_retain_after_seq":1,"retain_after_seq":1,"safe_write_retain_after_seq":1,"write_retain_after_seq":1,"limit":20}),
-    method!("inference.result.read", InferenceResultRequest, InferenceResultResponse, false, false, "Read an exact own-result byte range after full private digest/length verification.", {"call_id":EXAMPLE_ID,"result_sha256":"0000000000000000000000000000000000000000000000000000000000000000","offset":0,"length":1024}),
+    method!("inference.list", InferenceListRequest, InferenceListResponse, false, false, "Page own call/write membership; pruned cuts return history_gap.", {"call_after_seq":0,"call_through_seq":1,"write_after_seq":0,"write_through_seq":1,"limit":20,"cursor":null}),
+    method!("inference.retention.advance", InferenceRetentionRequest, InferenceRetentionResponse, false, true, "Advance Memory-asserted safe cuts; preserves live write replay.", {"id":EXAMPLE_ID,"observed_call_high_water_seq":1,"observed_write_high_water_seq":1,"safe_retain_after_seq":1,"retain_after_seq":1,"safe_write_retain_after_seq":1,"write_retain_after_seq":1,"limit":20}),
+    method!("inference.result.read", InferenceResultRequest, InferenceResultResponse, false, false, "Read one exact own-result byte range.", {"call_id":EXAMPLE_ID,"result_sha256":"0000000000000000000000000000000000000000000000000000000000000000","offset":0,"length":1024}),
     method!("inference.cancel", InferenceCancelRequest, InferenceMutationResponse, false, true, "Cancel an own queued call; sending calls honestly report too_late.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID}),
-    method!("inference.release", InferenceReleaseRequest, InferenceMutationResponse, false, true, "Fence publication and clean owned copies after Memory classifies backup dependencies; controller_dependent is protected.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID,"disposition":"abandon_for_erasure","result_sha256":null,"backup_dependency":"no_backup_dependencies"}),
+    method!("inference.release", InferenceReleaseRequest, InferenceMutationResponse, false, true, "Fence publication and clean owned copies after backup classification.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID,"disposition":"abandon_for_erasure","result_sha256":null,"backup_dependency":"no_backup_dependencies"}),
     method!("api.methods", MethodsRequest, MethodsResponse, false, false, "List/search callable canonical methods in bounded pages.", {"query":"mail", "limit":20}),
     method!("api.help", MethodHelpRequest, MethodHelpResponse, false, false, "Read a method's DTO schemas, example and limits.", {"method":"mail.send"}),
     method!(
@@ -104,7 +104,7 @@ const METHODS: &[Method] = &[
         "Run the bounded retention pass now and report pruned counts.",
         {}
     ),
-    method!("command.submit", CommandSubmitRequest, CommandSubmitResponse, false, true, "Submit a command using the target's advertised native capabilities; launch/send/wait child verbs included.", {"id":EXAMPLE_ID,"verb":"send","target":"a1","args":{"text":"Report current progress."}}),
+    method!("command.submit", CommandSubmitRequest, CommandSubmitResponse, false, true, "Submit a command with launch/send/wait child verbs.", {"id":EXAMPLE_ID,"verb":"send","target":"a1","args":{"text":"Report current progress."}}),
     method!("command.get", CommandGetRequest, Command, false, false, "Read a retained command in your authorized scope.", {"id":EXAMPLE_ID}),
     method!("command.children", CommandChildrenRequest, CommandChildrenResponse, false, false, "Page the retained children of one command.", {"id":EXAMPLE_ID,"limit":20}),
     method!("command.resolve", CommandResolveRequest, CommandResolveResponse, true, true, "Record an owner resolution of an uncertain command; never replay its effect.", {"id":EXAMPLE_ID,"command_id":"previous-command","as":"failed","reason":"Owner verified failure."}),
@@ -116,17 +116,17 @@ const METHODS: &[Method] = &[
         HarnessListResponse,
         true,
         false,
-        "List installed harness executables with versions; starts no model turn and performs no inference.",
+        "List installed harness executables with versions.",
         {}
     ),
-    method!("harness.models", HarnessModelsRequest, HarnessModelsResponse, true, false, "Read a harness native model catalogue through its own read-only method; starts no model turn and performs no inference.", {"harness":"codex"}),
-    method!("harness.quota", HarnessQuotaRequest, HarnessQuotaResponse, true, false, "Read provider-supported account quota with timestamp, scope, status and details when supported; starts no model turn and performs no inference.", {"harness":"codex"}),
+    method!("harness.models", HarnessModelsRequest, HarnessModelsResponse, true, false, "Read a harness native model catalogue (read-only).", {"harness":"codex"}),
+    method!("harness.quota", HarnessQuotaRequest, HarnessQuotaResponse, true, false, "Read provider-supported account quota when supported.", {"harness":"codex"}),
     method!("agent.history", AgentHistoryRequest, ObservationPage, true, false, "Read a bounded native history view advertised by agent.get.", {"id":"a1","source":"native","view":"turns","limit":20}),
-    method!("agent.list", AgentListRequest, AgentListResponse, false, false, "List scoped compact Agent summaries with indexed state/project/harness/parent/root filters, counts and explicit truncation.", {"limit":20,"state":"busy"}),
+    method!("agent.list", AgentListRequest, AgentListResponse, false, false, "List scoped compact Agent summaries with filters and counts.", {"limit":20,"state":"busy"}),
     method!("agent.result", AgentResultRequest, AgentResultResponse, false, false, "Read retained turns/results for one Agent.", {"id":"a1","limit":20}),
     method!("agent.processes", AgentProcessesRequest, AgentProcessesResponse, false, false, "Read bounded process observations for one Agent.", {"id":"a1"}),
     method!("agent.stats", AgentStatsRequest, AgentStatsResponse, false, false, "Read sampled Agent statistics with freshness metadata.", {"id":"a1"}),
-    method!("usage.summary", UsageSummaryRequest, UsageSummaryResponse, false, false, "Read bounded usage totals with explicit coverage over one Agent, project or tree scope.", {"agent":"a1"}),
+    method!("usage.summary", UsageSummaryRequest, UsageSummaryResponse, false, false, "Read bounded usage totals over one Agent, project or tree scope.", {"agent":"a1"}),
     method!("agent.git", AgentGitRequest, AgentGitResponse, false, false, "Read Git observations for one Agent's workspace.", {"id":"a1"}),
     method!("agent.edits", AgentEditsRequest, AgentEditsResponse, false, false, "Read a bounded page of observed workspace edits.", {"id":"a1","limit":20}),
     method!("turn.get", TurnGetRequest, Turn, false, false, "Read one exact Agent/generation/turn binding.", {"agent":"a1","generation":1,"turn_id":"turn-1"}),
@@ -143,10 +143,10 @@ const METHODS: &[Method] = &[
     method!("events.read", EventsReadRequest, EventsReadResponse, false, false, "Read a bounded event page; history gaps remain explicit.", {"after":0,"limit":20}),
     method!("events.subscribe", EventsSubscribeRequest, EventsSubscribeResponse, false, false, "Long-poll a bounded event page, at most 30 seconds.", {"after":0,"limit":20,"wait_ms":1000}),
     method!("swarm.wait", SwarmWaitRequest, SwarmWaitResponse, false, false, "Wait up to 30 seconds for a frozen set of child commands/turns with all/any semantics.", {"commands":[EXAMPLE_ID],"turns":[],"mode":"all","wait_ms":1000}),
-    method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest delivering one coalesced parent mailbox result with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
-    method!("swarm.reparent", ReparentRequest, ReparentResponse, true, true, "Atomically move one Agent subtree or all children to a controlled manager; Owner only, frozen profiles unchanged.", {"id":EXAMPLE_ID,"agent":"a2","expected_generation":1,"parent":"a3","parent_generation":1}),
-    method!("swarm.switch", SwitchRequest, SwitchResponse, true, true, "Launch a new Agent session then atomically hand off task inputs, claims, paused Goal and children; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"task_command":"retained-task","commands":[],"launch":{"harness":"antigravity","model":"gemini-4-hydrogen-low"}}),
-    method!("swarm.handoff", HandoffRequest, HandoffResponse, true, true, "Transfer selected undispatched task inputs, claims, paused Goal and children to an existing Agent; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"to":"a2","to_generation":1,"task_command":"retained-task","commands":[]}),
+    method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
+    method!("swarm.reparent", ReparentRequest, ReparentResponse, true, true, "Move one Agent subtree or all children to a controlled manager; Owner only.", {"id":EXAMPLE_ID,"agent":"a2","expected_generation":1,"parent":"a3","parent_generation":1}),
+    method!("swarm.switch", SwitchRequest, SwitchResponse, true, true, "Launch a new Agent session, then atomically hand off to it; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"task_command":"retained-task","commands":[],"launch":{"harness":"antigravity","model":"gemini-4-hydrogen-low"}}),
+    method!("swarm.handoff", HandoffRequest, HandoffResponse, true, true, "Transfer selected undispatched inputs and children to an Agent; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"to":"a2","to_generation":1,"task_command":"retained-task","commands":[]}),
     method!("command.cancel", CommandCancelRequest, CommandCancelResponse, true, true, "Withdraw one undispatched handoff input with no native effect; Owner only.", {"id":EXAMPLE_ID,"command_id":"retained-handoff/send-0"}),
     method!("project.get", ProjectGetRequest, ProjectRegistrationView, true, false, "Read one approved project registration.", {"id":"project-1"}),
     method!(
@@ -164,7 +164,7 @@ const METHODS: &[Method] = &[
         ProjectDiscoverResponse,
         true,
         true,
-        "Register an Owner-opened Git checkout with the current profile allowlist through the internal project-discovery settings author; non-Git paths are a no-op.",
+        "Register an Owner-opened Git checkout; non-Git paths are a no-op.",
         {"workspace":"C:/work/repo"}
     ),
     method!(
@@ -173,7 +173,7 @@ const METHODS: &[Method] = &[
         ProfileListResponse,
         true,
         false,
-        "List configured profiles as sanitized summaries (names, harness, model/effort, authority and route names) with launch-time resolvability; no environment or secret values.",
+        "List configured profiles as sanitized summaries with resolvability.",
         {}
     ),
     method!(
@@ -182,10 +182,10 @@ const METHODS: &[Method] = &[
         ProfilesReadResponse,
         true,
         false,
-        "Read the verbatim [profiles.*] sections of config.toml and the file revision; other sections stay server-side.",
+        "Read the verbatim [profiles.*] sections and the file revision.",
         {}
     ),
-    method!("config.profiles.save", ProfilesSaveRequest, ProfilesSaveResponse, true, true, "Validate (dry_run) or replace the [profiles.*] sections of config.toml with the daemon's own parser and launch resolution, guarded by the file revision.", {"expected_revision":null,"source":"[profiles.codex]
+    method!("config.profiles.save", ProfilesSaveRequest, ProfilesSaveResponse, true, true, "Validate (dry_run) or replace the [profiles.*] sections, guarded by revision.", {"expected_revision":null,"source":"[profiles.codex]
 harness = \"codex\"
 model = \"gpt-6-luna\"
 ","dry_run":true}),
@@ -204,7 +204,7 @@ model = \"gpt-6-luna\"
         SettingsSaveResponse,
         true,
         true,
-        "Validate (dry_run) or save complete typed settings sections with revision CAS and bounded author history.",
+        "Validate (dry_run) or save complete typed settings sections.",
         {"expected_revision":null,"sections":{"routing":{"default":["codex"]}},"dry_run":true,"client":"cli"}
     ),
     method!(
@@ -213,7 +213,7 @@ model = \"gpt-6-luna\"
         RoutingPreviewResponse,
         true,
         false,
-        "Preview the routing decision the next launch of a role would record; advisory, nothing is admitted, frozen or reserved.",
+        "Preview the routing decision for a role; advisory only.",
         {"role":"worker"}
     ),
     method!(
@@ -222,12 +222,12 @@ model = \"gpt-6-luna\"
         ScriptListResponse,
         true,
         false,
-        "Page existing script entries under approved Run roots; continue next_cursor through empty pages until absent.",
+        "Page existing script entries under approved Run roots.",
         {}
     ),
-    method!("script.read", ScriptReadRequest, ScriptReadResponse, true, false, "Read one existing script entry through a verified handle; oversized files are refused, binary or secret-bearing content is withheld.", {"project":null,"path":"check.ps1"}),
+    method!("script.read", ScriptReadRequest, ScriptReadResponse, true, false, "Read one existing script entry through a verified handle.", {"project":null,"path":"check.ps1"}),
     method!("script.save", ScriptSaveRequest, ScriptSaveResponse, true, true, "Validate (dry_run) or replace one existing script entry guarded by its revision; never executes.", {"project":null,"path":"check.ps1","expected_revision":"0000000000000000000000000000000000000000000000000000000000000000","content":"Write-Output ok\n","dry_run":true}),
-    method!("rule.list", RuleListRequest, RuleListResponse, true, false, "Page one rule namespace's stored states with canonical definitions and timer states.", {"limit":20}),
+    method!("rule.list", RuleListRequest, RuleListResponse, true, false, "Page one rule namespace's stored states and timer states.", {"limit":20}),
     method!("rule.get", RuleGetRequest, RuleStateView, true, false, "Read one rule's current and retiring cursors.", {"id":"rule-1"}),
     method!("rule.catch_up", RuleCatchUpRequest, Command, true, true, "Catch up a rule through a finite retained event interval.", {"id":EXAMPLE_ID,"rule":"rule-1","after_seq":0,"through_seq":10}),
     method!("timer.get", TimerGetRequest, TimerStateView, true, false, "Read one timer's state and next occurrence.", {"id":"timer-1"}),
@@ -437,10 +437,25 @@ impl Router {
             example["agent"] = json!("a1");
         }
         let scopes = method_scopes(method.name, principal, &identity);
+        // Compact by default: the sorted request field list stands in for
+        // the full JSON Schemas (fields, one example, limits). `full: true`
+        // restores both schemas for callers that need exact shapes.
+        let mut fields: Vec<String> = (method.input)()
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|properties| properties.keys().cloned().collect())
+            .unwrap_or_default();
+        fields.sort();
+        let (request_schema, response_schema) = if request.full.unwrap_or(false) {
+            ((method.input)(), (method.output)())
+        } else {
+            (Value::Null, Value::Null)
+        };
         encode(MethodHelpResponse {
             method:method.name.to_owned(), summary:method.summary.to_owned(),
             cli_aliases:aliases.iter().map(|s| (*s).to_owned()).collect(),
-            request_schema:(method.input)(), response_schema:(method.output)(),
+            fields,
+            request_schema, response_schema,
             example:json!({"method":method.name,"params":example}),
             mutation_id:if method.name.starts_with("inference.") && method.mutation { "Supply a caller-retained literal ULID before send; do not omit it. After a lost reply retry with that same id and identical semantic payload, or read inference.write.get. Never allocate another id to recover an uncertain mutation." } else if method.mutation { "id is optional on MCP: omit it and the server mints a ULID and returns it in the reply; retry with that same id. Otherwise supply a fresh caller-retained ULID in id before the first write. Retry only with that same id, principal, method and identical semantic payload. Never mint another id after an uncertain outcome; read back the retained result. The example id is illustrative; replace it for a new write." } else { "Read-only; no mutation id is required." }.to_owned(),
             scopes, limits:format!("{} Responses retain their DTO pagination and daemon 4 MiB frame bounds; one help result is at most 256 KiB. Examples for existing resources require their actual retained ids/profile/source/view.", method_limits(method.name)), unsupported,
@@ -652,6 +667,78 @@ mod tests {
             help["mutation_id"],
             json!("Read-only; no mutation id is required.")
         );
+    }
+
+    #[tokio::test]
+    async fn help_is_compact_by_default_and_full_on_request() {
+        let router = super::super::tests::router();
+        let compact = router
+            .method_help(&json!({"method": "mail.send"}), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(
+            compact["fields"],
+            json!(["id", "mode", "reply_to_delivery", "text", "thread", "to"])
+        );
+        assert!(compact["request_schema"].is_null());
+        assert!(compact["response_schema"].is_null());
+        assert!(compact.get("example").is_some());
+        assert!(compact.get("limits").is_some());
+        let wire = serde_json::to_vec(&compact).unwrap();
+        assert!(
+            wire.len() <= 2400,
+            "compact mail.send help exceeds 600 tokens: {} bytes",
+            wire.len()
+        );
+        let full = router
+            .method_help(
+                &json!({"method": "mail.send", "full": true}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(full["fields"], compact["fields"]);
+        assert!(full["request_schema"].is_object());
+        assert!(full["response_schema"].is_object());
+        assert!(full["request_schema"]["properties"].get("to").is_some());
+    }
+
+    #[tokio::test]
+    async fn method_pages_carry_one_line_summaries() {
+        let router = super::super::tests::router();
+        // Owner sees every method; walk every page so all summaries hold.
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        let mut seen = 0;
+        loop {
+            let mut params = serde_json::Map::new();
+            params.insert("limit".to_owned(), json!(50));
+            if let Some(cursor) = after {
+                params.insert("after".to_owned(), json!(cursor));
+            }
+            let page = router
+                .methods(&Value::Object(params), &Principal::Owner)
+                .await
+                .unwrap();
+            pages += 1;
+            let methods = page["methods"].as_array().expect("methods page");
+            assert!(!methods.is_empty());
+            for entry in methods {
+                seen += 1;
+                let summary = entry["summary"].as_str().expect("summary text");
+                assert!(
+                    summary.len() <= 100,
+                    "{} summary exceeds one line: {summary:?}",
+                    entry["method"]
+                );
+            }
+            after = page["next"].as_str().map(str::to_owned);
+            if after.is_none() {
+                break;
+            }
+        }
+        assert!(pages >= 2, "expected more than one methods page");
+        assert!(seen >= 80, "expected the full method catalogue: {seen}");
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::{
         types::{InboxUser, McpServerReadback, ModelRef, NativeModelEntry, SessionInfo},
     },
 };
-use eliot_core::{ContextItem, Error, InjectPoint, Result};
+use eliot_core::{ContextItem, Error, InjectPoint, McpPolicy, Result};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -164,6 +164,11 @@ struct ParsedStart {
     /// Split override ref, present exactly when an override was carried.
     override_model_ref: Option<ModelRef>,
     requested_agent: Option<String>,
+    /// Frozen worker MCP policy. The owned serve never sees the owner's
+    /// global config (isolated per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`),
+    /// so both policies serve the Agent-scoped server; the policy is still
+    /// read and reported so the record stays truthful.
+    requested_mcp_policy: McpPolicy,
     workspace: PathBuf,
     program: OsString,
     environment: Vec<(OsString, OsString)>,
@@ -540,6 +545,7 @@ impl OpenCodePlugin {
             return Ok(replay);
         }
         let (initialized, profile) = self.start_prereqs(&params)?;
+        let requested_mcp_policy = policy_from_snapshot(profile)?;
         // The retained subject validates through the shared Muse/Claude
         // helper: same continuity rules and codes, no local copy.
         let resume = params
@@ -618,6 +624,7 @@ impl OpenCodePlugin {
             override_model,
             override_model_ref,
             requested_agent,
+            requested_mcp_policy,
             workspace,
             program,
             environment,
@@ -979,6 +986,7 @@ impl OpenCodePlugin {
             observe_mcp_servers(&session.http, Instant::now() + RPC_TIMEOUT).await;
         effective["mcp_servers"] = mcp_servers;
         effective["mcp_servers_verified"] = json!(mcp_servers_verified);
+        effective["mcp_policy"] = json!(parsed.requested_mcp_policy.as_str());
         let context_bound =
             bind_context_hooks(&session.http, &created.id, Instant::now() + RPC_TIMEOUT).await;
         let effective = if context_bound {
@@ -1462,6 +1470,7 @@ impl OpenCodePlugin {
             observe_mcp_servers(&session.http, deadline).await;
         effective_value["mcp_servers"] = mcp_servers;
         effective_value["mcp_servers_verified"] = json!(mcp_servers_verified);
+        effective_value["mcp_policy"] = json!(parsed.requested_mcp_policy.as_str());
         Ok(effective_value)
     }
 
@@ -2915,6 +2924,25 @@ fn normalize_endpoint(value: &str) -> String {
     value.trim().trim_end_matches('/').to_owned()
 }
 
+/// Read the frozen worker MCP policy back. The owned serve is already
+/// isolated from the owner's global config, so both policies serve only the
+/// Agent-scoped server; the policy is still read (malformed snapshots fail
+/// closed) and reported. OpenCode has no selective-inclusion mapping, so a
+/// non-empty allow list fails closed instead of being silently dropped.
+fn policy_from_snapshot(profile: &serde_json::Map<String, Value>) -> Result<McpPolicy> {
+    let policy = McpPolicy::parse_snapshot(profile)
+        .map_err(|error| Error::new("profile_error", format!("OpenCode {}", error.message)))?;
+    let allow = eliot_core::parse_snapshot_allow_list(profile)
+        .map_err(|error| Error::new("profile_error", format!("OpenCode {}", error.message)))?;
+    if !allow.is_empty() {
+        return Err(Error::new(
+            "unsupported",
+            "OpenCode mcp_allow has no selective-inclusion mapping",
+        ));
+    }
+    Ok(policy)
+}
+
 /// How long the effective MCP readback waits for the installed inventory
 /// to settle on the Agent-scoped server. MCP servers connect
 /// asynchronously after session create (observed up to ~10s on the
@@ -3556,11 +3584,11 @@ mod tests {
         BackendKind, LocalProvider, McpSettle, OpenCodeHttp, OpenCodePlugin, SWARM_MCP_SERVER_NAME,
         StartAdmission, catalogue_contains, fetch_backend_inventory, local_key_value, mcp_names,
         mcp_settle, normalize_endpoint, opencode_manifest, opencode_scope, parse_configure_model,
-        parse_local_provider, split_model, start_auth_selector, start_config_override,
-        start_model_ref, verify_local_effective,
+        parse_local_provider, policy_from_snapshot, split_model, start_auth_selector,
+        start_config_override, start_model_ref, verify_local_effective,
     };
     use crate::native::types::{McpServerReadback, McpStatusReadback, NativeModelEntry};
-    use eliot_core::{AgentStartParams, Result};
+    use eliot_core::{AgentStartParams, McpPolicy, Result};
     use eliot_plugin::session::{
         ResumeSubject, optional_profile_text, parse_resume_subject, validate_source_plan,
     };
@@ -3574,6 +3602,34 @@ mod tests {
                 error: None,
             },
         }
+    }
+
+    #[test]
+    fn frozen_policy_reads_snapshot_and_rejects_allow() {
+        use serde_json::json;
+        // Keyless snapshots keep their recorded meaning, `inherit`; new
+        // freezes always record the key explicitly.
+        let empty = serde_json::Map::new();
+        assert_eq!(policy_from_snapshot(&empty).unwrap(), McpPolicy::Inherit);
+        let minimal = json!({"mcp": "minimal"});
+        assert_eq!(
+            policy_from_snapshot(minimal.as_object().unwrap()).unwrap(),
+            McpPolicy::Minimal
+        );
+        let inherit = json!({"mcp": "inherit"});
+        assert_eq!(
+            policy_from_snapshot(inherit.as_object().unwrap()).unwrap(),
+            McpPolicy::Inherit
+        );
+        let allowed = json!({"mcp": "minimal", "mcp_allow": ["owner-search"]});
+        assert_eq!(
+            policy_from_snapshot(allowed.as_object().unwrap())
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+        let broken = json!({"mcp": "isolated"});
+        assert!(policy_from_snapshot(broken.as_object().unwrap()).is_err());
     }
 
     #[test]

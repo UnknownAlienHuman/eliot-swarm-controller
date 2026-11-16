@@ -246,9 +246,12 @@ exact tool formats are resolved separately. See the
 
 ### Worker MCP policy
 
-Every profile selects a worker MCP inheritance policy in `mcp`: `inherit`
-(the default) or `minimal`, plus an optional `mcp_allow` list of native
-server names:
+Every profile selects a worker MCP policy in `mcp`: `minimal` (the default)
+or `inherit` (explicit opt-in), plus an optional `mcp_allow` list of native
+server names. Swarm MCP names (`eliot_swarm`, `eliot-swarm` and the
+per-session prefix) are reserved in every policy and can never be
+allow-listed: a worker that talks to the owner's daemon with the owner's
+identity is an authority leak.
 
 ```toml
 [profiles.codex-minimal]
@@ -259,12 +262,17 @@ mcp_allow = ["owner-search"]
 ```
 
 The resolved policy and allow list are frozen in the profile snapshot
-(`mcp`, `mcp_allow`) and the requested policy is reported in secret-free
-diagnostics and effective settings. Unknown policies are rejected at config
-load, and a non-empty allow list requires `minimal`.
+(`mcp`, `mcp_allow`; new freezes always record `mcp` explicitly) and the
+requested policy is reported in secret-free diagnostics and effective
+settings. Frozen snapshots without the key keep their recorded meaning
+(`inherit`). Unknown policies and reserved Swarm names in `mcp_allow` are
+rejected at config load, and a non-empty allow list requires `minimal`.
 
-`inherit` keeps the current behavior: the worker receives Eliot's
-Agent-scoped server in addition to the owner's native MCP surface.
+`inherit` is an explicit opt-in to the previous behavior: the worker receives
+Eliot's Agent-scoped server in addition to the owner's native MCP surface.
+Owner Swarm entries are still never inherited: Codex suppresses the exact
+owner names (`eliot_swarm`, `eliot-swarm`) with transport-carrying disables
+in both policies, and no profile can allow-list a Swarm name in any policy.
 `minimal` starts only the intended MCP surface: Eliot's Agent-scoped server
 plus the explicitly allowed native servers, with every other enumerated
 `mcp_servers` entry disabled through transport-carrying per-run `-c`
@@ -279,14 +287,17 @@ scoped `swarm mcp --require-agent` server is always present in both
 policies, and no policy edits the owner's global native config, copies
 `auth.json`, or changes native-store/observer bindings.
 
-Only the Codex and Claude harnesses implement `minimal`, each with its
-installed isolation mechanism; Muse, OpenCode and Antigravity keep
-`inherit` only and reject `minimal` as unsupported. Only Codex implements
-selective inclusion: a non-empty `mcp_allow` with `minimal` on any other
-harness is rejected as `unsupported` at config load (Claude `minimal` is the
-Eliot-only per-run config plus `--strict-mcp-config`, so an allow list
-would be silently dropped; with `inherit` an allow list is already rejected
-because it requires `minimal`). See the owning harness pages. Requested vs
+Codex, Claude and OpenCode implement `minimal`, each with its installed
+isolation mechanism (Codex per-run transport-carrying disables, Claude the
+Eliot-only per-run config plus `--strict-mcp-config`, OpenCode the isolated
+per-Agent serve whose generated config carries only the Agent-scoped
+server); Muse and Antigravity keep `inherit` only and reject `minimal` as
+`unsupported`, so their profiles must set `mcp = "inherit"` explicitly now
+that the default is `minimal`. Only Codex implements selective inclusion: a
+non-empty `mcp_allow` with `minimal` on Claude or OpenCode is rejected as
+`unsupported` at config load (an allow list would be silently dropped), and
+with `inherit` an allow list is already rejected because it requires
+`minimal`. See the owning harness pages. Requested vs
 observed: the
 effective server set is reported from native readback only where the harness
 supports it (`mcp_servers` with `mcp_servers_verified`); otherwise it stays
