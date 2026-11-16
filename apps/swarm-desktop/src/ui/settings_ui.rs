@@ -476,6 +476,7 @@ impl DesktopApp {
     pub(super) fn after_settings_saved(&mut self, context: &ComponentContext<Self>) {
         self.load_settings(context);
         self.load_profile_list(context);
+        self.load_routing_preview(context);
         if let Ok(data_dir) = self.data_dir.clone() {
             let _task = context.spawn_background(move |_| {
                 Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(&data_dir)))
@@ -787,6 +788,21 @@ impl DesktopApp {
             .text_wrapping(TextWrapping::Wrap)
             .margin(Thickness::xy(theme::spacing::MD, 0.0)),
         )];
+        // What Auto picks right now, from the saved policy.
+        if let Some(Ok(decision)) = &self.launch.preview {
+            let (headline, skipped) = model::decision_lines(decision);
+            let now = std::iter::once(format!("Now: {headline}."))
+                .chain(skipped)
+                .collect::<Vec<_>>()
+                .join("\n");
+            groups.push(KeyedView::new(
+                format!("now:{now}"),
+                m3::muted(now, theme::type_scale::BODY_SMALL)
+                    .automation_name("What Auto picks now")
+                    .text_wrapping(TextWrapping::Wrap)
+                    .margin(Thickness::xy(theme::spacing::MD, 0.0)),
+            ));
+        }
         for role in model::routing_roles(&self.settings.routing) {
             let list = model::candidates(&self.settings.routing, &role);
             let mut items: Vec<(String, View)> = Vec::new();

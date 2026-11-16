@@ -273,6 +273,8 @@ pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
 /// of one harness with optional model/effort (absent = native default).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchTarget {
+    /// No profile: the daemon's routing chooses at admission (role default).
+    Routed,
     Profile(String),
     Adhoc {
         harness: String,
@@ -297,6 +299,7 @@ pub async fn submit_launch(
     }
     let mut args = serde_json::json!({ "workspace": workspace });
     match target {
+        LaunchTarget::Routed => {}
         LaunchTarget::Profile(profile) if !profile.trim().is_empty() => {
             args["profile"] = Value::String(profile);
         }

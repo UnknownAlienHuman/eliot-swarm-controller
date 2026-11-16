@@ -12,12 +12,13 @@
 use std::path::Path;
 
 use eliot_core::api::{
-    ProfileListRequest, ProfileListResponse, ProjectRegistrationView, RuleListEntry,
-    RuleListRequest, RuleListResponse, ScriptListRequest, ScriptListResponse, ScriptReadRequest,
-    ScriptReadResponse, ScriptSaveRequest, ScriptSaveResponse, SettingsReadResponse,
-    SettingsSaveRequest, SettingsSaveResponse, TimerRunRequest, discovery::ProjectListRequest,
+    ProfileListRequest, ProfileListResponse, ProjectRegistrationView, RoutingPreviewRequest,
+    RoutingPreviewResponse, RuleListEntry, RuleListRequest, RuleListResponse, ScriptListRequest,
+    ScriptListResponse, ScriptReadRequest, ScriptReadResponse, ScriptSaveRequest,
+    ScriptSaveResponse, SettingsReadResponse, SettingsSaveRequest, SettingsSaveResponse,
+    TimerRunRequest, discovery::ProjectListRequest,
 };
-use eliot_core::{Command, Error, Result};
+use eliot_core::{Command, Error, Result, RoutingDecision};
 use serde_json::Value;
 
 use crate::settings::{self, Preferences};
@@ -60,6 +61,17 @@ pub async fn list_projects(data_dir: &Path) -> Result<Vec<ProjectRegistrationVie
         registration.validate()?;
     }
     Ok(registrations)
+}
+
+/// The decision routing would record for the next launch of `role`
+/// (advisory: admission evaluates again).
+pub async fn routing_preview(data_dir: &Path, role: Option<String>) -> Result<RoutingDecision> {
+    let params = RoutingPreviewRequest { role };
+    params.validate()?;
+    let reply: RoutingPreviewResponse =
+        eliot_daemon::client_call_typed(data_dir, "routing.preview", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply.decision)
 }
 
 /// Sanitized configured-profile summaries for the launch picker.

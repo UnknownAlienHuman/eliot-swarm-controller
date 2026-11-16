@@ -9,6 +9,7 @@
 //! dry run first when asked. Wire shapes: [`eliot_core::api::config_views`].
 
 use eliot_core::api::{SettingsHistoryEntry, SettingsHistoryStatus, SettingsSaveResponse};
+use eliot_core::{RouteQuotaStatus, RouteSkipReason, RoutingDecision};
 use serde_json::{Map, Value, json};
 
 /// The routing roles every launch path knows, shown even when unset.
@@ -530,6 +531,67 @@ pub fn utc_minute(ms: i64) -> String {
     )
 }
 
+/// Why routing passed over a candidate, in words.
+pub fn skip_reason(reason: RouteSkipReason) -> &'static str {
+    match reason {
+        RouteSkipReason::NotInstalled => "not installed",
+        RouteSkipReason::ProviderHold => "provider on hold",
+        RouteSkipReason::QuotaExhausted => "quota used up",
+        RouteSkipReason::CapacityFull => "at capacity",
+        RouteSkipReason::Unauthorized => "not allowed here",
+        RouteSkipReason::InvalidProfile => "profile does not resolve",
+    }
+}
+
+/// A routing decision as a headline and one line per skipped candidate.
+pub fn decision_lines(decision: &RoutingDecision) -> (String, Vec<String>) {
+    let role = if decision.role == "default" {
+        String::new()
+    } else {
+        format!(" for the {} role", decision.role)
+    };
+    let headline = match &decision.profile {
+        Some(profile) => {
+            let quota = match decision.quota_status {
+                RouteQuotaStatus::Supported => "",
+                RouteQuotaStatus::Unsupported => "; no quota readback",
+                RouteQuotaStatus::Unknown => "; quota unknown",
+            };
+            format!("Routing picks {profile}{role}: {}{quota}", decision.reason)
+        }
+        None if decision.skipped.is_empty() => {
+            format!("No profile is set{role}; add one in Settings, Routing")
+        }
+        None => format!("No profile is available{role}"),
+    };
+    let skipped = decision
+        .skipped
+        .iter()
+        .map(|skip| format!("Skipped {}: {}", skip.profile, skip_reason(skip.reason)))
+        .collect();
+    (headline, skipped)
+}
+
+/// A refused launch in words: a routing miss lists its skipped candidates.
+pub fn launch_error(error: &eliot_core::Error) -> String {
+    let decision = error
+        .routing
+        .as_deref()
+        .cloned()
+        .or_else(|| serde_json::from_str::<RoutingDecision>(&error.message).ok());
+    match decision {
+        Some(decision) if error.code == "routing_unavailable" => {
+            let (headline, skipped) = decision_lines(&decision);
+            let mut text = format!("routing_unavailable: {headline}");
+            if !skipped.is_empty() {
+                text.push_str(&format!(" ({})", skipped.join("; ")));
+            }
+            text
+        }
+        _ => error.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +686,39 @@ mod tests {
             desktop_section(Some(&current), "dark", "last_conversation", None),
             json!({"theme": "dark", "startup": "last_conversation", "window": {"width": 900, "height": 700}})
         );
+    }
+
+    #[test]
+    fn decisions_read_as_words() {
+        let decision = RoutingDecision {
+            role: "worker".to_owned(),
+            profile: Some("muse".to_owned()),
+            source: "settings.routing.worker".to_owned(),
+            reason: "first available candidate".to_owned(),
+            skipped: vec![eliot_core::RouteSkip {
+                profile: "codex".to_owned(),
+                reason: RouteSkipReason::CapacityFull,
+                quota_status: RouteQuotaStatus::Unknown,
+            }],
+            quota_status: RouteQuotaStatus::Unknown,
+        };
+        let (headline, skipped) = decision_lines(&decision);
+        assert_eq!(
+            headline,
+            "Routing picks muse for the worker role: first available candidate; quota unknown"
+        );
+        assert_eq!(skipped, ["Skipped codex: at capacity"]);
+        let mut miss = decision.clone();
+        miss.profile = None;
+        miss.role = "default".to_owned();
+        let mut error =
+            eliot_core::Error::new("routing_unavailable", serde_json::to_string(&miss).unwrap());
+        assert_eq!(
+            launch_error(&error),
+            "routing_unavailable: No profile is available (Skipped codex: at capacity)"
+        );
+        error.code = "not_allowed".to_owned();
+        assert!(launch_error(&error).starts_with("not_allowed: "));
     }
 
     #[test]

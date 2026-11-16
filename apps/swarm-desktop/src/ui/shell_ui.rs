@@ -164,6 +164,7 @@ impl DesktopApp {
                     self.preferences_loaded = true;
                     self.load_agents(context, None);
                     self.load_profile_list(context);
+                    self.load_routing_preview(context);
                     if let Ok(data_dir) = self.data_dir.clone() {
                         let _task = context.spawn_background(move |_| {
                             Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(
@@ -478,6 +479,7 @@ impl DesktopApp {
         if self.panel == Panel::Details {
             self.close_panel();
         }
+        self.load_routing_preview(context);
         self.set_status("New task.");
     }
 

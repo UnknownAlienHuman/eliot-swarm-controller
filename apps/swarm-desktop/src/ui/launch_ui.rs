@@ -2,9 +2,10 @@
 //! harness with its model and effort, and the first message, all set from
 //! the composer's chips.
 //!
-//! "Auto" stands for daemon routing (k55). Until routing lands it launches
-//! the default profile from Settings, else the first launchable profile the
-//! project allows, and the chip says which one.
+//! "Auto" is the daemon's routing: the launch names no profile and admission
+//! picks the first available candidate of the default role (Settings,
+//! Routing). Before launch the chip shows `routing.preview`'s pick and why;
+//! after launch the Agent details show the recorded decision.
 
 use super::*;
 use crate::configure::Pick;
@@ -28,13 +29,15 @@ pub(super) enum LaunchMsg {
     LaunchRequested,
     LaunchSubmitted(Fallible<LaunchOutcome>),
     ProfilesListed(Fallible<ProfileListResponse>),
+    /// `routing.preview` for the default role.
+    PreviewLoaded(Box<Fallible<eliot_core::RoutingDecision>>),
     HarnessCatalogLoaded(String, Box<Fallible<HarnessModelsResponse>>),
 }
 
 /// What a new task launches.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) enum Choice {
-    /// Routing (until it lands: the default profile).
+    /// The daemon's routing chooses at admission.
     #[default]
     Auto,
     Profile(String),
@@ -60,6 +63,9 @@ pub(super) struct LaunchState {
     pub(super) adhoc_effort: Option<String>,
     /// The ad-hoc harness's catalogue, once read.
     pub(super) catalog: Option<(String, Fallible<HarnessModelsResponse>)>,
+    /// What routing would pick for a new task now (advisory).
+    pub(super) preview: Option<Fallible<eliot_core::RoutingDecision>>,
+    pub(super) preview_loading: bool,
 }
 
 impl LaunchState {
@@ -82,24 +88,25 @@ impl LaunchState {
         }
     }
 
-    /// The profile Auto launches now: the preferred one when the project
-    /// allows it and it is launchable, else the first launchable allowed.
-    pub(super) fn auto_profile(&self, preferred: Option<&str>) -> Option<&ProfileSummary> {
-        let allowed = self.allowed();
-        preferred
-            .and_then(|name| {
-                allowed
-                    .iter()
-                    .find(|profile| profile.name == name && profile.launchable)
-            })
-            .or_else(|| allowed.iter().find(|profile| profile.launchable))
-            .copied()
+    /// The profile routing would pick now, from the last preview.
+    pub(super) fn auto_profile(&self) -> Option<&ProfileSummary> {
+        let name = self.preview.as_ref()?.as_ref().ok()?.profile.as_deref()?;
+        self.profile_summaries
+            .iter()
+            .find(|profile| profile.name == name)
     }
 
-    /// The profile this task launches (Auto resolved), if any.
-    pub(super) fn profile(&self, preferred: Option<&str>) -> Option<&ProfileSummary> {
+    /// The previewed pick is outside the project's profile allowlist.
+    fn auto_not_allowed(&self) -> bool {
+        self.auto_profile().is_some_and(|profile| {
+            !self.profiles.is_empty() && !self.profiles.contains(&profile.name)
+        })
+    }
+
+    /// The profile this task launches (Auto: the previewed pick), if any.
+    pub(super) fn profile(&self) -> Option<&ProfileSummary> {
         match &self.choice {
-            Choice::Auto => self.auto_profile(preferred),
+            Choice::Auto => self.auto_profile(),
             Choice::Profile(name) => self
                 .profile_summaries
                 .iter()
@@ -232,7 +239,7 @@ impl DesktopApp {
                             Some(text.clone()),
                         )
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| crate::settings_model::launch_error(&error))?;
                         Ok(LaunchOutcome {
                             // Admitted without an Agent id: the outcome is
                             // unknown, so the id is kept for a same-id retry.
@@ -289,6 +296,8 @@ impl DesktopApp {
                         });
                         self.nav.selection.select_agent(Some(outcome.agent));
                         self.load_agents(context, None);
+                        // Capacity changed: the next Auto pick may differ.
+                        self.load_routing_preview(context);
                     }
                     Err(error) if crate::state::uncertain(&error) => {
                         self.alert(format!(
@@ -306,7 +315,28 @@ impl DesktopApp {
                 }
                 Err(error) => self.alert(format!("Profiles not read: {error}")),
             },
+            LaunchMsg::PreviewLoaded(result) => {
+                self.launch.preview_loading = false;
+                self.launch.preview = Some(*result);
+            }
         }
+    }
+
+    /// Ask routing what it would pick for a new task now.
+    pub(super) fn load_routing_preview(&mut self, context: &ComponentContext<Self>) {
+        if self.launch.preview_loading {
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.launch.preview_loading = true;
+        let _task = context.spawn_background(move |_| {
+            Message::Launch(LaunchMsg::PreviewLoaded(Box::new(
+                client::block_on(config_client::routing_preview(&data_dir, None))
+                    .map_err(|error| error.to_string()),
+            )))
+        });
     }
 
     /// Read the ad-hoc harness's model catalogue (models and efforts).
@@ -329,14 +359,8 @@ impl DesktopApp {
                 effort: self.launch.adhoc_effort.clone(),
             }),
             Choice::Profile(name) => Ok(LaunchTarget::Profile(name.clone())),
-            Choice::Auto => self
-                .launch
-                .auto_profile(None)
-                .map(|profile| LaunchTarget::Profile(profile.name.clone()))
-                .ok_or_else(|| {
-                    "no launchable profile is allowed here; add one in Settings, or pick a harness"
-                        .to_owned()
-                }),
+            // Admission routes; a miss is refused there with its reasons.
+            Choice::Auto => Ok(LaunchTarget::Routed),
         }
     }
 
@@ -396,16 +420,36 @@ impl DesktopApp {
             View::empty()
         };
 
-        let auto = self.launch.auto_profile(None);
+        let preview = self.launch.preview.as_ref();
+        let decision = preview.and_then(|preview| preview.as_ref().ok());
         let profile_label = match &self.launch.choice {
-            Choice::Auto => match auto {
-                Some(profile) => format!("Auto · {}", profile.name),
-                None => "Auto".to_owned(),
+            Choice::Auto => match (preview, decision.and_then(|d| d.profile.as_deref())) {
+                (_, Some(profile)) => format!("Auto · {profile}"),
+                (Some(Ok(_)), None) => "Auto · no profile available".to_owned(),
+                _ => "Auto".to_owned(),
             },
             Choice::Profile(name) => name.clone(),
             Choice::Harness(harness) => format!("{harness} harness"),
         };
-        let mut profile_items = vec![MenuItem::item("auto", AUTO)];
+        // Why Auto picks what it picks: read-only lines above the choices.
+        let mut why: Vec<String> = match preview {
+            Some(Ok(decision)) => {
+                let (headline, skipped) = crate::settings_model::decision_lines(decision);
+                std::iter::once(headline).chain(skipped).collect()
+            }
+            Some(Err(error)) => vec![format!("Routing preview unavailable: {error}")],
+            None => vec!["Reading what routing would pick…".to_owned()],
+        };
+        if self.launch.auto_not_allowed() {
+            why.push("This project does not allow it; the start would be refused".to_owned());
+        }
+        let mut profile_items: Vec<MenuItem> = why
+            .iter()
+            .enumerate()
+            .map(|(index, line)| MenuItem::disabled(format!("why:{index}"), line.clone()))
+            .collect();
+        profile_items.push(MenuItem::separator("sep-why"));
+        profile_items.push(MenuItem::item("auto", AUTO));
         let allowed = self.launch.allowed();
         if !allowed.is_empty() {
             profile_items.push(MenuItem::separator("sep-profiles"));
@@ -425,13 +469,15 @@ impl DesktopApp {
                 MenuItem::item(format!("h:{harness}"), format!("{harness} harness"))
             }),
         ));
+        let tooltip = why.join("\n");
         let profile = m3::chip(palette)
-            .automation_name(format!("Profile: {profile_label}"))
+            .automation_name(format!("Profile: {profile_label}. {}", why.join(". ")))
             .content(m3::chip_label(m3::glyph::PROFILE, &profile_label))
             .menu(Menu::new(
                 profile_items,
                 context.callback(|label: String| Message::Launch(LaunchMsg::ProfileMenu(label))),
-            ));
+            ))
+            .tooltip(tooltip);
         StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(theme::spacing::SM)
@@ -441,7 +487,7 @@ impl DesktopApp {
     /// The model-and-effort chip and the access chip of a new task: read
     /// from the profile, or chosen from the ad-hoc harness's catalogue.
     pub(super) fn launch_chips(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let profile = self.launch.profile(None);
+        let profile = self.launch.profile();
         let (model_chip, access): (View, String) = match (&self.launch.choice, profile) {
             (Choice::Harness(harness), _) => {
                 let (models, efforts) = self.launch.adhoc_options();

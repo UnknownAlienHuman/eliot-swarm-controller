@@ -331,6 +331,34 @@ impl DesktopApp {
             section(palette, "Agent", &agent_lines),
         ));
 
+        // How the profile was chosen: the routing decision frozen at
+        // admission, with every skipped candidate.
+        let choice = match (detail, read) {
+            (Some(detail), _) => Some((detail.routing.clone(), detail.settings.profile.clone())),
+            (None, Some(read)) => Some((
+                read.agent.agent.profile_choice.clone(),
+                read.agent.agent.profile.clone(),
+            )),
+            (None, None) => None,
+        };
+        if let Some((decision, profile)) = choice {
+            let lines = match decision {
+                Some(decision) => {
+                    let (headline, skipped) = crate::settings_model::decision_lines(&decision);
+                    std::iter::once(headline.replacen("Routing picks", "Routing picked", 1))
+                        .chain(skipped)
+                        .collect()
+                }
+                None => vec![format!(
+                    "Started on {profile}, chosen in the composer (no routing)."
+                )],
+            };
+            sections.push(KeyedView::new(
+                "routing",
+                section(palette, "Profile choice", &lines),
+            ));
+        }
+
         // The conversation's retained coverage and the feed.
         if let Some(convo) = self.chat.convo.as_ref().filter(|convo| convo.agent() == id) {
             let mut lines = convo.coverage().lines(convo.inputs_unavailable());

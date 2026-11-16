@@ -133,6 +133,9 @@ struct UiDetail {
     observe_only: bool,
     /// The project label (its checkout).
     project: String,
+    /// The routing decision recorded at admission (None: an explicit
+    /// profile or harness).
+    routing: Option<eliot_core::RoutingDecision>,
 }
 
 /// Admission of one draft submission (Send, Steer or Resume): bound Agent,
@@ -331,6 +334,7 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         state: format!("{:?}", reply.agent.state).to_lowercase(),
         observe_only: reply.agent.observe_only,
         project: reply.agent.project.clone(),
+        routing: reply.agent.profile_choice.clone(),
     }
 }
 

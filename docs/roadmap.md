@@ -416,14 +416,12 @@ of the explicitly selected release scope.
       picks Auto, a profile from the daemon's sanitized `profile.list` summaries,
       or an Owner ad-hoc harness with its catalogue's models and efforts. The
       Agent details show requested settings beside the effective native
-      readback. Settings › Models and profiles keeps one draft of the
-      `[profiles.*]` source: form fields (dropdowns for effort, permissions and
-      approval policy, keeping a value outside the documented set) and the source
-      view both edit it. Validate and Save go through
-      `config.profiles.save`, which uses the daemon parser and launch resolution,
-      a revision guard and a temporary-file rename. An invalid draft is never
-      written and stays in the editor. The section states that running Agents
-      keep their frozen settings. Settings › Automation and scripts lists rules
+      readback. Settings › Models and profiles keeps one draft of the `profiles`
+      settings section as `[profiles.*]` TOML: form fields (dropdowns for effort,
+      permissions and approval policy, keeping a value outside the documented set)
+      and the source view both edit it. Validate and Save go through
+      `settings.save` (D8). An invalid draft is never written and stays in the
+      editor. The section states that running Agents keep their frozen settings. Settings › Automation and scripts lists rules
       and timers read-only through `rule.list`; no pause or resume operation
       exists. (Refs #407)
 
@@ -457,17 +455,32 @@ of the explicitly selected release scope.
       manager, Resume, Detach, Stop and Force stop); coverage, ids and readback
       live in the details panel. One composer carries the project and
       Auto/profile/harness chips, the model-and-effort and access chips, Send,
-      and Interrupt/Steer only while a turn runs. Auto launches the Settings
-      default profile until daemon routing (k55) lands. Settings has General,
-      Models and profiles, Routing, Projects, Automation and scripts, Cloud MCP
-      and Advanced, all through one client module (`config_client`) that the
-      unified settings API replaces. One component system in Material 3
+      and Interrupt/Steer only while a turn runs. Auto is daemon routing (D8).
+      Settings has General, Models and profiles, Routing, Projects, Automation and
+      scripts, Cloud MCP and Advanced, all through one client module
+      (`config_client`). One component system in Material 3
       components (owner review 2026-11-15: Codex layout, M3 visual language): a
       navigation drawer with 56-DIP items and a secondary-container active pill,
       an extended FAB for New task, outlined assist chips, filled/tonal/outlined/
       text and icon buttons, a segmented button, switches, outlined text fields,
       exposed dropdown menus, status chips and tonal cards, on the M3 type, shape
       and state-layer scales. (Refs #407)
+- [x] **D8 Settings and routing in the desktop.** Every Settings section reads and
+      writes the unified `settings.read/save` (S1) through `config_client`; the
+      desktop has no other store. General writes `[desktop]` theme and startup
+      ("reopen the last conversation" opens the most recently active Agent).
+      Routing edits each role's ordered candidates; Projects edits path, allowed
+      profiles and Agent actions; Automation edits assignments ("keep N busy from
+      folder X", S4) above the read-only rules and the scripts; Cloud MCP edits its
+      six fields; Advanced holds every section as JSON and the settings history
+      (author, time, sections, revision). Each save shows its result, revision
+      and restart need; a fresh read keeps drafts with unsaved edits. Main's
+      startup behaviors stay: Owner daemon autostart, the opened checkout's
+      `project.discover`, the fresh private directory remedy and the one-time
+      legacy `swarm-desktop.json` import. The composer's Auto chip launches with
+      no profile, so admission routes (S3); before launch it shows
+      `routing.preview`'s pick, reason and skipped candidates, and the Agent
+      details show the recorded `profile_choice`. (Refs #407)
 
 ## M1 — Memory one-shot inference (#199)
 
