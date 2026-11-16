@@ -21,7 +21,9 @@ current Agent may queue addressed mail to any existing Agent regardless of proje
 label or worktree; mail is communication only and does not grant command control.
 Project rules access project coordination; vars, claims and control remain as defined
 below. Only owner/global automation writes
-global vars. Agent-launched children cannot widen parental authority. Only the Owner
+global vars. Agent-launched children stay within parental Eliot scope; a frozen
+Owner-written `child_profiles` entry explicitly grants a different harness's own
+native policy, as defined under [Claims and hierarchy](#claims-and-hierarchy). Only the Owner
 may grant a different manager control through [Handoff](#handoff). A native child without isolated
 environment has no independent Eliot principal; calls from its parent environment are
 attributed to that parent and this limitation is shown.
@@ -222,12 +224,17 @@ launches a child through the ordinary launch path with `args.parent`; an Agent
 launches only its own children. The child takes the parent's project label and tree
 root at one deeper depth; the parent link is durable. A launch parent must be a
 controlled Agent: observe-only and unknown Agents cannot take children. Per
-Authority above, an Agent's child cannot widen parental authority: it carries the
-parent profile's frozen snapshot, or the freshly frozen snapshot of a same-harness
-profile from the parent snapshot's captured `child_profiles` allow-list, with only
-model and effort differing, the parent's captured credential bindings inherited
-verbatim, and every non-profile capacity scope kept with the same bounds; control
-is narrowed or equal (never widened). It omits `profile_snapshot` (the daemon
+Authority above, a child reuses the parent profile's frozen snapshot or names a
+profile from the parent's captured `child_profiles` allow-list. An explicit profile
+bypasses routing; a `role` selects candidates intersected with that frozen list
+(including the inherited parent profile). A later config edit cannot widen the list.
+An allow-listed cross-harness profile is an explicit Owner grant of that profile's
+freshly frozen harness, model, permissions and MCP policy. The child gets its own
+credential/selector bindings; parent bindings and native policy names never cross
+harnesses. Same-harness children retain the model/effort-only comparison and inherit
+parent credential bindings verbatim. Every non-profile capacity scope of the parent
+is kept with the same bounds, alongside the child's own scopes; conflicting bounds
+reject. Control is narrowed or equal (never widened). It omits `profile_snapshot` (the daemon
 freezes it) and shares the parent's workspace (an omitted workspace defaults to
 the parent's; a different workspace rejects, so a child never escapes the
 parent's authority) and mints no worktree; owner launches are unrestricted. Fanout limits (`[daemon.limits]`, checked at launch and re-parent admission)

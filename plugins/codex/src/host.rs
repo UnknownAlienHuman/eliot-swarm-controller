@@ -547,9 +547,10 @@ impl CodexPlugin {
         }
         secrets.push(initialized.credential.clone());
         metadata_secrets.push(initialized.credential.clone());
+        let native_subagents = profile.get("native_subagents").and_then(Value::as_str);
         let launch = NativeLaunch {
             program,
-            args: route.args()?,
+            args: route.args_with_native_subagents(native_subagents)?,
             cwd: PathBuf::from(&initialized.instance_dir),
             environment: variables,
         };
@@ -808,6 +809,7 @@ impl CodexPlugin {
         }
         let route = CodexRoute::from_profile(frozen_profile)?;
         let frozen_store = frozen_store_binding(profile)?;
+        let native_subagents = profile.get("native_subagents").and_then(Value::as_str);
         // An omitted model selects the harness native default (`isDefault`)
         // at start; an explicit model must match exactly or fail honestly
         // with no substitution. Requested-absent stays null in readback.
@@ -945,7 +947,7 @@ impl CodexPlugin {
             } else {
                 let probe = NativeLaunch {
                     program: program.clone(),
-                    args: route.args()?,
+                    args: route.args_with_native_subagents(native_subagents)?,
                     cwd: workspace.clone(),
                     environment: environment.clone(),
                 };
@@ -986,7 +988,7 @@ impl CodexPlugin {
         } else {
             let probe = NativeLaunch {
                 program: program.clone(),
-                args: route.args()?,
+                args: route.args_with_native_subagents(native_subagents)?,
                 cwd: workspace.clone(),
                 environment: environment.clone(),
             };
@@ -1028,6 +1030,7 @@ impl CodexPlugin {
                 &mcp_cwd,
                 &mcp_disables,
                 &plugin_disables,
+                native_subagents,
             )?,
             cwd: workspace.clone(),
             environment,

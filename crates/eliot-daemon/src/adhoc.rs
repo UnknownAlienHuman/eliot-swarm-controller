@@ -332,6 +332,10 @@ pub(crate) fn adhoc_snapshot(
     snapshot.insert("mcp".to_owned(), Value::String("inherit".to_owned()));
     snapshot.insert("mcp_allow".to_owned(), Value::Array(Vec::new()));
     snapshot.insert("child_profiles".to_owned(), Value::Array(Vec::new()));
+    snapshot.insert(
+        "native_subagents".to_owned(),
+        Value::String("allow".to_owned()),
+    );
     snapshot.insert("pass_env".to_owned(), Value::Array(Vec::new()));
     snapshot.insert("scratch".to_owned(), json!(["target/", "node_modules/"]));
     snapshot.insert(
