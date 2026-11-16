@@ -1295,8 +1295,22 @@ fn admit_configure_tx(
     Ok(())
 }
 
-/// Admit one turn-control command (`steer`, `interrupt`, `approve`, `deny`,
-/// `answer`): generation, state, turn, and pending-request binding.
+/// Owner-only replies for the target generation's frozen ask policy, shared
+/// by admission and dispatch so retained commands cannot bypass the policy.
+pub(super) fn require_reply_authority(principal: &str, verb: &str, agent: &Agent) -> Result<()> {
+    if principal != "owner"
+        && matches!(verb, "approve" | "deny" | "answer")
+        && agent.profile_snapshot.get("access").and_then(Value::as_str) == Some("ask")
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "access=ask request replies require the Owner",
+        ));
+    }
+    Ok(())
+}
+
+/// Admit one turn-control command: authority, generation, state, turn and request.
 fn admit_control_tx(
     tx: &Transaction<'_>,
     principal: &str,
@@ -1312,6 +1326,7 @@ fn admit_control_tx(
     let agent_num = parse_agent_id(target)?;
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
+    require_reply_authority(principal, &request.verb, &agent)?;
     // Control-verb support is owned by the PluginHost manifest check;
     // Store admits every known control verb and retains the live
     // generation, state, turn, and request checks below.
