@@ -1554,15 +1554,10 @@ impl CodexPlugin {
     /// Settle a pre-effect start failure after `discard_failed_start`.
     /// `session` is the owned post-discard session (phase Stopped or Unknown).
     /// Unconfirmed cleanup retains the controller with unknown; confirmed
-    /// cleanup caches the deterministic error for exact replay (residual
-    /// unknown from a missed read path becomes deterministic profile_error).
-    /// No thread/resume/input was dispatched. Returns the error for `start`.
-    /// Settle a pre-effect start failure after `discard_failed_start`.
-    /// `session` is the owned post-discard session (phase Stopped or Unknown).
-    /// Unconfirmed cleanup retains the controller with unknown; confirmed
     /// cleanup returns the authoritative failed-start value for exact replay
-    /// (residual unknown from a missed read path becomes deterministic
-    /// native_model_unavailable). No thread/resume/input was dispatched.
+    /// (a residual unclassified pre-dispatch read failure becomes
+    /// native_readback: no thread/resume/input was dispatched, but it is not a
+    /// model refusal).
     fn settle_pre_dispatch_outcome(
         &mut self,
         session: AgentSession,
@@ -1580,7 +1575,7 @@ impl CodexPlugin {
                 "Codex pre-dispatch metadata read failed before thread dispatch: {}",
                 error.message
             );
-            pre_dispatch_read_error(error, "native_model_unavailable", &message)
+            pre_dispatch_read_error(error, "native_readback", &message)
         } else {
             error
         };

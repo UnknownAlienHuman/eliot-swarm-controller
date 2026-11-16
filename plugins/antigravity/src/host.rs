@@ -552,7 +552,7 @@ impl Plugin {
                             ))
                         }
                     }
-                        Err(_) if session.terminate(true).await.is_err() => Err(Error::new(
+                    Err(_) if session.terminate(true).await.is_err() => Err(Error::new(
                         "unknown",
                         "Antigravity start failed and owned cleanup is unconfirmed",
                     )),
