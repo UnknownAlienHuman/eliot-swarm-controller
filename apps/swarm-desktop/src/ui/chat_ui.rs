@@ -1642,7 +1642,7 @@ impl DesktopApp {
                             .spacing(theme::spacing::SM)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
-                                m3::text_button(palette)
+                                m3::error_text_button(palette)
                                     .automation_name("Cancel force stop")
                                     .on_click(context.message(Message::Chat(
                                         ChatMsg::ForceStopAnswered(false),

@@ -586,6 +586,12 @@ pub mod winui {
             })
         }
 
+        /// A text button on an error container (the Force stop banner's
+        /// Cancel): on-error-container.
+        pub fn error_text_button(self) -> ResourceOverrides {
+            self.with(|s| Family::new(None, s.on_error_container).overrides(s))
+        }
+
         /// The confirmed destructive action (Force stop): filled in error.
         pub fn danger(self) -> ResourceOverrides {
             self.with(|s| Family::new(Some(s.error), s.on_error).overrides(s))
@@ -690,6 +696,7 @@ pub mod winui {
                 palette.card_button(),
                 palette.chip(false),
                 palette.segment(true),
+                palette.error_text_button(),
                 palette.danger(),
             ] {
                 assert_eq!(overrides, ResourceOverrides::new());

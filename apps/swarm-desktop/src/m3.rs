@@ -175,6 +175,11 @@ pub fn danger(palette: Palette) -> Button {
     button(palette.danger(), layout::CONTROL_HEIGHT)
 }
 
+/// A text button on an error container (on-error-container).
+pub fn error_text_button(palette: Palette) -> Button {
+    button(palette.error_text_button(), layout::CONTROL_HEIGHT)
+}
+
 /// Filled tonal: secondary actions that still read as buttons.
 pub fn tonal(palette: Palette) -> Button {
     button(palette.tonal(), layout::CONTROL_HEIGHT)

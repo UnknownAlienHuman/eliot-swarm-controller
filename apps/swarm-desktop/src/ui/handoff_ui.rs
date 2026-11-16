@@ -849,7 +849,7 @@ impl DesktopApp {
             let labelled = |label: &str, picker: ComboBox| -> View {
                 StackPanel::new().spacing(2.0).children((
                     small(label.to_owned()).opacity(theme::MUTED_OPACITY),
-                    picker.min_width(150.0),
+                    picker.min_width(136.0),
                 ))
             };
             push(
