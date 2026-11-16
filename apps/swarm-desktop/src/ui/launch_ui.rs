@@ -66,6 +66,8 @@ pub(super) struct LaunchState {
     /// What routing would pick for a new task now (advisory).
     pub(super) preview: Option<Fallible<eliot_core::RoutingDecision>>,
     pub(super) preview_loading: bool,
+    /// A refresh was asked for while one ran: read again when it lands.
+    pub(super) preview_again: bool,
 }
 
 impl LaunchState {
@@ -94,13 +96,6 @@ impl LaunchState {
         self.profile_summaries
             .iter()
             .find(|profile| profile.name == name)
-    }
-
-    /// The previewed pick is outside the project's profile allowlist.
-    fn auto_not_allowed(&self) -> bool {
-        self.auto_profile().is_some_and(|profile| {
-            !self.profiles.is_empty() && !self.profiles.contains(&profile.name)
-        })
     }
 
     /// The profile this task launches (Auto: the previewed pick), if any.
@@ -318,6 +313,9 @@ impl DesktopApp {
             LaunchMsg::PreviewLoaded(result) => {
                 self.launch.preview_loading = false;
                 self.launch.preview = Some(*result);
+                if std::mem::take(&mut self.launch.preview_again) {
+                    self.load_routing_preview(context);
+                }
             }
         }
     }
@@ -325,6 +323,8 @@ impl DesktopApp {
     /// Ask routing what it would pick for a new task now.
     pub(super) fn load_routing_preview(&mut self, context: &ComponentContext<Self>) {
         if self.launch.preview_loading {
+            // The running read may predate the change that asked.
+            self.launch.preview_again = true;
             return;
         }
         let Ok(data_dir) = self.data_dir.clone() else {
@@ -432,7 +432,7 @@ impl DesktopApp {
             Choice::Harness(harness) => format!("{harness} harness"),
         };
         // Why Auto picks what it picks: read-only lines above the choices.
-        let mut why: Vec<String> = match preview {
+        let why: Vec<String> = match preview {
             Some(Ok(decision)) => {
                 let (headline, skipped) = crate::settings_model::decision_lines(decision);
                 std::iter::once(headline).chain(skipped).collect()
@@ -440,9 +440,6 @@ impl DesktopApp {
             Some(Err(error)) => vec![format!("Routing preview unavailable: {error}")],
             None => vec!["Reading what routing would pick…".to_owned()],
         };
-        if self.launch.auto_not_allowed() {
-            why.push("This project does not allow it; the start would be refused".to_owned());
-        }
         let mut profile_items: Vec<MenuItem> = why
             .iter()
             .enumerate()

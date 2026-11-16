@@ -199,6 +199,9 @@ struct DesktopApp {
     prefs: crate::settings::Preferences,
     /// A preferences write is running (see `save_preferences`).
     prefs_saving: bool,
+    /// Counts local preference choices; a read issued before the latest
+    /// choice does not overwrite it.
+    prefs_rev: u64,
     /// The startup conversation was considered (once per window).
     startup_done: bool,
     /// The window's client width in DIPs, once observed.
@@ -449,6 +452,7 @@ impl Component for DesktopApp {
             appearance: shell_ui::Appearance::new(),
             prefs: crate::settings::Preferences::default(),
             prefs_saving: false,
+            prefs_rev: 0,
             startup_done: false,
             window_width: None,
             window_size: None,

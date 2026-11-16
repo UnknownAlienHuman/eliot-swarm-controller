@@ -104,6 +104,10 @@ pub(super) enum SettingsMsg {
 pub(super) struct SettingsState {
     pub(super) loaded: bool,
     pub(super) reading: bool,
+    /// A read was asked for while one ran (after a save): read again.
+    reread: bool,
+    /// [`DesktopApp::prefs_rev`] when the running read was issued.
+    read_prefs_rev: u64,
     /// The section whose save is running (one save at a time).
     saving: Option<Page>,
     revision: Option<String>,
@@ -231,13 +235,23 @@ impl DesktopApp {
                 self.settings.reading = false;
                 match result {
                     Ok(read) => {
-                        self.prefs = crate::settings::Preferences::from_reply(&read);
-                        self.preferred_window = crate::settings::window(&read);
+                        // A choice made after this read was issued (or still
+                        // being written) wins over the read.
+                        if !self.prefs_saving && self.prefs_rev == self.settings.read_prefs_rev {
+                            self.prefs = crate::settings::Preferences::from_reply(&read);
+                        }
                         self.take_profiles(&read);
                         self.settings.take(read);
-                        self.reprime_fields(context);
+                        // Only the Settings page has primed editors to refill;
+                        // the composer keeps its draft untouched.
+                        if self.main == Main::Settings {
+                            self.reprime_fields(context);
+                        }
                     }
                     Err(error) => self.settings.error = Some(format!("Settings not read: {error}")),
+                }
+                if std::mem::take(&mut self.settings.reread) {
+                    self.load_settings(context);
                 }
             }
             SettingsMsg::Reload => {
@@ -486,12 +500,15 @@ impl DesktopApp {
 
     pub(super) fn load_settings(&mut self, context: &ComponentContext<Self>) {
         if self.settings.reading {
+            // The running read may predate the save that asked.
+            self.settings.reread = true;
             return;
         }
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
         self.settings.reading = true;
+        self.settings.read_prefs_rev = self.prefs_rev;
         let _task = context.spawn_background(move |_| {
             Message::Settings(SettingsMsg::Loaded(
                 client::block_on(config_client::read_settings(&data_dir))
@@ -977,7 +994,7 @@ impl DesktopApp {
                         CheckBox::new()
                             .is_checked(on)
                             .is_enabled(!busy)
-                            .automation_name(format!("Allow {profile} in {id}"))
+                            .automation_name(format!("Allow {profile} for rules of {name}"))
                             .on_is_checked_changed(context.callback(move |on: bool| {
                                 Message::Settings(SettingsMsg::ProjectProfile(
                                     check_id.clone(),
@@ -1002,7 +1019,7 @@ impl DesktopApp {
                         "Checkout folder",
                         m3::field()
                             .text(nav::display_path(&path).to_owned())
-                            .automation_name(format!("Checkout folder of {id}"))
+                            .automation_name(format!("Checkout folder of {name}"))
                             .is_enabled(!busy)
                             .on_text_changed(context.callback(move |text| {
                                 Message::Settings(SettingsMsg::ProjectPath(path_id.clone(), text))
@@ -1011,7 +1028,7 @@ impl DesktopApp {
                         None,
                     ),
                     form_row(
-                        "Allowed profiles",
+                        "Rule profiles",
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)
                             .spacing(theme::spacing::MD)
@@ -1019,11 +1036,11 @@ impl DesktopApp {
                         None,
                     ),
                     form_row(
-                        "Agent actions",
+                        "Rule actions",
                         m3::field()
                             .text(model::project_actions(drafts, &id))
                             .placeholder_text("For example send, stop, git.fetch")
-                            .automation_name(format!("Agent actions of {id}"))
+                            .automation_name(format!("Rule actions of {name}"))
                             .is_enabled(!busy)
                             .on_text_changed(context.callback(move |text| {
                                 Message::Settings(SettingsMsg::ProjectActions(
@@ -1036,7 +1053,7 @@ impl DesktopApp {
                     ),
                     m3::error_text_button(palette)
                         .is_enabled(!busy)
-                        .automation_name(format!("Remove project {id}"))
+                        .automation_name(format!("Remove project {name}"))
                         .on_click(
                             context.message(Message::Settings(SettingsMsg::ProjectRemoved(
                                 id.clone(),

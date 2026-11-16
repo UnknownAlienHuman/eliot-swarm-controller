@@ -389,10 +389,12 @@ impl DesktopApp {
             }
             ShellMsg::ThemeChosen(theme) => {
                 self.prefs.theme = theme;
+                self.prefs_rev += 1;
                 self.save_preferences(context);
             }
             ShellMsg::StartupChosen(startup) => {
                 self.prefs.startup = startup;
+                self.prefs_rev += 1;
                 self.save_preferences(context);
             }
             ShellMsg::PreferencesSaved(saved, window, result) => {

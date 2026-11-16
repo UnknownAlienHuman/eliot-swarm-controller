@@ -350,7 +350,7 @@ impl DesktopApp {
                         .collect()
                 }
                 None => vec![format!(
-                    "Started on {profile}, chosen in the composer (no routing)."
+                    "Started on {profile}, named by its launch; routing did not choose it."
                 )],
             };
             sections.push(KeyedView::new(
