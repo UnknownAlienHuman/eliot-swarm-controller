@@ -54,6 +54,7 @@ fine for private, read-only exploration touching no shared files.
 Give each child disjoint files and require `who`, a claim before editing,
 and mail or an exact ack. Wait with `swarm.wait` or register `swarm.digest`,
 then collect the durable results before integrating.
+Managers: collect child results with `wait`, or `digest` for many children.
 Inspect one child with `command.children` (`swarm cmd children`).
 A manager moves task inputs, claims and children with `swarm.handoff`;
 only the owner moves agents (`swarm.reparent`, `swarm.switch`).

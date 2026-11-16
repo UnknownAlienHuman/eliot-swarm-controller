@@ -386,16 +386,16 @@ fn push_override(args: &mut Vec<OsString>, key: &str, value: String) {
 }
 
 /// Per-session native-subagent mapping for the installed Codex CLI
-/// (verified on 0.167.1 with `codex features list` showing `multi_agent`
-/// stable on and `multi_agent_v2` stable off): `deny` appends both
-/// `features.multi_agent=false` and `features.multi_agent_v2=false` as
-/// `-c` overrides, keeping the v2 switch off too. `allow` adds nothing and
-/// preserves today's behavior.
+/// (rust-v0.167.1 core/src/config/mod.rs, multi_agent_version_override).
+/// Model metadata can enable native agents despite multi_agent=false, so
+/// deny also needs agents.enabled=false and multi_agent_v2=false. The host
+/// repeats this mapping in each thread's config overlay. Allow adds nothing.
 pub(super) fn native_subagents_argv(native_subagents: Option<&str>) -> Vec<OsString> {
     if native_subagents != Some("deny") {
         return Vec::new();
     }
-    let mut args = Vec::with_capacity(4);
+    let mut args = Vec::with_capacity(6);
+    push_override(&mut args, "agents.enabled", "false".to_owned());
     push_override(&mut args, "features.multi_agent", "false".to_owned());
     push_override(&mut args, "features.multi_agent_v2", "false".to_owned());
     args
@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn native_subagents_deny_adds_both_multi_agent_overrides_before_app_server() {
+    fn native_subagents_deny_adds_all_overrides_before_app_server() {
         let route = CodexRoute::from_profile(&json!({"harness": "codex"})).unwrap();
         let allow = route.args_with_native_subagents(Some("allow")).unwrap();
         assert!(
@@ -648,6 +648,7 @@ mod tests {
             .collect::<Vec<_>>();
         let app_server = deny.iter().position(|arg| arg == "app-server").unwrap();
         for expected in [
+            "agents.enabled=false",
             "features.multi_agent=false",
             "features.multi_agent_v2=false",
         ] {
@@ -685,6 +686,7 @@ mod tests {
             .collect::<Vec<_>>();
         let app_server = with_mcp.iter().position(|arg| arg == "app-server").unwrap();
         for expected in [
+            "agents.enabled=false",
             "features.multi_agent=false",
             "features.multi_agent_v2=false",
         ] {

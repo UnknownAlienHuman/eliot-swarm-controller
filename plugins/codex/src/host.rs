@@ -1244,6 +1244,12 @@ impl CodexPlugin {
             }
         }
 
+        // rust-v0.167.1 Config::multi_agent_version_override requires agents.enabled=false
+        // and multi_agent_v2=false: model metadata can bypass multi_agent=false alone.
+        // Apply the documented dotted config overrides to every start and resume,
+        // including profiles that preserve the native reasoning-effort default.
+        let thread_config =
+            NativeThreadConfigOverrides::from_profile(selected_effort.clone(), native_subagents);
         let (thread_method, params_value) = if let Some(subject) = &resume_subject {
             let params = NativeThreadResumeParams {
                 thread_id: subject.native_ref.clone(),
@@ -1253,13 +1259,7 @@ impl CodexPlugin {
                 cwd: Some(workspace.to_string_lossy().into_owned()),
                 sandbox: Some(sandbox_mode),
                 approval_policy: Some(json!(approval_policy.clone())),
-                // Omitted effort omits the whole config overlay, preserving
-                // the native/provider default (schema: config optional).
-                config: selected_effort
-                    .clone()
-                    .map(|effort| NativeThreadConfigOverrides {
-                        model_reasoning_effort: effort,
-                    }),
+                config: thread_config,
             };
             (
                 "thread/resume",
@@ -1277,13 +1277,7 @@ impl CodexPlugin {
                 model_provider: Some(route.provider().to_owned()),
                 sandbox: Some(sandbox_mode),
                 approval_policy: Some(json!(approval_policy.clone())),
-                // Omitted effort omits the whole config overlay, preserving
-                // the native/provider default (schema: config optional).
-                config: selected_effort
-                    .clone()
-                    .map(|effort| NativeThreadConfigOverrides {
-                        model_reasoning_effort: effort,
-                    }),
+                config: thread_config,
                 service_tier: None,
                 ephemeral: None,
             };
@@ -3306,9 +3300,52 @@ mod tests {
         is_proven_scope_refusal, pre_dispatch_read_error, target_environment,
         unconfirmed_pre_dispatch_error, validate_resume_preflight,
     };
+    use super::{NativeThreadConfigOverrides, NativeThreadResumeParams, NativeThreadStartParams};
     use eliot_core::{Error, SecretPolicy, StderrSnapshot, StderrSource};
     use eliot_plugin::AgentStartParams;
     use serde_json::json;
+
+    #[test]
+    fn native_subagent_policy_is_in_start_and_resume_config_without_requiring_effort() {
+        for policy in [None, Some("allow"), Some("deny")] {
+            for effort in [None, Some("low".to_owned())] {
+                let config = NativeThreadConfigOverrides::from_profile(effort.clone(), policy);
+                let start = NativeThreadStartParams {
+                    config: config.clone(),
+                    ..Default::default()
+                };
+                let resume = NativeThreadResumeParams {
+                    thread_id: "retained-thread".to_owned(),
+                    exclude_turns: true,
+                    model: None,
+                    model_provider: None,
+                    cwd: None,
+                    sandbox: None,
+                    approval_policy: None,
+                    config,
+                };
+                let mut expected = json!({});
+                if let Some(effort) = effort {
+                    expected["model_reasoning_effort"] = json!(effort);
+                }
+                if policy == Some("deny") {
+                    expected["agents.enabled"] = json!(false);
+                    expected["features.multi_agent"] = json!(false);
+                    expected["features.multi_agent_v2"] = json!(false);
+                }
+                for request in [
+                    serde_json::to_value(start).unwrap(),
+                    serde_json::to_value(resume).unwrap(),
+                ] {
+                    if expected == json!({}) {
+                        assert!(request.get("config").is_none());
+                    } else {
+                        assert_eq!(request["config"], expected);
+                    }
+                }
+            }
+        }
+    }
     use std::{
         collections::{HashMap, HashSet},
         ffi::OsString,
