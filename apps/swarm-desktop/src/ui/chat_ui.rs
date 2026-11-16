@@ -147,6 +147,8 @@ impl DesktopApp {
     pub(super) fn chat_update(&mut self, msg: ChatMsg, context: &ComponentContext<Self>) {
         match msg {
             ChatMsg::ComposerChanged(text) => {
+                // Typing in the composer dismisses an open popover.
+                self.close_popover();
                 // Keep the text exactly as the TextBox reports it: a normalized
                 // copy would differ, be written back, and move the caret (or end
                 // an IME composition). Line endings are normalized at submission.
@@ -1024,6 +1026,20 @@ impl DesktopApp {
             (None, None) => View::empty(),
         };
         let composer = self.composer_view(column, context, palette);
+        // An open popover sits in its own row right above the composer (the
+        // empty area above gives way); a click on that area closes it.
+        let popover = self.popover_view(column, context, palette);
+        let dismiss: View = if self.launch.open.is_some() {
+            Border::new()
+                .grid_row(1)
+                .background(Brush::Solid(Color::transparent()))
+                .on_pointer_pressed(
+                    context.callback(|_: PointerEventInfo| Message::Launch(LaunchMsg::Close)),
+                )
+                .into()
+        } else {
+            View::empty()
+        };
 
         Grid::new()
             .rows([
@@ -1033,13 +1049,16 @@ impl DesktopApp {
                 GridLength::Auto,
                 GridLength::Auto,
                 GridLength::Auto,
+                GridLength::Auto,
             ])
             .children((
                 header,
                 body,
+                dismiss,
                 jump,
                 pending,
                 alert,
+                popover,
                 composer,
                 self.handoff_dialog(context),
             ))
@@ -1356,8 +1375,8 @@ impl DesktopApp {
         let detail = self.chat.detail.as_ref();
         let (context_row, chips): (View, View) = match (agent.as_deref(), detail) {
             (None, _) => (
-                self.launch_context(context, palette),
-                self.launch_chips(context, palette),
+                self.composer_top_row(context, palette),
+                self.composer_chips(context, palette),
             ),
             (Some(_), Some(detail)) => (
                 StackPanel::new()
@@ -1372,11 +1391,7 @@ impl DesktopApp {
                         m3::chip_static(
                             palette,
                             m3::glyph::PROFILE,
-                            &if detail.settings.profile == detail.harness {
-                                detail.harness.clone()
-                            } else {
-                                format!("{} · {}", detail.settings.profile, detail.harness)
-                            },
+                            &launch_ui::launched_as(&detail.settings.profile, &detail.harness),
                         ),
                     )),
                 StackPanel::new()
@@ -1387,7 +1402,7 @@ impl DesktopApp {
                         m3::chip_static(
                             palette,
                             m3::glyph::SHIELD,
-                            &launch_ui::access_label(detail.settings.permissions.as_deref()),
+                            &launch_ui::agent_access_label(&detail.settings),
                         ),
                     )),
             ),
@@ -1396,7 +1411,7 @@ impl DesktopApp {
         let placeholder = if agent.is_some() {
             "Send a follow-up"
         } else {
-            "Do anything"
+            "Describe a task…"
         };
         let field = TextBox::new()
             .grid_row(1)
@@ -1423,7 +1438,7 @@ impl DesktopApp {
             );
         let actions = self.composer_actions(agent, context, palette);
         Border::new()
-            .grid_row(5)
+            .grid_row(6)
             .width(column)
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)

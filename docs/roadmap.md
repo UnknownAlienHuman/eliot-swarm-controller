@@ -470,59 +470,94 @@ of the explicitly selected release scope.
       for a held or failed brief and an ordinary handoff to finish a switch.
 - [x] **D7 One shell.** The rail of separate screens is replaced by one shell
       (owner review 2026-11-15, the Codex app as reference). A sidebar holds
-      Search tasks (Ctrl+K: title, project and harness, through WinUI's
-      AutoSuggestBox), one tonal New task row (Ctrl+N), collapsible projects
-      with their Agents nested (manager, then workers, collapsed), Recents, a
-      calm fleet line that opens the monitor ("6 running"), a separate "N need
-      attention" row that lists only Agents waiting on a request or controlled
-      Agents in `unknown` (observe-only native children never count), and
-      Settings. A project is a repository: checkouts registered with the same
-      Git common directory group under the repository's name, and a task row
-      names its worktree only where the project spans several. Running tasks
-      stay on top, then newest first; stopped tasks last changed before today
-      fold into "Show N older"; a collapsed project shows its running count.
-      Titles come with each `agent.list` page (the first meaningful line of
-      the summary `preview`, Markdown removed, else the name, else
-      `<harness> · <profile>`). Collapsed projects live in memory until
-      `[desktop] collapsed_projects` exists. Reactor 0.100.0 has no key events
-      and no N/K accelerator keys, so the two shortcuts come from a keyboard
-      hook scoped to the window's thread. The conversation has a one-line header
-      (title, status dot, details toggle, a "…" menu for Hand off/Switch, Change
-      manager, Resume, Detach, Stop and Force stop); coverage, ids and readback
-      live in the details panel. One composer carries the project and
-      Auto/profile/harness chips, the model-and-effort and access chips, Send,
-      and Interrupt/Steer only while a turn runs. Auto is daemon routing (D8).
-      Settings has General, Models and profiles, Routing, Projects, Automation,
-      Scripts, Cloud MCP and Advanced, all through one client module
-      (`config_client`); while open it replaces the sidebar with its own
-      navigation (a Back row, then the pages) and shows one centred page of at
-      most 840 DIPs with a 200-DIP form label column. One component system at
-      Codex density with Material 3 color roles (owner reviews 2026-11-15 and
-      2026-11-16), every size from one tokens module: corners 8 for controls
-      and row highlights, 12 for containers (cards, menus, Details sections,
-      dialogs), 16 for the composer, a circle only for the icon-only Send;
-      heights 32 for controls and rows, 36 for form rows, 28 for tasks under a
-      project; four type styles (20/600, 14/600, 14/400, 12/400); a 4/8
-      spacing grid; 16/20-DIP icons. One action pattern: filled primary (one
-      per page), outlined secondary, text tertiary, destructive text in the
-      error color. The Details panel has only a close button. (Refs #407)
-- [x] **D8 Settings and routing in the desktop.** Every Settings section reads and
+      one tonal New task row (Ctrl+N), Search tasks (Ctrl+K: title, project and
+      harness, through WinUI's AutoSuggestBox), Automations and Usage,
+      collapsible projects with their Agents nested (manager, then workers,
+      collapsed), Recents, a calm fleet line that opens the monitor ("6
+      running"), a separate "N need attention" row that lists only Agents
+      waiting on a request or controlled Agents in `unknown` (observe-only
+      native children never count), and Settings. A project is a repository:
+      checkouts registered with the same Git common directory group under the
+      repository's name, and a task row names its worktree only where the
+      project spans several. Running tasks stay on top, then newest first;
+      stopped tasks last changed before today fold into "Show N older"; a
+      collapsed project shows its running count, and `[desktop]
+      collapsed_projects` keeps the collapse across restarts. Titles come with
+      each `agent.list` page (the first meaningful line of the summary
+      `preview`, Markdown removed, else the name, else `<harness> · <profile>`).
+      Reactor 0.100.0 has no key events and no N/K accelerator keys, so the
+      shortcuts and popover keys come from hooks scoped to the window's thread;
+      a search suggestion reached with ↑/↓ is only highlighted, and Enter or a
+      click opens it. The conversation has a one-line header (title, status
+      dot, details toggle, a "…" menu for Hand off/Switch, Change manager,
+      Resume, Detach, Stop and Force stop); coverage, ids and readback live in
+      the details panel. The composer of a conversation carries its project,
+      the model-and-effort and access chips, Send, and Interrupt/Steer only
+      while a turn runs; a new task's composer is D9. Settings replaces the
+      sidebar with its own navigation and shows one centred page of at most
+      840 DIPs (D9). One component system at Codex density with Material 3
+      color roles (owner reviews 2026-11-15 and 2026-11-16), every size from
+      one tokens module: corners 8 for controls and row highlights, 12 for
+      containers (cards, menus, popovers, Details sections, dialogs), 16 for
+      the composer, a circle only for the icon-only Send; heights 32 for
+      controls and rows, 36 for form rows, 28 for tasks under a project; four
+      type styles (20/600, 14/600, 14/400, 12/400); a 4/8 spacing grid;
+      16/20-DIP icons. One action pattern: filled primary (one per page),
+      outlined secondary, text tertiary, destructive text in the error color;
+      orange and red appear only for the Full access warning and destructive
+      actions. The Details panel has only a close button. (Refs #407)
+- [x] **D8 Settings and routing in the desktop.** Every Settings page reads and
       writes the unified `settings.read/save` (S1) through `config_client`; the
-      desktop has no other store. General writes `[desktop]` theme and startup
-      ("reopen the last conversation" opens the most recently active Agent).
-      Routing edits each role's ordered candidates; Projects edits path, allowed
-      profiles and Agent actions; Automation edits assignments ("keep N busy from
-      folder X", S4) above the read-only rules; Scripts edits the script
-      entries; Cloud MCP edits its six fields; Advanced holds every section as
-      JSON and the settings history
-      (author, time, sections, revision). Each save shows its result, revision
-      and restart need; a fresh read keeps drafts with unsaved edits. Main's
-      startup behaviors stay: Owner daemon autostart, the opened checkout's
+      desktop has no other store. Appearance and Startup write `[desktop]`
+      theme and startup ("reopen the last task" opens the most recently active
+      Agent). Routing edits each role's ordered candidates; Projects edits
+      path, allowed profiles and Agent actions; Automations edits assignments
+      ("keep N busy from folder X", S4) above the read-only rules and timers,
+      and the script entries; Cloud MCP edits its six fields; Advanced holds
+      every section as JSON and the settings history (author, time, sections,
+      revision). Each save shows its result and restart need (revisions only in
+      Advanced); a fresh read keeps drafts with unsaved edits. Main's startup
+      behaviors stay: Owner daemon autostart, the opened checkout's
       `project.discover`, the fresh private directory remedy and the one-time
-      legacy `swarm-desktop.json` import. The composer's Auto chip launches with
-      no profile, so admission routes (S3); before launch it shows
-      `routing.preview`'s pick, reason and skipped candidates, and the Agent
-      details show the recorded `profile_choice`. (Refs #407)
+      legacy `swarm-desktop.json` import. Auto launches with no profile, so
+      admission routes (S3); before launch the model picker shows
+      `routing.preview`'s pick and reason, and the Agent details show the
+      recorded `profile_choice`. (Refs #407)
+- [x] **D9 A desktop you can work in.** Owner review 2026-11-16, the Codex,
+      OpenCode and Antigravity apps as references. A new task's composer has
+      no profiles: the project chip (a searchable project list and "Other
+      folder…") on top, "Describe a task…", then the model chip
+      (`Harness · Model · effort`), the access chip and Send. The model chip
+      (Ctrl+M) opens OpenCode's picker pattern fed by `models.catalog` (k76a):
+      a search over harnesses, providers and models; Auto with Swarm's pick
+      and reason; Favorites and Recent (`[desktop]` `favorite_models` /
+      `recent_models`); then Codex, Claude Code, OpenCode (by provider), Muse
+      and Antigravity, each row with its provider, effort, a `default` badge
+      and a check on the current one; held models are greyed with the reason
+      and a missing harness says "not installed" once. Claude Code has no live
+      catalogue, so its group offers the CLI default and the model id typed in
+      the search, with the documented effort vocabulary. ↑/↓ move, ←/→ change
+      the effort (or click it on the highlighted row), Enter chooses, Ctrl+F
+      marks a favorite, Esc closes; saved presets are a group at the end. A
+      model choice is an Owner ad-hoc launch with `harness`, `model`, `effort`
+      and `access`. The access chip opens Codex's menu (Ask for approval /
+      Approve for me / Full access → `ask` / `auto` / `full`, Full in the
+      warning color, refused up front for OpenCode), remembered in
+      `[desktop] last_access`. The popovers are drawn above the composer, not
+      as WinUI flyouts (Reactor 0.100.0 cannot close a flyout it opened).
+      Settings follows Codex: a Search field over the settings of every page,
+      then the groups General (Appearance, Startup, Keyboard shortcuts),
+      Agents (Models & presets, Default access, Routing, Usage), Work
+      (Projects, Automations, Worktrees & cleanup), Integrations (Cloud MCP)
+      and Advanced (the settings file and history); each page has a title, a
+      one-line subtitle and cards of rows with the control on the right, and
+      "Open config.toml" where a section backs it. Usage shows each harness's
+      remaining provider quota as rings (weekly and 5-hour where `harness.quota`
+      reports them, "Not supported" otherwise), running Agents and the tokens
+      of Agents active today. Worktrees & cleanup lists the managed worktrees
+      under the data directory by project with Open; cleanup waits for
+      `cleanup.plan` / `cleanup.apply`. Shortcuts: Ctrl+N, Ctrl+K, Ctrl+M,
+      Ctrl+,. (Refs #407)
 
 ## M1 — Memory one-shot inference (#199)
 

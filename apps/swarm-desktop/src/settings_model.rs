@@ -363,14 +363,38 @@ pub fn cloud_template() -> Value {
 /// The `[desktop]` section with the given preferences; other fields kept.
 pub fn desktop_section(
     current: Option<&Value>,
-    theme: &str,
-    startup: &str,
+    preferences: &crate::settings::Preferences,
     window: Option<(u32, u32)>,
 ) -> Value {
+    use crate::settings::{MAX_COLLAPSED, MAX_COLLAPSED_KEY, MAX_FAVORITES, MAX_RECENTS};
     let mut desktop = current.cloned().unwrap_or_else(|| json!({}));
     let map = object(&mut desktop);
-    map.insert("theme".to_owned(), json!(theme));
-    map.insert("startup".to_owned(), json!(startup));
+    map.insert("theme".to_owned(), json!(preferences.theme));
+    map.insert("startup".to_owned(), json!(preferences.startup));
+    let bounded = |models: &[crate::settings::ModelRef], limit: usize| {
+        json!(models.iter().take(limit).collect::<Vec<_>>())
+    };
+    map.insert(
+        "favorite_models".to_owned(),
+        bounded(&preferences.favorites, MAX_FAVORITES),
+    );
+    map.insert(
+        "recent_models".to_owned(),
+        bounded(&preferences.recents, MAX_RECENTS),
+    );
+    // A key `[desktop]` would refuse (too long) is not remembered.
+    map.insert(
+        "collapsed_projects".to_owned(),
+        json!(
+            preferences
+                .collapsed
+                .iter()
+                .filter(|key| !key.trim().is_empty() && key.len() <= MAX_COLLAPSED_KEY)
+                .take(MAX_COLLAPSED)
+                .collect::<Vec<_>>()
+        ),
+    );
+    map.insert("last_access".to_owned(), json!(preferences.last_access));
     if let Some((width, height)) = window {
         map.insert(
             "window".to_owned(),
@@ -434,23 +458,18 @@ pub fn save_note(dry_run: bool, result: &Result<SettingsSaveResponse, String>) -
             "Valid; nothing saved.{}",
             restart(&reply.restart_required)
         ),
+        // Revisions and history numbers stay in Advanced (no hashes in the
+        // main pages).
         Ok(reply) if reply.saved => format!(
-            "Saved: revision {}{}.{}",
-            reply.revision.as_deref().map_or("?", short),
-            reply
-                .history_revision
-                .map_or_else(String::new, |entry| format!(", history #{entry}")),
+            "Saved. The change is in Advanced › History.{}",
             restart(&reply.restart_required)
         ),
-        Ok(reply) => format!(
-            "No change; revision {} stays.",
-            reply.revision.as_deref().map_or("?", short)
-        ),
+        Ok(_) => "No change to save.".to_owned(),
         Err(error) if error.starts_with("conflict") => {
             "Not saved: the settings changed elsewhere. Your draft is kept; Reload to see the current values.".to_owned()
         }
         Err(error) if crate::state::uncertain(error) => format!(
-            "Outcome unknown; Reload and check the revision before saving again. ({error})"
+            "Outcome unknown; Reload and check Advanced › History before saving again. ({error})"
         ),
         Err(error) if dry_run => format!("Invalid: {error}"),
         Err(error) => format!("Not saved: {error}"),
@@ -681,10 +700,32 @@ mod tests {
 
     #[test]
     fn desktop_section_keeps_other_fields() {
+        use crate::settings::{Access, ModelRef, Preferences, Startup, ThemeChoice};
         let current = json!({"theme": "system", "window": {"width": 900, "height": 700}});
+        let preferences = Preferences {
+            theme: ThemeChoice::Dark,
+            startup: Startup::LastConversation,
+            favorites: vec![ModelRef {
+                harness: "claude".to_owned(),
+                model: "claude-opus-5-5".to_owned(),
+                effort: Some("high".to_owned()),
+            }],
+            recents: Vec::new(),
+            collapsed: vec!["repo:c:/a/.git".to_owned(), "x".repeat(300)],
+            last_access: Some(Access::Full),
+        };
         assert_eq!(
-            desktop_section(Some(&current), "dark", "last_conversation", None),
-            json!({"theme": "dark", "startup": "last_conversation", "window": {"width": 900, "height": 700}})
+            desktop_section(Some(&current), &preferences, None),
+            json!({
+                "theme": "dark",
+                "startup": "last_conversation",
+                "window": {"width": 900, "height": 700},
+                "favorite_models": [{"harness": "claude", "model": "claude-opus-5-5", "effort": "high"}],
+                "recent_models": [],
+                // A key longer than `[desktop]` accepts is not written.
+                "collapsed_projects": ["repo:c:/a/.git"],
+                "last_access": "full"
+            })
         );
     }
 
@@ -732,7 +773,7 @@ mod tests {
         };
         assert_eq!(
             save_note(false, &Ok(saved)),
-            "Saved: revision abababababab, history #7. Restart the daemon to apply Cloud MCP."
+            "Saved. The change is in Advanced › History. Restart the daemon to apply Cloud MCP."
         );
         assert!(save_note(false, &Err("conflict: stale".to_owned())).contains("draft is kept"));
         assert!(save_note(true, &Err("profile_error: bad".to_owned())).starts_with("Invalid"));

@@ -136,6 +136,16 @@ pub mod layout {
     /// First window client size; the user resizes freely after.
     pub const WINDOW_WIDTH: f64 = 1440.0;
     pub const WINDOW_HEIGHT: f64 = 900.0;
+    /// The model picker above the composer (OpenCode's dialog width).
+    pub const PICKER_WIDTH: f64 = 520.0;
+    /// The access and project menus above the composer.
+    pub const MENU_WIDTH: f64 = 420.0;
+    /// The scrolling list of a popover.
+    pub const POPOVER_LIST_HEIGHT: f64 = 360.0;
+    /// The check column of a popover row.
+    pub const CHECK_COLUMN: f64 = 16.0;
+    /// A quota ring (Models & Usage).
+    pub const RING: f64 = 32.0;
 }
 
 #[cfg(test)]

@@ -60,18 +60,27 @@ impl DesktopApp {
                 match result {
                     Ok(list) => {
                         let previous = self.selected_script();
-                        self.scripts.unavailable = list
+                        // A project by its name, not its registration id.
+                        let projects = &self.nav.projects;
+                        let unavailable = list
                             .roots
                             .iter()
                             .filter_map(|root| {
                                 root.reason.as_ref().map(|reason| {
-                                    format!(
-                                        "{}: {reason}",
-                                        root.project.as_deref().unwrap_or("global")
-                                    )
+                                    let place = match root.project.as_deref() {
+                                        None => "global scripts",
+                                        Some(id) => projects
+                                            .iter()
+                                            .find(|project| project.id == id)
+                                            .map_or("a removed project", |project| {
+                                                project.name.as_str()
+                                            }),
+                                    };
+                                    format!("{place}: {reason}")
                                 })
                             })
                             .collect();
+                        self.scripts.unavailable = unavailable;
                         self.scripts.entries = list
                             .roots
                             .into_iter()

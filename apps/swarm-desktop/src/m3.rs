@@ -43,6 +43,23 @@ pub mod glyph {
     pub const PULSE: &str = "\u{E9D9}";
     pub const TOOLS: &str = "\u{E90F}";
     pub const FLAG: &str = "\u{E7C1}";
+    pub const CHECK: &str = "\u{E73E}";
+    pub const STAR: &str = "\u{E734}";
+    pub const STAR_FILLED: &str = "\u{E735}";
+    pub const LOCK: &str = "\u{E72E}";
+    pub const WARNING: &str = "\u{E7BA}";
+    pub const AUTO: &str = "\u{E99A}";
+    pub const AUTOMATION: &str = "\u{E916}";
+    pub const USAGE: &str = "\u{E9D2}";
+    pub const EXTERNAL: &str = "\u{E8A7}";
+    pub const OPEN_FOLDER: &str = "\u{E838}";
+    pub const KEYBOARD: &str = "\u{E765}";
+    pub const APPEARANCE: &str = "\u{E790}";
+    pub const STARTUP: &str = "\u{E7E8}";
+    pub const ROUTING: &str = "\u{E8AB}";
+    pub const WORKTREE: &str = "\u{E8F1}";
+    pub const CLOUD: &str = "\u{E753}";
+    pub const CODE: &str = "\u{E943}";
 }
 
 pub fn weight(style: TypeStyle) -> FontWeight {
@@ -478,4 +495,125 @@ pub fn divider(palette: Palette) -> Border {
     Border::new()
         .height(layout::HAIRLINE)
         .background(palette.outline_variant())
+}
+
+/// A settings page's header (the Codex settings pages): the title, its
+/// one-line subtitle and an optional action on the right (a link).
+pub fn page_header(title: &str, subtitle: &str, action: Option<View>) -> View {
+    Grid::new()
+        .columns([GridLength::STAR, GridLength::Auto])
+        .column_spacing(spacing::SM)
+        .children((
+            StackPanel::new().spacing(spacing::XS).children((
+                page_title(title.to_owned()),
+                secondary(subtitle.to_owned()).text_wrapping(TextWrapping::Wrap),
+            )),
+            Border::new()
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Bottom)
+                .content(action.unwrap_or_else(View::empty)),
+        ))
+}
+
+/// The title above a settings card ("Permissions"), 16 DIPs below the
+/// card above it.
+pub fn card_title(title: &str) -> View {
+    section_title(title.to_owned())
+        .margin(Thickness::new(0.0, spacing::SM, 0.0, 0.0))
+        .into()
+}
+
+/// One settings row (the Codex cards): the name and its one-line
+/// description on the left, the control on the right.
+pub fn setting_row(title: &str, description: &str, control: View) -> View {
+    Grid::new()
+        .min_height(height::FORM_ROW)
+        .margin(Thickness::xy(0.0, spacing::SM))
+        .columns([GridLength::STAR, GridLength::Auto])
+        .column_spacing(spacing::MD)
+        .children((
+            StackPanel::new()
+                .vertical_alignment(VerticalAlignment::Center)
+                .children((
+                    body(title.to_owned()).text_trimming(TextTrimming::CharacterEllipsis),
+                    if description.is_empty() {
+                        View::empty()
+                    } else {
+                        secondary(description.to_owned())
+                            .text_wrapping(TextWrapping::Wrap)
+                            .into()
+                    },
+                )),
+            Border::new()
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(control),
+        ))
+}
+
+/// Settings rows in one card, a hairline between rows.
+pub fn settings_card(palette: Palette, rows: Vec<KeyedView>) -> View {
+    let mut children = Vec::with_capacity(rows.len() * 2);
+    for (index, row) in rows.into_iter().enumerate() {
+        if index > 0 {
+            children.push(KeyedView::new(format!("divider:{index}"), divider(palette)));
+        }
+        children.push(row);
+    }
+    Border::new()
+        .background(palette.card())
+        .corner_radius(radius::CONTAINER)
+        .padding(Thickness::xy(spacing::MD, spacing::XS))
+        .vertical_alignment(VerticalAlignment::Top)
+        .content(StackPanel::new().keyed_children(children))
+}
+
+/// The content of a link-style text button ("Open config.toml ↗"): the
+/// label and its trailing glyph.
+pub fn link_content(label: &str) -> View {
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(spacing::XS)
+        .children((
+            TextBlock::new()
+                .text(label.to_owned())
+                .vertical_alignment(VerticalAlignment::Center),
+            icon(glyph::EXTERNAL),
+        ))
+}
+
+/// The container of a popover above the composer (the M3 menu: a
+/// surface-container card with a hairline outline and the container
+/// corner).
+pub fn popover(palette: Palette) -> Border {
+    Border::new()
+        .background(palette.popover())
+        .border_brush(palette.outline_variant())
+        .border_thickness(Thickness::uniform(layout::HAIRLINE))
+        .corner_radius(radius::CONTAINER)
+        .padding(Thickness::uniform(spacing::XS))
+}
+
+/// A small outlined badge ("default").
+pub fn badge(palette: Palette, text: &str) -> View {
+    Border::new()
+        .border_brush(palette.outline_variant())
+        .border_thickness(Thickness::uniform(layout::HAIRLINE))
+        .corner_radius(radius::CONTROL)
+        .padding(Thickness::xy(spacing::XS, 0.0))
+        .vertical_alignment(VerticalAlignment::Center)
+        .content(secondary(text.to_owned()))
+}
+
+/// A quota ring: the share remaining (0–100) as a determinate ring.
+pub fn ring(remaining: f64) -> View {
+    ProgressRing::new()
+        .is_indeterminate(false)
+        .minimum(0.0)
+        .maximum(100.0)
+        .value(remaining.clamp(0.0, 100.0))
+        .width(layout::RING)
+        .height(layout::RING)
+        .vertical_alignment(VerticalAlignment::Center)
+        .into()
 }

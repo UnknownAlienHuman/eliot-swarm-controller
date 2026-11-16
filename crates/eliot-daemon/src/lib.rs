@@ -29,6 +29,9 @@ pub(crate) mod test_support;
 mod workspace_git;
 mod workspaces;
 
+/// The closed Claude Code `--effort` vocabulary (ad-hoc launches and the
+/// desktop picker; Claude Code has no live model catalogue).
+pub use adhoc::CLAUDE_EFFORT_LEVELS;
 pub use config::load_cloud_access_config;
 pub use daemon::client_call_with_remote_context;
 pub use daemon::{

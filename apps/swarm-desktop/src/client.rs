@@ -270,7 +270,8 @@ pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {
 }
 
 /// What a launch freezes: a stored profile, or the Owner ad-hoc snapshot
-/// of one harness with optional model/effort (absent = native default).
+/// of one harness with optional model/effort (absent = native default) and
+/// access level (`ask`/`auto`/`full`; absent = the harness's safe defaults).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchTarget {
     /// No profile: the daemon's routing chooses at admission (role default).
@@ -280,6 +281,7 @@ pub enum LaunchTarget {
         harness: String,
         model: Option<String>,
         effort: Option<String>,
+        access: Option<String>,
     },
 }
 
@@ -313,6 +315,7 @@ pub async fn submit_launch(
             harness,
             model,
             effort,
+            access,
         } => {
             args["harness"] = Value::String(harness);
             if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
@@ -320,6 +323,9 @@ pub async fn submit_launch(
             }
             if let Some(effort) = effort.filter(|effort| !effort.trim().is_empty()) {
                 args["effort"] = Value::String(effort);
+            }
+            if let Some(access) = access.filter(|access| !access.trim().is_empty()) {
+                args["access"] = Value::String(access);
             }
         }
     }

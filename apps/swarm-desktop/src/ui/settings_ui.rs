@@ -1,64 +1,215 @@
-//! Settings: one page with sections, the one place for everything that
-//! needs adjusting. Every section reads and writes the daemon's unified
-//! settings (`settings.read` / `settings.save`, one store with a revision
-//! and author history) through [`crate::config_client`]:
-//! General (`[desktop]`), Models and profiles (`[profiles]`), Routing
-//! (`[routing]`), Projects (`[projects]`), Automation (`[automation]`
-//! assignments above the read-only rules), Scripts (their own files and
-//! API), Cloud MCP (`[cloud_mcp]`) and Advanced (every section as JSON, and
-//! the settings history). Each save shows its result and revision. The
-//! pages replace the sidebar with their own navigation (`settings_nav`) and
-//! show one centred column, one filled Save per page.
+//! Settings, the Codex settings pages as the pattern (owner review
+//! 2026-11-16): the sidebar becomes the settings navigation with a Search
+//! field and groups (General: Appearance, Startup, Keyboard shortcuts;
+//! Agents: Models & presets, Default access, Routing, Usage; Work: Projects,
+//! Automations, Worktrees & cleanup; Integrations: Cloud MCP; Advanced:
+//! the settings file and its history). Every page is one centred column: a
+//! title, a one-line subtitle, then cards whose rows carry the name and
+//! description on the left and the control on the right; destructive
+//! actions are separate and red. Every section reads and writes the
+//! daemon's unified settings (`settings.read` / `settings.save`, one store
+//! with a revision and author history) through [`crate::config_client`].
+//! Revisions and history stay in Advanced; the other pages say "Saved".
 
 use std::collections::{BTreeMap, HashMap};
 
 use super::*;
-use crate::settings::{Startup, ThemeChoice};
+use crate::settings::{Access, Startup, ThemeChoice};
 use crate::settings_model::{self as model, AssignmentField};
 use crate::theme::winui::Palette;
 use eliot_core::api::{
-    SettingsClientSource, SettingsHistoryEntry, SettingsReadResponse, SettingsSaveRequest,
-    SettingsSaveResponse, SettingsSection as Section,
+    HarnessQuotaResponse, SettingsClientSource, SettingsHistoryEntry, SettingsReadResponse,
+    SettingsSaveRequest, SettingsSaveResponse, SettingsSection as Section,
 };
 use serde_json::{Value, json};
 
-/// The page's sections, in order.
+/// The Settings pages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Page {
-    General,
+    Appearance,
+    Startup,
+    Shortcuts,
     Models,
+    Access,
     Routing,
+    Usage,
     Projects,
-    Automation,
-    Scripts,
+    Automations,
+    Worktrees,
     CloudMcp,
     Advanced,
 }
 
-impl Page {
-    const ALL: [Self; 8] = [
-        Self::General,
-        Self::Models,
-        Self::Routing,
-        Self::Projects,
-        Self::Automation,
-        Self::Scripts,
-        Self::CloudMcp,
-        Self::Advanced,
-    ];
+/// The navigation's groups and their pages, in order.
+const GROUPS: [(&str, &[Page]); 5] = [
+    (
+        "General",
+        &[Page::Appearance, Page::Startup, Page::Shortcuts],
+    ),
+    (
+        "Agents",
+        &[Page::Models, Page::Access, Page::Routing, Page::Usage],
+    ),
+    (
+        "Work",
+        &[Page::Projects, Page::Automations, Page::Worktrees],
+    ),
+    ("Integrations", &[Page::CloudMcp]),
+    ("Advanced", &[Page::Advanced]),
+];
 
-    fn label(self) -> &'static str {
+/// What the Search field finds: one entry per setting, `(page, name,
+/// words it also answers to)`.
+const INDEX: [(Page, &str, &str); 17] = [
+    (
+        Page::Appearance,
+        "Theme",
+        "appearance dark light system color colour",
+    ),
+    (
+        Page::Startup,
+        "Reopen the last task",
+        "startup start conversation open",
+    ),
+    (Page::Shortcuts, "Keyboard shortcuts", "keys ctrl hotkey"),
+    (
+        Page::Models,
+        "Presets",
+        "model profile harness effort preset",
+    ),
+    (
+        Page::Access,
+        "Default access",
+        "access permission approval full ask auto sandbox",
+    ),
+    (
+        Page::Routing,
+        "Routing order",
+        "auto role candidate profile order",
+    ),
+    (Page::Usage, "Quota", "usage limit weekly 5-hour tokens"),
+    (
+        Page::Usage,
+        "Running Agents and tokens",
+        "usage swarm totals",
+    ),
+    (Page::Projects, "Projects", "checkout folder repository"),
+    (Page::Projects, "Add a project", "new checkout"),
+    (
+        Page::Automations,
+        "Assignments",
+        "automation brief busy folder",
+    ),
+    (
+        Page::Automations,
+        "Rules and timers",
+        "automation schedule rule timer",
+    ),
+    (Page::Automations, "Scripts", "automation script run"),
+    (
+        Page::Worktrees,
+        "Managed worktrees",
+        "worktree cleanup branch",
+    ),
+    (
+        Page::CloudMcp,
+        "Cloud MCP",
+        "cloudflare tunnel remote access mcp",
+    ),
+    (
+        Page::Advanced,
+        "Settings file (JSON)",
+        "config toml json advanced",
+    ),
+    (Page::Advanced, "History", "revision changes author"),
+];
+
+impl Page {
+    pub(super) fn label(self) -> &'static str {
         match self {
-            Self::General => "General",
-            Self::Models => "Models and profiles",
+            Self::Appearance => "Appearance",
+            Self::Startup => "Startup",
+            Self::Shortcuts => "Keyboard shortcuts",
+            Self::Models => "Models & presets",
+            Self::Access => "Default access",
             Self::Routing => "Routing",
+            Self::Usage => "Usage",
             Self::Projects => "Projects",
-            Self::Automation => "Automation",
-            Self::Scripts => "Scripts",
+            Self::Automations => "Automations",
+            Self::Worktrees => "Worktrees & cleanup",
             Self::CloudMcp => "Cloud MCP",
-            Self::Advanced => "Advanced",
+            Self::Advanced => "Settings file & history",
         }
     }
+
+    /// The page's one-line subtitle.
+    fn subtitle(self) -> &'static str {
+        match self {
+            Self::Appearance => "How Swarm looks on this computer.",
+            Self::Startup => "What the window shows when it opens.",
+            Self::Shortcuts => "Keys that work anywhere in the window.",
+            Self::Models => {
+                "Presets are saved harness, model and access combinations; a new task picks its model in the composer."
+            }
+            Self::Access => "What new tasks may do without asking you first.",
+            Self::Routing => "How Auto chooses a preset when a task starts.",
+            Self::Usage => "Remaining provider quota per harness, and what Swarm is running.",
+            Self::Projects => "The checkouts tasks start in.",
+            Self::Automations => "Assignments, rules, timers and scripts that start work for you.",
+            Self::Worktrees => "Worktrees Swarm created for tasks, by project.",
+            Self::CloudMcp => "Reach Swarm's MCP endpoint from the cloud.",
+            Self::Advanced => "Every section of config.toml as JSON, and who changed what.",
+        }
+    }
+
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Appearance => m3::glyph::APPEARANCE,
+            Self::Startup => m3::glyph::STARTUP,
+            Self::Shortcuts => m3::glyph::KEYBOARD,
+            Self::Models => m3::glyph::MODEL,
+            Self::Access => m3::glyph::SHIELD,
+            Self::Routing => m3::glyph::ROUTING,
+            Self::Usage => m3::glyph::USAGE,
+            Self::Projects => m3::glyph::FOLDER,
+            Self::Automations => m3::glyph::AUTOMATION,
+            Self::Worktrees => m3::glyph::WORKTREE,
+            Self::CloudMcp => m3::glyph::CLOUD,
+            Self::Advanced => m3::glyph::CODE,
+        }
+    }
+
+    /// Pages backed by config.toml sections ("Open config.toml").
+    fn has_config(self) -> bool {
+        matches!(
+            self,
+            Self::Models
+                | Self::Access
+                | Self::Routing
+                | Self::Projects
+                | Self::Automations
+                | Self::CloudMcp
+                | Self::Advanced
+        )
+    }
+}
+
+/// The index entries a Settings search finds (case-insensitive over the
+/// name, the page and its other words).
+fn search_settings(query: &str) -> Vec<(Page, &'static str)> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    INDEX
+        .iter()
+        .filter(|(page, name, words)| {
+            name.to_lowercase().contains(&query)
+                || page.label().to_lowercase().contains(&query)
+                || words.contains(&query)
+        })
+        .map(|(page, name, _)| (*page, *name))
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +252,15 @@ pub(super) enum SettingsMsg {
     /// The Advanced JSON draft of every section.
     AllDraft(String),
     HistoryToggled,
+    /// Default access: the index picked in its list.
+    AccessDraft(Option<usize>),
+    /// Open config.toml with its default app.
+    OpenConfig,
+    /// Open a folder in File Explorer.
+    OpenFolder(String),
+    /// Read every installed harness's quota again.
+    UsageRefresh,
+    QuotaLoaded(String, Box<Fallible<HarnessQuotaResponse>>),
 }
 
 /// The read settings, the drafts of the page's sections and the last
@@ -134,6 +294,13 @@ pub(super) struct SettingsState {
     new_project_path: String,
     new_assignment: String,
     history_open: bool,
+    /// The navigation's search text.
+    pub(super) query: String,
+    /// Default access as edited (None: as saved).
+    access_draft: Option<Access>,
+    /// Quota per harness, as read.
+    quotas: BTreeMap<String, Fallible<HarnessQuotaResponse>>,
+    quotas_loading: usize,
 }
 
 impl SettingsState {
@@ -190,8 +357,18 @@ impl SettingsState {
             ),
             Page::Routing => one(Section::Routing, model::routing_for_save(&self.routing)),
             Page::Projects => one(Section::Projects, self.projects.clone()),
-            Page::Automation => one(Section::Automation, self.automation.clone()),
+            Page::Automations => one(Section::Automation, self.automation.clone()),
             Page::CloudMcp => one(Section::CloudMcp, self.cloud.clone()),
+            Page::Access => {
+                let access = self
+                    .access_draft
+                    .ok_or_else(|| "No change to save.".to_owned())?;
+                let mut desktop = self.base(Section::Desktop);
+                if let Some(map) = desktop.as_object_mut() {
+                    map.insert("last_access".to_owned(), json!(access));
+                }
+                one(Section::Desktop, desktop)
+            }
             Page::Advanced => {
                 let mut sections: BTreeMap<Section, Value> = serde_json::from_str(&self.all)
                     .map_err(|_| "The JSON does not parse; the draft is kept.".to_owned())?;
@@ -201,9 +378,19 @@ impl SettingsState {
                 }
                 Ok(sections)
             }
-            Page::General => Err("General saves as you choose.".to_owned()),
-            Page::Scripts => Err("Scripts save from their own editor.".to_owned()),
+            Page::Appearance | Page::Startup => Err("This page saves as you choose.".to_owned()),
+            Page::Shortcuts | Page::Usage | Page::Worktrees => {
+                Err("Nothing to save on this page.".to_owned())
+            }
         }
+    }
+
+    /// The saved default access level.
+    fn saved_access(&self) -> Option<Access> {
+        self.base(Section::Desktop)
+            .get("last_access")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
     }
 
     fn dirty(&self, page: Page) -> bool {
@@ -213,10 +400,18 @@ impl SettingsState {
                     != model::routing_for_save(&self.base(Section::Routing))
             }
             Page::Projects => self.projects != self.base(Section::Projects),
-            Page::Automation => self.automation != self.base(Section::Automation),
+            Page::Automations => self.automation != self.base(Section::Automation),
             Page::CloudMcp => self.cloud != self.base(Section::CloudMcp),
             Page::Advanced => self.all != self.all_base,
-            Page::General | Page::Models | Page::Scripts => false,
+            Page::Access => self
+                .access_draft
+                .is_some_and(|draft| Some(draft) != self.saved_access()),
+            Page::Appearance
+            | Page::Startup
+            | Page::Shortcuts
+            | Page::Models
+            | Page::Usage
+            | Page::Worktrees => false,
         }
     }
 }
@@ -226,6 +421,8 @@ impl DesktopApp {
         let s = &mut self.settings;
         match msg {
             SettingsMsg::PageSelected(page) => {
+                // A search result opens its page; the groups come back.
+                self.settings.query.clear();
                 if self.settings_page != page {
                     self.settings_page = page;
                     self.reprime_fields(context);
@@ -266,6 +463,13 @@ impl DesktopApp {
                     .notes
                     .insert(page, model::save_note(dry_run, &result));
                 if matches!(&result, Ok(reply) if reply.saved && !dry_run) {
+                    // The new default applies to the next new task now.
+                    if page == Page::Access
+                        && let Some(access) = self.settings.access_draft.take()
+                    {
+                        self.prefs.last_access = Some(access);
+                        self.launch.access = Some(access);
+                    }
                     self.after_settings_saved(context);
                 }
             }
@@ -277,10 +481,15 @@ impl DesktopApp {
                     }
                     Page::Routing => s.routing = s.base(Section::Routing),
                     Page::Projects => s.projects = s.base(Section::Projects),
-                    Page::Automation => s.automation = s.base(Section::Automation),
+                    Page::Automations => s.automation = s.base(Section::Automation),
                     Page::CloudMcp => s.cloud = s.base(Section::CloudMcp),
                     Page::Advanced => s.all = s.all_base.clone(),
-                    Page::General | Page::Scripts => {}
+                    Page::Access => s.access_draft = None,
+                    Page::Appearance
+                    | Page::Startup
+                    | Page::Shortcuts
+                    | Page::Usage
+                    | Page::Worktrees => {}
                 }
                 self.settings.notes.remove(&page);
                 self.reprime_fields(context);
@@ -380,7 +589,7 @@ impl DesktopApp {
                 match model::add_assignment(&mut s.automation, &key, &workspace) {
                     Ok(()) => s.new_assignment.clear(),
                     Err(error) => {
-                        s.notes.insert(Page::Automation, error);
+                        s.notes.insert(Page::Automations, error);
                     }
                 }
             }
@@ -402,6 +611,49 @@ impl DesktopApp {
                 }
             }
             SettingsMsg::HistoryToggled => s.history_open = !s.history_open,
+            SettingsMsg::AccessDraft(index) => {
+                if let Some(access) = index.and_then(|index| Access::ALL.get(index)) {
+                    s.access_draft = Some(*access);
+                }
+            }
+            SettingsMsg::OpenConfig => {
+                if let Ok(data_dir) = self.data_dir.clone() {
+                    let config = data_dir.join("config.toml");
+                    open_with_shell(&config.to_string_lossy());
+                }
+            }
+            SettingsMsg::OpenFolder(path) => open_with_shell(&path),
+            SettingsMsg::UsageRefresh => self.load_quotas(context),
+            SettingsMsg::QuotaLoaded(harness, reply) => {
+                self.settings.quotas_loading = self.settings.quotas_loading.saturating_sub(1);
+                self.settings.quotas.insert(harness, *reply);
+            }
+        }
+    }
+
+    /// Read the quota of every installed harness (one worker each) and the
+    /// catalogue's harness list when it is not read yet.
+    fn load_quotas(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.settings.quotas_loading > 0 {
+            return;
+        }
+        if self.launch.catalog.is_none() {
+            self.load_catalog(context);
+        }
+        for harness in crate::picker::HARNESSES {
+            self.settings.quotas_loading += 1;
+            let data_dir = data_dir.clone();
+            let _task = context.spawn_background(move |_| {
+                let reply = client::block_on(config_client::harness_quota(&data_dir, harness))
+                    .map_err(|error| error.to_string());
+                Message::Settings(SettingsMsg::QuotaLoaded(
+                    harness.to_owned(),
+                    Box::new(reply),
+                ))
+            });
         }
     }
 
@@ -525,10 +777,14 @@ impl DesktopApp {
         }
         match self.settings_page {
             Page::Models | Page::Routing | Page::Projects => self.load_profile_list(context),
-            Page::Automation => self.load_rules(context),
-            Page::Scripts if !self.scripts.listed => {
-                self.load_scripts(context);
+            Page::Automations => {
+                self.load_rules(context);
+                if !self.scripts.listed {
+                    self.load_scripts(context);
+                }
             }
+            Page::Usage => self.load_quotas(context),
+            Page::Worktrees => self.load_agents(context, None),
             _ => {}
         }
     }
@@ -556,18 +812,54 @@ impl DesktopApp {
         }
     }
 
-    /// The Settings navigation's page rows (the sidebar's place, see
-    /// `settings_nav`).
+    /// The Settings navigation's rows (the sidebar's place, see
+    /// `settings_nav`): the pages in their groups, or, while searching,
+    /// the settings that match with the page each is on.
     pub(super) fn settings_rows(
         &self,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> Vec<KeyedView> {
-        Page::ALL
-            .iter()
-            .map(|page| {
+        let mut rows = Vec::new();
+        if !self.settings.query.trim().is_empty() {
+            let found = search_settings(&self.settings.query);
+            rows.push(KeyedView::new("found", nav_label("Results")));
+            if found.is_empty() {
+                rows.push(KeyedView::new(
+                    "none",
+                    m3::secondary("No setting matches. Try another word.")
+                        .text_wrapping(TextWrapping::Wrap)
+                        .margin(Thickness::new(tokens::spacing::INSET, 0.0, 0.0, 0.0)),
+                ));
+            }
+            for (page, name) in found {
+                rows.push(KeyedView::new(
+                    format!("found:{name}"),
+                    m3::row(palette, false)
+                        .automation_name(format!("{name}, in {}", page.label()))
+                        .on_click(
+                            context.message(Message::Settings(SettingsMsg::PageSelected(page))),
+                        )
+                        .content(m3::row_content(
+                            Some(page.glyph()),
+                            name,
+                            // The page, unless the setting carries its name.
+                            if name == page.label() {
+                                ""
+                            } else {
+                                page.label()
+                            },
+                            View::empty(),
+                        )),
+                ));
+            }
+            return rows;
+        }
+        for (group, pages) in GROUPS {
+            rows.push(KeyedView::new(format!("group:{group}"), nav_label(group)));
+            for page in pages {
                 let selected = *page == self.settings_page;
-                KeyedView::new(
+                rows.push(KeyedView::new(
                     format!("{}:{selected}", page.label()),
                     m3::row(palette, selected)
                         .automation_name(if selected {
@@ -578,15 +870,11 @@ impl DesktopApp {
                         .on_click(
                             context.message(Message::Settings(SettingsMsg::PageSelected(*page))),
                         )
-                        .content(
-                            TextBlock::new()
-                                .text(page.label())
-                                .vertical_alignment(VerticalAlignment::Center)
-                                .text_trimming(TextTrimming::CharacterEllipsis),
-                        ),
-                )
-            })
-            .collect()
+                        .content(m3::icon_label(page.glyph(), page.label())),
+                ));
+            }
+        }
+        rows
     }
 
     /// The shown Settings page: its title, then its groups, in one centred
@@ -599,12 +887,16 @@ impl DesktopApp {
             m3::secondary("Reading settings…").into()
         } else {
             match page {
-                Page::General => self.general_section(context, palette),
+                Page::Appearance => self.appearance_page(context, palette),
+                Page::Startup => self.startup_page(context, palette),
+                Page::Shortcuts => shortcuts_page(palette),
                 Page::Models => self.models_section(context, palette),
+                Page::Access => self.access_page(context, palette),
                 Page::Routing => self.routing_section(context, palette),
+                Page::Usage => self.usage_page(context, palette),
                 Page::Projects => self.projects_section(context, palette),
-                Page::Automation => self.automation_section(context, palette),
-                Page::Scripts => self.scripts_view(context, palette),
+                Page::Automations => self.automation_section(context, palette),
+                Page::Worktrees => self.worktrees_page(context, palette),
                 Page::CloudMcp => self.cloud_section(context, palette),
                 Page::Advanced => self.advanced_section(context, palette),
             }
@@ -628,7 +920,20 @@ impl DesktopApp {
                     .keyed_children(vec![
                         KeyedView::new(
                             format!("title:{}", page.label()),
-                            m3::page_title(page.label()),
+                            m3::page_header(
+                                page.label(),
+                                page.subtitle(),
+                                page.has_config().then(|| {
+                                    m3::text_button(palette)
+                                        .automation_name("Open config.toml")
+                                        .on_click(
+                                            context.message(Message::Settings(
+                                                SettingsMsg::OpenConfig,
+                                            )),
+                                        )
+                                        .content(m3::link_content("Open config.toml"))
+                                }),
+                            ),
                         ),
                         KeyedView::new(format!("body:{}", page.label()), body),
                     ]),
@@ -663,7 +968,8 @@ impl DesktopApp {
         let note = self.settings.notes.get(&page).cloned().unwrap_or_else(|| {
             if dirty {
                 "Unsaved changes.".to_owned()
-            } else {
+            } else if page == Page::Advanced {
+                // Revisions belong to Advanced only.
                 format!(
                     "Saved settings, revision {}.",
                     self.settings
@@ -671,6 +977,8 @@ impl DesktopApp {
                         .as_deref()
                         .map_or("none yet", |revision| &revision[..revision.len().min(12)])
                 )
+            } else {
+                "All changes saved.".to_owned()
             }
         });
         StackPanel::new().spacing(tokens::spacing::SM).children((
@@ -702,7 +1010,7 @@ impl DesktopApp {
         ))
     }
 
-    fn general_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn appearance_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let segments: Vec<KeyedView> = [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark]
             .into_iter()
             .map(|choice| {
@@ -720,51 +1028,400 @@ impl DesktopApp {
                 )
             })
             .collect();
+        StackPanel::new().spacing(tokens::spacing::SM).children((
+            m3::settings_card(
+                palette,
+                vec![KeyedView::new(
+                    "theme",
+                    m3::setting_row(
+                        "Theme",
+                        "System follows the Windows setting.",
+                        m3::segmented(palette, segments),
+                    ),
+                )],
+            ),
+            self.page_note(Page::Appearance, "Changes save as you choose them."),
+        ))
+    }
+
+    fn startup_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let reopen = self.prefs.startup == Startup::LastConversation;
         // A check box rather than a switch: its shape stays on the scale (a
         // switch is a pill with a round thumb).
-        let switch = Grid::new().keyed_children(vec![KeyedView::new(
+        let check = Grid::new().keyed_children(vec![KeyedView::new(
             format!("reopen:{reopen}"),
             CheckBox::new()
                 .is_checked(reopen)
-                .automation_name("Reopen the last conversation at start")
+                .automation_name("Reopen the last task at start")
                 .on_is_checked_changed(context.callback(|on: bool| {
                     Message::Shell(ShellMsg::StartupChosen(if on {
                         Startup::LastConversation
                     } else {
                         Startup::NewTask
                     }))
-                }))
-                .content(m3::label("Reopen it")),
+                })),
         )]);
-        let note = self
-            .settings
-            .notes
-            .get(&Page::General)
-            .cloned()
-            .unwrap_or_else(|| "Changes save as you choose them.".to_owned());
         StackPanel::new().spacing(tokens::spacing::SM).children((
-            m3::group(
+            m3::settings_card(
                 palette,
-                vec![
-                    KeyedView::new(
-                        "theme",
-                        m3::form_row("Theme", m3::segmented(palette, segments), None),
+                vec![KeyedView::new(
+                    "reopen",
+                    m3::setting_row(
+                        "Reopen the last task",
+                        "At start, open the most recently active task instead of a new one.",
+                        check,
                     ),
-                    KeyedView::new(
-                        "theme-help",
-                        m3::help("System follows the Windows setting."),
-                    ),
-                    KeyedView::new("reopen", m3::form_row("Reopen last task", switch, None)),
-                    KeyedView::new(
-                        "reopen-help",
-                        m3::help(
-                            "At start, open the most recently active task instead of a new one.",
-                        ),
-                    ),
-                ],
+                )],
             ),
-            m3::secondary(note).text_wrapping(TextWrapping::Wrap),
+            self.page_note(Page::Startup, "Changes save as you choose them."),
+        ))
+    }
+
+    /// The page's last result, or `idle` when nothing happened yet.
+    fn page_note(&self, page: Page, idle: &str) -> View {
+        m3::secondary(
+            self.settings
+                .notes
+                .get(&page)
+                .cloned()
+                .unwrap_or_else(|| idle.to_owned()),
+        )
+        .text_wrapping(TextWrapping::Wrap)
+        .into()
+    }
+
+    /// Default access: the level a new task starts with (the composer's
+    /// access chip and `[desktop] last_access`), saved with this page.
+    fn access_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let shown = self
+            .settings
+            .access_draft
+            .or_else(|| self.settings.saved_access())
+            .unwrap_or(Access::Ask);
+        let index = Access::ALL.iter().position(|access| *access == shown);
+        let labels: Vec<String> = Access::ALL
+            .iter()
+            .map(|access| access.label().to_owned())
+            .collect();
+        let busy = self.settings.busy();
+        let picker = Grid::new().keyed_children(vec![KeyedView::new(
+            format!("access:{}", shown.wire()),
+            m3::enum_width(ComboBox::new())
+                .items_source(labels)
+                .selected_index(index)
+                .is_enabled(!busy)
+                .automation_name("Default access for new tasks")
+                .on_selection_changed(
+                    context.callback(|index| Message::Settings(SettingsMsg::AccessDraft(index))),
+                ),
+        )]);
+        let levels: Vec<KeyedView> = Access::ALL
+            .iter()
+            .map(|access| {
+                let title = m3::body(access.label());
+                let title = if *access == Access::Full {
+                    title.foreground(palette.warning())
+                } else {
+                    title
+                };
+                KeyedView::new(
+                    access.wire(),
+                    Grid::new()
+                        .min_height(tokens::height::FORM_ROW)
+                        .margin(Thickness::xy(0.0, tokens::spacing::SM))
+                        .columns([
+                            GridLength::Pixel(tokens::layout::LABEL_WIDTH),
+                            GridLength::STAR,
+                        ])
+                        .column_spacing(tokens::spacing::MD)
+                        .children((
+                            title.vertical_alignment(VerticalAlignment::Center),
+                            m3::secondary(access.description())
+                                .grid_column(1)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text_wrapping(TextWrapping::Wrap),
+                        )),
+                )
+            })
+            .collect();
+        let dirty = self.settings.dirty(Page::Access);
+        StackPanel::new().spacing(tokens::spacing::MD).children((
+            m3::settings_card(
+                palette,
+                vec![KeyedView::new(
+                    "default",
+                    m3::setting_row(
+                        "Default access for new tasks",
+                        "The composer starts with this level; choosing another there also changes it.",
+                        picker,
+                    ),
+                )],
+            ),
+            StackPanel::new().spacing(tokens::spacing::SM).children((
+                m3::card_title("What each level allows"),
+                m3::settings_card(palette, levels),
+                m3::secondary(
+                    "Presets and Auto keep their own permissions. OpenCode has no Full access mode.",
+                )
+                .text_wrapping(TextWrapping::Wrap),
+            )),
+            self.save_bar(Page::Access, dirty, context, palette),
+        ))
+    }
+
+    /// Models & Usage (Antigravity's page as the pattern): each installed
+    /// harness's remaining provider quota as rings (weekly and 5-hour where
+    /// the provider reports them), and what Swarm is running.
+    fn usage_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let running = self
+            .nav
+            .agents
+            .iter()
+            .filter(|agent| agent.running())
+            .count();
+        let today = today_start_ms();
+        let (tokens_today, reporting) = self
+            .nav
+            .agents
+            .iter()
+            .filter(|agent| agent.updated_at >= today)
+            .fold((0i64, 0usize), |(sum, count), agent| match agent.tokens {
+                Some(tokens) => (sum + tokens, count + 1),
+                None => (sum, count),
+            });
+        let totals = m3::settings_card(
+            palette,
+            vec![
+                KeyedView::new(
+                    format!("running:{running}"),
+                    m3::setting_row(
+                        "Running Agents",
+                        "Working now or starting.",
+                        m3::body(running.to_string()).into(),
+                    ),
+                ),
+                KeyedView::new(
+                    format!("tokens:{tokens_today}:{reporting}"),
+                    m3::setting_row(
+                        "Tokens today",
+                        &format!(
+                            "Reported by the {reporting} Agent(s) active today (their totals; Swarm has no per-day usage read)."
+                        ),
+                        m3::body(group_digits(tokens_today)).into(),
+                    ),
+                ),
+            ],
+        );
+        let installed: Vec<(String, Option<String>)> = match &self.launch.catalog {
+            Some(Ok(reply)) => reply
+                .harnesses
+                .iter()
+                .filter(|entry| entry.installed)
+                .map(|entry| (entry.harness.clone(), entry.version.clone()))
+                .collect(),
+            _ => crate::picker::HARNESSES
+                .iter()
+                .map(|harness| ((*harness).to_owned(), None))
+                .collect(),
+        };
+        let mut cards: Vec<KeyedView> = Vec::new();
+        for (harness, version) in installed {
+            let label = crate::picker::harness_label(&harness);
+            let provider =
+                crate::picker::provider_label(&eliot_core::api::catalog_provider(&harness, ""));
+            let title = if provider.eq_ignore_ascii_case(label) || provider.is_empty() {
+                label.to_owned()
+            } else {
+                format!("{label} · {provider}")
+            };
+            let rows: Vec<KeyedView> = match self.settings.quotas.get(&harness) {
+                None => vec![KeyedView::new(
+                    "reading",
+                    m3::setting_row("Quota", "Reading…", View::empty()),
+                )],
+                Some(Err(error)) => vec![KeyedView::new(
+                    "error",
+                    m3::setting_row("Quota", &format!("Not read: {error}"), View::empty()),
+                )],
+                Some(Ok(reply)) => {
+                    let windows = crate::quota::windows(reply);
+                    if windows.is_empty() {
+                        let why = reply
+                            .note
+                            .clone()
+                            .unwrap_or_else(|| "the harness reports no quota".to_owned());
+                        vec![KeyedView::new(
+                            "unsupported",
+                            m3::setting_row(
+                                "Quota",
+                                &format!("Not supported: {why}."),
+                                View::empty(),
+                            ),
+                        )]
+                    } else {
+                        windows
+                            .iter()
+                            .map(|window| {
+                                KeyedView::new(
+                                    format!("{}:{}", window.label, window.remaining),
+                                    m3::setting_row(
+                                        &format!("{} remaining", window.label),
+                                        &window.reset_note(crate::handoff::now_ms()),
+                                        StackPanel::new()
+                                            .orientation(Orientation::Horizontal)
+                                            .spacing(tokens::spacing::SM)
+                                            .children((
+                                                m3::body(format!("{}%", window.remaining))
+                                                    .vertical_alignment(VerticalAlignment::Center),
+                                                m3::ring(window.remaining as f64),
+                                            )),
+                                    ),
+                                )
+                            })
+                            .collect()
+                    }
+                }
+            };
+            cards.push(KeyedView::new(
+                format!("harness:{harness}"),
+                StackPanel::new().spacing(tokens::spacing::SM).children((
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::SM)
+                        .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                        .children((
+                            m3::section_title(title),
+                            m3::secondary(version.unwrap_or_default())
+                                .vertical_alignment(VerticalAlignment::Center),
+                        )),
+                    m3::settings_card(palette, rows),
+                )),
+            ));
+        }
+        StackPanel::new().spacing(tokens::spacing::MD).children((
+            StackPanel::new().spacing(tokens::spacing::SM).children((
+                m3::section_heading(
+                    "Swarm",
+                    "",
+                    Some(
+                        m3::text_button(palette)
+                            .is_enabled(self.settings.quotas_loading == 0)
+                            .automation_name("Read quota again")
+                            .on_click(context.message(Message::Settings(SettingsMsg::UsageRefresh)))
+                            .content(m3::label("Refresh")),
+                    ),
+                ),
+                totals,
+            )),
+            StackPanel::new()
+                .spacing(tokens::spacing::SM)
+                .keyed_children(cards),
+        ))
+    }
+
+    /// Worktrees & cleanup (Codex's Worktrees page as the pattern): where
+    /// Swarm creates worktrees, and the ones it manages, by project.
+    /// `cleanup.plan` / `cleanup.apply` are not in this build, so there is
+    /// no Delete; the list comes from the registered checkouts and the
+    /// listed Agents' workspaces under `<data>\worktrees`.
+    fn worktrees_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let root = self
+            .data_dir
+            .as_ref()
+            .map(|dir| dir.join("worktrees").to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let managed = crate::worktrees::managed(
+            &root,
+            &self
+                .nav
+                .projects
+                .iter()
+                .map(|project| (project.workspace.clone(), project.common_dir.clone()))
+                .collect::<Vec<_>>(),
+            &self
+                .nav
+                .agents
+                .iter()
+                .map(|agent| agent.project.clone())
+                .collect::<Vec<_>>(),
+        );
+        let settings = m3::settings_card(
+            palette,
+            vec![
+                KeyedView::new(
+                    "root",
+                    m3::setting_row(
+                        "Worktree root",
+                        nav::display_path(&root),
+                        m3::outlined(palette)
+                            .automation_name("Open the worktree root")
+                            .is_enabled(!root.is_empty())
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::OpenFolder(
+                                    root.clone(),
+                                ))),
+                            )
+                            .content(m3::icon_label(m3::glyph::OPEN_FOLDER, "Open")),
+                    ),
+                ),
+                KeyedView::new(
+                    "cleanup",
+                    m3::setting_row(
+                        "Automatic cleanup",
+                        "Not available in this version. Remove a worktree with git worktree remove in its repository.",
+                        View::empty(),
+                    ),
+                ),
+            ],
+        );
+        let mut groups: Vec<KeyedView> = Vec::new();
+        if managed.is_empty() {
+            groups.push(KeyedView::new(
+                "none",
+                m3::secondary(
+                    "No managed worktrees yet. A task started with swarm launch --worktree BRANCH gets one here.",
+                )
+                .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        for (project, paths) in managed {
+            let rows: Vec<KeyedView> = paths
+                .iter()
+                .map(|path| {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned());
+                    KeyedView::new(
+                        path.clone(),
+                        m3::setting_row(
+                            &name,
+                            nav::display_path(path),
+                            m3::icon_button(palette)
+                                .automation_name(format!("Open {name} in File Explorer"))
+                                .on_click(context.message(Message::Settings(
+                                    SettingsMsg::OpenFolder(path.clone()),
+                                )))
+                                .content(m3::icon(m3::glyph::OPEN_FOLDER)),
+                        ),
+                    )
+                })
+                .collect();
+            groups.push(KeyedView::new(
+                format!("project:{project}"),
+                StackPanel::new().spacing(tokens::spacing::SM).children((
+                    m3::section_heading(&project, &format!("{} worktree(s)", paths.len()), None),
+                    m3::settings_card(palette, rows),
+                )),
+            ));
+        }
+        StackPanel::new().spacing(tokens::spacing::MD).children((
+            StackPanel::new()
+                .spacing(tokens::spacing::SM)
+                .children((m3::card_title("Creation and cleanup"), settings)),
+            m3::card_title("Managed worktrees"),
+            StackPanel::new()
+                .spacing(tokens::spacing::MD)
+                .keyed_children(groups),
         ))
     }
 
@@ -1116,6 +1773,8 @@ impl DesktopApp {
                 )),
                 palette,
             ),
+            m3::card_title("Scripts"),
+            self.scripts_view(context, palette),
         ))
     }
 
@@ -1285,10 +1944,10 @@ impl DesktopApp {
                 )],
             ),
         ));
-        let dirty = self.settings.dirty(Page::Automation);
+        let dirty = self.settings.dirty(Page::Automations);
         groups.push(KeyedView::new(
             "save",
-            self.save_bar(Page::Automation, dirty, context, palette),
+            self.save_bar(Page::Automations, dirty, context, palette),
         ));
         StackPanel::new()
             .spacing(tokens::spacing::MD)
@@ -1471,6 +2130,66 @@ impl DesktopApp {
     }
 }
 
+/// Keyboard shortcuts: read-only (the window's keyboard hook owns them).
+fn shortcuts_page(palette: Palette) -> View {
+    let rows: Vec<KeyedView> = [
+        ("New task", "Ctrl+N"),
+        ("Search tasks", "Ctrl+K"),
+        ("Choose the model", "Ctrl+M"),
+        ("Settings", "Ctrl+,"),
+        ("Model picker: move", "↑ ↓"),
+        ("Model picker: effort", "← →"),
+        ("Model picker: favorite", "Ctrl+F"),
+        ("Choose / close a menu", "Enter / Esc"),
+    ]
+    .into_iter()
+    .map(|(name, keys)| KeyedView::new(name, m3::setting_row(name, "", m3::badge(palette, keys))))
+    .collect();
+    m3::settings_card(palette, rows)
+}
+
+/// A settings navigation group label: secondary text at the rows' inset.
+fn nav_label(text: &str) -> TextBlock {
+    m3::section_label(text).margin(Thickness::new(
+        tokens::spacing::INSET,
+        tokens::spacing::MD,
+        0.0,
+        tokens::spacing::XS,
+    ))
+}
+
+/// Open a file or folder the way File Explorer does (explicit argv; the
+/// shell picks the default app). Nothing is waited for.
+fn open_with_shell(path: &str) {
+    if path.trim().is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+}
+
+/// `1234567` as `1,234,567`.
+fn group_digits(value: i64) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    if value < 0 { format!("-{out}") } else { out }
+}
+
+/// The start of the local day, in ms since the epoch.
+fn today_start_ms() -> i64 {
+    use chrono::{Local, TimeZone};
+    Local::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|midnight| Local.from_local_datetime(&midnight).earliest())
+        .map_or(0, |start| start.timestamp_millis())
+}
+
 /// One routing candidate row: its place in the order, its name and the
 /// reorder / remove buttons.
 fn candidate_row(place: usize, name: &str, buttons: View) -> View {
@@ -1502,6 +2221,44 @@ mod tests {
             restart_required: Vec::new(),
             history: Vec::new(),
         }
+    }
+
+    #[test]
+    fn settings_search_finds_rows_across_pages() {
+        let found = search_settings("ACCESS");
+        assert_eq!(found[0], (Page::Access, "Default access"));
+        assert!(search_settings("").is_empty());
+        assert!(
+            search_settings("quota")
+                .iter()
+                .all(|(page, _)| *page == Page::Usage)
+        );
+        assert_eq!(group_digits(1_234_567), "1,234,567");
+        assert_eq!(group_digits(12), "12");
+        // Every page is in exactly one group.
+        let pages: Vec<Page> = GROUPS
+            .iter()
+            .flat_map(|(_, pages)| pages.iter().copied())
+            .collect();
+        assert_eq!(pages.len(), 12);
+    }
+
+    #[test]
+    fn default_access_saves_into_the_desktop_section() {
+        let mut state = SettingsState::default();
+        state.take(read_with(
+            "rev1",
+            json!({"default": []}),
+            json!({"theme": "dark", "last_access": "ask"}),
+        ));
+        assert!(!state.dirty(Page::Access));
+        state.access_draft = Some(Access::Full);
+        assert!(state.dirty(Page::Access));
+        let sections = state.request_sections(Page::Access, "").unwrap();
+        assert_eq!(
+            sections[&Section::Desktop],
+            json!({"theme": "dark", "last_access": "full"})
+        );
     }
 
     #[test]

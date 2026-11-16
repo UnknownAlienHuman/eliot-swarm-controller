@@ -60,6 +60,7 @@ impl DesktopApp {
                                 updated_at: 0,
                                 title: row.title.clone(),
                                 native_child: row.activity.is_some(),
+                                tokens: row.tokens,
                             })
                     });
                 if let Some(agent) = agent {

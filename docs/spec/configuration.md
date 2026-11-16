@@ -907,11 +907,16 @@ automation policy do not create a second executor. Desktop preferences use
 recently active Agent's conversation), `favorite_models` (bounded list of
 `{harness, model, effort?}`, at most 50), `recent_models` (bounded most-recent-first
 list of `{harness, model, effort?}`, at most 20), `collapsed_projects` (bounded
-list of project ids, at most 100) and `last_access` (`ask`, `auto` or `full`).
+list of the sidebar's project keys, at most 100) and `last_access` (`ask`, `auto` or `full`).
 Picker strings are stored verbatim: harness and access values must match their
-closed vocabularies exactly. Model ids and collapsed project ids are 1–256
+closed vocabularies exactly. Model ids and collapsed project keys are 1–256
 bytes, and effort is 1–128 bytes; these reject controls and surrounding whitespace.
 The desktop keeps no other preference store. The desktop writes `window` back once when the window closes, and only when the size changed.
+The new-task composer writes `recent_models` after an admitted model launch,
+`favorite_models` from the model picker (Ctrl+F or the row's star), `last_access`
+from the access chip or Settings › Default access, and `collapsed_projects` when a
+sidebar project is collapsed or expanded; a project key longer than 256
+bytes is not remembered.
 If that table is absent, the desktop imports the legacy per-user
 `swarm-desktop.json` preferences through the revision-guarded settings writer once.
 It retires the legacy file only after successful publication; an existing `[desktop]`
