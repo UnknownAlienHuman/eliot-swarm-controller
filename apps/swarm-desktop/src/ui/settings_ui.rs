@@ -1532,3 +1532,38 @@ fn scroll(content: View) -> View {
         .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
         .content(content)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_with(revision: &str, routing: Value, desktop: Value) -> SettingsReadResponse {
+        SettingsReadResponse {
+            revision: Some(revision.to_owned()),
+            sections: BTreeMap::from([(Section::Routing, routing), (Section::Desktop, desktop)]),
+            restart_required: Vec::new(),
+            history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn desktop_only_reread_keeps_edited_drafts() {
+        let mut state = SettingsState::default();
+        state.take(read_with(
+            "rev1",
+            json!({"default": ["a"]}),
+            json!({"theme": "system"}),
+        ));
+        // The owner edits Routing without saving; a window-size write moves
+        // the revision and the desktop section only.
+        state.routing = json!({"default": ["a", "b"]});
+        state.take(read_with(
+            "rev2",
+            json!({"default": ["a"]}),
+            json!({"theme": "system", "window": {"width": 900, "height": 700}}),
+        ));
+        assert_eq!(state.routing, json!({"default": ["a", "b"]}));
+        assert!(state.dirty(Page::Routing));
+        assert_eq!(state.revision.as_deref(), Some("rev2"));
+    }
+}
