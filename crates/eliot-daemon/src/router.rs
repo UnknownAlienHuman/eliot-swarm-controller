@@ -7745,6 +7745,7 @@ mod tests {
         let now = now_ms();
         let project_id = format!("git-fetch-wake-{}", ulid::Ulid::new());
         let root = std::env::temp_dir().join(&project_id);
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         let checkout = root.join("checkout").display().to_string();
         let repo_common_dir = std::path::Path::new(&checkout)
             .join(".git")
@@ -8002,6 +8003,7 @@ mod tests {
     async fn invalid_initial_timer_slot_leaves_rules_unseeded_and_same_id_registers_after_fix() {
         let root =
             std::env::temp_dir().join(format!("eliot-timer-preflight-{}", ulid::Ulid::new()));
+        let _temp_2 = crate::test_support::TempDir::own(root.clone());
         let rules_dir = root.join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
         let rule_path = rules_dir.join("timers.toml");
@@ -8072,13 +8074,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .unwrap();
         assert_eq!(timer.next_due_at, Some(timer.anchor + 1_000));
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]
     #[test]
     fn retained_launch_hydration_aligns_existing_8dot3_workspace_alias() {
         let root = std::env::temp_dir().join(format!("eliot-retained-alias-{}", ulid::Ulid::new()));
+        let _temp_3 = crate::test_support::TempDir::own(root.clone());
         let workspace = root.join("workspace with spaces");
         std::fs::create_dir_all(&workspace).unwrap();
         // cmd's %~sI asks Windows for the existing path's 8.3 spelling.
@@ -8090,11 +8092,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             ))
             .output();
         let Ok(short_path) = short_path else {
-            std::fs::remove_dir_all(&root).unwrap();
             return;
         };
         if !short_path.status.success() {
-            std::fs::remove_dir_all(&root).unwrap();
             return;
         }
         let requested = String::from_utf8_lossy(&short_path.stdout)
@@ -8105,11 +8105,9 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .split(['\\', '/'])
                 .any(|component| component.contains('~'))
         {
-            std::fs::remove_dir_all(&root).unwrap();
             return;
         }
         if !std::path::Path::new(&requested).is_dir() {
-            std::fs::remove_dir_all(&root).unwrap();
             return;
         }
         let stored = std::fs::canonicalize(&workspace)
@@ -8119,7 +8117,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .to_owned();
 
         if same_retained_workspace(&requested, &stored) {
-            std::fs::remove_dir_all(&root).unwrap();
             return; // This Windows volume did not expose a distinct short spelling.
         }
 
@@ -8133,7 +8130,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             request.args["workspace"].as_str().unwrap(),
             &stored
         ));
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
@@ -8375,6 +8371,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     #[tokio::test]
     async fn native_store_inputs_retained_hydration_survives_store_reopen() {
         let root = std::env::temp_dir().join(format!("eliot-store-inputs-{}", ulid::Ulid::new()));
+        let _temp_4 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir(&root).unwrap();
         let db = root.join("state.sqlite");
         let original_cwd = root.join("original-parent").join("workspace");
@@ -8698,6 +8695,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     async fn drain_worker_releases_ordered_successor_after_predecessor_applies() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-drain-worker-{}", ulid::Ulid::new()));
+        let _temp_5 = crate::test_support::TempDir::own(data_root.clone());
         std::fs::create_dir_all(&data_root).unwrap();
         let router = router_with_data_root(data_root.clone());
         let store = Arc::clone(&router.inner.store);
@@ -9094,7 +9092,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             }
         };
         let worker_result = worker_join;
-        std::fs::remove_dir_all(&data_root).unwrap();
         assert!(
             worker_result.is_ok(),
             "global rule worker failed: {worker_result:?}"
@@ -9623,6 +9620,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     #[tokio::test]
     async fn retained_unknowns_survive_restart_without_memory_cache() {
         let root = std::env::temp_dir().join(format!("eliot-drain-restart-{}", ulid::Ulid::new()));
+        let _temp_6 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir(&root).unwrap();
         let db = root.join("state.sqlite");
         let (agent, attach_id) = {
@@ -9670,7 +9668,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(retained[0]["id"], json!(attach_id));
         assert_eq!(retained[0]["agent"], json!(agent));
         assert_eq!(retained[0]["resolvable"], json!(false));
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
@@ -10351,6 +10348,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
 
         let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let root = base.join(format!("eliot-router-run-revocation-{}", ulid::Ulid::new()));
+        let _temp_12 = crate::test_support::TempDir::own(root.clone());
         let checkout_path = root.join("checkout");
         let data_root = root.join("owner-data");
         std::fs::create_dir_all(&checkout_path).unwrap();
@@ -10630,7 +10628,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         );
         drop(store);
         assert!(router.inner.run_workers.lock_recover().is_empty());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -10642,6 +10639,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "eliot-router-owner-run-revocation-{}",
             ulid::Ulid::new()
         ));
+        let _temp_13 = crate::test_support::TempDir::own(root.clone());
         let data_root = root.join("owner-data");
         let scripts_dir = data_root.join("scripts");
         let tools_dir = root.join("tools");
@@ -10848,7 +10846,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         );
         drop(store);
         assert!(router.inner.run_workers.lock_recover().is_empty());
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -10995,6 +10992,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 "eliot-managed-resume-rejection-{}",
                 ulid::Ulid::new()
             ));
+            let _temp_7 = crate::test_support::TempDir::own(root.clone());
             let checkout = root.join("checkout").to_string_lossy().into_owned();
             let worktree = root.join("worktree").to_string_lossy().into_owned();
             let branch = format!("codex/resume-rejection-{}", ulid::Ulid::new());
@@ -11154,6 +11152,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "eliot-project-resume-revocation-{}",
             ulid::Ulid::new()
         ));
+        let _temp_8 = crate::test_support::TempDir::own(root.clone());
         let checkout_path = root.join("checkout");
         let data_root = root.join("owner-data");
         let worktrees_root = data_root.join("worktrees");
@@ -11482,7 +11481,6 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(store.get_agent(&agent).unwrap().unwrap(), stopped_agent);
 
         drop(store);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -11492,6 +11490,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             "eliot-losing-workspace-prepare-{}",
             ulid::Ulid::new()
         ));
+        let _temp_9 = crate::test_support::TempDir::own(root.clone());
         let checkout = root.join("checkout").to_string_lossy().into_owned();
         let worktree = root.join("worktree").to_string_lossy().into_owned();
         let repo_common_dir = root.join("checkout/.git").to_string_lossy().into_owned();
@@ -14625,6 +14624,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
     async fn command_children_pages_a_catch_up_set_below_its_size() {
         let root =
             std::env::temp_dir().join(format!("eliot-children-catch-up-{}", ulid::Ulid::new()));
+        let _temp_10 = crate::test_support::TempDir::own(root.clone());
         let rules_dir = root.join("rules");
         std::fs::create_dir_all(&rules_dir).unwrap();
         std::fs::write(
@@ -15639,6 +15639,7 @@ mod run_authorization_tests {
     #[tokio::test]
     async fn profile_free_launch_retry_replays_frozen_default_after_routing_changes() {
         let root = std::env::temp_dir().join(format!("eliot-default-route-{}", ulid::Ulid::new()));
+        let _temp_11 = crate::test_support::TempDir::own(root.clone());
         let data_root = root.join("data");
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&data_root).unwrap();
@@ -15690,7 +15691,6 @@ mod run_authorization_tests {
             router.inner.store.lock().await.high_water().unwrap(),
             before
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

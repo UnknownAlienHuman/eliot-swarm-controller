@@ -836,6 +836,7 @@ mod tests {
     #[test]
     fn native_default_uses_advertised_current_selectors_without_writes() {
         let (base, workspace, hook_root) = test_dirs("native-default");
+        let _temp_1 = crate::test_temp::TempDir::own(base.clone());
         let mut params = start_params(&workspace, &base);
         params
             .profile
@@ -875,7 +876,6 @@ mod tests {
                 .code,
             "unknown"
         );
-        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -969,6 +969,7 @@ mod tests {
     #[test]
     fn add_dir_carries_only_the_hook_discovery_root() {
         let (base, workspace, hook_root) = test_dirs("plan");
+        let _temp_2 = crate::test_temp::TempDir::own(base.clone());
         let instance_dir = base.join("instance-1");
         fs::create_dir_all(&instance_dir).unwrap();
         let plan = Plan::new(
@@ -993,12 +994,12 @@ mod tests {
                 .any(|arg| arg == instance_dir.as_os_str()),
             "private instance directory must never be a native root",
         );
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn requested_and_effective_carry_native_roots() {
         let (base, workspace, hook_root) = test_dirs("roots");
+        let _temp_3 = crate::test_temp::TempDir::own(base.clone());
         let plan = Plan::new(
             &start_params(&workspace, &base),
             "cred",
@@ -1040,12 +1041,12 @@ mod tests {
                 Some(hook_root.to_string_lossy().as_ref()),
             );
         }
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn plan_rejects_a_missing_hook_discovery_dir() {
         let (base, workspace, _) = test_dirs("missing");
+        let _temp_4 = crate::test_temp::TempDir::own(base.clone());
         let missing = base.join("no-such-hooks-root");
         let error = match Plan::new(
             &start_params(&workspace, &base),
@@ -1057,12 +1058,12 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code, "invalid");
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn swarm_mcp_entry_carries_the_agent_scoped_server() {
         let (base, workspace, hook_root) = test_dirs("mcp-entry");
+        let _temp_5 = crate::test_temp::TempDir::own(base.clone());
         let plan = Plan::new(
             &start_params(&workspace, &base),
             "cred",
@@ -1089,12 +1090,12 @@ mod tests {
             ]),
         );
         assert_eq!(entry["env"], json!([]));
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn plan_rejects_identity_mismatch_without_owner_fallback() {
         let (base, workspace, hook_root) = test_dirs("mcp-identity");
+        let _temp_6 = crate::test_temp::TempDir::own(base.clone());
         for (tag, environment) in [
             (
                 "foreign-id",
@@ -1130,12 +1131,12 @@ mod tests {
             };
             assert_eq!(error.code, "not_allowed", "case {tag}");
         }
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
     fn effective_reports_mcp_unknown_at_readiness() {
         let (base, workspace, hook_root) = test_dirs("mcp-effective");
+        let _temp_7 = crate::test_temp::TempDir::own(base.clone());
         let plan = Plan::new(
             &start_params(&workspace, &base),
             "cred",
@@ -1167,7 +1168,6 @@ mod tests {
             .unwrap();
         assert_eq!(effective["mcp_servers"], Value::Null);
         assert_eq!(effective["mcp_servers_verified"], json!(false));
-        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -229,6 +229,7 @@ mod tests {
     #[test]
     fn panic_payload_never_reaches_either_sink() {
         let dir = std::env::temp_dir().join(format!("k68-panic-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(dir.clone());
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "crash::tests::panic_probe", "--nocapture"])
             .env("K68_PANIC_PROBE_DIR", &dir)
@@ -244,23 +245,23 @@ mod tests {
         );
         assert!(!stderr.contains("private-token-k68-panic"));
         assert!(markers[0].location.contains("crash.rs:"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn incomplete_publication_is_ignored_without_deletion() {
         let dir = std::env::temp_dir().join(format!("k68-partial-{}", ulid::Ulid::new()));
+        let _temp_2 = crate::test_support::TempDir::own(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         let temp = dir.join("daemon.panicked-1-1.tmp");
         std::fs::write(&temp, b"{\"code\":").unwrap();
         assert!(take_markers(&dir, "daemon.panicked").is_empty());
         assert!(temp.exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn markers_round_trip_and_consume_once() {
         let dir = std::env::temp_dir().join(format!("k68-crash-{}", std::process::id()));
+        let _temp_3 = crate::test_support::TempDir::own(dir.clone());
         let _ = std::fs::remove_dir_all(&dir);
         let marker = CrashMarker {
             code: "daemon.panicked".to_owned(),
@@ -274,7 +275,6 @@ mod tests {
         let taken = take_markers(&dir, "daemon.panicked");
         assert_eq!(taken, vec![marker]);
         assert!(take_markers(&dir, "daemon.panicked").is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -283,6 +283,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = std::env::temp_dir().join(format!("eliot-crash-mode-{}", ulid::Ulid::new()));
+        let _temp_4 = crate::test_support::TempDir::own(dir.clone());
         let marker = CrashMarker {
             code: "daemon.panicked".to_owned(),
             thread: "main".to_owned(),
@@ -299,12 +300,12 @@ mod tests {
         assert_eq!(entries.len(), 1, "one crash marker was written");
         let mode = entries[0].metadata().unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "crash marker is current-user-only");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_redacts_and_keeps_latest() {
         let root = std::env::temp_dir().join(format!("k68-crash2-{}", std::process::id()));
+        let _temp_5 = crate::test_support::TempDir::own(root.clone());
         let _ = std::fs::remove_dir_all(&root);
         let dir = crash_dir(&root);
         let policy = SecretPolicy::new(["s3cr3t"]);
@@ -325,6 +326,5 @@ mod tests {
         assert_eq!(loaded.message, "new [REDACTED]");
         assert_eq!(loaded.timestamp, 2);
         assert!(load_previous_crash(&root, &policy).is_none());
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

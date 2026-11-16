@@ -319,6 +319,7 @@ mod tests {
     #[tokio::test]
     async fn role_selects_first_free_candidate_and_retains_decision_on_agent() {
         let root = std::env::temp_dir().join(format!("eliot-routing-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         let cmd = std::env::current_exe()
             .unwrap()
@@ -348,12 +349,12 @@ mod tests {
         assert_eq!(agent.profile_choice.unwrap().role, "worker");
         drop(store);
         drop(router);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn preview_reports_the_choice_and_misses_without_admitting() {
         let root = std::env::temp_dir().join(format!("eliot-routing-{}", ulid::Ulid::new()));
+        let _temp_2 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         let cmd = std::env::current_exe()
             .unwrap()
@@ -386,7 +387,6 @@ mod tests {
                 .is_empty()
         );
         drop(router);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

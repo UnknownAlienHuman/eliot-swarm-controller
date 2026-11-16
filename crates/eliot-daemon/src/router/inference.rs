@@ -917,6 +917,7 @@ mod tests {
     async fn retirement_revokes_hash_before_durable_file_cleanup_and_replays() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-inference-retire-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(data_root.clone());
         std::fs::create_dir_all(&data_root).unwrap();
         let router = test_router(data_root.clone());
         let client = format!("memory:{}", ulid::Ulid::new());
@@ -1091,13 +1092,13 @@ mod tests {
             .unwrap();
         assert_eq!(replay, first);
         assert!(!data_root.join(&old_file).exists());
-        std::fs::remove_dir_all(&data_root).ok();
     }
 
     #[tokio::test]
     async fn cleanup_never_completes_on_unproven_quiescence() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-inference-quiescence-{}", ulid::Ulid::new()));
+        let _temp_2 = crate::test_support::TempDir::own(data_root.clone());
         std::fs::create_dir_all(&data_root).unwrap();
         let router = test_router(data_root.clone());
         let client = format!("memory:{}", ulid::Ulid::new());
@@ -1214,13 +1215,13 @@ mod tests {
                 .unwrap()
                 .cleanup_complete
         );
-        std::fs::remove_dir_all(&data_root).ok();
     }
 
     #[tokio::test]
     async fn prespawn_error_marks_unknown_without_any_fence() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-inference-prespawn-{}", ulid::Ulid::new()));
+        let _temp_3 = crate::test_support::TempDir::own(data_root.clone());
         std::fs::create_dir_all(&data_root).unwrap();
         let router = test_router(data_root.clone());
         let (client, call_id) = admit_call(&router).await;
@@ -1250,13 +1251,13 @@ mod tests {
         );
         assert!(!router.is_inference_unquiescent(&call_id));
         assert!(!router.inference_dispatch_fenced());
-        std::fs::remove_dir_all(&data_root).ok();
     }
 
     #[tokio::test]
     async fn proven_exit_survives_a_later_settlement_error() {
         let data_root =
             std::env::temp_dir().join(format!("eliot-inference-proven-exit-{}", ulid::Ulid::new()));
+        let _temp_4 = crate::test_support::TempDir::own(data_root.clone());
         std::fs::create_dir_all(&data_root).unwrap();
         let router = test_router(data_root.clone());
         let (client, call_id) = admit_call(&router).await;
@@ -1289,6 +1290,5 @@ mod tests {
         );
         assert!(!router.is_inference_unquiescent(&call_id));
         assert!(!router.inference_dispatch_fenced());
-        std::fs::remove_dir_all(&data_root).ok();
     }
 }

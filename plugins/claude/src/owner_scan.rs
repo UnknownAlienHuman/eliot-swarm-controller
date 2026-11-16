@@ -211,7 +211,7 @@ mod tests {
 
     static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
 
-    fn scratch_pair() -> (PathBuf, PathBuf) {
+    fn scratch_pair() -> (PathBuf, PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "eliot-claude-owner-scan-{}-{}",
             std::process::id(),
@@ -221,7 +221,7 @@ mod tests {
         let home = root.join("home");
         std::fs::create_dir_all(workspace.join(".claude")).expect("workspace");
         std::fs::create_dir_all(home.join(".claude")).expect("home");
-        (workspace, home)
+        (root, workspace, home)
     }
 
     fn write(path: &Path, text: &str) {
@@ -233,14 +233,16 @@ mod tests {
 
     #[test]
     fn scan_absent_sources_contributes_nothing() {
-        let (workspace, home) = scratch_pair();
+        let (scratch_root, workspace, home) = scratch_pair();
+        let _scratch = crate::test_temp::TempDir::own(scratch_root.clone());
         let entries = scan_owner_mcp_sources_with_home(&workspace, Some(home)).expect("scan");
         assert!(entries.is_empty());
     }
 
     #[test]
     fn scan_reads_mcp_servers_shapes_with_jsonc_tolerance() {
-        let (workspace, home) = scratch_pair();
+        let (scratch_root, workspace, home) = scratch_pair();
+        let _scratch = crate::test_temp::TempDir::own(scratch_root.clone());
         write(
             &workspace.join(".mcp.json"),
             r#"{
@@ -335,7 +337,8 @@ mod tests {
 
     #[test]
     fn refusal_names_the_server_and_source() {
-        let (workspace, home) = scratch_pair();
+        let (scratch_root, workspace, home) = scratch_pair();
+        let _scratch = crate::test_temp::TempDir::own(scratch_root.clone());
         write(
             &workspace.join(".mcp.json"),
             r#"{"mcpServers": {"swarm": {"command": "C:\\Tools\\Eliot\\swarm.exe", "args": ["mcp"]}}}"#,
@@ -351,7 +354,8 @@ mod tests {
         assert!(error.message.contains("\"swarm\""));
         assert!(error.message.contains("project .mcp.json"));
         // A clean layer passes.
-        let (workspace, home) = scratch_pair();
+        let (scratch_root, workspace, home) = scratch_pair();
+        let _scratch = crate::test_temp::TempDir::own(scratch_root.clone());
         refuse_owner_mcp_sources_with_home(&workspace, Some(home), Path::new("swarm"), None)
             .expect("clean layer passes");
     }

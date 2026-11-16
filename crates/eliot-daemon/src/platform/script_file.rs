@@ -321,6 +321,7 @@ mod cleanup_tests {
     #[test]
     fn held_file_refuses_whole_tree_before_any_deletion() {
         let root = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir(&root).unwrap();
         let path = root.join("held");
         std::fs::write(&path, b"owned").unwrap();
@@ -341,16 +342,17 @@ mod cleanup_tests {
     #[test]
     fn hardlinked_pair_inside_tree_is_kept() {
         let root = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+        let _temp_2 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("first"), b"1234567").unwrap();
         std::fs::hard_link(root.join("first"), root.join("second")).unwrap();
         assert_eq!(CleanupTree::open(&root).err().unwrap().code, "hard_link");
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn externally_linked_file_is_kept() {
         let parent = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+        let _temp_3 = crate::test_support::TempDir::own(parent.clone());
         let root = parent.join("tree");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("inner"), b"1234567").unwrap();
@@ -358,10 +360,6 @@ mod cleanup_tests {
         assert_eq!(CleanupTree::open(&root).err().unwrap().code, "hard_link");
         assert!(root.join("inner").exists());
         assert_eq!(std::fs::read(parent.join("outer")).unwrap(), b"1234567");
-        std::fs::remove_file(root.join("inner")).unwrap();
-        std::fs::remove_dir(&root).unwrap();
-        std::fs::remove_file(parent.join("outer")).unwrap();
-        std::fs::remove_dir(&parent).unwrap();
     }
 
     #[test]
@@ -371,6 +369,7 @@ mod cleanup_tests {
             0
         );
         let parent = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+        let _temp_4 = crate::test_support::TempDir::own(parent.clone());
         let root = parent.join("tree");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("leaf"), b"owned").unwrap();
@@ -378,13 +377,13 @@ mod cleanup_tests {
         assert!(std::fs::rename(root.join("leaf"), parent.join("escaped")).is_err());
         assert!(std::fs::rename(&root, parent.join("moved")).is_err());
         tree.remove().unwrap();
-        std::fs::remove_dir(parent).unwrap();
     }
 
     #[test]
     fn cleanup_refuses_nested_repository_and_protected_config_entries() {
         for name in [".git", ".codex", ".claude", ".config", ".ssh"] {
             let root = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+            let _temp_5 = crate::test_support::TempDir::own(root.clone());
             std::fs::create_dir_all(root.join("nested")).unwrap();
             drop(CleanupTree::open(&root).unwrap());
             std::fs::write(root.join("nested").join(name), b"protected").unwrap();
@@ -393,13 +392,13 @@ mod cleanup_tests {
                 "protected_content"
             );
             assert!(root.join("nested").join(name).exists());
-            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
     #[test]
     fn nested_tree_deletion_uses_opened_identity_and_counts_bytes() {
         let parent = std::env::temp_dir().join(format!("eliot-cleanup-{}", ulid::Ulid::new()));
+        let _temp_6 = crate::test_support::TempDir::own(parent.clone());
         let root = parent.join("tree");
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("nested/data"), b"1234567").unwrap();

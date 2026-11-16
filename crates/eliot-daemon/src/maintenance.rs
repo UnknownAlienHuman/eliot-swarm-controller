@@ -327,6 +327,7 @@ mod tests {
     fn unbounded_store_advisory_fires_only_without_windows_over_size() {
         let root =
             std::env::temp_dir().join(format!("eliot-retention-advisory-{}", ulid::Ulid::new()));
+        let _temp_1 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         let unbounded = config::RetentionConfig {
             events_days: None,
@@ -347,7 +348,6 @@ mod tests {
             &root,
             8
         ));
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
@@ -474,6 +474,7 @@ mod tests {
     async fn maintenance_prunes_and_replay_reports_history_gap() {
         let root =
             std::env::temp_dir().join(format!("eliot-retention-maintenance-{}", ulid::Ulid::new()));
+        let _temp_2 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("config.toml"),
@@ -542,13 +543,13 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, "history_gap");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn maintenance_prunes_acked_mail_and_reports_history_gap() {
         let root =
             std::env::temp_dir().join(format!("eliot-mail-maintenance-{}", ulid::Ulid::new()));
+        let _temp_3 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("config.toml"),
@@ -666,7 +667,6 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code, "history_gap");
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -836,6 +836,7 @@ mod tests {
     #[tokio::test]
     async fn run_now_reloads_config_and_reports_bounded_totals() {
         let root = std::env::temp_dir().join(format!("eliot-run-now-{}", ulid::Ulid::new()));
+        let _temp_4 = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("config.toml"),
@@ -886,6 +887,5 @@ mod tests {
         )
         .unwrap();
         assert!(run_now(&store, &root, &policy, pruned_at).await.is_err());
-        let _ = std::fs::remove_dir_all(&root);
     }
 }
