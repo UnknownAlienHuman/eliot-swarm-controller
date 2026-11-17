@@ -730,7 +730,11 @@ Git checkout; `profiles` and `actions` are explicit allowlists over existing glo
 profiles and implemented actions. Missing or empty allowlists deny all. Project
 registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
 project identity includes the canonical checkout and Git common directory, not an Agent's
-project label.
+project label. The registration ID names nothing a person reads: a project's name is the
+owner's `[desktop] display_names` entry, else the repository name of its `origin` remote
+(the readback's read-only `origin`, [api](api.md)), else the folder of the repository's
+main checkout (the parent of the common directory), never a linked worktree's folder.
+A linked worktree is a subproject of its repository, named by its branch.
 
 The optional owner-global `[projects.ID.git]` table binds fetch authority to that
 registration. `fetch_remotes` maps exact remote names to approved direct endpoints without

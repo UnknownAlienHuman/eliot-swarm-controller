@@ -502,6 +502,7 @@ mod tests {
             run_env: Vec::new(),
             git: None,
             revision: 1,
+            origin: None,
         };
         let verbs = ["approve", "deny", "answer"];
         for granted in verbs {
@@ -554,6 +555,7 @@ mod tests {
                 run_env: Vec::new(),
                 git: None,
                 revision: 1,
+                origin: None,
             };
             let mut request = SubmitCommand::new(String::new(), verb);
             request.target = Some("a1".to_owned());
@@ -630,6 +632,7 @@ mod tests {
             run_env: Vec::new(),
             git: None,
             revision: 1,
+            origin: None,
         };
         let project = Principal::ProjectRule { registration };
         let mut request = SubmitCommand::new("", "run");

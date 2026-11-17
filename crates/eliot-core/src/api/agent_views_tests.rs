@@ -50,9 +50,12 @@ fn project_registration_readback_preserves_explicit_empty_allowsets() {
         run_env: Vec::new(),
         git: None,
         revision: 1,
+        origin: None,
     };
     view.validate().unwrap();
     let wire = serde_json::to_value(&view).unwrap();
+    // No origin read: the field is absent, not null.
+    assert!(wire.get("origin").is_none());
     assert_eq!(wire["profiles"], json!([]));
     assert_eq!(wire["actions"], json!([]));
     assert_eq!(wire["interpreters"], json!({}));
@@ -77,9 +80,41 @@ fn project_registration_readback_preserves_explicit_empty_allowsets() {
     let mut invalid = view.clone();
     invalid.profiles = vec!["fake".to_owned(), "fake".to_owned()];
     assert!(invalid.validate().is_err());
-    invalid = view;
+    invalid = view.clone();
     invalid.actions = vec!["stop".to_owned(), " ".to_owned()];
     assert!(invalid.validate().is_err());
+
+    let mut named = view;
+    named.origin = Some("atlas-web".to_owned());
+    named.validate().unwrap();
+    for bad in ["", "org/atlas", "user@host", "a b", "..", "x:y"] {
+        named.origin = Some(bad.to_owned());
+        assert!(named.validate().is_err(), "{bad:?}");
+    }
+}
+
+#[test]
+fn origin_urls_read_as_their_repository_name_without_credentials() {
+    for (url, name) in [
+        ("https://github.com/acme/atlas-web.git", Some("atlas-web")),
+        (
+            "https://user:secret@example.com/acme/atlas.git/",
+            Some("atlas"),
+        ),
+        ("git@github.com:acme/atlas.git", Some("atlas")),
+        ("ssh://git@host:2222/srv/atlas", Some("atlas")),
+        ("file:///srv/git/tools.git", Some("tools")),
+        ("/srv/git/tools.git\n", Some("tools")),
+        (r"C:\repos\atlas.git", Some("atlas")),
+        ("https://host/acme/atlas.git?token=secret", Some("atlas")),
+        ("atlas", Some("atlas")),
+        ("https://host/", Some("host")),
+        ("", None),
+        ("   ", None),
+        ("https://host/acme/.git", None),
+    ] {
+        assert_eq!(repository_name_from_url(url).as_deref(), name, "{url:?}");
+    }
 }
 
 #[test]

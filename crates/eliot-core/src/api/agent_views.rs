@@ -611,6 +611,44 @@ pub struct ProjectRegistrationView {
     #[serde(default)]
     pub git: Option<ProjectGitView>,
     pub revision: i64,
+    /// The repository's name from its `origin` remote URL (the last path
+    /// segment without `.git`), read live from Git by `project.list` and
+    /// `project.get`. Read-only: never stored or settable, never the URL
+    /// itself (which may embed credentials); absent without an `origin`
+    /// remote or when Git cannot read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+/// A bare repository name as [`ProjectRegistrationView::origin`] carries
+/// it: nonempty, at most 255 characters, no path, user or port separators,
+/// whitespace or control characters.
+fn is_repository_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '/' | '\\' | ':' | '@' | '?' | '#')
+        })
+}
+
+/// The repository name of a Git remote URL: its last path segment without
+/// a trailing `.git` (`https://host/org/atlas.git`, `git@host:org/atlas`,
+/// a Windows path ending in `atlas.git` and `/srv/atlas/` all read `atlas`). Only the name
+/// leaves: user info, host, query and fragment are dropped, so a URL that
+/// embeds credentials never reaches a readback. `None` when no valid name
+/// remains.
+pub fn repository_name_from_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    let last = url
+        .rsplit(['/', '\\', ':'])
+        .find(|segment| !segment.is_empty())?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    is_repository_name(name).then(|| name.to_owned())
 }
 
 /// Result of project discovery; `None` means the path is not a Git checkout.
@@ -639,6 +677,14 @@ impl ProjectRegistrationView {
         validate_project_run_env(&self.run_env)?;
         if let Some(git) = &self.git {
             git.validate()?;
+        }
+        if let Some(origin) = &self.origin
+            && !is_repository_name(origin)
+        {
+            return Err(Error::new(
+                "invalid",
+                "project origin must be a bare repository name",
+            ));
         }
         for (reference, interpreter) in &self.interpreters {
             if reference.is_empty()

@@ -2269,6 +2269,10 @@ impl Router {
             .await
             .get_project_registration("owner", &request.id)?
             .ok_or_else(|| Error::new("not_found", "project registration was not found"))?;
+        // Git reads run after the Store lock is released.
+        let mut registrations = [registration];
+        crate::workspace_git::WorkspaceGit::fill_origins(&mut registrations).await;
+        let [registration] = registrations;
         registration.validate()?;
         serde_json::to_value(registration)
             .map_err(|_| Error::new("internal", "project registration could not be encoded"))
@@ -2277,12 +2281,14 @@ impl Router {
     async fn project_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
         let _: ProjectListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
-        let registrations = self
+        let mut registrations = self
             .inner
             .store
             .lock()
             .await
             .list_project_registrations("owner", None, PAGE_MAX)?;
+        // Git reads run after the Store lock is released.
+        crate::workspace_git::WorkspaceGit::fill_origins(&mut registrations).await;
         for registration in &registrations {
             registration.validate()?;
         }
@@ -10973,6 +10979,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             run_env: Vec::new(),
             git: None,
             revision: 1,
+            origin: None,
         };
         let mut request = SubmitCommand::new(String::new(), "resume");
         request.target = Some("a7".to_owned());
@@ -11098,6 +11105,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             run_env: Vec::new(),
             git: None,
             revision: 1,
+            origin: None,
         };
         let mut request = SubmitCommand::new(String::new(), "launch");
         request.expected_generation = Some(0);
@@ -11162,6 +11170,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             run_env: Vec::new(),
             git: None,
             revision: 1,
+            origin: None,
         };
         let command = Command {
             id: "launch-command".to_owned(),
@@ -12956,6 +12965,7 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
             run_env: Vec::new(),
             git: None,
             revision: 1,
+            origin: None,
         };
         let foreign = Principal::Agent {
             id: "a9999".to_owned(),
@@ -13589,6 +13599,7 @@ mod run_authorization_tests {
                     run_env: vec![],
                     git: None,
                     revision: 0,
+                    origin: None,
                 },
             },
         ] {

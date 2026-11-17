@@ -588,6 +588,13 @@ canonical checkout, repository common directory, explicit profile/action allowli
 optional Git fetch approval. They do not create or modify registrations. Their project
 values use Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs),
 whose optional `git` value uses [`ProjectGitView` and `GitCredentialHelper`](../../crates/eliot-core/src/api/agent_views.rs).
+The read-only `origin` is the repository's name from its `origin` remote URL (the last
+path segment without `.git`, [`repository_name_from_url`](../../crates/eliot-core/src/api/agent_views.rs)),
+read live with one bounded `git config --get remote.origin.url` per distinct common
+directory after the Store lock is released, in the Git probe's sanitized environment.
+It is never stored or settable and never the URL itself; it is absent without an
+`origin` remote or when Git cannot read it. Clients name a project by it before the
+main checkout's folder.
 
 `workspace.list {after?, limit?}` is an owner-only page of the managed worktrees
 that `launch --worktree` prepared and that are not yet removed, read from the

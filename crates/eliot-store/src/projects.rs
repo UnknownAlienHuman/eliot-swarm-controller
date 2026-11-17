@@ -932,6 +932,7 @@ fn normalize_registration(input: &ProjectRegistrationInput) -> Result<ProjectReg
         interpreters: interpreters.clone(),
         run_env: run_env.clone(),
         revision: 1,
+        origin: None,
     };
     view.validate()?;
     Ok(ProjectRegistrationInput {
@@ -1181,6 +1182,7 @@ fn project_registration_from_row(
             interpreters,
             run_env,
             revision,
+            origin: None,
         },
     })
 }

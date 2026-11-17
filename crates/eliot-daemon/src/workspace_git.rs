@@ -21,6 +21,8 @@ use tokio::{
 };
 
 const READ_TIME: Duration = Duration::from_secs(15);
+/// A project list waits at most this long for one repository's origin.
+const ORIGIN_READ_TIME: Duration = Duration::from_secs(3);
 const METADATA_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug)]
@@ -72,6 +74,63 @@ impl WorkspaceGit {
             path_text(&repository.root)?,
             path_text(&repository.common_dir)?,
         ))
+    }
+
+    /// The repository name of `common_dir`'s `origin` remote
+    /// ([`eliot_core::api::repository_name_from_url`]): one bounded
+    /// `git config --get remote.origin.url` run in the common directory with
+    /// the probe's sanitized environment (no inherited `GIT_*`). `None`
+    /// without an origin, for a missing directory, or when Git cannot read
+    /// it. The URL itself, which may embed credentials, never leaves here.
+    pub(crate) async fn origin_name(&self, common_dir: &str) -> Option<String> {
+        let root = canonical_root(common_dir).ok()?;
+        let output = self
+            .git
+            .workspace_command(
+                &root,
+                &["config", "--get", "remote.origin.url"],
+                Instant::now() + ORIGIN_READ_TIME,
+            )
+            .await
+            .ok()?;
+        if output.code != 0 {
+            return None;
+        }
+        eliot_core::api::repository_name_from_url(std::str::from_utf8(&output.stdout).ok()?)
+    }
+
+    /// Fill each registration's read-only `origin`, one read per distinct
+    /// Git common directory, concurrently. Registrations whose origin
+    /// cannot be read keep `None`.
+    pub(crate) async fn fill_origins(
+        registrations: &mut [eliot_core::api::ProjectRegistrationView],
+    ) {
+        if registrations.is_empty() {
+            return;
+        }
+        let Ok(git) = Self::new() else {
+            return;
+        };
+        let mut common_dirs: Vec<&str> = registrations
+            .iter()
+            .map(|registration| registration.repo_common_dir.as_str())
+            .collect();
+        common_dirs.sort_unstable();
+        common_dirs.dedup();
+        let names = futures_util::future::join_all(
+            common_dirs
+                .iter()
+                .map(|common_dir| git.origin_name(common_dir)),
+        )
+        .await;
+        let by_dir: std::collections::HashMap<String, Option<String>> = common_dirs
+            .into_iter()
+            .map(str::to_owned)
+            .zip(names)
+            .collect();
+        for registration in registrations {
+            registration.origin = by_dir.get(&registration.repo_common_dir).cloned().flatten();
+        }
     }
 
     /// Discover the canonical checkout containing an Owner-opened directory.
@@ -1266,5 +1325,55 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code, "unavailable");
+    }
+
+    #[tokio::test]
+    async fn origin_names_come_from_the_common_directory_without_credentials() {
+        let root = TestRoot::new("origin");
+        init_repo(&root.0);
+        let common = path_text(&root.0.join(".git")).expect("fixture path is UTF-8");
+        let registration = |id: &str| eliot_core::api::ProjectRegistrationView {
+            id: id.to_owned(),
+            checkout: path_text(&root.0).expect("fixture path is UTF-8"),
+            repo_common_dir: common.clone(),
+            profiles: Vec::new(),
+            actions: Vec::new(),
+            interpreters: Default::default(),
+            run_env: Vec::new(),
+            git: None,
+            revision: 1,
+            origin: Some("stale".to_owned()),
+        };
+        let missing = {
+            let mut gone = registration("gone");
+            gone.repo_common_dir =
+                path_text(&root.0.join("missing").join(".git")).expect("fixture path is UTF-8");
+            gone
+        };
+        // No origin remote: nothing to name it by.
+        let mut registrations = vec![registration("a"), missing.clone()];
+        WorkspaceGit::fill_origins(&mut registrations).await;
+        assert_eq!(registrations[0].origin, None);
+        assert_eq!(registrations[1].origin, None);
+
+        git(
+            &root.0,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://user:secret@example.com/acme/atlas-web.git",
+            ],
+        );
+        let mut registrations = vec![registration("a"), registration("b"), missing];
+        WorkspaceGit::fill_origins(&mut registrations).await;
+        let origins: Vec<Option<&str>> = registrations
+            .iter()
+            .map(|registration| registration.origin.as_deref())
+            .collect();
+        assert_eq!(origins, [Some("atlas-web"), Some("atlas-web"), None]);
+        for registration in &registrations {
+            registration.validate().expect("filled view stays valid");
+        }
     }
 }
