@@ -135,7 +135,7 @@ pub async fn archive_agent(
     Ok(reply.affected)
 }
 
-/// `agent.delete` (Owner only, stopped trees only): removes the tree's
+/// `agent.delete` (Owner only, stopped or failed trees): removes the tree's
 /// records from the Store; never the workspace, native store files or
 /// branches.
 pub async fn delete_agent(data_dir: &Path, mutation_id: String, agent: &str) -> Result<usize> {

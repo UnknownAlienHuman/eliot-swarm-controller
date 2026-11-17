@@ -852,7 +852,7 @@ read paths; a retried ack over it succeeds as already acked. An unset
 never stops a generation. Archive/unarchive requires idle or stopped descendants,
 no active or unknown turns, pending requests or open commands.
 Send, resume, steer and inject admission atomically clears the target's archive flag.
-Deletion requires every descendant stopped and drained, and shares retention's leaf-first command
+Deletion requires every descendant stopped or failed and drained, and shares retention's leaf-first command
 row cleanup. Store removes dependent records in one transaction and retains
 mutation replies plus deleted command identities through the retry window. It
 advances the conservative retained-history floor before removing event rows,
