@@ -21,6 +21,7 @@ pub(crate) enum SettingsAuthor {
     Owner(SettingsClientSource),
     Bootstrap,
     ProjectDiscovery,
+    ProjectCleanup,
 }
 
 impl SettingsAuthor {
@@ -30,6 +31,7 @@ impl SettingsAuthor {
             Self::Owner(SettingsClientSource::Desktop) => "owner:desktop",
             Self::Bootstrap => "bootstrap",
             Self::ProjectDiscovery => "project_discovery",
+            Self::ProjectCleanup => "project_cleanup",
         }
     }
 }
@@ -263,6 +265,46 @@ pub(crate) fn save_internal(
         dry_run,
         policy,
     )
+}
+
+/// Publish an Owner cleanup through the same settings writer and revoke
+/// exactly the removed registrations. Unselected paths may also be missing.
+pub(crate) fn remove_stale_projects(
+    data_root: &Path,
+    store: &mut Store,
+    revision: &str,
+    projects: JsonMap<String, JsonValue>,
+    removed: &[String],
+    policy: &SecretPolicy,
+) -> core::Result<()> {
+    let _guard = SETTINGS_SAVE_LOCK
+        .lock()
+        .map_err(|_| core::Error::new("internal", "settings save lock poisoned"))?;
+    let reply = save_internal_locked(
+        data_root,
+        store,
+        Some(revision),
+        &BTreeMap::from([(SettingsSection::Projects, JsonValue::Object(projects))]),
+        SettingsAuthor::ProjectCleanup,
+        false,
+        policy,
+    )?;
+    if !reply.saved
+        || current_revision(data_root).map_err(|_| {
+            core::Error::new("unknown", "project cleanup revision could not be verified")
+        })? != reply.revision
+    {
+        return Err(core::Error::new(
+            "unknown",
+            "project cleanup publication could not be confirmed",
+        ));
+    }
+    store.remove_project_registrations(removed).map_err(|_| {
+        core::Error::new(
+            "unknown",
+            "project settings were saved but Store reconciliation is uncertain",
+        )
+    })
 }
 
 fn save_internal_locked(

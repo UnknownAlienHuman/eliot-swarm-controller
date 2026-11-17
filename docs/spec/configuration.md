@@ -778,8 +778,9 @@ registration and the target's approved profile, repository identity, workspace r
 and exact generation before an effect. Missing or changed authority fails closed; there
 is no Owner fallback for a project-scoped request.
 
-Project configuration changes use the private global settings writer, with Owner or
-internal project-discovery author attribution. Invalid
+Project configuration changes use the private global settings writer. History
+attributes discovery to `project_discovery` and Owner cleanup of stale registrations
+to `project_cleanup`. Invalid
 project rule reload retains the last valid definition and reports a bounded diagnostic.
 
 ## Frozen profile and route binding

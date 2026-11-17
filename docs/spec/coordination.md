@@ -92,6 +92,21 @@ native store files are never touched. Logical reclaimed bytes count only fully
 confirmed removed trees; partial attempts report unknown and zero confirmed
 bytes.
 
+Owner plans with scope `all` or a registration ID in scope `project` include
+project registrations from the current settings revision. A creation-time cutoff
+excludes these entries because the settings do not record their creation time.
+The plan marks a registration safe only when its configured checkout path is
+missing and no live or unsettled Agent uses the registration or checkout. A
+present or unverifiable path, or a live binding, keeps the entry with a reason.
+Apply checks the plan's settings revision, path and Agent use again, then removes
+the selected stale entries in one revision-checked write through the private
+settings writer and records the change in settings history. The Store revokes
+their registration authority while retaining Agent project labels, workspaces
+and archived history. No filesystem tree is deleted by a project-registration
+candidate. CLI callers pass one `--artifact <id>` per safe registration selected with
+`cleanup apply <plan-id>`. The desktop's Project
+registrations group starts unchecked.
+
 The current limits are 64 candidates, 4,096 retained artifacts, 1,024 retained
 plans, 10,000 filesystem entries, depth 64 and five seconds per tree scan.
 Exceeding a bound refuses the tree before deletion. Ledger exhaustion rejects new

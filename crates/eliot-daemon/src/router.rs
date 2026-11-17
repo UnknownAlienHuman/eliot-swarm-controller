@@ -2468,12 +2468,31 @@ impl Router {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn reconcile_project_registrations(
         &self,
         inputs: &[ProjectRegistrationInput],
     ) -> Result<Vec<ProjectRegistrationView>> {
+        let revision = crate::config::settings::current_revision(&self.inner.data_root)?;
+        self.reconcile_configured_projects(inputs, revision.as_deref())
+            .await
+    }
+
+    pub(crate) async fn reconcile_configured_projects(
+        &self,
+        inputs: &[ProjectRegistrationInput],
+        expected_revision: Option<&str>,
+    ) -> Result<Vec<ProjectRegistrationView>> {
         let change = {
             let mut store = self.inner.store.lock().await;
+            if crate::config::settings::current_revision(&self.inner.data_root)?.as_deref()
+                != expected_revision
+            {
+                return Err(Error::new(
+                    "conflict",
+                    "project settings changed during reconciliation",
+                ));
+            }
             let change = store.reconcile_project_registrations("owner", inputs, now_ms())?;
             self.publish_locked(&change.events);
             change
