@@ -559,13 +559,29 @@ impl Store {
                 "cleanup plan is already consumed; read the original apply id",
             ));
         }
-        // Fence every attempted artifact across new plans and daemon restarts.
+        // Read ownership in the same transaction that reserves attempts. Agent
+        // ids are never reused, so deletion supersedes even a snapshot retained
+        // after the Agent was removed.
         for (index, item) in plan.items.iter().enumerate() {
+            let agent = parse_agent_id(&item.artifact.agent)?;
+            let retained: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agents WHERE id=?1)",
+                    [agent],
+                    |r| r.get(0),
+                )
+                .map_err(sql_error)?;
+            if !retained {
+                response.items[index].outcome = "skipped".to_owned();
+                response.items[index].reason = Some("superseded".to_owned());
+                continue;
+            }
+            // Fence every attempted artifact across new plans and daemon restarts.
             if attempted(item) {
                 let body: Option<String> = tx
                     .query_row(
-                        "SELECT body FROM artifacts WHERE id=?1",
-                        [&item.artifact.id],
+                        "SELECT body FROM artifacts WHERE id=?1 AND agent=?2",
+                        params![item.artifact.id, agent],
                         |r| r.get(0),
                     )
                     .optional()
@@ -800,6 +816,11 @@ mod tests {
         let (_, mut first, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
         assert!(is_new);
         assert_eq!(first.items[0].outcome, "unknown");
+        let error = store
+            .change_agent_tree(&Ulid::new().to_string(), "a1", None, now)
+            .unwrap_err();
+        assert_eq!(error.code, "busy");
+        assert!(error.message.contains("unknown artifact"));
         first.items[0].reason = Some("malformed_archive_acknowledgement".to_owned());
         let outcome = first.items[0].clone();
         store

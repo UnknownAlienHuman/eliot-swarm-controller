@@ -55,6 +55,10 @@ optional `artifacts` list (at most 64 unique ids, each a safe candidate of that
 plan) attempts only those; the plan's other safe candidates settle
 `skipped(not_selected)` without an attempt fence, so a later plan offers them again.
 The selection is part of the request binding.
+Deleting an Agent tree supersedes all of its items in unapplied plans at the
+deletion commit. Apply keeps the original selection binding and records those
+items as `skipped(superseded)`, without reserving an attempt or touching their
+artifacts. Other items proceed under the same plan and checks.
 The Store commits an unknown attempt before effects and settles results before
 acknowledgement. Exact same-ID replay returns the retained response. Another ID
 cannot consume the plan; another pre-existing plan cannot retry an attempted

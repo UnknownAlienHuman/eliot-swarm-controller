@@ -251,21 +251,8 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     for num in members {
         db!(tx.execute("INSERT INTO deleted_agents VALUES (?1)", [num]));
     }
-    let cleanup_pending: bool = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM cleanup_plans p, json_each(p.body,'$.items') i
-         WHERE p.apply_id IS NULL AND json_extract(i.value,'$.artifact.agent')
-             IN (SELECT 'a'||id FROM deleted_agents))",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
-    if cleanup_pending {
-        return Err(Error::new(
-            "busy",
-            "Agent tree has an unconsumed cleanup plan",
-        ));
-    }
+    // Active cleanup attempts already block in custody_blocker_tx. Deleting
+    // the Agent supersedes plan items that never acquired an attempt fence.
     let crossing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM commands c JOIN commands p ON p.id=c.parent_command WHERE (c.target IN (SELECT id FROM deleted_agents)) != (p.target IN (SELECT id FROM deleted_agents)))",[],|r|r.get(0)).map_err(sql_error)?;
     if crossing {
         return Err(Error::new(

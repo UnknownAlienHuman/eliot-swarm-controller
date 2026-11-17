@@ -252,66 +252,81 @@ fn delete_refuses_its_own_live_git_source_even_without_a_cursor() {
 }
 
 #[test]
-fn delete_refuses_unconsumed_cleanup_and_preserves_consumed_replay() {
+fn delete_supersedes_only_the_tree_items_in_an_unapplied_plan() {
     use eliot_core::api::{
         ArtifactKind, ArtifactView, CleanupApplyRequest, CleanupCandidate, CleanupPlan,
     };
     let mut store = Store::open(Path::new(":memory:")).unwrap();
     let now = Ulid::new().timestamp_ms() as i64;
-    for _ in 0..2 {
-        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','stopped',2,?1,?1)",[now]).unwrap();
+    for parent in [None, Some(1), None] {
+        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at,parent) VALUES ('p','codex','p','stopped',1,?1,?1,?2)",rusqlite::params![now,parent]).unwrap();
     }
-    let artifact = ArtifactView {
-        id: Ulid::new().to_string(),
-        agent: "a1".to_owned(),
-        generation: 1,
-        project: "p".to_owned(),
-        tree: vec!["a1:1".to_owned()],
-        path: "C:/scratch/old".to_owned(),
-        kind: ArtifactKind::Temp,
-        purpose: "old output".to_owned(),
-        identity: "old".to_owned(),
-        created_at: now,
-        state: "registered".to_owned(),
-        git: None,
+    let mut candidate = |agent: &str, verdict: &str| {
+        let artifact = ArtifactView {
+            id: Ulid::new().to_string(),
+            agent: agent.to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: Vec::new(),
+            path: format!("C:/scratch/{agent}"),
+            kind: ArtifactKind::Temp,
+            purpose: "old output".to_owned(),
+            identity: agent.to_owned(),
+            created_at: now,
+            state: "registered".to_owned(),
+            git: None,
+        };
+        store.record_known_artifact(artifact.clone()).unwrap();
+        CleanupCandidate {
+            artifact,
+            bytes: None,
+            verdict: verdict.to_owned(),
+            reason: "reviewed".to_owned(),
+        }
     };
     let plan = CleanupPlan {
         plan_id: Ulid::new().to_string(),
         created_at: now,
-        items: vec![CleanupCandidate {
-            artifact,
-            bytes: None,
-            verdict: "keep".to_owned(),
-            reason: "retained".to_owned(),
-        }],
+        items: vec![
+            candidate("a1", "safe"),
+            candidate("a2", "keep"),
+            candidate("a3", "safe"),
+        ],
         truncated: false,
     };
     store.retain_cleanup_plan("owner", &plan).unwrap();
-    let mut unrelated = plan.clone();
-    unrelated.plan_id = Ulid::new().to_string();
-    unrelated.items[0].artifact.agent = "a2".to_owned();
-    store.retain_cleanup_plan("owner", &unrelated).unwrap();
     let delete_id = Ulid::new().to_string();
-    assert_eq!(
-        store
-            .change_agent_tree(&delete_id, "a1", None, now)
-            .unwrap_err()
-            .code,
-        "busy"
-    );
-    assert!(store.get_agent("a1").unwrap().is_some());
+    let deleted = store
+        .change_agent_tree(&delete_id, "a1", None, now)
+        .unwrap();
+    assert_eq!(deleted["affected"], 2);
+    assert!(store.get_agent("a1").unwrap().is_none());
+    assert!(store.get_agent("a2").unwrap().is_none());
+    assert!(store.get_agent("a3").unwrap().is_some());
     let request = CleanupApplyRequest {
         id: Ulid::new().to_string(),
         plan_id: plan.plan_id.clone(),
         delete_remote: false,
-        artifacts: None,
+        artifacts: Some(vec![plan.items[0].artifact.id.clone()]),
     };
     let (_, first, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
     assert!(is_new);
-    store
-        .change_agent_tree(&delete_id, "a1", None, now)
-        .unwrap();
-    assert!(store.cleanup_plan("owner", &unrelated.plan_id).is_ok());
+    assert_eq!(first.bytes_reclaimed, 0);
+    for (outcome, input) in first.items[..2].iter().zip(&plan.items) {
+        assert_eq!(outcome.artifact_id, input.artifact.id);
+        assert_eq!(outcome.outcome, "skipped");
+        assert_eq!(outcome.reason.as_deref(), Some("superseded"));
+    }
+    assert_eq!(first.items[2].outcome, "skipped");
+    assert_eq!(first.items[2].reason.as_deref(), Some("not_selected"));
+    assert_eq!(
+        store
+            .known_artifact_path("C:/scratch/a3")
+            .unwrap()
+            .unwrap()
+            .state,
+        "registered"
+    );
     let (_, replay, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
     assert!(!is_new);
     assert_eq!(

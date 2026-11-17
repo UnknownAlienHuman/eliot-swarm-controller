@@ -669,8 +669,10 @@ does not need to rewrite its failure state. A `busy` refusal names the blocking
 Agent and its actual state, pending requests, command, turn (including generation
 and retained state) or undrained process, source or artifact, rather than treating stopped lifecycle as proof of drained
 history. A retained `unknown` turn still blocks deletion after stop. Live custody, open
-commands, uncertain turns, applicable unconsumed cleanup plans or a pinned history
-floor return `busy`; oversized operations return `unavailable` atomically. It never stops an Agent or deletes
+commands, uncertain turns, active or uncertain cleanup attempts, or a pinned history
+floor return `busy`; oversized operations return `unavailable` atomically. An unapplied
+[cleanup review](coordination.md#registered-artifacts-and-cleanup-k69) is superseded
+for the deleted tree's items. Delete never stops an Agent or deletes
 workspace files, native stores or Git branches. Run artifact cleanup separately
 before removing its ownership records. Process records for every generation of the
 tree are removed; consumed cleanup plans and their exact apply replay remain retained.
