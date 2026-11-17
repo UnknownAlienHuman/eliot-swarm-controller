@@ -325,28 +325,25 @@ and the terminal carried no `usage` (turn `usage: null`, `usage --agent`
 `turns_without_usage 1`, `sessions snapshots 0`,
 `generations_without_snapshot 1`). Text length is never used to estimate
 tokens.
-Quota exhaustion has no typed signal at the ACP level and is
-protocol-indistinguishable from a normal answer. Verified live
-2026-11-15 against installed `agy` 1.5.9 (profile `gemini-4-argon-low`,
-served as base `gemini-4-argon` plus `thought_level low`): ten
-consecutive quota-blocked prompts each produced exactly one
-`agent_message_chunk` carrying the warning text (`U+26A0 Individual
-quota reached. ... Resets in ...`) followed by the terminal
-`{"stopReason": "end_turn"}` with no `usage` object and no `_meta`.
-No `session/update` error/refusal kind, no JSON-RPC error object and
-no stderr accompanied any blocked turn, so per
-[monitoring](../spec/monitoring.md#provider-holds) no hold
-may be inferred from the text and the turn completes as `success`. The
-absent `usage` object is not a substitute signal either: usage-free
-normal turns exist (see the 1.5.3 turn above). The 429
-(`RESOURCE_EXHAUSTED`) surfaces only in agy's own CLI log file
-(captured via explicit `--cli_log_file`; observed default app-data
-directory `%USERPROFILE%\.gemini\antigravity-cli`), never on the ACP
-stdio stream, and the CLI exposes no quota/usage query (`agy usage`
-and `agy quota` are not subcommands; only `agy models` reads
-model state). The warning glyph is valid UTF-8 on the wire and in the
-stored event (`U+26A0`, bytes `E2 9A A0`); it only appears garbled when a
-reader decodes the output with a single-byte code page.
+Quota exhaustion has no structured signal in the observed ACP response.
+Reproduced 2026-11-17 against installed `agy` 1.5.10 and
+`gemini-4-argon-high`: an `agent_message_chunk` contains only
+`⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 107h59m40s.`,
+followed by `{"stopReason":"end_turn"}`, without an error, usage or `_meta`.
+The adapter therefore uses the explicit text fallback in
+[`quota::turn_restriction`](../../plugins/antigravity/src/quota.rs): only the
+complete assembled assistant warning matches, allowing surrounding whitespace
+and the warning glyph. Quoted examples, substrings, additional prose and
+truncated answers do not match. This is vendor text matching, not a structured
+ACP refusal. A matching normal/refusal terminal settles `failed` / `failure`,
+origin `provider`, `native_error.code:"quota_exhausted"`; `native_status` still
+preserves `end_turn`. Cancelled and unknown native stops retain their semantics.
+The native h/m/s reset hint becomes `provider_restriction.retry_after` in Unix
+milliseconds; an absent, malformed or overflowing hint stays null.
+The existing exact-generation provider hold blocks that frozen profile/account;
+reset expiry only permits an explicit probe and never clears a hold or replays
+the refused input. Absence of token usage is never quota evidence. The warning
+glyph is UTF-8 (`E2 9A A0`); a single-byte console decoder can garble it.
 
 There is no replay cursor/history API. Snapshots expose retained stream
 facts, not a native history poll. Loss means an explicit gap. Do not
@@ -506,8 +503,17 @@ skip. Implementation:
 quota pattern, without copied code. On Windows it reads the installed AGY
 `gemini:antigravity` Credential Manager entry (`token.access_token`) read-only,
 uses `loadCodeAssist` to read the existing quota project, then
-`retrieveUserQuotaSummary` on Google's fixed accounting host. Recognized group
-buckets become model-family 5-hour/weekly windows. Tokens, email and project
+`retrieveUserQuotaSummary` on `daily-cloudcode-pa.googleapis.com`. It uses the
+installed 1.5.10 CLI fingerprint, verified from the vendor binary's
+`codeassistclient.userAgent` and `CLIAuthProvider.GetUserAgentName`, rather than
+the legacy `antigravity/1.0` header. With identical account/project/request,
+that old header returns only Claude/GPT groups; the CLI header also returns
+Gemini and the account's separate Gemini 4 Argon group (observed 2026-11-17).
+The vendor's embedded `QuotaSummaryGroup` / `QuotaSummaryBucket` descriptors
+define `groups`, `displayName`, `buckets`, `window`, `remainingFraction` and
+`resetTime`. Recognized buckets become separately named Gemini, Gemini 4 Argon
+and Claude/GPT 5-hour/weekly windows. A missing group remains absent; no legacy
+model-availability response is substituted for account quota. Tokens, email and project
 identifiers never leave the plugin. No credential refresh or onboarding is done.
 Other platforms currently report a supported environment error because their
 native keyring reader is unimplemented; provider failures also remain supported

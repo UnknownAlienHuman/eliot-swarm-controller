@@ -1519,9 +1519,25 @@ impl State {
     }
 
     async fn settle_prompt(&mut self, result: &PromptResult) -> Result<()> {
-        let Some(status) = result.terminal_status()? else {
+        let Some(mut status) = result.terminal_status()? else {
             return Ok(());
         };
+        let observed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok());
+        let restriction = (!self.text_truncated && matches!(status, "completed" | "failed"))
+            .then(|| crate::quota::turn_restriction(&self.text_accum, observed_at.unwrap_or(0)))
+            .flatten()
+            .map(|mut restriction| {
+                if observed_at.is_none() {
+                    restriction.retry_after = None;
+                }
+                restriction
+            });
+        if restriction.is_some() {
+            status = "failed";
+        }
         // A terminal response alone suffices: no intermediate update is
         // required, matching the old stream-json rule.
         self.associate().await?;
@@ -1551,7 +1567,22 @@ impl State {
         let truncated = self.text_truncated;
         let mut data = json!({"command_id": command, "turn_id": turn,
             "status": status, "outcome": outcome, "native_status": result.stop_reason});
-        if failed {
+        if let Some(restriction) = restriction {
+            eliot_plugin::session::attach_failure_origin(
+                &mut data,
+                "antigravity",
+                eliot_core::FailureOrigin::Provider,
+                "agy 1.5.10 complete native quota warning; ACP returns end_turn without a structured error",
+                &self.policy,
+            );
+            data["native_error"] =
+                json!({"code":"quota_exhausted", "message":"provider quota exhausted"});
+            eliot_plugin::session::attach_provider_restriction(
+                &mut data,
+                restriction,
+                &self.policy,
+            );
+        } else if failed {
             eliot_plugin::session::attach_failure_origin(
                 &mut data,
                 "antigravity",
@@ -2396,6 +2427,64 @@ mod tests {
             );
             finish(tasks).await;
         }
+    }
+
+    #[tokio::test]
+    async fn recorded_quota_chunks_then_end_turn_fail_the_exact_turn() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let _association = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        // Actual agy 1.5.10 session/update content + session/prompt result,
+        // with an extra chunk boundary to exercise ordered accumulation.
+        let prompt: PromptResult =
+            serde_json::from_value(json!({"stopReason":"end_turn"})).unwrap();
+        let (result, terminal) = tokio::join!(
+            async {
+                for text in [
+                    "\n⚠ Individual quota reached. Please upgrade your subscription ",
+                    "to increase your limits. Resets in 107h59m40s.\n",
+                ] {
+                    let frame = json!({"sessionId":"session-1", "update":{
+                    "sessionUpdate":"agent_message_chunk", "content":{"type":"text","text":text}}});
+                    state.update(&frame).await?;
+                }
+                state.settle_prompt(&prompt).await
+            },
+            async {
+                next_commit(&mut commits, "turn.started")
+                    .await
+                    .1
+                    .send(())
+                    .unwrap();
+                next_commit(&mut commits, "message.completed")
+                    .await
+                    .1
+                    .send(())
+                    .unwrap();
+                let (terminal, ack) = next_commit(&mut commits, "turn.completed").await;
+                ack.send(()).unwrap();
+                terminal
+            }
+        );
+        result.unwrap();
+        let data = &terminal["data"];
+        assert_eq!(data["turn_id"], "turn-1");
+        assert_eq!(data["command_id"], "command-1");
+        assert_eq!(data["status"], "failed");
+        assert_eq!(data["outcome"], "failure");
+        assert_eq!(data["origin"], "provider");
+        assert_eq!(data["native_status"], "end_turn");
+        assert_eq!(data["native_error"]["code"], "quota_exhausted");
+        assert_eq!(data["provider_restriction"]["kind"], "quota");
+        assert!(
+            data["provider_restriction"]["retry_after"]
+                .as_i64()
+                .is_some()
+        );
+        assert!(state.pending.is_none());
+        // No text or restriction leaks to a later prompt.
+        state.prepare("command-2".into(), "turn-2".into()).unwrap();
+        assert!(state.text_accum.is_empty());
+        finish(tasks).await;
     }
 
     #[tokio::test]

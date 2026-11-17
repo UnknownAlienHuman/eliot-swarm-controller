@@ -464,6 +464,10 @@ Create or update a hold only from a structured restriction attached to the exact
 generation- and turn-bound controlled `turn.completed`. Generic failure, native error
 text, HTTP status, or a vendor-owned model-catalog response is not a restriction and
 does not create a hold.
+Antigravity's explicitly documented exception is the complete native quota
+warning matched at its plugin boundary when ACP supplies only `end_turn`;
+see [the exact fallback and captured surface](../harnesses/antigravity.md#facts-and-recovery).
+The plugin emits the same typed, exact-turn restriction; Store never parses text.
 
 The pinned Codex 0.161 projection recognizes three exact structured codes:
 `rateLimitExceeded` maps to rate-limit, `usageLimitExceeded` to quota, and
