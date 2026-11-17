@@ -114,7 +114,9 @@ impl Store {
                 let entry = totals
                     .iter_mut()
                     .find(|entry| entry.state == state)
-                    .expect("all Agent states");
+                    .ok_or_else(|| {
+                        Error::new("internal", "Agent state missing from state totals")
+                    })?;
                 entry.total = usize::try_from(total)
                     .map_err(|_| Error::new("internal", "Agent state count exceeds usize"))?;
             }
