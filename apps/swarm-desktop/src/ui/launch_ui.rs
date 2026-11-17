@@ -342,24 +342,30 @@ impl DesktopApp {
                 "A chat in its own private folder".to_owned(),
             ));
         }
-        rows.extend(
-            self.nav
-                .projects
-                .iter()
-                .map(|project| (project, self.project_label(project)))
-                .filter(|(project, label)| {
-                    query.is_empty()
-                        || label.to_lowercase().contains(&query)
-                        || project.workspace.to_lowercase().contains(&query)
-                })
-                .map(|(project, label)| {
-                    (
-                        project.workspace.clone(),
-                        label,
-                        nav::display_path(&project.workspace).to_owned(),
-                    )
-                }),
-        );
+        // Each project, then its subprojects ("app" < "app › x"), as the
+        // sidebar lists them (registered checkouts and the worktrees tasks
+        // run in); a registered folder that is gone cannot start a task.
+        let checkouts = self.checkouts();
+        let mut seen = HashSet::new();
+        let mut projects: Vec<(String, String, String)> = checkouts
+            .iter()
+            .filter(|checkout| !checkout.missing && seen.insert(nav::path_key(&checkout.path)))
+            .map(|checkout| (checkout, self.place_title_in(&checkout.path, &checkouts)))
+            .filter(|(checkout, label)| {
+                query.is_empty()
+                    || label.to_lowercase().contains(&query)
+                    || checkout.path.to_lowercase().contains(&query)
+            })
+            .map(|(checkout, label)| {
+                (
+                    checkout.path.clone(),
+                    label,
+                    nav::display_path(&checkout.path).to_owned(),
+                )
+            })
+            .collect();
+        projects.sort_by(|a, b| a.1.cmp(&b.1));
+        rows.extend(projects);
         rows.push((
             OTHER_FOLDER.to_owned(),
             "Other folder…".to_owned(),

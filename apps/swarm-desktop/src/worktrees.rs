@@ -21,11 +21,12 @@ pub struct Worktree {
 }
 
 /// Managed worktrees grouped by project name, `(project, worktrees)`
-/// sorted by project then path. `registered` are the `(checkout, name)`
-/// pairs that give a project label its name.
+/// sorted by project then path: the logical name of each worktree's
+/// project label ([`nav::project_of`] over `checkouts`), never a
+/// registration ID.
 pub fn grouped(
     rows: &[ManagedWorkspaceView],
-    registered: &[(String, String)],
+    checkouts: &[nav::Checkout],
 ) -> Vec<(String, Vec<Worktree>)> {
     let mut groups: Vec<(String, Vec<Worktree>)> = Vec::new();
     for row in rows {
@@ -34,7 +35,7 @@ pub fn grouped(
         } else {
             &row.project
         };
-        let project = nav::project_name(label, registered);
+        let project = nav::project_of(label, checkouts);
         let worktree = Worktree {
             path: nav::display_path(&row.worktree_path).to_owned(),
             branch: row.branch.clone(),
@@ -385,10 +386,13 @@ mod tests {
             row("a2", r"C:\src\app", r"D:\wt\app-a", WorkspacePhase::Ready),
             row("a5", r"C:\src\lib", r"D:\wt\lib-a", WorkspacePhase::Unknown),
         ];
-        let registered = vec![(r"C:\src\app".to_owned(), "app".to_owned())];
+        let mut app = nav::Checkout::new(r"C:\src\app", r"C:\src\app\.git");
+        app.origin = Some("app-web".to_owned());
+        let registered = vec![app];
         let groups = grouped(&rows, &registered);
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].0, "app");
+        // The origin's name, as everywhere else.
+        assert_eq!(groups[0].0, "app-web");
         assert_eq!(
             groups[0]
                 .1

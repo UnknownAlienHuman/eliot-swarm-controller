@@ -10,14 +10,20 @@
 //! listed children at once and its fetched branch, the authoritative
 //! direct-children page, when that read returns.
 //!
-//! A project is a repository: every registered checkout carries the Git
-//! common directory the daemon registered with it, so the worktrees of one
-//! repository form one group named after the repository, and a task row
-//! names its worktree only where the group spans several. Inside a group,
-//! running tasks stay on top, then the rest newest first; stopped tasks
-//! last changed before today fold into one "Show N older" row (the Codex
-//! sidebar's pattern). Titles come with each listed summary
-//! ([`summary_title`]), so every page carries its own.
+//! A project is a repository, a subproject one of its linked worktrees
+//! (one level of nesting: Project → Subprojects → Tasks). Every registered
+//! checkout carries the Git common directory the daemon registered with it,
+//! so the checkouts of one repository form one project. Its logical name
+//! ([`repository_name`]) is the repository name of its `origin` remote,
+//! else its main checkout's folder, never a registration ID or a linked
+//! worktree's folder; a subproject reads as its branch ([`branch_words`]:
+//! `feat/k141-monitor-charts` is "k141 monitor charts"), a detached one as
+//! its folder. Tasks in the main checkout sit directly under the project.
+//! Running tasks stay on top, then the rest newest first; stopped tasks
+//! last changed before today, and subprojects with nothing live and nothing
+//! from today, fold into one "Show N older" row (the Codex sidebar's
+//! pattern). Titles come with each listed summary ([`summary_title`]), so
+//! every page carries its own.
 
 use std::collections::{HashMap, HashSet};
 
@@ -150,9 +156,9 @@ pub struct Row {
     pub expanded: bool,
     /// The branch read state when expanded (loading, failed, more exist).
     pub note: Option<String>,
-    /// The worktree the task runs in, named only in a project whose tasks
-    /// run in more than one checkout, and only outside its main checkout.
-    pub place: Option<String>,
+    /// Listed under a subproject (one more indent than a project's own
+    /// tasks).
+    pub nested: bool,
 }
 
 impl Row {
@@ -161,65 +167,138 @@ impl Row {
     }
 }
 
-/// A registered checkout and the Git common directory of its repository,
-/// as the daemon registered them.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A checkout of a repository: a registered one (`project.list`), or a task
+/// folder the desktop found to be a worktree of one (Git's own files).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Checkout {
     pub path: String,
+    /// The Git common directory of its repository.
     pub common_dir: String,
+    /// The branch checked out there ([`head_branch`]); `None` for a
+    /// detached HEAD or when it was not read.
+    pub branch: Option<String>,
+    /// The repository's name from its `origin` remote (`project.list`'s
+    /// read-only `origin`), on any checkout of the repository.
+    pub origin: Option<String>,
+    /// A registered checkout whose folder is gone.
+    pub missing: bool,
 }
 
-/// A readable project name: the registered id for a registered checkout,
-/// otherwise the last component of the label.
-pub fn project_name(label: &str, registered: &[(String, String)]) -> String {
-    if let Some((_, id)) = registered.iter().find(|(checkout, _)| checkout == label) {
-        return id.clone();
+impl Checkout {
+    pub fn new(path: impl Into<String>, common_dir: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            common_dir: common_dir.into(),
+            ..Self::default()
+        }
     }
-    folder_name(label).to_owned()
 }
 
 /// The last component of a path (both separators: labels are Windows
 /// paths on Windows, POSIX elsewhere).
-fn folder_name(path: &str) -> &str {
+pub fn folder_name(path: &str) -> &str {
     path.rsplit(['\\', '/'])
         .find(|part| !part.is_empty())
         .unwrap_or(path)
 }
 
-/// Ids the daemon's project discovery mints: `project-` and a SHA-256.
-fn is_discovered_id(id: &str) -> bool {
-    id.strip_prefix("project-")
-        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+/// The branch a Git `HEAD` file names (`ref: refs/heads/<branch>`,
+/// gitrepository-layout(5)); `None` for a detached HEAD (an object id), a
+/// reftable placeholder (`refs/heads/.invalid`) or anything else.
+pub fn head_branch(head: &str) -> Option<String> {
+    let branch = head.trim().strip_prefix("ref:")?.trim();
+    let branch = branch.strip_prefix("refs/heads/")?;
+    (!branch.is_empty() && branch != ".invalid").then(|| branch.to_owned())
 }
 
-/// The name a person reads for a project: its id, or for an id minted by
-/// discovery, its checkout's folder name.
-pub fn project_display(id: &str, checkout: &str) -> String {
-    if is_discovered_id(id) {
-        project_name(checkout, &[])
+/// Branch prefixes that say what kind of change it is, not what it is
+/// about (conventional commit types and common topic folders).
+const BRANCH_KINDS: [&str; 18] = [
+    "feat", "feature", "features", "fix", "bugfix", "hotfix", "chore", "refactor", "docs", "doc",
+    "test", "tests", "perf", "build", "ci", "style", "wip", "topic",
+];
+
+/// A branch as a person reads it, by the substance of its task: without a
+/// leading change kind (`feat/`, `fix/`, …), separators as spaces:
+/// `feat/k141-monitor-charts` reads "k141 monitor charts", `release/1.2`
+/// "release 1.2", `main` "main".
+pub fn branch_words(branch: &str) -> String {
+    let segments: Vec<&str> = branch.split('/').filter(|part| !part.is_empty()).collect();
+    let topic = segments
+        .iter()
+        .position(|part| !BRANCH_KINDS.contains(&part.to_ascii_lowercase().as_str()))
+        .map_or(&segments[segments.len().saturating_sub(1)..], |start| {
+            &segments[start..]
+        });
+    let words = topic
+        .join(" ")
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if words.is_empty() {
+        branch.trim().to_owned()
     } else {
-        id.to_owned()
+        words
     }
 }
 
-/// Display names of `(id, checkout)` registrations, unique: a folder name
-/// shared by two discovered projects falls back to their ids.
-pub fn project_names(projects: &[(String, String)]) -> Vec<String> {
-    let names: Vec<String> = projects
+/// A repository's logical name: its `origin` remote's repository name,
+/// else its main checkout's folder ([`repository`]), never a registration
+/// ID or a linked worktree's folder.
+pub fn repository_name(common_dir: &str, origin: Option<&str>) -> String {
+    match origin.map(str::trim).filter(|origin| !origin.is_empty()) {
+        Some(origin) => origin.to_owned(),
+        None => repository(common_dir).0,
+    }
+}
+
+/// The origin name any checkout of the repository `key` carries.
+fn origin_of<'a>(key: &str, checkouts: &'a [Checkout]) -> Option<&'a str> {
+    checkouts
         .iter()
-        .map(|(id, checkout)| project_display(id, checkout))
-        .collect();
-    names
-        .iter()
-        .zip(projects)
-        .map(|(name, (id, _))| {
-            if names.iter().filter(|other| *other == name).count() > 1 {
-                id.clone()
-            } else {
-                name.clone()
-            }
-        })
-        .collect()
+        .filter(|checkout| path_key(&checkout.common_dir) == key)
+        .find_map(|checkout| checkout.origin.as_deref())
+}
+
+/// A checkout's subproject name, or `None` for its repository's main
+/// checkout (the project itself): its branch in words, else (detached)
+/// its folder without the repository's name in front.
+pub fn subproject_name(checkout: &Checkout) -> Option<String> {
+    let (folder, main) = repository(&checkout.common_dir);
+    if main.as_deref().map(path_key) == Some(path_key(&checkout.path)) {
+        return None;
+    }
+    Some(match checkout.branch.as_deref() {
+        Some(branch) => branch_words(branch),
+        None => place_name(folder_name(&checkout.path), &folder),
+    })
+}
+
+/// Where a task folder (an Agent's project label) belongs, as a person
+/// reads it: the project's logical name, and its subproject when the
+/// folder is in a linked worktree. A folder no checkout holds is a project
+/// of its own, named by its folder.
+pub fn place_of(label: &str, checkouts: &[Checkout]) -> (String, Option<String>) {
+    match checkout_of(label, checkouts) {
+        Some(checkout) => (
+            repository_name(
+                &checkout.common_dir,
+                origin_of(&path_key(&checkout.common_dir), checkouts),
+            ),
+            subproject_name(checkout),
+        ),
+        None => (folder_name(label).to_owned(), None),
+    }
+}
+
+/// [`place_of`] in one line: "atlas-web › search filters", or the
+/// project's name alone.
+pub fn place_label(label: &str, checkouts: &[Checkout]) -> String {
+    match place_of(label, checkouts) {
+        (project, Some(subproject)) => format!("{project} › {subproject}"),
+        (project, None) => project,
+    }
 }
 
 /// A path as a person reads it: without the `\\?\` verbatim prefix the
@@ -305,43 +384,65 @@ pub fn project_key(label: &str, checkouts: &[Checkout]) -> String {
     }
 }
 
-/// The project name of a label: its repository's, or its folder's.
+/// The project name of a label ([`place_of`]): its repository's logical
+/// name, or its folder's. The sidebar, the picker, Settings › Projects and
+/// the Monitor all name a project with it.
 pub fn project_of(label: &str, checkouts: &[Checkout]) -> String {
-    match checkout_of(label, checkouts) {
-        Some(checkout) => repository(&checkout.common_dir).0,
-        None => folder_name(label).to_owned(),
-    }
+    place_of(label, checkouts).0
 }
 
-/// One project of the sidebar: a repository with every registered
-/// checkout of it, or an unregistered folder.
+/// The subproject key of a label in a linked worktree (`sub:<path>`), the
+/// key a subproject collapses and is renamed by; `None` in a main
+/// checkout or an unregistered folder.
+pub fn subproject_key(label: &str, checkouts: &[Checkout]) -> Option<String> {
+    let checkout = checkout_of(label, checkouts)?;
+    subproject_name(checkout).map(|_| format!("sub:{}", path_key(&checkout.path)))
+}
+
+/// One project of the sidebar: a repository with its main checkout's tasks
+/// and its subprojects, or an unregistered folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Section {
     /// The repository's identity (its common directory), or the folder's.
     pub key: String,
+    /// Its logical name ([`repository_name`]).
     pub name: String,
     /// Where a new task in it starts: the main checkout when it is
     /// registered, else the first registered checkout (or the folder).
     pub checkout: String,
     /// Every checkout of the project.
     pub checkouts: Vec<String>,
+    /// Tasks in the main checkout (or the folder).
     pub rows: Vec<Row>,
-    /// Listed Agents of the project working now (the collapsed badge).
+    /// Linked worktrees shown now, each with its tasks.
+    pub subprojects: Vec<Subproject>,
+    /// Listed Agents of the project working now, subprojects included.
     pub running: usize,
     /// Whether the project is collapsed (it then has no rows).
     pub collapsed: bool,
-    /// Stopped tasks from before today, folded into one row.
+    /// Older stopped tasks and quiet subprojects, folded into one row.
     pub older: usize,
-    /// Whether those tasks are unfolded (the row then hides them again).
+    /// Whether those are unfolded (the row then hides them again).
     pub older_shown: bool,
+    /// The main checkout is registered and its folder is gone.
+    pub missing: bool,
 }
 
-impl Section {
-    /// Whether `checkout` is one of the project's checkouts.
-    pub fn holds(&self, checkout: &str) -> bool {
-        let wanted = path_key(checkout);
-        self.checkouts.iter().any(|path| path_key(path) == wanted)
-    }
+/// A linked worktree of a project, with its tasks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Subproject {
+    /// `sub:<path>`: what it collapses and is renamed by.
+    pub key: String,
+    /// Its branch in words, or its folder ([`subproject_name`]).
+    pub name: String,
+    pub checkout: String,
+    /// A registered worktree whose folder is gone.
+    pub missing: bool,
+    pub rows: Vec<Row>,
+    /// Listed Agents working in it now.
+    pub running: usize,
+    /// Whether it is collapsed (it then has no rows).
+    pub collapsed: bool,
 }
 
 /// Newest tasks a project keeps visible when every task of it is older.
@@ -352,7 +453,7 @@ pub const RECENT_WHEN_ALL_OLDER: usize = 3;
 pub struct Shown<'a> {
     pub branches: &'a HashMap<String, Branch>,
     pub expanded: &'a HashSet<String>,
-    /// Section keys of collapsed projects.
+    /// Section and subproject keys of collapsed rows.
     pub collapsed: &'a HashSet<String>,
     /// Section keys whose older tasks are unfolded.
     pub unfolded: &'a HashSet<String>,
@@ -370,11 +471,51 @@ struct Group<'a> {
     /// The main checkout's key, for a repository that has one.
     main: Option<String>,
     top: Vec<&'a UiAgent>,
+    subs: Vec<SubGroup<'a>>,
+}
+
+struct SubGroup<'a> {
+    sub: Subproject,
+    top: Vec<&'a UiAgent>,
+    /// The newest change of any task in it (0 with none).
+    newest: i64,
+    /// A task in it is live (not stopped, failed or lost).
+    live: bool,
+}
+
+/// The sidebar's order of tasks: running first, then live, then ended
+/// (stopping a task is a change too, but not activity), each newest first;
+/// ties in id order (`a9` < `a10`).
+fn task_order(a: &UiAgent, b: &UiAgent) -> std::cmp::Ordering {
+    b.running()
+        .cmp(&a.running())
+        .then(a.ended().cmp(&b.ended()))
+        .then(b.updated_at.cmp(&a.updated_at))
+        .then_with(|| (a.id.len(), &a.id).cmp(&(b.id.len(), &b.id)))
+}
+
+/// The tasks among `top` that fold under "Show N older": ended before
+/// today. A list whose tasks would all fold keeps its newest few (they
+/// sort first) when `keep_newest`, never "No tasks yet" above "Show N
+/// older".
+fn folding<'a>(top: &[&'a UiAgent], today_start: i64, keep_newest: bool) -> HashSet<&'a str> {
+    let mut folding: HashSet<&str> = top
+        .iter()
+        .filter(|agent| agent.ended() && agent.updated_at < today_start)
+        .map(|agent| agent.id.as_str())
+        .collect();
+    if keep_newest && !top.is_empty() && folding.len() == top.len() {
+        for agent in top.iter().take(RECENT_WHEN_ALL_OLDER) {
+            folding.remove(agent.id.as_str());
+        }
+    }
+    folding
 }
 
 /// The sidebar's projects: registered repositories in registration order
 /// (with no rows when they have no Agent yet), then every other project
-/// label in order of first appearance, each with its visible rows.
+/// label in order of first appearance, each with its main checkout's
+/// visible rows and its subprojects.
 pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Vec<Section> {
     let empty = |key: String, name: String, checkout: &str| Section {
         key,
@@ -382,34 +523,72 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
         checkout: checkout.to_owned(),
         checkouts: vec![checkout.to_owned()],
         rows: Vec::new(),
+        subprojects: Vec::new(),
         running: 0,
         collapsed: false,
         older: 0,
         older_shown: false,
+        missing: false,
     };
     let mut groups: Vec<Group> = Vec::new();
     for checkout in checkouts {
-        let key = format!("repo:{}", path_key(&checkout.common_dir));
-        if let Some(group) = groups.iter_mut().find(|group| group.section.key == key) {
-            group.section.checkouts.push(checkout.path.clone());
+        let common = path_key(&checkout.common_dir);
+        let key = format!("repo:{common}");
+        let index = match groups.iter().position(|group| group.section.key == key) {
+            Some(index) => {
+                groups[index].section.checkouts.push(checkout.path.clone());
+                index
+            }
+            None => {
+                let name = repository_name(&checkout.common_dir, origin_of(&common, checkouts));
+                let main = repository(&checkout.common_dir).1;
+                groups.push(Group {
+                    section: empty(key, name, &checkout.path),
+                    main: main.as_deref().map(path_key),
+                    top: Vec::new(),
+                    subs: Vec::new(),
+                });
+                groups.len() - 1
+            }
+        };
+        let group = &mut groups[index];
+        let path = path_key(&checkout.path);
+        if group.main.as_ref() == Some(&path) {
+            group.section.checkout = checkout.path.clone();
+            group.section.missing = checkout.missing;
             continue;
         }
-        let (name, main) = repository(&checkout.common_dir);
-        groups.push(Group {
-            section: empty(key, name, &checkout.path),
-            main: main.as_deref().map(path_key),
+        let sub_key = format!("sub:{path}");
+        if group.subs.iter().any(|sub| sub.sub.key == sub_key) {
+            continue;
+        }
+        group.subs.push(SubGroup {
+            sub: Subproject {
+                key: sub_key,
+                name: subproject_name(checkout).unwrap_or_default(),
+                checkout: checkout.path.clone(),
+                missing: checkout.missing,
+                rows: Vec::new(),
+                running: 0,
+                collapsed: false,
+            },
             top: Vec::new(),
+            newest: 0,
+            live: false,
         });
     }
     for group in &mut groups {
-        if let Some(main) = &group.main
-            && let Some(path) = group
-                .section
-                .checkouts
-                .iter()
-                .find(|path| path_key(path) == *main)
-        {
-            group.section.checkout = path.clone();
+        // Two branches that read alike keep their full names apart.
+        let names: Vec<String> = group.subs.iter().map(|sub| sub.sub.name.clone()).collect();
+        for sub in &mut group.subs {
+            if names.iter().filter(|name| **name == sub.sub.name).count() > 1 {
+                let checkout = checkouts
+                    .iter()
+                    .find(|checkout| path_key(&checkout.path) == sub.sub.key[4..]);
+                if let Some(branch) = checkout.and_then(|checkout| checkout.branch.as_deref()) {
+                    sub.sub.name = branch.to_owned();
+                }
+            }
         }
     }
 
@@ -426,12 +605,16 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
                     section: empty(key, name, &agent.project),
                     main: None,
                     top: Vec::new(),
+                    subs: Vec::new(),
                 });
                 groups.len() - 1
             }
         };
         let group = &mut groups[index];
-        if counted.insert(agent.id.as_str()) && agent.running() {
+        let sub = subproject_key(&agent.project, checkouts)
+            .and_then(|key| group.subs.iter().position(|sub| sub.sub.key == key));
+        let first = counted.insert(agent.id.as_str());
+        if first && agent.running() {
             group.section.running += 1;
         }
         // A native observed child shows only nested under its parent
@@ -446,8 +629,22 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
                         .is_none_or(|parent| !listed_ids.contains(parent))
             }
         };
-        if shows {
-            group.top.push(agent);
+        match sub {
+            Some(sub) => {
+                let sub = &mut group.subs[sub];
+                if first && agent.running() {
+                    sub.sub.running += 1;
+                }
+                if !agent.native_child {
+                    sub.newest = sub.newest.max(agent.updated_at);
+                    sub.live |= agent.live();
+                }
+                if shows {
+                    sub.top.push(agent);
+                }
+            }
+            None if shows => group.top.push(agent),
+            None => {}
         }
     }
 
@@ -455,7 +652,7 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for mut group in groups {
-        if filtered && group.top.is_empty() {
+        if filtered && group.top.is_empty() && group.subs.iter().all(|sub| sub.top.is_empty()) {
             continue;
         }
         group.section.collapsed = !filtered && shown.collapsed.contains(&group.section.key);
@@ -463,57 +660,71 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
             out.push(group.section);
             continue;
         }
-        // Running first, then live, then ended (stopping a task is a
-        // change too, but not activity), each newest first; ties in id
-        // order (`a9` < `a10`).
-        group.top.sort_by(|a, b| {
-            b.running()
-                .cmp(&a.running())
-                .then(a.ended().cmp(&b.ended()))
-                .then(b.updated_at.cmp(&a.updated_at))
-                .then_with(|| (a.id.len(), &a.id).cmp(&(b.id.len(), &b.id)))
+        group.top.sort_by(|a, b| task_order(a, b));
+        for sub in &mut group.subs {
+            sub.top.sort_by(|a, b| task_order(a, b));
+        }
+        // Subprojects at work first, then live ones, then newest (a missing
+        // one before a quiet one of the same age).
+        group.subs.sort_by(|a, b| {
+            (b.sub.running > 0)
+                .cmp(&(a.sub.running > 0))
+                .then(b.live.cmp(&a.live))
+                .then(b.newest.cmp(&a.newest))
+                .then(b.sub.missing.cmp(&a.sub.missing))
+                .then_with(|| a.sub.name.cmp(&b.sub.name))
         });
-        let mut folding: HashSet<&str> = group
-            .top
+        let unfolded = shown.unfolded.contains(&group.section.key);
+        let today = shown.today_start;
+        // A quiet subproject (nothing live, nothing from today) folds as a
+        // whole; a missing one stays in view, it asks for a decision.
+        let quiet = |sub: &SubGroup| !sub.sub.missing && !sub.live && sub.newest < today;
+        let mut sub_folds: Vec<bool> = group
+            .subs
             .iter()
-            .filter(|agent| !filtered && agent.ended() && agent.updated_at < shown.today_start)
-            .map(|agent| agent.id.as_str())
+            .map(|sub| !filtered && quiet(sub))
             .collect();
-        // A project whose tasks are all older still shows its newest few
-        // (they sort first), never "No tasks yet" above "Show N older".
-        if !group.top.is_empty()
-            && group
+        let mut main_folds = if filtered {
+            HashSet::new()
+        } else {
+            folding(&group.top, today, false)
+        };
+        // Never "No tasks yet" above "Show N older": when everything
+        // would fold, the newest few tasks or subprojects stay.
+        let anything = !group.top.is_empty() || !group.subs.is_empty();
+        let all_fold = main_folds.len() == group.top.len() && sub_folds.iter().all(|folds| *folds);
+        if !filtered && anything && all_fold {
+            let mut newest: Vec<(i64, Option<usize>, Option<&str>)> = group
                 .top
                 .iter()
-                .all(|agent| folding.contains(agent.id.as_str()))
-        {
-            for agent in group.top.iter().take(RECENT_WHEN_ALL_OLDER) {
-                folding.remove(agent.id.as_str());
+                .map(|agent| (agent.updated_at, None, Some(agent.id.as_str())))
+                .chain(
+                    group
+                        .subs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, sub)| (sub.newest, Some(index), None)),
+                )
+                .collect();
+            newest.sort_by_key(|(at, ..)| std::cmp::Reverse(*at));
+            for (_, sub, task) in newest.into_iter().take(RECENT_WHEN_ALL_OLDER) {
+                if let Some(index) = sub {
+                    sub_folds[index] = false;
+                }
+                if let Some(id) = task {
+                    main_folds.remove(id);
+                }
             }
         }
-        let folds = |agent: &UiAgent| folding.contains(agent.id.as_str());
-        let place_key = |agent: &UiAgent| match checkout_of(&agent.project, checkouts) {
-            Some(checkout) => path_key(&checkout.path),
-            None => path_key(&agent.project),
-        };
-        let places: HashSet<String> = group.top.iter().map(|agent| place_key(agent)).collect();
-        let unfolded = shown.unfolded.contains(&group.section.key);
-        group.section.older = group.top.iter().filter(|agent| folds(agent)).count();
-        group.section.older_shown = unfolded && group.section.older > 0;
+        let mut older = main_folds.len() + sub_folds.iter().filter(|folds| **folds).count();
         for agent in &group.top {
-            if folds(agent) && !unfolded {
+            if main_folds.contains(agent.id.as_str()) && !unfolded {
                 continue;
             }
-            let place = (places.len() > 1 && group.main.as_ref() != Some(&place_key(agent)))
-                .then(|| {
-                    checkout_of(&agent.project, checkouts)
-                        .map_or(agent.project.as_str(), |checkout| checkout.path.as_str())
-                })
-                .map(|path| place_name(folder_name(path), &group.section.name));
             push(
                 agent,
                 0,
-                place,
+                false,
                 listed,
                 shown,
                 !filtered,
@@ -521,9 +732,116 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
                 &mut group.section.rows,
             );
         }
+        for (sub, folds) in group.subs.into_iter().zip(sub_folds) {
+            if filtered && sub.top.is_empty() {
+                continue;
+            }
+            if folds && !unfolded {
+                continue;
+            }
+            let mut subproject = sub.sub;
+            subproject.collapsed = !filtered && shown.collapsed.contains(&subproject.key);
+            if !subproject.collapsed {
+                let inner = if filtered {
+                    HashSet::new()
+                } else {
+                    folding(&sub.top, today, true)
+                };
+                older += inner.len();
+                for agent in &sub.top {
+                    if inner.contains(agent.id.as_str()) && !unfolded {
+                        continue;
+                    }
+                    push(
+                        agent,
+                        0,
+                        true,
+                        listed,
+                        shown,
+                        !filtered,
+                        &mut seen,
+                        &mut subproject.rows,
+                    );
+                }
+            }
+            group.section.subprojects.push(subproject);
+        }
+        group.section.older = older;
+        group.section.older_shown = unfolded && older > 0;
         out.push(group.section);
     }
     out
+}
+
+/// Tasks using a project registration: `(live, all)`, top-level or not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Use {
+    pub live: usize,
+    pub tasks: usize,
+}
+
+/// Which registrations (`(id, checkout path)`) the Agents use: an Agent
+/// uses the registration whose checkout holds its folder; one in an
+/// unregistered linked worktree uses its repository's registration the
+/// daemon resolves it to (the main checkout's, else the only one), and
+/// every registration of that repository when that is ambiguous, so a
+/// live task never leaves a registration looking unused. `checkouts` must
+/// hold every folder's checkout (registered and resolved). Chats use none.
+pub fn registration_use(
+    registrations: &[(String, String)],
+    agents: &[UiAgent],
+    checkouts: &[Checkout],
+) -> HashMap<String, Use> {
+    let mut usage: HashMap<String, Use> = registrations
+        .iter()
+        .map(|(id, _)| (id.clone(), Use::default()))
+        .collect();
+    let mut seen = HashSet::new();
+    for agent in agents
+        .iter()
+        .filter(|agent| !agent.chat && seen.insert(agent.id.as_str()))
+    {
+        let Some(checkout) = checkout_of(&agent.project, checkouts) else {
+            continue;
+        };
+        let path = path_key(&checkout.path);
+        let mut users: Vec<&String> = registrations
+            .iter()
+            .filter(|(_, registered)| path_key(registered) == path)
+            .map(|(id, _)| id)
+            .collect();
+        if users.is_empty() {
+            let repository = path_key(&checkout.common_dir);
+            let main = repository_of_key(&checkout.common_dir);
+            let same: Vec<&(String, String)> = registrations
+                .iter()
+                .filter(|(_, registered)| {
+                    checkouts.iter().any(|known| {
+                        path_key(&known.path) == path_key(registered)
+                            && path_key(&known.common_dir) == repository
+                    })
+                })
+                .collect();
+            users = match same
+                .iter()
+                .find(|(_, registered)| Some(path_key(registered)) == main)
+            {
+                Some((id, _)) => vec![id],
+                None => same.iter().map(|(id, _)| id).collect(),
+            };
+        }
+        for id in users {
+            let entry = usage.entry(id.clone()).or_default();
+            entry.tasks += 1;
+            entry.live += usize::from(agent.live());
+        }
+    }
+    usage
+}
+
+/// The main checkout's key of a repository, when it has one.
+fn repository_of_key(common_dir: &str) -> Option<String> {
+    repository(common_dir).1.as_deref().map(path_key)
 }
 
 /// Whether `agent` matches a search: every word of `query` appears,
@@ -549,7 +867,7 @@ pub fn search(listed: &[UiAgent], checkouts: &[Checkout], query: &str) -> Vec<(S
     let mut found: Vec<(&UiAgent, String)> = listed
         .iter()
         .filter(|agent| seen.insert(agent.id.as_str()))
-        .map(|agent| (agent, project_of(&agent.project, checkouts)))
+        .map(|agent| (agent, place_label(&agent.project, checkouts)))
         .filter(|(agent, project)| matches(agent, project, query))
         .collect();
     found.sort_by(|(a, _), (b, _)| {
@@ -601,10 +919,10 @@ pub fn recents<'a>(
     recent
 }
 
-/// The sidebar's Recents: the newest tasks of collapsed projects (section
-/// keys in `collapsed`), the ones the list above hides. Tasks folded under
-/// "Show N older" stay there, and chats stay under Chats, so Recents never
-/// repeats the list or brings back old runs.
+/// The sidebar's Recents: the newest tasks of collapsed projects and
+/// subprojects (their keys in `collapsed`), the ones the list above hides.
+/// Tasks folded under "Show N older" stay there, and chats stay under
+/// Chats, so Recents never repeats the list or brings back old runs.
 pub fn sidebar_recents<'a>(
     agents: &'a [UiAgent],
     checkouts: &[Checkout],
@@ -612,7 +930,10 @@ pub fn sidebar_recents<'a>(
     limit: usize,
 ) -> Vec<&'a UiAgent> {
     recents(agents, limit, &|agent: &UiAgent| {
-        !agent.chat && collapsed.contains(project_key(&agent.project, checkouts).as_str())
+        !agent.chat
+            && (collapsed.contains(project_key(&agent.project, checkouts).as_str())
+                || subproject_key(&agent.project, checkouts)
+                    .is_some_and(|key| collapsed.contains(key.as_str())))
     })
 }
 
@@ -878,7 +1199,7 @@ fn children_of<'a>(
 fn push(
     agent: &UiAgent,
     depth: usize,
-    place: Option<String>,
+    nested: bool,
     listed: &[UiAgent],
     shown: &Shown,
     tree: bool,
@@ -912,11 +1233,11 @@ fn push(
         children: children.len(),
         expanded: is_expanded,
         note,
-        place,
+        nested,
     });
     if is_expanded {
         for child in children {
-            push(child, depth + 1, None, listed, shown, tree, seen, out);
+            push(child, depth + 1, nested, listed, shown, tree, seen, out);
         }
     }
 }
@@ -927,22 +1248,68 @@ mod tests {
     use eliot_core::AgentState;
 
     #[test]
-    fn discovered_projects_read_as_their_folder() {
-        let hash = "ab".repeat(32);
-        let discovered = format!("project-{hash}");
-        assert_eq!(project_display(&discovered, "C:\\work\\app"), "app");
-        assert_eq!(project_display("app-main", "C:\\work\\app"), "app-main");
+    fn a_project_is_named_by_its_origin_then_its_main_checkout_never_a_worktree() {
+        let git = r"\\?\C:\src\atlas\.git";
+        // The origin's repository name comes first.
+        assert_eq!(repository_name(git, Some("atlas-web")), "atlas-web");
+        // Without one, the main checkout's folder (the common dir's parent).
+        assert_eq!(repository_name(git, None), "atlas");
+        assert_eq!(repository_name(git, Some("  ")), "atlas");
+        assert_eq!(repository_name("/srv/git/tools.git", None), "tools");
+        let mut linked = Checkout::new(r"\\?\C:\wt\atlas-wt-search", git);
+        let main = Checkout::new(r"\\?\C:\src\atlas", git);
+        // A linked worktree's folder never names the project.
         assert_eq!(
-            project_display("project-short", "C:\\work\\app"),
-            "project-short"
+            place_of(
+                r"\\?\C:\wt\atlas-wt-search",
+                &[main.clone(), linked.clone()]
+            ),
+            ("atlas".to_owned(), Some("wt-search".to_owned()))
         );
-        let other = format!("project-{}", "cd".repeat(32));
-        let names = project_names(&[
-            (discovered.clone(), "C:\\a\\app".to_owned()),
-            (other.clone(), "C:\\b\\app".to_owned()),
-            ("web".to_owned(), "C:\\web".to_owned()),
-        ]);
-        assert_eq!(names, [discovered, other, "web".to_owned()]);
+        linked.branch = Some("feat/search-filters".to_owned());
+        let mut named = main.clone();
+        named.origin = Some("atlas-web".to_owned());
+        // Any checkout's origin names the whole repository.
+        let checkouts = [named, linked];
+        assert_eq!(
+            place_label(r"\\?\C:\wt\atlas-wt-search\src", &checkouts),
+            "atlas-web › search filters"
+        );
+        assert_eq!(place_label(r"\\?\C:\src\atlas", &checkouts), "atlas-web");
+        assert_eq!(
+            project_of(r"\\?\C:\wt\atlas-wt-search", &checkouts),
+            "atlas-web"
+        );
+        // A folder no checkout holds is its own project.
+        assert_eq!(place_label(r"C:\scratch\notes", &checkouts), "notes");
+        assert_eq!(subproject_key(r"\\?\C:\src\atlas", &checkouts), None);
+        assert_eq!(
+            subproject_key(r"\\?\C:\wt\atlas-wt-search", &checkouts),
+            Some(format!("sub:{}", path_key(r"C:\wt\atlas-wt-search")))
+        );
+    }
+
+    #[test]
+    fn branches_read_by_the_substance_of_their_task() {
+        for (branch, words) in [
+            ("feat/k141-monitor-charts", "k141 monitor charts"),
+            ("fix/k110_provider-quota", "k110 provider quota"),
+            ("refactor/k115-splits", "k115 splits"),
+            ("feature/ui/dark-mode", "ui dark mode"),
+            ("release/1.2", "release 1.2"),
+            ("main", "main"),
+            ("feat", "feat"),
+            ("fix/feat", "feat"),
+        ] {
+            assert_eq!(branch_words(branch), words, "{branch}");
+        }
+        assert_eq!(
+            head_branch("ref: refs/heads/feat/k142-projects\n").as_deref(),
+            Some("feat/k142-projects")
+        );
+        assert_eq!(head_branch(&"ab".repeat(20)), None);
+        assert_eq!(head_branch("ref: refs/heads/.invalid"), None);
+        assert_eq!(head_branch("ref: refs/remotes/origin/main"), None);
     }
 
     fn agent(id: &str, project: &str, parent: Option<&str>) -> UiAgent {
@@ -1023,10 +1390,7 @@ mod tests {
     }
 
     fn checkout(path: &str, common_dir: &str) -> Checkout {
-        Checkout {
-            path: path.to_owned(),
-            common_dir: common_dir.to_owned(),
-        }
+        Checkout::new(path, common_dir)
     }
 
     #[test]
@@ -1123,14 +1487,6 @@ mod tests {
     }
 
     #[test]
-    fn project_names_prefer_the_registered_id() {
-        let registered = vec![(r"\\?\C:\src\app".to_owned(), "app".to_owned())];
-        assert_eq!(project_name(r"\\?\C:\src\app", &registered), "app");
-        assert_eq!(project_name(r"\\?\C:\work\other", &registered), "other");
-        assert_eq!(project_name("plain", &registered), "plain");
-    }
-
-    #[test]
     fn repositories_are_named_by_their_common_directory() {
         assert_eq!(
             repository(r"\\?\C:\src\eliot-swarm-controller\.git"),
@@ -1146,63 +1502,240 @@ mod tests {
         assert_eq!(repository("/srv/git/plain"), ("plain".to_owned(), None));
     }
 
+    fn shape(section: &Section) -> (Vec<&str>, Vec<(&str, Vec<&str>)>) {
+        (
+            section
+                .rows
+                .iter()
+                .map(|row| row.agent.id.as_str())
+                .collect(),
+            section
+                .subprojects
+                .iter()
+                .map(|sub| {
+                    (
+                        sub.name.as_str(),
+                        sub.rows.iter().map(|row| row.agent.id.as_str()).collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     #[test]
-    fn worktrees_of_one_repository_form_one_project_named_after_it() {
+    fn worktrees_nest_as_subprojects_of_their_repository() {
         let git = r"\\?\C:\src\app\.git";
+        let mut k1 = checkout(r"\\?\C:\wt\wt-k1", git);
+        k1.branch = Some("feat/k1-sidebar-tree".to_owned());
+        let mut main = checkout(r"\\?\C:\src\app", git);
+        main.origin = Some("app-web".to_owned());
+        // A detached worktree reads as its folder.
+        let k2 = checkout(r"\\?\C:\wt\wt-k2", git);
         let checkouts = vec![
-            checkout(r"\\?\C:\wt\wt-k1", git),
-            checkout(r"\\?\C:\src\app", git),
-            checkout(r"\\?\C:\wt\wt-k2", git),
+            k1,
+            main,
+            k2,
             checkout(r"\\?\C:\src\web", r"\\?\C:\src\web\.git"),
             checkout(r"\\?\C:\src\idle", r"\\?\C:\src\idle\.git"),
         ];
         let listed = vec![
-            agent("a1", r"\\?\C:\wt\wt-k1", None),
+            with(agent("a1", r"\\?\C:\wt\wt-k1", None), "busy", 0),
             agent("a2", r"\\?\C:\src\app", None),
-            // A workspace below a registered checkout belongs to it.
+            // A workspace below a checkout belongs to it.
             agent("a3", r"\\?\C:\wt\wt-k2\crates", None),
             agent("a4", r"\\?\C:\src\web", None),
             agent("a5", r"\\?\C:\scratch\notes", None),
         ];
         let sections = View::default().sections(&listed, &checkouts);
-        let shape: Vec<(&str, &str, Vec<&str>)> = sections
+        let names: Vec<(&str, &str)> = sections
             .iter()
-            .map(|section| {
-                (
-                    section.name.as_str(),
-                    section.checkout.as_str(),
-                    section
-                        .rows
-                        .iter()
-                        .map(|row| row.agent.id.as_str())
-                        .collect(),
-                )
-            })
+            .map(|section| (section.name.as_str(), section.checkout.as_str()))
             .collect();
         assert_eq!(
-            shape,
+            names,
             [
-                ("app", r"\\?\C:\src\app", vec!["a1", "a2", "a3"]),
-                ("web", r"\\?\C:\src\web", vec!["a4"]),
-                ("idle", r"\\?\C:\src\idle", vec![]),
-                ("notes", r"\\?\C:\scratch\notes", vec!["a5"]),
+                ("app-web", r"\\?\C:\src\app"),
+                ("web", r"\\?\C:\src\web"),
+                ("idle", r"\\?\C:\src\idle"),
+                ("notes", r"\\?\C:\scratch\notes"),
             ]
         );
-        // The worktree shows where the project spans several checkouts,
-        // never for the main checkout or a single-checkout project.
-        let places: Vec<Option<&str>> = sections[0]
-            .rows
-            .iter()
-            .map(|row| row.place.as_deref())
-            .collect();
-        assert_eq!(places, [Some("wt-k1"), None, Some("wt-k2")]);
+        // The main checkout's tasks sit under the project; each linked
+        // worktree is a subproject, the one at work first.
+        assert_eq!(
+            shape(&sections[0]),
+            (
+                vec!["a2"],
+                vec![("k1 sidebar tree", vec!["a1"]), ("wt-k2", vec!["a3"])]
+            )
+        );
+        assert!(sections[0].subprojects[0].rows[0].nested);
+        assert!(!sections[0].rows[0].nested);
+        assert_eq!(
+            (sections[0].running, sections[0].subprojects[0].running),
+            (1, 1)
+        );
+        assert_eq!(shape(&sections[1]), (vec!["a4"], vec![]));
+        assert_eq!(sections[0].checkouts.len(), 3);
         assert_eq!(place_name("app-wt-tiles", "app"), "wt-tiles");
         assert_eq!(place_name("application", "app"), "application");
         assert_eq!(place_name("app", "app"), "app");
-        assert_eq!(sections[1].rows[0].place, None);
-        assert!(sections[0].holds(r"C:\wt\wt-k2"));
-        assert!(!sections[0].holds(r"C:\src\web"));
-        assert_eq!(project_of(r"\\?\C:\wt\wt-k1", &checkouts), "app");
+    }
+
+    #[test]
+    fn quiet_subprojects_fold_and_missing_ones_stay() {
+        let git = r"C:\src\app\.git";
+        let mut done = checkout(r"C:\wt\done", git);
+        done.branch = Some("fix/old-bug".to_owned());
+        let mut gone = checkout(r"C:\wt\gone", git);
+        gone.missing = true;
+        let mut today = checkout(r"C:\wt\today", git);
+        today.branch = Some("feat/today".to_owned());
+        let empty = checkout(r"C:\wt\empty", git);
+        let checkouts = vec![checkout(r"C:\src\app", git), done, gone, today, empty];
+        let listed = vec![
+            with(agent("a1", r"C:\src\app", None), "idle", 50),
+            with(agent("a2", r"C:\wt\done", None), "stopped", 10),
+            with(agent("a3", r"C:\wt\today", None), "stopped", 150),
+            with(agent("a4", r"C:\wt\today", None), "stopped", 20),
+        ];
+        let mut view = View {
+            today_start: 100,
+            ..View::default()
+        };
+        let section = &view.sections(&listed, &checkouts)[0];
+        // The missing worktree stays in view; the one from today shows its
+        // task from today; the quiet and the empty ones fold.
+        assert_eq!(
+            shape(section),
+            (vec!["a1"], vec![("today", vec!["a3"]), ("gone", vec![])])
+        );
+        assert!(section.subprojects[1].missing);
+        // Folded: two quiet subprojects and a4 inside "today".
+        assert_eq!((section.older, section.older_shown), (3, false));
+
+        view.unfolded.insert(section.key.clone());
+        let unfolded = &view.sections(&listed, &checkouts)[0];
+        assert_eq!(
+            shape(unfolded),
+            (
+                vec!["a1"],
+                vec![
+                    ("today", vec!["a3", "a4"]),
+                    ("old bug", vec!["a2"]),
+                    ("gone", vec![]),
+                    ("empty", vec![]),
+                ]
+            )
+        );
+        assert!(unfolded.older_shown);
+
+        // A collapsed subproject keeps its count, not its rows.
+        let mut view = View {
+            today_start: 100,
+            ..View::default()
+        };
+        view.collapsed
+            .insert(format!("sub:{}", path_key(r"C:\wt\today")));
+        let section = &view.sections(&listed, &checkouts)[0];
+        assert!(section.subprojects[0].collapsed);
+        assert!(section.subprojects[0].rows.is_empty());
+    }
+
+    #[test]
+    fn a_project_whose_subprojects_are_all_quiet_keeps_its_newest_few() {
+        let git = r"C:\src\app\.git";
+        let checkouts: Vec<Checkout> = std::iter::once(checkout(r"C:\src\app", git))
+            .chain((1..=5).map(|index| {
+                let mut worktree = checkout(&format!(r"C:\wt\w{index}"), git);
+                worktree.branch = Some(format!("feat/w{index}"));
+                worktree
+            }))
+            .collect();
+        let listed: Vec<UiAgent> = (1..=5)
+            .map(|index| {
+                with(
+                    agent(&format!("a{index}"), &format!(r"C:\wt\w{index}"), None),
+                    "stopped",
+                    index * 10,
+                )
+            })
+            .collect();
+        let view = View {
+            today_start: 100,
+            ..View::default()
+        };
+        let section = &view.sections(&listed, &checkouts)[0];
+        let names: Vec<&str> = section
+            .subprojects
+            .iter()
+            .map(|sub| sub.name.as_str())
+            .collect();
+        assert_eq!(names, ["w5", "w4", "w3"]);
+        assert_eq!(section.older, 2);
+    }
+
+    #[test]
+    fn registrations_count_the_tasks_that_use_them() {
+        let git = r"C:\src\app\.git";
+        let checkouts = vec![
+            checkout(r"C:\src\app", git),
+            checkout(r"C:\wt\legacy", git),
+            // An unregistered worktree the desktop resolved.
+            checkout(r"C:\wt\fresh", git),
+            checkout(r"C:\src\web", r"C:\src\web\.git"),
+        ];
+        let registrations = vec![
+            ("app".to_owned(), r"C:\src\app".to_owned()),
+            ("legacy".to_owned(), r"C:\wt\legacy".to_owned()),
+            ("web".to_owned(), r"C:\src\web".to_owned()),
+            ("gone".to_owned(), r"C:\wt\gone".to_owned()),
+        ];
+        let mut chat = agent("a6", r"C:\src\web", None);
+        chat.chat = true;
+        let agents = vec![
+            with(agent("a1", r"C:\src\app", None), "stopped", 0),
+            with(agent("a2", r"C:\wt\legacy\crates", None), "busy", 0),
+            // The daemon resolves an unregistered worktree to the main
+            // checkout's registration.
+            with(agent("a3", r"C:\wt\fresh", None), "idle", 0),
+            with(agent("a4", r"C:\scratch", None), "idle", 0),
+            with(agent("a1", r"C:\src\app", None), "stopped", 0),
+            chat,
+        ];
+        let usage = registration_use(&registrations, &agents, &checkouts);
+        assert_eq!(usage["app"], Use { live: 1, tasks: 2 });
+        assert_eq!(usage["legacy"], Use { live: 1, tasks: 1 });
+        assert_eq!(usage["web"], Use::default());
+        assert_eq!(usage["gone"], Use::default());
+
+        // Without a main checkout registration, an unregistered worktree's
+        // task keeps every registration of its repository in use.
+        let registrations = vec![("legacy".to_owned(), r"C:\wt\legacy".to_owned())];
+        let usage = registration_use(&registrations, &agents[2..3], &checkouts);
+        assert_eq!(usage["legacy"], Use { live: 1, tasks: 1 });
+    }
+
+    #[test]
+    fn a_search_lists_matches_under_their_subproject() {
+        let git = r"C:\src\app\.git";
+        let mut worktree = checkout(r"C:\wt\w1", git);
+        worktree.branch = Some("feat/k9-search".to_owned());
+        let checkouts = vec![checkout(r"C:\src\app", git), worktree];
+        let mut found = agent("a1", r"C:\wt\w1", None);
+        found.title = "needle".to_owned();
+        let listed = vec![found, agent("a2", r"C:\src\app", None)];
+        let needle = |agent: &UiAgent| agent.title == "needle";
+        let sections = View::default().filtered(&listed, &checkouts, Some(&needle));
+        assert_eq!(
+            shape(&sections[0]),
+            (vec![], vec![("k9 search", vec!["a1"])])
+        );
+        // The search label names the subproject too.
+        assert_eq!(
+            search(&listed, &checkouts, "needle")[0].0,
+            "needle · app › k9 search · muse"
+        );
     }
 
     #[test]
@@ -1326,7 +1859,7 @@ mod tests {
         assert_eq!(
             search(&listed, &checkouts, "k75 app"),
             [(
-                "k75: sidebar titles · app · codex".to_owned(),
+                "k75: sidebar titles · app › wt-k1 · codex".to_owned(),
                 "a1".to_owned()
             )]
         );
@@ -1461,14 +1994,8 @@ mod tests {
     #[test]
     fn sidebar_recents_hold_only_collapsed_projects_tasks() {
         let checkouts = [
-            Checkout {
-                path: "C:\\w\\atlas".to_owned(),
-                common_dir: "C:\\w\\atlas\\.git".to_owned(),
-            },
-            Checkout {
-                path: "C:\\w\\atlas-wt-1".to_owned(),
-                common_dir: "C:\\w\\atlas\\.git".to_owned(),
-            },
+            Checkout::new("C:\\w\\atlas", "C:\\w\\atlas\\.git"),
+            Checkout::new("C:\\w\\atlas-wt-1", "C:\\w\\atlas\\.git"),
         ];
         let mut listed = vec![
             with(agent("a1", "C:\\w\\atlas", None), "stopped", 10),
@@ -1489,6 +2016,14 @@ mod tests {
         // Both checkouts of the collapsed repository; the other project
         // and the chat stay where they are.
         assert_eq!(ids, ["a2", "a1"]);
+        // A collapsed subproject hides its tasks too: they are Recents.
+        let sub = subproject_key("C:\\w\\atlas-wt-1", &checkouts).unwrap();
+        let collapsed: HashSet<&str> = [sub.as_str()].into_iter().collect();
+        let ids: Vec<&str> = sidebar_recents(&listed, &checkouts, &collapsed, 8)
+            .into_iter()
+            .map(|agent| agent.id.as_str())
+            .collect();
+        assert_eq!(ids, ["a2"]);
     }
 
     #[test]

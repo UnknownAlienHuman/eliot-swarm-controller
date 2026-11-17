@@ -240,6 +240,23 @@ impl DesktopApp {
             eliot_core::count_words(selected.len() as u64, "item", "items"),
             crate::worktrees::size_words(bytes)
         );
+        // Every group with something safe to remove, opt-in groups (native
+        // session archives, project registrations) included; each item
+        // keeps its own keep or remove reason.
+        let all_safe = groups
+            .iter()
+            .filter(|view| view.removable > 0)
+            .all(|view| !state.cleanup_unchecked.contains(&view.group));
+        if groups.iter().any(|view| view.removable > 0) {
+            parts.push(KeyedView::new(
+                format!("all-safe:{all_safe}"),
+                m3::outlined(palette)
+                    .automation_name("Select all safe items")
+                    .is_enabled(!state.cleanup_busy && !all_safe)
+                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupSelectAll)))
+                    .content(m3::label("Select all safe")),
+            ));
+        }
         if !groups.is_empty() {
             parts.push(KeyedView::new(
                 "apply",
@@ -260,6 +277,8 @@ impl DesktopApp {
             .margin(Thickness::uniform(tokens::spacing::SM))
             .content(
                 StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .horizontal_alignment(HorizontalAlignment::Right)
                     .spacing(tokens::spacing::SM)
                     .keyed_children(parts),
             )
@@ -352,7 +371,7 @@ impl DesktopApp {
             }
             None => (empty, 0, true),
         };
-        let managed = crate::worktrees::grouped(rows, &self.registered_projects());
+        let managed = crate::worktrees::grouped(rows, &self.checkouts());
         let heading = match &self.settings.worktrees {
             None => "Reading…".to_owned(),
             Some(Err(_)) => String::new(),

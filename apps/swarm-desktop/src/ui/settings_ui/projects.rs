@@ -1,6 +1,12 @@
 use super::*;
+use crate::ui::bulk_ui::{BulkMsg, BulkOp, Pick};
 
 impl DesktopApp {
+    /// Settings › Projects: every registration by its logical name (the
+    /// project, and "project › subproject" for a linked worktree, never
+    /// its ID), with a check box for the bulk actions above the list
+    /// (Select all, Remove selected, Remove unused); a row opens its
+    /// editor (folder, rule profiles and actions, Remove project).
     pub(super) fn projects_section(
         &self,
         context: &mut ViewContext<Self>,
@@ -8,29 +14,88 @@ impl DesktopApp {
     ) -> View {
         let drafts = &self.settings.projects;
         let profiles = self.known_profiles();
+        let checkouts = self.checkouts();
+        let mut ids: Vec<(String, String)> = model::project_ids(drafts)
+            .into_iter()
+            .map(|id| {
+                let path = model::project_path(drafts, &id);
+                (self.place_title_in(&path, &checkouts), id)
+            })
+            .collect();
+        // Each repository's subprojects follow it ("app" < "app › x").
+        ids.sort();
+        let selected: Vec<String> = ids
+            .iter()
+            .filter(|(_, id)| self.settings.project_selected.contains(id))
+            .map(|(_, id)| id.clone())
+            .collect();
+        let all = !ids.is_empty() && selected.len() == ids.len();
         let mut rows: Vec<KeyedView> = Vec::new();
-        for id in model::project_ids(drafts) {
+        for (name, id) in &ids {
+            let (name, id) = (name.clone(), id.clone());
             let open = self.settings.project_open.as_deref() == Some(id.as_str());
+            let checked = self.settings.project_selected.contains(&id);
             let path = model::project_path(drafts, &id);
             let allowed = model::project_profiles(drafts, &id);
+            let missing = self
+                .nav
+                .projects
+                .iter()
+                .any(|project| project.id == id && project.missing);
             let summary = if allowed.is_empty() {
                 "no profiles allowed".to_owned()
             } else {
                 allowed.join(", ")
             };
-            let name = nav::project_display(&id, &path);
+            let note = if missing {
+                format!("Folder missing · {}", nav::display_path(&path))
+            } else {
+                format!("{} · {summary}", nav::display_path(&path))
+            };
+            let select_id = id.clone();
             rows.push(KeyedView::new(
-                format!("project:{id}:{open}"),
-                m3::row(palette, open)
-                    .automation_name(format!("Project {name}: {path}"))
-                    .on_click(
-                        context.message(Message::Settings(SettingsMsg::ProjectOpened(id.clone()))),
-                    )
-                    .content(m3::row_content(
-                        Some(m3::glyph::FOLDER),
-                        &name,
-                        &format!("{} · {summary}", nav::display_path(&path)),
-                        View::empty(),
+                format!("project:{id}:{open}:{checked}:{name}"),
+                Grid::new()
+                    .columns([GridLength::Auto, GridLength::STAR])
+                    .column_spacing(tokens::spacing::XS)
+                    .children((
+                        CheckBox::new()
+                            .is_checked(checked)
+                            .min_width(0.0)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .margin(Thickness::new(tokens::spacing::SM, 0.0, 0.0, 0.0))
+                            .automation_name(format!("Select {name}"))
+                            .on_is_checked_changed(context.callback(move |on: bool| {
+                                Message::Settings(SettingsMsg::ProjectSelected(
+                                    select_id.clone(),
+                                    on,
+                                ))
+                            })),
+                        m3::row(palette, open)
+                            .grid_column(1)
+                            .automation_name(format!("Project {name}: {note}"))
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::ProjectOpened(
+                                    id.clone(),
+                                ))),
+                            )
+                            .content(m3::row_content(
+                                Some(if name.contains(" › ") {
+                                    m3::glyph::WORKTREE
+                                } else {
+                                    m3::glyph::FOLDER
+                                }),
+                                &name,
+                                &note,
+                                if missing {
+                                    m3::secondary("missing")
+                                        .foreground(palette.error())
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .into()
+                                } else {
+                                    View::empty()
+                                },
+                            )),
                     )),
             ));
             if !open {
@@ -125,6 +190,52 @@ impl DesktopApp {
                 .margin(Thickness::uniform(tokens::spacing::SM)),
             ));
         }
+        let idle = !self.settings.busy() && self.bulk.is_none();
+        let remove_label = if selected.is_empty() {
+            "Remove selected".to_owned()
+        } else {
+            format!("Remove {} selected…", selected.len())
+        };
+        // Bulk actions: one confirmation names the count and what stays;
+        // a project with a live task is kept, never forced.
+        let bulk = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(tokens::spacing::SM)
+            .children((
+                m3::text_button(palette)
+                    .is_enabled(!ids.is_empty())
+                    .automation_name(if all {
+                        "Clear the selection"
+                    } else {
+                        "Select all projects"
+                    })
+                    .on_click(
+                        context.message(Message::Settings(SettingsMsg::ProjectsSelectAll(!all))),
+                    )
+                    .content(m3::label(if all {
+                        "Clear selection"
+                    } else {
+                        "Select all"
+                    })),
+                m3::outlined(palette)
+                    .is_enabled(idle && !ids.is_empty())
+                    .automation_name("Remove unused projects")
+                    .on_click(context.message(Message::Bulk(BulkMsg::Start(
+                        BulkOp::RemoveProjects,
+                        Pick::Unused,
+                        "all projects".to_owned(),
+                    ))))
+                    .content(m3::label("Remove unused…")),
+                m3::destructive(palette)
+                    .is_enabled(idle && !selected.is_empty())
+                    .automation_name(remove_label.clone())
+                    .on_click(context.message(Message::Bulk(BulkMsg::Start(
+                        BulkOp::RemoveProjects,
+                        Pick::Selected(selected.clone()),
+                        "the selection".to_owned(),
+                    ))))
+                    .content(m3::label(&remove_label)),
+            ));
         let add = m3::settings_card(
             palette,
             vec![KeyedView::new(
@@ -141,7 +252,9 @@ impl DesktopApp {
             )],
         );
         StackPanel::new().spacing(tokens::spacing::MD).children((
-            m3::list(palette, rows),
+            StackPanel::new()
+                .spacing(tokens::spacing::SM)
+                .children((bulk, m3::list(palette, rows))),
             StackPanel::new()
                 .spacing(tokens::spacing::SM)
                 .children((m3::section_heading("Add a project", "", None), add)),

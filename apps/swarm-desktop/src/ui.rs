@@ -52,6 +52,7 @@ use eliot_core::api::{
 use windows_reactor::*;
 
 mod automation_ui;
+mod bulk_ui;
 mod chat_ui;
 mod configure_ui;
 mod dialog_ui;
@@ -68,6 +69,7 @@ mod shell_ui;
 pub(crate) mod tokens;
 
 use automation_ui::AutomationMsg;
+use bulk_ui::BulkMsg;
 use chat_ui::ChatMsg;
 use configure_ui::ConfigureMsg;
 use launch_ui::LaunchMsg;
@@ -103,17 +105,22 @@ const AGENT_PAGE: usize = 100;
 /// Harnesses an Owner ad-hoc launch accepts (the daemon validates again).
 const ADHOC_HARNESSES: [&str; 5] = ["codex", "claude", "muse", "opencode", "antigravity"];
 
-/// UI copy of one project registration.
+/// UI copy of one project registration. Its name is derived, never the
+/// registration ID ([`DesktopApp::place_title`]).
 #[derive(Clone, Debug)]
 struct UiProject {
     id: String,
-    /// What the owner reads: the id, or the folder of a discovered project.
-    name: String,
     profiles: Vec<String>,
     workspace: String,
     /// The Git common directory registered with the checkout: its
     /// repository, which the sidebar groups by.
     common_dir: String,
+    /// The repository's name from its `origin` remote (`project.list`).
+    origin: Option<String>,
+    /// The branch checked out there ([`checkout_git`]).
+    branch: Option<String>,
+    /// The registered folder is gone.
+    missing: bool,
 }
 
 /// One page of the navigation list with its honest counters.
@@ -221,6 +228,7 @@ enum Message {
     Settings(SettingsMsg),
     Menu(MenuMsg),
     Move(MoveMsg),
+    Bulk(BulkMsg),
 }
 
 /// The input to the single desktop window: the workspace plus the shared
@@ -327,6 +335,8 @@ struct DesktopApp {
     automation: automation_ui::AutomationState,
     /// The sidebar's right-click menu, rename and confirmation.
     menu: menu_ui::MenuState,
+    /// The open bulk action (remove projects, archive or delete tasks).
+    bulk: Option<bulk_ui::BulkDialog>,
 }
 
 impl DesktopApp {
@@ -355,30 +365,80 @@ impl DesktopApp {
     }
 }
 
-/// Load project registrations on a worker; decode to picker rows.
+/// Load project registrations on a worker, with each checkout's branch and
+/// whether its folder is still there (Git's own files, [`checkout_git`]).
 fn load_projects_blocking(data_dir: &Path) -> Fallible<Vec<UiProject>> {
     client::block_on(async {
         let registrations = config_client::list_projects(data_dir)
             .await
             .map_err(|error| error.to_string())?;
-        let names = nav::project_names(
-            &registrations
-                .iter()
-                .map(|registration| (registration.id.clone(), registration.checkout.clone()))
-                .collect::<Vec<_>>(),
-        );
         Ok(registrations
             .into_iter()
-            .zip(names)
-            .map(|(registration, name)| UiProject {
-                workspace: registration.checkout.clone(),
-                common_dir: registration.repo_common_dir.clone(),
-                profiles: registration.profiles.clone(),
-                id: registration.id.clone(),
-                name,
+            .map(|registration| {
+                let folder = nav::display_path(&registration.checkout).to_owned();
+                let missing = folder_missing(&folder);
+                // A deleted worktree's administrative directory stays until
+                // Git prunes it: its HEAD still names the branch.
+                let branch = if missing {
+                    std::fs::read_to_string(
+                        Path::new(nav::display_path(&registration.repo_common_dir))
+                            .join("worktrees")
+                            .join(nav::folder_name(&folder))
+                            .join("HEAD"),
+                    )
+                    .ok()
+                    .and_then(|head| nav::head_branch(&head))
+                } else {
+                    checkout_git(&folder).and_then(|(_, branch)| branch)
+                };
+                UiProject {
+                    missing,
+                    branch,
+                    workspace: registration.checkout,
+                    common_dir: registration.repo_common_dir,
+                    profiles: registration.profiles,
+                    origin: registration.origin,
+                    id: registration.id,
+                }
             })
             .collect())
     })
+}
+
+/// Whether a folder is provably gone (an unreadable one is not "missing").
+fn folder_missing(folder: &str) -> bool {
+    matches!(
+        std::fs::symlink_metadata(folder),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// What Git's own files say about a checkout folder (git-worktree(1),
+/// gitrepository-layout(5)), with no Git process: the common directory of
+/// its repository and the branch its `HEAD` names ([`nav::head_branch`]).
+/// A main checkout's `.git` is a directory, its own common directory; a
+/// linked worktree's `.git` file names its administrative directory
+/// (`gitdir: <repo>/.git/worktrees/<name>`), whose `commondir` file names
+/// the repository's `.git` (relative to it). `None` when the folder is not
+/// a Git checkout or cannot be read; the common directory is canonical so
+/// it compares with the daemon's.
+fn checkout_git(folder: &str) -> Option<(String, Option<String>)> {
+    let folder = Path::new(folder);
+    let dot_git = folder.join(".git");
+    let (admin, common) = if dot_git.is_dir() {
+        (dot_git.clone(), dot_git)
+    } else {
+        let link = std::fs::read_to_string(&dot_git).ok()?;
+        let admin = folder.join(link.trim().strip_prefix("gitdir:")?.trim());
+        let common = std::fs::read_to_string(admin.join("commondir")).ok()?;
+        let common = admin.join(common.trim());
+        (admin, common)
+    };
+    let branch = std::fs::read_to_string(admin.join("HEAD"))
+        .ok()
+        .and_then(|head| nav::head_branch(&head));
+    let common = std::fs::canonicalize(common).ok()?;
+    Some((common.to_string_lossy().into_owned(), branch))
 }
 
 fn last_read_label(at_ms: i64) -> Option<String> {
@@ -673,6 +733,7 @@ impl Component for DesktopApp {
                 epoch: 0,
             },
             menu: menu_ui::MenuState::default(),
+            bulk: None,
         };
         // Before the first controls exist (see `app_resources::install`).
         if let Err(error) = crate::app_resources::install(app.palette().scheme()) {
@@ -716,6 +777,7 @@ impl Component for DesktopApp {
             Message::Handoff(msg) => self.handoff_update(msg, context),
             Message::Menu(msg) => self.menu_update(msg, context),
             Message::Move(msg) => self.move_update(msg, context),
+            Message::Bulk(msg) => self.bulk_update(msg, context),
         }
         self.sync_dialog(context);
     }

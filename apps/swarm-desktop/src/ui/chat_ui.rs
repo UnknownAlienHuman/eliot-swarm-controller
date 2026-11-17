@@ -813,13 +813,8 @@ impl DesktopApp {
                 starting_view(&text, &label, column, palette)
             }
             None => {
-                let project = self
-                    .selected_project()
-                    .map(|project| self.project_label(project))
-                    .or_else(|| {
-                        (!self.launch.workspace.is_empty())
-                            .then(|| nav::project_name(&self.launch.workspace, &[]))
-                    });
+                let project = (!self.launch.workspace.is_empty())
+                    .then(|| self.place_title(&self.launch.workspace));
                 let line = match project {
                     _ if self.launch.chat => "What would you like to chat about?".to_owned(),
                     Some(project) => format!("What should we build in {project}?"),

@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 
 use super::menu_ui::{Target, with_menu};
 use super::*;
-use crate::nav::{Branch, Checkout, Fleet, Row, Section, Shown};
+use crate::nav::{Branch, Checkout, Fleet, Row, Shown};
 use crate::settings::{Startup, ThemeChoice};
 use crate::shortcuts::{Input, Shortcut};
 use crate::theme::StatusTone;
@@ -100,9 +100,10 @@ pub(super) enum ShellMsg {
     ListTick,
     /// Hide the sidebar to a rail of icons, or show it again.
     SidebarToggled,
-    /// Unregistered task folders and the Git common directory each one is
-    /// a worktree of (None: not a Git worktree or not readable).
-    WorktreesResolved(Vec<(String, String, Option<String>)>),
+    /// Unregistered task folders, each with the Git common directory and
+    /// branch Git's files name for it (None: not a Git checkout or not
+    /// readable).
+    WorktreesResolved(Vec<(String, WorktreeGit)>),
 }
 
 /// Reactor 0.100.0 reports the window's Light/Dark scheme only, and a High
@@ -193,13 +194,15 @@ pub(super) struct ShellState {
     /// The sidebar is hidden to its rail (this session).
     pub(super) sidebar_collapsed: bool,
     /// Task folders no registered checkout holds, by [`nav::path_key`]:
-    /// the folder as listed and the Git common directory it is a worktree
-    /// of, if any. A worktree of a registered repository lists under that
-    /// project with its folder as a quiet tag (`wt-k111`), not as a
-    /// project of its own.
-    pub(super) worktree_repos: std::collections::BTreeMap<String, (String, Option<String>)>,
+    /// the folder as listed and, when it is a Git checkout, its common
+    /// directory and branch ([`checkout_git`]). A linked worktree lists as
+    /// a subproject of its repository, never as a project of its own.
+    pub(super) worktree_repos: std::collections::BTreeMap<String, WorktreeGit>,
     pub(super) worktrees_resolving: bool,
 }
+
+/// A resolved task folder: as listed, and its common directory and branch.
+pub(super) type WorktreeGit = (String, Option<(String, Option<String>)>);
 
 /// The sidebar search: what the box shows, what was typed and the
 /// suggestions it offers.
@@ -364,8 +367,8 @@ impl DesktopApp {
             ShellMsg::SidebarToggled => self.nav.sidebar_collapsed = !self.nav.sidebar_collapsed,
             ShellMsg::WorktreesResolved(found) => {
                 self.nav.worktrees_resolving = false;
-                for (key, folder, common) in found {
-                    self.nav.worktree_repos.insert(key, (folder, common));
+                for (key, resolved) in found {
+                    self.nav.worktree_repos.insert(key, resolved);
                 }
                 self.refresh_search();
                 // Folders listed while this read ran.
@@ -745,13 +748,41 @@ impl DesktopApp {
         self.launch.reconcile_choice();
     }
 
-    /// What the owner reads for a registered project: the display name they
-    /// gave its sidebar project (`[desktop] display_names`), else its name.
+    /// What the owner reads for a registered project ([`Self::place_title`]
+    /// of its checkout): never its registration ID.
     pub(super) fn project_label(&self, project: &UiProject) -> String {
-        let key = format!("project:repo:{}", nav::path_key(&project.common_dir));
+        self.place_title(&project.workspace)
+    }
+
+    /// What the owner reads for a task folder: the project's name (the
+    /// display name they gave it, `[desktop] display_names`, else its
+    /// logical name, [`nav::place_of`]) and, in a linked worktree, its
+    /// subproject's ("atlas-web › search filters").
+    pub(super) fn place_title(&self, label: &str) -> String {
+        self.place_title_in(label, &self.checkouts())
+    }
+
+    /// [`Self::place_title`] over checkouts already built.
+    pub(super) fn place_title_in(&self, label: &str, checkouts: &[Checkout]) -> String {
+        let (_, subproject) = nav::place_of(label, checkouts);
+        let project = self.project_title_in(label, checkouts);
+        match subproject {
+            Some(subproject) => {
+                let renamed = nav::subproject_key(label, checkouts)
+                    .and_then(|key| self.prefs.display_name(&format!("project:{key}")));
+                format!("{project} › {}", renamed.unwrap_or(&subproject))
+            }
+            None => project,
+        }
+    }
+
+    /// The project's name alone (the owner's display name, else its logical
+    /// name): what the sidebar's project row and the Monitor show.
+    pub(super) fn project_title_in(&self, label: &str, checkouts: &[Checkout]) -> String {
+        let key = format!("project:{}", nav::project_key(label, checkouts));
         self.prefs
             .display_name(&key)
-            .map_or_else(|| project.name.clone(), str::to_owned)
+            .map_or_else(|| nav::project_of(label, checkouts), str::to_owned)
     }
 
     /// Open the most recently active Agent's conversation once at start,
@@ -774,10 +805,10 @@ impl DesktopApp {
         }
     }
 
-    /// The registered checkouts with their repositories, for grouping.
-    /// Every registered checkout, then each unregistered task folder that
-    /// is a Git worktree of a registered repository (it lists under that
-    /// repository's project, tagged with its folder).
+    /// Every checkout the sidebar groups by: each registered one (with its
+    /// repository's origin name, branch and whether its folder is gone),
+    /// then each unregistered task folder that is a Git checkout, so a
+    /// linked worktree lists as a subproject of its repository.
     pub(super) fn checkouts(&self) -> Vec<Checkout> {
         let mut checkouts: Vec<Checkout> = self
             .nav
@@ -786,24 +817,33 @@ impl DesktopApp {
             .map(|project| Checkout {
                 path: project.workspace.clone(),
                 common_dir: project.common_dir.clone(),
+                branch: project.branch.clone(),
+                origin: project.origin.clone(),
+                missing: project.missing,
             })
-            .collect();
-        let repositories: HashSet<String> = checkouts
-            .iter()
-            .map(|checkout| nav::path_key(&checkout.common_dir))
             .collect();
         let registered: HashSet<String> = checkouts
             .iter()
             .map(|checkout| nav::path_key(&checkout.path))
             .collect();
-        for (key, (folder, common)) in &self.nav.worktree_repos {
-            if let Some(common) = common
-                && repositories.contains(&nav::path_key(common))
+        // Only folders a listed task still runs in (an archived or deleted
+        // task's worktree leaves with it).
+        let listed: HashSet<String> = self
+            .nav
+            .agents
+            .iter()
+            .map(|agent| nav::path_key(&agent.project))
+            .collect();
+        for (key, (folder, git)) in &self.nav.worktree_repos {
+            if let Some((common, branch)) = git
                 && !registered.contains(key)
+                && listed.contains(key)
             {
                 checkouts.push(Checkout {
                     path: folder.clone(),
                     common_dir: common.clone(),
+                    branch: branch.clone(),
+                    ..Checkout::default()
                 });
             }
         }
@@ -811,8 +851,8 @@ impl DesktopApp {
     }
 
     /// Read, once per folder, which Git repository each unregistered task
-    /// folder is a worktree of (a file read in the background; see
-    /// [`worktree_common_dir`]).
+    /// folder is a checkout of, and its branch (a file read in the
+    /// background; see [`checkout_git`]).
     fn resolve_worktrees(&mut self, context: &ComponentContext<Self>) {
         if self.nav.worktrees_resolving {
             return;
@@ -821,10 +861,7 @@ impl DesktopApp {
             .nav
             .projects
             .iter()
-            .map(|project| Checkout {
-                path: project.workspace.clone(),
-                common_dir: project.common_dir.clone(),
-            })
+            .map(|project| Checkout::new(project.workspace.clone(), project.common_dir.clone()))
             .collect();
         let mut wanted: Vec<(String, String)> = Vec::new();
         for agent in &self.nav.agents {
@@ -847,8 +884,8 @@ impl DesktopApp {
             let found = wanted
                 .into_iter()
                 .map(|(key, folder)| {
-                    let common = worktree_common_dir(nav::display_path(&folder));
-                    (key, folder, common)
+                    let git = checkout_git(nav::display_path(&folder));
+                    (key, (folder, git))
                 })
                 .collect();
             Message::Shell(ShellMsg::WorktreesResolved(found))
@@ -1226,6 +1263,8 @@ impl DesktopApp {
             self.handoff_dialog(context)
         } else if self.settings.cleanup_confirm {
             self.cleanup_confirmation(context, palette)
+        } else if let Some(dialog) = &self.bulk {
+            self.bulk_dialog(dialog, context, palette)
         } else {
             self.task_dialog(context, palette)
         };
@@ -1336,7 +1375,7 @@ impl DesktopApp {
         let checkouts = self.checkouts();
         let keep = |agent: &UiAgent| {
             query.is_empty()
-                || nav::matches(agent, &nav::project_of(&agent.project, &checkouts), &query)
+                || nav::matches(agent, &nav::place_label(&agent.project, &checkouts), &query)
         };
         let filtered = !query.is_empty();
         let shown = Shown {
@@ -1354,10 +1393,35 @@ impl DesktopApp {
         } else {
             "Projects"
         };
-        let mut items: Vec<KeyedView> = vec![KeyedView::new(
-            format!("caption:{caption}"),
-            section_label(caption),
-        )];
+        let caption_row: View = if filtered {
+            section_label(caption).into()
+        } else {
+            // Bulk actions over every project (k142): archive, delete,
+            // remove the unused ones, each after one confirmation.
+            let items: Vec<MenuItem> = super::bulk_ui::ALL_MENU
+                .iter()
+                .map(|(id, label)| MenuItem::item(*id, *label))
+                .collect();
+            Grid::new()
+                .columns([GridLength::STAR, GridLength::Auto])
+                .children((
+                    section_label(caption),
+                    m3::icon_button(palette)
+                        .grid_column(1)
+                        .width(tokens::height::SUB_ROW)
+                        .height(tokens::height::SUB_ROW)
+                        .vertical_alignment(VerticalAlignment::Bottom)
+                        .automation_name("Actions for all projects")
+                        .content(m3::icon(m3::glyph::MORE))
+                        .menu(Menu::new(
+                            items,
+                            // Capture-free: one identity across renders.
+                            context.callback(|id: String| Message::Bulk(BulkMsg::Menu(id))),
+                        )),
+                ))
+        };
+        let mut items: Vec<KeyedView> =
+            vec![KeyedView::new(format!("caption:{caption}"), caption_row)];
         if sections.is_empty() {
             let empty = if self.nav.agents_loading {
                 "Loading…"
@@ -1380,46 +1444,28 @@ impl DesktopApp {
         }
         let new_task_selected =
             self.main == Main::Conversation && self.chat.convo.is_none() && !self.launch.chat;
+        let launch_key = nav::path_key(&self.launch.workspace);
         for section in &sections {
-            let selected = new_task_selected && section.holds(&self.launch.workspace);
-            let name_key = format!("project:{}", section.key);
-            let renaming = self
-                .menu
-                .renaming
-                .as_ref()
-                .filter(|(target, _)| matches!(target, Target::Project { key, .. } if *key == section.key))
-                .map(|(_, typed)| typed.clone());
+            let selected = new_task_selected && nav::path_key(&section.checkout) == launch_key;
             let name = self
                 .prefs
-                .display_name(&name_key)
+                .display_name(&format!("project:{}", section.key))
                 .map_or_else(|| section.name.clone(), str::to_owned);
-            let row = match renaming {
-                Some(typed) => self.rename_row(&typed, 0.0, context, palette),
-                None => with_menu(
-                    self.project_row(section, &name, selected, filtered, context, palette),
-                    Target::Project {
-                        key: section.key.clone(),
-                        name: name.clone(),
-                        checkout: section.checkout.clone(),
-                        checkouts: section.checkouts.clone(),
-                        collapsed: section.collapsed,
-                    },
-                    context,
-                ),
+            let place = Place {
+                key: &section.key,
+                name: &name,
+                checkout: &section.checkout,
+                checkouts: &section.checkouts,
+                collapsed: section.collapsed,
+                running: section.running,
+                missing: section.missing,
+                nested: false,
             };
-            items.push(KeyedView::new(
-                format!(
-                    "project:{}:{selected}:{}:{name}:{}",
-                    section.key,
-                    section.collapsed,
-                    self.menu.renaming.is_some()
-                ),
-                row,
-            ));
+            items.push(self.place_item(&place, selected, filtered, context, palette));
             if section.collapsed {
                 continue;
             }
-            if section.rows.is_empty() {
+            if section.rows.is_empty() && section.subprojects.is_empty() {
                 // Older tasks fold below; "No tasks yet" only when there
                 // are none at all.
                 items.push(KeyedView::new(
@@ -1436,6 +1482,28 @@ impl DesktopApp {
             }
             for row in &section.rows {
                 items.push(self.task_item(row, context, palette));
+            }
+            for sub in &section.subprojects {
+                let name = self
+                    .prefs
+                    .display_name(&format!("project:{}", sub.key))
+                    .map_or_else(|| sub.name.clone(), str::to_owned);
+                let checkouts = [sub.checkout.clone()];
+                let place = Place {
+                    key: &sub.key,
+                    name: &name,
+                    checkout: &sub.checkout,
+                    checkouts: &checkouts,
+                    collapsed: sub.collapsed,
+                    running: sub.running,
+                    missing: sub.missing,
+                    nested: true,
+                };
+                let selected = new_task_selected && nav::path_key(&sub.checkout) == launch_key;
+                items.push(self.place_item(&place, selected, filtered, context, palette));
+                for row in &sub.rows {
+                    items.push(self.task_item(row, context, palette));
+                }
             }
             if section.older > 0 {
                 let label = if section.older_shown {
@@ -1500,7 +1568,7 @@ impl DesktopApp {
                         .count(),
                     expanded: self.nav.expanded.contains(&agent.id),
                     note: None,
-                    place: None,
+                    nested: false,
                 };
                 items.push(self.task_item(&row, context, palette));
                 if row.expanded {
@@ -1516,7 +1584,7 @@ impl DesktopApp {
                             children: 0,
                             expanded: false,
                             note: None,
-                            place: None,
+                            nested: false,
                         };
                         items.push(self.task_item(&child_row, context, palette));
                     }
@@ -1615,19 +1683,70 @@ impl DesktopApp {
             .children((header, new_task, search, destinations, list, bottom))
     }
 
-    /// A project row: its chevron, folder and repository name collapse or
-    /// expand it; a collapsed project keeps its running tasks as a count.
-    /// The trailing button starts a new task in it.
-    fn project_row(
+    /// A project or subproject row with its right-click menu, or the
+    /// rename editor in its place.
+    fn place_item(
         &self,
-        section: &Section,
-        name: &str,
+        place: &Place,
+        selected: bool,
+        filtered: bool,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> KeyedView {
+        let renaming = self
+            .menu
+            .renaming
+            .as_ref()
+            .filter(|(target, _)| matches!(target, Target::Project { key, .. } if key == place.key))
+            .map(|(_, typed)| typed.clone());
+        let indent = if place.nested {
+            tokens::layout::TREE_INDENT
+        } else {
+            0.0
+        };
+        let row = match renaming {
+            Some(typed) => self.rename_row(&typed, indent, context, palette),
+            None => with_menu(
+                self.place_row(place, selected, filtered, context, palette),
+                Target::Project {
+                    key: place.key.to_owned(),
+                    name: place.name.to_owned(),
+                    checkout: place.checkout.to_owned(),
+                    checkouts: place.checkouts.to_vec(),
+                    collapsed: place.collapsed,
+                },
+                context,
+            ),
+        };
+        KeyedView::new(
+            format!(
+                "project:{}:{selected}:{}:{}:{}:{}:{}",
+                place.key,
+                place.collapsed,
+                place.name,
+                place.running,
+                place.missing,
+                self.menu.renaming.is_some()
+            ),
+            row,
+        )
+    }
+
+    /// A project row (folder icon) or a subproject row (worktree icon, one
+    /// indent in): its chevron and name collapse or expand it; tasks
+    /// working now show as a count on the right, collapsed or not; a
+    /// registered folder that is gone says "missing" with a one-click
+    /// Remove. The trailing button starts a new task in it.
+    fn place_row(
+        &self,
+        place: &Place,
         selected: bool,
         filtered: bool,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let badge: View = if section.collapsed && section.running > 0 {
+        let name = place.name;
+        let badge: View = if place.running > 0 {
             StackPanel::new()
                 .orientation(Orientation::Horizontal)
                 .spacing(tokens::spacing::XS)
@@ -1636,26 +1755,49 @@ impl DesktopApp {
                     palette
                         .dot(StatusTone::Active)
                         .map_or_else(View::empty, m3::dot),
-                    m3::secondary(section.running.to_string())
+                    m3::secondary(place.running.to_string())
                         .vertical_alignment(VerticalAlignment::Center),
                 ))
+        } else if place.missing {
+            m3::secondary("missing")
+                .foreground(palette.error())
+                .vertical_alignment(VerticalAlignment::Center)
+                .into()
         } else {
             View::empty()
         };
-        let (chevron, state) = if section.collapsed {
+        let (chevron, state) = if place.collapsed {
             (m3::glyph::CHEVRON_RIGHT, "collapsed")
         } else {
             (m3::glyph::CHEVRON_DOWN, "expanded")
         };
-        let mut label = format!("{name}, project, {state}");
-        if section.collapsed && section.running > 0 {
-            label.push_str(&format!(", {} running", section.running));
+        let kind = if place.nested {
+            "subproject"
+        } else {
+            "project"
+        };
+        let mut label = format!("{name}, {kind}, {state}");
+        if place.running > 0 {
+            label.push_str(&format!(", {} working", place.running));
         }
-        let toggle = m3::row(palette, selected)
+        if place.missing {
+            label.push_str(", folder missing");
+        }
+        let row = if place.nested {
+            m3::sub_row(palette, selected)
+        } else {
+            m3::row(palette, selected)
+        };
+        let height = if place.nested {
+            tokens::height::SUB_ROW
+        } else {
+            tokens::height::CONTROL
+        };
+        let toggle = row
             .automation_name(label)
             .is_enabled(!filtered)
             .on_click(context.message(Message::Shell(ShellMsg::ProjectToggled(
-                section.key.clone(),
+                place.key.to_owned(),
             ))))
             .content(
                 Grid::new()
@@ -1664,25 +1806,62 @@ impl DesktopApp {
                     .children((
                         m3::icon(chevron),
                         Border::new().grid_column(1).content(m3::row_content(
-                            Some(m3::glyph::FOLDER),
+                            Some(if place.nested {
+                                m3::glyph::WORKTREE
+                            } else {
+                                m3::glyph::FOLDER
+                            }),
                             name,
                             "",
                             badge,
                         )),
                     )),
             );
-        let new_task = m3::icon_button(palette)
-            .grid_column(1)
-            .width(tokens::height::CONTROL)
-            .height(tokens::height::CONTROL)
-            .automation_name(format!("New task in {name}"))
-            .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
-                section.checkout.clone(),
-            ))))
-            .content(m3::icon(m3::glyph::NEW_TASK));
+        let action = if place.missing {
+            // The folder is gone: one click forgets the registration
+            // (kept, with its reason, while a task still uses it).
+            let registered = self
+                .nav
+                .projects
+                .iter()
+                .find(|project| nav::path_key(&project.workspace) == nav::path_key(place.checkout))
+                .map(|project| project.id.clone());
+            m3::icon_button(palette)
+                .grid_column(1)
+                .width(height)
+                .height(height)
+                .is_enabled(registered.is_some() && self.bulk.is_none())
+                .automation_name(format!("Remove missing {kind} {name}"))
+                .on_click(context.message(Message::Bulk(BulkMsg::Start(
+                    super::bulk_ui::BulkOp::RemoveProjects,
+                    super::bulk_ui::Pick::Missing(registered.unwrap_or_default()),
+                    name.to_owned(),
+                ))))
+                .content(m3::icon(m3::glyph::DELETE))
+        } else {
+            m3::icon_button(palette)
+                .grid_column(1)
+                .width(height)
+                .height(height)
+                .automation_name(format!("New task in {name}"))
+                .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
+                    place.checkout.to_owned(),
+                ))))
+                .content(m3::icon(m3::glyph::NEW_TASK))
+        };
         Grid::new()
+            .margin(Thickness::new(
+                if place.nested {
+                    tokens::layout::TREE_INDENT
+                } else {
+                    0.0
+                },
+                0.0,
+                0.0,
+                0.0,
+            ))
             .columns([GridLength::STAR, GridLength::Auto])
-            .children((toggle, new_task))
+            .children((toggle, action))
     }
 
     /// A task row under its project: indented 24 DIPs per level, so its
@@ -1733,9 +1912,6 @@ impl DesktopApp {
             eliot_core::api::agent_state_name(agent.state),
             agent.id
         );
-        if let Some(place) = &row.place {
-            name.push_str(&format!(", in {place}"));
-        }
         if row.depth > 0 {
             name.push_str(&format!(", worker level {}", row.depth));
         }
@@ -1808,7 +1984,12 @@ impl DesktopApp {
             )
             .content(
                 Grid::new()
-                    .margin(Thickness::new(row.depth as f64 * indent, 0.0, 0.0, 0.0))
+                    .margin(Thickness::new(
+                        (row.depth + usize::from(row.nested)) as f64 * indent,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ))
                     .columns([
                         GridLength::Pixel(indent),
                         GridLength::STAR,
@@ -1831,11 +2012,7 @@ impl DesktopApp {
                                 title,
                                 "",
                                 row_tag(
-                                    if agent.archived {
-                                        "archived"
-                                    } else {
-                                        row.place.as_deref().unwrap_or("")
-                                    },
+                                    if agent.archived { "archived" } else { "" },
                                     task_dot(palette, agent),
                                 ),
                             )),
@@ -1861,7 +2038,8 @@ impl DesktopApp {
         let view = match renaming {
             Some(typed) => self.rename_row(
                 &typed,
-                (row.depth as f64 + 1.0) * tokens::layout::TREE_INDENT,
+                (row.depth + usize::from(row.nested)) as f64 * tokens::layout::TREE_INDENT
+                    + tokens::layout::TREE_INDENT,
                 context,
                 palette,
             ),
@@ -2085,6 +2263,21 @@ impl DesktopApp {
     }
 }
 
+/// A project or subproject row's content: what it is called and holds.
+struct Place<'a> {
+    /// `repo:…`/`folder:…` for a project, `sub:…` for a subproject.
+    key: &'a str,
+    name: &'a str,
+    /// Where a new task in it starts.
+    checkout: &'a str,
+    checkouts: &'a [String],
+    collapsed: bool,
+    running: usize,
+    missing: bool,
+    /// A subproject (one indent in, worktree icon).
+    nested: bool,
+}
+
 /// A sidebar section label: secondary text at the rows' content inset, 16
 /// DIPs below the group above it.
 fn section_label(text: &str) -> TextBlock {
@@ -2150,27 +2343,4 @@ fn today_start_ms() -> i64 {
         .and_hms_opt(0, 0, 0)
         .and_then(|midnight| Local.from_local_datetime(&midnight).earliest())
         .map_or(0, |start| start.timestamp_millis())
-}
-
-/// The Git common directory a folder is a linked worktree of, from Git's
-/// own layout (git-worktree(1)): the folder's `.git` file names its
-/// administrative directory (`gitdir: <repo>/.git/worktrees/<name>`), whose
-/// `commondir` file names the repository's `.git` (relative to it). A main
-/// checkout (a `.git` directory) is its own common directory. `None` when
-/// the folder is not a Git checkout or cannot be read; the path is
-/// canonical so it compares with the daemon's.
-fn worktree_common_dir(folder: &str) -> Option<String> {
-    let folder = std::path::Path::new(folder);
-    let dot_git = folder.join(".git");
-    let common = if dot_git.is_dir() {
-        dot_git
-    } else {
-        let link = std::fs::read_to_string(&dot_git).ok()?;
-        let admin = folder.join(link.trim().strip_prefix("gitdir:")?.trim());
-        let common = std::fs::read_to_string(admin.join("commondir")).ok()?;
-        admin.join(common.trim())
-    };
-    std::fs::canonicalize(common)
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned())
 }

@@ -34,14 +34,10 @@ impl DesktopApp {
     ) -> View {
         let label = if self.launch.chat {
             "No project (chat)".to_owned()
+        } else if self.launch.workspace.is_empty() {
+            "No project".to_owned()
         } else {
-            self.selected_project()
-                .map(|project| self.project_label(project))
-                .or_else(|| {
-                    (!self.launch.workspace.is_empty())
-                        .then(|| nav::project_name(&self.launch.workspace, &[]))
-                })
-                .unwrap_or_else(|| "No project".to_owned())
+            self.place_title(&self.launch.workspace)
         };
         let open = self.launch.open == Some(Pop::Project);
         let glyph = if self.launch.chat {
