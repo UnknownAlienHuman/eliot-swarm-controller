@@ -45,6 +45,9 @@ pub mod height {
     /// A picker row with a supporting line under its title (the move
     /// picker's tasks).
     pub const TWO_LINE_ROW: f64 = 48.0;
+    /// A compact chip inside a row: the model picker's effort chip and the
+    /// highlighted row's effort segment.
+    pub const CHIP: f64 = 24.0;
 }
 
 /// Native aliases of the shared Material 3 type scale.
@@ -127,8 +130,13 @@ pub mod layout {
     /// First window client size; the user resizes freely after.
     pub const WINDOW_WIDTH: f64 = 1440.0;
     pub const WINDOW_HEIGHT: f64 = 900.0;
-    /// The model picker above the composer (OpenCode's dialog width).
-    pub const PICKER_WIDTH: f64 = 520.0;
+    /// The model picker above the composer: the widest catalogue name
+    /// (about 230 DIPs, "Gemini 3.1 Pro Preview Custom Tools") still fits
+    /// beside the highlighted row's six-step effort segment and star.
+    pub const PICKER_WIDTH: f64 = 600.0;
+    /// The composer's project chip trims a long project name past this
+    /// width.
+    pub const PROJECT_CHIP_WIDTH: f64 = 280.0;
     /// The access and project menus above the composer.
     pub const MENU_WIDTH: f64 = 420.0;
     /// The scrolling list of a popover.

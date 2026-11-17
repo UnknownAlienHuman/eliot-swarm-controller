@@ -838,63 +838,100 @@ impl DesktopApp {
                     context,
                 ),
             );
-            let labelled = |label: &str, picker: ComboBox| -> View {
+            let labelled = |label: &str, control: View| -> View {
                 StackPanel::new().spacing(tokens::spacing::XS).children((
                     small(label.to_owned()).opacity(theme::MUTED_OPACITY),
-                    picker.min_width(tokens::layout::DIALOG_PICKER_WIDTH),
+                    control,
                 ))
             };
+            // The effort steps as segments (the effort popover's control):
+            // each shows the short word and is named in full words, and its
+            // position is the index into `efforts` (0: the harness default).
+            let effort_segments: Vec<KeyedView> =
+                efforts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, effort)| {
+                        let (label, name) = if index == 0 {
+                            ("default", "Harness default effort".to_owned())
+                        } else {
+                            (
+                                crate::picker::effort_label(effort),
+                                crate::picker::effort_name(effort),
+                            )
+                        };
+                        let selected = state.effort == Some(index);
+                        KeyedView::new(
+                            format!("{index}:{effort}:{selected}"),
+                            m3::segment(palette, selected)
+                                .is_enabled(can_act && harness.is_some())
+                                .automation_name(format!(
+                                    "Ad-hoc effort: {name}{}",
+                                    if selected { " (chosen)" } else { "" }
+                                ))
+                                .on_click(context.message(Message::Handoff(
+                                    HandoffMsg::EffortPicked(Some(index)),
+                                )))
+                                .content(m3::segment_label(label)),
+                        )
+                    })
+                    .collect();
             push(
                 "adhoc",
                 StackPanel::new()
-                    .orientation(Orientation::Horizontal)
                     .spacing(tokens::spacing::SM)
                     .margin(Thickness::new(RADIO_INDENT, 0.0, 0.0, 0.0))
                     .keyed_children(vec![
                         KeyedView::new(
-                            "harness",
-                            labelled(
-                                "Harness",
-                                ComboBox::new()
-                                    .items_source(ADHOC_HARNESSES.map(str::to_owned).to_vec())
-                                    .selected_index(state.harness)
-                                    .is_enabled(can_act)
-                                    .placeholder_text("Pick one")
-                                    .automation_name("Ad-hoc harness")
-                                    .on_selection_changed(context.callback(|index| {
-                                        Message::Handoff(HandoffMsg::HarnessPicked(index))
-                                    })),
-                            ),
-                        ),
-                        // Option lists that change get a new control (see
-                        // `configure::panel`).
-                        KeyedView::new(
-                            format!("model:{}", models.join("\u{1f}")),
-                            labelled(
-                                "Model",
-                                ComboBox::new()
-                                    .items_source(models.clone())
-                                    .selected_index(state.model)
-                                    .is_enabled(can_act && harness.is_some())
-                                    .automation_name("Ad-hoc model")
-                                    .on_selection_changed(context.callback(|index| {
-                                        Message::Handoff(HandoffMsg::ModelPicked(index))
-                                    })),
-                            ),
+                            "pickers",
+                            StackPanel::new()
+                                .orientation(Orientation::Horizontal)
+                                .spacing(tokens::spacing::SM)
+                                .keyed_children(vec![
+                                    KeyedView::new(
+                                        "harness",
+                                        labelled(
+                                            "Harness",
+                                            ComboBox::new()
+                                                .items_source(
+                                                    ADHOC_HARNESSES.map(str::to_owned).to_vec(),
+                                                )
+                                                .selected_index(state.harness)
+                                                .is_enabled(can_act)
+                                                .placeholder_text("Pick one")
+                                                .automation_name("Ad-hoc harness")
+                                                .min_width(tokens::layout::DIALOG_PICKER_WIDTH)
+                                                .on_selection_changed(context.callback(|index| {
+                                                    Message::Handoff(HandoffMsg::HarnessPicked(
+                                                        index,
+                                                    ))
+                                                }))
+                                                .into(),
+                                        ),
+                                    ),
+                                    // Option lists that change get a new
+                                    // control (see `configure::panel`).
+                                    KeyedView::new(
+                                        format!("model:{}", models.join("\u{1f}")),
+                                        labelled(
+                                            "Model",
+                                            ComboBox::new()
+                                                .items_source(models.clone())
+                                                .selected_index(state.model)
+                                                .is_enabled(can_act && harness.is_some())
+                                                .automation_name("Ad-hoc model")
+                                                .min_width(tokens::layout::DIALOG_PICKER_WIDTH)
+                                                .on_selection_changed(context.callback(|index| {
+                                                    Message::Handoff(HandoffMsg::ModelPicked(index))
+                                                }))
+                                                .into(),
+                                        ),
+                                    ),
+                                ]),
                         ),
                         KeyedView::new(
                             format!("effort:{}", efforts.join("\u{1f}")),
-                            labelled(
-                                "Effort",
-                                ComboBox::new()
-                                    .items_source(efforts.clone())
-                                    .selected_index(state.effort)
-                                    .is_enabled(can_act && harness.is_some())
-                                    .automation_name("Ad-hoc effort")
-                                    .on_selection_changed(context.callback(|index| {
-                                        Message::Handoff(HandoffMsg::EffortPicked(index))
-                                    })),
-                            ),
+                            labelled("Effort", m3::segmented(palette, effort_segments)),
                         ),
                     ]),
             );
@@ -1191,7 +1228,9 @@ impl DesktopApp {
                 Some(harness) => format!(
                     "Starts a new ad-hoc {harness} Agent (model {}, effort {}) in {from}'s workspace and moves the task to it: {carried}. {from} keeps running.",
                     model.as_deref().unwrap_or("harness default"),
-                    effort.as_deref().unwrap_or("harness default")
+                    effort
+                        .as_deref()
+                        .map_or("harness default", crate::picker::effort_label)
                 ),
                 None => "Pick the ad-hoc Agent's harness.".to_owned(),
             },

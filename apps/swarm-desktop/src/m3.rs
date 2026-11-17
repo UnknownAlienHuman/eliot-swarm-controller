@@ -335,9 +335,9 @@ pub fn chip(palette: Palette) -> Button {
     button(palette.chip())
 }
 
-/// A borderless chip (Codex's composer pills: the project selector above
-/// the composer, the access level): the label in on-surface, a state layer
-/// on hover, no outline.
+/// A borderless chip (Codex's composer pills: the project selector in the
+/// composer's first row, the access level): the label in on-surface, a
+/// state layer on hover, no outline.
 pub fn text_chip(palette: Palette) -> Button {
     button(palette.row(false))
 }

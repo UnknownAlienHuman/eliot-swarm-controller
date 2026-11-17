@@ -1,5 +1,6 @@
 use super::*;
-use crate::configure::{effort_words, locked_words};
+use crate::configure::locked_words;
+use crate::picker::{effort_label, effort_name};
 use eliot_core::api::{HarnessModelsResponse, ModelsCatalogResponse};
 use launch_ui::Pop;
 
@@ -38,11 +39,12 @@ impl DesktopApp {
         }
     }
 
-    /// The one composer. A new task: the project selector above the card
-    /// (Codex's bar), then the field and the model and access chips. An
-    /// open Agent: its project, harness and access as plain read-only text,
-    /// the field, then the model-and-effort chip. Usage, Interrupt (only
-    /// while a turn runs) and Send or Resume sit at the right.
+    /// The one composer, one rounded card. A new task: the project chip as
+    /// the card's first row, then the field and the model and access
+    /// chips. An open Agent: its project, harness and access as plain
+    /// read-only text, the field, then the model-and-effort chip. Usage,
+    /// Interrupt (only while a turn runs) and Send or Resume sit at the
+    /// right.
     pub(super) fn composer_view(
         &self,
         column: Option<f64>,
@@ -51,14 +53,25 @@ impl DesktopApp {
     ) -> View {
         let agent = self.selected_agent_id();
         let detail = self.chat.detail.as_ref();
-        let bar: View = match agent {
-            None => self.composer_top_row(context, palette),
-            Some(_) => View::empty(),
-        };
+        // The first row: a new task's project chip (its own inset lines its
+        // icon up with the chips below), or the open Agent's read-only
+        // context (inset to where the chips' icons start).
         let (context_row, chips): (Option<View>, View) = match (agent.as_deref(), detail) {
-            (None, _) => (None, self.composer_chips(context, palette)),
+            (None, _) => (
+                Some(self.composer_project_row(context, palette)),
+                self.composer_chips(context, palette),
+            ),
             (Some(_), Some(detail)) => (
-                Some(self.agent_context(detail, palette)),
+                Some(
+                    Border::new()
+                        .margin(Thickness::new(
+                            tokens::spacing::INSET,
+                            tokens::spacing::XS,
+                            0.0,
+                            0.0,
+                        ))
+                        .content(self.agent_context(detail, palette)),
+                ),
                 self.model_chip(detail, context, palette),
             ),
             (Some(_), None) => (None, View::empty()),
@@ -134,22 +147,9 @@ impl DesktopApp {
                 Grid::new()
                     .rows(rows)
                     .row_spacing(tokens::spacing::SM)
-                    .children((
-                        context_row.map_or_else(View::empty, |row| {
-                            Border::new()
-                                .margin(Thickness::new(
-                                    tokens::spacing::INSET,
-                                    tokens::spacing::XS,
-                                    0.0,
-                                    0.0,
-                                ))
-                                .content(row)
-                        }),
-                        field,
-                        bottom,
-                    )),
+                    .children((context_row.unwrap_or_else(View::empty), field, bottom)),
             );
-        StackPanel::new()
+        Border::new()
             .grid_row(5)
             .width(column)
             .max_width(tokens::layout::READING_WIDTH)
@@ -160,7 +160,7 @@ impl DesktopApp {
                 0.0,
                 tokens::spacing::LG,
             ))
-            .children((bar, card))
+            .content(card)
     }
 
     /// The open Agent's project, harness and access: read-only, so plain
@@ -205,18 +205,20 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
+        let model = detail.settings.next_model().unwrap_or("Default model");
+        let effort = detail.settings.next_effort();
         let label = format!(
-            "{} · {}",
-            detail.settings.next_model().unwrap_or("Default model"),
-            detail
-                .settings
-                .next_effort()
-                .map_or_else(|| "Default effort".to_owned(), effort_words)
+            "{model} · {}",
+            effort.map_or("default effort", effort_label)
+        );
+        let name = format!(
+            "{model} · {}",
+            effort.map_or_else(|| "default effort".to_owned(), effort_name)
         );
         let open = self.launch.open == Some(Pop::Effort);
         m3::text_chip(palette)
             .automation_name(format!(
-                "Model and effort: {label} ({})",
+                "Model and effort: {name} ({})",
                 if open { "open" } else { "change" }
             ))
             .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Effort))))
@@ -310,7 +312,8 @@ impl DesktopApp {
         let current = detail.settings.next_effort();
         let shown = self.launch.effort_highlight.as_deref().or(current);
         let header = StackPanel::new().children((
-            m3::section_title(shown.map_or_else(|| "Default effort".to_owned(), effort_words)),
+            m3::section_title(shown.map_or("default effort", effort_label))
+                .automation_name(shown.map_or_else(|| "default effort".to_owned(), effort_name)),
             m3::secondary(detail.settings.next_model_words()),
         ));
         let preview = self.agent_launch_catalog(&detail.harness);
@@ -341,13 +344,13 @@ impl DesktopApp {
                         .iter()
                         .map(|effort| {
                             let selected = shown == Some(effort.as_str());
-                            let words = effort_words(effort);
                             KeyedView::new(
                                 format!("effort:{effort}:{selected}"),
                                 m3::segment(palette, selected)
                                     .is_enabled(enabled)
                                     .automation_name(format!(
-                                        "Effort {words}{}",
+                                        "Effort {}{}",
+                                        effort_name(effort),
                                         if current == Some(effort.as_str()) {
                                             " (current)"
                                         } else {
@@ -357,7 +360,7 @@ impl DesktopApp {
                                     .on_click(context.message(Message::Launch(
                                         LaunchMsg::EffortChosen(effort.clone()),
                                     )))
-                                    .content(m3::segment_label(&words)),
+                                    .content(m3::segment_label(effort_label(effort))),
                             )
                         })
                         .collect();

@@ -8,12 +8,15 @@ use std::collections::HashMap;
 
 use super::launch_ui::{CHAT_PROJECT, OTHER_FOLDER, Pop};
 use super::*;
-use crate::picker::{Choice, Item, ItemKind, ManageGroup, Row};
+use crate::picker::{self, Choice, Item, ItemKind, ManageGroup, Row};
 use crate::settings::Access;
 use crate::theme::winui::Palette;
 
 /// The picker's key hints (OpenCode's footer).
 const PICKER_HINTS: &str = "↑↓ move   ←→ effort   Enter choose   Ctrl+F favorite   Esc close";
+/// What a model row with no explicit effort launches: the harness's own
+/// default (its accessible name; the chip reads "Default").
+const DEFAULT_EFFORT: &str = "Default effort";
 /// Models a Manage models group lists before it asks for a search.
 const MANAGE_GROUP_ROWS: usize = 150;
 /// The conversation rows a popover overlays: the transcript, pending
@@ -21,10 +24,10 @@ const MANAGE_GROUP_ROWS: usize = 150;
 pub(super) const POPOVER_ROWS: i32 = 4;
 
 impl DesktopApp {
-    /// The bar above a new task's composer (Codex's): the project selector
-    /// as a borderless chip (and the folder field for a folder outside the
-    /// projects) on a strip tucked under the composer's corners.
-    pub(super) fn composer_top_row(
+    /// A new task composer's first row, inside its card (Codex's): the
+    /// project selector as a borderless chip, and the folder field for a
+    /// folder outside the projects.
+    pub(super) fn composer_project_row(
         &self,
         context: &mut ViewContext<Self>,
         palette: Palette,
@@ -52,7 +55,11 @@ impl DesktopApp {
                 if open { "list open" } else { "choose" }
             ))
             .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Project))))
-            .content(chip_content(glyph, &label, None));
+            .content(chip_content(
+                glyph,
+                &label,
+                Some(tokens::layout::PROJECT_CHIP_WIDTH),
+            ));
         let folder: View = if !self.launch.chat
             && (self.launch.custom_workspace || self.nav.projects.is_empty())
         {
@@ -69,27 +76,10 @@ impl DesktopApp {
         } else {
             View::empty()
         };
-        Border::new()
-            .margin(Thickness::new(
-                tokens::radius::COMPOSER,
-                0.0,
-                tokens::radius::COMPOSER,
-                0.0,
-            ))
-            .background(palette.card())
-            .corner_radius(CornerRadius::new(
-                tokens::radius::CONTAINER,
-                tokens::radius::CONTAINER,
-                0.0,
-                0.0,
-            ))
-            .padding(Thickness::xy(tokens::spacing::XS, tokens::spacing::XS))
-            .content(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::SM)
-                    .children((chip, folder)),
-            )
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(tokens::spacing::SM)
+            .children((chip, folder))
     }
 
     /// The composer's bottom-left chips for a new task: the model chip
@@ -97,13 +87,17 @@ impl DesktopApp {
     /// access as warning text, Codex's); a preset's access is read-only
     /// text.
     pub(super) fn composer_chips(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let label = self.launch.choice.chip_label(self.launch.auto_profile());
+        let auto_profile = self.launch.auto_profile();
+        let label = self.launch.choice.chip_label(auto_profile);
         let glyph = match self.launch.choice {
             Choice::Auto => m3::glyph::AUTO,
             _ => m3::glyph::MODEL,
         };
         let model = m3::chip(palette)
-            .automation_name(format!("Model: {label} (Ctrl+M)"))
+            .automation_name(format!(
+                "Model: {} (Ctrl+M)",
+                self.launch.choice.chip_name(auto_profile)
+            ))
             .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Model))))
             .content(chip_content(glyph, &label, None));
         let access: View = match &self.launch.choice {
@@ -290,23 +284,6 @@ impl DesktopApp {
                         _ => &item.title,
                     };
                     let choice = self.picker_row(item, title, highlighted, context, palette);
-                    let choice = if item.key == "auto" {
-                        Grid::new()
-                            .columns([GridLength::STAR, GridLength::Auto])
-                            .children((
-                                choice,
-                                m3::icon_button(palette)
-                                    .grid_column(1)
-                                    .automation_name("Edit Auto order")
-                                    .on_click(context.message(Message::Shell(
-                                        super::shell_ui::ShellMsg::AutoSettings,
-                                    )))
-                                    .content(m3::icon(m3::glyph::SLIDERS))
-                                    .tooltip("Edit Auto order"),
-                            ))
-                    } else {
-                        choice
-                    };
                     items.push(KeyedView::new(
                         format!("{}:{}:{title}", item.key, item.current),
                         choice,
@@ -322,7 +299,8 @@ impl DesktopApp {
             .on_text_changed(
                 context.callback(|text| Message::Launch(LaunchMsg::PickerQuery(text))),
             );
-        // OpenCode's sliders button at the right end of the search row.
+        // OpenCode's sliders button at the right end of the search row: the
+        // picker's one filter control (Manage models, and Auto's order).
         let manage = m3::icon_button(palette)
             .grid_column(1)
             .width(tokens::height::CONTROL)
@@ -356,8 +334,12 @@ impl DesktopApp {
             )))
     }
 
-    /// Model selection, effort choices and the favorite action are siblings
-    /// so every effort pill can be clicked directly.
+    /// One choosable row (OpenCode's): the check, the full model name and an
+    /// optional note, its badges, then the effort it launches as one short
+    /// chip. The highlighted row (hover or keyboard) swaps the chip for a
+    /// compact effort segment and shows the favorite star. Choosing the row
+    /// launches exactly the model and effort it shows (`Item::choice`); the
+    /// segments are siblings of the row's button, so each can be clicked.
     fn picker_row(
         &self,
         item: &Item,
@@ -367,14 +349,7 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let enabled = item.disabled.is_none();
-        let detail = item.disabled.as_deref().unwrap_or_else(|| {
-            // OpenCode catalog rows already sit beneath a provider heading.
-            if item.key.starts_with("opencode:") {
-                ""
-            } else {
-                &item.detail
-            }
-        });
+        let note = item.disabled.as_deref().unwrap_or(&item.detail);
         let mut name = title.to_owned();
         for (show, label) in [
             (item.current, "current"),
@@ -387,9 +362,17 @@ impl DesktopApp {
                 name.push_str(label);
             }
         }
+        // Screen readers hear the effort in full words ("medium"); a model
+        // row without one launches the harness's default effort.
+        let model_row = matches!(item.kind, ItemKind::Model { .. });
+        let effort_words = match item.effort.as_deref() {
+            Some(effort) => Some(picker::effort_name(effort)),
+            None if model_row => Some(DEFAULT_EFFORT.to_lowercase()),
+            None => None,
+        };
         for value in [
             &item.detail[..],
-            item.effort.as_deref().unwrap_or(""),
+            effort_words.as_deref().unwrap_or(""),
             item.disabled.as_deref().unwrap_or(""),
         ] {
             if !value.is_empty() {
@@ -418,86 +401,124 @@ impl DesktopApp {
         .filter(|(show, _)| *show)
         .map(|(_, label)| KeyedView::new(label, m3::badge(palette, label)))
         .collect();
-        let badges = StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::XS)
-            .keyed_children(labels);
+        // The name takes the width it needs (the picker is sized for the
+        // widest catalogue name); only the note gives way.
         let button = button
             .content(
                 Grid::new()
                     .columns([
                         GridLength::Pixel(tokens::layout::CHECK_COLUMN),
+                        GridLength::Auto,
                         GridLength::STAR,
+                        GridLength::Auto,
                     ])
                     .column_spacing(tokens::spacing::SM)
                     .children((
                         Border::new()
                             .vertical_alignment(VerticalAlignment::Center)
                             .content(check),
-                        Border::new()
+                        TextBlock::new()
                             .grid_column(1)
-                            .content(m3::row_content(None, title, detail, badges)),
+                            .text(title.to_owned())
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis),
+                        m3::secondary(note.to_owned())
+                            .grid_column(2)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .text_trimming(TextTrimming::CharacterEllipsis),
+                        StackPanel::new()
+                            .grid_column(3)
+                            .orientation(Orientation::Horizontal)
+                            .spacing(tokens::spacing::XS)
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .keyed_children(labels),
                     )),
             )
             .tooltip(title.to_owned());
-        let mut actions: Vec<_> = item
-            .efforts
-            .iter()
-            .map(|effort| {
-                let selected = item.effort.as_deref() == Some(effort);
-                KeyedView::new(
-                    format!("effort:{effort}:{selected}"),
-                    m3::segment(palette, selected)
-                        .min_width(0.0)
-                        .is_enabled(enabled)
-                        .automation_name(format!("{title} with effort {effort}"))
-                        .on_click(context.message(Message::Launch(LaunchMsg::PickerEffort(
-                            item.key.clone(),
-                            effort.clone(),
-                        ))))
-                        .content(m3::segment_label(effort)),
+        let segment = highlighted && enabled && !item.efforts.is_empty();
+        let effort: View = if segment {
+            let segments: Vec<KeyedView> =
+                item.efforts
+                    .iter()
+                    .map(|effort| {
+                        let selected = item.effort.as_deref() == Some(effort);
+                        KeyedView::new(
+                            format!("effort:{effort}:{selected}"),
+                            m3::segment(palette, selected)
+                                .style(ButtonStyle::Subtle)
+                                .height(tokens::height::CHIP)
+                                .min_height(tokens::height::CHIP)
+                                .min_width(0.0)
+                                .automation_name(format!(
+                                    "{title} with effort {}",
+                                    picker::effort_name(effort)
+                                ))
+                                .on_click(context.message(Message::Launch(
+                                    LaunchMsg::PickerEffort(item.key.clone(), effort.clone()),
+                                )))
+                                .content(chip_text(
+                                    picker::effort_label(effort),
+                                    &picker::effort_name(effort),
+                                )),
+                        )
+                    })
+                    .collect();
+            Border::new()
+                .height(tokens::height::CHIP)
+                .corner_radius(tokens::radius::CONTROL)
+                .background(palette.well())
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .keyed_children(segments),
                 )
-            })
-            .collect();
-        if actions.is_empty() && matches!(item.kind, ItemKind::Model { .. }) {
-            actions.push(KeyedView::new(
-                "effort",
-                m3::badge(palette, item.effort.as_deref().unwrap_or("Default effort")),
-            ));
-        }
-        if enabled && item.model_ref().is_some() {
-            let favorite = if highlighted {
-                let (glyph, action) = if item.favorite {
-                    (
-                        m3::glyph::STAR_FILLED,
-                        format!("Remove {title} from favorites"),
-                    )
-                } else {
-                    (m3::glyph::STAR, format!("Add {title} to favorites"))
-                };
-                m3::icon_button(palette)
-                    .automation_name(action)
-                    .on_click(
-                        context
-                            .message(Message::Launch(LaunchMsg::PickerFavorite(item.key.clone()))),
-                    )
-                    .content(m3::icon(glyph))
+        } else if let Some((label, name)) = match item.effort.as_deref() {
+            Some(effort) => Some((picker::effort_label(effort), picker::effort_name(effort))),
+            // Display only: the row's choice still carries no effort.
+            None if model_row => Some(("Default", DEFAULT_EFFORT.to_owned())),
+            None => None,
+        } {
+            Border::new()
+                .height(tokens::height::CHIP)
+                .corner_radius(tokens::radius::CONTROL)
+                .background(palette.well())
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(chip_text(label, &name).opacity(theme::MUTED_OPACITY))
+        } else {
+            View::empty()
+        };
+        let star: View = if highlighted && enabled && item.model_ref().is_some() {
+            let (glyph, action) = if item.favorite {
+                (
+                    m3::glyph::STAR_FILLED,
+                    format!("Remove {title} from favorites"),
+                )
             } else {
-                View::empty()
+                (m3::glyph::STAR, format!("Add {title} to favorites"))
             };
-            actions.push(KeyedView::new(
-                format!("star:{highlighted}:{}", item.favorite),
-                Border::new()
-                    .width(tokens::height::CONTROL)
-                    .content(favorite),
-            ));
-        }
-        let actions = StackPanel::new()
+            m3::icon_button(palette)
+                .automation_name(action)
+                .on_click(
+                    context.message(Message::Launch(LaunchMsg::PickerFavorite(item.key.clone()))),
+                )
+                .content(m3::icon(glyph))
+        } else {
+            View::empty()
+        };
+        // Every row keeps the star's column, so the effort chips line up.
+        let trailing = Grid::new()
             .grid_column(1)
-            .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::XS)
+            .columns([GridLength::Auto, GridLength::Pixel(tokens::height::CONTROL)])
+            .column_spacing(tokens::spacing::XS)
             .vertical_alignment(VerticalAlignment::Center)
-            .keyed_children(actions);
+            .keyed_children(vec![
+                KeyedView::new(format!("effort:{segment}"), effort),
+                KeyedView::new(
+                    format!("star:{highlighted}:{}", item.favorite),
+                    Border::new().grid_column(1).content(star),
+                ),
+            ]);
         Border::new()
             .corner_radius(tokens::radius::CONTROL)
             .background(if highlighted {
@@ -514,7 +535,7 @@ impl DesktopApp {
             .content(
                 Grid::new()
                     .columns([GridLength::STAR, GridLength::Auto])
-                    .children((button, actions)),
+                    .children((button, trailing)),
             )
     }
 
@@ -699,6 +720,22 @@ impl DesktopApp {
             _ => Vec::new(),
         };
         let mut rows: Vec<KeyedView> = Vec::new();
+        // Auto's order lives with the other picker settings, so the picker
+        // keeps one filter control (only a new task's picker offers Auto).
+        if self.popover_agent().is_none() && self.launch.preset_target().is_none() {
+            rows.push(KeyedView::new(
+                "auto-order",
+                m3::row(palette, false)
+                    .automation_name("Edit Auto order")
+                    .on_click(context.message(Message::Shell(ShellMsg::AutoSettings)))
+                    .content(m3::row_content(
+                        Some(m3::glyph::ROUTING),
+                        "Edit Auto order",
+                        "Settings › Routing",
+                        m3::icon(m3::glyph::CHEVRON_RIGHT),
+                    )),
+            ));
+        }
         match self.launch.catalog.as_ref() {
             None => rows.push(KeyedView::new(
                 "loading",
@@ -911,19 +948,33 @@ fn group_heading(
         )
 }
 
-/// A chip's content: its icon, label and the ▾ that says it opens.
-fn chip_content(glyph: &str, label: &str, _note: Option<&str>) -> View {
+/// A chip's content: its icon, label (trimmed past `max_width`) and the ▾
+/// that says it opens.
+fn chip_content(glyph: &str, label: &str, max_width: Option<f64>) -> View {
+    let label = TextBlock::new()
+        .text(label.to_owned())
+        .vertical_alignment(VerticalAlignment::Center)
+        .text_trimming(TextTrimming::CharacterEllipsis);
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::SM)
         .children((
             m3::icon(glyph),
-            TextBlock::new()
-                .text(label.to_owned())
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
+            match max_width {
+                Some(width) => label.max_width(width),
+                None => label,
+            },
             m3::icon(m3::glyph::CHEVRON_DOWN),
         ))
+}
+
+/// The label of a picker row's effort chip or segment: the short effort in
+/// the secondary type, inset from the chip's edges, named in full words.
+fn chip_text(label: &str, name: &str) -> TextBlock {
+    m3::text(label.to_owned(), tokens::text::SECONDARY)
+        .automation_name(name.to_owned())
+        .margin(Thickness::xy(tokens::spacing::SM, 0.0))
+        .vertical_alignment(VerticalAlignment::Center)
 }
 
 fn access_glyph(access: Access) -> &'static str {
