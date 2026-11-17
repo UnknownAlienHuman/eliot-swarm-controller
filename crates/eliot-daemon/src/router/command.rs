@@ -1,13 +1,13 @@
 //! Command execution: dispatch a Store-admitted command to native I/O and settle it.
 //!
 //! This module holds `process_command_inner` with its private preparation,
-//! dispatch-wait, verb-family, and settlement helpers as plain `impl Router`
-//! blocks. Shared admission, read and progress helpers stay in the parent
+//! dispatch-wait and settlement helpers as plain `impl Router` blocks. The
+//! sibling `command_verbs` module owns the verb-family executors.
+//! Shared admission, read and progress helpers stay in the parent
 //! module; native I/O still runs outside the Store lock exactly as before.
 use super::{
-    MODE_FORCE, Router, RouterInner, RunWorkerHandle, context,
-    validate_project_rule_launch_command, validate_project_rule_resume_command,
-    validate_retained_resume_agent,
+    MODE_FORCE, Router, RouterInner, RunWorkerHandle, validate_project_rule_launch_command,
+    validate_project_rule_resume_command, validate_retained_resume_agent,
 };
 use crate::common::now_ms;
 use eliot_core::{
@@ -853,8 +853,6 @@ impl Router {
     }
 }
 
-include!("command_verbs.rs");
-
 impl Router {
     pub(super) fn start_run_worker(&self, command: Command) -> RunWorkerStart {
         let run_id = command.id.clone();
@@ -895,7 +893,7 @@ impl Router {
         RunWorkerStart::Started
     }
 
-    async fn wait_run_worker(&self, run_id: &str) {
+    pub(super) async fn wait_run_worker(&self, run_id: &str) {
         let completed = self
             .inner
             .run_workers
@@ -921,7 +919,7 @@ impl Router {
         }
     }
 
-    async fn settle_run_cancelled_before_start(&self, run_id: &str) {
+    pub(super) async fn settle_run_cancelled_before_start(&self, run_id: &str) {
         let process = crate::scripts::unobserved_process_result(true);
         let outcome = json!({
             "code": "failed",
@@ -1043,7 +1041,7 @@ impl Router {
     /// and fill the stable fallback location/origin when the creation site
     /// did not classify them. The fallback origin is `unknown` with a note
     /// naming the missing classification; it never invents a location.
-    fn sanitized_failure(&self, error: &Error, default_where: &str) -> Error {
+    pub(super) fn sanitized_failure(&self, error: &Error, default_where: &str) -> Error {
         let secrets = self.daemon_secrets();
         let mut error = error.clone().sanitized(&SecretPolicy::new(&secrets));
         if error.failure_where.is_none() {
@@ -1062,7 +1060,7 @@ impl Router {
     /// touching producer-supplied codes, messages, states or causes. Only the
     /// stable fallback is recorded; real classification belongs at the error
     /// creation site.
-    fn ensure_outcome_failure_fields(value: &mut Value, default_where: &str) {
+    pub(super) fn ensure_outcome_failure_fields(value: &mut Value, default_where: &str) {
         let Some(object) = value.as_object_mut() else {
             return;
         };
@@ -1097,7 +1095,7 @@ impl Router {
     /// evidence. Optional stderr tails ride along only when the error
     /// already carries a sanitized tail; they never invalidate the primary
     /// outcome.
-    fn command_error_outcome(&self, error: &Error, code_key: &str) -> Value {
+    pub(super) fn command_error_outcome(&self, error: &Error, code_key: &str) -> Value {
         let mut outcome = json!({
             "message": error.message,
             "where": error
@@ -1187,7 +1185,7 @@ impl Router {
             .await;
     }
 
-    async fn settle_observe_attach(&self, id: &str, snapshot: Value) -> Option<Command> {
+    pub(super) async fn settle_observe_attach(&self, id: &str, snapshot: Value) -> Option<Command> {
         let (result, write_faulted) = {
             let mut store = self.inner.store.lock().await;
             let result = store.settle_observe_attach(id, snapshot, now_ms());
@@ -1215,7 +1213,7 @@ impl Router {
         }
     }
 
-    async fn settle_observe_detach(&self, id: &str, outcome: Value) -> Option<Command> {
+    pub(super) async fn settle_observe_detach(&self, id: &str, outcome: Value) -> Option<Command> {
         let (result, write_faulted) = {
             let mut store = self.inner.store.lock().await;
             let result = store.settle_observe_detach(id, outcome, now_ms());
@@ -1243,7 +1241,7 @@ impl Router {
         }
     }
 
-    async fn settle_plugin_error(&self, id: &str, error: &Error) {
+    pub(super) async fn settle_plugin_error(&self, id: &str, error: &Error) {
         let current = {
             let store = self.inner.store.lock().await;
             store.get_command(id)
@@ -1363,7 +1361,7 @@ impl Router {
     }
 }
 
-fn validate_observer_command_result(
+pub(super) fn validate_observer_command_result(
     mut value: Value,
     agent: &Agent,
     command: &Command,
@@ -1454,7 +1452,7 @@ fn validate_observer_command_result(
 /// state proves the plugin dispatched no native session effect, so the
 /// launch settles failed, never unknown. Any other shape keeps the
 /// historical ready settlement.
-fn classify_start_result(value: &Value) -> CommandState {
+pub(super) fn classify_start_result(value: &Value) -> CommandState {
     if value.get("state").and_then(Value::as_str) == Some("failed") {
         CommandState::Failed
     } else {
@@ -1635,7 +1633,7 @@ fn capture_dispatch_seq(command: &Command, events: &[Event]) -> Option<i64> {
 // These local Store helpers roll back their transaction on a validation or
 // capacity/CAS refusal. Persistence errors remain uncertain; this classification
 // is deliberately separate from errors returned by a native adapter after I/O.
-fn coordination_commit_error_state(code: &str) -> CommandState {
+pub(super) fn coordination_commit_error_state(code: &str) -> CommandState {
     match code {
         "invalid" | "not_allowed" | "not_found" | "stale_generation" | "secret_in_payload"
         | "history_gap" | "version_conflict" | "mailbox_full" => CommandState::Rejected,

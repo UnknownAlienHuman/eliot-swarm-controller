@@ -1,9 +1,21 @@
-// Included by command.rs to retain executor signatures and private helper access.
+//! Verb-family executors for Store-admitted commands, using shared settlement helpers.
+
+use super::command::{
+    RunWorkerStart, classify_start_result, coordination_commit_error_state,
+    validate_observer_command_result,
+};
+use super::{Router, context};
+use crate::common::now_ms;
+use eliot_core::{
+    Agent, Command, CommandState, ContextItem, Error, FailureOrigin, Result,
+    api::{FrozenGitFetch, ProjectRegistrationView},
+};
+use serde_json::{Value, json};
 
 impl Router {
     /// Run a dispatched `run` command to worker completion, or settle the
     /// pre-start cancellation when Force was requested first.
-    async fn execute_run_command(&self, dispatched: Command) {
+    pub(super) async fn execute_run_command(&self, dispatched: Command) {
         let run_id = dispatched.id.clone();
         match self.start_run_worker(dispatched) {
             RunWorkerStart::Started | RunWorkerStart::AlreadyActive => {
@@ -18,7 +30,7 @@ impl Router {
 
     /// Execute a dispatched `git.fetch` against its registration and settle
     /// the recorded outcome, cleaning up only after a durable match.
-    async fn execute_git_fetch_command(
+    pub(super) async fn execute_git_fetch_command(
         &self,
         id: &str,
         dispatched: Command,
@@ -97,7 +109,7 @@ impl Router {
     /// settlement in a single Store transaction, publishing the committed
     /// batch in order while still serialized with the writer. No external
     /// send.
-    async fn execute_user_event_command(&self, id: &str, dispatched: Command) {
+    pub(super) async fn execute_user_event_command(&self, id: &str, dispatched: Command) {
         let (kind, mut data) = match super::user_event_kind_data(&dispatched.verb, &dispatched.args)
         {
             Ok(kind_data) => kind_data,
@@ -167,7 +179,7 @@ impl Router {
     /// `attention.emit` verb only from the internal attention producer, and
     /// the bound commit additionally requires that verb, so a public emit
     /// can never acquire an authoritative subject binding.
-    async fn execute_attention_event_command(&self, id: &str, dispatched: Command) {
+    pub(super) async fn execute_attention_event_command(&self, id: &str, dispatched: Command) {
         let (kind, mut data) = match super::user_event_kind_data(&dispatched.verb, &dispatched.args)
         {
             Ok(kind_data) => kind_data,
@@ -210,7 +222,7 @@ impl Router {
     /// transaction, publishing the committed batch in order while still
     /// serialized with the writer, then fan out mailbox wakes only after
     /// commit through the existing coordination wake path.
-    async fn execute_mail_send_command(&self, id: &str, dispatched: Command) {
+    pub(super) async fn execute_mail_send_command(&self, id: &str, dispatched: Command) {
         if let Err(error) = self.validate_coordination_command(&dispatched) {
             self.settle(
                 id,
@@ -253,7 +265,7 @@ impl Router {
     /// variable effect together with its Applied settlement in a single Store
     /// transaction, publishing the committed batch (`var.changed` first) in
     /// order while still serialized with the writer.
-    async fn execute_var_set_command(&self, id: &str, dispatched: Command) {
+    pub(super) async fn execute_var_set_command(&self, id: &str, dispatched: Command) {
         if let Err(error) = self.validate_coordination_command(&dispatched) {
             self.settle(
                 id,
@@ -345,7 +357,12 @@ impl Router {
 
     /// Attach an observer through the owned plugin and settle the validated
     /// snapshot.
-    async fn execute_attach_command(&self, id: &str, agent: &Agent, dispatched: Command) {
+    pub(super) async fn execute_attach_command(
+        &self,
+        id: &str,
+        agent: &Agent,
+        dispatched: Command,
+    ) {
         match self
             .inner
             .plugin_host
@@ -392,7 +409,7 @@ impl Router {
     }
 
     /// Remove a managed worktree and settle a removal failure.
-    async fn execute_worktree_remove_command(&self, id: &str, dispatched: Command) {
+    pub(super) async fn execute_worktree_remove_command(&self, id: &str, dispatched: Command) {
         match self.inner.workspaces.remove(&dispatched).await {
             Ok(_) => {}
             Err(error) => {
@@ -406,7 +423,7 @@ impl Router {
     /// `"failed"` start state is an authoritative proven-no-effect verdict
     /// (the plugin returns it instead of an error only for checks before any
     /// native session effect), so the launch settles failed, never unknown.
-    async fn execute_start_command(
+    pub(super) async fn execute_start_command(
         &self,
         id: &str,
         agent: Agent,
@@ -466,7 +483,7 @@ impl Router {
     /// Send one turn through the owned plugin and settle its outcome,
     /// requiring a committed turn association for an applied send. Returns
     /// whether the caller must send the trailing progress signal.
-    async fn execute_send_command(
+    pub(super) async fn execute_send_command(
         &self,
         id: &str,
         agent: &Agent,
@@ -550,7 +567,7 @@ impl Router {
     /// Run one native control (steer, interrupt, or a request reply) through
     /// the owned plugin and settle its outcome. Returns whether the caller
     /// must send the trailing progress signal.
-    async fn execute_control_command(
+    pub(super) async fn execute_control_command(
         &self,
         id: &str,
         agent: &Agent,
@@ -606,7 +623,7 @@ impl Router {
     /// an unverified or refused switch never stores an overlay. Settlement
     /// happens only after the Store commit, so an applied configure always
     /// has a retained row to read back.
-    async fn execute_configure_command(
+    pub(super) async fn execute_configure_command(
         &self,
         id: &str,
         agent: &Agent,
@@ -801,7 +818,12 @@ impl Router {
     /// Store, otherwise the owned plugin stops natively and the summary is
     /// settled. Returns whether the caller must send the trailing progress
     /// signal.
-    async fn execute_stop_command(&self, id: &str, agent: &Agent, dispatched: Command) -> bool {
+    pub(super) async fn execute_stop_command(
+        &self,
+        id: &str,
+        agent: &Agent,
+        dispatched: Command,
+    ) -> bool {
         // Store dispatch atomically latches a preparation cancel before
         // the manager signals its custody. Otherwise this is native stop.
         match self.inner.workspaces.cancel(id).await {
@@ -932,7 +954,12 @@ impl Router {
 
     /// Detach an observer through the owned plugin and settle the validated
     /// outcome.
-    async fn execute_detach_command(&self, id: &str, agent: &Agent, dispatched: Command) {
+    pub(super) async fn execute_detach_command(
+        &self,
+        id: &str,
+        agent: &Agent,
+        dispatched: Command,
+    ) {
         match self
             .inner
             .plugin_host
