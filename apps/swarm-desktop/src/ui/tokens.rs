@@ -123,6 +123,18 @@ pub mod layout {
     pub const PLOT_STUB: f64 = 2.0;
     /// The gap between two chart bars.
     pub const PLOT_GAP: f64 = 1.0;
+    /// The Monitor's state bar, a project's bar, and the surface gap
+    /// between two segments of a stacked bar.
+    pub const STATE_BAR: f64 = 12.0;
+    /// The state bar under High Contrast, tall enough for each segment's
+    /// glyph.
+    pub const STATE_BAR_MARKED: f64 = 20.0;
+    pub const PROJECT_BAR: f64 = 8.0;
+    pub const BAR_GAP: f64 = 2.0;
+    /// A Monitor project row: its name and count over its bar.
+    pub const PROJECT_ROW: f64 = 44.0;
+    /// The longest label of a Monitor filter chip.
+    pub const FILTER_CHIP_TEXT: f64 = 200.0;
     /// The user's message bubble takes at most this share of the column.
     pub const BUBBLE_SHARE: f64 = 0.8;
     /// The narrowest content column.

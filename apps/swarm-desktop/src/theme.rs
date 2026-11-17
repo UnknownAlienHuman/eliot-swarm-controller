@@ -248,19 +248,6 @@ impl StatusTone {
             eliot_core::AgentState::Stopped => Self::Neutral,
         }
     }
-
-    /// The tone of native observed-child activity, which has a distinct state
-    /// vocabulary from a controlled Agent lifecycle.
-    pub fn of_activity_state(state: &str) -> Self {
-        match state {
-            "running" => Self::Active,
-            "idle" => Self::Ready,
-            "interrupted" => Self::Attention,
-            "unknown" => Self::Unknown,
-            "lost" => Self::Failed,
-            _ => Self::Neutral,
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -432,6 +419,43 @@ pub mod winui {
             })
         }
 
+        /// A Monitor chart role: working in primary, needs attention in
+        /// error, idle in outline-variant (anything else in outline), with
+        /// the content color its state layers mix in.
+        fn chart_roles(tone: StatusTone) -> fn(&Scheme) -> (Rgb8, Rgb8) {
+            match tone {
+                StatusTone::Active => |s| (s.primary, s.on_primary),
+                StatusTone::Attention | StatusTone::Failed | StatusTone::Unknown => {
+                    |s| (s.error, s.on_error)
+                }
+                StatusTone::Ready => |s| (s.outline_variant, s.on_surface),
+                StatusTone::Pending | StatusTone::Neutral => |s| (s.outline, s.on_surface),
+            }
+        }
+
+        /// The fill of a Monitor chart mark (a bar segment, a list dot).
+        pub fn chart_fill(self, tone: StatusTone) -> Brush {
+            let roles = Self::chart_roles(tone);
+            match self.scheme {
+                Some(scheme) => Brush::Solid(color(roles(scheme).0)),
+                None => Brush::Theme(match tone {
+                    StatusTone::Active => ThemeBrush::AccentText,
+                    StatusTone::Attention | StatusTone::Failed | StatusTone::Unknown => {
+                        ThemeBrush::SystemCritical
+                    }
+                    _ => ThemeBrush::CardStroke,
+                }),
+            }
+        }
+
+        /// The same fill as a button family: a clickable bar segment.
+        pub fn chart_button(self, tone: StatusTone) -> ResourceOverrides {
+            self.with(|s| {
+                let (fill, on) = Self::chart_roles(tone)(s);
+                Family::new(Some(fill), on).overrides(s)
+            })
+        }
+
         /// Container and content of a status chip.
         pub fn status_chip(self, tone: StatusTone) -> (Brush, Brush) {
             match self.scheme {
@@ -499,12 +523,6 @@ pub mod winui {
                 }
                 .overrides(s)
             })
-        }
-
-        /// A card that is one button (monitor cards): no fill of its own
-        /// (the card's container shows through), on-surface state layers.
-        pub fn card_button(self) -> ResourceOverrides {
-            self.with(|s| Family::new(None, s.on_surface).overrides(s))
         }
 
         /// An assist chip: outlined in outline-variant.
@@ -662,10 +680,10 @@ pub mod winui {
                 palette.destructive(),
                 palette.icon_button(),
                 palette.row(true),
-                palette.card_button(),
                 palette.chip(),
                 palette.segment(true),
                 palette.error_text_button(),
+                palette.chart_button(StatusTone::Active),
             ] {
                 assert_eq!(overrides, ResourceOverrides::new());
             }
@@ -690,6 +708,23 @@ pub mod winui {
                     Brush::Solid(color(scheme.secondary_container))
                 );
                 assert_ne!(palette.filled(), ResourceOverrides::new());
+                // The Monitor's charts: working, needs attention, idle.
+                assert_eq!(
+                    palette.chart_fill(StatusTone::Active),
+                    Brush::Solid(color(scheme.primary))
+                );
+                assert_eq!(
+                    palette.chart_fill(StatusTone::Attention),
+                    Brush::Solid(color(scheme.error))
+                );
+                assert_eq!(
+                    palette.chart_fill(StatusTone::Ready),
+                    Brush::Solid(color(scheme.outline_variant))
+                );
+                assert_ne!(
+                    palette.chart_button(StatusTone::Active),
+                    palette.chart_button(StatusTone::Attention)
+                );
                 assert_ne!(palette.row(true), palette.row(false));
                 assert_ne!(palette.destructive(), palette.text_button());
             }

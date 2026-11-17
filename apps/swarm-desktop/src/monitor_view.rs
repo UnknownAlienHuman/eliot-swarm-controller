@@ -1,4 +1,4 @@
-//! WinUI pieces of the right panel: the monitor's Agent cards, the CPU and
+//! WinUI pieces of the right panel: the monitor's Agent rows, the CPU and
 //! RSS charts (bars built from `Border`s, each with its latest value and a
 //! labelled scale; no canvas) and the usage lines. Buttons carry the Agent
 //! and generation shown on screen, so a click acts on exactly what was
@@ -22,144 +22,151 @@ fn small(text: impl Into<String>) -> TextBlock {
         .is_text_selection_enabled(true)
 }
 
-/// The line under a card's measures: why a lost or failed Agent ended (from
-/// its loss origin), or an open attention report.
-pub enum CardNote {
+/// A list row's second line: why a lost or failed Agent ended (from its
+/// loss origin), what an Agent that needs attention needs, or the task a
+/// top-level worker runs under.
+pub enum RowNote {
     Ended(String),
     Attention(String),
+    Under(String),
 }
 
-/// Width the last lines of a resumable card leave for its Resume button.
-const RESUME_RESERVE: f64 = 88.0;
-
-/// What a card does: the card itself opens the conversation; a resumable
+/// What a row does: the row itself opens the conversation; a resumable
 /// one also offers Resume (its callback and whether it is enabled).
-pub struct CardActions {
+pub struct RowActions {
     pub open: Callback<()>,
     pub resume: Option<(Callback<()>, bool)>,
 }
 
-/// One monitor card: the title with its status, what it does now, its
-/// resources in one muted line, and why it ended or the open attention
-/// report. The whole card opens the conversation; Resume sits on it.
-pub fn card(
+/// What one list row shows besides its Agent.
+pub struct RowLook<'a> {
+    pub title: &'a str,
+    /// How long it has been quiet ([`MonitorRow::quiet`]), as shown
+    /// ("3 min", "no progress yet") and in words for its accessible name
+    /// ("last progress 3 min ago").
+    pub elapsed: &'a str,
+    pub elapsed_words: &'a str,
+    /// The dot in its group's chart color.
+    pub dot: Brush,
+    /// The open Agent's row.
+    pub selected: bool,
+}
+
+/// One Monitor list row: the status dot in its chart color, the title, the
+/// harness and how long it has been quiet, on one line; a second line only
+/// says why it needs attention or ended (or the task it runs under). Its
+/// measures live in Details, which the row opens with the conversation;
+/// Resume sits beside it.
+pub fn list_row(
     row: &MonitorRow,
-    title: &str,
-    parent: Option<&str>,
-    note: Option<&CardNote>,
-    actions: CardActions,
+    look: RowLook,
+    note: Option<&RowNote>,
+    actions: RowActions,
     palette: Palette,
 ) -> View {
     let status = row.status_words();
-    // A nested child sits under its parent's card already; a top-level one
-    // whose parent is not shown names that task (`parent`: its title).
-    let under = parent
-        .map(|parent| format!(" · under {parent}"))
-        .unwrap_or_default();
-    let (note_line, note_name): (View, String) = match note {
-        Some(CardNote::Ended(text)) => (
-            crate::m3::body(text.clone())
-                .text_trimming(TextTrimming::CharacterEllipsis)
-                .into(),
+    let harness = crate::picker::harness_label(&row.harness);
+    let (note_line, note_name): (Option<View>, String) = match note {
+        Some(RowNote::Ended(text)) => (
+            Some(
+                crate::m3::secondary(text.clone())
+                    .text_trimming(TextTrimming::CharacterEllipsis)
+                    .into(),
+            ),
             format!(", {text}"),
         ),
-        Some(CardNote::Attention(text)) => (
-            crate::m3::secondary(format!("Attention: {text}"))
-                .foreground(palette.error())
-                .text_trimming(TextTrimming::CharacterEllipsis)
-                .into(),
-            format!(", attention: {text}"),
+        Some(RowNote::Attention(text)) => (
+            Some(
+                crate::m3::text(text.clone(), tokens::text::SECONDARY)
+                    .foreground(palette.error())
+                    .text_trimming(TextTrimming::CharacterEllipsis)
+                    .into(),
+            ),
+            format!(", needs attention: {text}"),
         ),
-        None => (View::empty(), String::new()),
-    };
-    // Only the measures the daemon reported.
-    let measures = [
-        row.obs
-            .rss_bytes()
-            .map(|_| bytes_label(row.obs.rss_bytes())),
-        row.obs
-            .cpu_time_ns()
-            .map(|_| cpu_time_label(row.obs.cpu_time_ns())),
-        row.tokens.map(|_| tokens_label(row)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" · ");
-    let reserve = if actions.resume.is_some() {
-        RESUME_RESERVE
-    } else {
-        0.0
-    };
-    // The button pads its content by the control inset; the content adds
-    // the same inset above and below.
-    let card = crate::m3::card_button(
-        palette,
-        format!(
-            "{title}, {status}, {}{under}, {}{note_name}",
-            crate::picker::harness_label(&row.harness),
-            row.operation(),
+        Some(RowNote::Under(parent)) => (
+            Some(
+                crate::m3::secondary(format!("Under {parent}"))
+                    .text_trimming(TextTrimming::CharacterEllipsis)
+                    .into(),
+            ),
+            format!(", under {parent}"),
         ),
-        actions.open,
-        StackPanel::new()
-            .spacing(tokens::spacing::XS)
-            // The button's 1-DIP border and 12-DIP inset plus this put the
-            // text at the 16-DIP padding of every other card.
-            .margin(Thickness::xy(
-                tokens::spacing::MD - tokens::spacing::INSET - tokens::layout::HAIRLINE,
-                tokens::spacing::MD - tokens::layout::HAIRLINE,
-            ))
-            .children((
-                Grid::new()
-                    .columns([GridLength::STAR, GridLength::Auto])
-                    .column_spacing(tokens::spacing::SM)
-                    .children((
-                        crate::m3::section_title(title.to_owned())
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis),
-                        Border::new().grid_column(1).content(crate::m3::status(
-                            palette,
-                            row.status_code(),
-                            status,
-                        )),
-                    )),
-                crate::m3::body(format!(
-                    "{} · {}{under}",
-                    crate::picker::harness_label(&row.harness),
-                    row.operation()
-                ))
-                .opacity(theme::MUTED_OPACITY)
+        None => (None, String::new()),
+    };
+    let line = Grid::new()
+        .columns([
+            GridLength::Auto,
+            GridLength::STAR,
+            GridLength::Auto,
+            GridLength::Auto,
+        ])
+        .column_spacing(tokens::spacing::SM)
+        .children((
+            crate::m3::dot(look.dot),
+            TextBlock::new()
+                .grid_column(1)
+                .text(look.title.to_owned())
+                .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
-                // The last lines leave room for Resume at the right.
+            crate::m3::secondary(harness.to_owned())
+                .grid_column(2)
+                .vertical_alignment(VerticalAlignment::Center),
+            crate::m3::secondary(look.elapsed.to_owned())
+                .grid_column(3)
+                .vertical_alignment(VerticalAlignment::Center),
+        ));
+    let two_lines = note_line.is_some();
+    let content: View = match note_line {
+        // The second line starts under the title, past the dot.
+        Some(note_line) => StackPanel::new()
+            .spacing(tokens::spacing::XS / 2.0)
+            .vertical_alignment(VerticalAlignment::Center)
+            .children((
+                line,
                 Border::new()
-                    .margin(Thickness::new(0.0, 0.0, reserve, 0.0))
-                    .content(
-                        crate::m3::secondary(measures)
-                            .text_trimming(TextTrimming::CharacterEllipsis),
-                    ),
-                Border::new()
-                    .margin(Thickness::new(0.0, 0.0, reserve, 0.0))
+                    .margin(Thickness::new(
+                        tokens::layout::DOT + tokens::spacing::SM,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ))
                     .content(note_line),
             )),
-    );
-    let Some((resume, enabled)) = actions.resume else {
-        return card;
+        None => line,
     };
-    // Resume is its own button beside the card button (a button inside a
-    // button would swallow the click): drawn over the card's top-right
-    // status line would hide it, so it sits on the card's bottom-right
-    // corner, level with the last line.
-    Grid::new().children((
-        card,
-        crate::m3::text_button(palette)
-            .horizontal_alignment(HorizontalAlignment::Right)
-            .vertical_alignment(VerticalAlignment::Bottom)
-            .margin(Thickness::xy(tokens::spacing::SM, tokens::spacing::SM))
-            .is_enabled(enabled)
-            .automation_name(format!("Resume {title} (run {})", row.generation))
-            .on_click(resume)
-            .content(crate::m3::label("Resume")),
-    ))
+    let height = if two_lines {
+        tokens::height::TWO_LINE_ROW
+    } else {
+        tokens::height::CONTROL
+    };
+    let button = crate::m3::row(palette, look.selected)
+        .height(height)
+        .min_height(height)
+        .automation_name(format!(
+            "{}, {status}, {harness}, {}{note_name}",
+            look.title, look.elapsed_words
+        ))
+        .on_click(actions.open)
+        .content(content);
+    let Some((resume, enabled)) = actions.resume else {
+        return button;
+    };
+    // Resume is its own button beside the row (a button inside a button
+    // would swallow the click).
+    Grid::new()
+        .columns([GridLength::STAR, GridLength::Auto])
+        .column_spacing(tokens::spacing::XS)
+        .children((
+            button,
+            crate::m3::text_button(palette)
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center)
+                .is_enabled(enabled)
+                .automation_name(format!("Resume {} (run {})", look.title, row.generation))
+                .on_click(resume)
+                .content(crate::m3::label("Resume")),
+        ))
 }
 
 /// Plot height in DIPs; the bars stretch across the card width.
@@ -450,6 +457,20 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
         return views;
     }
     if let Some(row) = row {
+        // What the list row leaves out: what it does now, its tokens and
+        // CPU time (only the measures the daemon reported).
+        let now = [
+            Some(row.operation()),
+            row.tokens.map(|_| tokens_label(row)),
+            row.obs
+                .cpu_time_ns()
+                .map(|_| cpu_time_label(row.obs.cpu_time_ns())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        views.push(KeyedView::new("now", small(now)));
         views.push(KeyedView::new(
             "fresh",
             small(row.obs.freshness()).opacity(theme::MUTED_OPACITY),
