@@ -629,14 +629,9 @@ impl Component for DesktopApp {
                 drafts: DraftStore::default(),
                 answers: HashMap::new(),
                 confirm_force: None,
+                loss: None,
             },
-            monitor: monitor_ui::MonitorState {
-                data: Monitor::default(),
-                epoch: 0,
-                task: None,
-                selected: None,
-                reparent_status: String::new(),
-            },
+            monitor: monitor_ui::MonitorState::default(),
             automation: automation_ui::AutomationState {
                 rules: Vec::new(),
                 status: String::new(),

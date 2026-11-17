@@ -1287,10 +1287,16 @@ impl DesktopApp {
                 continue;
             }
             if section.rows.is_empty() {
+                // Older tasks fold below; "No tasks yet" only when there
+                // are none at all.
                 items.push(KeyedView::new(
                     format!("empty:{}", section.key),
                     quiet_row(
-                        "No tasks yet: start one with New task",
+                        if section.older > 0 {
+                            "No recent tasks"
+                        } else {
+                            "No tasks yet: start one with New task"
+                        },
                         tokens::layout::TREE_INDENT,
                     ),
                 ));

@@ -60,7 +60,7 @@ const GROUPS: [(&str, &[Page]); 5] = [
 
 /// What the Search field finds: one entry per setting, `(page, name,
 /// words it also answers to)`.
-const INDEX: [(Page, &str, &str); 17] = [
+const INDEX: [(Page, &str, &str); 18] = [
     (
         Page::Appearance,
         "Theme",
@@ -110,6 +110,11 @@ const INDEX: [(Page, &str, &str); 17] = [
         Page::Worktrees,
         "Managed worktrees",
         "worktree cleanup branch",
+    ),
+    (
+        Page::Worktrees,
+        "Clean up finished work",
+        "cleanup remove delete disk space merged branch temp target archive",
     ),
     (
         Page::CloudMcp,
@@ -214,9 +219,15 @@ fn search_settings(query: &str) -> Vec<(Page, &'static str)> {
 
 #[derive(Clone, Debug)]
 pub(super) enum SettingsMsg {
+    /// Clean up finished work: read a plan (nothing is removed).
     CleanupPlan,
     CleanupPlanned(Fallible<eliot_core::api::CleanupPlan>),
+    /// Check (true) or uncheck one group of the plan.
+    CleanupGroupToggled(crate::worktrees::CleanupGroup, bool),
+    /// Ask for the one confirmation.
     CleanupApply,
+    /// The confirmation's answer: true removes the selected items.
+    CleanupConfirmed(bool),
     CleanupApplied(Fallible<eliot_core::api::CleanupApplyResponse>),
     PageSelected(Page),
     Loaded(Fallible<SettingsReadResponse>),
@@ -281,9 +292,22 @@ pub(super) type ManagedWorktrees = (Vec<eliot_core::api::ManagedWorkspaceView>, 
 /// save result of each section.
 #[derive(Default)]
 pub(super) struct SettingsState {
+    /// The plan under review (nothing removed yet).
     cleanup_plan: Option<eliot_core::api::CleanupPlan>,
     cleanup_busy: bool,
-    cleanup_result: Option<String>,
+    /// Why the last plan or apply read failed.
+    cleanup_error: Option<String>,
+    /// Groups the owner unchecked (every group starts checked).
+    cleanup_unchecked: std::collections::HashSet<crate::worktrees::CleanupGroup>,
+    /// The one confirmation is shown.
+    cleanup_confirm: bool,
+    /// The ledger key of the apply in flight or uncertain (same id on retry).
+    cleanup_key: Option<String>,
+    /// The applied plan and its result.
+    cleanup_result: Option<(
+        eliot_core::api::CleanupPlan,
+        eliot_core::api::CleanupApplyResponse,
+    )>,
     pub(super) loaded: bool,
     pub(super) reading: bool,
     /// A read was asked for while one ran (after a save): read again.
@@ -449,10 +473,12 @@ impl DesktopApp {
                 }
                 s.cleanup_busy = true;
                 s.cleanup_plan = None;
+                s.cleanup_error = None;
+                s.cleanup_confirm = false;
                 s.cleanup_result = None;
                 let Ok(data) = self.data_dir.clone() else {
                     s.cleanup_busy = false;
-                    s.cleanup_result = Some("Daemon data directory unavailable".to_owned());
+                    s.cleanup_error = Some("Daemon data directory unavailable".to_owned());
                     return;
                 };
                 let _task = context.spawn_background(move |_| {
@@ -474,30 +500,67 @@ impl DesktopApp {
             SettingsMsg::CleanupPlanned(result) => {
                 s.cleanup_busy = false;
                 match result {
-                    Ok(plan) => s.cleanup_plan = Some(plan),
-                    Err(e) => s.cleanup_result = Some(e),
+                    Ok(plan) => {
+                        s.cleanup_unchecked.clear();
+                        s.cleanup_plan = Some(plan);
+                    }
+                    Err(e) => s.cleanup_error = Some(e),
                 }
             }
-            SettingsMsg::CleanupApply => {
+            SettingsMsg::CleanupGroupToggled(group, on) => {
                 if s.cleanup_busy {
                     return;
                 }
-                let Some(plan) = s.cleanup_plan.take() else {
+                s.cleanup_confirm = false;
+                if on {
+                    s.cleanup_unchecked.remove(&group);
+                } else {
+                    s.cleanup_unchecked.insert(group);
+                }
+            }
+            SettingsMsg::CleanupApply => {
+                let selected = s
+                    .cleanup_plan
+                    .as_ref()
+                    .map(|plan| crate::worktrees::selected_artifacts(plan, &s.cleanup_unchecked))
+                    .unwrap_or_default();
+                if !s.cleanup_busy && !selected.is_empty() {
+                    s.cleanup_confirm = true;
+                }
+            }
+            SettingsMsg::CleanupConfirmed(false) => s.cleanup_confirm = false,
+            SettingsMsg::CleanupConfirmed(true) => {
+                s.cleanup_confirm = false;
+                if s.cleanup_busy {
+                    return;
+                }
+                let Some(plan) = s.cleanup_plan.clone() else {
                     return;
                 };
-                s.cleanup_busy = true;
+                let selected = crate::worktrees::selected_artifacts(&plan, &s.cleanup_unchecked);
+                if selected.is_empty() {
+                    return;
+                }
                 let Ok(data) = self.data_dir.clone() else {
-                    s.cleanup_busy = false;
-                    s.cleanup_result = Some("Daemon data directory unavailable".to_owned());
+                    s.cleanup_error = Some("Daemon data directory unavailable".to_owned());
                     return;
                 };
+                // One plan and selection keep one mutation id until a
+                // definite reply; an uncertain one retries under the same id.
+                let key = format!("cleanup.apply:{}:{}", plan.plan_id, selected.join(","));
+                let id = self.ledger.id_for(&key);
+                let s = &mut self.settings;
+                s.cleanup_key = Some(key);
+                s.cleanup_busy = true;
+                s.cleanup_error = None;
                 let _task = context.spawn_background(move |_| {
                     let request = eliot_core::api::CleanupApplyRequest {
-                        id: ulid::Ulid::new().to_string(),
+                        id,
                         plan_id: plan.plan_id,
                         // The desktop applies local-only deletions; remote
                         // branch deletion stays an explicit Owner CLI flag.
                         delete_remote: false,
+                        artifacts: Some(selected),
                     };
                     Message::Settings(SettingsMsg::CleanupApplied(
                         client::block_on(eliot_daemon::client_call_typed(
@@ -511,27 +574,36 @@ impl DesktopApp {
             }
             SettingsMsg::CleanupApplied(result) => {
                 s.cleanup_busy = false;
-                s.cleanup_result = Some(match result {
-                    Ok(reply) => format!(
-                        "{} bytes reclaimed. {}",
-                        reply.bytes_reclaimed,
-                        reply
-                            .items
-                            .iter()
-                            .map(|item| format!(
-                                "{}: {}{}",
-                                item.artifact_id,
-                                item.outcome,
-                                item.reason
-                                    .as_ref()
-                                    .map(|r| format!(" ({r})"))
-                                    .unwrap_or_default()
-                            ))
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                    Err(error) => format!("Cleanup result unavailable: {error}"),
-                });
+                let uncertain = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| crate::state::uncertain(error));
+                let key = s.cleanup_key.take();
+                match result {
+                    Ok(reply) => {
+                        if let Some(plan) = s.cleanup_plan.take() {
+                            s.cleanup_result = Some((plan, reply));
+                        }
+                    }
+                    Err(error) if uncertain => {
+                        s.cleanup_key = key.clone();
+                        s.cleanup_error = Some(format!(
+                            "Cleanup not confirmed; Remove again retries the same request: {}",
+                            crate::state::plain_error(&error)
+                        ));
+                    }
+                    Err(error) => {
+                        s.cleanup_error = Some(format!(
+                            "Cleanup refused: {}",
+                            crate::state::plain_error(&error)
+                        ))
+                    }
+                }
+                if !uncertain && let Some(key) = key {
+                    self.ledger.complete(&key);
+                }
+                // The worktree list follows what was removed.
+                self.settings_update(SettingsMsg::WorktreesRefresh, context);
             }
             SettingsMsg::PageSelected(page) => {
                 // A search result opens its page; the groups come back.
@@ -1510,10 +1582,204 @@ impl DesktopApp {
         ))
     }
 
+    /// The cleanup review under its row: the plan by kind (a checkbox per
+    /// group that has something to remove, each item with its size and its
+    /// keep or remove reason), Remove with one inline confirmation, then the
+    /// result: removed, kept with why, and unknown.
+    fn cleanup_review(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let state = &self.settings;
+        let mut parts: Vec<KeyedView> = Vec::new();
+        if state.cleanup_busy {
+            parts.push(KeyedView::new(
+                "busy",
+                m3::secondary(if state.cleanup_plan.is_some() {
+                    "Removing the selected items…"
+                } else {
+                    "Reviewing what can be removed…"
+                }),
+            ));
+        }
+        if let Some(error) = &state.cleanup_error {
+            parts.push(KeyedView::new(
+                format!("error:{error}"),
+                m3::body(error.clone())
+                    .foreground(palette.error())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+            ));
+        }
+        if let Some((plan, reply)) = &state.cleanup_result {
+            let lines = crate::worktrees::result_lines(plan, reply);
+            let rows: Vec<KeyedView> = lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    let text = if index == 0 {
+                        m3::text(line.clone(), tokens::text::SECTION_TITLE)
+                    } else {
+                        m3::body(line.clone())
+                    };
+                    KeyedView::new(
+                        format!("result:{index}"),
+                        text.text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true),
+                    )
+                })
+                .collect();
+            parts.push(KeyedView::new(
+                "result",
+                m3::card_high(palette)
+                    .automation_name("Cleanup result")
+                    .content(
+                        StackPanel::new()
+                            .spacing(tokens::spacing::XS)
+                            .keyed_children(rows),
+                    ),
+            ));
+        }
+        if let Some(plan) = &state.cleanup_plan {
+            let groups = crate::worktrees::cleanup_groups(plan);
+            if groups.is_empty() {
+                parts.push(KeyedView::new(
+                    "empty",
+                    m3::secondary("Nothing to clean up: Swarm holds no finished work.")
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
+            for view in &groups {
+                let group = view.group;
+                let checked = !state.cleanup_unchecked.contains(&group);
+                let kept = view.items.len() - view.removable;
+                let summary = match (view.removable, kept) {
+                    (0, kept) => format!("{kept} kept"),
+                    (removable, 0) => format!(
+                        "{removable} to remove · {}",
+                        crate::worktrees::size_words(view.bytes)
+                    ),
+                    (removable, kept) => format!(
+                        "{removable} to remove · {} · {kept} kept",
+                        crate::worktrees::size_words(view.bytes)
+                    ),
+                };
+                let header: View = if view.removable > 0 {
+                    CheckBox::new()
+                        .is_checked(checked)
+                        .is_enabled(!state.cleanup_busy)
+                        .automation_name(format!("Remove {}: {summary}", group.title()))
+                        .on_is_checked_changed(context.callback(move |on: bool| {
+                            Message::Settings(SettingsMsg::CleanupGroupToggled(group, on))
+                        }))
+                        .content(m3::text(
+                            format!("{} · {summary}", group.title()),
+                            tokens::text::SECTION_TITLE,
+                        ))
+                } else {
+                    m3::text(
+                        format!("{} · {summary}", group.title()),
+                        tokens::text::SECTION_TITLE,
+                    )
+                    .into()
+                };
+                let mut rows: Vec<KeyedView> =
+                    vec![KeyedView::new(format!("header:{checked}"), header)];
+                for item in &view.items {
+                    let (name, line) = crate::worktrees::item_line(item);
+                    rows.push(KeyedView::new(
+                        item.artifact.id.clone(),
+                        StackPanel::new().children((
+                            m3::body(name).text_trimming(TextTrimming::CharacterEllipsis),
+                            m3::secondary(line)
+                                .text_wrapping(TextWrapping::Wrap)
+                                .is_text_selection_enabled(true),
+                        )),
+                    ));
+                }
+                parts.push(KeyedView::new(
+                    format!("group:{group:?}"),
+                    m3::card_high(palette).content(
+                        StackPanel::new()
+                            .spacing(tokens::spacing::SM)
+                            .keyed_children(rows),
+                    ),
+                ));
+            }
+            if plan.truncated {
+                parts.push(KeyedView::new(
+                    "truncated",
+                    m3::secondary(
+                        "The review stopped at its bound; review again after this cleanup for the rest.",
+                    )
+                    .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
+            let selected = crate::worktrees::selected_artifacts(plan, &state.cleanup_unchecked);
+            let bytes: u64 = plan
+                .items
+                .iter()
+                .filter(|item| selected.contains(&item.artifact.id))
+                .filter_map(|item| item.bytes)
+                .sum();
+            let what = format!(
+                "{} item(s), {}",
+                selected.len(),
+                crate::worktrees::size_words(bytes)
+            );
+            if state.cleanup_confirm {
+                parts.push(KeyedView::new(
+                    "confirm",
+                    m3::card_high(palette)
+                        .automation_name("Confirm cleanup")
+                        .content(
+                            StackPanel::new().spacing(tokens::spacing::SM).children((
+                                m3::body(format!(
+                                    "Remove {what}? This cannot be undone. Kept items stay; Swarm checks each item again before removing it."
+                                ))
+                                .text_wrapping(TextWrapping::Wrap),
+                                StackPanel::new()
+                                    .orientation(Orientation::Horizontal)
+                                    .spacing(tokens::spacing::SM)
+                                    .children((
+                                        m3::destructive(palette)
+                                            .automation_name(format!("Remove: {what}"))
+                                            .on_click(context.message(Message::Settings(
+                                                SettingsMsg::CleanupConfirmed(true),
+                                            )))
+                                            .content(m3::label("Remove")),
+                                        m3::text_button(palette)
+                                            .automation_name("Cancel cleanup")
+                                            .on_click(context.message(Message::Settings(
+                                                SettingsMsg::CleanupConfirmed(false),
+                                            )))
+                                            .content(m3::label("Cancel")),
+                                    )),
+                            )),
+                        ),
+                ));
+            } else if !groups.is_empty() {
+                parts.push(KeyedView::new(
+                    "apply",
+                    m3::destructive(palette)
+                        .automation_name(format!("Remove selected: {what}"))
+                        .is_enabled(!state.cleanup_busy && !selected.is_empty())
+                        .on_click(context.message(Message::Settings(SettingsMsg::CleanupApply)))
+                        .content(m3::label(&if selected.is_empty() {
+                            "Nothing selected".to_owned()
+                        } else {
+                            format!("Remove {what}")
+                        })),
+                ));
+            }
+        }
+        StackPanel::new()
+            .spacing(tokens::spacing::SM)
+            .keyed_children(parts)
+    }
+
     /// Worktrees & cleanup (Codex's Worktrees page as the pattern): where
-    /// Swarm creates worktrees, and the ones it manages, by project.
-    /// `cleanup.plan` / `cleanup.apply` are not in this build, so there is
-    /// no Delete; the list is the daemon's `workspace.list`, every page.
+    /// Swarm creates worktrees, Clean up finished work (`cleanup.plan`
+    /// reviewed by kind, then `cleanup.apply` of the checked groups after
+    /// one confirmation), and the worktrees it manages, by project (the
+    /// daemon's `workspace.list`, every page).
     fn worktrees_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let root = self
             .data_dir
@@ -1542,13 +1808,22 @@ impl DesktopApp {
                 KeyedView::new(
                     "cleanup",
                     m3::setting_row(
-                        "Automatic cleanup",
-                        "Not available in this version. Remove a worktree with git worktree remove in its repository.",
-                        View::empty(),
+                        "Clean up finished work",
+                        "Review what Swarm can remove for finished tasks, by kind, with sizes and reasons. Nothing is removed until you confirm.",
+                        m3::outlined(palette)
+                            .automation_name("Review cleanup")
+                            .is_enabled(!self.settings.cleanup_busy)
+                            .on_click(context.message(Message::Settings(SettingsMsg::CleanupPlan)))
+                            .content(m3::label(if self.settings.cleanup_plan.is_some() {
+                                "Review again"
+                            } else {
+                                "Review…"
+                            })),
                     ),
                 ),
             ],
         );
+        let cleanup = self.cleanup_review(context, palette);
         let mut groups: Vec<KeyedView> = Vec::new();
         let empty: &[eliot_core::api::ManagedWorkspaceView] = &[];
         let (rows, total, complete) = match &self.settings.worktrees {
@@ -1629,9 +1904,11 @@ impl DesktopApp {
             ));
         }
         StackPanel::new().spacing(tokens::spacing::MD).children((
-            StackPanel::new()
-                .spacing(tokens::spacing::SM)
-                .children((m3::card_title("Creation and cleanup"), settings)),
+            StackPanel::new().spacing(tokens::spacing::SM).children((
+                m3::card_title("Creation and cleanup"),
+                settings,
+                cleanup,
+            )),
             m3::section_heading(
                 "Managed worktrees",
                 &heading,
@@ -2331,21 +2608,6 @@ impl DesktopApp {
                     ],
                 ),
                 history_view,
-                m3::group(palette,vec![
-                    KeyedView::new("cleanup",m3::form_row("Clean up",m3::body("Review owned artifacts and their sizes before applying cleanup.").into(),Some(m3::outlined(palette)
-                        .automation_name("Clean up")
-                        .is_enabled(!self.settings.cleanup_busy)
-                        .on_click(context.message(Message::Settings(SettingsMsg::CleanupPlan)))
-                        .content(m3::label("Clean up…"))))),
-                    KeyedView::new("cleanup-plan",m3::body(self.settings.cleanup_plan.as_ref().map(|plan| {
-                        let rows=plan.items.iter().map(|item|format!("{} · {} · {} · {}",item.artifact.path,item.bytes.map(|b|format!("{b} bytes")).unwrap_or_else(||"size unavailable".to_owned()),item.verdict,item.reason)).collect::<Vec<_>>().join("\n");
-                        format!("{} candidates{}\n{}",plan.items.len(),if plan.truncated {" (list truncated)"}else{""},rows)
-                    }).or_else(||self.settings.cleanup_result.clone()).unwrap_or_default()).text_wrapping(TextWrapping::Wrap)),
-                    KeyedView::new("cleanup-apply",m3::outlined(palette).automation_name("Apply cleanup")
-                        .is_enabled(!self.settings.cleanup_busy && self.settings.cleanup_plan.as_ref().is_some_and(|p|p.items.iter().any(|i|i.verdict=="safe")))
-                        .on_click(context.message(Message::Settings(SettingsMsg::CleanupApply)))
-                        .content(m3::label("Apply safe items"))),
-                ]),
                 m3::section_heading(
                     "All settings",
                     &format!(

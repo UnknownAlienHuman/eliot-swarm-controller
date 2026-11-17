@@ -7,8 +7,8 @@
 use windows_reactor::*;
 
 use crate::monitor::{
-    self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, bytes_label, cpu_time_label, state_name,
-    state_words, tokens_label,
+    self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, bytes_label, cpu_time_label, state_words,
+    tokens_label,
 };
 use crate::theme;
 use crate::theme::winui::Palette;
@@ -30,24 +30,42 @@ fn small(text: impl Into<String>) -> TextBlock {
         .is_text_selection_enabled(true)
 }
 
-/// One monitor card: the title with its state, what it does now, and its
-/// resources in one muted line. The whole card opens the conversation.
-pub fn card(row: &MonitorRow, title: &str, open: Callback<()>, palette: Palette) -> View {
-    let state = state_name(row.state);
+/// One monitor card: the title with its status, what it does now, its
+/// resources in one muted line, and the open attention report when there
+/// is one. The whole card opens the conversation.
+pub fn card(
+    row: &MonitorRow,
+    title: &str,
+    attention: Option<&str>,
+    open: Callback<()>,
+    palette: Palette,
+) -> View {
+    let status = row.status_words();
+    // A nested native child sits under its parent already.
     let under = row
         .parent
         .as_deref()
+        .filter(|_| !row.native_child)
         .map(|parent| format!(" · under {parent}"))
         .unwrap_or_default();
+    let attention_line: View = match attention {
+        Some(text) => crate::m3::secondary(format!("Attention: {text}"))
+            .foreground(palette.error())
+            .text_trimming(TextTrimming::CharacterEllipsis)
+            .into(),
+        None => View::empty(),
+    };
     // The button pads its content by the control inset; the content adds
     // the same inset above and below.
     crate::m3::card_button(
         palette,
         format!(
-            "{title}, {}, {}{under}, {}",
-            state_words(row.state),
+            "{title}, {status}, {}{under}, {}{}",
             crate::picker::harness_label(&row.harness),
-            row.operation()
+            row.operation(),
+            attention
+                .map(|text| format!(", attention: {text}"))
+                .unwrap_or_default()
         ),
         open,
         StackPanel::new()
@@ -68,8 +86,8 @@ pub fn card(row: &MonitorRow, title: &str, open: Callback<()>, palette: Palette)
                             .text_trimming(TextTrimming::CharacterEllipsis),
                         Border::new().grid_column(1).content(crate::m3::status(
                             palette,
-                            state,
-                            state_words(row.state),
+                            row.status_code(),
+                            status,
                         )),
                     )),
                 crate::m3::body(format!(
@@ -96,6 +114,7 @@ pub fn card(row: &MonitorRow, title: &str, open: Callback<()>, palette: Palette)
                     .join(" · "),
                 )
                 .text_trimming(TextTrimming::CharacterEllipsis),
+                attention_line,
             )),
     )
 }

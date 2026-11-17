@@ -263,14 +263,19 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
         .keyed_children(parts)
 }
 
-fn utc(ms: i64) -> String {
-    let seconds = ms.div_euclid(1000).rem_euclid(86_400);
-    format!(
-        "{:02}:{:02}:{:02} UTC",
-        seconds / 3600,
-        (seconds / 60) % 60,
-        seconds % 60
-    )
+/// A daemon time (epoch ms) on this computer's clock: "00:06:45" for a
+/// time today, "2026-11-18 02:00" for another day.
+pub fn local_time(ms: i64) -> String {
+    local_time_on(ms, chrono::Local::now().date_naive())
+}
+
+fn local_time_on(ms: i64, today: chrono::NaiveDate) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_millis_opt(ms).single() {
+        Some(at) if at.date_naive() == today => at.format("%H:%M:%S").to_string(),
+        Some(at) => at.format("%Y-%m-%d %H:%M").to_string(),
+        None => "an unreadable time".to_owned(),
+    }
 }
 
 fn compact(value: &serde_json::Value) -> String {
@@ -454,7 +459,7 @@ fn trigger_words(entry: &RuleListEntry) -> String {
             TimerSchedule::Cron { expression, tz } => {
                 format!("on the schedule {expression} ({tz})")
             }
-            TimerSchedule::Once { at } => format!("once at {}", utc(*at)),
+            TimerSchedule::Once { at } => format!("once at {}", local_time(*at)),
         };
         return schedule;
     }
@@ -538,7 +543,7 @@ pub struct RuleText {
     pub name: String,
     /// Enabled or disabled, paused, the revision.
     pub status: String,
-    /// "Every 10 min: launch …; next at 04:30:26 UTC."
+    /// "Every 10 min: launch …; next at 00:06:45" (local time).
     pub sentence: String,
     pub limit: Option<String>,
 }
@@ -572,7 +577,7 @@ pub fn rule_text(entry: &RuleListEntry) -> RuleText {
         }
     );
     if let Some(next) = entry.timer.as_ref().and_then(|timer| timer.next_due_at) {
-        sentence.push_str(&format!("; next at {}", utc(next)));
+        sentence.push_str(&format!("; next at {}", local_time(next)));
     }
     sentence.push('.');
     RuleText {
@@ -986,6 +991,28 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 1970-01-01 04:30:26 UTC.
+    const NEXT_DUE: i64 = 16_226_000;
+
+    #[test]
+    fn local_times_drop_utc_and_name_the_day_only_when_it_is_not_today() {
+        use chrono::TimeZone;
+        let at = chrono::Local
+            .timestamp_millis_opt(NEXT_DUE)
+            .single()
+            .unwrap();
+        assert_eq!(
+            local_time_on(NEXT_DUE, at.date_naive()),
+            at.format("%H:%M:%S").to_string()
+        );
+        let tomorrow = at.date_naive().succ_opt().unwrap();
+        assert_eq!(
+            local_time_on(NEXT_DUE, tomorrow),
+            at.format("%Y-%m-%d %H:%M").to_string()
+        );
+        assert!(!local_time(NEXT_DUE).contains("UTC"));
+    }
     use eliot_core::api::{RuleStateView, TimerStateView};
     use serde_json::json;
 
@@ -1013,8 +1040,7 @@ mod tests {
                 schedule,
                 anchor: 0,
                 last_key: None,
-                // 04:30:26 UTC.
-                next_due_at: Some(16_226_000),
+                next_due_at: Some(NEXT_DUE),
                 enabled: true,
             }),
             definition,
@@ -1089,8 +1115,12 @@ mod tests {
         assert_eq!(launch.status, "Enabled · revision 1");
         assert_eq!(
             launch.sentence,
-            "Every 10 min: launch a worker with the next brief from C:/qa/briefs in C:/qa/ws-alpha, keeping 1 busy; next at 04:30:26 UTC."
+            format!(
+                "Every 10 min: launch a worker with the next brief from C:/qa/briefs in C:/qa/ws-alpha, keeping 1 busy; next at {}.",
+                local_time(NEXT_DUE)
+            )
         );
+        assert!(!launch.sentence.contains("UTC"), "{}", launch.sentence);
         let stop = rule_text(&rules[1]);
         assert_eq!(
             stop.sentence,
