@@ -607,3 +607,83 @@ fn a_lost_tree_archives_and_unarchives_but_does_not_delete() {
         .unwrap();
     assert!(!store.get_agent(&agent).unwrap().unwrap().archived);
 }
+
+#[test]
+fn archiving_an_ended_agent_requires_drained_custody_and_names_the_blocker() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('','antigravity','p','failed',1,?1,?1)",[now]).unwrap();
+    insert_process(&store, "archive-boot", 4242, 1, "agent:a1#1", "running");
+    let archive = |store: &mut Store, archived: bool| {
+        store.change_agent_tree(&Ulid::new().to_string(), "a1", Some(archived), now)
+    };
+    let refused = |store: &mut Store, blocker: &str| {
+        let error = archive(store, true).unwrap_err();
+        assert_eq!(error.code, "busy");
+        assert!(
+            error.message.contains(&format!("a1 still has {blocker}")),
+            "{}",
+            error.message
+        );
+        assert!(!store.get_agent("a1").unwrap().unwrap().archived);
+    };
+    refused(&mut store, "running child process 4242 (agent:a1#1)");
+    store
+        .connection
+        .execute("UPDATE agents SET state='lost' WHERE id=1", [])
+        .unwrap();
+    refused(&mut store, "running child process 4242 (agent:a1#1)");
+    store
+        .connection
+        .execute("UPDATE processes SET state='exited',exit_code=1", [])
+        .unwrap();
+    store.connection.execute("INSERT INTO artifacts(id,agent,generation,path,body) VALUES ('art-archive',1,1,'C:/scratch/archive','{\"state\":\"unknown\"}')",[]).unwrap();
+    refused(&mut store, "unknown artifact art-archive");
+    store
+        .connection
+        .execute("DELETE FROM artifacts", [])
+        .unwrap();
+    store.connection.execute("INSERT INTO source_state(agent,generation,source,state,health,updated_at) VALUES (1,1,'stream','open','error',?1)",[now]).unwrap();
+    refused(&mut store, "open stream source (generation 1)");
+    store
+        .connection
+        .execute("UPDATE source_state SET state='closed' WHERE agent=1", [])
+        .unwrap();
+    // Eliot's git observer of a resumable lost Agent stays open: archive
+    // does not wait for it, delete's drain would.
+    store.connection.execute("INSERT INTO source_state(agent,generation,source,state,health,updated_at) VALUES (1,1,'git','open','ok',?1)",[now]).unwrap();
+    assert_eq!(archive(&mut store, true).unwrap()["archived"], true);
+    store
+        .connection
+        .execute("UPDATE agents SET state='failed' WHERE id=1", [])
+        .unwrap();
+    let error = store
+        .change_agent_tree(&Ulid::new().to_string(), "a1", None, now)
+        .unwrap_err();
+    assert!(
+        error.message.contains(
+            "a1 still has open git source (generation 1); agent.delete requires drained custody"
+        ),
+        "{}",
+        error.message
+    );
+    // Unarchive only reveals, so it needs no drain.
+    insert_process(&store, "archive-boot", 4243, 1, "agent:a1#1", "unknown");
+    assert_eq!(archive(&mut store, false).unwrap()["archived"], false);
+    // An idle Agent keeps its live custody: archive never stops a generation.
+    let idle = ready_steer_agent(&mut store, "archive-idle", now);
+    insert_process(
+        &store,
+        "archive-boot",
+        4244,
+        1,
+        &format!("agent:{idle}#1"),
+        "running",
+    );
+    assert_eq!(
+        store
+            .change_agent_tree(&Ulid::new().to_string(), &idle, Some(true), now)
+            .unwrap()["archived"],
+        true
+    );
+}

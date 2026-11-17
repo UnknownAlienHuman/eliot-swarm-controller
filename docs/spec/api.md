@@ -646,7 +646,11 @@ optional members are omitted when requests are serialized.
 `agent.archive {id, agent:"aN", archived:bool}` is Owner-only and atomically
 archives or unarchives the selected Agent and all current descendants. Every
 member must be idle or ended (stopped, failed or lost), with no active/uncertain
-turn, pending request or open command; otherwise it returns typed `busy` and stops nothing. The flag is
+turn, pending request or open command, and archiving an ended member also needs its
+custody resolved: no unexited owned process, `unknown` artifact or open native source
+(Eliot's `os`/`git`/`workspace_process` observers may stay open). Otherwise it returns
+typed `busy`, naming the blocking Agent and its state, request, command, turn,
+process, source or artifact, and stops nothing. Unarchive needs no drain. The flag is
 durable. Admission of send, resume, steer or inject atomically unarchives its
 target, including selector members, so new activity appears in the default list.
 `agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;
@@ -657,8 +661,8 @@ CLI: `swarm archive aN`, `swarm unarchive aN`, `swarm ls --archived include`.
 stopped or failed, using retention's leaf-first command cleanup. A failed launch
 can be removed after its sources and custody drain; an already-terminal `stop`
 does not need to rewrite its failure state. A `busy` refusal names the blocking
-Agent and its actual state, pending requests, command or turn (including generation
-and retained state), rather than treating stopped lifecycle as proof of drained
+Agent and its actual state, pending requests, command, turn (including generation
+and retained state) or undrained process, source or artifact, rather than treating stopped lifecycle as proof of drained
 history. A retained `unknown` turn still blocks deletion after stop. Live custody, open
 commands, uncertain turns, applicable unconsumed cleanup plans or a pinned history
 floor return `busy`; oversized operations return `unavailable` atomically. It never stops an Agent or deletes

@@ -145,11 +145,28 @@ impl Store {
                     ),
                 ));
             }
-            if archived.is_none() {
-                let live = generation_liveness_tx(&tx, *num)?;
-                if live {
-                    return Err(Error::new("busy", "Agent tree still has live custody"));
-                }
+            // Delete needs drained custody. Archive of an ended member needs
+            // resolved custody, so it never hides a process, artifact or
+            // native source the owner must still resolve; Eliot's own os, git
+            // and workspace-process observers of a resumable Agent may stay
+            // open. An idle member keeps its live custody (archive never
+            // stops a generation); unarchive only reveals.
+            let guard = match archived {
+                None => Some(true),
+                Some(true) if row.state != AgentState::Idle => Some(false),
+                Some(_) => None,
+            };
+            if let Some(observers) = guard
+                && let Some(blocker) = custody_blocker_tx(&tx, *num, observers)?
+            {
+                return Err(Error::new(
+                    "busy",
+                    format!(
+                        "{} still has {blocker}; {method} requires {} custody",
+                        row.id,
+                        if observers { "drained" } else { "resolved" }
+                    ),
+                ));
             }
         }
         if let Some(value) = archived {
@@ -175,8 +192,28 @@ impl Store {
     }
 }
 
-fn generation_liveness_tx(tx: &Transaction<'_>, agent: i64) -> Result<bool> {
-    tx.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE agent=?1 AND json_extract(body,'$.state')='unknown') OR EXISTS(SELECT 1 FROM source_state WHERE agent=?1 AND state='open' AND source!='daemon') OR EXISTS(SELECT 1 FROM processes WHERE owner LIKE ?2 AND state!='exited') OR EXISTS(SELECT 1 FROM processes WHERE owner LIKE ?3 AND state!='exited')",params![agent,format!("agent:{}#%",format_agent_id(agent)),format!("workspace:{}#%",format_agent_id(agent))],|r|r.get(0)).map_err(sql_error)
+/// First unresolved custody of an Agent across its generations, in words: an
+/// unexited owned process, an `unknown` artifact or an open non-daemon
+/// source; Eliot's os, git and workspace-process observers count only with
+/// `observers` (delete's drain).
+fn custody_blocker_tx(tx: &Transaction<'_>, agent: i64, observers: bool) -> Result<Option<String>> {
+    let id = format_agent_id(agent);
+    tx.query_row(
+        "SELECT state||' '||role||' process '||pid||' ('||owner||')' FROM processes WHERE (owner LIKE ?2 OR owner LIKE ?3) AND state!='exited'
+         UNION ALL SELECT 'unknown artifact '||id FROM artifacts WHERE agent=?1 AND json_extract(body,'$.state')='unknown'
+         UNION ALL SELECT 'open '||source||' source (generation '||generation||')' FROM source_state WHERE agent=?1 AND state='open' AND source!='daemon'
+             AND (?4 OR source NOT IN ('os','git','workspace_process'))
+         LIMIT 1",
+        params![
+            agent,
+            format!("agent:{id}#%"),
+            format!("workspace:{id}#%"),
+            observers
+        ],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(sql_error)
 }
 
 fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()> {

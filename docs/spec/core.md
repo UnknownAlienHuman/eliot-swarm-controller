@@ -895,7 +895,12 @@ read paths; a retried ack over it succeeds as already acked. An unset
 `archived` is a durable presentation flag independent of lifecycle state; archiving
 never stops a generation. Archive/unarchive requires idle or ended (stopped, failed
 or lost) descendants, no active or unknown turns, pending requests or open commands,
-so a lost tree that cannot be deleted can still be hidden.
+so a lost tree that cannot be deleted can still be hidden. Archiving an ended member
+also requires its custody resolved (no unexited owned process, `unknown` artifact or
+open native source), so archive never hides custody the owner must still resolve.
+Eliot's own `os`, `git` and `workspace_process` observers of a resumable Agent may
+stay open; delete's drain waits for them. An idle member keeps its live custody, and
+unarchive only reveals. A refusal names the Agent and its first blocker.
 Send, resume, steer and inject admission atomically clears the target's archive flag.
 Deletion requires every descendant stopped or failed and drained, and shares retention's leaf-first command
 row cleanup. Store removes dependent records in one transaction and retains
