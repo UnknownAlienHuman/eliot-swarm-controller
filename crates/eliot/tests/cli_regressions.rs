@@ -1012,11 +1012,25 @@ fn public_result_queries_reject_bad_shapes_without_mutation() {
             );
         }
     }
-    // Valid grammar reaches record lookup; generation zero and non-ULID command
-    // selectors do not gain another validation rule or arbitrary length cap.
+    assert_invalid_read_rpc(
+        &runtime,
+        &fixture,
+        "command.get",
+        "oversized command ID",
+        json!({"id":"x".repeat(eliot_core::limits::MAX_COMMAND_ID_BYTES + 1)}),
+    );
+    // Bounded non-ULID command references reach record lookup unchanged;
+    // generation zero remains valid for turn and result reads.
     for (method, params) in [
         ("command.get", json!({"id":"missing-command"})),
-        ("command.get", json!({"id":"x".repeat(4097)})),
+        (
+            "command.get",
+            json!({"id":"x".repeat(eliot_core::limits::MAX_COMMAND_ID_BYTES)}),
+        ),
+        (
+            "command.get",
+            json!({"id":"01M7MEN64NE9TXV12N4JNF3QCW/send"}),
+        ),
         ("turn.get", turn_query),
         ("agent.result", json!({"id":"a1"})),
         (

@@ -851,8 +851,41 @@ mod tests {
     }
 
     #[test]
+    fn mcp_preserves_derived_command_references_separately_from_mutation_ids() {
+        let derived = "01M7MEN64NE9TXV12N4JNF3QCW/send";
+        for method in [
+            "command.get",
+            "command.children",
+            "command.cancel",
+            "command.resolve",
+        ] {
+            let params = if matches!(method, "command.get" | "command.children") {
+                json!({"id":derived})
+            } else {
+                json!({"command_id":derived})
+            };
+            let mut params = params.as_object().unwrap().clone();
+            let minted = mint_missing_mutation_id(method, &mut params);
+            if matches!(method, "command.get" | "command.children") {
+                assert!(minted.is_none());
+                assert_eq!(params["id"], derived);
+            } else {
+                assert!(minted.is_some());
+                assert_eq!(params["command_id"], derived);
+                assert!(params["id"].as_str().unwrap().parse::<ulid::Ulid>().is_ok());
+            }
+        }
+    }
+
+    #[test]
     fn mutation_id_is_minted_only_when_a_mutation_omits_it() {
-        for method in ["mail.send", "var.set", "command.submit"] {
+        for method in [
+            "mail.send",
+            "var.set",
+            "command.submit",
+            "command.cancel",
+            "command.resolve",
+        ] {
             let mut params = Map::new();
             let minted = mint_missing_mutation_id(method, &mut params);
             let id = minted.expect("omitted id is minted");
@@ -868,7 +901,14 @@ mod tests {
             explicit.get("id").and_then(Value::as_str),
             Some("01ARZ3NDEKTSV4RRFFQ69G5FAV")
         );
-        for method in ["var.get", "mail.read", "api.help", "unknown.method"] {
+        for method in [
+            "var.get",
+            "mail.read",
+            "api.help",
+            "unknown.method",
+            "command.get",
+            "command.children",
+        ] {
             let mut params = Map::new();
             assert_eq!(mint_missing_mutation_id(method, &mut params), None);
             assert!(!params.contains_key("id"));

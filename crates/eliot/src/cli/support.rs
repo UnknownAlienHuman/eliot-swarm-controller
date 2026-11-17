@@ -430,6 +430,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn invalid_mutation_id_names_the_global_option() {
+        let error = mutation_id(Some("01M7MEN64NE9TXV12N4JNF3QCW/send".to_owned()))
+            .err()
+            .unwrap();
+        assert_eq!(error.exit_code, 2);
+        assert_eq!(error.message, "--id must be a valid ULID");
+    }
+
+    #[test]
     fn busy_readback_prints_the_persisted_bound_and_preserves_exit_code() {
         let mut command: CoreCommand = serde_json::from_value(json!({
             "id":"launch", "principal":"owner", "method":"command.submit", "verb":"launch",

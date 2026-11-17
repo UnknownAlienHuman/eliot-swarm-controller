@@ -18,6 +18,12 @@ first roadmap caller, not as empty L1 subsystems.
 | `turn_id`, `request_id` | exact native execution/request within an Agent generation |
 | `native_id` | stable normalized native fact identity within its source |
 
+`command.get`, `command.children`, `command.cancel` and `command.resolve` validate
+command references with Core's [`validate_command_id`](../../crates/eliot-core/src/command.rs):
+nonblank and at most [`MAX_COMMAND_ID_BYTES`](../../crates/eliot-core/src/limits.rs)
+bytes, including linked `<id>/send` and selector child IDs. Preserve the exact bytes
+without normalization; external mutation IDs remain ULIDs.
+
 One native subject maps to one canonical Agent row. Attach/detach/resume update it;
 a native fork has another subject and Agent. Optional names are unique and cannot look
 like Agent ids/selectors. Public numeric identities must not be recycled after cleanup.

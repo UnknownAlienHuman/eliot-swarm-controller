@@ -33,7 +33,8 @@ pub use agent_start::AgentStartParams;
 pub use canonical::canonical_json_sha256;
 pub use command::{
     classify_dispatched_error, command_transition_allowed, handoff_brief_resolution_allowed,
-    is_deterministic_pre_admission_rejection, workspace_preparation_transition_allowed,
+    is_deterministic_pre_admission_rejection, validate_command_id,
+    workspace_preparation_transition_allowed,
 };
 pub use context::{ContextItem, ContextOutcome, InjectArgs, InjectPoint};
 pub use diagnostics::{

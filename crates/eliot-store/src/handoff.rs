@@ -139,8 +139,13 @@ impl Store {
         let record = load_command_record(&tx, &request.command_id)?
             .ok_or_else(|| Error::new("not_found", "input missing"))?;
         let eligible:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM commands c JOIN commands p ON p.id=c.parent_command WHERE c.id=?1 AND c.link_kind='handoff' AND p.method='swarm.handoff')",[&request.command_id],|row|row.get(0)).map_err(sql_error)?;
-        if !eligible
-            || record.command.verb != "send"
+        if !eligible {
+            return Err(Error::new(
+                "bad_state",
+                "command.cancel supports only handoff SEND children; launch/resume inputs and ordinary commands cannot be withdrawn",
+            ));
+        }
+        if record.command.verb != "send"
             || !matches!(record.state, CommandState::Accepted | CommandState::Queued)
         {
             return Err(Error::new(

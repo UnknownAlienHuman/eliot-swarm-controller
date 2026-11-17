@@ -43,6 +43,7 @@ impl CommandResolution {
 #[serde(deny_unknown_fields)]
 pub struct CommandResolveRequest {
     pub id: String,
+    /// Exact nonblank command ID, at most 256 bytes; includes derived IDs.
     pub command_id: String,
     #[serde(rename = "as")]
     pub resolution: CommandResolution,
@@ -52,12 +53,7 @@ pub struct CommandResolveRequest {
 impl CommandResolveRequest {
     pub fn validate(&self) -> Result<()> {
         validate_write_id(&self.id)?;
-        if self.command_id.trim().is_empty() {
-            return Err(Error::new(
-                "invalid",
-                "command.resolve command_id must be nonempty",
-            ));
-        }
+        crate::command::validate_command_id(&self.command_id)?;
         validate_reason(&self.reason)
     }
 

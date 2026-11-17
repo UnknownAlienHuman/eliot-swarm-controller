@@ -1024,7 +1024,10 @@ same representation with a distinct link kind, not selector execution semantics.
 `command.children` is implemented for retained expansions through Core
 [`CommandChildrenRequest`/`CommandChildrenResponse`](../../crates/eliot-core/src/api/reads.rs).
 `id` names the parent and `after` names the last child of the previous page; both are
-kept verbatim and must be nonempty. `limit` defaults to 100 only when omitted and must
+kept verbatim and use the bounded [Core command ID validator](../../crates/eliot-core/src/command.rs),
+shared with `command.get`, `command.cancel` and `command.resolve`. CLI positional
+`COMMAND_ID` references are independent of the mutation's optional `--id ULID`.
+`limit` defaults to 100 only when omitted and must
 be 1–1,000; explicit `null`, wrong types, out-of-range values and unknown fields are
 `invalid`. Children page in fixed ordinal order and `next` is the last returned child
 id, or null on an empty page. Reads use the same principal scope as `command.get`: the
@@ -1098,8 +1101,9 @@ and carries session subtotals with their supply gaps
 and per-unit costs. `swarm usage` renders this response as a compact table;
 `--json` keeps printing the raw response.
 
-Required IDs must be strings whose trimmed value is nonempty. Validation does not trim,
-normalize or impose a new length limit on them. `turn.get` requires a nonnegative integer
+Required IDs must be strings whose trimmed value is nonempty and are preserved without
+trimming or normalization. Command references use the [Core command ID validator](../../crates/eliot-core/src/command.rs).
+`turn.get` requires a nonnegative integer
 generation. For `agent.result`, omitted `generation` selects the current generation;
 omitted `turn_id` requests turns for that generation; omitted `limit` defaults to 100.
 Any supplied generation must be a nonnegative integer, and any supplied `turn_id` must
@@ -1287,7 +1291,9 @@ swarm [--id ULID] cmd cancel HANDOFF_INPUT_ID
 `command.cancel {id,command_id}` is Owner-only and implemented only for
 accepted/queued SEND children of a handoff. It atomically records no-effect
 cancellation and a retained mutation reply; ordinary, dispatched and unknown
-commands refuse. It never interrupts a native turn. `command.resolve` can release
+commands refuse with `bad_state`. Launch/resume inputs, including `<id>/send`,
+are outside this cancellation scope even while queued; the refusal names this
+restriction. It never interrupts a native turn. `command.resolve` can release
 an unknown brief, or narrowly assert a failed handoff brief applied, without a
 resend. These Owner recovery operations remain available during drain. MCP
 advertises both mutations and mints omitted IDs using its normal rules.
