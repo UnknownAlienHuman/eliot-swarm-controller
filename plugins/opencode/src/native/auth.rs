@@ -166,6 +166,7 @@ pub async fn transfer_selected_integration(
     transfer: &AuthTransfer<'_>,
     deadline: Instant,
 ) -> Result<()> {
+    let _timing = super::startup::Step::new("auth_transfer");
     // An empty XDG root would silently fall back to the canonical store and
     // import into owner state: refuse before spawning. Relative roots stay
     // consistent because every child shares the server's workspace cwd.
@@ -234,6 +235,7 @@ struct ListEntry {
 /// The canonical gate: the selection must name exactly one integration
 /// entry (by ID or name) holding exactly one connection.
 async fn canonical_gate(transfer: &AuthTransfer<'_>, deadline: Instant) -> Result<Gate> {
+    let _timing = super::startup::Step::new("auth_canonical_list");
     let mut command = canonical_command(transfer);
     command
         .args(list_argv())
@@ -247,6 +249,7 @@ async fn canonical_gate(transfer: &AuthTransfer<'_>, deadline: Instant) -> Resul
 /// The isolated gate: same rule, read under the isolated roots the server
 /// will use, so the read observes exactly the store `serve` will read.
 async fn isolated_gate(transfer: &AuthTransfer<'_>, deadline: Instant) -> Result<Gate> {
+    let _timing = super::startup::Step::new("auth_isolated_list");
     let mut command = isolated_command(transfer);
     command
         .args(list_argv())
@@ -385,6 +388,7 @@ async fn run_list(mut command: Command, deadline: Instant) -> Result<Vec<ListEnt
 /// native error text may echo secrets, so failures surface as static
 /// strings only.
 async fn export_selected(transfer: &AuthTransfer<'_>, deadline: Instant) -> Result<SecretBytes> {
+    let _timing = super::startup::Step::new("auth_export");
     let mut command = canonical_command(transfer);
     command
         .args(export_argv(transfer.selector))
@@ -518,6 +522,7 @@ async fn import_once(
     secret: &SecretBytes,
     deadline: Instant,
 ) -> ImportAttempt {
+    let _timing = super::startup::Step::new("auth_import");
     let mut command = isolated_command(transfer);
     command
         .args(import_argv())

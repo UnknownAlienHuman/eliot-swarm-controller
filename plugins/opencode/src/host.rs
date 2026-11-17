@@ -744,6 +744,7 @@ impl OpenCodePlugin {
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
+        let _timing = crate::native::startup::Step::new("start_total");
         let parsed = match self.parse_start_request(raw)? {
             StartAdmission::Replay(outcome) => return outcome,
             StartAdmission::New(parsed) => parsed,
@@ -799,6 +800,7 @@ impl OpenCodePlugin {
     /// Start phase 1, admission: decode, replay guards, and frozen-profile
     /// validation. Failures here retain nothing: a corrected start may retry.
     fn parse_start_request(&self, raw: &Value) -> Result<StartAdmission> {
+        let _timing = crate::native::startup::Step::new("frozen_admission");
         let params: AgentStartParams = decode(raw, "OpenCode agent.start params are invalid")?;
         validate_identity(
             &params.agent_id,
@@ -1056,6 +1058,7 @@ impl OpenCodePlugin {
         let http = server.http().clone();
         // Subscribe before session create/input: the stream must observe the
         // session's whole durable sequence starting at `session.created`.
+        let subscribe_timing = crate::native::startup::Step::new("subscribe");
         let (frames, stream) = match http.subscribe(phase_deadline(envelope, RPC_TIMEOUT)).await {
             Ok(subscribed) => subscribed,
             Err(error) => {
@@ -1068,6 +1071,7 @@ impl OpenCodePlugin {
                 });
             }
         };
+        drop(subscribe_timing);
         let events = crate::events::spawn(
             frames,
             stream,
@@ -1118,6 +1122,7 @@ impl OpenCodePlugin {
         mut session: AgentSession,
         envelope: Instant,
     ) -> std::result::Result<AgentSession, PhaseFailure> {
+        let _timing = crate::native::startup::Step::new("process_registration");
         if let Err(error) = register_native_process(
             peer,
             &parsed.credential,
@@ -1166,6 +1171,7 @@ impl OpenCodePlugin {
         mut session: AgentSession,
         envelope: Instant,
     ) -> Result<CreateOutcome> {
+        let _timing = crate::native::startup::Step::new("session_create_verify");
         session.native_scope = opencode_scope(session.server.data_dir());
         // Pre-create verification: no native session or prompt exists yet.
         let local_fragment = if let Some(local) = parsed.local.as_ref() {
@@ -1205,6 +1211,7 @@ impl OpenCodePlugin {
                 .as_ref()
                 .and_then(|model_ref| model_ref.variant.as_deref())
         {
+            let _timing = crate::native::startup::Step::new("model_catalogue");
             let catalogue = match session
                 .http
                 .list_native_models(phase_deadline(envelope, RPC_TIMEOUT))
