@@ -232,6 +232,7 @@ impl DesktopApp {
                     self.nav.collapsed = self.prefs.collapsed.iter().cloned().collect();
                     self.launch_preferences_loaded();
                     self.preferred_window = crate::settings::window(&read);
+                    self.seed_settings(read, context);
                     // The opened checkout, registered by discovery, is where
                     // a new task starts.
                     if let Some(checkout) = discovered {
@@ -670,14 +671,15 @@ impl DesktopApp {
     /// Open Settings, at `page` when given.
     fn open_settings(&mut self, page: Option<settings_ui::Page>, context: &ComponentContext<Self>) {
         self.close_popover();
+        let reopened = self.main != Main::Settings;
         let page_changed = page.is_some_and(|page| page != self.settings_page);
         if let Some(page) = page {
             self.settings_page = page;
         }
-        if self.main != Main::Settings || page_changed {
+        if reopened || page_changed {
             self.main = Main::Settings;
             self.reprime_fields(context);
-            self.settings_entered(context);
+            self.settings_entered(reopened, context);
         }
     }
 

@@ -282,8 +282,14 @@ pub fn as_catalog(reply: &HarnessModelsResponse) -> ModelsCatalogResponse {
                 id: entry.id.clone(),
                 display_name: entry.id.clone(),
                 provider: eliot_core::api::catalog_provider(&reply.harness, &entry.id),
-                efforts: entry.efforts.clone(),
-                default_effort: entry.default_effort.clone(),
+                efforts: entry
+                    .efforts
+                    .clone()
+                    .filter(|_| reply.configure.effort_refusal.is_none()),
+                default_effort: entry
+                    .default_effort
+                    .clone()
+                    .filter(|_| reply.configure.effort_refusal.is_none()),
                 default: entry.default || reply.default.as_deref() == Some(entry.id.as_str()),
                 availability: eliot_core::api::harness::CATALOG_AVAILABLE.to_owned(),
                 source: entry.source.clone(),
@@ -294,6 +300,18 @@ pub fn as_catalog(reply: &HarnessModelsResponse) -> ModelsCatalogResponse {
         ttl_ms: reply.ttl_ms,
         failures: Vec::new(),
     }
+}
+
+/// The launch catalogue can preview one harness's efforts while the
+/// Agent's route is checked. An unknown explicit model has no preview.
+pub fn launch_model<'a>(
+    catalog: &'a ModelsCatalogResponse,
+    harness: &str,
+    model: Option<&str>,
+) -> Option<&'a ModelsCatalogEntry> {
+    catalog.models.iter().find(|entry| {
+        entry.harness == harness && model.map_or(entry.default, |model| entry.id == model)
+    })
 }
 
 /// Models and efforts of a catalogue reply, the efforts for `model` (else
@@ -481,6 +499,32 @@ mod tests {
             Some("Claude Code keeps the model and effort it started with.")
         );
         assert_eq!(locked_words("Codex", false, false), None);
+    }
+
+    #[test]
+    fn launch_preview_stays_with_the_harness_and_confirmed_options_remove_locked_effort() {
+        let launch = as_catalog(&reply(ConfigureSupport::default()));
+        assert_eq!(launch_model(&launch, "codex", None).unwrap().id, "m1");
+        assert_eq!(
+            launch_model(&launch, "codex", Some("m2"))
+                .unwrap()
+                .efforts
+                .as_deref()
+                .unwrap(),
+            ["medium", "xhigh"]
+        );
+        assert!(launch_model(&launch, "claude", Some("m2")).is_none());
+        assert!(launch_model(&launch, "codex", Some("missing")).is_none());
+        let locked = as_catalog(&reply(ConfigureSupport {
+            model_refusal: None,
+            effort_refusal: Some("fixed effort".to_owned()),
+        }));
+        assert!(
+            locked
+                .models
+                .iter()
+                .all(|model| { model.efforts.is_none() && model.default_effort.is_none() })
+        );
     }
 
     #[test]

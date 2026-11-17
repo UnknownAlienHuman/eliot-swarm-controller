@@ -381,8 +381,23 @@ fn load_projects_blocking(data_dir: &Path) -> Fallible<Vec<UiProject>> {
     })
 }
 
-/// One validated page of Agent rows on a worker, with each row's chat and
-/// archived flags; `archived` is the list filter (None: the default).
+fn last_read_label(at_ms: i64) -> Option<String> {
+    let at = chrono::DateTime::from_timestamp_millis(at_ms)?.with_timezone(&chrono::Local);
+    Some(format!("Last read {}", at.format("%b %-d, %H:%M:%S")))
+}
+
+fn panel_read_status(read_at_ms: Option<i64>, refreshing: bool) -> Option<String> {
+    let read = read_at_ms?;
+    let stale = crate::handoff::now_ms().saturating_sub(read) > monitor::PERIOD_MS as i64;
+    match (refreshing, stale) {
+        (true, true) => last_read_label(read).map(|label| format!("Refreshing… · {label}")),
+        (true, false) => Some("Refreshing…".to_owned()),
+        (false, true) => last_read_label(read),
+        (false, false) => None,
+    }
+}
+
+/// One validated page of Agent rows on a worker, with chat and archived flags.
 fn load_agents_blocking(
     data_dir: &Path,
     request: &AgentListRequest,

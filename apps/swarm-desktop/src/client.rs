@@ -400,10 +400,16 @@ where
 /// at or after `at_ms`, by binary search over single-row unfiltered reads
 /// (about log2 of the journal length). Commit timestamps follow sequence
 /// order closely; callers keep a margin below the result.
-pub async fn seq_before(data_dir: &Path, at_ms: i64, floor: i64, high: i64) -> Result<i64> {
+pub async fn seq_before(
+    data_dir: &Path,
+    at_ms: i64,
+    floor: i64,
+    high: i64,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<i64> {
     let everything = EventsFilter::default();
     let (mut low, mut high) = (floor, high);
-    while low < high {
+    while low < high && !cancelled() {
         let mid = low + (high - low) / 2;
         let page = events_read(data_dir, mid, 1, &everything).await?;
         match page.events.first() {
