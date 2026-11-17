@@ -565,6 +565,7 @@ pub fn author_label(author: &str) -> String {
         "owner:cli" => "You, with the CLI".to_owned(),
         "bootstrap" => "Swarm, at first start".to_owned(),
         "project_discovery" => "Swarm, registering an opened project".to_owned(),
+        "project_cleanup" => "You, removing stale project registrations".to_owned(),
         other => other.to_owned(),
     }
 }

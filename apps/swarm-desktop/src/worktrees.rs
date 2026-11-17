@@ -65,24 +65,25 @@ pub enum CleanupGroup {
     Temp,
     Chats,
     Sessions,
+    ProjectRegistrations,
     Other,
 }
 
 impl CleanupGroup {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Branches,
         Self::Worktrees,
         Self::Build,
         Self::Temp,
         Self::Chats,
         Self::Sessions,
+        Self::ProjectRegistrations,
         Self::Other,
     ];
 
-    /// Whether a fresh review checks the group. Native session archives
-    /// change the owner's harness stores, so they start unchecked.
+    /// Native session archives and project settings changes are opt-in.
     pub fn checked_by_default(self) -> bool {
-        self != Self::Sessions
+        !matches!(self, Self::Sessions | Self::ProjectRegistrations)
     }
 
     /// The groups a fresh review leaves unchecked.
@@ -101,6 +102,7 @@ impl CleanupGroup {
             Self::Temp => "Temporary folders",
             Self::Chats => "Chat folders",
             Self::Sessions => "Native session archives",
+            Self::ProjectRegistrations => "Project registrations",
             Self::Other => "Other folders",
         }
     }
@@ -114,6 +116,7 @@ impl CleanupGroup {
             ArtifactKind::Build => Self::Build,
             ArtifactKind::Temp => Self::Temp,
             ArtifactKind::NativeSession => Self::Sessions,
+            ArtifactKind::ProjectRegistration => Self::ProjectRegistrations,
             ArtifactKind::Other if candidate.artifact.purpose == "Swarm chat directory" => {
                 Self::Chats
             }
@@ -221,7 +224,13 @@ pub fn reason_words(reason: &str) -> String {
         "hard_link" => "shares files with another folder".to_owned(),
         "not_selected" => "its group was not selected".to_owned(),
         "prior_cleanup_attempt" => "an earlier cleanup already tried it".to_owned(),
-        "identity_changed" => "it changed since the review".to_owned(),
+        "identity_changed" | "conflict" => "it changed since the review".to_owned(),
+        "project_path_present" => "the registered path still exists".to_owned(),
+        "project_path_missing" => {
+            "the registered path is gone and no live Agent uses it".to_owned()
+        }
+        "project_path_unverified" => "the registered path could not be checked".to_owned(),
+        "project_in_use" => "an Agent or unsettled command still uses the registration".to_owned(),
         "branch_checked_out" => "the branch is checked out".to_owned(),
         "no_default_branch" => "the upstream default branch couldn't be found".to_owned(),
         "removed" => "already removed".to_owned(),
@@ -251,6 +260,7 @@ pub fn item_line(item: &CleanupCandidate, title: Option<&str>) -> (String, Strin
     let chat = CleanupGroup::of(item) == CleanupGroup::Chats;
     let name = match (item.artifact.kind, title) {
         (ArtifactKind::Branch, _) => tail.to_owned(),
+        (ArtifactKind::ProjectRegistration, _) => item.artifact.project.clone(),
         // A native session is named by its task, not its store reference.
         (ArtifactKind::NativeSession, Some(title)) => title.to_owned(),
         // No title read: the app's session, its Agent on the second line.
@@ -269,7 +279,7 @@ pub fn item_line(item: &CleanupCandidate, title: Option<&str>) -> (String, Strin
         _ => String::new(),
     };
     let size = match (item.artifact.kind, item.bytes) {
-        (ArtifactKind::Branch | ArtifactKind::NativeSession, _) => String::new(),
+        (_, _) if !sized(CleanupGroup::of(item)) => String::new(),
         (_, Some(bytes)) => format!("{} · ", size_words(bytes)),
         (_, None) => "size not measured · ".to_owned(),
     };
@@ -293,7 +303,10 @@ pub fn item_line(item: &CleanupCandidate, title: Option<&str>) -> (String, Strin
 /// Whether a group's size means anything (branches and archived native
 /// sessions free no folder).
 pub fn sized(group: CleanupGroup) -> bool {
-    !matches!(group, CleanupGroup::Branches | CleanupGroup::Sessions)
+    !matches!(
+        group,
+        CleanupGroup::Branches | CleanupGroup::Sessions | CleanupGroup::ProjectRegistrations
+    )
 }
 
 /// The result of one apply, in words: what was removed, kept (with why) and
@@ -472,7 +485,9 @@ mod tests {
         assert_eq!(line, "Codex session · a1 · Remove: its task finished");
         assert_eq!(
             CleanupGroup::unchecked_by_default(),
-            [CleanupGroup::Sessions].into_iter().collect()
+            [CleanupGroup::Sessions, CleanupGroup::ProjectRegistrations]
+                .into_iter()
+                .collect()
         );
         assert!(!sized(CleanupGroup::Branches) && sized(CleanupGroup::Temp));
         let mut unchecked = std::collections::HashSet::new();

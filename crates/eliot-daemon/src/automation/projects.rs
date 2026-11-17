@@ -35,9 +35,11 @@ pub(super) struct LoadedProjectRules {
 
 /// Resolve owner-configured registrations to canonical checkout and Git identity.
 /// Call before Store admission; no Store lock is acquired during filesystem or Git work.
-pub(super) async fn load_registrations(data_root: &Path) -> Result<Vec<RegistrationSnapshot>> {
-    let configured = config::load_project_registration_config(data_root)?;
-    resolve_registrations(configured).await
+pub(super) async fn load_registrations(
+    data_root: &Path,
+) -> Result<(Option<String>, Vec<RegistrationSnapshot>)> {
+    let (revision, configured) = config::settings::project_configs_snapshot(data_root)?;
+    Ok((revision, resolve_registrations(configured).await?))
 }
 
 pub(super) async fn resolve_registrations(
@@ -387,7 +389,7 @@ mod tests {
     }
 
     async fn sole_registration(fixture: &ProjectFixture) -> RegistrationSnapshot {
-        let mut registrations = load_registrations(&fixture.data_root)
+        let (_, mut registrations) = load_registrations(&fixture.data_root)
             .await
             .expect("load owner registrations");
         assert_eq!(registrations.len(), 1);

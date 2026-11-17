@@ -257,6 +257,52 @@ impl Store {
         Ok((items, truncated))
     }
 
+    /// A missing checkout can still belong to a current workspace, or to a
+    /// terminal Agent with unsettled activity. The Store holds the complete
+    /// fleet here, including rows outside an inventory page.
+    pub fn cleanup_project_in_use(&self, id: &str, path: &str) -> Result<bool> {
+        let pending = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE principal=?1
+             AND state IN ('accepted','queued','dispatched','unknown'))",
+                [format!("project:{id}")],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?;
+        if pending {
+            return Ok(true);
+        }
+        let path = cleanup_path(path);
+        let mut query = self.connection.prepare(
+            "SELECT a.project, a.workspace, w.repo_path, w.worktree_path
+               FROM agents a LEFT JOIN workspaces w
+                 ON w.agent=a.id AND w.target_generation=a.generation AND w.phase!='removed'
+              WHERE a.state NOT IN ('stopped','failed')
+                 OR EXISTS(SELECT 1 FROM source_state s WHERE s.agent=a.id
+                            AND s.state='open' AND s.source NOT IN ('daemon','os','git','workspace_process'))
+                 OR EXISTS(SELECT 1 FROM commands c WHERE c.target=a.id
+                            AND c.state IN ('accepted','queued','dispatched','unknown'))
+                 OR EXISTS(SELECT 1 FROM processes p WHERE p.state!='exited'
+                            AND p.owner IN ('agent:a'||a.id||'#'||a.generation,
+                                            'workspace:a'||a.id||'#'||a.generation))",
+        ).map_err(sql_error)?;
+        let mut rows = query.query([]).map_err(sql_error)?;
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            let project: String = row.get(0).map_err(sql_error)?;
+            if project == id || cleanup_path(&project) == path {
+                return Ok(true);
+            }
+            for column in [1, 2, 3] {
+                let location: Option<String> = row.get(column).map_err(sql_error)?;
+                if location.is_some_and(|location| cleanup_path(&location).starts_with(&path)) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub fn cleanup_replay(
         &self,
         principal: &str,
@@ -559,10 +605,24 @@ impl Store {
                 "cleanup plan is already consumed; read the original apply id",
             ));
         }
-        // Read ownership in the same transaction that reserves attempts. Agent
-        // ids are never reused, so deletion supersedes even a snapshot retained
-        // after the Agent was removed.
         for (index, item) in plan.items.iter().enumerate() {
+            // A project registration belongs to settings, not to an Agent, so
+            // Agent deletion never supersedes it.
+            if item.artifact.kind == ArtifactKind::ProjectRegistration {
+                if attempted(item) {
+                    if principal != "owner" {
+                        return Err(Error::new("not_allowed", "project cleanup requires Owner"));
+                    }
+                    if prior_project_cleanup(&tx, &request.id, &item.artifact)? {
+                        response.items[index].outcome = "skipped".to_owned();
+                        response.items[index].reason = Some("prior_cleanup_attempt".to_owned());
+                    }
+                }
+                continue;
+            }
+            // Read ownership in the same transaction that reserves attempts. Agent
+            // ids are never reused, so deletion supersedes even a snapshot retained
+            // after the Agent was removed.
             let agent = parse_agent_id(&item.artifact.agent)?;
             let retained: bool = tx
                 .query_row(
@@ -645,6 +705,20 @@ impl Store {
         Ok(!sources && !pending && !live_process)
     }
 
+    pub fn settle_project_cleanup(
+        &mut self,
+        request: &CleanupApplyRequest,
+        response: &CleanupApplyResponse,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        update_cleanup_receipt(&tx, "owner", request, response)?;
+        commit_transaction(tx, &self.write_faulted)
+    }
+
     pub fn settle_cleanup_item(
         &mut self,
         principal: &str,
@@ -658,13 +732,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let changed = tx.execute("UPDATE writes SET result=?1 WHERE id=?2 AND principal=?3 AND method='cleanup.apply'",params![encode_json(response)?,request.id,principal]).map_err(sql_error)?;
-        if changed != 1 {
-            return Err(Error::new(
-                "source_integrity",
-                "cleanup receipt disappeared",
-            ));
-        }
+        update_cleanup_receipt(&tx, principal, request, response)?;
         let mut updated = artifact.clone();
         updated.state = match outcome.outcome.as_str() {
             "removed" => "removed",
@@ -702,6 +770,65 @@ impl Store {
     }
 }
 
+fn update_cleanup_receipt(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &CleanupApplyRequest,
+    response: &CleanupApplyResponse,
+) -> Result<()> {
+    let changed = tx
+        .execute(
+            "UPDATE writes SET result=?1 WHERE id=?2 AND principal=?3 AND method='cleanup.apply'",
+            params![encode_json(response)?, request.id, principal],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        return Err(Error::new(
+            "source_integrity",
+            "cleanup receipt disappeared",
+        ));
+    }
+    Ok(())
+}
+
+fn prior_project_cleanup(
+    tx: &Transaction<'_>,
+    apply_id: &str,
+    artifact: &ArtifactView,
+) -> Result<bool> {
+    // The receipt fences the exact project/settings revision even across
+    // plans and restart. Retention pins unresolved project cleanup receipts.
+    tx.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM cleanup_plans p
+             JOIN json_each(p.body, '$.items') i
+             JOIN writes w ON w.id=p.apply_id
+            WHERE p.principal='owner' AND p.apply_id <> ?3
+              AND json_extract(i.value, '$.verdict')='safe'
+              AND json_extract(i.value, '$.artifact.kind')='project_registration'
+              AND json_extract(i.value, '$.artifact.project')=?1
+              AND json_extract(i.value, '$.artifact.identity')=?2
+              AND EXISTS(
+                  SELECT 1 FROM json_each(w.result, '$.items') r
+                   WHERE json_extract(r.value, '$.artifact_id')=json_extract(i.value, '$.artifact.id')
+                     AND json_extract(r.value, '$.outcome')='unknown'
+              )
+         )",
+        params![artifact.project, artifact.identity, apply_id], |row| row.get(0),
+    ).map_err(sql_error)
+}
+
+fn cleanup_path(path: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let path = path.replace('\\', "/");
+        let path = path.strip_prefix("//?/").unwrap_or(&path);
+        std::path::PathBuf::from(path.to_ascii_lowercase())
+    }
+    #[cfg(not(windows))]
+    std::path::PathBuf::from(path)
+}
+
 fn cleanup_terminal(state: AgentState) -> bool {
     matches!(state, AgentState::Stopped | AgentState::Failed)
 }
@@ -721,6 +848,109 @@ pub(super) fn require_no_cleanup_attempt(connection: &Connection, agent: &Agent)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_project_workspace_keeps_registration_but_archive_remains_readable() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let path = if cfg!(windows) {
+            "C:/removed/repo"
+        } else {
+            "/removed/repo"
+        };
+        let workspace = if cfg!(windows) {
+            r"\\?\C:\Removed\Repo\child"
+        } else {
+            "/removed/repo/child"
+        };
+        store.connection.execute(
+            "INSERT INTO agents(project,workspace,harness,profile,state,generation,created_at,updated_at)
+             VALUES (?1,?2,'codex','p','idle',1,1,1)",
+            params![workspace, workspace],
+        ).unwrap();
+        assert!(
+            store
+                .cleanup_project_in_use("registered-project", path)
+                .unwrap()
+        );
+        store
+            .connection
+            .execute("UPDATE agents SET state='stopped',archived=1", [])
+            .unwrap();
+        assert!(
+            !store
+                .cleanup_project_in_use("registered-project", path)
+                .unwrap()
+        );
+        let agent = store.get_agent("a1").unwrap().unwrap();
+        assert!(agent.archived);
+        assert_eq!(agent.project, workspace);
+    }
+
+    #[test]
+    fn unsettled_targetless_project_command_keeps_registration() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store.connection.execute(
+            "INSERT INTO commands(id,principal,method,payload_digest,verb,args,state,created_at,updated_at)
+             VALUES (?1,'project:demo','command.submit',x'00','run','{}','dispatched',1,1)",
+            [Ulid::new().to_string()],
+        ).unwrap();
+        assert!(store.cleanup_project_in_use("demo", "/gone").unwrap());
+        assert!(!store.cleanup_project_in_use("other", "/gone").unwrap());
+        store
+            .connection
+            .execute("UPDATE commands SET state='applied'", [])
+            .unwrap();
+        assert!(!store.cleanup_project_in_use("demo", "/gone").unwrap());
+    }
+
+    #[test]
+    fn uncertain_project_cleanup_fences_another_plan_for_the_same_revision() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        for expected in ["unknown", "skipped"] {
+            let artifact = ArtifactView {
+                id: Ulid::new().to_string(),
+                agent: String::new(),
+                generation: 0,
+                project: "stale-project".to_owned(),
+                tree: Vec::new(),
+                path: "C:/missing".to_owned(),
+                kind: ArtifactKind::ProjectRegistration,
+                purpose: "Project registration".to_owned(),
+                identity: "same-settings-revision".to_owned(),
+                created_at: 0,
+                state: "registered".to_owned(),
+                git: None,
+            };
+            let plan = CleanupPlan {
+                plan_id: Ulid::new().to_string(),
+                created_at: now,
+                items: vec![CleanupCandidate {
+                    artifact,
+                    bytes: None,
+                    verdict: "safe".to_owned(),
+                    reason: "project_path_missing".to_owned(),
+                }],
+                truncated: false,
+            };
+            store.retain_cleanup_plan("owner", &plan).unwrap();
+            let request = CleanupApplyRequest {
+                id: Ulid::new().to_string(),
+                plan_id: plan.plan_id,
+                delete_remote: false,
+                artifacts: None,
+            };
+            let (_, response, _) = store.begin_cleanup_apply("owner", &request, now).unwrap();
+            assert_eq!(response.items[0].outcome, expected);
+            let (_, replay, fresh) = store.begin_cleanup_apply("owner", &request, now).unwrap();
+            assert!(!fresh);
+            assert_eq!(replay.items[0].outcome, expected);
+            let trimmed = store
+                .prune_retention(None, Some(1), None, now + 2 * 86_400_000)
+                .unwrap();
+            assert_eq!(trimmed.writes_deleted, i64::from(expected == "skipped"));
+        }
+    }
 
     #[test]
     fn registration_requires_durable_generation_root() {

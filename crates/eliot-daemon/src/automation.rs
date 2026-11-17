@@ -192,8 +192,8 @@ pub(crate) async fn initialize_project_rules(
     policy: &SecretPolicy,
 ) -> Result<Vec<ProjectRuleNamespace>> {
     let registration_result = projects::load_registrations(data_root).await;
-    let registrations = match registration_result {
-        Ok(registrations) => registrations,
+    let (revision, registrations) = match registration_result {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             logging::record(policy, "daemon.rule_reload_rejected", &[], Some(&error));
             return Ok(Vec::new());
@@ -206,7 +206,9 @@ pub(crate) async fn initialize_project_rules(
         .iter()
         .map(project_registration_input)
         .collect::<Vec<_>>();
-    let views = router.reconcile_project_registrations(&inputs).await?;
+    let views = router
+        .reconcile_configured_projects(&inputs, revision.as_deref())
+        .await?;
     let mut namespaces = Vec::with_capacity(views.len());
     for view in views {
         let Some(registration) = registrations
@@ -448,8 +450,8 @@ async fn refresh_project_namespaces(
     namespaces: &mut Vec<ProjectRuleNamespace>,
     owner_config_notices: &mut ReloadNoticeContext,
 ) -> Result<bool> {
-    let registrations = match projects::load_registrations(data_root).await {
-        Ok(registrations) => registrations,
+    let (revision, registrations) = match projects::load_registrations(data_root).await {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             report_rejected_source(policy, &error, owner_config_notices)?;
             for namespace in namespaces.iter_mut() {
@@ -462,7 +464,10 @@ async fn refresh_project_namespaces(
         .iter()
         .map(project_registration_input)
         .collect::<Vec<_>>();
-    let views = match router.reconcile_project_registrations(&inputs).await {
+    let views = match router
+        .reconcile_configured_projects(&inputs, revision.as_deref())
+        .await
+    {
         Ok(views) => views,
         Err(error) => {
             report_rejected_source(policy, &error, owner_config_notices)?;
@@ -2603,7 +2608,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         };
         write_config(&["run"], false);
 
-        let loaded = projects::load_registrations(&data_root).await.unwrap();
+        let (_, loaded) = projects::load_registrations(&data_root).await.unwrap();
         let input = project_registration_input(&loaded[0]);
         let store = Arc::new(tokio::sync::Mutex::new(
             eliot_store::Store::open(Path::new(":memory:")).unwrap(),
@@ -2860,8 +2865,9 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
         }
 
         write_config(&["send"], true);
-        let revoked_registration =
-            project_registration_input(&projects::load_registrations(&data_root).await.unwrap()[0]);
+        let revoked_registration = project_registration_input(
+            &projects::load_registrations(&data_root).await.unwrap().1[0],
+        );
         let revoked_registration = router
             .reconcile_project_registrations(std::slice::from_ref(&revoked_registration))
             .await

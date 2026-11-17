@@ -48,7 +48,7 @@ pub(crate) struct Cli {
 // function instead of accumulating every argument builder in this enum's frame.
 #[derive(Subcommand)]
 pub(crate) enum CliCommand {
-    /// Plan or apply cleanup for retained Agent artifacts.
+    /// Plan or apply cleanup for retained Agent artifacts and stale projects.
     Cleanup(CleanupArgs),
     /// Register an artifact directory owned by this Agent generation.
     Artifact(ArtifactArgs),
@@ -199,6 +199,9 @@ pub(crate) enum CleanupCommand {
     },
     Apply {
         plan_id: String,
+        /// Apply only this safe candidate ID. Repeat to select multiple.
+        #[arg(long = "artifact")]
+        artifacts: Vec<String>,
         /// After a local branch is removed, delete it from its upstream
         /// remote as well. Owner-only; never automatic.
         #[arg(long)]

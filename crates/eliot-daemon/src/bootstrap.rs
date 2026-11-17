@@ -76,50 +76,87 @@ pub(crate) async fn discover_project(
     workspace: &Path,
     policy: &SecretPolicy,
 ) -> Result<ProjectDiscoverResponse> {
-    let Some((checkout, common_dir)) = workspace_identity(workspace).await? else {
+    use crate::config::settings;
+
+    let Some((checkout, common_dir, linked)) = workspace_identity(workspace).await? else {
         return Ok(ProjectDiscoverResponse { project: None });
     };
-    let existing_id = matching_project_id(data_root, &checkout, &common_dir).await?;
-    let registration = {
-        let mut store = store.lock().await;
-        ensure_project_identity(
+    let (revision, configured) = settings::project_configs_snapshot(data_root)?;
+    let matching = matching_project(configured, &checkout, &common_dir, linked).await?;
+    let mut store = store.lock().await;
+    if settings::current_revision(data_root)? != revision {
+        return Err(Error::new(
+            "conflict",
+            "project settings changed during discovery",
+        ));
+    }
+    let project = match matching {
+        Some((definition, registered_checkout, registered_common)) => {
+            Some(upsert_discovered_project(
+                &mut store,
+                definition,
+                &registered_checkout,
+                &registered_common,
+            )?)
+        }
+        None => register_project(
             data_root,
             &mut store,
             &checkout,
             &common_dir,
-            existing_id.as_deref(),
+            revision.as_deref(),
             policy,
-        )?
+        )?,
     };
-    Ok(ProjectDiscoverResponse {
-        project: registration,
-    })
+    Ok(ProjectDiscoverResponse { project })
 }
 
-async fn matching_project_id(
-    data_root: &Path,
+async fn matching_project(
+    projects: Vec<crate::config::ProjectRegistrationConfig>,
     checkout: &str,
     common_dir: &str,
-) -> Result<Option<String>> {
-    let projects = crate::config::load_project_registration_config(data_root)?;
+    linked: bool,
+) -> Result<Option<(crate::config::ProjectRegistrationConfig, String, String)>> {
     if projects.is_empty() {
         return Ok(None);
     }
     let git = crate::workspace_git::WorkspaceGit::new()?;
+    let mut best = None;
+    let mut rank = 0;
+    let mut ambiguous = false;
     for project in projects {
-        match git.discover_repository_identity(&project.path).await {
-            Ok((registered_checkout, registered_common))
-                if same_git_path(&registered_checkout, checkout)
-                    && same_git_path(&registered_common, common_dir) =>
-            {
-                return Ok(Some(project.id));
-            }
-            Ok(_) => {}
-            Err(error) if error.code == "unavailable" => {}
-            Err(error) => return Err(error),
+        let (registered_checkout, registered_common, registered_linked) =
+            match git.discover_repository_identity(&project.path).await {
+                Ok(identity) => identity,
+                Err(error) if error.code == "unavailable" => continue,
+                Err(error) => return Err(error),
+            };
+        if !same_git_path(&registered_common, common_dir) {
+            continue;
+        }
+        let candidate_rank = if linked && !registered_linked {
+            // A legacy worktree entry cannot supersede the repository grant.
+            2
+        } else if linked || same_git_path(&registered_checkout, checkout) {
+            1
+        } else {
+            continue;
+        };
+        if candidate_rank > rank {
+            best = Some((project, registered_checkout, registered_common));
+            rank = candidate_rank;
+            ambiguous = false;
+        } else if candidate_rank == rank {
+            ambiguous = true;
         }
     }
-    Ok(None)
+    if ambiguous {
+        return Err(Error::new(
+            "conflict",
+            "multiple project registrations match the checkout",
+        ));
+    }
+    Ok(best)
 }
 
 fn same_git_path(left: &str, right: &str) -> bool {
@@ -133,7 +170,7 @@ fn same_git_path(left: &str, right: &str) -> bool {
     }
 }
 
-async fn workspace_identity(workspace: &Path) -> Result<Option<(String, String)>> {
+async fn workspace_identity(workspace: &Path) -> Result<Option<(String, String, bool)>> {
     let path = workspace
         .to_str()
         .ok_or_else(|| Error::new("invalid", "project workspace path is not UTF-8"))?;
@@ -322,18 +359,24 @@ fn installed_default_profiles(muse_cmd: Option<String>) -> serde_json::Map<Strin
     profiles
 }
 
-fn ensure_project_identity(
+fn register_project(
     data_root: &Path,
     store: &mut Store,
     checkout: &str,
     common_dir: &str,
-    existing_id: Option<&str>,
+    expected_revision: Option<&str>,
     policy: &SecretPolicy,
 ) -> Result<Option<ProjectRegistrationView>> {
     use crate::config::settings::{self, SettingsAuthor};
     use eliot_core::api::SettingsSection::{Profiles, Projects};
 
     let read = settings::read_internal(data_root, &*store, Some(&[Profiles, Projects]), policy)?;
+    if read.revision.as_deref() != expected_revision {
+        return Err(Error::new(
+            "conflict",
+            "project settings changed during discovery",
+        ));
+    }
     let profiles = read
         .sections
         .get(&Profiles)
@@ -354,36 +397,44 @@ fn ensure_project_identity(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let id = existing_id
-        .map(str::to_owned)
-        .unwrap_or_else(|| project_id(checkout));
-    if !projects.contains_key(&id) {
-        let entry = json!({
-            "path": checkout,
-            "profiles": profile_names,
-            "actions": ["launch", "send"],
-        });
-        projects.insert(id.clone(), entry);
-        let mut sections = BTreeMap::new();
-        sections.insert(Projects, Value::Object(projects));
-        settings::save_internal(
-            data_root,
-            store,
-            read.revision.as_deref(),
-            &sections,
-            SettingsAuthor::ProjectDiscovery,
-            false,
-            policy,
-        )?;
+    let id = project_id(checkout);
+    if projects.contains_key(&id) {
+        return Err(Error::new(
+            "conflict",
+            "project registration ID already belongs to another checkout",
+        ));
     }
+    let entry = json!({
+        "path": checkout,
+        "profiles": profile_names,
+        "actions": ["launch", "send"],
+    });
+    projects.insert(id.clone(), entry);
+    let mut sections = BTreeMap::new();
+    sections.insert(Projects, Value::Object(projects));
+    settings::save_internal(
+        data_root,
+        store,
+        read.revision.as_deref(),
+        &sections,
+        SettingsAuthor::ProjectDiscovery,
+        false,
+        policy,
+    )?;
 
     let definition = crate::config::load_project_registration_config(data_root)?
         .into_iter()
         .find(|project| project.id == id)
         .ok_or_else(|| Error::new("source_integrity", "saved project registration disappeared"))?;
-    // A concurrent settings save may have retargeted the matched ID while
-    // Git discovery ran outside the Store lock. Never apply that path's
-    // authority to the checkout from the earlier discovery.
+    upsert_discovered_project(store, definition, checkout, common_dir).map(Some)
+}
+
+fn upsert_discovered_project(
+    store: &mut Store,
+    definition: crate::config::ProjectRegistrationConfig,
+    checkout: &str,
+    common_dir: &str,
+) -> Result<ProjectRegistrationView> {
     let configured_checkout = std::fs::canonicalize(&definition.path)
         .map_err(|_| Error::new("conflict", "project checkout changed during discovery"))?;
     if !configured_checkout
@@ -396,7 +447,7 @@ fn ensure_project_identity(
         ));
     }
     let input = ProjectRegistrationInput {
-        id,
+        id: definition.id,
         checkout: checkout.to_owned(),
         repo_common_dir: common_dir.to_owned(),
         git: definition.git,
@@ -407,7 +458,7 @@ fn ensure_project_identity(
     };
     store
         .upsert_project_registration("owner", &input, crate::common::now_ms())
-        .map(|change| Some(change.value))
+        .map(|change| change.value)
 }
 
 fn project_id(checkout: &str) -> String {
@@ -428,6 +479,70 @@ fn project_id(checkout: &str) -> String {
 mod tests {
     use super::*;
     use eliot_core::api::SettingsSection::Projects;
+
+    #[tokio::test]
+    async fn linked_worktree_reuses_registered_checkout_and_its_exact_grants() {
+        use crate::config::settings::{self, SettingsAuthor};
+        use eliot_core::api::{SettingsClientSource, SettingsSection::Profiles};
+
+        let root = std::env::temp_dir().join(format!("eliot-linked-project-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        let checkout = root.join("checkout");
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&checkout).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+            vec!["worktree", "add", "--detach", linked.to_str().unwrap()],
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(&checkout)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let policy = SecretPolicy::default();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let revision = settings::save_internal(
+            &root, &mut store, None,
+            &BTreeMap::from([
+                (Profiles, json!({"chosen": {"harness": "codex"}, "other": {"harness": "codex"}})),
+                (Projects, json!({
+                    "repo": {"path": checkout, "profiles": ["chosen"], "actions": ["send"]},
+                    "legacy": {"path": linked, "profiles": ["chosen", "other"], "actions": ["send", "launch"]}
+                })),
+            ]),
+            SettingsAuthor::Owner(SettingsClientSource::Cli), false, &policy,
+        ).unwrap().revision;
+        let store = Mutex::new(store);
+        let primary = discover_project(&root, &store, &checkout, &policy)
+            .await
+            .unwrap();
+        let linked = discover_project(&root, &store, &linked, &policy)
+            .await
+            .unwrap();
+        assert_eq!(linked, primary);
+        let registration = linked.project.unwrap();
+        assert_eq!(registration.id, "repo");
+        assert_eq!(registration.profiles, ["chosen"]);
+        assert_eq!(registration.actions, ["send"]);
+        assert_eq!(settings::current_revision(&root).unwrap(), revision);
+    }
 
     /// k97: every daemon start re-registered its startup checkout as a
     /// project, resurrecting an Owner-removed project. Startup performs

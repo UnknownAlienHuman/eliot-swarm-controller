@@ -714,7 +714,13 @@ Owner-global `[projects.ID]` entries register projects. On an Owner open or laun
 an unregistered Git checkout, S2 creates an entry through the settings writer,
 recorded as a machine change. Its profile allowlist is the existing profiles;
 its action allowlist grants ordinary launch/send only, without script/interpreter,
-Git fetch or additional automation authority. Existing registrations are preserved.
+Git fetch or additional automation authority. For a linked worktree, the
+canonical Git common directory identifies its repository registration. Discovery
+prefers the registered primary checkout even when a legacy registration names the
+worktree itself. Without a registered primary checkout, discovery can reuse a
+sole registration for the common directory. Ambiguous matches refuse discovery.
+Reuse returns that registration's checkout and exact allowlists, preserves the
+Agent's workspace, and adds no settings entry. Workspace inventory is read-only.
 Daemon startup performs no project discovery: a removed project stays removed
 across restarts, and no checkout is ever registered implicitly. Registration
 runs only through an explicit Owner open (`project.discover`), an Owner
@@ -772,8 +778,9 @@ registration and the target's approved profile, repository identity, workspace r
 and exact generation before an effect. Missing or changed authority fails closed; there
 is no Owner fallback for a project-scoped request.
 
-Project configuration changes use the private global settings writer, with Owner or
-internal project-discovery author attribution. Invalid
+Project configuration changes use the private global settings writer. History
+attributes discovery to `project_discovery` and Owner cleanup of stale registrations
+to `project_cleanup`. Invalid
 project rule reload retains the last valid definition and reports a bounded diagnostic.
 
 ## Frozen profile and route binding

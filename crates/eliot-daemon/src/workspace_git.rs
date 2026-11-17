@@ -79,7 +79,7 @@ impl WorkspaceGit {
     pub(crate) async fn discover_repository_identity(
         &self,
         path: &str,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, String, bool)> {
         let requested = canonical_root(path)?;
         let deadline = Instant::now() + READ_TIME;
         let bytes = self
@@ -95,7 +95,7 @@ impl WorkspaceGit {
                 deadline,
             )
             .await?;
-        let (top, _git_dir, common_dir) = identity_lines(&bytes)?;
+        let (top, git_dir, common_dir) = identity_lines(&bytes)?;
         let checkout = canonical_root(&top)?;
         if !requested.starts_with(&checkout) {
             return Err(problem(
@@ -104,7 +104,8 @@ impl WorkspaceGit {
             ));
         }
         let common_dir = canonical_root(&common_dir)?;
-        Ok((path_text(&checkout)?, path_text(&common_dir)?))
+        let linked = canonical_root(&git_dir)? != common_dir;
+        Ok((path_text(&checkout)?, path_text(&common_dir)?, linked))
     }
 
     pub(crate) async fn freeze(

@@ -606,14 +606,23 @@ pub(super) fn delete_commands_tx<'a>(
 }
 
 fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
-    // Filter pins before the page limit, so unresolved rounds cannot starve
-    // eligible replies behind them. Finalization still needs their write row.
+    // Filter pins before the page limit. Unresolved goal rounds and project
+    // cleanup attempts still need their write receipts for the retry fence.
     Ok(db!(tx.execute(
         "DELETE FROM writes WHERE id IN (
              SELECT id FROM writes WHERE created_at <= ?1
                AND method NOT LIKE 'inference.%'
                AND NOT (method = 'goal.round'
                         AND json_extract(result, '$.outcome') IS json_extract(?3, '$'))
+               AND NOT (method = 'cleanup.apply' AND EXISTS(
+                   SELECT 1 FROM cleanup_plans p
+                     JOIN json_each(p.body, '$.items') i
+                     JOIN json_each(writes.result, '$.items') r
+                    WHERE p.apply_id=writes.id
+                      AND json_extract(i.value, '$.artifact.kind')='project_registration'
+                      AND json_extract(i.value, '$.artifact.id')=json_extract(r.value, '$.artifact_id')
+                      AND json_extract(r.value, '$.outcome')='unknown'
+               ))
              ORDER BY created_at, id LIMIT ?2
          )",
         params![

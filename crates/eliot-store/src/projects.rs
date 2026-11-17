@@ -119,6 +119,25 @@ impl Store {
         result
     }
 
+    /// Revoke only the settings entries removed by an Owner cleanup. Agent
+    /// rows retain their own project label and native history independently.
+    pub fn remove_project_registrations(&mut self, ids: &[String]) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            for id in ids {
+                tx.execute("DELETE FROM project_registrations WHERE id = ?1", [id])
+                    .map_err(sql_error)?;
+            }
+            commit_transaction(tx, &self.write_faulted)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     pub fn get_project_registration(
         &self,
         principal: &str,

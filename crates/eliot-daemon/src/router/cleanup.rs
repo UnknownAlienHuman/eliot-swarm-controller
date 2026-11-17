@@ -7,6 +7,8 @@ use eliot_core::FailureOrigin;
 use eliot_core::api::*;
 use std::path::{Component, Path};
 
+mod projects;
+
 fn encoded(value: impl serde::Serialize) -> Result<Value> {
     serde_json::to_value(value)
         .map_err(|_| Error::new("internal", "cleanup response cannot encode"))
@@ -598,7 +600,23 @@ impl Router {
             items: Vec::new(),
             truncated: truncated || inventory_incomplete,
         };
-        for artifact in artifacts {
+        let (safe_projects, kept_projects): (Vec<_>, Vec<_>) =
+            if matches!(principal, Principal::Owner) {
+                self.plan_project_registrations(&request)
+                    .await?
+                    .into_iter()
+                    .partition(|item| item.verdict == "safe")
+            } else {
+                (Vec::new(), Vec::new())
+            };
+        plan.truncated |=
+            artifacts.len() + safe_projects.len() + kept_projects.len() > MAX_CLEANUP_ITEMS;
+        plan.items
+            .extend(safe_projects.into_iter().take(MAX_CLEANUP_ITEMS));
+        for artifact in artifacts
+            .into_iter()
+            .take(MAX_CLEANUP_ITEMS - plan.items.len())
+        {
             let mut candidate = CleanupCandidate {
                 artifact,
                 bytes: None,
@@ -670,6 +688,11 @@ impl Router {
             }
             plan.items.push(candidate);
         }
+        plan.items.extend(
+            kept_projects
+                .into_iter()
+                .take(MAX_CLEANUP_ITEMS - plan.items.len()),
+        );
         self.inner
             .store
             .lock()
@@ -770,17 +793,21 @@ impl Router {
             require_owner(principal)?;
         }
         let name = principal_name(principal);
-        let (plan, mut response, is_new) =
-            self.inner
-                .store
-                .lock()
-                .await
-                .begin_cleanup_apply(&name, &request, now_ms())?;
-        if !is_new {
-            return encoded(response);
-        }
+        let (plan, mut response) = {
+            let mut store = self.inner.store.lock().await;
+            let (plan, mut response, is_new) =
+                store.begin_cleanup_apply(&name, &request, now_ms())?;
+            if !is_new {
+                return encoded(response);
+            }
+            self.apply_project_registrations(&mut store, &request, &plan, &mut response)?;
+            (plan, response)
+        };
         for (index, item) in plan.items.iter().enumerate() {
-            if item.verdict != "safe" || response.items[index].outcome != "unknown" {
+            if item.artifact.kind == ArtifactKind::ProjectRegistration
+                || item.verdict != "safe"
+                || response.items[index].outcome != "unknown"
+            {
                 continue;
             }
             let outcome = match self

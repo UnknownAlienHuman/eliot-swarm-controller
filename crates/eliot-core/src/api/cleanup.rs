@@ -11,6 +11,7 @@ pub enum ArtifactKind {
     Worktree,
     Branch,
     NativeSession,
+    ProjectRegistration,
     Other,
 }
 
@@ -34,12 +35,15 @@ impl ArtifactRegisterRequest {
             || self.purpose.len() > 512
             || matches!(
                 self.kind,
-                ArtifactKind::Branch | ArtifactKind::NativeSession | ArtifactKind::Worktree
+                ArtifactKind::Branch
+                    | ArtifactKind::NativeSession
+                    | ArtifactKind::Worktree
+                    | ArtifactKind::ProjectRegistration
             )
         {
             return Err(Error::new(
                 "invalid",
-                "invalid artifact path, kind or purpose; worktrees are registered by Swarm",
+                "invalid artifact path, kind or purpose",
             ));
         }
         Ok(())

@@ -39,13 +39,14 @@ pub(crate) async fn run_cleanup(
         }
         CleanupCommand::Apply {
             plan_id,
+            artifacts,
             delete_remote,
         } => {
             let request = CleanupApplyRequest {
                 id: mutation_id(id)?,
                 plan_id,
                 delete_remote,
-                artifacts: None,
+                artifacts: (!artifacts.is_empty()).then_some(artifacts),
             };
             request
                 .validate()
