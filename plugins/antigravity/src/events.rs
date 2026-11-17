@@ -2500,7 +2500,13 @@ mod tests {
         };
         let (result, ()) = tokio::join!(state.settle_prompt(&prompt), async {
             for kind in ["turn.started", "turn.completed"] {
-                next_commit(&mut commits, kind).await.1.send(()).unwrap();
+                let (event, ack) = next_commit(&mut commits, kind).await;
+                if kind == "turn.completed" {
+                    assert_eq!(event["data"]["turn_id"], "turn-1");
+                    assert_eq!(event["data"]["outcome"], "interrupted");
+                    assert_eq!(event["data"]["native_status"], "cancelled");
+                }
+                ack.send(()).unwrap();
             }
         });
         result.unwrap();

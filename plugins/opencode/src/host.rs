@@ -3301,8 +3301,34 @@ impl OpenCodePlugin {
                 "OpenCode stop outcome is unresolved and will not be repeated",
             ));
         }
-        session.stop_command_id = Some(params.command_id);
-        terminate_session(session, params.force).await?;
+        // Latch once before native I/O. An uncertain cancel is never replayed.
+        session.stop_command_id = Some(params.command_id.clone());
+        if let Some(interrupt) = params.interrupt() {
+            let until = Instant::now() + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT;
+            let _ = tokio::time::timeout_at(until, self.interrupt_command(interrupt)).await;
+            if let Some(session) = self.session.as_ref() {
+                let _ = tokio::time::timeout_at(until, async {
+                    loop {
+                        let status = session.events.current_status().await?;
+                        if !status.source_unknown
+                            && !status.batch_unknown
+                            && status.last_turn.as_ref().is_some_and(|turn| {
+                                Some(&turn.turn_id) == params.turn_id.as_ref() && turn.terminal
+                            })
+                        {
+                            return Ok::<(), Error>(());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                })
+                .await;
+            }
+        }
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("unknown", "stop lost its retained native session"))?;
+        terminate_session(session, params.force, params.interrupt().is_some()).await?;
         Ok(json!({"state": "applied"}))
     }
 
@@ -3312,7 +3338,7 @@ impl OpenCodePlugin {
             // without replaying native interrupt/GET or a blind End. An
             // already-acked End is likewise never repeated.
             if session.phase != SessionPhase::Stopped && !session.resources_proved_closed {
-                terminate_session(session, true).await?;
+                terminate_session(session, true, false).await?;
             }
             session.events.close().await;
         }
@@ -3322,7 +3348,7 @@ impl OpenCodePlugin {
     async fn shutdown_owned(&mut self) {
         if let Some(session) = self.session.as_mut() {
             if session.phase != SessionPhase::Stopped && !session.resources_proved_closed {
-                let _ = terminate_session(session, true).await;
+                let _ = terminate_session(session, true, false).await;
             }
             session.events.close().await;
         }
@@ -4131,7 +4157,11 @@ fn start_paths(
 /// process custody. Proven retained applies; proven absent or any
 /// ambiguous readback is unknown. Force ends the owned server without
 /// the quiesce wait and never touches another Agent.
-async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()> {
+async fn terminate_session(
+    session: &mut AgentSession,
+    force: bool,
+    interrupt_attempted: bool,
+) -> Result<()> {
     let deadline = Instant::now() + RPC_TIMEOUT;
     // A semantic quiesce/retention failure never skips the bounded
     // owned-resource cleanup below. The semantic error is preserved
@@ -4145,10 +4175,14 @@ async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()
     } else {
         let _ = note_stage(&mut stage, StopStage::Quiesce);
         if !force && let Some(session_id) = session.session_id.clone() {
-            if OpenCodePlugin::resume_quiesce(session, &session_id, deadline)
-                .await
-                .is_err()
-            {
+            let quiet = if interrupt_attempted {
+                // The stop prelude already made its one interrupt attempt.
+                // Cleanup is read-only even if that write was uncertain.
+                OpenCodePlugin::resume_verify_idle(session, &session_id, deadline).await
+            } else {
+                OpenCodePlugin::resume_quiesce(session, &session_id, deadline).await
+            };
+            if quiet.is_err() {
                 semantic_error = true;
             } else {
                 let _ = note_stage(&mut stage, StopStage::Retention);

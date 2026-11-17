@@ -2944,6 +2944,64 @@ mod tests {
         assert_eq!(readback.outcome, "failed");
     }
 
+    #[tokio::test]
+    async fn busy_stop_native_cancel_commits_exact_interrupted_turn() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (host_io, plugin_io) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(plugin_io);
+        let mut peer = eliot_plugin::Peer::from_io(read, write);
+        let client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let http = crate::native::client::OpenCodeHttp::new(
+            1,
+            "pw".to_owned(),
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let mut processor = EventProcessor::new(
+            http,
+            client,
+            EventConfig {
+                credential: "test-credential".to_owned(),
+                agent_id: "a1".to_owned(),
+                generation: 1,
+                secrets: Vec::new(),
+            },
+        );
+        processor.status.ready = true;
+        processor.status.session_id = Some("test-session".to_owned());
+        processor.open_inbox_id = Some("input-1".to_owned());
+        processor.status.active_command_id = Some("send-1".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        let frame: crate::native::types::SseEnvelope = serde_json::from_value(serde_json::json!({
+                    "id":"event-1","type":"session.execution.interrupted","data":{"sessionID":"test-session"}
+                })).unwrap();
+        let terminal = processor.complete_turn(&frame);
+        let (read, mut write) = tokio::io::split(host_io);
+        let (result, ()) = tokio::join!(terminal, async {
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, "events.put");
+            let event = &request.params["events"][0];
+            assert_eq!(event["kind"], "turn.completed");
+            assert_eq!(event["data"]["turn_id"], "turn-1");
+            assert_eq!(event["data"]["command_id"], "send-1");
+            assert_eq!(event["data"]["outcome"], "interrupted");
+            let response = serde_json::json!({"jsonrpc":"2.0","id":request.id,"result":{"first_seq":1,"last_seq":1,"cursor":null}});
+            write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        result.unwrap();
+        assert!(processor.status.active_turn_id.is_none());
+        assert!(processor.status.last_turn.as_ref().unwrap().terminal);
+        assert!(!processor.status.source_unknown);
+        peer_task.abort();
+    }
+
     fn handle_with(status: EventStatus) -> EventHandle {
         let (control, _) = tokio::sync::mpsc::channel(1);
         let (_, watcher) = tokio::sync::watch::channel(status);

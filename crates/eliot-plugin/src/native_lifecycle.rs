@@ -16,6 +16,19 @@ use crate::{native_transport::NativeChild, session::EVENT_DEADLINE};
 
 const PLUGIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Acknowledged interrupt dispatch is not terminal evidence. Stop gives the
+/// exact turn this bounded window before proceeding with session shutdown.
+pub const STOP_INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Wait on the adapter's native terminal projection, never on an RPC ack.
+/// The adapter's subsequent BeginStop barrier drains the terminal commit
+/// before native teardown. An absent terminal leaves Store's turn unknown.
+pub async fn wait_for_stop_turn(until: Instant, mut terminal: impl FnMut() -> bool) {
+    while !terminal() && Instant::now() < until {
+        tokio::time::sleep_until((Instant::now() + Duration::from_millis(25)).min(until)).await;
+    }
+}
+
 /// Own the runtime for every stdio plugin entry. Tokio stdin starts an
 /// uncancellable blocking read, so ordinary runtime Drop can wait forever even
 /// after the adapter has drained its native tail and aborted its peer reader.
@@ -115,6 +128,33 @@ pub async fn drain_native_exit(
 mod tests {
     use super::{run_plugin_entry, wait_for_native_tail};
     use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn busy_stop_without_terminal_exhausts_only_its_interrupt_window() {
+        let until = tokio::time::Instant::now() + std::time::Duration::from_millis(40);
+        super::wait_for_stop_turn(until, || false).await;
+        assert!(tokio::time::Instant::now() >= until);
+        // Already observed terminal evidence never consumes another window.
+        super::wait_for_stop_turn(until, || true).await;
+    }
+
+    #[test]
+    fn busy_stop_interrupt_preserves_identity_and_never_infers_a_turn() {
+        let mut stop: crate::AgentStopParams = serde_json::from_value(serde_json::json!({
+            "agent_id":"a1", "generation":7, "command_id":"stop-1", "turn_id":"exact-turn"
+        }))
+        .unwrap();
+        let interrupt = stop.interrupt().unwrap();
+        assert_eq!(interrupt.turn_id.as_deref(), Some("exact-turn"));
+        assert_eq!(interrupt.generation, 7);
+        assert_eq!(interrupt.command_id, "stop-1");
+        assert!(interrupt.request_id.is_none());
+        stop.force = true;
+        assert!(stop.interrupt().is_none());
+        stop.force = false;
+        stop.turn_id = None;
+        assert!(stop.interrupt().is_none());
+    }
 
     #[tokio::test]
     async fn owner_closure_without_committed_tail_is_unknown() {

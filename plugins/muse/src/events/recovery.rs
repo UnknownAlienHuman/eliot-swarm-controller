@@ -1436,6 +1436,28 @@ mod tests {
     }
 
     #[test]
+    fn busy_stop_cancelled_frame_keeps_exact_turn_and_native_terminal() {
+        let events = vec![recovery_event(
+            "turn/completed",
+            json!({
+                "sessionId": "session-1", "turnId": "turn-1",
+                "viewCursor": "rev-9", "terminal": "cancelled",
+            }),
+        )];
+        let (scan, folded) = fold_recovery_all(&events, "session-1", "turn-1");
+        assert!(matches!(folded, RecoveryFold::Continue));
+        let terminal: NativeTurnCompletedNotification =
+            serde_json::from_value(scan.turn_params.unwrap()).unwrap();
+        assert_eq!(terminal.terminal, NativeTurnTerminal::Cancelled);
+        assert_eq!(
+            super::super::turn_outcome(&terminal.terminal),
+            Some("interrupted")
+        );
+        let (foreign, _) = fold_recovery_all(&events, "session-1", "other-turn");
+        assert!(foreign.turn_params.is_none());
+    }
+
+    #[test]
     fn recovery_fold_unknown_terminal_is_unproven() {
         // A wire-open terminal the adapter does not model can never prove
         // the turn: the unknown settlement below stays honest.

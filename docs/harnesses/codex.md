@@ -443,7 +443,7 @@ write. A lost Eliot event acknowledgement follows the common last-batch rule.
 | steer | `turn/steer` with `expectedTurnId`; stale turn rejects |
 | inject | next_input via the next SEND prepend; active_turn via `turn/steer` on the exact captured turn, mechanism `codex.turn/steer`; other points unsupported, never a weaker SEND |
 | interrupt | `turn/interrupt` for the captured turn; no blind retry |
-| stop | end this Agent's owned session/process |
+| stop | for a captured busy turn, send exact-thread/turn `turn/interrupt` once and wait up to the core stop interrupt bound for native `turn/completed`; only the terminal status proves interruption. Then end this Agent's owned session/process; missing evidence retains an unknown turn. Force skips the cooperative window |
 | resume | new Eliot generation/app-server plus `thread/resume` of retained thread; no old input replay |
 | approve/deny/answer | reply to the exact offered native request; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
 | configure | model and effort ride the per-turn `turn/start` fields (`TurnStartParams.model`/`effort`), resolved from the retained revision at send dispatch; the frozen snapshot never changes |

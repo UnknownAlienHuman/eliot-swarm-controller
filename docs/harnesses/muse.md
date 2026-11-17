@@ -57,7 +57,7 @@ native refusal alone does not prove a contract mismatch or an upstream failure.
 | launch/send | session/start then turn/start; readiness, input association and result separate |
 | steer/interrupt | steer is turn/steer with the exact expected turn; interrupt is turn/cancel on the exact turn (halt running, keep queue; turn/unqueue targets queued submits, never used here) |
 | inject | exact supported steer or explicit next-send prepend, mechanism reported; active_turn uses the actual turn/steer mechanism with the exact expected turn (`muse.turn/steer`), other points unsupported here |
-| stop/resume | clear/pause native Goal as necessary and close owned host; resume exact session without old input |
+| stop/resume | interrupt the captured busy turn and await native terminal evidence within the core bound, then clear/pause native Goal as necessary and close owned host; missing evidence retains an unknown turn; resume exact session without old input |
 | approve/deny/answer | exact session/child request id and offered choice/requirement; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
 | configure | effort rides per-turn `reasoningEffort` in `turn/start`, resolved from the retained revision at send dispatch; a model change needs a new native session and is refused as `unsupported` (the frozen snapshot never changes) |
 | goal | native set/edit/pause/resume/clear where installed schema supports them |
@@ -75,7 +75,11 @@ checkpoint authority. A successful read is a point-in-time observation, not a
 guarantee against a later vendor failure; an already admitted steer still keeps
 its honest applied/unknown result and is never retroactively called rejected.
 
-Owned-host stop drops MSP stdin before its graceful wait. One absolute stop RPC
+Busy stop first sends exact-session/turn `turn/cancel` once and waits up to the
+core stop interrupt bound for native `turn/completed` (`cancelled` maps to
+`interrupted`). Acceptance alone is not terminal evidence; missing evidence keeps
+the turn unknown. Force skips this cooperative window. After the window,
+owned-host stop drops MSP stdin before its graceful wait. One absolute stop RPC
 deadline bounds waits for control preparation, native exit/output drain, event
 settlement and the reply, with time reserved for ordered event acknowledgement and response.
 When stop preempts a snapshot, its deadline is captured before replying to the

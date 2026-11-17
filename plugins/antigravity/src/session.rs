@@ -1158,33 +1158,10 @@ impl Session {
         }
         // Re-check the exact turn under the same lock discipline as send:
         // a turn that ended since the first check was never interrupted.
-        let dispatched = {
-            let mut state = self.state.lock().await;
-            if state.active_turn() != Some(turn_id) {
-                return Err(Error::new(
-                    "stale_turn",
-                    "turn/interrupt does not match the exact active native turn",
-                ));
-            }
-            self.highwater_seq = seq;
-            // Hold the event lock across the write and latch: an ask queued
-            // during session/cancel must observe this exact-turn intent.
-            let dispatched = self
-                .client
-                .notify(
-                    "session/cancel",
-                    Some(json!({"sessionId": self.conversation})),
-                    Instant::now() + TIMEOUT,
-                )
-                .await;
-            if !matches!(&dispatched, Err(error) if native_no_write(&error.code)) {
-                state.latch_cancellation(&params.command_id, Some(turn_id));
-                state
-                    .answer_pending_cancelled(&self.client, &params.command_id, Some(turn_id))
-                    .await;
-            }
-            dispatched
-        };
+        self.highwater_seq = seq;
+        let dispatched = self
+            .cancel_turn(&params.command_id, turn_id, Instant::now() + TIMEOUT)
+            .await;
         let result = match dispatched {
             Ok(()) => {
                 // Per the ACP cancellation contract, answer every pending
@@ -1240,6 +1217,32 @@ impl Session {
             outcome: result.clone(),
         });
         result
+    }
+
+    async fn cancel_turn(&self, command_id: &str, turn_id: &str, until: Instant) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state.active_turn() != Some(turn_id) || state.source_unknown || state.batch_unknown {
+            return Err(Error::new(
+                "stale_turn",
+                "cancel does not match a healthy exact native turn",
+            ));
+        }
+        // Hold the event lock across write and latch so late asks observe intent.
+        let dispatched = self
+            .client
+            .notify(
+                "session/cancel",
+                Some(json!({"sessionId": self.conversation})),
+                until,
+            )
+            .await;
+        if !matches!(&dispatched, Err(error) if native_no_write(&error.code)) {
+            state.latch_cancellation(command_id, Some(turn_id));
+            state
+                .answer_pending_cancelled(&self.client, command_id, Some(turn_id))
+                .await;
+        }
+        dispatched
     }
 
     pub async fn snapshot(&self, params: AgentSnapshotParams) -> Result<Value> {
@@ -1344,6 +1347,30 @@ impl Session {
             params.force,
             Err(Error::new("unknown", "Antigravity stop is unresolved")),
         ));
+        if !params.force
+            && let Some(turn_id) = params.turn_id.as_deref()
+        {
+            let until = Instant::now() + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT;
+            let _ = timeout_at(until, async {
+                let _ = self.cancel_turn(&params.command_id, turn_id, until).await;
+                loop {
+                    let terminal = {
+                        let state = self.state.lock().await;
+                        !state.source_unknown
+                            && !state.batch_unknown
+                            && state
+                                .last_turn
+                                .as_ref()
+                                .is_some_and(|turn| turn.turn_id == turn_id && turn.terminal)
+                    };
+                    if terminal {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await;
+        }
         // Answer open permission asks `cancelled` best-effort, then close
         // whatever remains: the native session is ending, so no ask may
         // stay open behind it. Closing is not best-effort: every retained

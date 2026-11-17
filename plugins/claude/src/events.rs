@@ -212,7 +212,7 @@ struct PendingNativeRequest {
 fn claude_outcome(reason: &str) -> &'static str {
     match reason.trim() {
         "success" | "completed" => "success",
-        "cancelled" | "interrupted" => "interrupted",
+        "cancelled" | "interrupted" | "aborted_streaming" => "interrupted",
         "error" | "failed" | "failure" => "failure",
         reason => {
             let lower = reason.to_lowercase();
@@ -3433,6 +3433,46 @@ mod tests {
     use super::*;
     use eliot_plugin::Peer;
 
+    #[tokio::test]
+    async fn busy_stop_native_cancel_commits_exact_interrupted_turn() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (host_io, plugin_io) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(plugin_io);
+        let mut peer = eliot_plugin::Peer::from_io(read, write);
+        let client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let mut processor = ready_processor();
+        processor.host = client.clone();
+        processor.sink = eliot_plugin::CommitSink::new(client, "test-credential".to_owned());
+        processor.status.active_command_id = Some("send-1".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        let frame = serde_json::json!({"type":"command_lifecycle","command_uuid":"turn-1","state":"cancelled"});
+        let terminal = processor.observe_lifecycle(&frame);
+        let (read, mut write) = tokio::io::split(host_io);
+        let (result, ()) = tokio::join!(terminal, async {
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, "events.put");
+            let event = &request.params["events"][0];
+            assert_eq!(event["kind"], "turn.completed");
+            assert_eq!(event["data"]["turn_id"], "turn-1");
+            assert_eq!(event["data"]["command_id"], "send-1");
+            assert_eq!(event["data"]["outcome"], "interrupted");
+            let response = serde_json::json!({"jsonrpc":"2.0","id":request.id,"result":{"first_seq":1,"last_seq":1,"cursor":null}});
+            write
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        result.unwrap();
+        assert!(processor.status.active_turn_id.is_none());
+        assert!(processor.status.last_turn.as_ref().unwrap().terminal);
+        assert!(!processor.status.source_unknown);
+        peer_task.abort();
+    }
+
     fn ready_processor() -> EventProcessor {
         // The writer task pends unwritten; registration and cancel never
         // touch the host, so no fixture I/O is needed.
@@ -3460,6 +3500,9 @@ mod tests {
         assert_eq!(claude_outcome("completed"), "success");
         assert_eq!(claude_outcome("cancelled"), "interrupted");
         assert_eq!(claude_outcome("interrupted"), "interrupted");
+        // Installed 2.1.325 busy-stop capture, 2026-11-17: native result
+        // terminal_reason after an acknowledged interrupt control.
+        assert_eq!(claude_outcome("aborted_streaming"), "interrupted");
         for reason in [
             "api_error",
             "api_error_rate_limited",
@@ -3688,6 +3731,15 @@ mod tests {
         assert_eq!(usage.cache_write_tokens, Some(11995));
         assert_eq!(usage.scope.as_deref(), Some("main_loop_turn"));
         assert!(result_session_usage(&record).is_some());
+        // Native 2.1.325 busy-stop terminal, captured 2026-11-17. A control
+        // ack alone cannot establish this; the result carries the abort.
+        let mut aborted = record;
+        aborted["terminal_reason"] = json!("aborted_streaming");
+        let parsed: ResultRecord = serde_json::from_value(aborted).unwrap();
+        let (outcome, native_status) =
+            terminal_outcome_and_status(&parsed.terminal_reason, &plain, None);
+        assert_eq!(outcome, "interrupted");
+        assert_eq!(native_status, "aborted_streaming");
     }
 
     #[tokio::test]

@@ -165,7 +165,12 @@ that settlement and snapshots, never through the interrupt ack. The
 wait polls the shared turn state without holding its lock and performs
 no callback work while holding it.
 
-Stop sends a best-effort `session/close` for the retained session, then
+Busy stop first sends `session/cancel` once for its captured exact active turn,
+answers that turn's pending permission asks as cancelled, and waits up to the
+core stop interrupt bound for the fenced `session/prompt` terminal response.
+Only native `stopReason: cancelled` proves interruption; other terminal reasons
+keep their actual outcome, and missing evidence leaves the turn unknown.
+Force skips this window. Stop then sends best-effort `session/close` for the retained session, then
 closes stdin and drains stdout before settling the session; force targets
 only owned custody. Resume creates a new Agent generation loading the
 exact retained session id, without replaying the old prompt. Connected
