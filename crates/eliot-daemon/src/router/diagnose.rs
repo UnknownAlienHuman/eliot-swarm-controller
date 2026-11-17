@@ -200,6 +200,30 @@ impl Router {
         }];
         let mut preceded_by = None;
         let mut commands = std::collections::HashSet::new();
+        let mut unresolved = Vec::new();
+        if row.is_terminal() {
+            let (command, turn) = store.agent_unknowns(agent)?;
+            if let Some(command) = command {
+                unresolved.push(format!("unknown command {} (generation {}); resolve with swarm cmd resolve using an exact Owner assertion",
+                    command.id, command.generation.map_or_else(|| "unassigned".to_owned(), |g| g.to_string())));
+                commands.insert(command.id.clone());
+                let mut step = command_step(&command);
+                step.message = unresolved.last().cloned();
+                steps.push(step);
+            }
+            if let Some(turn) = turn {
+                unresolved.push(format!("unknown turn {} (generation {}); resolve with swarm turn resolve using an exact Owner assertion",
+                    turn.turn_id, turn.generation));
+                let mut step = turn_step(
+                    &turn,
+                    store
+                        .turn_terminal_event(agent, turn.generation, &turn.turn_id)?
+                        .as_ref(),
+                );
+                step.message = unresolved.last().cloned();
+                steps.push(step);
+            }
+        }
         if let Some(command) = store.generation_start_command(agent, generation)? {
             commands.insert(command.id.clone());
             if command.state != eliot_core::CommandState::Applied {
@@ -256,7 +280,18 @@ impl Router {
         let origin = chain_origin(&steps);
         Ok(DiagnoseResponse {
             target: target.to_owned(),
-            summary: summary_for(target, &steps, "agent"),
+            summary: if unresolved.is_empty() {
+                summary_for(target, &steps, "agent")
+            } else {
+                bound_chars(
+                    &format!(
+                        "{target} is {}; retained {}",
+                        eliot_core::api::agent_state_name(row.state),
+                        unresolved.join("; ")
+                    ),
+                    MAX_DIAGNOSE_SUMMARY_CHARS,
+                )
+            },
             previous_crash: if healthy_agent(&steps) {
                 None
             } else {
@@ -368,7 +403,13 @@ fn turn_step(turn: &Turn, terminal: Option<&Event>) -> DiagnoseStep {
         code: terminal
             .and_then(|event| event.data.get("native_error")?.get("code")?.as_str())
             .map(|code| bound_chars(code, 128))
-            .or_else(|| turn.outcome.map(|outcome| outcome.as_str().to_owned())),
+            .or_else(|| {
+                if turn.state == eliot_core::TurnState::Unknown {
+                    Some("unknown".to_owned())
+                } else {
+                    turn.outcome.map(|outcome| outcome.as_str().to_owned())
+                }
+            }),
         message,
         failure_where: terminal
             .and_then(|event| event.data.get("where")?.as_str())
@@ -631,6 +672,49 @@ mod tests {
                 .code,
             "not_allowed"
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_diagnosis_names_retained_unknown_command_and_owner_resolution() {
+        let router = test_router().await;
+        let (agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            let id = ulid::Ulid::new().to_string();
+            let mut launch = SubmitCommand::new(id.clone(), "launch");
+            launch.args = json!({"project":"why-unknown", "workspace":"synthetic-workspace",
+                "harness":"codex", "profile":"codex-fixture", "profile_snapshot":{}});
+            launch.expected_generation = Some(0);
+            let agent = store
+                .submit("owner", launch, now_ms())
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            store.dispatch(&id, now_ms()).unwrap();
+            store
+                .settle(&id, CommandState::Unknown, None, now_ms())
+                .unwrap();
+            store.mark_lost(&agent, 1, now_ms()).unwrap();
+            (agent, id)
+        };
+        let value = router
+            .diagnose(&json!({"target":agent}), &Principal::Owner)
+            .await
+            .unwrap();
+        let response: DiagnoseResponse = serde_json::from_value(value).unwrap();
+        assert!(response.summary.contains(&send_id));
+        assert!(response.summary.contains("exact Owner assertion"));
+        let unknown = response
+            .steps
+            .iter()
+            .find(|step| {
+                step.message
+                    .as_ref()
+                    .is_some_and(|text| text.contains(&send_id))
+            })
+            .unwrap();
+        assert!(unknown.user_message().contains("swarm cmd resolve"));
+        response.validate().unwrap();
     }
 
     #[tokio::test]

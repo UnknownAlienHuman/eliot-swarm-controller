@@ -83,7 +83,10 @@ impl StopDeadlines {
     fn new(now: Instant) -> Self {
         let queued_until = now + RPC_DEADLINE;
         // agent.stop + shutdown; the force snapshot fits the second RPC window.
-        let rpc_until = queued_until + RPC_DEADLINE + RPC_DEADLINE;
+        let rpc_until = queued_until
+            + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT
+            + RPC_DEADLINE
+            + RPC_DEADLINE;
         // close_input, then two attempts, each with leader and family waits.
         let custody_until = rpc_until + STOP_GRACE + (STOP_GRACE + STOP_GRACE) * 2;
         // Callback drain/abort-join and one bounded Store settlement.
@@ -210,6 +213,7 @@ enum RuntimeMessage {
     },
     Stop {
         command: Command,
+        turn_id: Option<String>,
         force: bool,
         deadlines: StopDeadlines,
         reply: oneshot::Sender<Result<Value>>,
@@ -876,6 +880,7 @@ impl PluginHost {
             &sender,
             RuntimeMessage::Stop {
                 command,
+                turn_id: agent.active_turn.clone(),
                 force,
                 deadlines,
                 reply,
@@ -2753,7 +2758,12 @@ fn prepare_queued_stop_call(
             "stop queue deadline elapsed before native dispatch",
         ));
     }
-    Ok(client.call("agent.stop", params, deadlines.rpc_deadline(RPC_DEADLINE)))
+    Ok(client.call(
+        "agent.stop",
+        params,
+        deadlines
+            .rpc_deadline(RPC_DEADLINE + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT),
+    ))
 }
 
 async fn wait_child(
@@ -5280,7 +5290,9 @@ mod tests {
         let now = Instant::now();
         let deadlines = StopDeadlines::new(now);
         assert_eq!(deadlines.queued_until - now, RPC_DEADLINE);
-        let second_rpc_starts = deadlines.queued_until + RPC_DEADLINE;
+        let second_rpc_starts = deadlines.queued_until
+            + RPC_DEADLINE
+            + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT;
         assert_eq!(
             deadlines.rpc_deadline_at(second_rpc_starts, RPC_DEADLINE),
             deadlines.rpc_until
@@ -5360,6 +5372,7 @@ mod tests {
             &sender,
             RuntimeMessage::Stop {
                 command: command.clone(),
+                turn_id: None,
                 force: true,
                 deadlines,
                 reply,
@@ -5390,6 +5403,7 @@ mod tests {
             &sender,
             RuntimeMessage::Stop {
                 command,
+                turn_id: None,
                 force: true,
                 deadlines,
                 reply,

@@ -3,6 +3,30 @@ use super::*;
 use eliot_core::api::AgentTreeResponse;
 
 impl Store {
+    /// First retained unknown of each kind across all generations. Lifecycle
+    /// deletion checks historical work too; diagnosis must use the same scope,
+    /// independent of its bounded recent-turn page.
+    pub fn agent_unknowns(&self, agent: &str) -> Result<(Option<Command>, Option<Turn>)> {
+        let num = parse_agent_id(agent)?;
+        let command: Option<String> = self.connection.query_row(
+            "SELECT id FROM commands WHERE target=?1 AND state='unknown' ORDER BY created_at,id LIMIT 1",
+            [num], |row| row.get(0),
+        ).optional().map_err(sql_error)?;
+        let turn: Option<(i64, String)> = self.connection.query_row(
+            "SELECT generation,turn_id FROM turns WHERE agent=?1 AND state='unknown' ORDER BY generation,turn_id LIMIT 1",
+            [num], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(sql_error)?;
+        Ok((
+            command
+                .map(|id| self.get_command(&id))
+                .transpose()?
+                .flatten(),
+            turn.map(|(generation, id)| self.get_turn(agent, generation, &id))
+                .transpose()?
+                .flatten(),
+        ))
+    }
+
     pub fn change_agent_tree(
         &mut self,
         id: &str,
@@ -358,6 +382,11 @@ mod tests {
         let now = ulid::Ulid::new().timestamp_ms() as i64;
         store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('','muse','p','stopped',2,?1,?1)", [now]).unwrap();
         store.connection.execute("INSERT INTO turns(agent,generation,turn_id,state,started_at,completed_at) VALUES (1,1,'retained-turn','unknown',?1,?1)", [now]).unwrap();
+        let (command, turn) = store.agent_unknowns("a1").unwrap();
+        assert!(command.is_none());
+        let turn = turn.unwrap();
+        assert_eq!(turn.generation, 1);
+        assert_eq!(turn.turn_id, "retained-turn");
         for archived in [None, Some(true)] {
             let before = store.connection.total_changes();
             let error = store

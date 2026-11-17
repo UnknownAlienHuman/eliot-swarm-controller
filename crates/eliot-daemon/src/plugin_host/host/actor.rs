@@ -443,12 +443,13 @@ pub(super) async fn run_agent_inner(
                             ));
                         }
                     }
-                    RuntimeMessage::Stop { command, force, deadlines, reply } => {
+                    RuntimeMessage::Stop { command, turn_id, force, deadlines, reply } => {
                         let params = json!({
                             "agent_id": agent.id,
                             "generation": agent.generation,
                             "command_id": command.id,
                             "force": force,
+                            "turn_id": turn_id,
                         });
                         let stop_call = match prepare_queued_stop_call(&client, params, deadlines) {
                             Ok(call) => call,
