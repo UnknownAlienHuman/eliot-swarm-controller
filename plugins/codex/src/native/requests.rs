@@ -448,7 +448,7 @@ pub(crate) fn public_request_view(request: &CorePending) -> Result<(String, Valu
                             },
                         })
                         .collect::<Vec<_>>();
-                    let kind = if options.is_empty() || question.is_other {
+                    let kind = if options.is_empty() {
                         QuestionKind::Text
                     } else {
                         QuestionKind::Single
@@ -520,4 +520,44 @@ fn approval_summary(kind: &str, details: &Map<String, Value>) -> String {
         summary.push_str(reason);
     }
     summary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn other_with_options_remains_a_single_choice_question() {
+        let request = CorePending {
+            id: "request-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            kind: "user_input".to_owned(),
+            details: json!({
+                "questions": [{
+                    "id": "choice",
+                    "header": "Pick one",
+                    "question": "Which option?",
+                    "is_other": true,
+                    "options": [
+                        {"label": "A", "description": "First"},
+                        {"label": "B", "description": "Second"}
+                    ]
+                }]
+            }),
+        };
+
+        let (kind, details) = public_request_view(&request).unwrap();
+        let public: QuestionRequest = serde_json::from_value(details).unwrap();
+        assert_eq!(kind, "question");
+        assert_eq!(public.questions[0].kind, QuestionKind::Single);
+        assert!(public.questions[0].free_entry);
+        assert_eq!(
+            public.questions[0]
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+    }
 }
