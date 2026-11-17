@@ -361,16 +361,12 @@ impl Plugin {
         let environment = crate::profile::reader_environment(snapshot)?;
         // The catalogue errors are static typed strings (stderr is discarded,
         // like every other helper), so there is no native text to redact.
-        let ids = crate::native::run_models(
+        let models = crate::native::run_models(
             std::ffi::OsStr::new(program),
             &environment.variables,
             Instant::now() + crate::native::MODELS_TIMEOUT,
         )
         .await?;
-        let models: Vec<Value> = ids
-            .into_iter()
-            .map(|id| json!({"id": id, "default": false}))
-            .collect();
         Ok(json!({"models": models, "default": Value::Null}))
     }
 

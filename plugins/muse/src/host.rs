@@ -2224,6 +2224,7 @@ impl MusePlugin {
                     };
                     json!({
                         "id": entry.model_id,
+                        "display_name": entry.display_label.as_deref().and_then(eliot_core::api::harness::native_model_display_name),
                         "default": false,
                         "efforts": efforts,
                     })

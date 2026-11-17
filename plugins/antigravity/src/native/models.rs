@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use eliot_core::api::{HarnessModelEntry, harness::native_model_display_name};
 use eliot_core::{Error, Result};
 use tokio::{
     io::AsyncReadExt,
@@ -43,15 +44,15 @@ pub(crate) const MAX_MODEL_ID_BYTES: usize = 256;
 /// Grace for reaping a catalogue child after the kill signal.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
-/// Run the frozen native exe with exact argv `models` and return its ids
-/// verbatim, in wire order. Bounded by `deadline` and [`MAX_MODELS_BYTES`];
+/// Run the frozen native exe with exact argv `models` and return its entries
+/// in wire order. Bounded by `deadline` and [`MAX_MODELS_BYTES`];
 /// stderr is discarded like every other helper, so failures are static typed
 /// strings naming the `models` surface, never native text.
 pub(crate) async fn run_models(
     program: &OsStr,
     environment: &[(OsString, OsString)],
     deadline: Instant,
-) -> Result<Vec<String>> {
+) -> Result<Vec<HarnessModelEntry>> {
     let mut command = Command::new(program);
     command
         .args(models_argv())
@@ -128,18 +129,15 @@ pub(crate) async fn run_models(
 }
 
 /// Parse `agy models` stdout verbatim: one `<id>\t<display name>` line per
-/// model. Ids keep their exact bytes (a trailing `\r` is a line ending, not
-/// part of the id); blank lines and tab-free status lines (the observed
-/// `Fetching available models...` progress note) are skipped, never
-/// interpreted. Anything else malformed fails the read instead of guessed.
-pub(crate) fn parse_models_output(text: &str) -> Result<Vec<String>> {
-    let mut ids = Vec::new();
+/// model. Blank lines and tab-free status lines are skipped. Malformed ids
+/// fail the read and unusable display names are omitted.
+pub(crate) fn parse_models_output(text: &str) -> Result<Vec<HarnessModelEntry>> {
+    let mut models = Vec::new();
     for line in text.lines() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
         if line.trim().is_empty() {
             continue;
         }
-        let Some((id, _)) = line.split_once('\t') else {
+        let Some((id, name)) = line.split_once('\t') else {
             continue;
         };
         if id.is_empty()
@@ -152,15 +150,22 @@ pub(crate) fn parse_models_output(text: &str) -> Result<Vec<String>> {
                 "Antigravity models catalogue is malformed",
             ));
         }
-        ids.push(id.to_owned());
-        if ids.len() > MAX_MODELS {
+        models.push(HarnessModelEntry {
+            id: id.to_owned(),
+            display_name: native_model_display_name(name).map(str::to_owned),
+            default: false,
+            efforts: None,
+            default_effort: None,
+            source: None,
+        });
+        if models.len() > MAX_MODELS {
             return Err(Error::new(
                 "source_integrity",
                 "Antigravity models catalogue exceeds 1024 entries",
             ));
         }
     }
-    Ok(ids)
+    Ok(models)
 }
 
 async fn kill_and_reap(child: &mut tokio::process::Child) -> bool {
@@ -186,10 +191,13 @@ mod tests {
         gpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
 
     #[test]
-    fn recorded_catalogue_parses_ids_verbatim() {
-        let ids = parse_models_output(RECORDED).expect("recorded output parses");
+    fn recorded_catalogue_parses_ids_and_names_verbatim() {
+        let models = parse_models_output(RECORDED).expect("recorded output parses");
         assert_eq!(
-            ids,
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "gemini-4-argon-medium",
                 "gemini-4-hydrogen-xhigh",
@@ -197,15 +205,35 @@ mod tests {
                 "gpt-oss-120b-medium",
             ]
         );
+        assert_eq!(
+            models[0].display_name.as_deref(),
+            Some("Gemini 4 Argon (Medium)")
+        );
+        assert_eq!(
+            models[2].display_name.as_deref(),
+            Some("Orchestrator (Argon)")
+        );
     }
 
     #[test]
     fn status_and_blank_lines_are_skipped_crlf_tolerated() {
-        let ids = parse_models_output(
+        let models = parse_models_output(
             "Fetching available models...\n\n  \ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\r\n",
         )
         .expect("status lines are skipped");
-        assert_eq!(ids, vec!["gemini-3.8-flash-high"]);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemini-3.8-flash-high");
+        assert_eq!(
+            models[0].display_name.as_deref(),
+            Some("Gemini 3.8 Flash (High)")
+        );
+    }
+
+    #[test]
+    fn invalid_names_leave_the_model_id_usable() {
+        let models = parse_models_output("model\tName\twith a control\n").unwrap();
+        assert_eq!(models[0].display_name, None);
+        assert_eq!(models[0].id, "model");
     }
 
     #[test]
@@ -229,13 +257,11 @@ mod tests {
 
     #[test]
     fn empty_catalogue_reads_empty_without_inference() {
-        assert_eq!(
-            parse_models_output("").expect("empty parses"),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            parse_models_output("Fetching available models...\n").expect("status only parses"),
-            Vec::<String>::new()
+        assert!(parse_models_output("").expect("empty parses").is_empty());
+        assert!(
+            parse_models_output("Fetching available models...\n")
+                .expect("status only parses")
+                .is_empty()
         );
     }
 }
