@@ -1070,6 +1070,13 @@ says that nothing has failed in that recent history; it carries no unrelated
 previous-crash marker. Unknown origin remains for unexplained failures or
 unknown outcomes. A terminal's typed `native_error.code` (for example
 `quota_exhausted`) and native quota reset hint are included in its turn step.
+For an Agent in any lifecycle state, diagnosis also lists retained unknown commands
+and turns from any generation, appending `; retained ...` to the usual summary
+within its length bound. The summary keeps its origin-first explanation. The
+retained details name the exact command or turn and generation and the exact Owner
+assertion through `swarm cmd resolve` or `swarm turn resolve` that can settle it.
+Observe-only commands are not Owner-resolvable; their details say they remain
+retained for the record instead of recommending `swarm cmd resolve`.
 At most 16 steps;
 no new store, only existing event and record readbacks.
 

@@ -201,28 +201,25 @@ impl Router {
         let mut preceded_by = None;
         let mut commands = std::collections::HashSet::new();
         let mut unresolved = Vec::new();
-        if row.is_terminal() {
-            let (command, turn) = store.agent_unknowns(agent)?;
-            if let Some(command) = command {
-                unresolved.push(format!("unknown command {} (generation {}); resolve with swarm cmd resolve using an exact Owner assertion",
-                    command.id, command.generation.map_or_else(|| "unassigned".to_owned(), |g| g.to_string())));
-                commands.insert(command.id.clone());
-                let mut step = command_step(&command);
-                step.message = unresolved.last().cloned();
-                steps.push(step);
-            }
-            if let Some(turn) = turn {
-                unresolved.push(format!("unknown turn {} (generation {}); resolve with swarm turn resolve using an exact Owner assertion",
-                    turn.turn_id, turn.generation));
-                let mut step = turn_step(
-                    &turn,
-                    store
-                        .turn_terminal_event(agent, turn.generation, &turn.turn_id)?
-                        .as_ref(),
-                );
-                step.message = unresolved.last().cloned();
-                steps.push(step);
-            }
+        let (command, turn) = store.agent_unknowns(agent)?;
+        if let Some(command) = command {
+            unresolved.push(unknown_command_message(&command, row.observe_only));
+            commands.insert(command.id.clone());
+            let mut step = command_step(&command);
+            step.message = unresolved.last().cloned();
+            steps.push(step);
+        }
+        if let Some(turn) = turn {
+            unresolved.push(format!("unknown turn {} (generation {}); resolve with swarm turn resolve using an exact Owner assertion",
+                turn.turn_id, turn.generation));
+            let mut step = turn_step(
+                &turn,
+                store
+                    .turn_terminal_event(agent, turn.generation, &turn.turn_id)?
+                    .as_ref(),
+            );
+            step.message = unresolved.last().cloned();
+            steps.push(step);
         }
         if let Some(command) = store.generation_start_command(agent, generation)? {
             commands.insert(command.id.clone());
@@ -280,18 +277,7 @@ impl Router {
         let origin = chain_origin(&steps);
         Ok(DiagnoseResponse {
             target: target.to_owned(),
-            summary: if unresolved.is_empty() {
-                summary_for(target, &steps, "agent")
-            } else {
-                bound_chars(
-                    &format!(
-                        "{target} is {}; retained {}",
-                        eliot_core::api::agent_state_name(row.state),
-                        unresolved.join("; ")
-                    ),
-                    MAX_DIAGNOSE_SUMMARY_CHARS,
-                )
-            },
+            summary: append_retained(&summary_for(target, &steps, "agent"), &unresolved),
             previous_crash: if healthy_agent(&steps) {
                 None
             } else {
@@ -301,6 +287,38 @@ impl Router {
             preceded_by,
         })
     }
+}
+
+fn append_retained(summary: &str, unresolved: &[String]) -> String {
+    if unresolved.is_empty() {
+        return summary.to_owned();
+    }
+    // Reserve a prefix for the origin and target even when retained details
+    // are long, then bound the failure message to leave space for the suffix.
+    let retained = bound_chars(
+        &format!("; retained {}", unresolved.join("; ")),
+        MAX_DIAGNOSE_SUMMARY_CHARS * 3 / 4,
+    );
+    let prefix = bound_chars(
+        summary,
+        MAX_DIAGNOSE_SUMMARY_CHARS - retained.chars().count(),
+    );
+    format!("{prefix}{retained}")
+}
+
+fn unknown_command_message(command: &Command, observe_only: bool) -> String {
+    let resolution = if observe_only {
+        "not Owner-resolvable: observe-only commands remain retained for the record"
+    } else {
+        "resolve with swarm cmd resolve using an exact Owner assertion"
+    };
+    format!(
+        "unknown command {} (generation {}); {resolution}",
+        command.id,
+        command
+            .generation
+            .map_or_else(|| "unassigned".to_owned(), |g| g.to_string())
+    )
 }
 
 /// The previous-run crash marker only when the chain leaves the
@@ -572,6 +590,24 @@ mod tests {
     use eliot_core::{CommandState, NativeEvent, SourceBatch, SubmitCommand};
     use serde_json::json;
 
+    #[test]
+    fn long_origin_summary_keeps_retained_work_within_character_bound() {
+        let summary = bound_chars(
+            &format!(
+                "provider origin: a1 quota_exhausted at provider.request: {}",
+                "λ".repeat(1024)
+            ),
+            MAX_DIAGNOSE_SUMMARY_CHARS,
+        );
+        let retained = vec!["unknown command command-1 (generation 1); resolve with swarm cmd resolve using an exact Owner assertion".into(),
+            "unknown turn turn-1 (generation 1); resolve with swarm turn resolve using an exact Owner assertion".into()];
+        let combined = append_retained(&summary, &retained);
+        assert!(combined.starts_with("provider origin:"));
+        assert!(combined.contains("; retained unknown command command-1"));
+        assert!(combined.contains("unknown turn turn-1"));
+        assert!(combined.chars().count() <= MAX_DIAGNOSE_SUMMARY_CHARS);
+    }
+
     fn failed_send_fixture(store: &mut eliot_store::Store) -> (String, String, String) {
         let now = now_ms();
         let launch_id = ulid::Ulid::new().to_string();
@@ -636,6 +672,74 @@ mod tests {
         )
     }
 
+    fn unknown_work_fixture(store: &mut eliot_store::Store) -> (String, String) {
+        let id = ulid::Ulid::new().to_string();
+        let mut launch = SubmitCommand::new(id.clone(), "launch");
+        launch.args = json!({"project":"why-unknown", "workspace":"synthetic-workspace",
+            "harness":"codex", "profile":"codex-fixture", "profile_snapshot":{}});
+        launch.expected_generation = Some(0);
+        let agent = store
+            .submit("owner", launch, now_ms())
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&id, now_ms()).unwrap();
+        let plan = ["session", "turn", "message", "tool", "request"]
+            .into_iter()
+            .map(|family| (family.to_owned(), "stream".to_owned()))
+            .collect();
+        store
+            .install_plugin_sources(&agent, 1, &id, &plan, now_ms())
+            .unwrap();
+        store.put_batch(SourceBatch {batch_id:"ready-1".into(), agent_id:agent.clone(), generation:1,
+            source:"stream".into(), cursor:None, events:vec![NativeEvent {ts:None,
+                kind:"session.ready".into(), native_id:"ready-1".into(),
+                data:json!({"command_id":id, "native_scope":"test-scope", "native_ref":"test-ref"})}]}, now_ms()).unwrap();
+        store
+            .settle(&id, CommandState::Applied, None, now_ms())
+            .unwrap();
+        let id = ulid::Ulid::new().to_string();
+        let mut send = SubmitCommand::new(id.clone(), "send");
+        send.target = Some(agent.clone());
+        send.expected_generation = Some(1);
+        send.args = json!({"text":"hello"});
+        store.submit("owner", send, now_ms()).unwrap();
+        store.dispatch(&id, now_ms()).unwrap();
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: "started-1".into(),
+                    agent_id: agent.clone(),
+                    generation: 1,
+                    source: "stream".into(),
+                    cursor: None,
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "turn.started".into(),
+                        native_id: "started-1".into(),
+                        data: json!({"command_id":id, "turn_id":"turn-1"}),
+                    }],
+                },
+                now_ms(),
+            )
+            .unwrap();
+        // Association applies send. A separately dispatched interrupt may still
+        // be unknown when that generation is lost.
+        let id = ulid::Ulid::new().to_string();
+        let mut interrupt = SubmitCommand::new(id.clone(), "interrupt");
+        interrupt.target = Some(agent.clone());
+        interrupt.expected_generation = Some(1);
+        interrupt.expected_turn_id = Some("turn-1".into());
+        store.submit("owner", interrupt, now_ms()).unwrap();
+        store.dispatch(&id, now_ms()).unwrap();
+        store
+            .settle(&id, CommandState::Unknown, None, now_ms())
+            .unwrap();
+        store.mark_lost(&agent, 1, now_ms()).unwrap();
+        (agent, id)
+    }
+
     #[tokio::test]
     async fn failed_launch_agent_includes_exact_command_without_a_turn() {
         let router = test_router().await;
@@ -692,7 +796,7 @@ mod tests {
                 .unwrap();
             store.dispatch(&id, now_ms()).unwrap();
             store
-                .settle(&id, CommandState::Unknown, None, now_ms())
+                .settle(&id, CommandState::Unknown, Some(json!({"code":"unknown", "origin":"swarm", "where":"daemon.restart", "message":"restart lost the native readback"})), now_ms())
                 .unwrap();
             store.mark_lost(&agent, 1, now_ms()).unwrap();
             (agent, id)
@@ -703,6 +807,16 @@ mod tests {
             .unwrap();
         let response: DiagnoseResponse = serde_json::from_value(value).unwrap();
         assert!(response.summary.contains(&send_id));
+        assert!(
+            response.summary.starts_with("swarm origin:"),
+            "{}",
+            response.summary
+        );
+        assert!(
+            response.summary.contains("; retained "),
+            "{}",
+            response.summary
+        );
         assert!(response.summary.contains("exact Owner assertion"));
         let unknown = response
             .steps
@@ -714,6 +828,69 @@ mod tests {
             })
             .unwrap();
         assert!(unknown.user_message().contains("swarm cmd resolve"));
+        response.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn observe_only_unknown_command_does_not_suggest_owner_resolution() {
+        let router = test_router().await;
+        let mut store = router.inner.store.lock().await;
+        let (_, id) = unknown_work_fixture(&mut store);
+        let command = store.get_command(&id).unwrap().unwrap();
+        let message = unknown_command_message(&command, true);
+        assert!(message.contains(&id));
+        assert!(message.contains("observe-only"));
+        assert!(!message.contains("swarm cmd resolve"));
+    }
+
+    #[tokio::test]
+    async fn idle_diagnosis_names_unknown_work_from_an_earlier_generation() {
+        let router = test_router().await;
+        let (agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, send_id) = unknown_work_fixture(&mut store);
+            // Store-only fixture: there is no native process to retain custody.
+            store.close_native_sources(&agent, 1, now_ms()).unwrap();
+            store
+                .release_restart_closed_generation(&agent, 1, "store_only_fixture", false, now_ms())
+                .unwrap();
+            let id = ulid::Ulid::new().to_string();
+            let mut resume = SubmitCommand::new(id.clone(), "resume");
+            resume.target = Some(agent.clone());
+            resume.expected_generation = Some(1);
+            store.submit("owner", resume, now_ms()).unwrap();
+            store.dispatch(&id, now_ms()).unwrap();
+            let plan = ["session", "turn", "message", "tool", "request"]
+                .into_iter()
+                .map(|family| (family.to_owned(), "stream".to_owned()))
+                .collect();
+            store
+                .install_plugin_sources(&agent, 2, &id, &plan, now_ms())
+                .unwrap();
+            store.put_batch(SourceBatch {batch_id:"ready-2".into(), agent_id:agent.clone(), generation:2,
+                source:"stream".into(), cursor:None, events:vec![NativeEvent {ts:None,
+                    kind:"session.ready".into(), native_id:"ready-2".into(), data:json!({"command_id":id, "native_scope":"test-scope", "native_ref":"test-ref"})}]}, now_ms()).unwrap();
+            store
+                .settle(&id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            assert_eq!(
+                store.get_agent(&agent).unwrap().unwrap().state,
+                eliot_core::AgentState::Idle
+            );
+            (agent, send_id)
+        };
+        let value = router
+            .diagnose(&json!({"target":agent}), &Principal::Owner)
+            .await
+            .unwrap();
+        let response: DiagnoseResponse = serde_json::from_value(value).unwrap();
+        assert!(response.summary.contains(&send_id), "{}", response.summary);
+        assert!(response.summary.contains("generation 1"));
+        assert!(response.steps.iter().any(|step| {
+            step.message
+                .as_deref()
+                .is_some_and(|text| text.contains("unknown turn turn-1 (generation 1)"))
+        }));
         response.validate().unwrap();
     }
 
