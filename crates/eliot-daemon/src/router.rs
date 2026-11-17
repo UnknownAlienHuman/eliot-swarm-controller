@@ -3359,24 +3359,7 @@ impl Router {
             // return it uncached so the next read tries again.
             Err(error) if error.code == "busy" => return Err(error),
             Err(error) => {
-                if harness == "muse" && error.code == "unsupported" {
-                    response.status = "unsupported".to_owned();
-                    response.note=Some("Installed Muse MSP exposes neither usage/read nor a retained subscription observation".to_owned());
-                } else {
-                    let origin = if error.origin == Some(eliot_core::FailureOrigin::Provider) {
-                        "provider"
-                    } else {
-                        "environment"
-                    };
-                    response.details = Some(
-                        json!({"state":"error","origin":origin,"error":"quota read failed; no values available"}),
-                    );
-                    response.note = Some(if error.code == "quota_unavailable" {
-                        error.message.chars().take(512).collect()
-                    } else {
-                        "Read-only native/provider quota unavailable; no inference or credential refresh attempted".to_owned()
-                    });
-                }
+                catalog::quota_read_error(&mut response, error);
             }
         }
         request.validate_response(&response)?;
@@ -4993,12 +4976,9 @@ impl Router {
                     .filter(|cause| !cause.trim().is_empty())
             })
             .unwrap_or_else(|| "unknown".to_owned());
-        if reason.len() > 128 {
-            reason.truncate(128);
-            while !reason.is_char_boundary(reason.len()) {
-                reason.pop();
-            }
-        }
+        // Floor to a character boundary first: the old truncate-then-fix-up
+        // ran after the panic. 'bound_chars' never splits UTF-8 mid-codepoint.
+        reason = eliot_core::bound_chars(&reason, 128);
         let resolvable = !agent.observe_only;
         let hint = if resolvable {
             "owner-resolvable with cmd resolve (command) or turn resolve (turn); retained for the record; use --force only for live work".to_owned()
@@ -7208,6 +7188,43 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn retained_unknown_reason_truncation_respects_char_boundary() {
+        let router = router();
+        let now = now_ms();
+        let attach_id = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, attach_id, detach_id) =
+                fenced_observer_attach(&mut store, "reason-scope", "reason-native", now);
+            close_and_settle_observer_detach(
+                &mut store,
+                &agent,
+                &detach_id,
+                "reason-scope",
+                "reason-native",
+                now,
+            );
+            // Byte 128 of the retained reason lands inside a Cyrillic char: the
+            // old byte 'truncate' panicked here (the boundary fix-up ran after
+            // truncation, too late).
+            let reason = format!("x{}", "ж".repeat(100));
+            store
+                .settle(
+                    &attach_id,
+                    CommandState::Unknown,
+                    Some(json!({"reason": reason})),
+                    now,
+                )
+                .expect("re-settle unknown with a long reason");
+            attach_id
+        };
+        let summary = router
+            .retained_unknown(&attach_id)
+            .await
+            .expect("retained unknown summary");
+        assert!(summary.reason.len() <= 128);
+        assert!(summary.reason.starts_with('x'));
+    }
     #[tokio::test]
     async fn public_emit_cannot_acquire_the_attention_binding() {
         let router = router();

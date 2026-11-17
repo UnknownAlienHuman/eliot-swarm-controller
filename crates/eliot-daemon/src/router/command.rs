@@ -24,6 +24,11 @@ use tokio::sync::{broadcast, oneshot, watch};
 
 pub(super) const CONTROLLED_PLUGIN_SOURCE: &str = "stream";
 
+/// Bounded pre-dispatch re-reads of one admitted command: a transient Store
+/// blip must not strand accepted work, but an unreadable command must never
+/// dispatch.
+const LOAD_COMMAND_READ_ATTEMPTS: usize = 3;
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ObserverCommandResult {
@@ -169,7 +174,14 @@ impl Router {
         id: &str,
         has_linked: bool,
     ) -> Option<PreparedCommand> {
-        let command = self.load_command_for_dispatch(id).await?;
+        let command = match self.load_command_for_dispatch(id).await {
+            Ok(Some(command)) => command,
+            Ok(None) => return None,
+            Err(error) => {
+                self.abandon_unreadable_command(id, &error).await;
+                return None;
+            }
+        };
         if command.verb == "inject" {
             // Queued inject points are durable pending context: only a
             // concrete next_input send or authenticated safe-point callback
@@ -204,14 +216,36 @@ impl Router {
         })
     }
 
-    /// Load the command to dispatch; a missing or unreadable command ends
-    /// silently because a retained/settled command cannot acquire new I/O.
-    async fn load_command_for_dispatch(&self, id: &str) -> Option<Command> {
-        let store = self.inner.store.lock().await;
-        match store.get_command(id) {
-            Ok(Some(command)) => Some(command),
-            _ => None,
+    /// Load the command to dispatch. A missing command ends silently because
+    /// a retained/settled command cannot acquire new I/O; a Store read
+    /// failure keeps its typed error for bounded recovery below. Nothing
+    /// dispatches on this path, so no external effect is uncertain.
+    async fn load_command_for_dispatch(&self, id: &str) -> Result<Option<Command>> {
+        for _ in 1..LOAD_COMMAND_READ_ATTEMPTS {
+            let store = self.inner.store.lock().await;
+            if let Ok(command) = store.get_command(id) {
+                return Ok(command);
+            }
         }
+        let store = self.inner.store.lock().await;
+        store.get_command(id)
+    }
+
+    /// A Store read failure before any dispatch keeps its typed error and
+    /// never dispatches: the command may still be accepted, so the worker
+    /// records the in-memory unknown cause (no Store write is assumed) and
+    /// signals progress. Recovery re-drives the still-accepted command once
+    /// the Store is readable; nothing here claims an external effect.
+    async fn abandon_unreadable_command(&self, id: &str, error: &Error) {
+        let error = self.sanitized_failure(error, "router.dispatch.load_command");
+        crate::logging::record(
+            &SecretPolicy::new(self.daemon_secrets()),
+            &error.code,
+            &[("command", id)],
+            Some(&error),
+        );
+        self.note_unknown_id(id, "store_command_read_unknown");
+        self.signal_progress();
     }
 
     /// Reject `run` commands outside owner/project authority and re-verify
@@ -2608,6 +2642,43 @@ mod tests {
             .unwrap();
         assert_eq!(rejected.data["outcome"], outcome);
         assert_eq!(command.generation, Some(0));
+    }
+
+    #[tokio::test]
+    async fn dispatch_store_read_error_marks_unknown_instead_of_dropping() {
+        use std::sync::Arc;
+        // File-backed Store so a second connection can break command reads
+        // the way a wedged SQLite file breaks production dispatch.
+        let dir = std::env::temp_dir().join("eliot-k94-dispatch-read");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("dispatch read fixture dir");
+        let db = dir.join("state.sqlite");
+        let id = Ulid::new().to_string();
+        let router = {
+            let mut store = eliot_store::Store::open(&db).expect("open fixture store");
+            let mut request = SubmitCommand::new(id.clone(), "launch");
+            request.args = json!({"harness":"codex","profile":"luna","project":"k94-regression","workspace":".","profile_snapshot":{"harness":"codex"}});
+            store
+                .submit("owner", request, now_ms())
+                .expect("admit launch");
+            super::super::Router::new(
+                dir.clone(),
+                "owner-credential".to_owned(),
+                Arc::new(tokio::sync::Mutex::new(store)),
+                crate::bus::Bus::new(16),
+            )
+        };
+        rusqlite::Connection::open(&db)
+            .expect("reopen fixture db")
+            .execute("DROP TABLE commands", ())
+            .expect("break command reads");
+        assert!(router.prepare_command_dispatch(&id, false).await.is_none());
+        assert!(router.unknown_ids().contains(&id));
+        assert_eq!(
+            router.unknown_cause(&id).as_deref(),
+            Some("store_command_read_unknown")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

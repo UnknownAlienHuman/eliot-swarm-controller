@@ -278,7 +278,6 @@ fn save_internal_locked(
         prepare_candidate(data_root, expected_revision, sections, policy)?;
     let original = original_file.as_deref().unwrap_or_default();
     let current_revision = original_file.as_deref().map(profiles_edit::revision_of);
-    store.reconcile_settings_history(current_revision.as_deref())?;
     let changed_sections = sections
         .keys()
         .copied()
@@ -299,6 +298,9 @@ fn save_internal_locked(
             history_revision: None,
         });
     }
+    // Reconcile crash-left pending history only on the mutating path: a
+    // validation-only dry run must leave prior save outcomes untouched.
+    store.reconcile_settings_history(current_revision.as_deref())?;
     commit_candidate_locked(
         data_root,
         store,
@@ -721,6 +723,44 @@ mod tests {
         assert!(spliced.starts_with("# preserve\n[daemon]\nattention_suspicion_secs = 900\n\n"));
         assert!(spliced.contains("[profiles.new]"));
         assert!(!spliced.contains("[profiles.old]"));
+    }
+
+    #[test]
+    fn dry_run_leaves_pending_history_untouched() {
+        let root = TestRoot::new();
+        let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        // A crash-left pending row: a previous save published metadata but
+        // the process died before the file write settled.
+        let pending_revision = "a".repeat(64);
+        let row = store
+            .prepare_settings_history(
+                None,
+                &pending_revision,
+                &[SettingsSection::Profiles],
+                "owner",
+                0,
+            )
+            .expect("prepare pending history");
+        assert!(row > 0);
+        let sections = BTreeMap::from([(SettingsSection::Profiles, profile_section("gpt-6-luna"))]);
+        let dry = save_internal(
+            &root.0,
+            &mut store,
+            None,
+            &sections,
+            SettingsAuthor::Owner(SettingsClientSource::Cli),
+            true,
+            &policy,
+        )
+        .expect("dry run validates");
+        assert!(!dry.saved);
+        let history = store.list_settings_history(100).expect("history");
+        assert_eq!(history.len(), 1);
+        assert!(
+            matches!(history[0].status, SettingsHistoryStatus::Pending),
+            "dry run must not reconcile prior history"
+        );
     }
 
     #[test]

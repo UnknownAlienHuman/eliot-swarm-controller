@@ -700,6 +700,10 @@ an unregistered Git checkout, S2 creates an entry through the settings writer,
 recorded as a machine change. Its profile allowlist is the existing profiles;
 its action allowlist grants ordinary launch/send only, without script/interpreter,
 Git fetch or additional automation authority. Existing registrations are preserved.
+Daemon startup performs no project discovery: a removed project stays removed
+across restarts, and no checkout is ever registered implicitly. Registration
+runs only through an explicit Owner open (`project.discover`), an Owner
+launch in the checkout, or the desktop's workspace checkout.
 `path` names the canonical
 Git checkout; `profiles` and `actions` are explicit allowlists over existing global
 profiles and implemented actions. Missing or empty allowlists deny all. Project
@@ -1295,7 +1299,10 @@ becomes implemented; absent later features return `unsupported`, not a hidden su
 `[daemon].chats_root` is an optional absolute local root (at most 4096 bytes),
 defaulting to `<user home>/Eliot/chats`. `settings.read` exposes the effective
 default, and `settings.save` replaces it with the daemon section. It must be outside
-the daemon data directory and cannot contain that directory. The daemon validates
+the daemon data directory, harness homes and user configuration roots, and cannot
+contain those roots. Before canonicalization or admission, every existing component
+of the supplied path is checked for links and Windows reparse points, including
+ancestors of a nonexistent suffix. The daemon validates
 private directory ownership, rejects links/reparse traversal and creates a new
 `aN` child exclusively for an Owner `launch` with `chat:true` and no workspace.
 Native stores and owner configuration are never created there by Eliot. Changing

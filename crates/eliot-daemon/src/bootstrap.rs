@@ -23,11 +23,16 @@ pub fn ensure_private_data_dir(path: impl AsRef<Path>) -> Result<PathBuf> {
 
 /// Seed installed native-default profiles and initial default/worker routes via
 /// the unified settings writer. Existing profile and routing choices survive.
+///
+/// Startup performs no project discovery: an automatic checkout
+/// registration here would resurrect a project the Owner removed on every
+/// restart. Explicit registration still runs through [`discover_project`]
+/// (an Owner open, an Owner launch workspace, or the desktop's workspace
+/// checkout).
 pub(crate) async fn ensure_hot_start(
     data_root: &Path,
     store: &Mutex<Store>,
     policy: &SecretPolicy,
-    cwd: Option<&Path>,
 ) -> Result<()> {
     {
         let needs = {
@@ -58,20 +63,6 @@ pub(crate) async fn ensure_hot_start(
         };
         let mut store = store.lock().await;
         ensure_bootstrap_settings(data_root, &mut store, policy, muse_cmd)?;
-    }
-    if let Some(cwd) = cwd
-        && let Some((checkout, common_dir)) = workspace_identity(cwd).await?
-    {
-        let existing_id = matching_project_id(data_root, &checkout, &common_dir).await?;
-        let mut store = store.lock().await;
-        let _ = ensure_project_identity(
-            data_root,
-            &mut store,
-            &checkout,
-            &common_dir,
-            existing_id.as_deref(),
-            policy,
-        )?;
     }
     Ok(())
 }
@@ -436,6 +427,102 @@ fn project_id(checkout: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_core::api::SettingsSection::Projects;
+
+    /// k97: every daemon start re-registered its startup checkout as a
+    /// project, resurrecting an Owner-removed project. Startup performs
+    /// no project discovery: explicit `project.discover` registers, and a
+    /// removal persists across restarts.
+    #[tokio::test]
+    async fn removed_project_stays_removed_across_hot_start() {
+        use crate::config::settings::{self, SettingsAuthor};
+        use eliot_core::api::SettingsClientSource;
+
+        let root =
+            std::env::temp_dir().join(format!("eliot-bootstrap-removed-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let checkout = root.join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&checkout)
+            .output()
+            .expect("start git init");
+        assert!(output.status.success(), "git init failed");
+        let policy = SecretPolicy::default();
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+
+        // A stored profile lets discovery register; a fresh root with no
+        // profiles registers nothing.
+        let mut sections = BTreeMap::new();
+        sections.insert(
+            eliot_core::api::SettingsSection::Profiles,
+            json!({"fixture": {"harness": "codex"}}),
+        );
+        settings::save_internal(
+            &root,
+            &mut store,
+            None,
+            &sections,
+            SettingsAuthor::Owner(SettingsClientSource::Cli),
+            false,
+            &policy,
+        )
+        .unwrap();
+
+        // Explicit discovery registers the checkout.
+        let guard = Mutex::new(store);
+        let response = discover_project(&root, &guard, &checkout, &policy)
+            .await
+            .unwrap();
+        assert!(
+            response.project.is_some(),
+            "explicit discovery registers the checkout"
+        );
+        let mut store = guard.into_inner();
+        let read = settings::read_internal(&root, &store, Some(&[Projects]), &policy).unwrap();
+        assert!(
+            read.sections
+                .get(&Projects)
+                .and_then(Value::as_object)
+                .is_some_and(|projects| !projects.is_empty()),
+            "explicit discovery registers before removal"
+        );
+
+        // Owner removal: the projects section loses the checkout and the
+        // Store reconciles to the same empty set.
+        let mut sections = BTreeMap::new();
+        sections.insert(Projects, json!({}));
+        settings::save_internal(
+            &root,
+            &mut store,
+            read.revision.as_deref(),
+            &sections,
+            SettingsAuthor::Owner(SettingsClientSource::Desktop),
+            false,
+            &policy,
+        )
+        .unwrap();
+        store
+            .reconcile_project_registrations("owner", &[], crate::common::now_ms())
+            .unwrap();
+
+        // A daemon restart must not resurrect the removed project, even
+        // with the checkout as its startup directory.
+        let guard = Mutex::new(store);
+        ensure_hot_start(&root, &guard, &policy).await.unwrap();
+        drop(guard);
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let read = settings::read_internal(&root, &store, Some(&[Projects]), &policy).unwrap();
+        assert!(
+            read.sections
+                .get(&Projects)
+                .and_then(Value::as_object)
+                .is_none_or(|projects| projects.is_empty()),
+            "a removed project stays removed across hot start"
+        );
+    }
 
     #[test]
     fn bootstrap_manager_prefers_deny_capable_harnesses() {

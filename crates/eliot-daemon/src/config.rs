@@ -88,13 +88,114 @@ pub(crate) fn validate_chats_location(
         .map(std::path::PathBuf::from)
         .map(Ok)
         .unwrap_or_else(default_chats_root)?;
-    let resolve = |path: &Path| {
-        std::fs::canonicalize(path)
-            .or_else(|_| std::path::absolute(path))
-            .map_err(|_| core::Error::new("profile_error", "root path unavailable"))
+    let mut protected = vec![data_root.to_owned()];
+    for name in [
+        "CODEX_HOME",
+        "CODEX_SQLITE_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "MUSE_CONFIG_DIR",
+        "OPENCODE_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+    ] {
+        if let Some(path) = std::env::var_os(name).filter(|path| !path.is_empty()) {
+            protected.push(PathBuf::from(path));
+        }
+    }
+    for name in ["USERPROFILE", "HOME"] {
+        if let Some(home) = std::env::var_os(name).filter(|path| !path.is_empty()) {
+            let home = PathBuf::from(home);
+            for relative in [
+                ".codex",
+                ".claude",
+                ".config",
+                ".local/share",
+                ".gemini",
+                ".antigravity",
+                ".agy",
+                ".muse",
+            ] {
+                protected.push(home.join(relative));
+            }
+            #[cfg(windows)]
+            protected.push(home.join("AppData"));
+        }
+    }
+    validate_chats_root(&root, &protected)
+}
+
+fn validate_chats_root(root: &Path, protected: &[PathBuf]) -> core::Result<PathBuf> {
+    let refused = || {
+        core::Error::new(
+            "profile_error",
+            "chats_root overlaps protected data/configuration or traverses a link",
+        )
     };
-    let root = resolve(&root)?;
-    let data = resolve(data_root)?;
+    if !root.is_absolute() {
+        return Err(refused());
+    }
+    // Inspect the supplied spelling before canonicalization can erase a link
+    // or junction. Nonexistent suffixes are allowed for exclusive creation.
+    let mut prefix = PathBuf::new();
+    for component in root.components() {
+        match component {
+            std::path::Component::ParentDir | std::path::Component::CurDir => return Err(refused()),
+            #[cfg(windows)]
+            std::path::Component::Normal(name)
+                if name
+                    .to_str()
+                    .is_none_or(|name| name.ends_with(['.', ' ']) || name.contains(':')) =>
+            {
+                return Err(refused());
+            }
+            #[cfg(windows)]
+            std::path::Component::Prefix(p)
+                if !matches!(
+                    p.kind(),
+                    std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+                ) =>
+            {
+                return Err(refused());
+            }
+            _ => prefix.push(component),
+        }
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || crate::platform::is_reparse_point(&metadata)
+                    || !metadata.is_dir() =>
+            {
+                return Err(refused());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(refused()),
+        }
+    }
+    let resolve = |path: &Path| -> core::Result<PathBuf> {
+        let mut existing = std::path::absolute(path).map_err(|_| refused())?;
+        let mut suffix = Vec::new();
+        loop {
+            match std::fs::canonicalize(&existing) {
+                Ok(mut resolved) => {
+                    for name in suffix.into_iter().rev() {
+                        resolved.push(name);
+                    }
+                    return Ok(resolved);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    suffix.push(existing.file_name().ok_or_else(refused)?.to_owned());
+                    if !existing.pop() {
+                        return Err(refused());
+                    }
+                }
+                Err(_) => return Err(refused()),
+            }
+        }
+    };
+    let root = resolve(root)?;
     let normalized = |path: &Path| {
         let text = path.to_string_lossy().replace('\\', "/");
         let text = text.strip_prefix("//?/").unwrap_or(&text);
@@ -105,14 +206,11 @@ pub(crate) fn validate_chats_location(
         })
     };
     let normalized_root = normalized(&root);
-    let normalized_data = normalized(&data);
-    if normalized_root.starts_with(&normalized_data)
-        || normalized_data.starts_with(&normalized_root)
-    {
-        return Err(core::Error::new(
-            "profile_error",
-            "chats_root must be outside the daemon data directory",
-        ));
+    for path in protected {
+        let protected = normalized(&resolve(path)?);
+        if normalized_root.starts_with(&protected) || protected.starts_with(&normalized_root) {
+            return Err(refused());
+        }
     }
     Ok(root)
 }
@@ -2880,15 +2978,28 @@ fn opencode_snapshot_from_entry(
             "profile_error",
         ));
     }
+    // A frozen effort selects the installed `Model.Variant` id on launch
+    // (`Model.Ref.variant`); the live native catalogue proves membership.
+    let effort = entry.effort.as_deref().map(str::trim);
+    if effort.is_some_and(|value| {
+        value.is_empty() || value.len() > MAX_EFFORT_LEN || value.chars().any(char::is_control)
+    }) {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "effort",
+            "must be non-empty, at most 128 characters and contain no controls",
+            "profile_error",
+        ));
+    }
     for field in [
-        "effort",
         "approval",
         "collaboration_mode",
         "permissions",
         "approval_policy",
     ] {
         let present = match field {
-            "effort" => entry.effort.as_deref(),
             "approval" => entry.approval.as_deref(),
             "collaboration_mode" => entry.collaboration_mode.as_deref(),
             "permissions" => entry.permissions.as_deref(),
@@ -2937,6 +3048,9 @@ fn opencode_snapshot_from_entry(
     snapshot.insert("harness".to_owned(), Value::String("opencode".to_owned()));
     if let Some(model) = model {
         snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
+    if let Some(effort) = effort {
+        snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
     }
     if has_local_backend_fields(entry) {
         if model.is_none() {
@@ -3761,6 +3875,66 @@ fn is_unsupported_field(field: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chats_reject_protected_roots_and_nonexistent_descendants() {
+        let fixture = AutomationConfigFixture::new();
+        let protected = fixture.root.join("codex-home");
+        std::fs::create_dir(&protected).unwrap();
+        let roots = vec![protected.clone(), fixture.root.join("config-not-created")];
+        for root in [
+            protected.clone(),
+            protected.join("chats"),
+            fixture.root.clone(),
+            roots[1].join("chats"),
+        ] {
+            assert_eq!(
+                validate_chats_root(&root, &roots).unwrap_err().code,
+                "profile_error"
+            );
+        }
+        assert!(
+            validate_chats_root(&fixture.root.join("codex-home-sibling/chats"), &roots).is_ok()
+        );
+        assert!(
+            validate_chats_root(&fixture.root.join("safe/../codex-home/chats"), &roots).is_err()
+        );
+        #[cfg(windows)]
+        for alias in ["config-not-created./chats", "config-not-created /chats"] {
+            assert!(validate_chats_root(&fixture.root.join(alias), &roots).is_err());
+        }
+    }
+
+    #[test]
+    fn chats_reject_original_link_components_before_canonicalization() {
+        let fixture = AutomationConfigFixture::new();
+        let target = fixture.root.join("target");
+        let link = fixture.root.join("link");
+        std::fs::create_dir(&target).unwrap();
+        #[cfg(windows)]
+        {
+            let result = std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(&target)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // Even an otherwise unprotected target and a missing suffix must fail.
+        assert!(validate_chats_root(&link, &[]).is_err());
+        assert!(validate_chats_root(&link.join("missing/chats"), &[]).is_err());
+        #[cfg(windows)]
+        std::fs::remove_dir(&link).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&link).unwrap();
+    }
 
     struct AutomationConfigFixture {
         root: std::path::PathBuf,
@@ -5409,9 +5583,21 @@ pass_env = ["OPENAI_API_KEY"]
             let error = resolve_text_profile(&source, "oc").expect_err("must reject");
             assert_eq!(error.code, "profile_error", "{source}");
         }
+        // A frozen effort selects the installed variant id on launch.
+        let source = format!("{source}effort = \"high\"\n");
+        let snapshot = resolve_text_profile(&source, "oc").unwrap();
+        assert_eq!(snapshot["effort"], "high");
+        let long = "x".repeat(129);
+        for effort in [String::new(), "   ".to_owned(), long] {
+            let source = format!(
+                "[profiles.oc]\nharness='opencode'\nmodel='opencode/big-pickle'\ncmd='C:/Tools/opencode.exe'\neffort={}\n",
+                serde_json::to_string(&effort).unwrap()
+            );
+            let error = resolve_text_profile(&source, "oc").expect_err("must reject");
+            assert_eq!(error.code, "profile_error", "{source}");
+        }
         // Unconnected presets stay rejected, never silently frozen.
         for field in [
-            "effort='high'",
             "approval='allowAll'",
             "collaboration_mode='plan'",
             "permissions='read-only'",
