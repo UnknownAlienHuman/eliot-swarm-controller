@@ -1,13 +1,14 @@
 use super::{GoalCheckResult, GoalContinuation, GoalRoundCommit, GoalRoundKey, Store};
+use crate::tests::{native_batch, ready_agent_with_native_identity, send_request};
 use eliot_core::{
-    AgentState, CommandState, GitPathStatus, GitSnapshot, NativeEvent, SourceBatch, SubmitCommand,
+    AgentState, CommandState, GitPathStatus, GitSnapshot, SubmitCommand,
     api::{
         DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalCounters, GoalDefinition, GoalMarkerState, GoalMode,
-        GoalStatus, MIN_GOAL_CADENCE_MS,
+        GoalStatus, GoalView, MIN_GOAL_CADENCE_MS,
     },
     parse_agent_id,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -27,75 +28,12 @@ fn store() -> Store {
 }
 
 fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
-    let launch_id = Ulid::new().to_string();
-    let admission = store
-        .submit(
-            "owner",
-            SubmitCommand {
-                id: launch_id.clone(),
-                target: None,
-                selector: None,
-                verb: "launch".to_owned(),
-                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
-                expected_generation: Some(0),
-                expected_turn_id: None,
-                request_id: None,
-                probe: false,
-            },
-            now,
-        )
-        .expect("admit launch");
-    let agent = admission.command.target.expect("launch target");
-    store.dispatch(&launch_id, now).expect("dispatch launch");
-    crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now);
-    store
-        .put_batch(
-            SourceBatch {
-                batch_id: format!("{project}:ready"),
-                agent_id: agent.clone(),
-                generation: 1,
-                source: "stream".to_owned(),
-                events: vec![NativeEvent {
-                    ts: None,
-                    kind: "session.ready".to_owned(),
-                    native_id: format!("{project}:ready"),
-                    data: json!({"command_id":launch_id,
-                        "native_scope": format!("{project}:scope"),
-                        "native_ref": format!("{project}:ref")}),
-                }],
-                cursor: None,
-            },
-            now,
-        )
-        .expect("commit session ready");
-    store
-        .settle(&launch_id, CommandState::Applied, None, now)
-        .expect("settle launch");
-    agent
-}
-
-fn send_request(agent: &str, text: &str) -> SubmitCommand {
-    let mut request = SubmitCommand::new(Ulid::new().to_string(), "send");
-    request.target = Some(agent.to_owned());
-    request.expected_generation = Some(1);
-    request.args = json!({"text": text});
-    request
-}
-
-fn native_batch(agent: &str, generation: i64, kind: &str, data: Value) -> SourceBatch {
-    SourceBatch {
-        batch_id: Ulid::new().to_string(),
-        agent_id: agent.to_owned(),
-        generation,
-        source: "stream".to_owned(),
-        events: vec![NativeEvent {
-            ts: None,
-            kind: kind.to_owned(),
-            native_id: Ulid::new().to_string(),
-            data,
-        }],
-        cursor: None,
-    }
+    ready_agent_with_native_identity(
+        store,
+        project,
+        now,
+        Some((&format!("{project}:scope"), &format!("{project}:ref"))),
+    )
 }
 
 fn attach_observer(store: &mut Store, now: i64) -> String {
@@ -130,6 +68,24 @@ fn definition(text: &str) -> GoalDefinition {
         max_without_progress: Some(2),
         cadence_ms: None,
     }
+}
+
+fn set_goal_fixture(
+    store: &mut Store,
+    agent: &str,
+    definition: &GoalDefinition,
+    now: i64,
+) -> GoalView {
+    store
+        .goal_set(
+            agent,
+            "eliot",
+            &Ulid::new().to_string(),
+            "owner",
+            definition,
+            now,
+        )
+        .unwrap()
 }
 
 fn commit_for(
@@ -525,16 +481,7 @@ fn goal_pause_clear_resume_follow_revision_semantics() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-transitions", now);
-    store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let paused = store
         .goal_pause(
             &agent,
@@ -614,16 +561,7 @@ fn goal_probe_reports_idle_facts_for_a_clean_round() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-probe", now);
-    store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let high_water = store.high_water().unwrap();
     assert!(high_water > 0);
     let probe = store
@@ -645,24 +583,15 @@ fn goal_probe_reports_open_and_unknown_gates() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-gates", now);
-    store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
-    let stuck = send_request(&agent, "stuck input");
+    set_goal_fixture(&mut store, &agent, &definition("green"), now);
+    let stuck = send_request(&agent, 1, "stuck input");
     let stuck_id = stuck.id.clone();
     store.submit("owner", stuck, now + 1).expect("admit send");
     store.dispatch(&stuck_id, now + 1).expect("dispatch send");
     store
         .settle(&stuck_id, CommandState::Unknown, None, now + 2)
         .expect("settle unknown");
-    let open = send_request(&agent, "queued input");
+    let open = send_request(&agent, 1, "queued input");
     store.submit("owner", open, now + 3).expect("admit send");
     let probe = store
         .goal_round_probe(
@@ -681,16 +610,7 @@ fn goal_probe_reports_unhealthy_harness_sources_and_pending_requests() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-health", now);
-    store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    set_goal_fixture(&mut store, &agent, &definition("green"), now);
     // Monitor sources stay advisory: a stale process monitor never gates a
     // round, while the harness stream does.
     store
@@ -711,7 +631,7 @@ fn goal_probe_reports_unhealthy_harness_sources_and_pending_requests() {
             rusqlite::params![eliot_core::parse_agent_id(&agent).unwrap()],
         )
         .expect("mark harness stream stale");
-    let send = send_request(&agent, "needs approval");
+    let send = send_request(&agent, 1, "needs approval");
     let send_id = send.id.clone();
     store.submit("owner", send, now + 3).expect("admit send");
     store.dispatch(&send_id, now + 3).expect("dispatch send");
@@ -774,16 +694,7 @@ fn goal_probe_refuses_consumed_and_terminal_rounds() {
             .code,
         "not_found"
     );
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     let commit = commit_for(
@@ -810,16 +721,7 @@ fn goal_generation_drift_pauses_on_probe() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-drift", now);
-    store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    set_goal_fixture(&mut store, &agent, &definition("green"), now);
     crate::tests::install_live_custody_observations(&mut store, &agent, 1, now);
     store
         .put_batch(native_batch(&agent, 1, "session.ended", json!({})), now + 1)
@@ -883,16 +785,7 @@ fn goal_commit_completes_on_exit_zero() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-complete", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     let result = store
@@ -926,16 +819,7 @@ fn goal_commit_admits_one_ordinary_send_continuation() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-continue", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     let (round, _, send_id) = claim(&mut store, &agent, view.revision, key, now + 1);
     let result = store
@@ -976,16 +860,7 @@ fn goal_commit_refuses_a_consumed_round_key() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-replay", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     let commit = commit_for(
@@ -1004,16 +879,7 @@ fn goal_commit_refuses_a_consumed_round_key() {
     assert_eq!(replay.outcome, super::GoalCommitOutcome::Completed);
     // A continued round stays active but its key is consumed: a different
     // mutation for the same key can never commit twice.
-    store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now + 3,
-        )
-        .unwrap();
+    set_goal_fixture(&mut store, &agent, &definition("green"), now + 3);
     let current = store.goal_get(&agent, "eliot").unwrap().unwrap();
     let fresh_key = store.high_water().unwrap();
     let (round_continued, _, cont_continued) =
@@ -1060,16 +926,7 @@ fn goal_commit_refuses_revision_and_event_drift() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-stale", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     store
@@ -1151,7 +1008,7 @@ fn goal_commit_refuses_revision_and_event_drift() {
             .code,
         "stale_round"
     );
-    let fresh_send = send_request(&agent, "advance the key");
+    let fresh_send = send_request(&agent, 1, "advance the key");
     let fresh_id = fresh_send.id.clone();
     store
         .submit("owner", fresh_send, now + 4)
@@ -1160,7 +1017,7 @@ fn goal_commit_refuses_revision_and_event_drift() {
     let fresh = store.high_water().unwrap();
     assert!(fresh > key);
     let (round_drift, _, _) = claim(&mut store, &agent, current.revision, fresh, now + 5);
-    let late = send_request(&agent, "late input");
+    let late = send_request(&agent, 1, "late input");
     let late_id = late.id.clone();
     store
         .submit("owner", late, now + 6)
@@ -1203,16 +1060,7 @@ fn goal_commit_blocks_without_a_check_for_an_exhausted_budget() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-budget", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     let result = store
@@ -1248,16 +1096,7 @@ fn goal_commit_blocks_a_failed_check_against_frozen_limits() {
     let agent = ready_agent(&mut store, "goal-limits", now);
     let mut budgeted = definition("green");
     budgeted.max_rounds = Some(1);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &budgeted,
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &budgeted, now);
     let key = store.high_water().unwrap();
     let (round, _, send_id) = claim(&mut store, &agent, view.revision, key, now + 1);
     let blocked = store
@@ -1293,17 +1132,8 @@ fn goal_commit_blocks_on_turn_limit_and_no_progress_streaks() {
     limited.max_turns = Some(1);
     limited.max_without_progress = None;
     limited.max_rounds = None;
-    store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &limited,
-            now,
-        )
-        .unwrap();
-    let send = send_request(&agent, "drive a turn");
+    set_goal_fixture(&mut store, &agent, &limited, now);
+    let send = send_request(&agent, 1, "drive a turn");
     let send_id = send.id.clone();
     store.submit("owner", send, now + 1).expect("admit send");
     store.dispatch(&send_id, now + 1).expect("dispatch send");
@@ -1363,16 +1193,7 @@ fn goal_commit_blocks_on_turn_limit_and_no_progress_streaks() {
     // The default turn/round bounds stay: automatic Goals need one, and
     // neither fires before the no-progress streak does.
     let agent = ready_agent(&mut store, "goal-no-progress", now + 5);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &streaky,
-            now + 5,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &streaky, now + 5);
     let key = store.high_water().unwrap();
     let (round_first, _, cont_first) = claim(&mut store, &agent, view.revision, key, now + 6);
     let first = store
@@ -1426,16 +1247,7 @@ fn goal_commit_completes_despite_a_spent_budget() {
     let mut budgeted = definition("green");
     budgeted.max_rounds = Some(1);
     budgeted.max_turns = Some(1);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &budgeted,
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &budgeted, now);
     let key = store.high_water().unwrap();
     let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     let completed = store
@@ -1460,16 +1272,7 @@ fn goal_no_progress_counter_skips_incomplete_output() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-progress", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let continued =
         |store: &mut Store, revision: i64, key: i64, check: GoalCheckResult, now: i64| {
             let (round, _, cont) = claim(store, &agent, revision, key, now);
@@ -1546,16 +1349,7 @@ fn goal_claim_refuses_a_second_round_while_one_is_in_flight() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-flight", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 1);
     for other in [key, key + 1] {
@@ -1686,16 +1480,7 @@ fn goal_commit_requires_its_claimed_marker() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-marker", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     let round_id = Ulid::new().to_string();
     let unclaimed = commit_for(
@@ -1718,7 +1503,7 @@ fn goal_commit_requires_its_claimed_marker() {
     );
     assert!(store.get_command(&round_id).unwrap().is_none());
     // A claim for a fresh key does not authorize the old commit.
-    let send = send_request(&agent, "advance the key");
+    let send = send_request(&agent, 1, "advance the key");
     let send_id = send.id.clone();
     store.submit("owner", send, now + 2).expect("admit send");
     complete_send(&mut store, &agent, &send_id, "turn-marker-1", now + 2);
@@ -1768,16 +1553,7 @@ fn goal_crash_leaves_an_unknown_marker_and_burns_its_key() {
     let (agent, key) = {
         let mut store = Store::open(&path).expect("open file Store");
         let agent = ready_agent(&mut store, "goal-crash", now);
-        let view = store
-            .goal_set(
-                &agent,
-                "eliot",
-                &Ulid::new().to_string(),
-                "owner",
-                &definition("green"),
-                now,
-            )
-            .unwrap();
+        let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
         let key = store.high_water().unwrap();
         store
             .goal_round_probe(&agent, "eliot", GoalRoundKey::Idle(key), now)
@@ -1802,7 +1578,7 @@ fn goal_crash_leaves_an_unknown_marker_and_burns_its_key() {
     assert_eq!(marker.state, GoalMarkerState::Unknown);
     assert_eq!(marker.round_key, format!("idle:{key}"));
     // The next round needs a new idle key.
-    let send = send_request(&agent, "after the crash");
+    let send = send_request(&agent, 1, "after the crash");
     let send_id = send.id.clone();
     store.submit("owner", send, now + 2).expect("admit send");
     complete_send(&mut store, &agent, &send_id, "turn-crash-1", now + 2);
@@ -1846,19 +1622,10 @@ fn goal_commit_refuses_activity_admitted_during_the_check() {
     let now = now_ms();
     // An owner send admitted during the check: no continuation.
     let agent = ready_agent(&mut store, "goal-mid-open", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     let (round, _, round_id) = claim(&mut store, &agent, view.revision, key, now + 1);
-    let send = send_request(&agent, "owner input during the check");
+    let send = send_request(&agent, 1, "owner input during the check");
     store.submit("owner", send, now + 1).expect("admit send");
     let raced = commit_for(
         &agent,
@@ -1905,19 +1672,10 @@ fn goal_commit_refuses_activity_admitted_during_the_check() {
     );
     // A turn started during the check.
     let agent = ready_agent(&mut store, "goal-mid-turn", now + 3);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now + 3,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now + 3);
     let key = store.high_water().unwrap();
     let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 4);
-    let send = send_request(&agent, "drive a turn");
+    let send = send_request(&agent, 1, "drive a turn");
     let send_id = send.id.clone();
     store.submit("owner", send, now + 4).expect("admit send");
     store.dispatch(&send_id, now + 4).expect("dispatch send");
@@ -1947,19 +1705,10 @@ fn goal_commit_refuses_activity_admitted_during_the_check() {
     );
     // A request opened during the check.
     let agent = ready_agent(&mut store, "goal-mid-request", now + 6);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now + 6,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now + 6);
     let key = store.high_water().unwrap();
     let (round, _, _) = claim(&mut store, &agent, view.revision, key, now + 7);
-    let send = send_request(&agent, "needs approval");
+    let send = send_request(&agent, 1, "needs approval");
     let send_id = send.id.clone();
     store.submit("owner", send, now + 7).expect("admit send");
     store.dispatch(&send_id, now + 7).expect("dispatch send");
@@ -2016,16 +1765,7 @@ fn goal_round_key_must_name_a_generation_event() {
         .expect("insert idle agent");
     assert_eq!(inserted, 1);
     let agent = format!("a{}", store.connection.last_insert_rowid());
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     assert_eq!(
         store
             .goal_round_probe(&agent, "eliot", GoalRoundKey::Idle(0), now + 1)
@@ -2081,16 +1821,7 @@ fn goal_show_reports_live_turns_used() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-live-turns", now);
-    store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    set_goal_fixture(&mut store, &agent, &definition("green"), now);
     assert_eq!(
         store
             .goal_get(&agent, "eliot")
@@ -2100,7 +1831,7 @@ fn goal_show_reports_live_turns_used() {
             .turns_used,
         0
     );
-    let send = send_request(&agent, "outside any round");
+    let send = send_request(&agent, 1, "outside any round");
     let send_id = send.id.clone();
     store.submit("owner", send, now + 1).expect("admit send");
     complete_send(&mut store, &agent, &send_id, "turn-live-1", now + 1);
@@ -2114,16 +1845,7 @@ fn goal_commit_refuses_a_check_without_an_exit_code() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-no-code", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     let (round, _, cont) = claim(&mut store, &agent, view.revision, key, now + 1);
     let codeless = GoalCheckResult {
@@ -2159,16 +1881,7 @@ fn goal_burned_key_survives_pause_and_resume() {
     let (agent, key) = {
         let mut store = Store::open(&path).expect("open file Store");
         let agent = ready_agent(&mut store, "goal-pause-burn", now);
-        let view = store
-            .goal_set(
-                &agent,
-                "eliot",
-                &Ulid::new().to_string(),
-                "owner",
-                &definition("green"),
-                now,
-            )
-            .unwrap();
+        let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
         let key = store.high_water().unwrap();
         claim(&mut store, &agent, view.revision, key, now);
         // Crash: the handle drops with the marker `running`.
@@ -2239,18 +1952,9 @@ fn goal_round_key_must_name_an_idle_event() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-idle-key", now);
-    store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    set_goal_fixture(&mut store, &agent, &definition("green"), now);
     // Start a turn and leave it open: the latest event names a busy Agent.
-    let send = send_request(&agent, "leave a turn open");
+    let send = send_request(&agent, 1, "leave a turn open");
     let send_id = send.id.clone();
     store.submit("owner", send, now + 1).expect("admit send");
     store.dispatch(&send_id, now + 1).expect("dispatch send");
@@ -2421,16 +2125,7 @@ fn goal_slot_round_trip_continues_then_completes() {
     let mut store = store();
     let base = now_ms();
     let agent = ready_agent(&mut store, "goal-slot", base);
-    let set = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &cadenced_definition("green"),
-            base,
-        )
-        .unwrap();
+    let set = set_goal_fixture(&mut store, &agent, &cadenced_definition("green"), base);
     assert_eq!(set.cadence_anchor_ms, Some(base));
     let first_due = base + MIN_GOAL_CADENCE_MS;
     let probe = store
@@ -2546,16 +2241,7 @@ fn goal_slot_keys_validate_form_range_and_due() {
     let mut store = store();
     let base = now_ms();
     let agent = ready_agent(&mut store, "goal-slot-gates", base);
-    let set = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &cadenced_definition("green"),
-            base,
-        )
-        .unwrap();
+    let set = set_goal_fixture(&mut store, &agent, &cadenced_definition("green"), base);
     // Slot 0 is malformed, a future slot is not due.
     for key in [GoalRoundKey::Slot(0), GoalRoundKey::Slot(-3)] {
         assert_eq!(
@@ -2671,16 +2357,7 @@ fn goal_slot_keys_validate_form_range_and_due() {
     );
     // A Goal without a cadence refuses slots.
     let plain = ready_agent(&mut store, "goal-slot-plain", base);
-    store
-        .goal_set(
-            &plain,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            base,
-        )
-        .unwrap();
+    set_goal_fixture(&mut store, &plain, &definition("green"), base);
     assert_eq!(
         store
             .goal_round_probe(
@@ -2700,16 +2377,7 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
     let mut store = store();
     let base = now_ms();
     let agent = ready_agent(&mut store, "goal-slot-burn", base);
-    let set = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            base,
-        )
-        .unwrap();
+    let set = set_goal_fixture(&mut store, &agent, &definition("green"), base);
     let key = store.high_water().unwrap();
     let round = Ulid::new().to_string();
     let claim_seq = store
@@ -2761,16 +2429,7 @@ fn goal_slot_burn_ignores_revision_but_separates_forms() {
     // A new cadenced definition re-anchors; the same number as a slot is
     // a different key form and is not burned.
     let anchor = base + 1;
-    let cadenced = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &cadenced_definition("green"),
-            anchor,
-        )
-        .unwrap();
+    let cadenced = set_goal_fixture(&mut store, &agent, &cadenced_definition("green"), anchor);
     let due = anchor + key * MIN_GOAL_CADENCE_MS;
     let probe = store
         .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(key), due)
@@ -2883,16 +2542,7 @@ fn goal_slot_commit_refuses_events_during_the_check() {
     let mut store = store();
     let base = now_ms();
     let agent = ready_agent(&mut store, "goal-slot-race", base);
-    let set = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &cadenced_definition("green"),
-            base,
-        )
-        .unwrap();
+    let set = set_goal_fixture(&mut store, &agent, &cadenced_definition("green"), base);
     let due = base + MIN_GOAL_CADENCE_MS;
     let round = Ulid::new().to_string();
     let claim_seq = store
@@ -3007,16 +2657,7 @@ fn goal_fingerprint_head_change_is_progress() {
     let agent = ready_agent(&mut store, "goal-fp-head", base);
     let mut limited = definition("green");
     limited.max_without_progress = Some(1);
-    let set = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &limited,
-            base,
-        )
-        .unwrap();
+    let set = set_goal_fixture(&mut store, &agent, &limited, base);
     let head_a = "a".repeat(40);
     let head_b = "b".repeat(40);
     observe_git(
@@ -3101,16 +2742,7 @@ fn goal_fingerprint_dirty_change_is_progress() {
     let agent = ready_agent(&mut store, "goal-fp-dirty", base);
     let mut limited = definition("green");
     limited.max_without_progress = Some(1);
-    let set = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &limited,
-            base,
-        )
-        .unwrap();
+    let set = set_goal_fixture(&mut store, &agent, &limited, base);
     let head = "c".repeat(40);
     observe_git(
         &mut store,
@@ -3161,16 +2793,7 @@ fn goal_incomplete_fingerprint_never_blocks_no_progress() {
     let agent = ready_agent(&mut store, "goal-fp-partial", base);
     let mut limited = definition("green");
     limited.max_without_progress = Some(1);
-    let set = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &limited,
-            base,
-        )
-        .unwrap();
+    let set = set_goal_fixture(&mut store, &agent, &limited, base);
     // A binding with no snapshot yet: incomplete.
     store
         .ensure_git_source(&agent, 1, "synthetic-workspace", base + 1)
@@ -3236,16 +2859,7 @@ fn goal_unhealthy_git_source_resets_no_progress_streak() {
     let agent = ready_agent(&mut store, "goal-fp-health", base);
     let mut limited = definition("green");
     limited.max_without_progress = Some(1);
-    let set = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &limited,
-            base,
-        )
-        .unwrap();
+    let set = set_goal_fixture(&mut store, &agent, &limited, base);
     observe_git(
         &mut store,
         &agent,
@@ -3286,16 +2900,7 @@ fn goal_truncated_edit_page_is_an_incomplete_fingerprint() {
     let agent = ready_agent(&mut store, "goal-fp-truncate", base);
     let mut limited = definition("green");
     limited.max_without_progress = Some(1);
-    let set = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &limited,
-            base,
-        )
-        .unwrap();
+    let set = set_goal_fixture(&mut store, &agent, &limited, base);
     observe_git(
         &mut store,
         &agent,
@@ -3443,16 +3048,7 @@ fn goal_committed_slots_are_monotonic() {
     let mut store = store();
     let base = now_ms();
     let agent = ready_agent(&mut store, "goal-slot-monotonic", base);
-    let set = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &cadenced_definition("green"),
-            base,
-        )
-        .unwrap();
+    let set = set_goal_fixture(&mut store, &agent, &cadenced_definition("green"), base);
     let ninth_due = base + 9 * MIN_GOAL_CADENCE_MS;
     let probe = store
         .goal_round_probe(&agent, "eliot", GoalRoundKey::Slot(9), ninth_due)
@@ -3564,26 +3160,9 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
         let idle_agent = ready_agent(&mut store, "goal-reopen-idle", base);
         let idle_key = store.high_water().unwrap();
         let slot_agent = ready_agent(&mut store, "goal-reopen-slot", base);
-        let idle_view = store
-            .goal_set(
-                &idle_agent,
-                "eliot",
-                &Ulid::new().to_string(),
-                "owner",
-                &definition("green"),
-                base,
-            )
-            .unwrap();
-        let slot_view = store
-            .goal_set(
-                &slot_agent,
-                "eliot",
-                &Ulid::new().to_string(),
-                "owner",
-                &cadenced_definition("green"),
-                base,
-            )
-            .unwrap();
+        let idle_view = set_goal_fixture(&mut store, &idle_agent, &definition("green"), base);
+        let slot_view =
+            set_goal_fixture(&mut store, &slot_agent, &cadenced_definition("green"), base);
         let first_due = base + MIN_GOAL_CADENCE_MS;
         store
             .goal_round_probe(
@@ -3694,7 +3273,7 @@ fn goal_reopen_reads_idle_and_slot_markers_as_unknown() {
         assert_eq!(marker.round_key, key.text());
     }
     // Fresh keys still claim, durably rewriting the crashed rows.
-    let send = send_request(&idle_agent, "after the crash");
+    let send = send_request(&idle_agent, 1, "after the crash");
     let send_id = send.id.clone();
     store.submit("owner", send, base + 2).expect("admit send");
     complete_send(&mut store, &idle_agent, &send_id, "turn-reopen-1", base + 2);
@@ -3767,16 +3346,7 @@ fn goal_reconcile_candidates_cover_only_active_idle_keyed_goals() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-reconcile", now);
     let key = store.high_water().unwrap();
-    store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let candidates = store.goal_reconcile_candidates().unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].agent, agent);
@@ -3803,16 +3373,7 @@ fn goal_reconcile_candidates_cover_only_active_idle_keyed_goals() {
     assert_eq!(store.goal_reconcile_candidates().unwrap().len(), 1);
     // A cadenced Goal rounds on slots, never on retained idle events.
     let slot_agent = ready_agent(&mut store, "goal-reconcile-slot", now);
-    store
-        .goal_set(
-            &slot_agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &cadenced_definition("green"),
-            now,
-        )
-        .unwrap();
+    set_goal_fixture(&mut store, &slot_agent, &cadenced_definition("green"), now);
     let agents: Vec<String> = store
         .goal_reconcile_candidates()
         .unwrap()
@@ -3827,16 +3388,7 @@ fn goal_reconcile_candidate_names_the_consumed_key() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-reconcile-burn", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     let fresh = store.goal_reconcile_candidates().unwrap();
     assert_eq!(fresh.len(), 1);
@@ -3881,16 +3433,7 @@ fn goal_reconcile_candidate_rearms_after_definition_change() {
     let mut store = store();
     let now = now_ms();
     let agent = ready_agent(&mut store, "goal-reconcile-rearm", now);
-    let view = store
-        .goal_set(
-            &agent,
-            "eliot",
-            &Ulid::new().to_string(),
-            "owner",
-            &definition("green"),
-            now,
-        )
-        .unwrap();
+    let view = set_goal_fixture(&mut store, &agent, &definition("green"), now);
     let key = store.high_water().unwrap();
     // A completed round consumes its key and completes the Goal, so the
     // sweep sees no candidate. The commit reuses the claim's request id
