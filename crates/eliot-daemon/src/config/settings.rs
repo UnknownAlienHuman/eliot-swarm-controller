@@ -209,6 +209,34 @@ pub(crate) fn save(
             "resolved projects do not match the settings source revision",
         ));
     }
+    if !request.dry_run
+        && let Some(projects) = projects
+    {
+        let (revision, configured) = project_configs_snapshot(data_root)?;
+        if revision != request.expected_revision {
+            return Err(core::Error::new(
+                "conflict",
+                "config.toml changed since settings were read; reload and reapply the edit",
+            ));
+        }
+        let retained: BTreeSet<_> = projects
+            .inputs
+            .iter()
+            .map(|input| input.id.as_str())
+            .collect();
+        let mut previous: BTreeMap<_, _> = configured
+            .into_iter()
+            .map(|row| (row.id, row.path))
+            .collect();
+        for row in store.list_project_registrations("owner", None, 1_000)? {
+            previous.insert(row.id, row.checkout);
+        }
+        for (id, path) in previous {
+            if !retained.contains(id.as_str()) {
+                require_project_unused(store, &id, &path)?;
+            }
+        }
+    }
     let reply = save_internal_locked(
         data_root,
         store,
@@ -234,6 +262,26 @@ pub(crate) fn save(
         events = change.events;
     }
     Ok((reply, events))
+}
+
+/// Reuse the complete Store usage fence for both settings removal and cleanup.
+/// Callers hold the Store lock through settings publication.
+pub(crate) fn require_project_unused(store: &Store, id: &str, path: &str) -> core::Result<()> {
+    let registration = store.get_project_registration("owner", id)?;
+    let checkout = registration
+        .as_ref()
+        .map_or(path, |row| row.checkout.as_str());
+    let common = registration
+        .as_ref()
+        .map(|row| row.repo_common_dir.as_str());
+    let linked = common.map_or_else(Vec::new, crate::workspace_git::registration_linked_paths);
+    if store.project_in_use(id, checkout, common, &linked)? {
+        return Err(core::Error::new(
+            "project_in_use",
+            "an Agent or unsettled command still uses the registration",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) struct ResolvedProjects {

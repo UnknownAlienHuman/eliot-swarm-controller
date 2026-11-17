@@ -49,11 +49,11 @@ pub use agent_views::{
     DaemonPanicTestResponse, DaemonStatusResponse, DiagnoseResponse, DiagnoseStep, DrainReport,
     GitCredentialHelper, MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS,
     MAX_DIAGNOSE_SUMMARY_CHARS, OwnedProcessKind, OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES,
-    ProcessPageCursor, ProjectDiscoverResponse, ProjectGitView, ProjectRegistrationView,
-    RetainedUnknownSummary, RetentionView, RunningTurnSummary, SourceOwner, SourceState,
-    StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus,
-    WorkspaceCustodyView, activity_state_name, agent_state_name, diagnosis_reason,
-    process_state_name, repository_name_from_url, stats_coverage_name,
+    ProcessPageCursor, ProjectCheckoutView, ProjectDiscoverResponse, ProjectGitView,
+    ProjectRegistrationView, RetainedUnknownSummary, RetentionView, RunningTurnSummary,
+    SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary, WorkerTaskHealth,
+    WorkerTaskStatus, WorkspaceCustodyView, activity_state_name, agent_state_name,
+    diagnosis_reason, process_state_name, repository_name_from_url, stats_coverage_name,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,

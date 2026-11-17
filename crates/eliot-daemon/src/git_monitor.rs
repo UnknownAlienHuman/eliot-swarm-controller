@@ -1149,7 +1149,8 @@ pub(crate) fn canonical_root(workspace: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn reject_links(path: &Path) -> Result<()> {
-    for prefix in path.ancestors() {
+    let ancestors: Vec<_> = path.ancestors().collect();
+    for prefix in ancestors.into_iter().rev() {
         match fs::symlink_metadata(prefix) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {

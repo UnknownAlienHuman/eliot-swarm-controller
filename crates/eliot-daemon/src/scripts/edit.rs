@@ -513,6 +513,7 @@ mod tests {
             git: None,
             revision: 1,
             origin: None,
+            checkouts: Vec::new(),
         };
         let policy = SecretPolicy::new(["audit-secret"]);
         let reply = list(
@@ -736,6 +737,7 @@ mod tests {
             git: None,
             revision: 1,
             origin: None,
+            checkouts: Vec::new(),
         };
         let request = ScriptListRequest {
             cursor: Some("1:0".into()),

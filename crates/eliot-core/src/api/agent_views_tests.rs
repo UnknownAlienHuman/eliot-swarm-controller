@@ -51,6 +51,7 @@ fn project_registration_readback_preserves_explicit_empty_allowsets() {
         git: None,
         revision: 1,
         origin: None,
+        checkouts: Vec::new(),
     };
     view.validate().unwrap();
     let wire = serde_json::to_value(&view).unwrap();
@@ -490,6 +491,7 @@ fn summary() -> AgentSummary {
         id: "a1".to_owned(),
         generation: 0,
         project: "p".to_owned(),
+        workspace: None,
         harness: "fake".to_owned(),
         name: None,
         profile: None,

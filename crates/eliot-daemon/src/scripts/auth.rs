@@ -179,6 +179,7 @@ mod tests {
                 git: None,
                 revision: 4,
                 origin: None,
+                checkouts: Vec::new(),
             }),
         }
     }

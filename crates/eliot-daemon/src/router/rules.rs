@@ -1630,7 +1630,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
         action.expected_turn_id = Some("turn-captured".to_owned());
         authorize_command(
             &Principal::ProjectRule {
-                registration: captured.clone(),
+                registration: Box::new(captured.clone()),
             },
             &mut action,
         )
@@ -1745,7 +1745,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
         action.request_id = Some(request_id.to_owned());
         authorize_command(
             &Principal::ProjectRule {
-                registration: registration.clone(),
+                registration: Box::new(registration.clone()),
             },
             &mut action,
         )

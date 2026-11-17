@@ -503,6 +503,7 @@ mod tests {
             git: None,
             revision: 1,
             origin: None,
+            checkouts: Vec::new(),
         };
         let verbs = ["approve", "deny", "answer"];
         for granted in verbs {
@@ -521,7 +522,7 @@ mod tests {
                 request.request_id = Some("request-captured".to_owned());
                 let result = authorize_command(
                     &Principal::ProjectRule {
-                        registration: registration.clone(),
+                        registration: Box::new(registration.clone()),
                     },
                     &mut request,
                 );
@@ -556,6 +557,7 @@ mod tests {
                 git: None,
                 revision: 1,
                 origin: None,
+                checkouts: Vec::new(),
             };
             let mut request = SubmitCommand::new(String::new(), verb);
             request.target = Some("a1".to_owned());
@@ -565,7 +567,7 @@ mod tests {
 
             authorize_command(
                 &Principal::ProjectRule {
-                    registration: registration.clone(),
+                    registration: Box::new(registration.clone()),
                 },
                 &mut request,
             )
@@ -577,7 +579,7 @@ mod tests {
             request.expected_generation = None;
             let error = authorize_command(
                 &Principal::ProjectRule {
-                    registration: registration.clone(),
+                    registration: Box::new(registration.clone()),
                 },
                 &mut request,
             )
@@ -588,7 +590,7 @@ mod tests {
             revoked.actions = vec!["send".to_owned()];
             let error = authorize_command(
                 &Principal::ProjectRule {
-                    registration: revoked,
+                    registration: Box::new(revoked),
                 },
                 &mut request,
             )
@@ -633,8 +635,11 @@ mod tests {
             git: None,
             revision: 1,
             origin: None,
+            checkouts: Vec::new(),
         };
-        let project = Principal::ProjectRule { registration };
+        let project = Principal::ProjectRule {
+            registration: Box::new(registration),
+        };
         let mut request = SubmitCommand::new("", "run");
         assert!(authorize_command(&project, &mut request).is_ok());
         request.target = Some("a1".to_owned());

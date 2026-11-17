@@ -504,6 +504,148 @@ mod tests {
         assert_eq!(store.list_settings_history(100).unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn project_save_refuses_linked_checkout_admitted_after_resolution() {
+        let root = SettingsRoot::new();
+        let checkout = root.0.join("repo");
+        let linked = root.0.join("linked");
+        std::fs::create_dir(&checkout).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&checkout)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&[
+            "-c",
+            "user.name=EliotTest",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "root",
+        ]);
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "linked-task",
+            linked.to_str().unwrap(),
+        ]);
+        let router = crate::router::tests::router_with_data_root(root.0.clone());
+        let request = project_request(&root, &checkout, "launch");
+        router
+            .settings_save(&serde_json::to_value(request).unwrap(), &Principal::Owner)
+            .await
+            .unwrap();
+
+        let mut removal = project_request(&root, &checkout, "launch");
+        removal
+            .sections
+            .insert(eliot_core::api::SettingsSection::Projects, json!({}));
+        let policy = router.secret_policy_snapshot();
+        let (source, candidate) = crate::config::settings::prepare_candidate(
+            &root.0,
+            removal.expected_revision.as_deref(),
+            &removal.sections,
+            &policy,
+        )
+        .unwrap();
+        let resolved = crate::config::settings::ResolvedProjects {
+            source_revision: removal.expected_revision.clone(),
+            candidate_revision: crate::config::profiles_edit::revision_of(&candidate),
+            inputs: Vec::new(),
+        };
+        let mut launch = eliot_core::SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        launch.expected_generation = Some(0);
+        launch.args = json!({
+            "project": linked,
+            "workspace": linked,
+            "harness": "codex",
+            "profile": "base",
+            "profile_snapshot": {"harness": "codex"},
+        });
+        let mut store = router.inner.store.lock().await;
+        store
+            .submit("owner", launch, crate::common::now_ms())
+            .unwrap();
+        let error =
+            crate::config::settings::save(&root.0, &mut store, &removal, &policy, Some(&resolved))
+                .unwrap_err();
+        assert_eq!(error.code, "project_in_use");
+        assert_eq!(
+            std::fs::read_to_string(root.0.join("config.toml")).unwrap(),
+            source.unwrap()
+        );
+        assert!(
+            store
+                .get_project_registration("owner", "sample")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.list_settings_history(100).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn selected_stale_cleanup_rechecks_restoration_and_leaves_other_missing_project() {
+        use eliot_core::api::{ArtifactKind, CleanupApplyResponse, CleanupPlan};
+        let root = SettingsRoot::new();
+        let one = root.0.join("one");
+        let two = root.0.join("two");
+        let config = root.0.join("config.toml");
+        let source = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{source}\n[projects.one]\npath = {}\nprofiles = []\nactions = []\n\n[projects.two]\npath = {}\nprofiles = []\nactions = []\n", json!(one), json!(two))).unwrap();
+        let router = crate::router::tests::router_with_data_root(root.0.clone());
+        for restored in [true, false] {
+            let plan: CleanupPlan = serde_json::from_value(
+                router
+                    .cleanup_plan(
+                        &json!({"scope":"project","project":"one"}),
+                        &Principal::Owner,
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let item = plan
+                .items
+                .iter()
+                .find(|item| item.artifact.kind == ArtifactKind::ProjectRegistration)
+                .unwrap();
+            assert_eq!(item.artifact.project, "one");
+            assert_eq!(item.verdict, "safe");
+            if restored {
+                std::fs::create_dir(&one).unwrap();
+            }
+            let reply: CleanupApplyResponse = serde_json::from_value(router.cleanup_apply(
+                &json!({"id":ulid::Ulid::new().to_string(),"plan_id":plan.plan_id,"artifacts":[item.artifact.id]}),
+                &Principal::Owner,
+            ).await.unwrap()).unwrap();
+            let result = reply
+                .items
+                .iter()
+                .find(|result| result.artifact_id == item.artifact.id)
+                .unwrap();
+            assert_eq!(result.outcome, if restored { "skipped" } else { "removed" });
+            let current = std::fs::read_to_string(&config).unwrap();
+            let projects = crate::config::settings::project_configs(&current).unwrap();
+            assert!(projects.iter().any(|project| project.id == "two"));
+            assert_eq!(projects.iter().any(|project| project.id == "one"), restored);
+            if restored {
+                assert_eq!(result.reason.as_deref(), Some("project_path_present"));
+                std::fs::remove_dir(&one).unwrap();
+            }
+        }
+    }
+
     fn entry(id: &str, definition: Value) -> RuleListEntry {
         RuleListEntry {
             state: RuleStateView {

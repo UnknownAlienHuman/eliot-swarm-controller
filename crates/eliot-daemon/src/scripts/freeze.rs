@@ -571,6 +571,7 @@ mod tests {
                 git: None,
                 revision: 1,
                 origin: None,
+                checkouts: Vec::new(),
             };
             Self {
                 root: checkout,

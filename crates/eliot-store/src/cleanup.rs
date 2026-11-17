@@ -260,7 +260,13 @@ impl Store {
     /// A missing checkout can still belong to a current workspace, or to a
     /// terminal Agent with unsettled activity. The Store holds the complete
     /// fleet here, including rows outside an inventory page.
-    pub fn cleanup_project_in_use(&self, id: &str, path: &str) -> Result<bool> {
+    pub fn project_in_use(
+        &self,
+        id: &str,
+        path: &str,
+        common_dir: Option<&str>,
+        linked_checkouts: &[String],
+    ) -> Result<bool> {
         let pending = self
             .connection
             .query_row(
@@ -274,8 +280,17 @@ impl Store {
             return Ok(true);
         }
         let path = cleanup_path(path);
+        let common_dir = common_dir.map(cleanup_path);
+        let linked: Vec<_> = linked_checkouts
+            .iter()
+            .map(|path| cleanup_path(path))
+            .collect();
+        let uses_checkout = |location: &str| {
+            let location = cleanup_path(location);
+            location.starts_with(&path) || linked.iter().any(|root| location.starts_with(root))
+        };
         let mut query = self.connection.prepare(
-            "SELECT a.project, a.workspace, w.repo_path, w.worktree_path
+            "SELECT a.project, a.workspace, w.repo_path, w.worktree_path, w.repo_common_dir
                FROM agents a LEFT JOIN workspaces w
                  ON w.agent=a.id AND w.target_generation=a.generation AND w.phase!='removed'
               WHERE a.state NOT IN ('stopped','failed')
@@ -290,12 +305,16 @@ impl Store {
         let mut rows = query.query([]).map_err(sql_error)?;
         while let Some(row) = rows.next().map_err(sql_error)? {
             let project: String = row.get(0).map_err(sql_error)?;
-            if project == id || cleanup_path(&project) == path {
+            if project == id || uses_checkout(&project) {
+                return Ok(true);
+            }
+            let workspace_common: Option<String> = row.get(4).map_err(sql_error)?;
+            if common_dir.is_some() && workspace_common.as_deref().map(cleanup_path) == common_dir {
                 return Ok(true);
             }
             for column in [1, 2, 3] {
                 let location: Option<String> = row.get(column).map_err(sql_error)?;
-                if location.is_some_and(|location| cleanup_path(&location).starts_with(&path)) {
+                if location.as_deref().is_some_and(uses_checkout) {
                     return Ok(true);
                 }
             }
@@ -869,7 +888,7 @@ mod tests {
         ).unwrap();
         assert!(
             store
-                .cleanup_project_in_use("registered-project", path)
+                .project_in_use("registered-project", path, None, &[])
                 .unwrap()
         );
         store
@@ -878,7 +897,7 @@ mod tests {
             .unwrap();
         assert!(
             !store
-                .cleanup_project_in_use("registered-project", path)
+                .project_in_use("registered-project", path, None, &[])
                 .unwrap()
         );
         let agent = store.get_agent("a1").unwrap().unwrap();
@@ -894,13 +913,13 @@ mod tests {
              VALUES (?1,'project:demo','command.submit',x'00','run','{}','dispatched',1,1)",
             [Ulid::new().to_string()],
         ).unwrap();
-        assert!(store.cleanup_project_in_use("demo", "/gone").unwrap());
-        assert!(!store.cleanup_project_in_use("other", "/gone").unwrap());
+        assert!(store.project_in_use("demo", "/gone", None, &[]).unwrap());
+        assert!(!store.project_in_use("other", "/gone", None, &[]).unwrap());
         store
             .connection
             .execute("UPDATE commands SET state='applied'", [])
             .unwrap();
-        assert!(!store.cleanup_project_in_use("demo", "/gone").unwrap());
+        assert!(!store.project_in_use("demo", "/gone", None, &[]).unwrap());
     }
 
     #[test]

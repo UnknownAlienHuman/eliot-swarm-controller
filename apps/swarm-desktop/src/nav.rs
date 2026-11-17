@@ -2115,6 +2115,7 @@ mod tests {
             id: "a7".to_owned(),
             generation: 1,
             project: "/p".to_owned(),
+            workspace: None,
             harness: "codex".to_owned(),
             name: name.map(str::to_owned),
             profile: profile.map(str::to_owned),

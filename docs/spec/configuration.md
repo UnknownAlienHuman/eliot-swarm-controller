@@ -733,8 +733,9 @@ project identity includes the canonical checkout and Git common directory, not a
 project label. The registration ID names nothing a person reads: a project's name is the
 owner's `[desktop] display_names` entry, else the repository name of its `origin` remote
 (the readback's read-only `origin`, [api](api.md)), else the folder of the repository's
-main checkout (the parent of the common directory), never a linked worktree's folder.
-A linked worktree is a subproject of its repository, named by its branch.
+main checkout. The daemon readback identifies the main checkout even when Git metadata
+lives in a separate directory. A linked worktree is a subproject of its repository,
+named by the branch from the daemon's verified checkout readback when available.
 
 The optional owner-global `[projects.ID.git]` table binds fetch authority to that
 registration. `fetch_remotes` maps exact remote names to approved direct endpoints without
@@ -1011,6 +1012,14 @@ Resolved registrations carry their source revision, rechecked under the settings
 writer lock; publication and Store reconciliation hold that lock and the Store writer
 without asynchronous Git work between them. A delayed save cannot restore older
 project authority after a newer settings save.
+Before publishing an Owner save that removes project registrations, the daemon
+checks each removed registration under the same Store lock used by Agent admission.
+The check covers the checkout, verified linked worktrees, retained managed-worktree
+identity, and unsettled activity. A registration in use refuses the entire save with
+`project_in_use` and leaves the settings revision and registrations intact.
+The desktop's one-click removal of a missing checkout uses the project registration
+candidate in `cleanup.plan` and `cleanup.apply`, which rechecks absence and usage
+while holding the Store lock.
 An uncertain post-replacement failure is `unknown`; read the revision before retrying.
 
 A stale revision writes nothing. An editor such as the desktop sends only the sections

@@ -52,6 +52,9 @@ pub struct AgentSummary {
     #[schemars(range(min = 0))]
     pub generation: i64,
     pub project: String,
+    /// The retained execution directory, independently of the project label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     pub harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -618,6 +621,18 @@ pub struct ProjectRegistrationView {
     /// remote or when Git cannot read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Live checkout identities verified against this registration's common directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkouts: Vec<ProjectCheckoutView>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectCheckoutView {
+    pub path: String,
+    pub main: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// A bare repository name as [`ProjectRegistrationView::origin`] carries
@@ -747,6 +762,23 @@ impl ProjectRegistrationView {
                 "invalid",
                 "project origin must be a bare repository name",
             ));
+        }
+        let mut paths = BTreeSet::new();
+        if self.checkouts.len() > 1000
+            || self.checkouts.iter().filter(|entry| entry.main).count() > 1
+        {
+            return Err(invalid_response());
+        }
+        for checkout in &self.checkouts {
+            text(&checkout.path)?;
+            if checkout.path.len() > 4096
+                || !paths.insert(&checkout.path)
+                || checkout.branch.as_ref().is_some_and(|branch| {
+                    branch.is_empty() || branch.len() > 1024 || branch.chars().any(char::is_control)
+                })
+            {
+                return Err(invalid_response());
+            }
         }
         for (reference, interpreter) in &self.interpreters {
             if reference.is_empty()
