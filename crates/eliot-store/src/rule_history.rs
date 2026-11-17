@@ -3,6 +3,42 @@
 use super::*;
 use std::collections::{HashMap, HashSet};
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct RuleCatchUpAction {
+    pub event_seq: i64,
+    pub outcome: RuleCatchUpActionOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub enum RuleCatchUpActionOutcome {
+    Command(SubmitCommand),
+    Rejected { code: String },
+}
+
+impl RuleCatchUpAction {
+    pub fn command(event_seq: i64, request: SubmitCommand) -> Self {
+        Self {
+            event_seq,
+            outcome: RuleCatchUpActionOutcome::Command(request),
+        }
+    }
+
+    pub fn rejected(event_seq: i64, code: impl Into<String>) -> Self {
+        Self {
+            event_seq,
+            outcome: RuleCatchUpActionOutcome::Rejected { code: code.into() },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuleCatchUpAdmission {
+    pub parent: Command,
+    pub children: Vec<Admission>,
+    pub events: Vec<Event>,
+    pub is_new: bool,
+}
+
 struct PlannedAction {
     event_seq: i64,
     child_id: String,
@@ -664,4 +700,377 @@ fn ensure_full_catch_up_result<T: serde::Serialize>(items: &[T]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn resume_workspace_stop_pending_tx(
+    tx: &Transaction<'_>,
+    resume_id: &str,
+    target: i64,
+    old_generation: i64,
+) -> Result<bool> {
+    let Some(workspace) = super::super::workspace::load_workspace(tx, target)? else {
+        return Ok(false);
+    };
+    if workspace.start_command_id != resume_id
+        || !super::super::workspace::workspace_cancel_requested(&workspace)
+    {
+        return Ok(false);
+    }
+    let next_generation = old_generation
+        .checked_add(1)
+        .ok_or_else(|| Error::new("source_integrity", "resume generation overflow"))?;
+    let stop_id = workspace
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("stop_command_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("source_integrity", "workspace cancel marker has no Stop"))?;
+    let stop = load_command_record(tx, stop_id)?
+        .ok_or_else(|| Error::new("source_integrity", "workspace cancel Stop disappeared"))?;
+    if workspace.target_generation != next_generation
+        || !matches!(
+            workspace.phase,
+            WorkspacePhase::Creating | WorkspacePhase::Ready
+        )
+        || stop.command.verb != "stop"
+        || stop.target != Some(target)
+        || stop.command.generation != Some(old_generation)
+        || stop.expected_turn_id.is_some()
+        || !matches!(stop.state, CommandState::Dispatched | CommandState::Unknown)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "workspace cancel marker does not retain its exact pending Stop",
+        ));
+    }
+    Ok(true)
+}
+
+/// Gate a rule-action child at the Store dispatch boundary. A held successor is
+/// durably queued; a failed predecessor cancels every later undispatched sibling.
+pub(crate) fn gate_rule_action_dispatch_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<RuleActionDispatchGate> {
+    let link: Option<(Option<String>, Option<String>, Option<i64>)> = tx
+        .query_row(
+            "SELECT parent_command, link_kind, ordinal FROM commands WHERE id = ?1",
+            [command_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((parent_id, link_kind, ordinal)) = link else {
+        return Err(Error::new(
+            "not_found",
+            "rule-action dispatch command was not found",
+        ));
+    };
+    if link_kind.as_deref() != Some("rule_action") {
+        return Ok(RuleActionDispatchGate::Ready);
+    }
+    let (Some(parent_id), Some(ordinal)) = (parent_id, ordinal) else {
+        return Err(Error::new(
+            "source_integrity",
+            "rule-action child has incomplete parent ordering metadata",
+        ));
+    };
+    if ordinal < 0 {
+        return Err(Error::new(
+            "source_integrity",
+            "rule-action ordinal is negative",
+        ));
+    }
+    let parent = load_command_record(tx, &parent_id)?
+        .ok_or_else(|| Error::new("source_integrity", "rule-action parent is missing"))?;
+    if !matches!(
+        parent.command.verb.as_str(),
+        "rule" | "timer.run" | "rule.catch_up" | "run"
+    ) {
+        return Err(Error::new(
+            "source_integrity",
+            "rule-action parent has an unsupported verb",
+        ));
+    }
+    if parent.command.verb == "run" && parent.command.state != CommandState::Applied {
+        return Err(Error::new(
+            "source_integrity",
+            "script output children cannot dispatch before the Run child set is committed",
+        ));
+    }
+    let expected_children = parent
+        .command
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("children"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "rule-action parent has no fixed child set",
+            )
+        })?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| Error::new("source_integrity", "rule-action child ID is invalid"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut statement = tx
+        .prepare(
+            "SELECT id, principal, ordinal, state, target, generation, expected_generation
+             FROM commands
+             WHERE parent_command = ?1 AND link_kind = 'rule_action' AND ordinal IS NOT NULL
+             ORDER BY ordinal",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([&parent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    let sibling_rows = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    drop(statement);
+    let child_ids = sibling_rows
+        .iter()
+        .map(|(id, _, _, _, _, _, _)| id.clone())
+        .collect::<Vec<_>>();
+    if child_ids != expected_children {
+        return Err(Error::new(
+            "source_integrity",
+            "rule-action child rows differ from the parent's fixed child set",
+        ));
+    }
+    let current_index = usize::try_from(ordinal)
+        .map_err(|_| Error::new("source_integrity", "rule-action ordinal is invalid"))?;
+    if current_index >= sibling_rows.len()
+        || sibling_rows[current_index].0 != command_id
+        || sibling_rows.iter().enumerate().any(|(index, row)| {
+            i64::try_from(index).ok() != Some(row.2) || row.1 != parent.command.principal
+        })
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "rule-action sibling ordering is inconsistent",
+        ));
+    }
+    if current_index == 0 {
+        return Ok(RuleActionDispatchGate::Ready);
+    }
+
+    let mut failed_predecessor = None;
+    for (index, row) in sibling_rows.iter().take(current_index).enumerate() {
+        let predecessor_state = parse_enum::<CommandState>(&row.3, "command state")?;
+        let mut predecessor_pending = matches!(
+            predecessor_state,
+            CommandState::Accepted
+                | CommandState::Queued
+                | CommandState::Dispatched
+                | CommandState::Unknown
+        );
+        let mut predecessor_failed = matches!(
+            predecessor_state,
+            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+        );
+        if predecessor_state == CommandState::Applied {
+            let predecessor = load_command_record(tx, &row.0)?.ok_or_else(|| {
+                Error::new("source_integrity", "rule-action predecessor disappeared")
+            })?;
+            if matches!(predecessor.command.verb.as_str(), "launch" | "resume") {
+                let retained = retained_action_admission(tx, predecessor.command)?;
+                if let Some(linked_send) = retained.linked_command {
+                    match linked_send.state {
+                        CommandState::Applied => {}
+                        CommandState::Rejected | CommandState::Failed | CommandState::Cancelled => {
+                            predecessor_failed = true
+                        }
+                        CommandState::Accepted
+                        | CommandState::Queued
+                        | CommandState::Dispatched
+                        | CommandState::Unknown => predecessor_pending = true,
+                    }
+                }
+            }
+        }
+        if predecessor_failed {
+            failed_predecessor = Some(index);
+            break;
+        }
+        if predecessor_pending {
+            let current = load_command_record(tx, command_id)?
+                .ok_or_else(|| Error::new("source_integrity", "rule-action child disappeared"))?;
+            if current.state == CommandState::Accepted {
+                let target = current.target;
+                let generation = current
+                    .command
+                    .generation
+                    .or(current.command.expected_generation);
+                if target.is_some() != generation.is_some() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "rule-action child has inconsistent target binding",
+                    ));
+                }
+                update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
+                events.push(insert_daemon_command_event(
+                    tx,
+                    now,
+                    "command.queued",
+                    target,
+                    generation,
+                    command_id,
+                    json!({
+                        "command_id": command_id,
+                        "reason": "rule_action_predecessor_pending",
+                    }),
+                )?);
+            }
+            return Ok(RuleActionDispatchGate::Held);
+        }
+    }
+    let Some(failed_index) = failed_predecessor else {
+        return Ok(RuleActionDispatchGate::Ready);
+    };
+    for row in sibling_rows.iter().skip(failed_index + 1) {
+        let sibling_state: CommandState = parse_enum(&row.3, "command state")?;
+        if !matches!(sibling_state, CommandState::Accepted | CommandState::Queued) {
+            continue;
+        }
+        let sibling = load_command_record(tx, &row.0)?
+            .ok_or_else(|| Error::new("source_integrity", "rule-action sibling disappeared"))?;
+        if sibling.command.verb != "resume" {
+            continue;
+        }
+        let target = row.4.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "undispatched rule-action child has no target",
+            )
+        })?;
+        let generation = row.5.or(row.6).ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "undispatched rule-action child has no generation",
+            )
+        })?;
+        if resume_workspace_stop_pending_tx(tx, &row.0, target, generation)? {
+            let current = load_command_record(tx, command_id)?
+                .ok_or_else(|| Error::new("source_integrity", "rule-action child disappeared"))?;
+            if current.state == CommandState::Accepted {
+                let current_target = current.target;
+                let current_generation = current
+                    .command
+                    .generation
+                    .or(current.command.expected_generation);
+                if current_target.is_some() != current_generation.is_some() {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "rule-action child has inconsistent target binding",
+                    ));
+                }
+                update_command_state(tx, command_id, CommandState::Queued, None, None, now)?;
+                events.push(insert_daemon_command_event(
+                    tx,
+                    now,
+                    "command.queued",
+                    current_target,
+                    current_generation,
+                    command_id,
+                    json!({
+                        "command_id": command_id,
+                        "reason": "workspace_stop_pending",
+                    }),
+                )?);
+            }
+            return Ok(RuleActionDispatchGate::Held);
+        }
+    }
+    for row in sibling_rows.iter().skip(failed_index + 1) {
+        let sibling_state: CommandState = parse_enum(&row.3, "command state")?;
+        if !matches!(sibling_state, CommandState::Accepted | CommandState::Queued) {
+            continue;
+        }
+        let sibling = load_command_record(tx, &row.0)?
+            .ok_or_else(|| Error::new("source_integrity", "rule-action sibling disappeared"))?;
+        if sibling.target.is_some() {
+            let target = row.4.ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "undispatched rule-action child has no target",
+                )
+            })?;
+            let generation = row.5.or(row.6).ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "undispatched rule-action child has no generation",
+                )
+            })?;
+            cancel_pending_command_tx(
+                tx,
+                target,
+                generation,
+                &row.0,
+                "rule_action_predecessor_terminal",
+                now,
+                events,
+            )?;
+            if sibling.command.verb == "launch" {
+                super::super::capacity::release_unstarted_tx(tx, target, 1, &row.0)?;
+                super::super::fail_unstarted_launch_tx(tx, target, &row.0, now, events)?;
+            } else if sibling.command.verb == "resume" {
+                super::super::lifecycle::cancel_unstarted_resume_input_tx(
+                    tx,
+                    target,
+                    &row.0,
+                    "rule_action_predecessor_terminal",
+                    now,
+                    events,
+                    false,
+                )?;
+            }
+            continue;
+        }
+        if row.4.is_some() || row.5.is_some() || row.6.is_some() {
+            return Err(Error::new(
+                "source_integrity",
+                "targetless rule-action child has an Agent binding",
+            ));
+        }
+        let outcome = json!({"reason": "rule_action_predecessor_terminal"});
+        update_command_state(
+            tx,
+            &row.0,
+            CommandState::Cancelled,
+            Some(&outcome),
+            None,
+            now,
+        )?;
+        events.push(insert_daemon_command_event(
+            tx,
+            now,
+            "command.cancelled",
+            None,
+            None,
+            &row.0,
+            json!({
+                "command_id": row.0,
+                "reason": "rule_action_predecessor_terminal",
+            }),
+        )?);
+    }
+    Ok(RuleActionDispatchGate::Cancelled)
 }
