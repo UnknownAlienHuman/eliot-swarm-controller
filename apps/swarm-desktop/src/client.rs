@@ -328,24 +328,76 @@ pub async fn events_wake(
 
 /// Scan the journal window `(from, through]` for the filter. Events above
 /// `through` are dropped: live delivery continues from `through` and will
-/// carry them, so nothing is applied twice or skipped.
+/// carry them, so nothing is applied twice or skipped. The caller bounds the
+/// window itself (the chat feed's `window_rows`).
 pub async fn scan_events(
     data_dir: &Path,
     from: i64,
     through: i64,
     filter: &EventsFilter,
 ) -> Result<Vec<eliot_core::Event>> {
+    let scan = scan_pages(from, through, usize::MAX, &|| false, |after| {
+        events_read(data_dir, after, EVENT_SCAN_ROWS, filter)
+    })
+    .await?;
+    Ok(scan.events)
+}
+
+/// What a budgeted scan read and where it stopped.
+#[derive(Debug)]
+pub struct EventScan {
+    pub events: Vec<eliot_core::Event>,
+    /// The cursor to resume from: `through` once the window is complete,
+    /// otherwise the last page's `next`.
+    pub next: i64,
+}
+
+/// Scan `(from, through]` with at most `max_pages` `events.read` calls
+/// (each scans at most `EVENT_SCAN_ROWS` server-side), checking `cancelled`
+/// before every call. A scan that runs out of budget or is cancelled stops
+/// at the last page read; the caller resumes from `next`.
+pub async fn scan_events_budgeted(
+    data_dir: &Path,
+    from: i64,
+    through: i64,
+    filter: &EventsFilter,
+    max_pages: usize,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<EventScan> {
+    scan_pages(from, through, max_pages, cancelled, |after| {
+        events_read(data_dir, after, EVENT_SCAN_ROWS, filter)
+    })
+    .await
+}
+
+async fn scan_pages<F, Fut>(
+    from: i64,
+    through: i64,
+    max_pages: usize,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    mut read: F,
+) -> Result<EventScan>
+where
+    F: FnMut(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<EventsReadResponse>>,
+{
     let mut after = from;
     let mut events = Vec::new();
-    while after < through {
-        let page = events_read(data_dir, after, EVENT_SCAN_ROWS, filter).await?;
+    let mut pages = 0;
+    while after < through && pages < max_pages && !cancelled() {
+        let page = read(after).await?;
+        pages += 1;
         events.extend(page.events.into_iter().filter(|event| event.seq <= through));
         if page.next <= after || !page.truncated {
+            after = through;
             break;
         }
         after = page.next;
     }
-    Ok(events)
+    Ok(EventScan {
+        events,
+        next: after.min(through),
+    })
 }
 
 /// Exclusive journal cursor just before the first retained event committed
@@ -891,4 +943,59 @@ pub async fn submit_stop(
     )?;
     request.expected_generation = Some(generation);
     submit(data_dir, &request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// Pages of 1,000 scanned rows each, matching nothing, truncated until
+    /// `high`.
+    fn page(after: i64, high: i64) -> Result<EventsReadResponse> {
+        let next = (after + 1_000).min(high);
+        Ok(EventsReadResponse {
+            events: Vec::new(),
+            next,
+            high_water: high,
+            truncated: next < high,
+        })
+    }
+
+    #[test]
+    fn a_budgeted_scan_stops_at_the_last_page_and_resumes_there() {
+        let calls = Cell::new(0);
+        let scan = block_on(scan_pages(0, 1_000_000, 4, &|| false, |after| {
+            calls.set(calls.get() + 1);
+            std::future::ready(page(after, 1_000_000))
+        }))
+        .unwrap();
+        assert_eq!(calls.get(), 4);
+        assert_eq!(scan.next, 4_000);
+
+        let resumed = block_on(scan_pages(scan.next, 1_000_000, 4, &|| false, |after| {
+            std::future::ready(page(after, 1_000_000))
+        }))
+        .unwrap();
+        assert_eq!(resumed.next, 8_000);
+    }
+
+    #[test]
+    fn a_complete_scan_reaches_through_and_a_cancelled_one_reads_nothing() {
+        let scan = block_on(scan_pages(0, 2_500, 4, &|| false, |after| {
+            std::future::ready(page(after, 2_500))
+        }))
+        .unwrap();
+        assert_eq!(scan.next, 2_500);
+
+        let calls = Cell::new(0);
+        let cancelled = block_on(scan_pages(0, 2_500, 4, &|| true, |after| {
+            calls.set(calls.get() + 1);
+            std::future::ready(page(after, 2_500))
+        }))
+        .unwrap();
+        assert_eq!(calls.get(), 0);
+        assert_eq!(cancelled.next, 0);
+    }
 }

@@ -51,6 +51,9 @@ pub const RECENT_MS: i64 = 24 * 60 * 60 * 1000;
 pub const ATTENTION_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 /// The daemon's typed attention report kind (`docs/spec/monitoring.md`).
 pub const ATTENTION_KIND: &str = "x.user.agent.attention";
+/// `events.read` calls one refresh spends on attention reports (each scans
+/// at most 1,000 journal rows server-side).
+pub const ATTENTION_SCAN_PAGES: usize = 4;
 /// UI-only samples kept per Agent series.
 pub const RING_CAPACITY: usize = 600;
 /// Bars drawn per graph; never more than useful at this width.
@@ -1036,11 +1039,15 @@ enum Read {
 }
 
 /// The attention reports after `cursor` (or, on the first read, from
-/// `ATTENTION_WINDOW_MS` back) through the current high-water mark.
+/// `ATTENTION_WINDOW_MS` back) toward the current high-water mark, at most
+/// `ATTENTION_SCAN_PAGES` reads per refresh. A backlog larger than that
+/// continues from where this refresh stopped, so a busy journal never holds
+/// a refresh for thousands of calls.
 async fn read_attention(
     data_dir: &Path,
     cursor: Option<i64>,
     now_ms: i64,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<AttentionRead, String> {
     let filter = eliot_core::api::EventsFilter {
         agents: Vec::new(),
@@ -1062,15 +1069,23 @@ async fn read_attention(
         .await
         .map_err(|error| error.to_string())?,
     };
-    let events = client::scan_events(data_dir, from, bounds.hi, &filter)
-        .await
-        .map_err(|error| error.to_string())?;
+    let scan = client::scan_events_budgeted(
+        data_dir,
+        from,
+        bounds.hi,
+        &filter,
+        ATTENTION_SCAN_PAGES,
+        cancelled,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     Ok(AttentionRead {
-        reports: events
+        reports: scan
+            .events
             .iter()
             .filter_map(AttentionReport::from_event)
             .collect(),
-        next: bounds.hi,
+        next: scan.next,
     })
 }
 
@@ -1124,7 +1139,7 @@ pub async fn refresh(
         if cancelled() {
             return Read::Cancelled;
         }
-        Read::Attention(read_attention(data_dir, attention_cursor, read_at_ms).await)
+        Read::Attention(read_attention(data_dir, attention_cursor, read_at_ms, cancelled).await)
     }));
     for state in ROW_STATES {
         reads.push(Box::pin(async move {
