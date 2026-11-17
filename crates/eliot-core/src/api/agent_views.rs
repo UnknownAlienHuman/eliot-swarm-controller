@@ -1,11 +1,13 @@
 //! Public Agent/daemon read grammar and pure reply binding checks.
 //! Store authorization and the exact workspace target remain Router decisions.
 
-use super::{GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView, StatsCoverage};
+use super::{
+    GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView, StatsCoverage,
+};
 use crate::{
     Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
-    NativeChildActivityState, ProcessIdentity, ProcessRecord, ProcessState, Result, SessionUsage, StderrSnapshot,
-    TurnOutcome, TurnUsage,
+    NativeChildActivityState, ProcessIdentity, ProcessRecord, ProcessState, Result, SessionUsage,
+    StderrSnapshot, TurnOutcome, TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -2729,7 +2731,10 @@ mod tests {
         );
         assert_eq!(observed(Activity::Unknown).fleet_bucket(), "unknown");
         assert_eq!(
-            (activity_state_name(Activity::Lost), observed(Activity::Lost).fleet_bucket()),
+            (
+                activity_state_name(Activity::Lost),
+                observed(Activity::Lost).fleet_bucket()
+            ),
             ("lost", "unknown")
         );
         assert_eq!(summary().fleet_bucket(), "idle");

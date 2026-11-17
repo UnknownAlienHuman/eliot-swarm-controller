@@ -56,7 +56,7 @@ impl UiAgent {
             id: summary.id.clone(),
             generation: summary.generation,
             harness: summary.harness.clone(),
-            state: format!("{:?}", summary.state).to_lowercase(),
+            state: eliot_core::api::agent_state_name(summary.state).to_owned(),
             project: summary.project.clone(),
             parent: summary.parent.clone(),
             updated_at: summary.updated_at,

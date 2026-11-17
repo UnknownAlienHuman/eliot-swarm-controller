@@ -27,11 +27,11 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
-use eliot_core::AgentState;
-use eliot_core::api::{agent_state_name, 
+use eliot_core::api::{
     AgentGetResponse, AgentListRequest, AgentListResponse, AgentListRow, ObservationView,
-    ProcessStatsView, UsageSummaryResponse,
+    ProcessStatsView, UsageSummaryResponse, agent_state_name, stats_coverage_name,
 };
+use eliot_core::{AgentState, NativeChildActivityState};
 use futures_util::StreamExt;
 
 use crate::client::{self, MAX_CONCURRENT_READS};
@@ -170,7 +170,7 @@ impl Obs {
                     sampled_at: stats.sampled_at,
                     age_ms: stats.age_ms,
                     ttl_ms: stats.ttl_ms,
-                    coverage: format!("{:?}", stats.coverage).to_lowercase(),
+                    coverage: stats_coverage_name(stats.coverage).to_owned(),
                     clock_regressed: stats.clock_regressed,
                     error: stats.error.clone(),
                     processes: data.processes.len(),
@@ -402,7 +402,7 @@ pub struct MonitorRow {
     pub state: AgentState,
     pub harness: String,
     pub active_turn: Option<String>,
-    pub activity: Option<String>,
+    pub activity: Option<NativeChildActivityState>,
     pub progress_age_ms: Option<i64>,
     pub last_outcome: Option<String>,
     /// Fleet token count from the shared [`AgentSummary::fleet_usage`]
@@ -449,10 +449,7 @@ impl MonitorRow {
             state: summary.state,
             harness: summary.harness.clone(),
             active_turn: summary.active_turn.clone(),
-            activity: summary
-                .activity
-                .as_ref()
-                .map(|activity| format!("{:?}", activity.state).to_lowercase()),
+            activity: summary.activity.as_ref().map(|activity| activity.state),
             progress_age_ms: summary.progress_age_ms,
             last_outcome: summary
                 .last_outcome
@@ -472,12 +469,12 @@ impl MonitorRow {
         if !self.native_child {
             return state_words(self.state);
         }
-        match (self.state, self.activity.as_deref()) {
+        match (self.state, self.activity) {
             (AgentState::Stopped, _) => "Ended with parent",
-            (_, Some("running")) => "Working",
-            (_, Some("idle")) => "Idle",
-            (_, Some("interrupted")) => "Interrupted",
-            (_, Some("lost")) => "Lost",
+            (_, Some(NativeChildActivityState::Running)) => "Working",
+            (_, Some(NativeChildActivityState::Idle)) => "Idle",
+            (_, Some(NativeChildActivityState::Interrupted)) => "Interrupted",
+            (_, Some(NativeChildActivityState::Lost)) => "Lost",
             _ => state_words(self.state),
         }
     }
@@ -500,11 +497,11 @@ impl MonitorRow {
 
     /// The status code its tone follows ([`crate::m3::status`]).
     pub fn status_code(&self) -> &'static str {
-        match self.status_words() {
-            "Ended with parent" => "stopped",
-            "Working" if self.native_child => "busy",
-            "Idle" if self.native_child => "idle",
-            "Lost" if self.native_child => "lost",
+        match (self.native_child, self.state, self.activity) {
+            (true, AgentState::Stopped, _) => "stopped",
+            (true, _, Some(NativeChildActivityState::Running)) => "busy",
+            (true, _, Some(NativeChildActivityState::Idle)) => "idle",
+            (true, _, Some(NativeChildActivityState::Lost)) => "lost",
             _ => agent_state_name(self.state),
         }
     }
@@ -513,9 +510,9 @@ impl MonitorRow {
     /// parent instead (`None`), unless the parent is not shown.
     pub fn group(&self, attention: Option<&Incident>) -> Group {
         if self.native_child {
-            return match (self.state, self.activity.as_deref()) {
+            return match (self.state, self.activity) {
                 (AgentState::Stopped | AgentState::Failed | AgentState::Lost, _) => Group::Stopped,
-                (_, Some("running")) => Group::Working,
+                (_, Some(NativeChildActivityState::Running)) => Group::Working,
                 _ => Group::Idle,
             };
         }
@@ -536,7 +533,8 @@ impl MonitorRow {
         // A native child's turn is its observed activity, not a controlled
         // active turn.
         let working = self.active_turn.is_some()
-            || (self.activity.as_deref() == Some("running") && self.state != AgentState::Stopped);
+            || (self.activity == Some(NativeChildActivityState::Running)
+                && self.state != AgentState::Stopped);
         let ended = matches!(
             self.state,
             AgentState::Stopped | AgentState::Failed | AgentState::Lost
@@ -549,7 +547,7 @@ impl MonitorRow {
             (false, Some(outcome)) => format!("Last turn {}", outcome_words(outcome)),
             // An open turn cut off by the end has no result; nothing is
             // invented for it.
-            (false, None) if ended && self.activity.as_deref() == Some("lost") => {
+            (false, None) if ended && self.activity == Some(NativeChildActivityState::Lost) => {
                 "Its open turn has no result".to_owned()
             }
             (false, None) if ended || self.activity.is_some() => "No finished turn".to_owned(),
@@ -1028,7 +1026,8 @@ impl Monitor {
                     });
                 }
                 Err(error) => {
-                    self.errors.push(format!("{}: {error}", agent_state_name(*state)));
+                    self.errors
+                        .push(format!("{}: {error}", agent_state_name(*state)));
                     counts.push(StateCount {
                         state: *state,
                         total: None,
@@ -1045,7 +1044,8 @@ impl Monitor {
                     shown: 0,
                 }),
                 Err(error) => {
-                    self.errors.push(format!("{}: {error}", agent_state_name(*state)));
+                    self.errors
+                        .push(format!("{}: {error}", agent_state_name(*state)));
                     counts.push(StateCount {
                         state: *state,
                         total: None,
@@ -1437,7 +1437,7 @@ mod tests {
 
     #[test]
     fn an_agent_seen_in_two_state_reads_is_one_row() {
-        use eliot_core::api::{agent_state_name, AgentListResponse, AgentSummary};
+        use eliot_core::api::{AgentListResponse, AgentSummary};
         let row = |state: AgentState| AgentListRow {
             summary: AgentSummary {
                 archived: false,

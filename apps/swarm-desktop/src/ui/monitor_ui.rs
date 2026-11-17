@@ -73,7 +73,7 @@ impl DesktopApp {
                                 id: row.id.clone(),
                                 generation: row.generation,
                                 harness: row.harness.clone(),
-                                state: monitor::state_name(row.state).to_owned(),
+                                state: eliot_core::api::agent_state_name(row.state).to_owned(),
                                 project: String::new(),
                                 parent: row.parent.clone(),
                                 updated_at: 0,

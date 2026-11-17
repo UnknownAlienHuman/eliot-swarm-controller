@@ -3,8 +3,9 @@
 
 use super::{Principal, Router};
 use crate::common::now_ms;
-use eliot_core::api::{agent_state_name, process_state_name, stats_coverage_name, 
-    EmitDefinitionArgs, MailMode, MailSendRequest, ObservationView, SourceState,
+use eliot_core::api::{
+    EmitDefinitionArgs, MailMode, MailSendRequest, ObservationView, SourceState, agent_state_name,
+    process_state_name, stats_coverage_name,
 };
 use eliot_core::{Agent, AgentState, CommandState, Error, ProcessState, Result};
 use serde::Serialize;

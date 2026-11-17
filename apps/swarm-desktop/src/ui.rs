@@ -448,7 +448,7 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         pending,
         harness: reply.agent.harness.clone(),
         settings: configure::Settings::from_reply(reply),
-        state: format!("{:?}", reply.agent.state).to_lowercase(),
+        state: eliot_core::api::agent_state_name(reply.agent.state).to_owned(),
         observe_only: reply.agent.observe_only,
         project: reply.agent.project.clone(),
         routing: reply.agent.profile_choice.clone(),
