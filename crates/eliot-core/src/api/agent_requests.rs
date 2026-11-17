@@ -1,8 +1,22 @@
-// Included by agent_views.rs to retain the existing DTO scope and private validators.
+//! Public Agent/daemon read requests and pure reply binding checks.
+
+use super::agent_views::{
+    generation, invalid_response, object, optional_text, required_text, text,
+};
+use super::{
+    AgentEditsResponse, AgentGetResponse, AgentGitResponse, AgentListResponse,
+    AgentProcessesResponse, AgentStatsResponse, DaemonPanicTestResponse, DaemonStatusResponse,
+    DiagnoseResponse, ProjectDiscoverResponse,
+};
+use crate::{Agent, AgentState, Error, ProcessIdentity, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 
 pub const PROCESS_CURSOR_MAX_BYTES: usize = 2_048;
 
-const EDIT_CURSOR_MAX_BYTES: usize = 64 * 1_024;
+// The sibling view tests exercise the exact request cursor byte boundary.
+pub(super) const EDIT_CURSOR_MAX_BYTES: usize = 64 * 1_024;
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

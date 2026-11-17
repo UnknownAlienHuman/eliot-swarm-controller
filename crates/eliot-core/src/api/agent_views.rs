@@ -1,17 +1,15 @@
-//! Public Agent/daemon read grammar and pure reply binding checks.
+//! Public Agent/daemon reply views and pure validation.
 //! Store authorization and the exact workspace target remain Router decisions.
 
 use super::{GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView};
 use crate::{
     Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
-    NativeChildActivityState, ProcessIdentity, ProcessRecord, Result, SessionUsage, StderrSnapshot,
-    TurnOutcome, TurnUsage,
+    NativeChildActivityState, ProcessRecord, Result, SessionUsage, StderrSnapshot, TurnOutcome,
+    TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
-
-include!("agent_requests.rs");
 
 /// Most characters of [`AgentSummary::preview`].
 pub const AGENT_PREVIEW_CHARS: usize = 256;
@@ -1206,7 +1204,8 @@ impl WorkerTaskStatus {
     }
 }
 
-fn text(value: &str) -> Result<()> {
+// Shared syntax and reply checks for the sibling Agent request DTOs.
+pub(super) fn text(value: &str) -> Result<()> {
     if value.trim().is_empty() {
         return Err(Error::new("invalid", "text must be non-empty"));
     }
@@ -1250,18 +1249,18 @@ fn validate_project_run_env(values: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn generation(value: Option<i64>) -> Result<()> {
+pub(super) fn generation(value: Option<i64>) -> Result<()> {
     if value.is_some_and(|value| value < 0) {
         return Err(Error::new("invalid", "generation must be nonnegative"));
     }
     Ok(())
 }
 
-fn invalid_response() -> Error {
+pub(super) fn invalid_response() -> Error {
     Error::new("unknown", "Agent view response is invalid")
 }
 
-fn required_text<'de, D: serde::Deserializer<'de>>(
+pub(super) fn required_text<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<String, D::Error> {
     let value = String::deserialize(deserializer)?;
@@ -1269,7 +1268,7 @@ fn required_text<'de, D: serde::Deserializer<'de>>(
     Ok(value)
 }
 
-fn optional_text<'de, D: serde::Deserializer<'de>>(
+pub(super) fn optional_text<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error> {
     let value = Option::<String>::deserialize(deserializer)?;
@@ -1281,7 +1280,7 @@ fn optional_text<'de, D: serde::Deserializer<'de>>(
 
 // The same small object-map adapter used by the existing result-read DTOs.
 // Reuse Core models instead of publishing a parallel response schema for them.
-fn object<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(
+pub(super) fn object<'de, D: serde::Deserializer<'de>, T: DeserializeOwned>(
     deserializer: D,
 ) -> std::result::Result<T, D::Error> {
     let value = Map::<String, Value>::deserialize(deserializer)?;
@@ -1358,4 +1357,6 @@ fn process_records<'de, D: serde::Deserializer<'de>>(
         .collect()
 }
 
-include!("agent_views_tests.rs");
+#[cfg(test)]
+#[path = "agent_views_tests.rs"]
+mod tests;
