@@ -224,14 +224,10 @@ impl DesktopApp {
         });
     }
 
-    /// "Stopped by a Swarm restart · Resume" above the composer, bound to
-    /// the generation shown.
-    pub(super) fn loss_notice(
-        &self,
-        column: Option<f64>,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> Option<View> {
+    /// Why the open Agent stopped ("Stopped by a Swarm restart"), one line
+    /// above the composer. Resume itself is the composer's one action (the
+    /// filled button, or Send with a message), never repeated here.
+    pub(super) fn loss_notice(&self, column: Option<f64>) -> Option<View> {
         let detail = self.chat.detail.as_ref()?;
         let agent = self.selected_agent_id()?;
         let (read, generation, words) = self.chat.loss.as_ref()?;
@@ -249,36 +245,17 @@ impl DesktopApp {
                 .max_width(tokens::layout::READING_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Center)
                 .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                .background(palette.card())
-                .corner_radius(tokens::radius::CONTAINER)
-                .padding(Thickness::new(
-                    tokens::spacing::MD,
-                    tokens::spacing::XS,
-                    tokens::spacing::XS,
-                    tokens::spacing::XS,
-                ))
-                .automation_name(format!("{words} · Resume"))
+                .padding(Thickness::xy(tokens::spacing::MD, 0.0))
+                .automation_name(words.to_owned())
                 .content(
-                    Grid::new()
-                        .columns([GridLength::STAR, GridLength::Auto])
-                        .column_spacing(tokens::spacing::SM)
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::SM)
                         .children((
-                            m3::body(words.to_owned())
+                            m3::icon(m3::glyph::INFO),
+                            m3::secondary(words.to_owned())
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_trimming(TextTrimming::CharacterEllipsis),
-                            m3::text_button(palette)
-                                .grid_column(1)
-                                .is_enabled(!self.submitting())
-                                .automation_name(format!(
-                                    "Resume after the Swarm restart (run {generation})"
-                                ))
-                                .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
-                                    DraftAction::Resume {
-                                        agent,
-                                        generation: *generation,
-                                    },
-                                ))))
-                                .content(m3::label("Resume")),
                         )),
                 ),
         )

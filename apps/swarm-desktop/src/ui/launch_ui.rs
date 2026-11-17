@@ -30,11 +30,18 @@ use eliot_core::api::ModelsCatalogResponse;
 /// A popover above the composer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Pop {
+    /// The model picker: a new task's, a preset's, or the open Agent's
+    /// (its own route's models, applied through `configure`).
     Model,
     /// The picker's Manage models panel (OpenCode's).
     Manage,
     Access,
     Project,
+    /// The open Agent's effort steps and the way into its model picker
+    /// (Codex's model-and-effort popover).
+    Effort,
+    /// The usage ring's popover: the tightest limits and Manage usage.
+    Usage,
 }
 
 /// The project popover's row that shows the folder field.
@@ -64,6 +71,12 @@ pub(super) enum LaunchMsg {
     Toggle(Pop),
     /// Close the open popover (a click outside it, Esc).
     Close,
+    /// The pointer entered (true) or left the composer's message field,
+    /// and whether a button was already down as it entered.
+    ComposerPointer {
+        over: bool,
+        pressed: bool,
+    },
     /// The model search field's text.
     PickerQuery(String),
     /// A picker row was clicked (its key).
@@ -100,6 +113,9 @@ pub(super) enum LaunchMsg {
     GroupToggled(String),
     /// A preset's Model field: open the picker for that preset and harness.
     PresetPicker(String, String),
+    /// An effort step of the open Agent's effort popover: configure it for
+    /// the next turn.
+    EffortChosen(String),
     /// A popover key from the keyboard hook.
     Key(PopoverKey),
     /// After the render that bound the highlighted row: bring it into view.
@@ -150,6 +166,9 @@ pub(super) struct LaunchState {
     /// The highlighted picker or project row (its key).
     pub(super) highlight: Option<String>,
     pub(super) access_highlight: Option<Access>,
+    /// The effort step arrow keys moved to in the effort popover (Enter
+    /// applies it).
+    pub(super) effort_highlight: Option<String>,
     /// Efforts chosen on picker rows with ←/→ (row key → effort).
     pub(super) efforts: HashMap<String, String>,
     /// The open popover's search field.
@@ -232,6 +251,31 @@ impl LaunchState {
 impl DesktopApp {
     /// The picker's rows for the current state.
     pub(super) fn picker_rows(&self) -> Vec<Row> {
+        if let Some(detail) = self.popover_agent() {
+            // The open Agent: only its own route's models, as `configure`
+            // admission checks them, with the next turn's model checked.
+            let catalog = self.agent_catalog().map(|read| {
+                read.as_ref()
+                    .map(crate::configure::as_catalog)
+                    .map_err(Clone::clone)
+            });
+            let current = Choice::Model(Pick {
+                harness: detail.harness.clone(),
+                model: detail.settings.next_model().map(str::to_owned),
+                effort: detail.settings.next_effort().map(str::to_owned),
+            });
+            return picker::rows(&picker::Inputs {
+                catalog: catalog.as_ref(),
+                query: &self.launch.query,
+                prefs: &self.prefs,
+                only_harness: Some(&detail.harness),
+                presets: &[],
+                current: &current,
+                auto_detail: "",
+                efforts: &self.launch.efforts,
+                claude_efforts: eliot_daemon::CLAUDE_EFFORT_LEVELS,
+            });
+        }
         let presets = self.launch.allowed();
         let auto_detail = self.launch.auto_detail();
         let preset_current = self.preset_choice();
@@ -328,6 +372,12 @@ impl DesktopApp {
                 }
             }
             LaunchMsg::Close => self.close_popover(),
+            LaunchMsg::ComposerPointer { over, pressed } => {
+                crate::shortcuts::set_composer_over(over);
+                if over && pressed {
+                    self.composer_pressed();
+                }
+            }
             LaunchMsg::PickerQuery(text) => {
                 if self.launch.query != text {
                     self.launch.query = text;
@@ -380,7 +430,7 @@ impl DesktopApp {
             LaunchMsg::ManageOpened => {
                 self.launch.open = Some(Pop::Manage);
                 self.launch.manage_query.clear();
-                crate::shortcuts::set_popover(HookPopover::Menu);
+                crate::shortcuts::set_popover(HookPopover::Panel);
                 self.load_catalog(context);
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
             }
@@ -449,6 +499,16 @@ impl DesktopApp {
                     self.open_popover(Pop::Model, context);
                 }
             }
+            LaunchMsg::EffortChosen(effort) => {
+                self.close_popover();
+                self.configure_update(
+                    configure_ui::ConfigureMsg::Chosen {
+                        model: None,
+                        effort: Some(effort),
+                    },
+                    context,
+                );
+            }
             LaunchMsg::Key(key) => self.popover_key(key, context),
             LaunchMsg::Reveal(epoch) => {
                 if epoch != self.launch.reveal_epoch || self.launch.open != Some(Pop::Model) {
@@ -509,11 +569,23 @@ impl DesktopApp {
     }
 
     fn open_popover(&mut self, pop: Pop, context: &ComponentContext<Self>) {
-        // The composer for a new task, or a preset's Model field in Settings.
+        // The composer for a new task, a preset's Model field in Settings,
+        // or the open conversation's composer (its effort popover, model
+        // picker and usage).
         let preset = self.launch.preset.is_some() && self.main == Main::Settings;
-        if !preset && (self.selected_agent_id().is_some() || self.main != Main::Conversation) {
+        if !preset && self.main != Main::Conversation {
             return;
         }
+        let agent = !preset && self.selected_agent_id().is_some();
+        let pop = match (agent, pop) {
+            (true, Pop::Effort | Pop::Usage) => pop,
+            // A model the harness keeps opens the effort popover, which
+            // says so.
+            (true, Pop::Model) if self.agent_model_allowed() => pop,
+            (true, Pop::Model) => Pop::Effort,
+            (true, _) | (false, Pop::Effort) => return,
+            (false, _) => pop,
+        };
         if !preset {
             self.launch.preset = None;
         }
@@ -522,10 +594,14 @@ impl DesktopApp {
             Pop::Model => {
                 self.launch.query.clear();
                 self.launch.highlight = picker::initial(&self.picker_rows());
-                // Every open revalidates (the daemon serves a complete
-                // catalogue from its cache and reads a failed harness again);
-                // the rows show the last read meanwhile.
-                self.load_catalog(context);
+                if agent {
+                    self.ensure_catalog(context);
+                } else {
+                    // Every open revalidates (the daemon serves a complete
+                    // catalogue from its cache and reads a failed harness
+                    // again); the rows show the last read meanwhile.
+                    self.load_catalog(context);
+                }
                 crate::shortcuts::set_popover(HookPopover::Picker);
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
                 self.reveal(context);
@@ -544,6 +620,29 @@ impl DesktopApp {
                 crate::shortcuts::set_popover(HookPopover::Menu);
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
             }
+            Pop::Effort => {
+                self.launch.effort_highlight = self
+                    .chat
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.settings.next_effort())
+                    .map(str::to_owned);
+                self.ensure_catalog(context);
+                // Left and right step the effort, Enter applies it.
+                crate::shortcuts::set_popover(HookPopover::Picker);
+            }
+            Pop::Usage => crate::shortcuts::set_popover(HookPopover::Menu),
+        }
+    }
+
+    /// A press on the composer's message field (the pointer hook's report,
+    /// or the field's `PointerEntered` with a button already down: touch,
+    /// or a press without a move first) closes the open popover, so its
+    /// keys stop taking the composer's Enter; the press itself reached the
+    /// field. A preset's picker in Settings has no composer.
+    pub(super) fn composer_pressed(&mut self) {
+        if self.main == Main::Conversation && self.launch.preset.is_none() {
+            self.close_popover();
         }
     }
 
@@ -561,6 +660,21 @@ impl DesktopApp {
     /// A choice from the picker: it sets the launch's harness, model and
     /// effort (or Auto, or a preset) and closes the picker.
     fn choose(&mut self, choice: Choice, context: &ComponentContext<Self>) {
+        if self.popover_agent().is_some() {
+            // The open Agent's picker: the row's model and effort for its
+            // next turn.
+            self.close_popover();
+            if let Choice::Model(pick) = choice {
+                self.configure_update(
+                    configure_ui::ConfigureMsg::Chosen {
+                        model: pick.model,
+                        effort: pick.effort,
+                    },
+                    context,
+                );
+            }
+            return;
+        }
         if let Some((name, _)) = self.launch.preset.clone() {
             // A preset's Model field: the model (and an effort chosen on the
             // row) go into the preset's draft; Save writes config.toml.
@@ -624,16 +738,45 @@ impl DesktopApp {
         let Some(pop) = self.launch.open else {
             return;
         };
-        if key == PopoverKey::Escape {
-            if pop == Pop::Manage {
+        match key {
+            PopoverKey::Escape if pop == Pop::Manage => {
                 self.launch_update(LaunchMsg::ManageClosed, context);
-            } else {
-                self.close_popover();
+                return;
             }
-            return;
+            // Tab returns the keyboard to the composer: the popover would
+            // otherwise keep taking its Enter.
+            PopoverKey::Escape | PopoverKey::Tab => {
+                self.close_popover();
+                return;
+            }
+            _ => {}
         }
         match pop {
-            Pop::Manage => {}
+            Pop::Manage | Pop::Usage => {}
+            Pop::Effort => {
+                let efforts = self.agent_efforts();
+                let at = self
+                    .launch
+                    .effort_highlight
+                    .as_deref()
+                    .and_then(|effort| efforts.iter().position(|known| known == effort));
+                match key {
+                    PopoverKey::Left | PopoverKey::Right if !efforts.is_empty() => {
+                        let next = match (at, key == PopoverKey::Right) {
+                            (None, _) => 0,
+                            (Some(at), true) => (at + 1).min(efforts.len() - 1),
+                            (Some(at), false) => at.saturating_sub(1),
+                        };
+                        self.launch.effort_highlight = efforts.get(next).cloned();
+                    }
+                    PopoverKey::Enter => {
+                        if let Some(effort) = self.launch.effort_highlight.clone() {
+                            self.launch_update(LaunchMsg::EffortChosen(effort), context);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Pop::Model => {
                 let rows = self.picker_rows();
                 let highlight = self.launch.highlight.clone();
@@ -660,7 +803,7 @@ impl DesktopApp {
                             self.toggle_favorite(&key, context);
                         }
                     }
-                    PopoverKey::Escape => {}
+                    PopoverKey::Escape | PopoverKey::Tab => {}
                 }
             }
             Pop::Access => {

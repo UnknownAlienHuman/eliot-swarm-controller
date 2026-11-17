@@ -281,29 +281,4 @@ impl DesktopApp {
                     )),
             )
     }
-
-    /// The configure pick a model-chip menu label names, for `agent`.
-    pub(in crate::ui) fn configure_pick(
-        &self,
-        agent: &str,
-        generation: i64,
-        label: &str,
-    ) -> Option<Pick> {
-        let detail = self.chat.detail.as_ref()?;
-        let catalog = self
-            .configure
-            .catalog
-            .as_ref()
-            .filter(|catalog| catalog.is_for(agent, generation))?;
-        let reply = catalog.reply.as_ref().ok()?;
-        let (mut models, mut efforts) = configure::options(reply, detail.settings.next_model());
-        // A field the daemon refuses never resolves.
-        if reply.configure.model_refusal.is_some() {
-            models.clear();
-        }
-        if reply.configure.effort_refusal.is_some() {
-            efforts.clear();
-        }
-        configure::resolve(label, &models, &efforts)
-    }
 }

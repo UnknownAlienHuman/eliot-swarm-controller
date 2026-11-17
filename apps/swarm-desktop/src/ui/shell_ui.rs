@@ -548,11 +548,13 @@ impl DesktopApp {
                         }
                     }
                     Shortcut::Popover(key) if self.menu.open.is_some() => {
-                        if key == crate::shortcuts::PopoverKey::Escape {
+                        use crate::shortcuts::PopoverKey;
+                        if matches!(key, PopoverKey::Escape | PopoverKey::Tab) {
                             self.close_menu();
                         }
                     }
                     Shortcut::Popover(key) => self.launch_update(LaunchMsg::Key(key), context),
+                    Shortcut::ComposerPressed => self.composer_pressed(),
                     Shortcut::Enter(_) if self.menu.renaming.is_some() => {
                         self.menu_update(MenuMsg::RenameCommitted, context);
                     }

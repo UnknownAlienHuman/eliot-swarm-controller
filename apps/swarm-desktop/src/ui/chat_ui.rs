@@ -21,7 +21,6 @@ mod transcript;
 use super::move_ui;
 use super::*;
 use crate::chat::InputFailure;
-use crate::configure::Pick;
 use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
 use transcript::starting_view;
@@ -849,16 +848,18 @@ impl DesktopApp {
                 ),
             (None, None) => self
                 .archived_notice(column, context, palette)
-                .or_else(|| self.loss_notice(column, context, palette))
+                .or_else(|| self.loss_notice(column))
                 .unwrap_or_else(View::empty),
         };
         let composer = self.composer_view(column, context, palette);
-        // An open popover sits in its own row right above the composer (the
-        // empty area above gives way); a click on that area closes it.
+        // An open popover overlays the rows above the composer (drawn after
+        // them), so nothing moves when it opens; a click anywhere on those
+        // rows outside it closes it.
         let popover = self.popover_view(column, context, palette);
         let dismiss: View = if self.launch.open.is_some() {
             Border::new()
                 .grid_row(1)
+                .grid_row_span(super::picker_ui::POPOVER_ROWS)
                 .background(Brush::Solid(Color::transparent()))
                 .on_pointer_pressed(
                     context.callback(|_: PointerEventInfo| Message::Launch(LaunchMsg::Close)),
@@ -868,6 +869,9 @@ impl DesktopApp {
             View::empty()
         };
 
+        // Rows: the header, the transcript, (spare), pending requests, the
+        // notice, the composer; the popover spans the transcript to the
+        // notice.
         Grid::new()
             .rows([
                 GridLength::Auto,
@@ -876,16 +880,15 @@ impl DesktopApp {
                 GridLength::Auto,
                 GridLength::Auto,
                 GridLength::Auto,
-                GridLength::Auto,
             ])
             .children((
                 header,
                 body,
-                dismiss,
                 pending,
                 alert,
-                popover,
                 composer,
+                dismiss,
+                popover,
                 self.handoff_dialog(context),
             ))
     }

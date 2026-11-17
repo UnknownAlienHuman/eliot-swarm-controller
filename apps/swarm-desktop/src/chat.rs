@@ -908,18 +908,12 @@ impl Conversation {
                     done,
                     failed,
                 } => {
-                    let mut summary = format!("{total} tool operation(s) · {done} finished");
-                    if *failed > 0 {
-                        summary.push_str(&format!(" · {failed} not successful"));
-                    }
-                    if total > done {
-                        summary.push_str(&format!(" · {} running", total - done));
-                    }
+                    let summary = tools_summary(*total, *done, *failed);
                     let mut detail: Vec<String> = Vec::new();
                     if *total > rows.len() {
                         detail.push(format!(
-                            "… {} earlier operation(s) not listed",
-                            total - rows.len()
+                            "… {} not listed",
+                            count(total - rows.len(), "earlier tool", "earlier tools")
                         ));
                     }
                     detail.extend(rows.iter().map(|row| {
@@ -949,8 +943,12 @@ impl Conversation {
                 PartKind::Notice,
                 "Progress".to_owned(),
                 format!(
-                    "{} further progress message(s) not kept by the per-turn bound.",
-                    turn.messages_dropped
+                    "{} not kept: a turn keeps a bounded number.",
+                    count(
+                        turn.messages_dropped,
+                        "more progress message",
+                        "more progress messages"
+                    )
                 ),
                 Vec::new(),
             ));
@@ -960,7 +958,13 @@ impl Conversation {
             TurnStatus::Completed(Some(TurnOutcome::Success)) | TurnStatus::Completed(None) => {
                 "Assistant".to_owned()
             }
-            TurnStatus::Completed(Some(outcome)) => format!("Assistant · {}", outcome.as_str()),
+            TurnStatus::Completed(Some(TurnOutcome::Failure)) => "Assistant · failed".to_owned(),
+            TurnStatus::Completed(Some(TurnOutcome::Interrupted)) => {
+                "Assistant · interrupted".to_owned()
+            }
+            TurnStatus::Completed(Some(TurnOutcome::Unknown)) => {
+                "Assistant · result not confirmed".to_owned()
+            }
             TurnStatus::Unknown => "Assistant · result not confirmed".to_owned(),
             TurnStatus::Running => "Assistant · working".to_owned(),
         };
@@ -1025,6 +1029,29 @@ impl Conversation {
                 }
             })
     }
+}
+
+/// `n` and the noun in the right number: "1 tool", "3 tools".
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// A turn's tool card in words: "Ran 3 tools" once all finished well,
+/// else "3 tools · 1 running · 1 failed".
+fn tools_summary(total: usize, done: usize, failed: usize) -> String {
+    let tools = count(total, "tool", "tools");
+    let running = total.saturating_sub(done);
+    if running == 0 && failed == 0 {
+        return format!("Ran {tools}");
+    }
+    let mut parts = vec![tools];
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    parts.join(" · ")
 }
 
 #[cfg(test)]
@@ -1482,10 +1509,9 @@ mod tests {
         chat.apply_events(&events);
         let tools = &chat.items()[0].parts[1];
         assert_eq!(tools.kind, PartKind::Tools);
-        assert!(tools.text.starts_with(&format!(
-            "{} tool operation(s) · {} finished",
-            MAX_TOOL_ROWS + 10,
-            MAX_TOOL_ROWS + 10
-        )));
+        assert_eq!(tools.text, format!("Ran {} tools", MAX_TOOL_ROWS + 10));
+        assert_eq!(tools_summary(1, 1, 0), "Ran 1 tool");
+        assert_eq!(tools_summary(3, 2, 1), "3 tools · 1 running · 1 failed");
+        assert_eq!(tools_summary(2, 2, 2), "2 tools · 2 failed");
     }
 }

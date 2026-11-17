@@ -1,9 +1,10 @@
 use super::*;
 
 impl DesktopApp {
-    /// Models & Usage (Antigravity's page as the pattern): each installed
-    /// harness's remaining provider quota as rings (weekly and 5-hour where
-    /// the provider reports them), and what Swarm is running.
+    /// Models & Usage (Antigravity's page as the pattern): what Swarm runs
+    /// now, then each installed harness's limits as two-line rows (the
+    /// limit and when it refreshes) with the share left and its ring.
+    /// Storage and retention live in Advanced.
     pub(super) fn usage_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let today = today_start_ms();
         let loaded = self.nav.agents.len();
@@ -22,31 +23,20 @@ impl DesktopApp {
             None => ("…".to_owned(), "Counting…".to_owned()),
             Some(Ok(fleet)) => (
                 fleet.running.to_string(),
-                format!(
-                    "Working now or starting, of {} Agent(s) in Swarm (exact counts).",
-                    fleet.agents
-                ),
+                format!("Working or starting, of {} in Swarm", agents(fleet.agents)),
             ),
             Some(Err(error)) => (
-                "not counted".to_owned(),
-                format!("Could not count: {}", crate::state::plain_error(error)),
+                "—".to_owned(),
+                format!("Not counted: {}", crate::state::plain_error(error)),
             ),
         };
+        // Each Agent reports its whole total; Swarm has no per-day read.
         let coverage = match total {
             Some(total) if total > loaded => format!(
-                "Partial: from the {loaded} most recent Agents loaded here, of {total} in Swarm; {reporting} active today report tokens (their totals; Swarm has no per-day usage read)."
+                "Totals of {} active today, among the {loaded} most recent of {total}",
+                agents(reporting)
             ),
-            _ => format!(
-                "From all {loaded} Agent(s); {reporting} active today report tokens (their totals; Swarm has no per-day usage read)."
-            ),
-        };
-        let (retention_value, retention_note) = match fleet {
-            None => ("…".to_owned(), "Reading…".to_owned()),
-            Some(Err(_)) => (
-                "not read".to_owned(),
-                "daemon.status could not be read.".to_owned(),
-            ),
-            Some(Ok(fleet)) => retention_lines(fleet.retention.as_ref()),
+            _ => format!("Totals of {} active today", agents(reporting)),
         };
         let totals = m3::settings_card(
             palette,
@@ -67,14 +57,6 @@ impl DesktopApp {
                         m3::body(group_digits(tokens_today)).into(),
                     ),
                 ),
-                KeyedView::new(
-                    format!("retention:{retention_value}:{retention_note}"),
-                    m3::setting_row(
-                        "History retention",
-                        &retention_note,
-                        m3::body(retention_value).into(),
-                    ),
-                ),
             ],
         );
         let installed: Vec<(String, Option<String>)> = match &self.launch.catalog {
@@ -89,6 +71,7 @@ impl DesktopApp {
                 .map(|harness| ((*harness).to_owned(), None))
                 .collect(),
         };
+        let now = crate::handoff::now_ms();
         let mut cards: Vec<KeyedView> = Vec::new();
         for (harness, version) in installed {
             let label = crate::picker::harness_label(&harness);
@@ -102,12 +85,12 @@ impl DesktopApp {
             let rows: Vec<KeyedView> = match self.settings.quotas.get(&harness) {
                 None => vec![KeyedView::new(
                     "reading",
-                    m3::setting_row("Quota", "Reading…", View::empty()),
+                    m3::setting_row("Reading the limits…", "", View::empty()),
                 )],
                 Some(Err(error)) => vec![KeyedView::new(
                     "error",
                     m3::setting_row(
-                        &format!("{label}: quota not read"),
+                        "Limits not read",
                         &crate::state::plain_error(error),
                         View::empty(),
                     ),
@@ -124,19 +107,19 @@ impl DesktopApp {
                             ),
                         )]
                     } else {
-                        let now = crate::handoff::now_ms();
                         let observed = crate::quota::observed_note(reply);
                         windows
                             .iter()
                             .enumerate()
                             .map(|(index, window)| {
-                                let mut line = window.line(now);
+                                let title = format!("{} remaining", window.name());
+                                let mut note = crate::quota::sentence(&window.resets_in(now));
                                 if let Some(observed) = &observed {
-                                    line = format!("{line} · {observed}");
+                                    note = format!("{note} · {observed}");
                                 }
                                 KeyedView::new(
-                                    format!("{index}:{line}"),
-                                    m3::setting_row(&line, "", m3::ring(window.remaining as f64)),
+                                    format!("{index}:{title}:{note}:{}", window.remaining),
+                                    m3::setting_row(&title, &note, limit_value(window.remaining)),
                                 )
                             })
                             .collect()
@@ -169,7 +152,7 @@ impl DesktopApp {
                             .is_enabled(
                                 self.settings.quotas_loading == 0 && !self.settings.fleet_loading,
                             )
-                            .automation_name("Read quota again")
+                            .automation_name("Read the limits again")
                             .on_click(context.message(Message::Settings(SettingsMsg::UsageRefresh)))
                             .content(m3::label("Refresh")),
                     ),
@@ -181,6 +164,36 @@ impl DesktopApp {
                 .keyed_children(cards),
         ))
     }
+
+    /// Advanced's storage row: the store's size and what retention prunes,
+    /// from `daemon.status` (read when Advanced opens).
+    pub(super) fn storage_row(&self) -> View {
+        let (value, note) = match self.settings.fleet.as_ref() {
+            None => ("…".to_owned(), "Reading…".to_owned()),
+            Some(Err(error)) => (
+                "—".to_owned(),
+                format!("Not read: {}", crate::state::plain_error(error)),
+            ),
+            Some(Ok(fleet)) => retention_lines(fleet.retention.as_ref()),
+        };
+        m3::setting_row("Storage and history", &note, m3::body(value).into())
+    }
+}
+
+/// "1 Agent", "40 Agents".
+fn agents(count: usize) -> String {
+    format!("{count} {}", if count == 1 { "Agent" } else { "Agents" })
+}
+
+/// A limit's share left and its ring (Antigravity's rows).
+fn limit_value(remaining: i64) -> View {
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(tokens::spacing::SM)
+        .children((
+            m3::body(format!("{remaining}%")).vertical_alignment(VerticalAlignment::Center),
+            m3::ring(remaining as f64),
+        ))
 }
 
 /// `1234567` as `1,234,567`.
@@ -196,23 +209,23 @@ pub(super) fn group_digits(value: i64) -> String {
     if value < 0 { format!("-{out}") } else { out }
 }
 
-/// The retention row: the configured windows, or why they are unknown.
-/// An unreadable configuration is never shown as "unbounded".
+/// The storage row: the store's size as the value; what retention keeps,
+/// or why that could not be read, as the note. An unreadable
+/// configuration is never shown as "kept forever".
 pub(super) fn retention_lines(view: Option<&eliot_core::api::RetentionView>) -> (String, String) {
     let Some(view) = view else {
         return (
-            "not reported".to_owned(),
-            "This daemon reports no retention view.".to_owned(),
+            "—".to_owned(),
+            "This Swarm reports no storage view.".to_owned(),
         );
     };
-    let store = format!(
-        "Store {} (database and log).",
-        crate::monitor::bytes_label(Some(view.db_bytes.saturating_add(view.wal_bytes)))
-    );
+    let size = crate::monitor::bytes_label(Some(view.db_bytes.saturating_add(view.wal_bytes)));
     if let Some(error) = &view.config_error {
         return (
-            "unknown".to_owned(),
-            format!("config.toml could not be read ({error}); the windows are unknown. {store}"),
+            size,
+            format!(
+                "What history is kept could not be read: config.toml failed to load ({error})."
+            ),
         );
     }
     if view.unbounded {
@@ -222,16 +235,22 @@ pub(super) fn retention_lines(view: Option<&eliot_core::api::RetentionView>) -> 
             .map(|advisory| format!(" {advisory}."))
             .unwrap_or_default();
         return (
-            "unbounded".to_owned(),
-            format!("No daemon.retention window is set: nothing is pruned. {store}{advisory}"),
+            size,
+            format!(
+                "All history is kept: no retention window is set (daemon.retention).{advisory}"
+            ),
         );
     }
-    let window =
-        |days: Option<i64>| days.map_or_else(|| "kept".to_owned(), |days| format!("{days} d"));
+    let window = |days: Option<i64>| {
+        days.map_or_else(
+            || "kept".to_owned(),
+            |days| format!("{days} {}", if days == 1 { "day" } else { "days" }),
+        )
+    };
     (
-        "bounded".to_owned(),
+        size,
         format!(
-            "Events {}, commands {}, mail {}. {store}",
+            "History kept: events {}, commands {}, mail {}.",
             window(view.events_days),
             window(view.commands_days),
             window(view.mail_days)

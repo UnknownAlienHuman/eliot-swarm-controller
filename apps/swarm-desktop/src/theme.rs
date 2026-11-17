@@ -527,19 +527,8 @@ pub mod winui {
             })
         }
 
-        /// The access chip at Full access: the chip's outline, warning
-        /// content.
-        pub fn warning_chip(self) -> ResourceOverrides {
-            self.with(|s| {
-                Family {
-                    outline: Some(s.outline_variant),
-                    ..Family::new(None, s.warning)
-                }
-                .overrides(s)
-            })
-        }
-
-        /// The Full access row of the access menu: warning content.
+        /// The Full access row of the access menu and the new task's access
+        /// chip at Full access: warning content, no outline.
         pub fn warning_row(self) -> ResourceOverrides {
             self.with(|s| Family::new(None, s.warning).overrides(s))
         }

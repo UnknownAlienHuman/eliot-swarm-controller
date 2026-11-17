@@ -1034,6 +1034,8 @@ impl DesktopApp {
                 self.load_fleet(context);
             }
             Page::Worktrees => self.load_worktrees(context),
+            // Storage and history (the store's size, retention).
+            Page::Advanced => self.load_fleet(context),
             _ => {}
         }
     }
@@ -1309,24 +1311,29 @@ mod tests {
             size_advisory: None,
             config_error: Some("profile_error: config.toml: bad".to_owned()),
         };
+        let size = crate::monitor::bytes_label(Some(1024));
         let (value, note) = retention_lines(Some(&view));
-        assert_eq!(value, "unknown");
-        assert!(note.contains("config.toml could not be read (profile_error: config.toml: bad)"));
-        assert!(!note.contains("nothing is pruned"));
+        assert_eq!(value, size);
+        assert!(note.contains("config.toml failed to load (profile_error: config.toml: bad)"));
+        assert!(!note.contains("All history is kept"));
         let unset = eliot_core::api::RetentionView {
             unbounded: true,
             config_error: None,
             ..view.clone()
         };
-        assert_eq!(retention_lines(Some(&unset)).0, "unbounded");
+        assert!(
+            retention_lines(Some(&unset))
+                .1
+                .starts_with("All history is kept")
+        );
         let bounded = eliot_core::api::RetentionView {
             events_days: Some(30),
             config_error: None,
             ..view
         };
         let (value, note) = retention_lines(Some(&bounded));
-        assert_eq!(value, "bounded");
-        assert!(note.starts_with("Events 30 d, commands kept, mail kept."));
+        assert_eq!(value, size);
+        assert!(note.starts_with("History kept: events 30 days, commands kept, mail kept."));
     }
 
     fn read_with(revision: &str, routing: Value, desktop: Value) -> SettingsReadResponse {
