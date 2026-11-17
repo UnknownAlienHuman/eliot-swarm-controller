@@ -30,15 +30,17 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F, VK_K, VK_LEFT, VK_M, VK_N, VK_OEM_COMMA,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    GetActiveWindow, GetKeyState, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F, VK_K, VK_LEFT, VK_M, VK_N,
+    VK_OEM_COMMA, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, HC_ACTION, MSG, PM_REMOVE, SetWindowsHookExW, WH_GETMESSAGE, WH_KEYBOARD,
-    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NCLBUTTONDOWN, WM_POINTERDOWN, WM_RBUTTONDOWN,
+    CallNextHookEx, GetCursorPos, HC_ACTION, MSG, PM_REMOVE, SetWindowsHookExW, WH_GETMESSAGE,
+    WH_KEYBOARD, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_NCLBUTTONDOWN, WM_POINTERDOWN, WM_RBUTTONDOWN,
 };
 
 /// A key of an open popover.
@@ -86,6 +88,7 @@ pub enum Popover {
     Picker = 1,
     Menu = 2,
     Panel = 3,
+    Dialog = 4,
 }
 
 /// How the last input arrived.
@@ -206,6 +209,24 @@ pub fn install() -> Result<Receiver<Shortcut>, String> {
     Ok(receiver)
 }
 
+/// Current pointer in this UI thread's window DIPs, for a task's ⋯ button.
+pub fn pointer_position() -> (f64, f64) {
+    // SAFETY: the UI thread owns the active window; these calls only read
+    // the cursor and convert its screen coordinates to that window.
+    unsafe {
+        let window = GetActiveWindow();
+        let mut point = POINT::default();
+        if window.is_null()
+            || GetCursorPos(&mut point) == 0
+            || ScreenToClient(window, &mut point) == 0
+        {
+            return (16.0, 80.0);
+        }
+        let scale = 96.0 / f64::from(GetDpiForWindow(window).max(96));
+        (f64::from(point.x) * scale, f64::from(point.y) * scale)
+    }
+}
+
 /// The chord of a key with the modifiers held now.
 fn chord(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<Shortcut> {
     if !ctrl || shift || alt {
@@ -224,6 +245,9 @@ fn chord(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<Shortcut> {
 fn popover_key(popover: u8, key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<PopoverKey> {
     if popover == Popover::None as u8 || alt {
         return None;
+    }
+    if popover == Popover::Dialog as u8 {
+        return (key == VK_ESCAPE && !ctrl && !shift).then_some(PopoverKey::Escape);
     }
     if key == VK_TAB && !ctrl {
         // A panel's own controls take Tab; elsewhere it returns to the composer.

@@ -54,6 +54,7 @@ use windows_reactor::*;
 mod automation_ui;
 mod chat_ui;
 mod configure_ui;
+mod dialog_ui;
 mod handoff_ui;
 mod launch_ui;
 mod menu_ui;
@@ -205,6 +206,9 @@ type RulePage = (Vec<RuleListEntry>, bool);
 /// Messages are plain owned data so background workers can return them.
 #[derive(Clone, Debug)]
 enum Message {
+    DialogFocus(u64, u8),
+    DialogFocusFallback(u64, u8),
+    DialogClosed(u64),
     Shell(ShellMsg),
     Launch(LaunchMsg),
     Chat(ChatMsg),
@@ -270,6 +274,7 @@ struct DesktopApp {
     appearance: shell_ui::Appearance,
     /// The palette the title bar was last colored in (`None`: not yet).
     title_bar: Option<theme::winui::Palette>,
+    dialog: dialog_ui::Focus,
     /// The `[desktop]` preferences (theme, what opens at start).
     prefs: crate::settings::Preferences,
     /// A preferences write is running (see `save_preferences`).
@@ -567,6 +572,7 @@ impl Component for DesktopApp {
             alert: None,
             appearance: shell_ui::Appearance::new(),
             title_bar: None,
+            dialog: dialog_ui::Focus::default(),
             prefs: crate::settings::Preferences::default(),
             prefs_saving: false,
             prefs_rev: 0,
@@ -674,6 +680,15 @@ impl Component for DesktopApp {
 
     fn update(&mut self, message: Message, context: &ComponentContext<Self>) {
         match message {
+            Message::DialogClosed(epoch) => {
+                if self.dialog.epoch == epoch {
+                    self.dialog_key(crate::shortcuts::PopoverKey::Escape, context);
+                }
+            }
+            Message::DialogFocusFallback(epoch, tries) => {
+                self.focus_dialog_close(epoch, tries, context)
+            }
+            Message::DialogFocus(epoch, tries) => self.focus_dialog(epoch, tries, context),
             Message::Shell(msg) => self.shell_update(msg, context),
             Message::Launch(msg) => self.launch_update(msg, context),
             Message::Chat(msg) => self.chat_update(msg, context),
@@ -687,6 +702,7 @@ impl Component for DesktopApp {
             Message::Menu(msg) => self.menu_update(msg, context),
             Message::Move(msg) => self.move_update(msg, context),
         }
+        self.sync_dialog(context);
     }
 
     fn view(&self, _input: &DesktopInput, context: &mut ViewContext<Self>) -> View {

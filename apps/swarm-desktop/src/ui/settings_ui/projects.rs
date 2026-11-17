@@ -125,48 +125,20 @@ impl DesktopApp {
                 .margin(Thickness::uniform(tokens::spacing::SM)),
             ));
         }
-        let add = m3::group(
+        let add = m3::settings_card(
             palette,
-            vec![
-                KeyedView::new(
-                    "id",
-                    m3::form_row(
-                        "Project id",
-                        m3::field()
-                            .text(self.settings.new_project_id.clone())
-                            .placeholder_text("Letters, digits, - and _")
-                            .automation_name("New project id")
-                            .on_text_changed(context.callback(|text| {
-                                Message::Settings(SettingsMsg::NewProjectId(text))
-                            }))
-                            .into(),
-                        None,
-                    ),
+            vec![KeyedView::new(
+                "browse",
+                m3::setting_row(
+                    "Checkout folder",
+                    "Choose a folder to add and save the project.",
+                    m3::filled(palette)
+                        .automation_name("Browse to add a project")
+                        .is_enabled(!self.settings.busy())
+                        .on_click(context.message(Message::Settings(SettingsMsg::ProjectBrowse)))
+                        .content(m3::icon_label(m3::glyph::OPEN_FOLDER, "Browse…")),
                 ),
-                KeyedView::new(
-                    "path",
-                    m3::form_row(
-                        "Checkout folder",
-                        m3::field()
-                            .text(self.settings.new_project_path.clone())
-                            .placeholder_text("C:\\path\\to\\checkout")
-                            .automation_name("New project folder")
-                            .on_text_changed(context.callback(|text| {
-                                Message::Settings(SettingsMsg::NewProjectPath(text))
-                            }))
-                            .into(),
-                        Some(
-                            m3::outlined(palette)
-                                .is_enabled(!self.settings.new_project_id.trim().is_empty())
-                                .automation_name("Add project")
-                                .on_click(
-                                    context.message(Message::Settings(SettingsMsg::ProjectAdded)),
-                                )
-                                .content(m3::label("Add")),
-                        ),
-                    ),
-                ),
-            ],
+            )],
         );
         StackPanel::new().spacing(tokens::spacing::MD).children((
             m3::list(palette, rows),

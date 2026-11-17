@@ -10,7 +10,11 @@ impl DesktopApp {
         // A task title when Swarm knows one (else the item keeps its id).
         let title = |agent: &str| {
             let title = self.agent_title(agent);
-            (title != agent).then_some(title)
+            self.prefs
+                .display_name(&format!("agent:{agent}"))
+                .map(str::to_owned)
+                .or_else(|| state.cleanup_titles.get(agent).cloned())
+                .or_else(|| (title != agent).then_some(title))
         };
         let mut parts: Vec<KeyedView> = Vec::new();
         if state.cleanup_busy {
@@ -105,6 +109,28 @@ impl DesktopApp {
                 };
                 let mut rows: Vec<KeyedView> =
                     vec![KeyedView::new(format!("header:{checked}"), header)];
+                let expanded = state.cleanup_open.contains(&group);
+                rows.push(KeyedView::new(
+                    format!("expand:{expanded}"),
+                    m3::sub_row(palette, false)
+                        .automation_name(format!(
+                            "{} items ({})",
+                            group.title(),
+                            if expanded { "shown" } else { "hidden" }
+                        ))
+                        .on_click(
+                            context.message(Message::Settings(SettingsMsg::CleanupExpanded(group))),
+                        )
+                        .content(m3::icon_label(
+                            if expanded {
+                                m3::glyph::CHEVRON_DOWN
+                            } else {
+                                m3::glyph::CHEVRON_RIGHT
+                            },
+                            "Review items",
+                        )),
+                ));
+                let mut details = Vec::new();
                 let item_row = |item: &eliot_core::api::CleanupCandidate| {
                     let (name, line) =
                         crate::worktrees::item_line(item, title(&item.artifact.agent).as_deref());
@@ -121,11 +147,11 @@ impl DesktopApp {
                 // What Remove takes comes first; the kept items fold under
                 // one "N kept" row.
                 let (removable, kept_items) = view.split();
-                rows.extend(removable.iter().map(|item| item_row(item)));
+                details.extend(removable.iter().map(|item| item_row(item)));
                 if !kept_items.is_empty() {
                     let open = state.cleanup_kept_open.contains(&group);
                     let label = format!("{} kept", kept_items.len());
-                    rows.push(KeyedView::new(
+                    details.push(KeyedView::new(
                         format!("kept:{open}"),
                         m3::sub_row(palette, false)
                             .automation_name(format!(
@@ -150,8 +176,21 @@ impl DesktopApp {
                             )),
                     ));
                     if open {
-                        rows.extend(kept_items.iter().map(|item| item_row(item)));
+                        details.extend(kept_items.iter().map(|item| item_row(item)));
                     }
+                }
+                if expanded {
+                    rows.push(KeyedView::new(
+                        "items",
+                        ScrollViewer::new()
+                            .max_height(240.0)
+                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                            .content(
+                                StackPanel::new()
+                                    .spacing(tokens::spacing::SM)
+                                    .keyed_children(details),
+                            ),
+                    ));
                 }
                 parts.push(KeyedView::new(
                     format!("group:{group:?}"),
@@ -171,67 +210,78 @@ impl DesktopApp {
                     .text_wrapping(TextWrapping::Wrap),
                 ));
             }
-            let selected = crate::worktrees::selected_artifacts(plan, &state.cleanup_unchecked);
-            let bytes: u64 = plan
-                .items
-                .iter()
-                .filter(|item| selected.contains(&item.artifact.id))
-                .filter_map(|item| item.bytes)
-                .sum();
-            let what = format!(
-                "{}, {}",
-                eliot_core::count_words(selected.len() as u64, "item", "items"),
-                crate::worktrees::size_words(bytes)
-            );
-            if state.cleanup_confirm {
-                parts.push(KeyedView::new(
-                    "confirm",
-                    m3::card_high(palette)
-                        .automation_name("Confirm cleanup")
-                        .content(
-                            StackPanel::new().spacing(tokens::spacing::SM).children((
-                                m3::body(format!(
-                                    "Remove {what}? This cannot be undone. Kept items stay; Swarm checks each item again before removing it."
-                                ))
-                                .text_wrapping(TextWrapping::Wrap),
-                                StackPanel::new()
-                                    .orientation(Orientation::Horizontal)
-                                    .spacing(tokens::spacing::SM)
-                                    .children((
-                                        m3::destructive(palette)
-                                            .automation_name(format!("Remove: {what}"))
-                                            .on_click(context.message(Message::Settings(
-                                                SettingsMsg::CleanupConfirmed(true),
-                                            )))
-                                            .content(m3::label("Remove")),
-                                        m3::text_button(palette)
-                                            .automation_name("Cancel cleanup")
-                                            .on_click(context.message(Message::Settings(
-                                                SettingsMsg::CleanupConfirmed(false),
-                                            )))
-                                            .content(m3::label("Cancel")),
-                                    )),
-                            )),
-                        ),
-                ));
-            } else if !groups.is_empty() {
-                parts.push(KeyedView::new(
-                    "apply",
-                    m3::destructive(palette)
-                        .automation_name(format!("Remove selected: {what}"))
-                        .is_enabled(!state.cleanup_busy && !selected.is_empty())
-                        .on_click(context.message(Message::Settings(SettingsMsg::CleanupApply)))
-                        .content(m3::label(&if selected.is_empty() {
-                            "Nothing selected".to_owned()
-                        } else {
-                            format!("Remove {what}")
-                        })),
-                ));
-            }
         }
         StackPanel::new()
             .spacing(tokens::spacing::SM)
             .keyed_children(parts)
+    }
+
+    /// Kept outside the page scroller: selection and Remove never scroll away.
+    pub(super) fn cleanup_actions(
+        &self,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let state = &self.settings;
+        let Some(plan) = &state.cleanup_plan else {
+            return View::empty();
+        };
+        let groups = crate::worktrees::cleanup_groups(plan);
+        let mut parts = Vec::new();
+        let selected = crate::worktrees::selected_artifacts(plan, &state.cleanup_unchecked);
+        let bytes: u64 = plan
+            .items
+            .iter()
+            .filter(|item| selected.contains(&item.artifact.id))
+            .filter_map(|item| item.bytes)
+            .sum();
+        let what = format!(
+            "{}, {}",
+            eliot_core::count_words(selected.len() as u64, "item", "items"),
+            crate::worktrees::size_words(bytes)
+        );
+        if !groups.is_empty() {
+            parts.push(KeyedView::new(
+                "apply",
+                m3::destructive(palette)
+                    .automation_name(format!("Remove selected: {what}"))
+                    .is_enabled(!state.cleanup_busy && !selected.is_empty())
+                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupApply)))
+                    .content(m3::label(&if selected.is_empty() {
+                        "Nothing selected".to_owned()
+                    } else {
+                        format!("Remove {what}")
+                    })),
+            ));
+        }
+        m3::card_high(palette)
+            .width(self.settings_column_width())
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .margin(Thickness::uniform(tokens::spacing::SM))
+            .content(
+                StackPanel::new()
+                    .spacing(tokens::spacing::SM)
+                    .keyed_children(parts),
+            )
+    }
+
+    pub(in crate::ui) fn cleanup_confirmation(
+        &self,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let Some(plan) = &self.settings.cleanup_plan else {
+            return View::empty();
+        };
+        let selected = crate::worktrees::selected_artifacts(plan, &self.settings.cleanup_unchecked);
+        super::super::dialog_ui::surface(context, self.dialog.epoch, palette, "Remove selected items?".to_owned(),
+            m3::body(format!("Remove {}? This cannot be undone. Kept items stay; Swarm checks each item again before removing it.",
+                eliot_core::count_words(selected.len() as u64, "item", "items"))).text_wrapping(TextWrapping::Wrap).into(),
+            super::super::dialog_ui::actions(
+                m3::text_button(palette).element_ref(&self.dialog.close).automation_name("Cancel cleanup")
+                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(false)))).content(m3::label("Cancel")),
+                m3::destructive(palette).element_ref(&self.dialog.primary).is_enabled(!self.settings.cleanup_busy && !selected.is_empty()).automation_name("Confirm Remove")
+                    .on_click(context.message(Message::Settings(SettingsMsg::CleanupConfirmed(true)))).content(m3::label("Remove"))), 420.0)
     }
 
     /// Worktrees & cleanup (Codex's Worktrees page as the pattern): where

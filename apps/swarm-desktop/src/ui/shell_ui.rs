@@ -33,6 +33,7 @@ pub(super) enum Panel {
 
 #[derive(Clone, Debug)]
 pub(super) enum ShellMsg {
+    AutoSettings,
     /// The daemon runs (started when needed), the opened checkout was
     /// discovered, and the settings were read.
     DaemonReady(Fallible<(Option<String>, eliot_core::api::SettingsReadResponse)>),
@@ -220,6 +221,10 @@ pub(super) struct Search {
 impl DesktopApp {
     pub(super) fn shell_update(&mut self, msg: ShellMsg, context: &ComponentContext<Self>) {
         match msg {
+            ShellMsg::AutoSettings => {
+                self.close_popover();
+                self.open_settings(Some(Page::Routing), context);
+            }
             ShellMsg::DaemonReady(result) => match result {
                 Ok((discovered, read)) => {
                     self.startup_error = false;
@@ -572,6 +577,10 @@ impl DesktopApp {
             }
             ShellMsg::Shortcut(shortcut) => {
                 match shortcut {
+                    Shortcut::Popover(key) if self.dialog_kind() != 0 => {
+                        self.dialog_key(key, context)
+                    }
+                    _ if self.dialog_kind() != 0 => {}
                     Shortcut::NewTask => self.new_task(context),
                     Shortcut::Search => self.focus_search(SEARCH_FOCUS_TRIES, context),
                     Shortcut::Settings => self.open_settings(None, context),
@@ -1211,7 +1220,15 @@ impl DesktopApp {
             ));
         // One cell: the window, and over it the right-click menu or the
         // confirmation dialog.
-        let window = Grid::new().children((columns_grid, self.menu_overlay(context, palette)));
+        let overlay = if self.handoff.open {
+            self.handoff_dialog(context)
+        } else if self.settings.cleanup_confirm {
+            self.cleanup_confirmation(context, palette)
+        } else {
+            self.task_dialog(context, palette)
+        };
+        let window =
+            Grid::new().children((columns_grid, self.menu_overlay(context, palette), overlay));
         // Reactor updates a Button's resource overrides in place, but WinUI
         // resolves a template's ThemeResource values only when the template
         // is applied or the theme changes, and the theme change arrives before
@@ -1734,33 +1751,96 @@ impl DesktopApp {
                 .into(),
             None => View::empty(),
         };
-        Grid::new()
-            .margin(Thickness::new(row.depth as f64 * indent, 0.0, 0.0, 0.0))
-            .columns([GridLength::Pixel(indent), GridLength::STAR])
-            .rows([GridLength::Auto, GridLength::Auto])
-            .children((
-                Border::new()
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .content(chevron),
-                m3::sub_row(palette, selected)
-                    .grid_column(1)
-                    .automation_name(name)
-                    .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
-                    .content(m3::row_content(
-                        None,
-                        title,
-                        "",
-                        row_tag(
-                            if agent.archived {
-                                "archived"
-                            } else {
-                                row.place.as_deref().unwrap_or("")
-                            },
-                            task_dot(palette, agent),
-                        ),
-                    )),
-                note,
+        let quick = if agent.native_child {
+            None
+        } else if agent.live() {
+            Some((super::menu_ui::Action::Stop, "Stop", m3::glyph::STOP))
+        } else if agent.state == eliot_core::AgentState::Lost {
+            Some((super::menu_ui::Action::Resume, "Resume", m3::glyph::RESUME))
+        } else if !agent.archived {
+            Some((
+                super::menu_ui::Action::Archive(true),
+                "Archive",
+                m3::glyph::ARCHIVE,
             ))
+        } else {
+            None
+        };
+        let over = self.menu.hovered.as_deref() == Some(agent.id.as_str()) || selected;
+        let quick: View = if over {
+            quick
+                .map(|(action, label, glyph)| {
+                    m3::icon_button(palette)
+                        .width(tokens::height::SUB_ROW)
+                        .height(tokens::height::SUB_ROW)
+                        .automation_name(format!("{label} {title}"))
+                        .on_click(
+                            context.message(Message::Menu(MenuMsg::Quick(agent.clone(), action))),
+                        )
+                        .content(m3::icon(glyph))
+                        .tooltip(label)
+                })
+                .unwrap_or_else(View::empty)
+        } else {
+            View::empty()
+        };
+        let actions = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .children((
+                quick,
+                m3::icon_button(palette)
+                    .width(tokens::height::SUB_ROW)
+                    .height(tokens::height::SUB_ROW)
+                    .automation_name(format!("Actions for {title}"))
+                    .on_click(context.message(Message::Menu(MenuMsg::TaskOpened(agent.clone()))))
+                    .content(m3::icon(m3::glyph::MORE))
+                    .tooltip("Task actions"),
+            ));
+        Border::new()
+            .on_pointer_entered(context.callback({
+                let id = agent.id.clone();
+                move |_: PointerEventInfo| Message::Menu(MenuMsg::Hovered(Some(id.clone())))
+            }))
+            .on_pointer_exited(
+                context.callback(|_: PointerEventInfo| Message::Menu(MenuMsg::Hovered(None))),
+            )
+            .content(
+                Grid::new()
+                    .margin(Thickness::new(row.depth as f64 * indent, 0.0, 0.0, 0.0))
+                    .columns([
+                        GridLength::Pixel(indent),
+                        GridLength::STAR,
+                        GridLength::Auto,
+                    ])
+                    .rows([GridLength::Auto, GridLength::Auto])
+                    .children((
+                        Border::new()
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .content(chevron),
+                        m3::sub_row(palette, selected)
+                            .grid_column(1)
+                            .automation_name(name)
+                            .on_click(
+                                context
+                                    .message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))),
+                            )
+                            .content(m3::row_content(
+                                None,
+                                title,
+                                "",
+                                row_tag(
+                                    if agent.archived {
+                                        "archived"
+                                    } else {
+                                        row.place.as_deref().unwrap_or("")
+                                    },
+                                    task_dot(palette, agent),
+                                ),
+                            )),
+                        note,
+                        Border::new().grid_column(2).content(actions),
+                    )),
+            )
     }
 
     /// One task or chat row: its right-click menu, or the rename editor.

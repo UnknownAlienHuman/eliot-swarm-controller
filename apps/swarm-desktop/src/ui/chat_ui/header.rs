@@ -9,6 +9,20 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
     ) {
         let bound = BoundAction::agent_control(&binding.agent, binding.generation);
+        if let Some(mut agent) = self.find_agent(&binding.agent).cloned() {
+            agent.generation = binding.generation;
+            let target = menu_ui::Target::Agent(agent);
+            if let Some((action, _, _, _)) = self
+                .menu_entries(&target)
+                .into_iter()
+                .chain(self.developer_entries(&target))
+                .find(|(_, name, _, _)| name == label)
+            {
+                self.menu_action(target, action, context);
+                return;
+            }
+        }
+
         match label {
             MENU_DETAILS => self.show_details(&binding.agent, context),
             MENU_MOVE => {
@@ -116,29 +130,37 @@ impl DesktopApp {
                         | eliot_core::AgentState::Lost
                 );
                 let controllable = !detail.observe_only;
-                let mut items = vec![
-                    MenuItem::item("details", MENU_DETAILS),
-                    MenuItem::separator("s1"),
-                ];
+                let task = self
+                    .find_agent(agent)
+                    .map(|agent| menu_ui::Target::Agent(agent.clone()));
+                let mut items: Vec<MenuItem> = task
+                    .as_ref()
+                    .map(|target| {
+                        self.menu_entries(target)
+                            .into_iter()
+                            .filter(|(action, _, _, _)| *action != menu_ui::Action::More)
+                            .map(|(_, label, _, _)| MenuItem::item(label.clone(), label))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut more = vec![MenuItem::item("details", MENU_DETAILS)];
                 if !self.submitting() {
-                    items.push(MenuItem::item("handoff", MENU_HANDOFF));
-                    if controllable {
-                        items.push(MenuItem::item("move", MENU_MOVE));
-                    }
-                    if controllable && ended && detail.active_turn.is_none() {
-                        items.push(MenuItem::item("resume", MENU_RESUME));
-                    }
+                    more.push(MenuItem::item("handoff", MENU_HANDOFF));
                     if detail.observe_only {
-                        items.push(MenuItem::item("detach", MENU_DETACH));
+                        more.push(MenuItem::item("detach", MENU_DETACH));
                     }
                     if controllable && !ended {
-                        items.push(MenuItem::separator("s2"));
-                        items.push(MenuItem::item("stop", MENU_STOP));
-                        items.push(MenuItem::item("force", MENU_FORCE));
+                        more.push(MenuItem::item("force", MENU_FORCE));
                     }
-                } else {
-                    items.push(MenuItem::disabled("busy", "Waiting for the last action…"));
                 }
+                if let Some(target) = &task {
+                    more.extend(
+                        self.developer_entries(target)
+                            .into_iter()
+                            .map(|(_, label, _, _)| MenuItem::item(label.clone(), label)),
+                    );
+                }
+                items.push(MenuItem::submenu("more", "More", more));
                 m3::icon_button(palette)
                     .automation_name("More actions")
                     .content(m3::toolbar_icon(m3::glyph::MORE))
