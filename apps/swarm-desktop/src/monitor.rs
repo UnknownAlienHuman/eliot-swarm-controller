@@ -799,7 +799,7 @@ impl Monitor {
         }
         self.losses
             .get(&(row.id.clone(), row.generation))
-            .and_then(|summary| diagnosis_line(summary))
+            .and_then(diagnosis_line)
     }
 
     /// Lost or failed generations shown whose loss origin is not read yet,

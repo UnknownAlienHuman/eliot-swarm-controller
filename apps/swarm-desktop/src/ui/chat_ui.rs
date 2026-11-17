@@ -21,7 +21,9 @@ use crate::theme::winui::Palette;
 #[derive(Clone, Debug)]
 pub(super) enum ChatMsg {
     ComposerChanged(String),
-    AnswerChanged(String, String),
+    AnswerChanged(String, String, Vec<String>),
+    AnswerUnchanged,
+    AnswerOptionChanged(String, String, String, bool),
     SnapshotLoaded(u64, eliot_core::Result<Box<Snapshot>>),
     Delivered(u64, eliot_core::Result<Option<Box<Delivery>>>),
     BackoffDone(u64, bool),
@@ -227,7 +229,7 @@ pub(super) struct ChatState {
     pub(super) opened_from_search: bool,
     // Mutations.
     pub(super) drafts: DraftStore,
-    pub(super) answers: HashMap<String, String>,
+    pub(super) answers: HashMap<String, eliot_core::requests::Answers>,
     /// The Force stop awaiting confirmation, bound at its menu click, with
     /// the title shown in the question.
     pub(super) confirm_force: Option<(BoundAction, String)>,
@@ -269,8 +271,30 @@ impl DesktopApp {
                     self.launch.launch_rev = self.launch.launch_rev.wrapping_add(1);
                 }
             }
-            ChatMsg::AnswerChanged(request, text) => {
-                self.chat.answers.insert(request, text);
+            ChatMsg::AnswerUnchanged => {}
+            ChatMsg::AnswerChanged(request, question, values) => {
+                let answers = self.chat.answers.entry(request).or_default();
+                if values.is_empty() {
+                    answers.remove(&question);
+                } else if values != [""] || answers.contains_key(&question) {
+                    answers.insert(question, eliot_core::requests::Answer { answers: values });
+                }
+            }
+            ChatMsg::AnswerOptionChanged(request, question, option, selected) => {
+                let answers = self.chat.answers.entry(request).or_default();
+                let values = &mut answers
+                    .entry(question.clone())
+                    .or_insert_with(|| eliot_core::requests::Answer {
+                        answers: Vec::new(),
+                    })
+                    .answers;
+                values.retain(|value| value != &option);
+                if selected {
+                    values.push(option);
+                }
+                if values.is_empty() {
+                    answers.remove(&question);
+                }
             }
             ChatMsg::SnapshotLoaded(epoch, result) => {
                 if epoch != self.chat.epoch {
@@ -488,7 +512,7 @@ impl DesktopApp {
                     // other cause stays in Agent details ("What went wrong").
                     let words = summary
                         .ok()
-                        .filter(|summary| monitor::restart_loss(summary))
+                        .filter(monitor::restart_loss)
                         .map(|_| monitor::RESTART_LOSS_WORDS.to_owned());
                     self.chat.loss = Some((agent, generation, words));
                 }
@@ -619,13 +643,8 @@ impl DesktopApp {
                     .get(request.binding.request.as_deref().unwrap_or_default())
                     .cloned()
                     .unwrap_or_default();
-                let answers = match serde_json::from_str::<serde_json::Value>(&answer) {
-                    Ok(answers) if answers.is_object() => answers,
-                    _ => {
-                        self.alert("Answers must be a JSON object keyed by question id.");
-                        return;
-                    }
-                };
+                let answers = serde_json::to_value(&answer).expect("answer map encodes");
+                let answer = answers.to_string();
                 // The payload is part of the action: edited answers are a new
                 // action with a new id, never a same-id retry with other data.
                 let key = format!(
@@ -1729,70 +1748,99 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let pending_rows: Vec<KeyedView> = self
-            .chat
-            .detail
-            .as_ref()
-            .map(|detail| detail.pending.as_slice())
-            .unwrap_or_default()
-            .iter()
-            .map(|request| {
-                let key = request.binding.request.clone().unwrap_or_default();
-                let answer_box = m3::field()
-                    .text(self.chat.answers.get(&key).cloned().unwrap_or_default())
-                    .placeholder_text("{\"question\": {\"answers\": [\"…\"]}}")
-                    .automation_name("Answer JSON")
-                    .on_text_changed({
-                        let key = key.clone();
-                        context.callback(move |text: String| {
-                            Message::Chat(ChatMsg::AnswerChanged(key.clone(), text))
-                        })
+        let pending_rows: Vec<KeyedView> =
+            self.chat
+                .detail
+                .as_ref()
+                .map(|detail| detail.pending.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(|request| {
+                    let key = request.binding.request.clone().unwrap_or_default();
+                    let questions = request.questions.iter().map(|question| {
+                        KeyedView::new(
+                            question.id.clone(),
+                            self.question_view(&key, question, context),
+                        )
                     });
-                let (fill, on) = palette.attention();
-                KeyedView::new(
-                    key,
-                    Border::new()
-                        .background(fill)
-                        .corner_radius(tokens::radius::CONTAINER)
-                        .padding(Thickness::uniform(tokens::spacing::MD))
-                        .content(
-                            StackPanel::new().spacing(tokens::spacing::SM).children((
-                                m3::section_title(format!("The Agent asks: {}", request.kind))
+                    let answer_box: View = StackPanel::new()
+                        .spacing(tokens::spacing::SM)
+                        .keyed_children(questions.collect::<Vec<_>>());
+                    let mut actions = vec![KeyedView::new(
+                        "cancel",
+                        m3::outlined(palette)
+                            .is_enabled(!self.submitting())
+                            .on_click(context.message(Message::Chat(ChatMsg::ApprovalRequested(
+                                request.clone(),
+                                false,
+                            ))))
+                            .content(m3::label(if request.kind == "approval" {
+                                "Deny"
+                            } else {
+                                "Cancel request"
+                            })),
+                    )];
+                    if request.kind == "approval" {
+                        actions.insert(
+                            0,
+                            KeyedView::new(
+                                "approve",
+                                m3::filled(palette)
+                                    .is_enabled(!self.submitting())
+                                    .on_click(context.message(Message::Chat(
+                                        ChatMsg::ApprovalRequested(request.clone(), true),
+                                    )))
+                                    .content(m3::label("Approve")),
+                            ),
+                        );
+                    } else if request.kind == "question" {
+                        actions.push(KeyedView::new(
+                            "answer",
+                            m3::text_button(palette)
+                                .is_enabled(
+                                    !self.submitting()
+                                        && request.questions.iter().any(|question| {
+                                            !question.is_secret
+                                                && question.kind
+                                                    != eliot_core::requests::QuestionKind::Resource
+                                        }),
+                                )
+                                .on_click(context.message(Message::Chat(ChatMsg::AnswerRequested(
+                                    request.clone(),
+                                ))))
+                                .content(m3::label("Answer")),
+                        ));
+                    }
+                    let (fill, on) = palette.attention();
+                    KeyedView::new(
+                        key,
+                        Border::new()
+                            .background(fill)
+                            .corner_radius(tokens::radius::CONTAINER)
+                            .padding(Thickness::uniform(tokens::spacing::MD))
+                            .content(
+                                StackPanel::new().spacing(tokens::spacing::SM).children((
+                                    m3::section_title(if request.kind == "approval" {
+                                        "Permission requested"
+                                    } else {
+                                        "Your answer is needed"
+                                    })
                                     .foreground(on),
-                                TextBlock::new()
-                                    .text(request.summary.clone())
-                                    .foreground(on)
-                                    .text_wrapping(TextWrapping::Wrap)
-                                    .is_text_selection_enabled(true),
-                                answer_box,
-                                StackPanel::new()
-                                    .orientation(Orientation::Horizontal)
-                                    .spacing(tokens::spacing::SM)
-                                    .children((
-                                        m3::filled(palette)
-                                            .is_enabled(!self.submitting())
-                                            .on_click(context.message(Message::Chat(
-                                                ChatMsg::ApprovalRequested(request.clone(), true),
-                                            )))
-                                            .content(m3::label("Approve")),
-                                        m3::outlined(palette)
-                                            .is_enabled(!self.submitting())
-                                            .on_click(context.message(Message::Chat(
-                                                ChatMsg::ApprovalRequested(request.clone(), false),
-                                            )))
-                                            .content(m3::label("Deny")),
-                                        m3::text_button(palette)
-                                            .is_enabled(!self.submitting())
-                                            .on_click(context.message(Message::Chat(
-                                                ChatMsg::AnswerRequested(request.clone()),
-                                            )))
-                                            .content(m3::label("Answer")),
-                                    )),
-                            )),
-                        ),
-                )
-            })
-            .collect();
+                                    TextBlock::new()
+                                        .text(request.summary.clone())
+                                        .foreground(on)
+                                        .text_wrapping(TextWrapping::Wrap)
+                                        .is_text_selection_enabled(true),
+                                    answer_box,
+                                    StackPanel::new()
+                                        .orientation(Orientation::Horizontal)
+                                        .spacing(tokens::spacing::SM)
+                                        .keyed_children(actions),
+                                )),
+                            ),
+                    )
+                })
+                .collect();
         StackPanel::new()
             .grid_row(3)
             .spacing(tokens::spacing::SM)
@@ -1800,6 +1848,110 @@ impl DesktopApp {
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
             .keyed_children(pending_rows)
+    }
+
+    /// Controls keep the universal string-list answer shape. The plugin still
+    /// validates against the retained native offer immediately before writing.
+    fn question_view(
+        &self,
+        request: &str,
+        question: &eliot_core::requests::Question,
+        context: &mut ViewContext<Self>,
+    ) -> View {
+        use eliot_core::requests::QuestionKind;
+        let values = self
+            .chat
+            .answers
+            .get(request)
+            .and_then(|answers| answers.get(&question.id))
+            .map(|answer| answer.answers.clone())
+            .unwrap_or_default();
+        let request = request.to_owned();
+        let id = question.id.clone();
+        let changed = {
+            let request = request.clone();
+            let id = id.clone();
+            move |values| Message::Chat(ChatMsg::AnswerChanged(request.clone(), id.clone(), values))
+        };
+        let omit: View = if values.is_empty() {
+            View::empty()
+        } else {
+            Button::new()
+                .on_click(context.message(Message::Chat(ChatMsg::AnswerChanged(
+                    request.clone(),
+                    id.clone(),
+                    Vec::new(),
+                ))))
+                .content(m3::label("Leave unanswered"))
+        };
+        let control: View = if question.is_secret {
+            m3::label("Answer this confidential question in the Agent's native application.").into()
+        } else {
+            match question.kind {
+            QuestionKind::Resource => m3::label("This step needs action in the native application. You can cancel this request here.").into(),
+            QuestionKind::Number | QuestionKind::Text => {
+                let before = values.first().cloned().unwrap_or_default();
+                m3::field().text(before.clone())
+                    .placeholder_text(if question.kind == QuestionKind::Number { "Enter a number" } else { "Your answer" })
+                    .automation_name(if question.kind == QuestionKind::Number { "Number answer" } else { "Text answer" })
+                    .on_text_changed(context.callback(move |text| if text == before {
+                        Message::Chat(ChatMsg::AnswerUnchanged)
+                    } else { changed(vec![text]) })).into()
+            },
+            QuestionKind::Boolean | QuestionKind::Single => {
+                let options: Vec<(String, String)> = if question.kind == QuestionKind::Boolean {
+                    vec![("true".to_owned(), "Yes".to_owned()), ("false".to_owned(), "No".to_owned())]
+                } else { question.options.iter().map(|option| (option.id.clone(), option.label.clone())).collect() };
+                let ids: Vec<String> = options.iter().map(|(id, _)| id.clone()).collect();
+                let selected = values.first().and_then(|value| ids.iter().position(|id| id == value));
+                let pick = ComboBox::new().items_source(options.into_iter().map(|(_, label)| label).collect::<Vec<_>>())
+                    .selected_index(selected).placeholder_text("Choose an answer")
+                    .automation_name("Choose an answer")
+                    .on_selection_changed(context.callback(move |index: Option<usize>|
+                        index.and_then(|index| ids.get(index).cloned()).map_or(
+                            Message::Chat(ChatMsg::AnswerUnchanged), |id| changed(vec![id]))));
+                if question.free_entry {
+                    let request = request.clone(); let id = id.clone();
+                    let before = if selected.is_none() { values.first().cloned().unwrap_or_default() } else { String::new() };
+                    StackPanel::new().spacing(tokens::spacing::SM).children((pick,
+                        m3::field().text(before.clone())
+                            .placeholder_text("Or enter another answer")
+                            .automation_name("Other answer")
+                            .on_text_changed(context.callback(move |text| if text == before {
+                                Message::Chat(ChatMsg::AnswerUnchanged)
+                            } else { Message::Chat(ChatMsg::AnswerChanged(request.clone(), id.clone(), vec![text])) }))))
+                } else { pick.into() }
+            }
+            QuestionKind::Multiple => {
+                let mut controls: Vec<KeyedView> = question.options.iter().map(|option| {
+                    let request = request.clone(); let id = id.clone(); let option_id = option.id.clone();
+                    KeyedView::new(option.id.clone(), CheckBox::new()
+                        .is_checked(values.contains(&option.id)).automation_name(option.label.clone())
+                        .on_is_checked_changed(context.callback(move |on| Message::Chat(ChatMsg::AnswerOptionChanged(request.clone(), id.clone(), option_id.clone(), on)))).content(m3::label(&option.label)))
+                }).collect();
+                if question.free_entry {
+                    let selected: Vec<String> = values.iter().filter(|value| question.options.iter().any(|option| &option.id == *value)).cloned().collect();
+                    let other = values.iter().filter(|value| !selected.contains(value)).cloned().collect::<Vec<_>>().join("\n");
+                    controls.push(KeyedView::new("free", m3::field().text(other.clone()).accepts_return(true)
+                        .placeholder_text("Other answers, one per line").automation_name("Other answers")
+                        .on_text_changed(context.callback(move |text: String| {
+                            if text == other { return Message::Chat(ChatMsg::AnswerUnchanged); }
+                            let mut values = selected.clone(); values.extend(text.lines().map(str::to_owned)); changed(values)
+                        }))));
+                }
+                StackPanel::new().spacing(tokens::spacing::SM).keyed_children(controls)
+            }
+
+        }
+        };
+        StackPanel::new().spacing(tokens::spacing::SM).children((
+            m3::label(question.title.as_deref().unwrap_or("Your answer")),
+            TextBlock::new()
+                .text(question.prompt.clone().unwrap_or_default())
+                .text_wrapping(TextWrapping::Wrap),
+            control,
+            omit,
+        ))
     }
 
     /// The one composer: the context row (project and profile), the field,

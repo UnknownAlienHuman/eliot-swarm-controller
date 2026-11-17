@@ -129,6 +129,7 @@ struct UiPending {
     binding: BoundAction,
     kind: String,
     summary: String,
+    questions: Vec<eliot_core::requests::Question>,
 }
 
 /// Readback for the selected Agent.
@@ -440,6 +441,11 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
             ),
             kind: request.kind.clone(),
             summary: request_summary(&request.details),
+            questions: serde_json::from_value::<eliot_core::requests::QuestionRequest>(
+                request.details.clone(),
+            )
+            .map(|request| request.questions)
+            .unwrap_or_default(),
         })
         .collect();
     UiDetail {
@@ -456,12 +462,11 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
 }
 
 fn request_summary(details: &serde_json::Value) -> String {
-    let text = details.to_string();
-    if text.chars().count() <= 160 {
-        text
-    } else {
-        format!("{}…", text.chars().take(160).collect::<String>())
-    }
+    details
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("The Agent needs your answer.")
+        .to_owned()
 }
 
 /// Poll one retained command (bounded, cancellable) until it is terminal.

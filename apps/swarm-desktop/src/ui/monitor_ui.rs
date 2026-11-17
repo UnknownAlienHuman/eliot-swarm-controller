@@ -524,7 +524,7 @@ impl DesktopApp {
         // full causal chain lives behind `swarm why`.
         if let Some(line) = read
             .and_then(|read| read.diagnosis.as_ref().ok())
-            .and_then(|summary| monitor::diagnosis_line(summary))
+            .and_then(monitor::diagnosis_line)
         {
             sections.push(KeyedView::new(
                 "diagnosis",
