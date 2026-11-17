@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 48;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 49;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1166,6 +1166,19 @@ impl Store {
                 INSERT INTO schema_migrations(version) VALUES (48);").map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 49 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX events_heavy_agent_generation
+                     ON events(agent, generation, seq) WHERE kind = 'activity.heavy';
+                 INSERT INTO schema_migrations(version) VALUES (49);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1175,12 +1188,38 @@ mod continuity_tests {
     use super::*;
 
     #[test]
+    fn v48_upgrade_indexes_heavy_rollups_by_exact_generation() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX events_heavy_agent_generation;
+             DELETE FROM schema_migrations WHERE version=49;",
+            )
+            .unwrap();
+        store.migrate().unwrap();
+        for sql in [
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM events WHERE kind='activity.heavy' AND agent=?1 AND generation=?2",
+            "EXPLAIN QUERY PLAN SELECT data FROM events WHERE kind='activity.heavy' AND agent=?1 AND generation=?2 ORDER BY seq DESC LIMIT 201",
+        ] {
+            let plan: String = store
+                .connection
+                .query_row(sql, params![1, 2], |row| row.get(3))
+                .unwrap();
+            assert!(plan.contains("events_heavy_agent_generation"), "{plan}");
+            assert!(plan.contains("agent=? AND generation=?"), "{plan}");
+        }
+    }
+
+    #[test]
     fn v39_upgrade_recovers_expiry_from_retention_without_losing_replay() {
         let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
         store
             .connection
             .execute_batch(
-                "DROP INDEX agents_list_archived;
+                "DROP INDEX events_heavy_agent_generation;
+                 DELETE FROM schema_migrations WHERE version=49;
+                 DROP INDEX agents_list_archived;
                  ALTER TABLE agents DROP COLUMN archived;
                  ALTER TABLE agents DROP COLUMN chat;
                  DELETE FROM schema_migrations WHERE version=48;
@@ -1258,7 +1297,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX agents_list_archived;
+                "DROP INDEX events_heavy_agent_generation;
+                 DELETE FROM schema_migrations WHERE version=49;
+                 DROP INDEX agents_list_archived;
                  ALTER TABLE agents DROP COLUMN archived;
                  ALTER TABLE agents DROP COLUMN chat;
                  DELETE FROM schema_migrations WHERE version=48;
