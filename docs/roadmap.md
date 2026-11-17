@@ -576,19 +576,22 @@ of the explicitly selected release scope.
       recorded `profile_choice`. (Refs #407)
 - [x] **D9 A desktop you can work in.** Owner review 2026-11-16, the Codex,
       OpenCode and Antigravity apps as references. A new task's composer has
-      no profiles: the project selector (a searchable project list and "Other
-      folder…") on a bar above it, "Describe a task…", then the model chip
-      (`Harness · Model · effort`), the access chip and Send. The model chip
+      no profiles: one card holds the project selector (a searchable project
+      list and "Other folder…") as its first row, "Describe a task…", then the
+      model chip (`Harness · Model · effort`), the access chip and Send. The model chip
       (Ctrl+M) opens OpenCode's picker pattern fed by `models.catalog` (k76a):
       a search over harnesses, providers and models; Auto with Swarm's pick
       and reason; Favorites and Recent (`[desktop]` `favorite_models` /
       `recent_models`); then Codex, Claude Code, OpenCode (by provider), Muse
-      and Antigravity, each row with its provider, effort, a `default` badge
-      and a check on the current one; held models are greyed with the reason
+      and Antigravity, each row with the model's full name, a `default` badge,
+      a check on the current one and its effort as one short chip (efforts
+      read `low`, `med`, `high`, `xhigh`, `max`, `ultra` across the desktop,
+      in full words for screen readers); held models are greyed with the reason
       and a missing harness says "not installed" once. Claude Code has no live
       catalogue, so its group offers the CLI default and the model id typed in
       the search, with the documented effort vocabulary. ↑/↓ move, ←/→ change
-      the effort (or click it on the highlighted row), Enter chooses, Ctrl+F
+      the effort (or click it in the highlighted row's compact effort
+      segment), Enter chooses, Ctrl+F
       marks a favorite, Esc closes; saved presets are a group at the end. A
       model choice is an Owner ad-hoc launch with `harness`, `model`, `effort`
       and `access`. The access chip opens Codex's menu (Ask for approval /
@@ -624,7 +627,8 @@ of the explicitly selected release scope.
       harness, and each OpenCode provider) collapse, remembered in `[desktop]
       collapsed_model_groups`; OpenCode's Manage models (the sliders button at
       the end of the search row) toggles provider groups and single models into
-      `[desktop] model_visibility` with toggle switches, the picker lists only
+      `[desktop] model_visibility` with toggle switches and links Auto's order
+      in Settings › Routing (the picker's one filter control); the picker lists only
       shown models and a search still finds a hidden one, marked hidden. Every
       picker open revalidates `models.catalog`; a harness whose read failed
       shows its typed error with Retry. The selected effort

@@ -302,7 +302,10 @@ pub fn identity_lines(read: &DetailRead) -> Vec<String> {
     let harness = crate::picker::harness_label(&agent.harness).to_owned();
     let mut lines = vec![format!("{harness} · {}", state_words(agent.state))];
     match (field("model"), field("effort")) {
-        (Some(model), Some(effort)) => lines.push(format!("{model} · {effort} effort")),
+        (Some(model), Some(effort)) => lines.push(format!(
+            "{model} · {} effort",
+            crate::picker::effort_label(&effort)
+        )),
         (Some(model), None) => lines.push(model),
         _ => lines.push(format!("Model not reported by {harness} yet")),
     }

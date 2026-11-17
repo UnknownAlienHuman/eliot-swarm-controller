@@ -887,7 +887,14 @@ impl DesktopApp {
                             labelled(
                                 "Effort",
                                 ComboBox::new()
-                                    .items_source(efforts.clone())
+                                    .items_source(
+                                        efforts
+                                            .iter()
+                                            .map(|effort| {
+                                                crate::picker::effort_label(effort).to_owned()
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    )
                                     .selected_index(state.effort)
                                     .is_enabled(can_act && harness.is_some())
                                     .automation_name("Ad-hoc effort")
@@ -1191,7 +1198,9 @@ impl DesktopApp {
                 Some(harness) => format!(
                     "Starts a new ad-hoc {harness} Agent (model {}, effort {}) in {from}'s workspace and moves the task to it: {carried}. {from} keeps running.",
                     model.as_deref().unwrap_or("harness default"),
-                    effort.as_deref().unwrap_or("harness default")
+                    effort
+                        .as_deref()
+                        .map_or("harness default", crate::picker::effort_label)
                 ),
                 None => "Pick the ad-hoc Agent's harness.".to_owned(),
             },

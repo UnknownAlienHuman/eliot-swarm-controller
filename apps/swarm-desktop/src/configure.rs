@@ -17,6 +17,8 @@ use eliot_core::api::{
 };
 use serde_json::Value;
 
+use crate::picker::effort_label;
+
 /// Settings facts of one Agent generation, read from `agent.get`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Settings {
@@ -125,13 +127,13 @@ impl Settings {
             (Some(model), effort) => {
                 lines.push(said("Model", model, self.model_verified));
                 if let Some(effort) = effort {
-                    lines.push(said("Effort", &effort_words(effort), self.effort_verified));
+                    lines.push(said("Effort", effort_label(effort), self.effort_verified));
                 }
             }
             _ => match (&self.profile_model, &self.profile_effort) {
                 (Some(model), Some(effort)) => lines.push(format!(
                     "Requested model {model} · {} effort",
-                    effort_words(effort)
+                    effort_label(effort)
                 )),
                 (Some(model), None) => lines.push(format!("Requested model {model}")),
                 _ => lines.push("Default model".to_owned()),
@@ -142,7 +144,7 @@ impl Settings {
             let effort = config
                 .effort
                 .as_deref()
-                .map_or_else(|| "the same effort".to_owned(), effort_words);
+                .map_or("the same effort", effort_label);
             lines.push(format!("Next turn: {model} · {effort}"));
         }
         lines
@@ -190,21 +192,6 @@ pub fn outcome_words(command: &Command) -> String {
                 code.to_owned()
             };
             eliot_core::reason_message(&code, text("message"))
-        }
-    }
-}
-
-/// An effort level in words: `xhigh` → "Extra high", `medium` → "Medium".
-pub fn effort_words(effort: &str) -> String {
-    match effort {
-        "xhigh" => "Extra high".to_owned(),
-        "max" => "Max".to_owned(),
-        other => {
-            let words = other.replace(['_', '-'], " ");
-            let mut chars = words.chars();
-            chars.next().map_or_else(String::new, |first| {
-                first.to_uppercase().chain(chars).collect()
-            })
         }
     }
 }
@@ -383,10 +370,12 @@ mod tests {
         let mut settings = running("m1", "xhigh");
         let lines = settings.lines();
         assert_eq!(lines[0], "Requested model m1");
-        assert_eq!(lines[1], "Requested effort Extra high");
+        assert_eq!(lines[1], "Requested effort xhigh");
         settings.effort_verified = true;
         let lines = settings.lines();
-        assert_eq!(lines[1], "Effort Extra high");
+        assert_eq!(lines[1], "Effort xhigh");
+        // Details use the desktop's short effort words.
+        assert_eq!(running("m1", "medium").lines()[1], "Requested effort med");
         assert_eq!(lines[0], "Requested model m1");
         settings.model_verified = true;
         assert_eq!(settings.lines()[0], "Model m1");
@@ -413,7 +402,7 @@ mod tests {
         };
         let lines = settings.lines();
         assert_eq!(lines[0], "Default model");
-        assert_eq!(lines[1], "Next turn: m1 · High");
+        assert_eq!(lines[1], "Next turn: m1 · high");
         assert_eq!(settings.next_model(), Some("m1"));
     }
 
@@ -450,14 +439,6 @@ mod tests {
         assert_eq!(picked(&options, Some(0)), None);
         assert_eq!(picked(&options, Some(1)), Some("m1".to_owned()));
         assert_eq!(picked(&options, Some(9)), None);
-    }
-
-    #[test]
-    fn efforts_read_as_words() {
-        assert_eq!(effort_words("xhigh"), "Extra high");
-        assert_eq!(effort_words("medium"), "Medium");
-        assert_eq!(effort_words("low"), "Low");
-        assert_eq!(effort_words("max"), "Max");
     }
 
     #[test]

@@ -58,6 +58,25 @@ pub fn provider_label(provider: &str) -> String {
     }
 }
 
+/// An effort as the desktop shows it: the wire value, `medium` cut to
+/// `med` (`low`, `med`, `high`, `xhigh`, `max`, `ultra`). The wire value
+/// itself never changes.
+pub fn effort_label(effort: &str) -> &str {
+    match effort {
+        "medium" => "med",
+        other => other,
+    }
+}
+
+/// An effort in full words for screen readers: `xhigh` → "extra high",
+/// `medium` → "medium".
+pub fn effort_name(effort: &str) -> String {
+    match effort {
+        "xhigh" => "extra high".to_owned(),
+        other => other.replace(['_', '-'], " "),
+    }
+}
+
 /// One harness, model (None: the harness's own default) and effort (None:
 /// the model's default).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -91,8 +110,18 @@ pub enum Choice {
 }
 
 impl Choice {
-    /// The model chip's words: `Harness · Model · effort`.
+    /// The model chip's words: `Harness · Model · effort`, the effort short.
     pub fn chip_label(&self, auto_profile: Option<&str>) -> String {
+        self.chip_text(auto_profile, |effort| effort_label(effort).to_owned())
+    }
+
+    /// [`Self::chip_label`] with the effort in full words (its accessible
+    /// name).
+    pub fn chip_name(&self, auto_profile: Option<&str>) -> String {
+        self.chip_text(auto_profile, effort_name)
+    }
+
+    fn chip_text(&self, auto_profile: Option<&str>, effort: impl Fn(&str) -> String) -> String {
         match self {
             Self::Auto => match auto_profile {
                 Some(profile) => format!("Auto · {profile}"),
@@ -103,7 +132,9 @@ impl Choice {
                 "{} · {} · {}",
                 harness_label(&pick.harness),
                 pick.model.as_deref().map_or("default model", short_model),
-                pick.effort.as_deref().unwrap_or("default effort")
+                pick.effort
+                    .as_deref()
+                    .map_or_else(|| "default effort".to_owned(), effort)
             ),
         }
     }
@@ -139,7 +170,10 @@ pub struct Item {
     pub key: String,
     pub kind: ItemKind,
     pub title: String,
-    /// Secondary text: the provider (and harness), or Auto's pick and why.
+    /// Secondary text: the harness and provider of a favorite or recent
+    /// model, a preset's model, Auto's pick and why, or what a Claude Code
+    /// row does. A catalogue row under its harness (and provider) heading
+    /// has none: its title names the model.
     pub detail: String,
     /// The effort shown inline: what choosing the row launches.
     pub effort: Option<String>,
@@ -610,7 +644,7 @@ fn claude_rows(
             "claude:default".to_owned(),
             None,
             "Default model".to_owned(),
-            "Anthropic · the Claude Code CLI picks".to_owned(),
+            "the Claude Code CLI picks".to_owned(),
         )));
     }
     if let Some(typed) = typed {
@@ -618,7 +652,7 @@ fn claude_rows(
             format!("claude:typed:{typed}"),
             Some(typed.to_owned()),
             typed.to_owned(),
-            "Anthropic · use this model id".to_owned(),
+            "use this model id".to_owned(),
         )));
     } else if query.is_empty() {
         rows.push(note(
@@ -742,7 +776,7 @@ fn catalog_item(
         } else {
             model.display_name.clone()
         },
-        detail: provider_label(&model.provider),
+        detail: String::new(),
         efforts,
         default: model.default,
         disabled: (model.availability == HELD)
@@ -1123,7 +1157,10 @@ mod tests {
         // OpenCode rows show the model without its provider prefix.
         let luna = find(&rows, Some("opencode:opencode-go/gpt-5.6-luna")).unwrap();
         assert_eq!(luna.title, "gpt-5.6-luna");
-        assert_eq!(luna.detail, "OpenCode Go");
+        // Its provider heading names the provider; the row does not repeat it.
+        assert_eq!(luna.detail, "");
+        let recent = find(&rows, Some("recent:codex:gpt-6-luna:high")).unwrap();
+        assert_eq!(recent.detail, "Codex · OpenAI");
     }
 
     #[test]
@@ -1327,5 +1364,26 @@ mod tests {
             Choice::Auto.chip_label(Some("codex-luna")),
             "Auto · codex-luna"
         );
+        // Short on screen, full words for screen readers; the wire value stays.
+        let medium = Choice::Model(Pick {
+            harness: "codex".to_owned(),
+            model: Some("gpt-6.1-sol".to_owned()),
+            effort: Some("medium".to_owned()),
+        });
+        assert_eq!(medium.chip_label(None), "Codex · gpt-6.1-sol · med");
+        assert_eq!(medium.chip_name(None), "Codex · gpt-6.1-sol · medium");
+        assert!(matches!(&medium, Choice::Model(pick) if pick.effort.as_deref() == Some("medium")));
+    }
+
+    #[test]
+    fn efforts_are_short_on_screen_and_full_for_screen_readers() {
+        let shown: Vec<&str> = ["low", "medium", "high", "xhigh", "max", "ultra"]
+            .into_iter()
+            .map(effort_label)
+            .collect();
+        assert_eq!(shown, ["low", "med", "high", "xhigh", "max", "ultra"]);
+        assert_eq!(effort_name("medium"), "medium");
+        assert_eq!(effort_name("xhigh"), "extra high");
+        assert_eq!(effort_name("low"), "low");
     }
 }
