@@ -47,6 +47,21 @@ pub(super) struct ProfilesEditor {
     pub(super) sent: Option<String>,
 }
 
+impl ProfilesEditor {
+    /// Keep the selected preset when the draft still has it, else select
+    /// the first one.
+    pub(super) fn select_existing(&mut self) {
+        let names = profiles::profile_names(&self.draft);
+        if self
+            .selected
+            .as_ref()
+            .is_none_or(|name| !names.contains(name))
+        {
+            self.selected = names.first().cloned();
+        }
+    }
+}
+
 impl DesktopApp {
     pub(super) fn profiles_update(&mut self, msg: ProfilesMsg, context: &ComponentContext<Self>) {
         match msg {

@@ -9,13 +9,14 @@
 //! actions are separate and red. Every section reads and writes the
 //! daemon's unified settings (`settings.read` / `settings.save`, one store
 //! with a revision and author history) through [`crate::config_client`].
-//! A control change saves at once (a typed one when typing pauses), one
-//! revision-checked save at a time, with "Saved" or the error in the
-//! page's status line; only the raw editors (the presets' TOML and every
-//! section's JSON) keep Save, Validate and Discard. Revisions and history
-//! stay in Advanced.
+//! A control change saves at once (a typed one when typing on its page
+//! pauses), one revision-checked save at a time, with "Saved" or the error
+//! in the page's status line; a stale or refused save follows the rule in
+//! `docs/spec/configuration.md` (unified settings). Only the raw editors
+//! (the presets' TOML and every section's JSON) keep Save, Validate and
+//! Discard. Revisions and history stay in Advanced.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 mod access;
 mod advanced;
@@ -248,8 +249,8 @@ pub(super) enum SettingsMsg {
     Reload,
     /// Validate (true) or save the page's section.
     Save(Page, bool),
-    /// A typed change rests: save the page if no later keystroke came
-    /// (the edit sequence it was scheduled at).
+    /// A typed change rests: save the page if no later keystroke came on
+    /// that page (the edit sequence it was scheduled at).
     AutoSave(Page, u64),
     Saved(Page, bool, MutationResult<SettingsSaveResponse>),
     /// Put the page's draft back to the saved values.
@@ -307,6 +308,23 @@ pub(super) type ManagedWorktrees = (Vec<eliot_core::api::ManagedWorkspaceView>, 
 
 /// How long typing must rest before a typed change saves.
 const TYPING_PAUSE_MS: u64 = 800;
+
+/// A change refused for an invalid value or a section changed elsewhere:
+/// the form shows the stored values again.
+const SHOWS_SAVED: &str = "The page shows the saved values.";
+
+/// An edit never applied because another writer changed its section
+/// meanwhile (the stale-revision rule in `docs/spec/configuration.md`).
+const CHANGED_ELSEWHERE: &str = "Not saved: these settings were changed somewhere else meanwhile. The page shows the saved values.";
+
+/// Whether a section's draft differs from a stored value as a save would
+/// send it (Routing drops its empty roles).
+fn differs(section: Section, draft: &Value, stored: &Value) -> bool {
+    match section {
+        Section::Routing => model::routing_for_save(draft) != model::routing_for_save(stored),
+        _ => draft != stored,
+    }
+}
 
 /// A page's last save result in words; an error is drawn in the error
 /// colour and stays until the next change.
@@ -371,20 +389,25 @@ pub(super) struct SettingsState {
     read_prefs_rev: u64,
     /// The section whose save is running (one save at a time).
     saving: Option<Page>,
-    /// The running save's sections as sent, and each one's saved value
-    /// when it was sent (a stale-revision refusal retries only when no one
-    /// else changed them).
-    sending: Option<(BTreeMap<Section, Value>, BTreeMap<Section, Value>)>,
+    /// The running save's sections as sent.
+    sending: Option<BTreeMap<Section, Value>>,
     /// Sections the last saves wrote, until a read shows them: a draft
     /// equal to one follows the read even when the daemon normalised it.
     sent: BTreeMap<Section, Value>,
+    /// Sections a save of unknown outcome sent, until the next read: if it
+    /// landed, that read shows this desktop's own value, not another
+    /// writer's.
+    unsure: BTreeSet<Section>,
     /// Pages whose control changes wait for the running save or read.
     queued: Vec<Page>,
-    /// A save refused for a stale revision: the page and its sections'
-    /// saved values when it was sent; the next read decides.
-    retry: Option<(Page, BTreeMap<Section, Value>)>,
-    /// Bumped by every typed change; only the latest one's pause saves.
+    /// Pages whose save was refused for a stale revision: the next read
+    /// decides whether each goes again (see [`SettingsState::take`]).
+    retry: Vec<Page>,
+    /// Numbers every typed change.
     edit_seq: u64,
+    /// Each page's latest typed change still waiting for its pause: typing
+    /// on one page never cancels another page's save.
+    typing: HashMap<Page, u64>,
     revision: Option<String>,
     base: BTreeMap<Section, Value>,
     restart_required: Vec<Section>,
@@ -398,6 +421,9 @@ pub(super) struct SettingsState {
     /// Advanced: every section as pretty JSON, and its read form.
     all: String,
     all_base: String,
+    /// The read sections the JSON draft was made from: its edits are the
+    /// sections that differ from them, and only those are sent.
+    all_from: BTreeMap<Section, Value>,
     new_role: String,
     project_open: Option<String>,
     new_project_id: String,
@@ -429,25 +455,87 @@ impl SettingsState {
         self.reading || self.saving.is_some()
     }
 
-    /// Take a fresh read: drafts without unsaved edits follow it, edited
-    /// drafts are kept.
+    /// A typed change on `page`: the sequence its pause carries.
+    fn typed(&mut self, page: Page) -> u64 {
+        self.edit_seq += 1;
+        self.typing.insert(page, self.edit_seq);
+        self.edit_seq
+    }
+
+    /// Whether the pause scheduled at `seq` is the page's latest typed
+    /// change (then it saves).
+    fn rested(&mut self, page: Page, seq: u64) -> bool {
+        let latest = self.typing.get(&page) == Some(&seq);
+        if latest {
+            self.typing.remove(&page);
+        }
+        latest
+    }
+
+    /// A definite refusal (an invalid value): the stored revision did not
+    /// move. A form shows the stored values again under the error; the
+    /// settings file's JSON, a raw editor, keeps its draft for correction.
+    fn refused(&mut self, page: Page, mut note: Note) {
+        if page != Page::Advanced {
+            self.discard(page);
+            note.text = format!("{} {SHOWS_SAVED}", note.text);
+        }
+        self.notes.insert(page, note);
+    }
+
+    /// Take a fresh read. A draft without unsaved edits follows it. An
+    /// edited draft stays while its section is unchanged in the read (or
+    /// changed only by this desktop's own save) and saves on the new
+    /// revision; when another writer changed that section, the edit is
+    /// never applied: the stored values show with the refusal.
     fn take(&mut self, read: SettingsReadResponse) {
         let old = std::mem::take(&mut self.base);
         let sent = std::mem::take(&mut self.sent);
+        let mut unsure = std::mem::take(&mut self.unsure);
+        // A save still running may already be in this read.
+        unsure.extend(self.sending.iter().flat_map(|sending| sending.keys()));
         let fresh = !self.loaded;
-        let follow = |draft: &mut Value, section: Section, new: &BTreeMap<Section, Value>| {
+        let mut refused = Vec::new();
+        let mut follow = |draft: &mut Value, section: Section, page: Page| {
             let before = old.get(&section).cloned().unwrap_or_else(|| json!({}));
-            if fresh || *draft == before || sent.get(&section) == Some(draft) {
-                *draft = new.get(&section).cloned().unwrap_or_else(|| json!({}));
+            let new = read
+                .sections
+                .get(&section)
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let edited =
+                !fresh && *draft != before && *draft != new && sent.get(&section) != Some(draft);
+            let ours = sent.contains_key(&section) || unsure.contains(&section);
+            if edited && (new == before || ours) {
+                return;
             }
+            if edited && differs(section, draft, &before) {
+                refused.push(page);
+            }
+            *draft = new;
         };
-        follow(&mut self.routing, Section::Routing, &read.sections);
-        follow(&mut self.projects, Section::Projects, &read.sections);
-        follow(&mut self.automation, Section::Automation, &read.sections);
-        follow(&mut self.cloud, Section::CloudMcp, &read.sections);
+        follow(&mut self.routing, Section::Routing, Page::Routing);
+        follow(&mut self.projects, Section::Projects, Page::Projects);
+        follow(&mut self.automation, Section::Automation, Page::Automations);
+        follow(&mut self.cloud, Section::CloudMcp, Page::CloudMcp);
+        for page in refused {
+            self.typing.remove(&page);
+            self.notes.insert(page, Note::error(CHANGED_ELSEWHERE));
+        }
+        // The JSON draft follows the read unless it holds edits not saved
+        // yet; its edited sections are judged when it is sent
+        // ([`Self::refuse_if_changed`]).
         let all = serde_json::to_string_pretty(&read.sections).unwrap_or_default();
-        if fresh || self.all == self.all_base {
+        if fresh
+            || self.all == self.all_base
+            || self.json_edits().is_ok_and(|edits| {
+                edits
+                    .iter()
+                    .all(|(section, value)| sent.get(section) == Some(value))
+            })
+        {
             self.all = all.clone();
+            self.all_from = read.sections.clone();
         }
         self.all_base = all;
         self.base = read.sections;
@@ -475,9 +563,7 @@ impl SettingsState {
             Page::Automations => one(Section::Automation, self.automation.clone()),
             Page::CloudMcp => one(Section::CloudMcp, self.cloud.clone()),
             Page::Advanced => {
-                let mut sections: BTreeMap<Section, Value> = serde_json::from_str(&self.all)
-                    .map_err(|_| "The JSON does not parse; the draft is kept.".to_owned())?;
-                sections.retain(|section, value| self.base.get(section) != Some(value));
+                let sections = self.json_edits()?;
                 if sections.is_empty() {
                     return Err("No section changed.".to_owned());
                 }
@@ -490,12 +576,41 @@ impl SettingsState {
         }
     }
 
+    /// The sections the owner edited in the settings file's JSON: those
+    /// that differ from the read the draft was made from. A section another
+    /// writer changed since is not one of them, so it is never sent back.
+    fn json_edits(&self) -> Result<BTreeMap<Section, Value>, String> {
+        let mut sections: BTreeMap<Section, Value> = serde_json::from_str(&self.all)
+            .map_err(|_| "The JSON does not parse; the draft is kept.".to_owned())?;
+        sections.retain(|section, value| self.all_from.get(section) != Some(value));
+        Ok(sections)
+    }
+
+    /// The JSON draft is sent only when every section it edits still holds
+    /// the value it was edited from; otherwise it is never applied and the
+    /// stored values show with the refusal. True when refused. (A form
+    /// follows the same rule as each read arrives, in [`Self::take`].)
+    fn refuse_if_changed(&mut self, page: Page) -> bool {
+        let changed = page == Page::Advanced
+            && self.json_edits().is_ok_and(|edits| {
+                edits
+                    .keys()
+                    .any(|section| self.all_from.get(section) != self.base.get(section))
+            });
+        if changed {
+            self.discard(page);
+            self.notes.insert(page, Note::error(CHANGED_ELSEWHERE));
+        }
+        changed
+    }
+
     fn dirty(&self, page: Page) -> bool {
         match page {
-            Page::Routing => {
-                model::routing_for_save(&self.routing)
-                    != model::routing_for_save(&self.base(Section::Routing))
-            }
+            Page::Routing => differs(
+                Section::Routing,
+                &self.routing,
+                &self.base(Section::Routing),
+            ),
             Page::Projects => self.projects != self.base(Section::Projects),
             Page::Automations => self.automation != self.base(Section::Automation),
             Page::CloudMcp => self.cloud != self.base(Section::CloudMcp),
@@ -509,14 +624,19 @@ impl SettingsState {
         }
     }
 
-    /// Put a page's draft back to the saved values.
+    /// Put a page's draft back to the saved values (a typed change still
+    /// waiting for its pause is dropped with it).
     fn discard(&mut self, page: Page) {
+        self.typing.remove(&page);
         match page {
             Page::Routing => self.routing = self.base(Section::Routing),
             Page::Projects => self.projects = self.base(Section::Projects),
             Page::Automations => self.automation = self.base(Section::Automation),
             Page::CloudMcp => self.cloud = self.base(Section::CloudMcp),
-            Page::Advanced => self.all = self.all_base.clone(),
+            Page::Advanced => {
+                self.all = self.all_base.clone();
+                self.all_from = self.base.clone();
+            }
             Page::General
             | Page::Access
             | Page::Models
@@ -691,6 +811,15 @@ impl DesktopApp {
                         }
                         self.take_profiles(&read);
                         self.settings.take(read);
+                        // Saves refused as stale go again first, on this
+                        // revision, unless this read showed their edited
+                        // section changed (then their drafts are the stored
+                        // values now and nothing is sent).
+                        let s = &mut self.settings;
+                        for page in std::mem::take(&mut s.retry).into_iter().rev() {
+                            s.queued.retain(|queued| *queued != page);
+                            s.queued.insert(0, page);
+                        }
                         // Only the Settings page has primed editors to refill;
                         // the composer keeps its draft untouched.
                         if self.main == Main::Settings {
@@ -707,13 +836,13 @@ impl DesktopApp {
             }
             SettingsMsg::Save(page, dry_run) => self.save_page(page, dry_run, context),
             SettingsMsg::AutoSave(page, seq) => {
-                if seq == self.settings.edit_seq {
+                if self.settings.rested(page, seq) {
                     self.autosave(page, context);
                 }
             }
             SettingsMsg::Saved(page, dry_run, result) => {
                 self.settings.saving = None;
-                let (sent, basis) = self.settings.sending.take().unwrap_or_default();
+                let sent = self.settings.sending.take().unwrap_or_default();
                 let sent_draft = self.editor.sending.take();
                 self.settings.notes.insert(page, Note::of(dry_run, &result));
                 if dry_run {
@@ -733,27 +862,44 @@ impl DesktopApp {
                         }
                         self.after_settings_saved(context);
                     }
-                    // Another writer moved the revision: read, then retry
-                    // once if no one changed this page's sections.
+                    // Another writer moved the revision and nothing was
+                    // written: the next read decides (`SettingsState::take`).
                     Err(error) if error.code == "conflict" => {
-                        self.settings.retry = Some((page, basis));
+                        let s = &mut self.settings;
+                        s.queued.retain(|queued| *queued != page);
+                        if !s.retry.contains(&page) {
+                            s.retry.push(page);
+                        }
                         self.load_settings(context);
                     }
                     // The outcome is not known: never send it again on our
-                    // own; a read shows whether it landed.
-                    Err(error) if crate::state::uncertain(error) => self.load_settings(context),
-                    // Refused (an invalid value): the draft stays, the error
-                    // shows, and the other pages' changes still save.
-                    Err(_) => self.drain_saves(context),
+                    // own; a read shows whether it landed (and if it did, the
+                    // value there is this desktop's own).
+                    Err(error) if crate::state::uncertain(error) => {
+                        self.settings.unsure.extend(sent.into_keys());
+                        self.load_settings(context);
+                    }
+                    // Refused (an invalid value), nothing changed: a form
+                    // shows the stored values under the error, a raw editor
+                    // (the JSON, typed presets TOML) keeps its draft, and the
+                    // other pages' changes still save.
+                    Err(_) => {
+                        if !(page == Page::Models && self.editor.raw_dirty) {
+                            if page == Page::Models {
+                                self.discard_profiles();
+                            }
+                            self.settings.refused(page, Note::of(false, &result));
+                            self.reprime_fields(context);
+                        }
+                        self.drain_saves(context);
+                    }
                 }
             }
             SettingsMsg::Discard(page) => {
                 if page == Page::Models {
-                    self.editor.draft = self.editor.base.clone();
-                    self.editor.view = self.editor.base.clone();
-                    self.editor.raw_dirty = false;
+                    self.discard_profiles();
                 }
-                s.discard(page);
+                self.settings.discard(page);
                 self.settings.notes.remove(&page);
                 self.reprime_fields(context);
             }
@@ -1020,7 +1166,10 @@ impl DesktopApp {
         }
     }
 
-    /// The profile editor follows a read unless it has unsaved edits.
+    /// The profile editor follows a read unless it has unsaved edits; those
+    /// follow the rule of [`SettingsState::take`]: they stay while the
+    /// presets are unchanged in the read (or changed by this desktop's own
+    /// save), and when another writer changed them they are never applied.
     fn take_profiles(&mut self, read: &SettingsReadResponse) {
         let section = read
             .sections
@@ -1034,9 +1183,22 @@ impl DesktopApp {
         match model::profiles_toml(&section) {
             Ok(text) => {
                 // A draft a save wrote follows the read's formatting.
-                if editor.draft == editor.base || sent.as_ref() == Some(&editor.draft) {
+                let edited = editor.draft != editor.base
+                    && editor.draft != text
+                    && sent.as_ref() != Some(&editor.draft);
+                let ours = sent.is_some()
+                    || editor.sending.is_some()
+                    || self.settings.unsure.contains(&Section::Profiles);
+                let elsewhere = edited && text != editor.base && !ours;
+                if !edited || elsewhere {
                     editor.draft = text.clone();
                     editor.view = text.clone();
+                    editor.raw_dirty = false;
+                }
+                if elsewhere {
+                    self.settings
+                        .notes
+                        .insert(Page::Models, Note::error(CHANGED_ELSEWHERE));
                 }
                 editor.base = text;
                 editor.editable = true;
@@ -1047,14 +1209,7 @@ impl DesktopApp {
                 editor.reason = Some(error);
             }
         }
-        let names = profiles::profile_names(&editor.draft);
-        if editor
-            .selected
-            .as_ref()
-            .is_none_or(|name| !names.contains(name))
-        {
-            editor.selected = names.first().cloned();
-        }
+        editor.select_existing();
     }
 
     /// Validate or save one section from its draft. A save asked for
@@ -1078,6 +1233,10 @@ impl DesktopApp {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
+        if !dry_run && self.settings.refuse_if_changed(page) {
+            self.reprime_fields(context);
+            return;
+        }
         let sections = match self.settings.request_sections(page, &self.editor.draft) {
             Ok(sections) => sections,
             Err(note) => {
@@ -1085,11 +1244,7 @@ impl DesktopApp {
                 return;
             }
         };
-        let basis = sections
-            .keys()
-            .map(|section| (*section, self.settings.base(*section)))
-            .collect();
-        self.settings.sending = Some((sections.clone(), basis));
+        self.settings.sending = Some(sections.clone());
         self.editor.sending = (page == Page::Models).then(|| self.editor.draft.clone());
         let request = SettingsSaveRequest {
             expected_revision: self.settings.revision.clone(),
@@ -1133,8 +1288,7 @@ impl DesktopApp {
 
     /// Save a typed change once typing rests for [`TYPING_PAUSE_MS`].
     fn autosave_later(&mut self, page: Page, context: &ComponentContext<Self>) {
-        self.settings.edit_seq += 1;
-        let seq = self.settings.edit_seq;
+        let seq = self.settings.typed(page);
         let _task = context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
             let _ = feed::backoff(TYPING_PAUSE_MS, &cancelled);
@@ -1150,41 +1304,28 @@ impl DesktopApp {
         }
     }
 
-    /// After a read or a refused save: settle a stale-revision retry, then
-    /// start the next waiting save (one at a time).
+    /// Put the presets' draft back to the saved presets.
+    fn discard_profiles(&mut self) {
+        self.editor.draft = self.editor.base.clone();
+        self.editor.view = self.editor.base.clone();
+        self.editor.raw_dirty = false;
+        self.editor.select_existing();
+    }
+
+    /// After a read, a refused save or a preference write: start the next
+    /// waiting save (one at a time). A page with nothing to send now (no
+    /// change left, or refused before sending) lets the next one go.
     pub(super) fn drain_saves(&mut self, context: &ComponentContext<Self>) {
         if self.settings.busy() || self.prefs_saving || !self.settings.loaded {
             return;
-        }
-        if let Some((page, basis)) = self.settings.retry.take() {
-            if basis
-                .iter()
-                .all(|(section, value)| self.settings.base(*section) == *value)
-            {
-                // Only other sections moved: send this change again on the
-                // new revision (the refusal was definite, nothing landed).
-                self.settings.queued.retain(|queued| *queued != page);
-                self.settings.queued.insert(0, page);
-            } else {
-                // Someone else changed this page meanwhile: theirs stays.
-                if page == Page::Models {
-                    self.editor.draft = self.editor.base.clone();
-                    self.editor.view = self.editor.base.clone();
-                }
-                self.settings.discard(page);
-                self.settings.notes.insert(
-                    page,
-                    Note::error(
-                        "Not saved: this page was changed somewhere else at the same time; it now shows the current values.",
-                    ),
-                );
-            }
         }
         while !self.settings.queued.is_empty() {
             let page = self.settings.queued.remove(0);
             if self.page_dirty(page) {
                 self.save_page(page, false, context);
-                return;
+                if self.settings.busy() {
+                    return;
+                }
             }
         }
     }
@@ -1686,5 +1827,177 @@ mod tests {
         assert_eq!(state.routing, json!({"default": ["a", "b"]}));
         assert!(state.dirty(Page::Routing));
         assert_eq!(state.revision.as_deref(), Some("rev2"));
+    }
+
+    fn read(revision: &str, sections: &[(Section, Value)]) -> SettingsReadResponse {
+        SettingsReadResponse {
+            revision: Some(revision.to_owned()),
+            sections: sections.iter().cloned().collect(),
+            restart_required: Vec::new(),
+            history: Vec::new(),
+        }
+    }
+
+    /// The settings file's JSON draft with one section replaced.
+    fn edit_all(state: &mut SettingsState, section: &str, value: Value) {
+        let mut all: Value = serde_json::from_str(&state.all).unwrap();
+        all[section] = value;
+        state.all = serde_json::to_string_pretty(&all).unwrap();
+    }
+
+    #[test]
+    fn typed_changes_on_two_pages_both_save() {
+        let mut state = SettingsState::default();
+        // A Projects path, then a Cloud field within the pause.
+        let projects = state.typed(Page::Projects);
+        let cloud = state.typed(Page::CloudMcp);
+        assert!(state.rested(Page::Projects, projects));
+        assert!(state.rested(Page::CloudMcp, cloud));
+        // On one page only the latest keystroke's pause saves.
+        let first = state.typed(Page::Projects);
+        let second = state.typed(Page::Projects);
+        assert!(!state.rested(Page::Projects, first));
+        assert!(state.rested(Page::Projects, second));
+    }
+
+    #[test]
+    fn a_refused_value_shows_the_stored_one_and_a_raw_draft_stays() {
+        let stored = json!({"atlas": {"path": "C:/atlas"}});
+        let mut state = SettingsState::default();
+        state.take(read("rev1", &[(Section::Projects, stored.clone())]));
+        state.projects = json!({"atlas": {"path": "C:/missing"}});
+        state.refused(Page::Projects, Note::error("Not saved: no such folder"));
+        assert_eq!(state.projects, stored);
+        assert!(!state.dirty(Page::Projects));
+        let note = &state.notes[&Page::Projects];
+        assert!(note.error && note.text.contains("no such folder"));
+        // The settings file's JSON keeps its draft for correction.
+        edit_all(
+            &mut state,
+            "projects",
+            json!({"atlas": {"path": "C:/missing"}}),
+        );
+        let draft = state.all.clone();
+        state.refused(Page::Advanced, Note::error("Not saved: no such folder"));
+        assert_eq!(state.all, draft);
+        assert!(state.notes[&Page::Advanced].error);
+    }
+
+    #[test]
+    fn a_stale_save_reapplies_only_the_sections_the_owner_edited() {
+        let routing = json!({"default": ["a"]});
+        let mut state = SettingsState::default();
+        state.take(read(
+            "rev1",
+            &[
+                (Section::Routing, routing.clone()),
+                (Section::Projects, json!({"atlas": {}})),
+            ],
+        ));
+        edit_all(&mut state, "routing", json!({"default": ["a", "b"]}));
+        let edited = BTreeMap::from([(Section::Routing, json!({"default": ["a", "b"]}))]);
+        assert_eq!(
+            state.request_sections(Page::Advanced, ""),
+            Ok(edited.clone())
+        );
+        // Refused as stale: another writer added a project meanwhile. Routing
+        // is unchanged, so the change goes again, and only routing: the
+        // other writer's project stays.
+        state.take(read(
+            "rev2",
+            &[
+                (Section::Routing, routing.clone()),
+                (Section::Projects, json!({"atlas": {}, "beta": {}})),
+            ],
+        ));
+        assert!(!state.refuse_if_changed(Page::Advanced));
+        assert_eq!(state.request_sections(Page::Advanced, ""), Ok(edited));
+        // Another writer changed routing itself: never applied; the stored
+        // values show with the refusal.
+        state.take(read(
+            "rev3",
+            &[
+                (Section::Routing, json!({"default": ["c"]})),
+                (Section::Projects, json!({"atlas": {}, "beta": {}})),
+            ],
+        ));
+        assert!(state.refuse_if_changed(Page::Advanced));
+        assert!(!state.dirty(Page::Advanced));
+        assert!(state.notes[&Page::Advanced].error);
+        assert!(state.request_sections(Page::Advanced, "").is_err());
+    }
+
+    #[test]
+    fn a_form_change_follows_the_rule_on_the_next_read() {
+        let mut state = SettingsState::default();
+        state.take(read(
+            "rev1",
+            &[
+                (Section::Routing, json!({"default": ["a"]})),
+                (Section::Projects, json!({})),
+            ],
+        ));
+        // Edited (unsent, or refused as stale); another writer changes a
+        // different section: the change stays and saves on the new revision.
+        state.routing = json!({"default": ["a", "b"]});
+        state.take(read(
+            "rev2",
+            &[
+                (Section::Routing, json!({"default": ["a"]})),
+                (Section::Projects, json!({"beta": {}})),
+            ],
+        ));
+        assert_eq!(state.routing, json!({"default": ["a", "b"]}));
+        assert!(state.dirty(Page::Routing));
+        assert!(!state.notes.contains_key(&Page::Routing));
+        // Another writer changes routing itself: the stored values show
+        // with the refusal, and nothing is sent.
+        state.take(read(
+            "rev3",
+            &[
+                (Section::Routing, json!({"default": ["c"]})),
+                (Section::Projects, json!({"beta": {}})),
+            ],
+        ));
+        assert_eq!(state.routing, json!({"default": ["c"]}));
+        assert!(!state.dirty(Page::Routing));
+        assert!(state.notes[&Page::Routing].error);
+        // This desktop's own save (sure or not) is not someone else's: a
+        // later edit on top of it stays.
+        state.routing = json!({"default": ["c", "d", "e"]});
+        state
+            .sent
+            .insert(Section::Routing, json!({"default": ["c", "d"]}));
+        state.take(read(
+            "rev4",
+            &[
+                (Section::Routing, json!({"default": ["c", "d"]})),
+                (Section::Projects, json!({"beta": {}})),
+            ],
+        ));
+        assert_eq!(state.routing, json!({"default": ["c", "d", "e"]}));
+        state.unsure.insert(Section::Routing);
+        state.take(read(
+            "rev5",
+            &[
+                (Section::Routing, json!({"default": ["c", "d", "f"]})),
+                (Section::Projects, json!({"beta": {}})),
+            ],
+        ));
+        assert_eq!(state.routing, json!({"default": ["c", "d", "e"]}));
+        // A save still running may already be in the read.
+        state.sending = Some(BTreeMap::from([(
+            Section::Routing,
+            json!({"default": ["c", "d", "e"]}),
+        )]));
+        state.routing = json!({"default": ["c", "d", "e", "g"]});
+        state.take(read(
+            "rev6",
+            &[
+                (Section::Routing, json!({"default": ["c", "d", "e"]})),
+                (Section::Projects, json!({"beta": {}})),
+            ],
+        ));
+        assert_eq!(state.routing, json!({"default": ["c", "d", "e", "g"]}));
     }
 }

@@ -496,8 +496,9 @@ pub fn save_note(
         // main pages).
         Ok(reply) if reply.saved => format!("Saved.{}", restart(&reply.restart_required)),
         Ok(_) => "No change to save.".to_owned(),
-        // A page that saves as it changes sends it again on the new
-        // revision when no one changed its sections (see `drain_saves`).
+        // The next read decides: the change goes again on the new revision
+        // only if the sections it edits are unchanged there (see
+        // `SettingsState::take`).
         Err(error) if error.code == "conflict" => {
             "Not saved yet: the settings changed elsewhere. Your change is kept and checked against them.".to_owned()
         }
