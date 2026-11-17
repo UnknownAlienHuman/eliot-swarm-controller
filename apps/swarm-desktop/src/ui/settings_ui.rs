@@ -22,6 +22,7 @@ mod access;
 mod advanced;
 mod automations;
 mod cloud_mcp;
+mod folder;
 mod general;
 mod models;
 mod projects;
@@ -234,11 +235,12 @@ fn search_settings(query: &str) -> Vec<(Page, &'static str)> {
 pub(super) enum SettingsMsg {
     /// Clean up finished work: read a plan (nothing is removed).
     CleanupPlan,
-    CleanupPlanned(Fallible<eliot_core::api::CleanupPlan>),
+    CleanupPlanned(Fallible<(eliot_core::api::CleanupPlan, HashMap<String, String>)>),
     /// Check (true) or uncheck one group of the plan.
     CleanupGroupToggled(crate::worktrees::CleanupGroup, bool),
     /// Show or hide one group's kept items.
     CleanupKeptToggled(crate::worktrees::CleanupGroup),
+    CleanupExpanded(crate::worktrees::CleanupGroup),
     /// Ask for the one confirmation.
     CleanupApply,
     /// The confirmation's answer: true removes the selected items.
@@ -268,9 +270,7 @@ pub(super) enum SettingsMsg {
     ProjectProfile(String, String, bool),
     ProjectActions(String, String),
     ProjectRemoved(String),
-    NewProjectId(String),
-    NewProjectPath(String),
-    ProjectAdded,
+    ProjectBrowse,
     AssignmentText(String, AssignmentField, String),
     AssignmentBusy(String, Option<f64>),
     /// Assignment key and the index picked in its role list.
@@ -380,6 +380,7 @@ pub(super) struct SettingsState {
     /// The plan under review (nothing removed yet).
     cleanup_plan: Option<eliot_core::api::CleanupPlan>,
     cleanup_busy: bool,
+    cleanup_titles: HashMap<String, String>,
     /// Why the last plan or apply read failed.
     cleanup_error: Option<String>,
     /// Unchecked groups (a fresh review starts with
@@ -387,8 +388,9 @@ pub(super) struct SettingsState {
     cleanup_unchecked: std::collections::HashSet<crate::worktrees::CleanupGroup>,
     /// Groups whose kept items are shown (collapsed by default).
     cleanup_kept_open: std::collections::HashSet<crate::worktrees::CleanupGroup>,
+    cleanup_open: std::collections::HashSet<crate::worktrees::CleanupGroup>,
     /// The one confirmation is shown.
-    cleanup_confirm: bool,
+    pub(super) cleanup_confirm: bool,
     /// The ledger key of the apply in flight or uncertain (same id on retry).
     cleanup_key: Option<String>,
     /// The applied plan and its result.
@@ -441,8 +443,6 @@ pub(super) struct SettingsState {
     all_from: BTreeMap<Section, Value>,
     new_role: String,
     project_open: Option<String>,
-    new_project_id: String,
-    new_project_path: String,
     new_assignment: String,
     history_open: bool,
     /// The navigation's search text.
@@ -688,23 +688,62 @@ impl DesktopApp {
                         project: None,
                         older_than: None,
                     };
-                    Message::Settings(SettingsMsg::CleanupPlanned(
-                        client::block_on(eliot_daemon::client_call_typed(
-                            &data,
-                            "cleanup.plan",
-                            &request,
-                        ))
-                        .map_err(|error| error.to_string()),
-                    ))
+                    let result = client::block_on(async {
+                        let plan: eliot_core::api::CleanupPlan =
+                            eliot_daemon::client_call_typed(&data, "cleanup.plan", &request)
+                                .await?;
+                        let wanted: HashSet<_> = plan
+                            .items
+                            .iter()
+                            .map(|item| item.artifact.agent.clone())
+                            .collect();
+                        let mut titles = HashMap::new();
+                        let mut after = None;
+                        // A bounded retained-summary read includes archived tasks,
+                        // unlike the sidebar's current page. No native-history I/O.
+                        for _ in 0..8 {
+                            let read = client::list_agents(
+                                &data,
+                                &AgentListRequest {
+                                    archived: eliot_core::api::ArchivedFilter::Include,
+                                    after,
+                                    limit: 500,
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                            let Ok(page) = read else {
+                                break;
+                            };
+                            for row in &page.agents {
+                                let agent = &row.summary;
+                                if wanted.contains(&agent.id) {
+                                    titles.insert(agent.id.clone(), nav::summary_title(agent));
+                                }
+                            }
+                            if titles.len() == wanted.len() {
+                                break;
+                            }
+                            after = page.next;
+                            if after.is_none() {
+                                break;
+                            }
+                        }
+                        Ok::<_, eliot_core::Error>((plan, titles))
+                    })
+                    .map_err(|error| error.to_string());
+                    Message::Settings(SettingsMsg::CleanupPlanned(result))
                 });
             }
             SettingsMsg::CleanupPlanned(result) => {
                 s.cleanup_busy = false;
                 match result {
-                    Ok(plan) => {
+                    Ok((plan, titles)) => {
+                        s.cleanup_titles = titles;
                         s.cleanup_unchecked =
                             crate::worktrees::CleanupGroup::unchecked_by_default();
                         s.cleanup_kept_open.clear();
+                        s.cleanup_open.clear();
                         s.cleanup_plan = Some(plan);
                     }
                     Err(e) => s.cleanup_error = Some(e),
@@ -713,6 +752,11 @@ impl DesktopApp {
             SettingsMsg::CleanupKeptToggled(group) => {
                 if !s.cleanup_kept_open.remove(&group) {
                     s.cleanup_kept_open.insert(group);
+                }
+            }
+            SettingsMsg::CleanupExpanded(group) => {
+                if !s.cleanup_open.remove(&group) {
+                    s.cleanup_open.insert(group);
                 }
             }
             SettingsMsg::CleanupGroupToggled(group, on) => {
@@ -983,24 +1027,28 @@ impl DesktopApp {
                 s.project_open = None;
                 self.autosave(Page::Projects, context);
             }
-            SettingsMsg::NewProjectId(text) => s.new_project_id = text,
-            SettingsMsg::NewProjectPath(text) => s.new_project_path = text,
-            SettingsMsg::ProjectAdded => {
-                let profiles = self.known_profiles();
-                let s = &mut self.settings;
-                let id = s.new_project_id.trim().to_owned();
-                match model::add_project(&mut s.projects, &id, &s.new_project_path, &profiles) {
-                    Ok(()) => {
-                        s.project_open = Some(id);
-                        s.new_project_id.clear();
-                        s.new_project_path.clear();
-                        self.autosave(Page::Projects, context);
-                    }
-                    Err(error) => {
-                        s.notes.insert(Page::Projects, Note::error(error));
+            SettingsMsg::ProjectBrowse => match folder::pick() {
+                Ok(Some(path)) => {
+                    let profiles = self.known_profiles();
+                    let s = &mut self.settings;
+                    let id = model::project_id_for_folder(&s.projects, &path);
+                    match model::add_project(&mut s.projects, &id, &path, &profiles) {
+                        Ok(()) => {
+                            s.project_open = Some(id);
+                            self.autosave(Page::Projects, context);
+                        }
+                        Err(error) => {
+                            s.notes.insert(Page::Projects, Note::error(error));
+                        }
                     }
                 }
-            }
+                Ok(None) => {}
+                Err(error) => {
+                    self.settings
+                        .notes
+                        .insert(Page::Projects, Note::error(error));
+                }
+            },
             SettingsMsg::AssignmentText(key, field, text) => {
                 if nav::display_path(&model::assignment_text(&s.automation, &key, field)) != text {
                     model::set_assignment_text(&mut s.automation, &key, field, &text);
@@ -1562,8 +1610,20 @@ impl DesktopApp {
         // The save status stays in view below the page, however far the
         // page is scrolled.
         Grid::new()
-            .rows([GridLength::STAR, GridLength::Auto])
-            .children((scroll, self.save_status(page, width, palette)))
+            .rows([GridLength::STAR, GridLength::Auto, GridLength::Auto])
+            .children((
+                scroll,
+                Border::new()
+                    .grid_row(1)
+                    .content(if page == Page::Worktrees {
+                        self.cleanup_actions(context, palette)
+                    } else {
+                        View::empty()
+                    }),
+                Border::new()
+                    .grid_row(2)
+                    .content(self.save_status(page, width, palette)),
+            ))
     }
 
     /// The settings column: one explicit width, so every page's groups

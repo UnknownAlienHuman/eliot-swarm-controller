@@ -1095,6 +1095,10 @@ with `swarm settings save request.json` (add `--dry-run` to validate only):
 Each named section is a complete replacement; leave unmodified sections out of the
 request. The desktop Settings screen uses the same read/save contract and follows the
 stale-revision rule of [unified settings](#unified-settings).
+The desktop adds a project by choosing its checkout with the native folder picker;
+it derives a valid, collision-free ID from the folder name and immediately saves
+only the projects section through that same revision-checked writer. The Auto model
+row links directly to Routing; reordering candidates uses the same immediate writer.
 
 ## Legacy profile-only editing (`config.profiles.*`)
 

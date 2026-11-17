@@ -6,9 +6,8 @@
 //! candidates ([`reparent::search_managers`], every page up to a bound),
 //! not the sidebar's single page, and says when it left some unread.
 //!
-//! The picker is drawn in the window, over a scrim, in the window's own
-//! theme (the delete confirmation's pattern; a `ContentDialog` follows the
-//! Windows theme). The move is the existing `swarm.reparent` with both
+//! The picker uses the shared M3 dialog and native modal focus host.
+//! The move is the existing `swarm.reparent` with both
 //! generations bound at the click; the daemon's checks decide, and a
 //! refusal stays in the picker in words. An uncertain reply keeps the
 //! ledger entry, so Move again sends the same mutation id.
@@ -348,6 +347,7 @@ impl DesktopApp {
         };
         let confirm: View = match picked {
             Some(parent) => m3::filled(palette)
+                .element_ref(&self.dialog.primary)
                 .is_enabled(!self.submitting())
                 .automation_name(format!("Move under: {}", self.agent_label(parent)))
                 .on_click(context.message(Message::Move(MoveMsg::Confirmed(
@@ -369,44 +369,37 @@ impl DesktopApp {
                 .content(m3::label("Move")),
         };
         let heading = format!("Move “{title}” under another task");
-        Grid::new().children((
-            Border::new().background(palette.scrim()),
-            m3::card_high(palette)
-                .width(DIALOG_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .vertical_alignment(VerticalAlignment::Center)
-                .automation_name(heading.clone())
-                .content(
-                    StackPanel::new().spacing(tokens::spacing::MD).children((
-                        m3::section_title(heading).text_wrapping(TextWrapping::Wrap),
-                        m3::secondary(format!(
-                            "Pick a running or ready {} (archived ones are not listed). It then shows under that task in the sidebar and the Monitor.",
-                            scope.offered()
-                        ))
-                        .text_wrapping(TextWrapping::Wrap),
-                        m3::field()
-                            .text(dialog.query.clone())
-                            .placeholder_text("Search tasks")
-                            .automation_name("Search tasks to move under")
-                            .on_text_changed(
-                                context.callback(|text| Message::Move(MoveMsg::QueryChanged(text))),
-                            ),
-                        list,
-                        incomplete,
-                        summary,
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .horizontal_alignment(HorizontalAlignment::Right)
-                            .spacing(tokens::spacing::SM)
-                            .children((
-                                m3::text_button(palette)
-                                    .automation_name("Cancel move")
-                                    .on_click(context.message(Message::Move(MoveMsg::Closed)))
-                                    .content(m3::label("Cancel")),
-                                confirm,
-                            )),
-                    )),
-                ),
-        ))
+        super::dialog_ui::surface(
+            context,
+            self.dialog.epoch,
+            palette,
+            heading,
+            StackPanel::new().spacing(tokens::spacing::MD).children((
+                m3::secondary(format!(
+                    "Pick a running or ready {}. Its workers move with it.",
+                    scope.offered()
+                ))
+                .text_wrapping(TextWrapping::Wrap),
+                m3::field()
+                    .text(dialog.query.clone())
+                    .placeholder_text("Search tasks")
+                    .automation_name("Search tasks to move under")
+                    .on_text_changed(
+                        context.callback(|text| Message::Move(MoveMsg::QueryChanged(text))),
+                    ),
+                list,
+                incomplete,
+                summary,
+            )),
+            super::dialog_ui::actions(
+                m3::text_button(palette)
+                    .element_ref(&self.dialog.close)
+                    .automation_name("Cancel move")
+                    .on_click(context.message(Message::Move(MoveMsg::Closed)))
+                    .content(m3::label("Cancel")),
+                confirm,
+            ),
+            DIALOG_WIDTH,
+        )
     }
 }

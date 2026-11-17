@@ -881,16 +881,7 @@ impl DesktopApp {
                 GridLength::Auto,
                 GridLength::Auto,
             ])
-            .children((
-                header,
-                body,
-                pending,
-                alert,
-                composer,
-                dismiss,
-                popover,
-                self.handoff_dialog(context),
-            ))
+            .children((header, body, pending, alert, composer, dismiss, popover))
     }
 
     /// The reading column's width: the reading width, or the main area less

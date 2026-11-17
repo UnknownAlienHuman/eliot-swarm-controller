@@ -216,7 +216,36 @@ pub fn set_project_actions(draft: &mut Value, id: &str, text: &str) {
     }
 }
 
-/// Add a project allowing every listed profile; the daemon resolves its Git
+/// Derive a bounded valid ID from a checkout name, avoiding saved IDs.
+pub fn project_id_for_folder(draft: &Value, path: &str) -> String {
+    let leaf = path
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("");
+    let slug: String = leaf
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    let slug = &slug[..slug.len().min(112)];
+    let base = if slug.is_empty() { "project" } else { slug };
+    let mut id = base.to_owned();
+    let mut suffix = 2;
+    while draft.get(&id).is_some() {
+        id = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    id
+}
+
+/// Add a project allowing the listed profiles; the daemon resolves its Git
 /// identity when the draft is validated or saved.
 pub fn add_project(
     draft: &mut Value,
@@ -650,6 +679,24 @@ pub fn launch_error(error: &eliot_core::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_project_ids_accept_windows_paths_and_resolve_slug_collisions() {
+        let draft = json!({"my-project": {}, "my-project-2": {}});
+        assert_eq!(
+            project_id_for_folder(&draft, r"C:\work\My Project\"),
+            "my-project-3"
+        );
+        assert_eq!(
+            project_id_for_folder(&draft, "/work/Other_Repo/"),
+            "other_repo"
+        );
+        assert_eq!(project_id_for_folder(&draft, "/work/日本語"), "project");
+        let long = format!("C:/work/{}", "x".repeat(200));
+        let id = project_id_for_folder(&json!({}), &long);
+        assert!(valid_name(&id));
+        assert!(valid_name(&project_id_for_folder(&json!({id: {}}), &long)));
+    }
 
     #[test]
     fn routing_edits_keep_order_and_drop_empty_roles() {

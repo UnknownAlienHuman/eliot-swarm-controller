@@ -16,9 +16,9 @@
 //!
 //! Reactor 0.100.0 attaches a `Menu` only as a Button's left-click flyout
 //! and has no `ContextFlyout`, so the menu is drawn in the window, at the
-//! pointer, over a transparent layer that closes it on any press (the
-//! composer popovers' pattern); the confirmation is an in-window dialog in
-//! the window's own theme (a `ContentDialog` follows the Windows theme).
+//! pointer, over a transparent layer that closes it on any press. All modal
+//! confirmations use the common M3 body/footer and native focus host in
+//! [`super::dialog_ui`].
 //! A row's right press arrives through its `Border` (`PointerPressed` with
 //! the right button, which a Button leaves unhandled).
 //!
@@ -78,6 +78,7 @@ pub(super) enum Action {
     Archive(bool),
     Delete,
     CopyId,
+    More,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +87,9 @@ pub(super) enum MenuMsg {
     Requested(Target, f64, f64),
     Closed,
     Chosen(Action),
+    Quick(UiAgent, Action),
+    TaskOpened(UiAgent),
+    Hovered(Option<String>),
     RenameChanged(String),
     RenameCommitted,
     RenameCancelled,
@@ -122,6 +126,8 @@ pub(super) enum MenuMsg {
 #[derive(Default)]
 pub(super) struct MenuState {
     pub(super) open: Option<(Target, f64, f64)>,
+    pub(super) more: bool,
+    pub(super) hovered: Option<String>,
     /// The target being renamed and the text typed so far.
     pub(super) renaming: Option<(Target, String)>,
     pub(super) confirm: Option<(Target, Action)>,
@@ -195,10 +201,20 @@ impl DesktopApp {
         match msg {
             MenuMsg::Requested(target, x, y) => {
                 self.close_popover();
+                self.menu.more = false;
                 self.menu.open = Some((target, x, y));
                 crate::shortcuts::set_popover(crate::shortcuts::Popover::Menu);
             }
             MenuMsg::Closed => self.close_menu(),
+            MenuMsg::TaskOpened(agent) => {
+                let (x, y) = crate::shortcuts::pointer_position();
+                self.menu_update(MenuMsg::Requested(Target::Agent(agent), x, y), context);
+            }
+            MenuMsg::Hovered(agent) => self.menu.hovered = agent,
+            MenuMsg::Quick(agent, action) => {
+                self.menu_action(Target::Agent(agent), action, context)
+            }
+            MenuMsg::Chosen(Action::More) => self.menu.more = !self.menu.more,
             MenuMsg::Chosen(action) => {
                 let Some((target, _, _)) = self.menu.open.take() else {
                     return;
@@ -598,7 +614,12 @@ impl DesktopApp {
         }
     }
 
-    fn menu_action(&mut self, target: Target, action: Action, context: &ComponentContext<Self>) {
+    pub(super) fn menu_action(
+        &mut self,
+        target: Target,
+        action: Action,
+        context: &ComponentContext<Self>,
+    ) {
         match (action, &target) {
             (Action::NewTaskHere, Target::Project { checkout, .. }) => {
                 self.shell_update(ShellMsg::ProjectPicked(checkout.clone()), context);
@@ -755,7 +776,10 @@ impl DesktopApp {
 
     /// The menu's entries for a target, in order: (action, label, glyph,
     /// destructive).
-    fn menu_entries(&self, target: &Target) -> Vec<(Action, String, &'static str, bool)> {
+    pub(super) fn menu_entries(
+        &self,
+        target: &Target,
+    ) -> Vec<(Action, String, &'static str, bool)> {
         match target {
             Target::Project { collapsed, .. } => vec![
                 (
@@ -794,30 +818,27 @@ impl DesktopApp {
                 ),
             ],
             Target::Agent(agent) => {
+                if self.menu.more && self.menu.open.is_some() {
+                    return std::iter::once((
+                        Action::More,
+                        "Back".to_owned(),
+                        m3::glyph::BACK,
+                        false,
+                    ))
+                    .chain(self.developer_entries(target))
+                    .collect();
+                }
                 let mut entries = vec![(
                     Action::Rename,
                     "Rename".to_owned(),
                     m3::glyph::RENAME,
                     false,
                 )];
-                if agent.live() && !agent.native_child {
-                    entries.push((Action::Stop, "Stop".to_owned(), m3::glyph::STOP, false));
-                }
                 if !agent.native_child {
                     entries.push((
                         Action::MoveUnder,
                         "Move under another task…".to_owned(),
                         m3::glyph::MOVE,
-                        false,
-                    ));
-                }
-                // A lost task cannot be deleted (the Store keeps it):
-                // resume it, or archive it to hide it.
-                if agent.state == eliot_core::AgentState::Lost && !agent.native_child {
-                    entries.push((
-                        Action::Resume,
-                        "Resume".to_owned(),
-                        m3::glyph::RESUME,
                         false,
                     ));
                 }
@@ -838,6 +859,25 @@ impl DesktopApp {
                         )
                     });
                 }
+                // A lost task cannot be deleted (the Store keeps it):
+                // resume it, or archive it to hide it.
+                if matches!(
+                    agent.state,
+                    eliot_core::AgentState::Lost
+                        | eliot_core::AgentState::Stopped
+                        | eliot_core::AgentState::Failed
+                ) && !agent.native_child
+                {
+                    entries.push((
+                        Action::Resume,
+                        "Resume".to_owned(),
+                        m3::glyph::RESUME,
+                        false,
+                    ));
+                }
+                if agent.live() && !agent.native_child {
+                    entries.push((Action::Stop, "Stop".to_owned(), m3::glyph::STOP, false));
+                }
                 if !agent.native_child && (agent.live() || agent.deletable()) {
                     entries.push((
                         Action::Delete,
@@ -852,27 +892,41 @@ impl DesktopApp {
                     ));
                 }
                 entries.push((
-                    Action::CopyId,
-                    "Copy Agent ID".to_owned(),
-                    m3::glyph::COPY,
+                    Action::More,
+                    "More".to_owned(),
+                    m3::glyph::CHEVRON_RIGHT,
                     false,
                 ));
-                if !agent.project.is_empty() {
-                    entries.push((
-                        Action::OpenFolder,
-                        "Open folder".to_owned(),
-                        m3::glyph::OPEN_FOLDER,
-                        false,
-                    ));
-                }
                 entries
             }
         }
     }
 
-    /// The window-wide layer: the open menu at the pointer (a press outside
-    /// closes it) or the confirmation dialog over a scrim.
-    pub(super) fn menu_overlay(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn developer_entries(
+        &self,
+        target: &Target,
+    ) -> Vec<(Action, String, &'static str, bool)> {
+        let Target::Agent(agent) = target else {
+            return Vec::new();
+        };
+        let mut entries = vec![(
+            Action::CopyId,
+            "Copy Agent ID".to_owned(),
+            m3::glyph::COPY,
+            false,
+        )];
+        if !agent.project.is_empty() {
+            entries.push((
+                Action::OpenFolder,
+                "Open folder".to_owned(),
+                m3::glyph::OPEN_FOLDER,
+                false,
+            ));
+        }
+        entries
+    }
+
+    pub(super) fn task_dialog(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         if let Some(removal) = &self.menu.removal {
             return self.removal_dialog(removal, context, palette);
         }
@@ -882,6 +936,16 @@ impl DesktopApp {
         if let Some(dialog) = &self.menu.moving {
             return self.move_dialog(dialog, context, palette);
         }
+        let epoch = self.dialog.epoch;
+        ContentDialog::new()
+            .is_open(false)
+            .on_closed(context.callback(move |_| Message::DialogClosed(epoch)))
+            .content(View::empty())
+    }
+
+    /// The window-wide layer: the open menu at the pointer (a press outside
+    /// closes it) or the confirmation dialog over a scrim.
+    pub(super) fn menu_overlay(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let Some((target, x, y)) = &self.menu.open else {
             return View::empty();
         };
@@ -951,38 +1015,26 @@ impl DesktopApp {
                 "Remove project",
             ),
         };
-        Grid::new().children((
-            Border::new().background(palette.scrim()),
-            m3::card_high(palette)
-                .width(420.0)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .vertical_alignment(VerticalAlignment::Center)
-                .automation_name(title.clone())
-                .content(
-                    StackPanel::new().spacing(tokens::spacing::MD).children((
-                        m3::section_title(title.clone()).text_wrapping(TextWrapping::Wrap),
-                        m3::secondary(body).text_wrapping(TextWrapping::Wrap),
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .horizontal_alignment(HorizontalAlignment::Right)
-                            .spacing(tokens::spacing::SM)
-                            .children((
-                                m3::text_button(palette)
-                                    .automation_name("Cancel")
-                                    .on_click(
-                                        context.message(Message::Menu(MenuMsg::Confirmed(false))),
-                                    )
-                                    .content(m3::label("Cancel")),
-                                m3::destructive(palette)
-                                    .automation_name(format!("{button}: {}", target.title()))
-                                    .on_click(
-                                        context.message(Message::Menu(MenuMsg::Confirmed(true))),
-                                    )
-                                    .content(m3::label(button)),
-                            )),
-                    )),
-                ),
-        ))
+        super::dialog_ui::surface(
+            context,
+            self.dialog.epoch,
+            palette,
+            title,
+            m3::secondary(body).text_wrapping(TextWrapping::Wrap).into(),
+            super::dialog_ui::actions(
+                m3::text_button(palette)
+                    .element_ref(&self.dialog.close)
+                    .automation_name("Cancel")
+                    .on_click(context.message(Message::Menu(MenuMsg::Confirmed(false))))
+                    .content(m3::label("Cancel")),
+                m3::destructive(palette)
+                    .element_ref(&self.dialog.primary)
+                    .automation_name(format!("{button}: {}", target.title()))
+                    .on_click(context.message(Message::Menu(MenuMsg::Confirmed(true))))
+                    .content(m3::label(button)),
+            ),
+            420.0,
+        )
     }
 
     /// Stop and delete in progress: the step it is at, or a refused step's
@@ -1022,25 +1074,22 @@ impl DesktopApp {
                 .orientation(Orientation::Horizontal)
                 .horizontal_alignment(HorizontalAlignment::Right)
                 .children((m3::text_button(palette)
+                    .element_ref(&self.dialog.close)
                     .automation_name("Close")
                     .on_click(context.message(Message::Menu(MenuMsg::RemovalClosed)))
                     .content(m3::label("Close")),))
         } else {
             View::empty()
         };
-        Grid::new().children((
-            Border::new().background(palette.scrim()),
-            m3::card_high(palette)
-                .width(420.0)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .vertical_alignment(VerticalAlignment::Center)
-                .automation_name(title.clone())
-                .content(StackPanel::new().spacing(tokens::spacing::MD).children((
-                    m3::section_title(title).text_wrapping(TextWrapping::Wrap),
-                    status,
-                    close,
-                ))),
-        ))
+        super::dialog_ui::surface(
+            context,
+            self.dialog.epoch,
+            palette,
+            title,
+            status,
+            close,
+            420.0,
+        )
     }
 
     /// "Archived “title”" with Undo, above the composer.

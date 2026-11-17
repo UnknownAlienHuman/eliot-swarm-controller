@@ -260,9 +260,27 @@ impl DesktopApp {
                     // Not keyed by the highlight: the highlight is the row's
                     // fill, and re-creating the row under the pointer as it
                     // enters would drop the click that follows.
+                    let choice = self.picker_row(item, highlighted, context, palette);
+                    let choice = if item.key == "auto" {
+                        Grid::new()
+                            .columns([GridLength::STAR, GridLength::Auto])
+                            .children((
+                                choice,
+                                m3::icon_button(palette)
+                                    .grid_column(1)
+                                    .automation_name("Edit Auto order")
+                                    .on_click(context.message(Message::Shell(
+                                        super::shell_ui::ShellMsg::AutoSettings,
+                                    )))
+                                    .content(m3::icon(m3::glyph::SLIDERS))
+                                    .tooltip("Edit Auto order"),
+                            ))
+                    } else {
+                        choice
+                    };
                     items.push(KeyedView::new(
                         format!("{}:{}", item.key, item.current),
-                        self.picker_row(item, highlighted, context, palette),
+                        choice,
                     ));
                 }
             }

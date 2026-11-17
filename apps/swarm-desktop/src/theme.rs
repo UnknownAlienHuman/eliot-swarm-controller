@@ -364,11 +364,6 @@ pub mod winui {
             self.role(|s| s.error, ThemeBrush::SystemCritical)
         }
 
-        /// The M3 scrim behind a dialog: black at 32 %.
-        pub fn scrim(self) -> Brush {
-            Brush::Solid(Color::argb(82, 0, 0, 0))
-        }
-
         /// A destructive confirmation's surface (the Force stop banner).
         pub fn error_container(self) -> Brush {
             self.role(|s| s.error_container, ThemeBrush::SystemCriticalBackground)

@@ -1,5 +1,5 @@
 //! Glue for the Hand off / Switch dialog: its messages, background reads and
-//! submissions, and the `ContentDialog` view. The rules (send selection,
+//! submissions, and the shared M3 dialog view. The rules (send selection,
 //! result facts, gate meanings, when "finish" applies) live in
 //! [`crate::handoff`].
 //!
@@ -84,7 +84,7 @@ pub(super) enum HandoffMsg {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct DialogState {
-    open: bool,
+    pub(super) open: bool,
     /// Tags one opening; replies from an earlier one are dropped.
     epoch: u64,
     from: String,
@@ -660,20 +660,11 @@ impl DesktopApp {
     /// clicked. Ids stay out of the main view: SENDs show their text and age,
     /// and the readback with ids sits under "Readback details".
     ///
-    /// WinUI 3 shows a ContentDialog in the popup layer, which follows the
-    /// application theme, not the window root's RequestedTheme (Reactor
-    /// 0.100.0 sets that on the host Grid only and exposes no RequestedTheme
-    /// on ContentDialog). Nothing inside therefore sets palette brushes:
-    /// text and controls resolve the application's resources, which
-    /// `app_resources` writes from the window's scheme (the dialog surface,
-    /// its text, fields and dropdowns), and the primary is WinUI's
-    /// AccentButtonStyle on the M3 filled roles.
     pub(super) fn handoff_dialog(&self, context: &mut ViewContext<Self>) -> View {
         let state = &self.handoff;
+        let palette = self.palette();
         if !state.open {
-            // Reactor hides an open dialog only through is_open(false);
-            // removing its node would leave it on screen.
-            return ContentDialog::new().is_open(false).content(View::empty());
+            return View::empty();
         }
         let now = handoff::now_ms();
         let rows: &[SendRow] = match &state.sends {
@@ -1084,33 +1075,31 @@ impl DesktopApp {
         };
         let primary: View = match primary_message {
             _ if primary_label.is_empty() => View::empty(),
-            Some(message) => Button::new()
+            Some(message) => m3::filled(palette)
+                .element_ref(&self.dialog.primary)
                 .is_enabled(primary_enabled)
                 .on_click(context.message(Message::Handoff(message)))
-                .style(ButtonStyle::Accent)
                 .automation_name(primary_label.clone())
                 .content(TextBlock::new().text(primary_label)),
-            None => Button::new()
+            None => m3::filled(palette)
                 .is_enabled(false)
-                .style(ButtonStyle::Accent)
                 .automation_name(primary_label.clone())
                 .content(TextBlock::new().text(primary_label)),
         };
-        // Unstyled: the application's text-button colors of the dialog's
-        // own theme.
-        let close = Button::new()
+        // The same Cancel/Close then primary order as every M3 dialog.
+        let close = m3::text_button(palette)
+            .element_ref(&self.dialog.close)
             .automation_name("Close")
             .on_click(context.message(Message::Handoff(HandoffMsg::Closed)))
             .content(TextBlock::new().text("Close"));
-        // A definite refusal leads the footer in the theme's critical color
-        // (a theme brush: the dialog may not share the window's palette).
+        // Definite refusals use the shared window palette's error role.
         let summary = self.handoff_summary(harness, model, effort);
         let summary: View = match &state.refusal {
             Some(refusal) => StackPanel::new()
                 .spacing(tokens::spacing::XS)
                 .vertical_alignment(VerticalAlignment::Center)
                 .children((
-                    small(refusal.clone()).foreground(Brush::Theme(ThemeBrush::SystemCritical)),
+                    small(refusal.clone()).foreground(palette.error()),
                     small(summary),
                 )),
             None => small(summary)
@@ -1130,27 +1119,17 @@ impl DesktopApp {
                     .vertical_alignment(VerticalAlignment::Bottom)
                     .children((close, primary)),
             ));
-        ContentDialog::new()
-            .is_open(true)
-            .title(format!("Hand off or switch {}", state.from))
-            .on_closed(context.callback(|_| Message::Handoff(HandoffMsg::Closed)))
-            .content(
-                Grid::new()
-                    .rows([GridLength::STAR, GridLength::Auto])
-                    .row_spacing(tokens::spacing::LG)
-                    .children((
-                        ScrollViewer::new()
-                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                            .max_height(tokens::layout::DIALOG_MAX_HEIGHT)
-                            .content(
-                                StackPanel::new()
-                                    .spacing(tokens::spacing::XS)
-                                    .margin(Thickness::new(0.0, 0.0, tokens::spacing::LG, 0.0))
-                                    .keyed_children(sections),
-                            ),
-                        footer,
-                    )),
-            )
+        super::dialog_ui::surface(
+            context,
+            self.dialog.epoch,
+            palette,
+            format!("Hand off or switch {}", state.from),
+            StackPanel::new()
+                .spacing(tokens::spacing::XS)
+                .keyed_children(sections),
+            footer,
+            640.0,
+        )
     }
 
     /// The submission for the chosen destination, from what is shown: the
