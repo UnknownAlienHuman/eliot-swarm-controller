@@ -6,7 +6,7 @@ use super::args::{
 };
 use super::support::read_and_print;
 use super::support::{Failure, PAGE_SIZE, print_value, validate_limit};
-use eliot_core::api::AgentSummary;
+use eliot_core::api::{AgentSummary, activity_state_name};
 use eliot_core::api::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse,
@@ -17,7 +17,9 @@ use eliot_core::api::{
     ObservationPage, ObserveHeavyRequest, ObserveHeavyResponse, TurnCounterMissing,
     UsageSummaryRequest, UsageSummaryResponse,
 };
-use eliot_core::{AgentState, Error as CoreError, NativeChildActivityState};
+use eliot_core::{AgentState, Error as CoreError};
+#[cfg(test)]
+use eliot_core::NativeChildActivityState;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1100,16 +1102,6 @@ pub(crate) fn missing_cell(missing: &TurnCounterMissing) -> String {
         missing.cache_write_tokens,
         missing.total_tokens,
     )
-}
-
-pub(crate) fn activity_state_name(state: NativeChildActivityState) -> &'static str {
-    match state {
-        NativeChildActivityState::Running => "running",
-        NativeChildActivityState::Idle => "idle",
-        NativeChildActivityState::Interrupted => "interrupted",
-        NativeChildActivityState::Lost => "lost",
-        NativeChildActivityState::Unknown => "unknown",
-    }
 }
 
 pub(crate) fn age_cell(age_ms: Option<i64>) -> String {
