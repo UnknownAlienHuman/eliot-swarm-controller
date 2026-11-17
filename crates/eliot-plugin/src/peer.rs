@@ -141,7 +141,9 @@ where
                     match decode_frame(&line) {
                         Ok(Incoming::Request(request)) => return Some(request),
                         Ok(Incoming::Response(response)) => {
-                            self.client.route_response(response);
+                            if !self.client.route_response(response) {
+                                return None;
+                            }
                         }
                         Err(error) => {
                             let deadline = Instant::now() + INVALID_FRAME_RESPONSE_TIMEOUT;
@@ -271,13 +273,20 @@ impl PeerClient {
             .map_err(|_| Error::new("transport_closed", "plugin writer stopped"))?
     }
 
-    fn route_response(&self, response: RpcResponse) {
+    /// Route one host response to its pending call. Returns whether the peer
+    /// stays usable: a non-string id can never match a pending call (outbound
+    /// ids are always `plugin-call-{seq}` strings), so the peer is
+    /// non-conformant and every pending call fails at once with `unknown`
+    /// instead of stranding until its deadline. Each failed call was already
+    /// sent, so every effect stays uncertain.
+    fn route_response(&self, response: RpcResponse) -> bool {
         let Some(id) = response.id.as_str() else {
-            return;
+            self.fail_pending(Error::new("unknown", "plugin response id is not a string"));
+            return false;
         };
         let sender = self.pending.lock_recover().remove(id);
         let Some(sender) = sender else {
-            return;
+            return true;
         };
         let result = match (response.result, response.error) {
             (Some(value), None) => Ok(value),
@@ -288,6 +297,7 @@ impl PeerClient {
             )),
         };
         let _ = sender.send(result);
+        true
     }
 
     fn fail_pending(&self, error: Error) {
@@ -735,6 +745,32 @@ mod tests {
             pending_slots: Arc::new(Semaphore::new(MAX_PENDING_CALLS)),
             next_id: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    #[test]
+    fn malformed_response_id_fails_pending_calls_with_unknown() {
+        let client = test_client();
+        let (tx, mut rx) = oneshot::channel();
+        client
+            .pending
+            .lock_recover()
+            .insert("plugin-call-7".to_owned(), tx);
+        let response = RpcResponse {
+            jsonrpc: "2.0".to_owned(),
+            id: json!(42),
+            result: Some(json!({"ok": true})),
+            error: None,
+        };
+        // A non-string id can never match the string outbound id: the peer
+        // is non-conformant, so the call fails at once with `unknown`
+        // instead of stranding until its deadline, and the peer stops.
+        assert!(!client.route_response(response));
+        let error = rx
+            .try_recv()
+            .expect("malformed id wakes the pending call")
+            .expect_err("pending call fails");
+        assert_eq!(error.code, "unknown");
+        assert!(client.pending.lock_recover().is_empty());
     }
 
     fn batch_readback(batch: &SourceBatch) -> Value {

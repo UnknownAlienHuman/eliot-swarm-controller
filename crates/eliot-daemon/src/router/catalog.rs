@@ -38,7 +38,7 @@ pub(super) fn quota_read_error(response: &mut HarnessQuotaResponse, error: eliot
             serde_json::json!({"state":"error","origin":origin,"error":"quota read failed; no values available"}),
         );
         response.note = Some(if error.code == "quota_unavailable" {
-            error.message.chars().take(512).collect()
+            eliot_core::bound_chars(&error.message, 512)
         } else {
             "Read-only native/provider quota unavailable; no inference or credential refresh attempted".to_owned()
         });
@@ -367,6 +367,28 @@ fn evict_quotas(map: &mut HashMap<String, HarnessQuotaResponse>, now: i64) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn quota_read_error_note_is_byte_bounded_on_a_char_boundary() {
+        let mut response = HarnessQuotaResponse {
+            harness: "claude".to_owned(),
+            scope: "profile:adhoc harness:claude".to_owned(),
+            fetched_at_ms: 1_000,
+            ttl_ms: CATALOG_TTL_MS,
+            credential: "none".to_owned(),
+            status: "supported".to_owned(),
+            note: None,
+            details: None,
+        };
+        let message = "ж".repeat(400);
+        quota_read_error(
+            &mut response,
+            eliot_core::Error::new("quota_unavailable", message),
+        );
+        let note = response.note.expect("quota read error carries a note");
+        assert!(note.len() <= 512, "note is {} bytes", note.len());
+        assert!(note.chars().all(|c| c == 'ж'));
+    }
 
     #[test]
     fn quota_method_not_found_is_unsupported_and_names_checked_method() {

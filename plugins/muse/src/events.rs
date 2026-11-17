@@ -4653,21 +4653,6 @@ fn projection_turn_state(result: &Value, session_id: &str, turn_id: &str) -> Pro
     }
 }
 
-/// Bound free wire text to `max` bytes without splitting UTF-8:
-/// `String::truncate` panics on a non-char-boundary, which would take down
-/// the event task on a non-ASCII status, so floor to the boundary instead,
-/// mirroring the native-error and stderr-tail bounds.
-fn truncate_to_char_boundary(mut text: String, max: usize) -> String {
-    if text.len() > max {
-        let mut end = max;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-    }
-    text
-}
-
 /// Exact reason a `session/read` result proved nothing about the gapped
 /// turn. Mirrors `projection_turn_state` case by case so pending recovery
 /// names the readback failure instead of the gap alone.
@@ -4696,7 +4681,7 @@ fn describe_unproven_session_read(result: &Value, session_id: &str, turn_id: &st
         ("idle", _) => "session/read reported idle without a null active turn".to_owned(),
         ("notLoaded", _) => "session/read reported the session notLoaded".to_owned(),
         _ => {
-            let short = truncate_to_char_boundary(status.to_owned(), 32);
+            let short = eliot_core::bound_chars(status, 32);
             format!("session/read reported status {short}")
         }
     }
@@ -6471,17 +6456,11 @@ mod tests {
         // down the event task. The bound floors to the last full char.
         let status = format!("{}Ä", "a".repeat(31));
         assert_eq!(status.len(), 33);
-        assert_eq!(
-            truncate_to_char_boundary(status.clone(), 32),
-            "a".repeat(31)
-        );
-        assert_eq!(
-            truncate_to_char_boundary("b".repeat(40), 32),
-            "b".repeat(32)
-        );
-        assert_eq!(truncate_to_char_boundary("short".to_owned(), 32), "short");
+        assert_eq!(eliot_core::bound_chars(&status, 32), "a".repeat(31));
+        assert_eq!(eliot_core::bound_chars(&"b".repeat(40), 32), "b".repeat(32));
+        assert_eq!(eliot_core::bound_chars("short", 32), "short");
         // A four-byte emoji straddling the bound floors the same way.
-        let bounded = truncate_to_char_boundary(format!("{}💥tail", "c".repeat(30)), 32);
+        let bounded = eliot_core::bound_chars(&format!("{}💥tail", "c".repeat(30)), 32);
         assert_eq!(bounded, "c".repeat(30));
         // The regression through the real path: an unknown non-ASCII status
         // on the wire must describe the failure, never panic.
