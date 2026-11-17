@@ -449,9 +449,11 @@ write. A lost Eliot event acknowledgement follows the common last-batch rule.
 | configure | model and effort ride the per-turn `turn/start` fields (`TurnStartParams.model`/`effort`), resolved from the retained revision at send dispatch; the frozen snapshot never changes |
 | fork / native Goal / child control | later optional methods verified against installed schema, not advertised until implemented |
 
-Read effective model/provider/cwd/permissions from documented native fields. When an
-endpoint/billing fact is not exposed, report it as unverified rather than inventing
-readback. An unexpected effective route does not authorize further input.
+Read effective model/provider/cwd/permissions from documented native fields. The
+`thread/start`/`thread/resume` request always names the selected model, so its echoed
+`model` equal to that selection sets `model_verified`; `effort_verified` needs a
+requested effort echoed on the ChatGPT route. When an endpoint/billing fact is not
+exposed, report it as unverified rather than inventing readback. An unexpected effective route does not authorize further input.
 
 Controlled launch resolves the effective native store through a dedicated read-only
 `profile.store` reader after workspace preparation, then commits its binding with launch
