@@ -10,7 +10,8 @@
 use eliot_core::AgentState;
 use eliot_core::api::{ReparentRequest, ReparentResponse};
 
-use crate::monitor::{MonitorRow, state_name};
+use crate::monitor::MonitorRow;
+use eliot_core::api::agent_state_name;
 
 /// The two `swarm.reparent` source forms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,7 +89,7 @@ pub fn candidate_label(row: &MonitorRow) -> String {
     format!(
         "{} · {} · {} · generation {}",
         row.id,
-        state_name(row.state),
+        agent_state_name(row.state),
         row.harness,
         row.generation
     )

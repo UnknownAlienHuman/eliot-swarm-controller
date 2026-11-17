@@ -28,7 +28,7 @@ use std::path::Path;
 use std::pin::Pin;
 
 use eliot_core::AgentState;
-use eliot_core::api::{
+use eliot_core::api::{agent_state_name, 
     AgentGetResponse, AgentListRequest, AgentListResponse, AgentListRow, ObservationView,
     ProcessStatsView, UsageSummaryResponse,
 };
@@ -116,20 +116,6 @@ pub fn attention_words(reason: &str) -> String {
                 first.to_uppercase().chain(chars).collect()
             })
         }
-    }
-}
-
-pub fn state_name(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Unknown => "unknown",
-        AgentState::Created => "created",
-        AgentState::Starting => "starting",
-        AgentState::Idle => "idle",
-        AgentState::Busy => "busy",
-        AgentState::Waiting => "waiting",
-        AgentState::Stopped => "stopped",
-        AgentState::Failed => "failed",
-        AgentState::Lost => "lost",
     }
 }
 
@@ -519,7 +505,7 @@ impl MonitorRow {
             "Working" if self.native_child => "busy",
             "Idle" if self.native_child => "idle",
             "Lost" if self.native_child => "lost",
-            _ => state_name(self.state),
+            _ => agent_state_name(self.state),
         }
     }
 
@@ -1042,7 +1028,7 @@ impl Monitor {
                     });
                 }
                 Err(error) => {
-                    self.errors.push(format!("{}: {error}", state_name(*state)));
+                    self.errors.push(format!("{}: {error}", agent_state_name(*state)));
                     counts.push(StateCount {
                         state: *state,
                         total: None,
@@ -1059,7 +1045,7 @@ impl Monitor {
                     shown: 0,
                 }),
                 Err(error) => {
-                    self.errors.push(format!("{}: {error}", state_name(*state)));
+                    self.errors.push(format!("{}: {error}", agent_state_name(*state)));
                     counts.push(StateCount {
                         state: *state,
                         total: None,
@@ -1451,7 +1437,7 @@ mod tests {
 
     #[test]
     fn an_agent_seen_in_two_state_reads_is_one_row() {
-        use eliot_core::api::{AgentListResponse, AgentSummary};
+        use eliot_core::api::{agent_state_name, AgentListResponse, AgentSummary};
         let row = |state: AgentState| AgentListRow {
             summary: AgentSummary {
                 archived: false,

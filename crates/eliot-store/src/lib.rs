@@ -39,7 +39,7 @@ pub use rules::{
 pub use scripts::ScriptRunAdmission;
 pub use usage::ResolvedUsageScope;
 
-use eliot_core::api::{HeavySummaryView, SessionGrowthView};
+use eliot_core::api::{HeavySummaryView, SessionGrowthView, agent_state_name};
 use eliot_core::limits::{MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES};
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
@@ -5825,20 +5825,6 @@ fn validate_id_age(id: &str, now: i64) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn agent_state_name(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Unknown => "unknown",
-        AgentState::Created => "created",
-        AgentState::Starting => "starting",
-        AgentState::Idle => "idle",
-        AgentState::Busy => "busy",
-        AgentState::Waiting => "waiting",
-        AgentState::Stopped => "stopped",
-        AgentState::Failed => "failed",
-        AgentState::Lost => "lost",
-    }
 }
 
 fn command_state_name(state: CommandState) -> &'static str {

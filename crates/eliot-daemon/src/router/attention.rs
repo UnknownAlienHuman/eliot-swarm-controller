@@ -3,7 +3,7 @@
 
 use super::{Principal, Router};
 use crate::common::now_ms;
-use eliot_core::api::{
+use eliot_core::api::{agent_state_name, 
     EmitDefinitionArgs, MailMode, MailSendRequest, ObservationView, SourceState,
 };
 use eliot_core::{Agent, AgentState, CommandState, Error, ProcessState, Result};
@@ -2005,7 +2005,7 @@ fn activity_context(captured: &CapturedAgent) -> String {
         eliot_store::ActiveToolCoverage::Active { .. } => "active_tool".to_owned(),
         eliot_store::ActiveToolCoverage::Unknown => "tool_coverage_unknown".to_owned(),
         eliot_store::ActiveToolCoverage::Clear => {
-            format!("state_{}", state_name(captured.agent.state))
+            format!("state_{}", agent_state_name(captured.agent.state))
         }
     }
 }
@@ -2209,7 +2209,7 @@ fn build_report(
         reason: kind.as_str().to_owned(),
         agent_id: captured.agent.id.clone(),
         generation: captured.agent.generation,
-        agent_state: state_name(captured.agent.state).to_owned(),
+        agent_state: agent_state_name(captured.agent.state).to_owned(),
         turn_id: captured.agent.active_turn.clone(),
         parent_agent: captured.agent.parent.clone(),
         observed_at,
@@ -2907,20 +2907,6 @@ fn diagnosis_summary(report: &AttentionReport) -> String {
         process_complete,
         process_exited,
     )
-}
-
-fn state_name(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Created => "created",
-        AgentState::Starting => "starting",
-        AgentState::Idle => "idle",
-        AgentState::Busy => "busy",
-        AgentState::Waiting => "waiting",
-        AgentState::Stopped => "stopped",
-        AgentState::Failed => "failed",
-        AgentState::Lost => "lost",
-        AgentState::Unknown => "unknown",
-    }
 }
 
 #[cfg(test)]
