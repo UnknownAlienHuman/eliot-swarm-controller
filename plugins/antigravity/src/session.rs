@@ -206,6 +206,7 @@ pub(crate) struct Session {
     task: Option<JoinHandle<()>>,
     hooks: Option<HookServer>,
     hook_config: Option<OwnedHookConfig>,
+    mcp_config: Option<crate::mcp::OwnedConfig>,
     ready: bool,
     highwater_seq: i64,
     retained: Option<RetainedCommand>,
@@ -237,6 +238,7 @@ impl Session {
         credential: &str,
         mut hook_config: HookConfigGuard,
         hooks: HookServer,
+        mcp_config: Option<crate::mcp::OwnedConfig>,
     ) -> Result<Self> {
         let reserved = [
             hooks::ENV_HOOK_HELPER,
@@ -299,6 +301,7 @@ impl Session {
             task: None,
             hooks: Some(hooks),
             hook_config: hook_config.0.take(),
+            mcp_config,
             ready: false,
             highwater_seq: 0,
             retained: None,
@@ -1452,6 +1455,7 @@ impl Session {
             let _ = task.await;
         }
         self.state.lock().await.cancel_pending_steer();
+        self.mcp_config.take();
         if let Some(config) = self.hook_config.take() {
             remove_hook_config(&config);
         }
@@ -1490,6 +1494,7 @@ impl Session {
         if let Some(config) = self.hook_config.take() {
             remove_hook_config(&config);
         }
+        self.mcp_config.take();
         if self.ready {
             let mut state = self.state.lock().await;
             state.ended().await?;

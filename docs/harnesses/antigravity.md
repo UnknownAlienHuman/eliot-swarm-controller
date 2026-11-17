@@ -14,9 +14,9 @@ Subject: `(canonical auth/config scope, exact ACP sessionId)`.
 agy acp --stdio --dangerously-skip-permissions=false|true --add-dir <hook-discovery-root>
 ```
 
-Installed CLI surface (observed 2026-11-15, read-only `--version`/`--help`;
+Installed CLI surface (observed 2026-11-17, read-only `--version`/`acp --help`;
 1.5.3 on 2026-11-13):
-`agy.exe` reports version 1.5.9. `agy acp` accepts `--add-dir` (repeatable),
+`agy.exe` reports version 1.5.10. `agy acp` accepts `--add-dir` (repeatable),
 `--agent`, `--app-data-dir`, `--cli_dir_name`, `--cli_log_file`/`--log-file`,
 `--cloud_code_endpoint`, `--dangerously-skip-permissions`, `--disable-telemetry`,
 `--gemini-dir`, `--ide-mcp-port`, `--include-default-customizations`,
@@ -213,7 +213,8 @@ dropping the whole root and its hooks without firing, so the staged root
 is stored without that prefix (it names the identical directory). The real
 workspace remains the ACP cwd, and the private instance directory is never a native
 root. The adapter does not write global or user-project hook files, copy
-authentication, or change login/native-store paths. The staged config, its
+authentication, or change login/native-store paths. The MCP config root described
+below is separate from this discovery root. The staged hook config, its
 `.agents` directory, and the discovery root are removed when the generation
 ends. Requested and effective settings carry each native root with its purpose
 (`native_roots.workspace` vs `native_roots.hook_discovery`).
@@ -357,6 +358,39 @@ drain buffered stdout first. Unknown input/result is not retried.
 
 ## Session MCP servers (managed Agents)
 
+The frozen `mcp` policy defaults to `minimal` for new profiles. Installed agy
+1.5.10 documents `acp --gemini-dir` (Gemini files) and `--app-data-dir`
+(application data). The plugin stages `<private-plugins>/<Agent>-agy/config/mcp_config.json`
+with only enabled `mcp_allow` definitions and passes that isolated Gemini root;
+the owner's global MCP servers and plugins are therefore outside native discovery.
+This root persists across generations and is part of the native scope, preserving
+exact session resume. The MCP file is held until native exit and removed with
+generation shutdown; native conversations remain in this Agent's root. Legacy
+`inherit` sessions keep their original native store. The root is never an
+`--add-dir` workspace root. `--app-data-dir` is left unset: despite its help wording,
+1.5.10 rejects absolute application-data paths (observed on Windows 2026-11-17).
+
+The [vendor MCP docs](https://antigravity.google/docs/mcp) identify the global
+`~/.gemini/config/mcp_config.json` and workspace `.agents/mcp_config.json` sources.
+The [customization discovery docs](https://antigravity.google/docs/customization-discovery/)
+also identify `.agent`, `_agents`, `_agent`, repository ancestors, plugins and
+personal customization directories. Allowed enabled names are resolved from those
+global/workspace MCP files. A missing name or owner Swarm transport rejects startup.
+Workspace MCP servers outside the allow list, plugin directories/manifests, and
+personal customization directory redirects reject as `unsupported` before spawning:
+the CLI has no verified per-server suppression for these workspace sources. No
+workspace config is edited. Explicit or legacy `inherit` preserves native discovery,
+checks owner Swarm identities before spawn, and rejects unenumerated plugin sources.
+The policy/allow list in requested and effective settings records the enforced
+configuration; ACP still supplies no observed inventory.
+
+The [vendor authentication docs](https://antigravity.google/docs/install?tab=cli)
+document local silent sign-in through the OS keyring (Windows Credential Manager).
+Isolation changes neither HOME nor that keyring. No token, auth file or owner settings
+is copied, and no login flow is launched by the plugin. The existing OpenCode
+credential import is a pattern for preserving native authentication under isolation;
+AGY's shared keyring makes an export/import unnecessary.
+
 Every managed ACP session carries the Agent-scoped swarm MCP server on the
 documented session-setup surface: `session/new` — and `session/load` with
 the exact retained session id on resume — sends
@@ -412,19 +446,6 @@ Mutations carry a caller-retained ULID in `params.id`; MCP callers may omit it a
 and returns it in the reply for exact retry. The server adds no automatic retries, defaults, or speculative rollbacks. Output frames and stdio line writes are
 strictly bounded to [`MAX_RPC_FRAME_BYTES`](../../crates/eliot-daemon/src/daemon.rs) (4 MiB) via
 [`BoundedLineWriter`](../../crates/eliot/src/mcp/bounded_io.rs).
-
-## Worker MCP policy
-
-This harness keeps `inherit` only: a profile that omits `mcp` resolves to
-`inherit` (the `minimal` default applies only where a harness maps it), and
-an explicit non-`inherit` policy is rejected as `unsupported` at config load. Verified read-only
-(`agy acp --help`, installed 1.5.9): the ACP server flags expose no MCP
-isolation mechanism (no strict/ignore-MCP flag; the documented top-level
-`--settings` is a session-only settings surface, not a verified isolation
-mechanism), so no `minimal` mechanism is implemented. The owner's
-`agy mcp list` surface (codebase_memory, eliot-search, windows-mcp on the
-reference machine) contains no Swarm entry, so no owner Swarm server can
-reach a worker through this harness.
 
 ## Permissions and final checks
 

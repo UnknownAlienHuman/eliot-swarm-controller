@@ -339,7 +339,7 @@ exact tool formats are resolved separately. See the
 
 Every profile selects a worker MCP policy in `mcp`: `minimal` (the default
 where the harness maps it) or `inherit` (explicit opt-in, and the default for
-Muse and Antigravity, which have no minimal mapping), plus an optional `mcp_allow` list of native
+Muse, which has no minimal mapping), plus an optional `mcp_allow` list of native
 server names. Owner Swarm servers are identified by transport, not by name
 (`eliot_core::is_owner_swarm_server`, shared by every harness plugin in
 every policy, regardless of name or allow list): a stdio server whose
@@ -410,6 +410,21 @@ servers. By harness:
   unexpected server, `inherit` refuses reserved Swarm names, and
   `mcp_servers_verified` is reported only after the gate passes with the
   Agent-scoped entry connected.
+- Antigravity defaults to `minimal`. Before spawn the plugin writes only allowed
+  native MCP definitions to an Agent-owned `<plugins>/<Agent>-agy/config/mcp_config.json`,
+  selects that root with agy 1.5.10's `acp --gemini-dir`, and supplies the Swarm
+  Agent bridge through ACP session setup. This native root persists across
+  generations for exact session resume and is part of the native scope; legacy
+  `inherit` sessions retain their original root. Sign-in uses the OS keyring
+  without copying credentials. The MCP file is removed after native exit.
+  `mcp_allow` selects enabled names from the native global/workspace MCP files;
+  missing names or owner Swarm identities fail startup. Workspace definitions
+  outside that list cannot be suppressed by these flags and reject as
+  `unsupported` before spawn. Workspace plugin sources and personal customization
+  directory redirects also reject as unsupported rather than claiming isolation
+  over unenumerated sources. Explicit or legacy `inherit` keeps native discovery,
+  with pre-spawn owner Swarm checks and refusal of unenumerated plugin sources.
+  Policy and allow list are reported separately from the unknown ACP inventory.
 
 No policy edits the owner global native config or copies
 `auth.json`; no project or user file is ever edited by these scans. No
