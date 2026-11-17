@@ -271,20 +271,8 @@ metadata for empty/tiny messages. Acknowledged/history retention is bounded by
 pruned); reads of removed deliveries return `history_gap`, while a retried
 ack over them succeeds as already acked.
 
-```sql
-CREATE TABLE messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  delivery_id TEXT NOT NULL UNIQUE,
-  sender TEXT NOT NULL, sender_generation INTEGER,
-  recipient INTEGER NOT NULL, recipient_generation INTEGER NOT NULL,
-  thread TEXT, reply_to_delivery TEXT,
-  mode TEXT NOT NULL, text TEXT NOT NULL, content_digest BLOB NOT NULL,
-  admitted_at INTEGER NOT NULL, presented_at INTEGER,
-  presentation_command TEXT, read_at INTEGER
-);
-CREATE INDEX messages_inbox ON messages(recipient,read_at,id);
-CREATE INDEX messages_thread ON messages(thread,id);
-```
+The [Store migrations](../../crates/eliot-store/src/schema.rs) own the
+`messages` schema and inbox/thread indexes.
 
 ## Shared variables
 
@@ -297,13 +285,8 @@ supplied one must equal the current version, where an absent row reads as 0.
 Concurrent queued writes use bounded [Store commit grouping](core.md#storage);
 each request still has its own CAS result and retained idempotency binding.
 
-```sql
-CREATE TABLE vars (
-  scope TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
-  version INTEGER NOT NULL, set_by TEXT NOT NULL, note TEXT, set_at INTEGER NOT NULL,
-  PRIMARY KEY(scope,key)
-);
-```
+The [Store migrations](../../crates/eliot-store/src/schema.rs) own the
+`vars` schema.
 
 ## Who works on this
 
