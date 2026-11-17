@@ -2116,12 +2116,13 @@ fn incident_identity(captured: &CapturedAgent, kind: IncidentKind, activity: &st
         sources.sort();
         parts.extend(sources);
     }
-    digest_id(&parts.iter().map(String::as_str).collect::<Vec<_>>())
+    digest_id(&parts)
 }
 
-fn digest_id(parts: &[&str]) -> String {
+fn digest_id(parts: &[impl AsRef<str>]) -> String {
     let mut digest = Sha256::new();
     for part in parts {
+        let part = part.as_ref();
         digest.update((part.len() as u64).to_le_bytes());
         digest.update(part.as_bytes());
     }
@@ -2131,6 +2132,22 @@ fn digest_id(parts: &[&str]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("attention-{hex}")
+}
+
+#[cfg(test)]
+#[test]
+fn attention_digest_fixed_vectors_preserve_length_prefixed_bytes() {
+    let expected = "attention-43ee655579de01ca739b3f95c1c2d3f46d353b2c0df818064ea594506cdb2617";
+    assert_eq!(digest_id(&["ab", "c"]), expected);
+    assert_eq!(digest_id(&["ab".to_owned(), "c".to_owned()]), expected);
+    assert_eq!(
+        digest_id(&["a", "bc"]),
+        "attention-9a8acca1b6c6c0befd3fbc756aed625da998c998f7252e738c4ef061906b9b21"
+    );
+    assert_eq!(
+        loss_incident_id("a42", 7, 1234),
+        "attention-8fd04c48fa0f140136cdb4a8874fb63adc1bc3a06853f59af98b11ddd1404431"
+    );
 }
 
 fn build_report(
