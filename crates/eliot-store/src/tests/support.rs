@@ -589,3 +589,22 @@ pub(super) fn ready_attention_agent(store: &mut Store, project: &str, now: i64) 
         .expect("settle launch");
     agent
 }
+
+pub(super) fn insert_process(
+    store: &Store,
+    boot: &str,
+    pid: u32,
+    start_time: i64,
+    owner: &str,
+    state: &str,
+) {
+    store
+        .connection
+        .execute(
+            "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state,
+                 exit_code, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'child', ?5, NULL, 1000)",
+            rusqlite::params![boot, pid, start_time, owner, state],
+        )
+        .expect("insert process");
+}

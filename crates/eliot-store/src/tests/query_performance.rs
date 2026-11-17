@@ -191,18 +191,6 @@ fn ordered_store_reads_keep_unsettled_order_and_observer_exclusions() {
     );
 }
 
-fn insert_process(store: &Store, boot: &str, pid: u32, start_time: i64, owner: &str, state: &str) {
-    store
-        .connection
-        .execute(
-            "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state,
-                 exit_code, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'child', ?5, NULL, 1000)",
-            rusqlite::params![boot, pid, start_time, owner, state],
-        )
-        .expect("insert process");
-}
-
 /// Pre-split `list_processes` statement: the optional-cursor OR form. Kept as the
 /// page-identity oracle for the split first-page/cursor-range queries.
 fn legacy_process_page(
