@@ -2186,6 +2186,56 @@ mod tests {
                 "decision": "approve", "feedback_allowed": false}], "feedback_allowed": false}})
     }
 
+    #[tokio::test]
+    async fn stop_closure_failure_preserves_typed_outcome_and_retains_ask() {
+        // A host that rejects the `request.closed` commit: stop-time closure
+        // must surface the typed error instead of publishing `applied` with
+        // no `request.closed` history, and the ask must stay retained.
+        let (host_io, plugin_io) = duplex(64 * 1024);
+        let (read, write) = split(plugin_io);
+        let mut peer = eliot_plugin::Peer::from_io(read, write);
+        let mut state = State::new(
+            peer.client(),
+            "credential".into(),
+            "a1".into(),
+            1,
+            SecretPolicy::new(Vec::<String>::new()),
+            "session-1".into(),
+        );
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let host_task = tokio::spawn(async move {
+            let (read, mut write) = split(host_io);
+            let mut reader = BufReader::new(read);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let request: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(request.method, "events.put");
+                let response = json!({"jsonrpc": "2.0", "id": request.id,
+                    "error": {"code": -32000, "message": "store unavailable"}});
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        state
+            .pending_requests
+            .insert("same-tool".into(), request(json!("p0")));
+        let error = state
+            .close_pending_requests(None)
+            .await
+            .expect_err("rejected request.closed commit fails closure");
+        // `invalid` is not a definite batch rejection, so the sink latches the
+        // batch unknown: the closure outcome is `unknown`, an uncertain effect
+        // the stop must not paper over. The ask stays retained for recovery.
+        assert_eq!(error.code, "unknown");
+        assert!(state.pending_requests.contains_key("same-tool"));
+        finish([peer_task, host_task]).await;
+    }
+
     fn request(native_id: Value) -> PendingNativeRequest {
         PendingNativeRequest {
             turn_id: "turn-1".into(),

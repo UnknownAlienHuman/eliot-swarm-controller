@@ -1219,7 +1219,7 @@ impl FailureOrigin {
 }
 
 /// Truncate to a character boundary; never splits UTF-8 mid-codepoint.
-fn bound_chars(text: &str, limit: usize) -> String {
+pub fn bound_chars(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_owned();
     }
@@ -2834,6 +2834,19 @@ mod failure_location_tests {
             assert_eq!(FailureOrigin::parse(origin.as_str()), Some(origin));
         }
         assert_eq!(FailureOrigin::parse("datacenter"), None);
+    }
+
+    #[test]
+    fn bound_chars_floors_multibyte_tails_to_the_boundary() {
+        assert_eq!(bound_chars("short", 512), "short");
+        assert_eq!(bound_chars(&"x".repeat(512), 512), "x".repeat(512));
+        // Byte 512 lands inside the Cyrillic tail: byte `truncate` would panic.
+        assert_eq!(bound_chars(&"ж".repeat(300), 512), "ж".repeat(256));
+        // Byte 128 lands inside the tail after a one-byte head.
+        assert_eq!(
+            bound_chars(&format!("x{}", "ж".repeat(100)), 128),
+            format!("x{}", "ж".repeat(63)),
+        );
     }
 
     #[test]
