@@ -47,6 +47,32 @@ use tokio::{
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const STEER_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+fn quota_read_error(error: Error) -> Error {
+    if error.failure_where.as_deref() == Some("plugin.muse.native.response.method_not_found") {
+        error
+            .with_code("unsupported")
+            .with_message("Installed Muse MSP does not support usage/read")
+    } else {
+        let detail = error.message.clone();
+        error.with_message(format!("Muse usage/read did not return quota: {detail}"))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn quota_read_keeps_method_not_found_classification() {
+    let error = quota_read_error(
+        Error::new("native_rejected", "method not found")
+            .with_where("plugin.muse.native.response.method_not_found"),
+    );
+    assert_eq!(error.code, "unsupported");
+    assert!(error.message.contains("usage/read"));
+    assert_eq!(
+        quota_read_error(Error::new("unknown", "lost reply")).code,
+        "unknown"
+    );
+}
+
 /// A failed read is safe to refuse before input dispatch. It is never a
 /// terminal verdict, and never permission to change or replay the input.
 fn validate_steer_readback(readback: Result<Value>, session_id: &str, turn_id: &str) -> Result<()> {
@@ -2195,8 +2221,8 @@ impl MusePlugin {
                 "Muse quota.read requires a dedicated reader plugin instance",
             ));
         }
-        let profile: Value = decode(raw, "Muse quota.read params are invalid")?;
-        let snapshot = profile.get("profile").unwrap_or(&profile);
+        let params = eliot_plugin::quota::decode(raw)?;
+        let snapshot = &params.profile;
         if snapshot.get("harness").and_then(Value::as_str) != Some("muse") {
             return Err(Error::new(
                 "profile_error",
@@ -2221,9 +2247,26 @@ impl MusePlugin {
                 program: OsString::from(program),
                 args: vec![OsString::from("serve")],
                 cwd,
-                environment: Vec::new(),
+                environment: params
+                    .environment
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|value| (OsString::from(key), OsString::from(value)))
+                    })
+                    .collect(),
             },
-            SecretPolicy::new(std::iter::empty::<String>()),
+            SecretPolicy::new(
+                params
+                    .environment
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(_, value)| value.as_str()),
+            ),
         )
         .await?;
         let client = native.client();
@@ -2281,10 +2324,7 @@ impl MusePlugin {
                     deadline,
                 )
                 .await
-                .map_err(|error| {
-                    let detail = error.message.clone();
-                    error.with_message(format!("Muse usage/read did not return quota: {detail}"))
-                })?;
+                .map_err(quota_read_error)?;
             let read: NativeUsageReadResult = serde_json::from_value(response).map_err(|_| {
                 Error::new(
                     "profile_error",
@@ -2329,7 +2369,7 @@ impl MusePlugin {
                 // are fabricated.
                 None => serde_json::json!({}),
             };
-            Ok(json!({"details": details}))
+            Ok(json!({"details": if details.as_object().is_some_and(|o|o.is_empty()) { details } else {json!({"usage":details})}}))
         }
         .await;
         let result = result.map_err(|error| client.diagnostic_error(error));

@@ -52,6 +52,20 @@ that actually extracts code; do not install all these projects as dependencies.
 | L6 MCP stdio | **Dependency:** official [`rmcp` 3.9.0](https://crates.io/crates/rmcp/3.9.0); Apache-2.0; MSRV 1.88; crate download verified with Rust 1.99.1. | Use the SDK directly; no source copied. |
 | L6 HTTP origin authentication | **Dependency:** [`jsonwebtoken` 11.1.0](https://crates.io/crates/jsonwebtoken/11.1.0), MIT, MSRV 1.88, inspected 2026-11-07 with pinned Rust 1.99.1. Reuse the already-locked `aws-lc-rs` backend and `reqwest` 0.13.5; PEM features are disabled. | Verify the signed Cloudflare Access application assertion with fixed configured issuer/JWKS/AUD and bounded refresh. Reuse rmcp request extensions and sessions. No copied crypto, OAuth implementation, new service or identity registry. |
 
+## Provider quota pattern (k92, inspected 2026-11-16)
+
+OpenCodex release 2.84.0, local source
+`C:/Development/Rust/projects/opencodex-repair-20261013`: **pattern only**, no
+code import or dependency. Claude: `src/providers/quota/vendor-probes-oauth.ts`
+and `claude-cli-identity.ts`; Antigravity: `src/providers/quota/antigravity.ts`
+and `src/oauth/google-antigravity.ts`; OpenCode: `opencode-go-transport.ts`,
+`opencode-zen-rate-limit.ts` and the actual read-only usage reader in
+`src/providers/quota/vendor-probes-key.ts`; Muse: `muse-subscription-usage.ts`.
+Targets are the owning plugin quota modules. Reuse the fixed read-only endpoint,
+window mapping and truthful absence patterns; never import OAuth refresh,
+account management, synthetic backoff, the proxy application or its UI. Native
+credential locations/schemas were verified against the installed CLI/keyring.
+
 ## Reuse procedure
 
 For a dependency, add the narrow needed features and use its API. For extraction, copy

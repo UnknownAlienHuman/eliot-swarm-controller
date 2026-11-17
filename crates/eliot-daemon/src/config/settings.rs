@@ -165,7 +165,10 @@ pub(crate) fn read_internal(
     let sections = requested.map_or_else(|| all_sections().to_vec(), ToOwned::to_owned);
     let mut values = BTreeMap::new();
     for section in &sections {
-        let value = section_json(&source, section_name(*section))?;
+        let mut value = section_json(&source, section_name(*section))?;
+        if *section == SettingsSection::Daemon && value.get("chats_root").is_none() {
+            value["chats_root"] = serde_json::json!(super::default_chats_root()?.to_string_lossy());
+        }
         if policy.contains_value(&value) {
             return Err(core::Error::new(
                 "not_allowed",
@@ -341,6 +344,10 @@ pub(crate) fn prepare_candidate(
     }
     validate_unselected_sections(original, &candidate, sections.keys().copied())?;
     validate_candidate(&candidate)?;
+    super::validate_chats_location(
+        data_root,
+        parse_config(&candidate)?.daemon.chats_root.as_deref(),
+    )?;
     Ok((original_file, candidate))
 }
 

@@ -39,6 +39,15 @@ pub(crate) async fn dispatch(
         CliCommand::Models(args) => agents::run_models(args, data_dir, json_output).await,
         CliCommand::Quota(args) => agents::run_quota(args, data_dir, json_output).await,
         CliCommand::Attach(args) => agents::run_attach(args, data_dir, json_output, id).await,
+        CliCommand::Archive(args) => {
+            agents::run_tree_change(args.agent, Some(true), data_dir, json_output, id).await
+        }
+        CliCommand::Unarchive(args) => {
+            agents::run_tree_change(args.agent, Some(false), data_dir, json_output, id).await
+        }
+        CliCommand::Delete(args) => {
+            agents::run_tree_change(args.agent, None, data_dir, json_output, id).await
+        }
         CliCommand::Launch(args) => agents::run_launch(args, data_dir, json_output, id).await,
         CliCommand::Send(args) => agents::run_send(args, data_dir, json_output, id).await,
         CliCommand::Resume(args) => agents::run_resume(args, data_dir, json_output, id).await,

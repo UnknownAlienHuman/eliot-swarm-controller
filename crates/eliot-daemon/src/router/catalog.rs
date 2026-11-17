@@ -20,6 +20,31 @@ const MAX_CACHED_SCOPES: usize = 32;
 /// Serve cached catalogue/quota entries for this long after the native read.
 pub(crate) const CATALOG_TTL_MS: u64 = HARNESS_READ_TTL_MS;
 
+pub(super) fn quota_read_error(response: &mut HarnessQuotaResponse, error: eliot_core::Error) {
+    if error.code == "unsupported" {
+        response.status = "unsupported".to_owned();
+        response.note = Some(match response.harness.as_str() {
+            "muse" => "Installed Muse MSP does not support usage/read and has no retained subscription observation",
+            "codex" => "Installed Codex app-server does not support account/rateLimits/read",
+            _ => "Installed harness has no supported read-only quota method",
+        }.to_owned());
+    } else {
+        let origin = if error.origin == Some(eliot_core::FailureOrigin::Provider) {
+            "provider"
+        } else {
+            "environment"
+        };
+        response.details = Some(
+            serde_json::json!({"state":"error","origin":origin,"error":"quota read failed; no values available"}),
+        );
+        response.note = Some(if error.code == "quota_unavailable" {
+            eliot_core::bound_chars(&error.message, 512)
+        } else {
+            "Read-only native/provider quota unavailable; no inference or credential refresh attempted".to_owned()
+        });
+    }
+}
+
 /// Derive the nonsecret `(scope, credential)` pair for one frozen snapshot.
 ///
 /// `profile_label` is the validated profile name, or `adhoc` for daemon
@@ -90,6 +115,12 @@ pub(crate) fn describe_snapshot(
                     .filter(|name| !name.trim().is_empty())
                     .map_or_else(|| "no-auth".to_owned(), |name| format!("env:{name}"));
             }
+        }
+        "claude" => {
+            credential = "claude-cli-oauth".to_owned();
+        }
+        "antigravity" => {
+            credential = "antigravity-cli-keyring".to_owned();
         }
         "muse" => {
             credential = "ambient".to_owned();
@@ -336,6 +367,67 @@ fn evict_quotas(map: &mut HashMap<String, HarnessQuotaResponse>, now: i64) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn quota_read_error_note_is_byte_bounded_on_a_char_boundary() {
+        let mut response = HarnessQuotaResponse {
+            harness: "claude".to_owned(),
+            scope: "profile:adhoc harness:claude".to_owned(),
+            fetched_at_ms: 1_000,
+            ttl_ms: CATALOG_TTL_MS,
+            credential: "none".to_owned(),
+            status: "supported".to_owned(),
+            note: None,
+            details: None,
+        };
+        let message = "ж".repeat(400);
+        quota_read_error(
+            &mut response,
+            eliot_core::Error::new("quota_unavailable", message),
+        );
+        let note = response.note.expect("quota read error carries a note");
+        assert!(note.len() <= 512, "note is {} bytes", note.len());
+        assert!(note.chars().all(|c| c == 'ж'));
+    }
+
+    #[test]
+    fn quota_method_not_found_is_unsupported_and_names_checked_method() {
+        for (harness, method) in [("codex", "account/rateLimits/read"), ("muse", "usage/read")] {
+            let response = HarnessQuotaResponse {
+                harness: harness.to_owned(),
+                scope: "profile:p".to_owned(),
+                credential: "ambient".to_owned(),
+                fetched_at_ms: 1000,
+                ttl_ms: CATALOG_TTL_MS,
+                status: "supported".to_owned(),
+                note: None,
+                details: None,
+            };
+            let mut unsupported = response.clone();
+            quota_read_error(
+                &mut unsupported,
+                eliot_core::Error::new("unsupported", "method not found"),
+            );
+            assert_eq!(unsupported.status, "unsupported");
+            assert!(unsupported.note.unwrap().contains(method));
+            assert!(unsupported.details.is_none());
+            let mut environment = response.clone();
+            quota_read_error(
+                &mut environment,
+                eliot_core::Error::new("unavailable", "reader failed"),
+            );
+            assert_eq!(environment.status, "supported");
+            assert_eq!(environment.details.unwrap()["origin"], "environment");
+            let mut provider = response;
+            quota_read_error(
+                &mut provider,
+                eliot_core::Error::new("quota_unavailable", "upstream failed")
+                    .with_origin(eliot_core::FailureOrigin::Provider, "provider read"),
+            );
+            assert_eq!(provider.status, "supported");
+            assert_eq!(provider.details.unwrap()["origin"], "provider");
+        }
+    }
 
     #[test]
     fn native_model_cache_invalidates_inside_ttl_on_executable_or_version_change() {

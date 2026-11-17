@@ -81,8 +81,13 @@ impl NativeStdioConfig for MuseStdioConfig {
         // `-32603` internal, all other MSP kinds, unknown codes — leaves an
         // admitted write unruled-out, so it is unknown, never rejected.
         if is_not_admitted(error.code) {
+            let location = if error.code == -32601 {
+                "plugin.muse.native.response.method_not_found"
+            } else {
+                "plugin.muse.native.response"
+            };
             Err(Error::new("native_rejected", error.message)
-                .with_where("plugin.muse.native.response")
+                .with_where(location)
                 .with_origin(
                     eliot_core::FailureOrigin::Harness,
                     "MSP pre-admission refusal",
@@ -113,6 +118,28 @@ pub(crate) use eliot_plugin::native_stdio::{NativeFrame, NativeLaunch, StreamSta
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn method_not_found_retains_classification_and_non_admission() {
+        for (code, expected) in [
+            (-32601, "native_rejected"),
+            (-32602, "native_rejected"),
+            (-32603, "unknown"),
+        ] {
+            let error = MuseStdioConfig::map_response_error(SharedErrorBody {
+                code,
+                message: "native refusal".to_owned(),
+                data: None,
+            })
+            .unwrap_err();
+            assert_eq!(error.code, expected);
+            assert_eq!(
+                error.failure_where.as_deref()
+                    == Some("plugin.muse.native.response.method_not_found"),
+                code == -32601
+            );
+            assert_eq!(error.origin, Some(eliot_core::FailureOrigin::Harness));
+        }
+    }
     use std::io::Write;
 
     #[test]

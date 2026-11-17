@@ -732,6 +732,7 @@ impl ClaudePlugin {
     async fn dispatch(&mut self, request: &RpcRequest, client: &PeerClient) -> DispatchOutcome {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
+            "quota.read" => crate::quota::read(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => match self.command(request).await {
                 DispatchOutcome::Ready(result) => result,

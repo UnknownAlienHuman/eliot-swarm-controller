@@ -54,8 +54,13 @@ impl NativeStdioConfig for CodexStdioConfig {
     ];
 
     fn map_response_error(error: NativeJsonRpcErrorBody) -> Result<Value> {
+        let location = if error.code == -32601 {
+            "plugin.codex.native.response.method_not_found"
+        } else {
+            "plugin.codex.native.response"
+        };
         Err(Error::new("native_rejected", error.message)
-            .with_where("plugin.codex.native.response")
+            .with_where(location)
             .with_origin(
                 eliot_core::FailureOrigin::Harness,
                 "native JSON-RPC refusal; no structured upstream error",
@@ -91,6 +96,24 @@ pub(crate) use eliot_plugin::native_stdio::{NativeFrame, NativeLaunch, StreamSta
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn method_not_found_retains_classification_and_non_admission() {
+        for code in [-32601, -32602] {
+            let error = CodexStdioConfig::map_response_error(NativeJsonRpcErrorBody {
+                code,
+                message: "native refusal".to_owned(),
+                data: None,
+            })
+            .unwrap_err();
+            assert_eq!(error.code, "native_rejected");
+            assert_eq!(
+                error.failure_where.as_deref()
+                    == Some("plugin.codex.native.response.method_not_found"),
+                code == -32601
+            );
+            assert_eq!(error.origin, Some(eliot_core::FailureOrigin::Harness));
+        }
+    }
     use std::io::Write;
 
     #[test]

@@ -588,6 +588,44 @@ fn count(store: &Store, table: &str) -> i64 {
 }
 
 #[test]
+fn native_chat_child_inherits_classification_and_lists_cleanly() {
+    let mut store = store();
+    let parent = producer(&mut store, "chat-parent");
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET project='',chat=1 WHERE id=?1",
+            [parse_agent_id(&parent).unwrap()],
+        )
+        .unwrap();
+    let child = register(
+        &mut store,
+        &parent,
+        request(&parent, "chat-parent", "chat-child"),
+    );
+    assert!(child.agent.chat);
+    assert_eq!(child.agent.project, "");
+    let page = store
+        .list_agent_summaries(
+            &AgentListFilter::default(),
+            None,
+            20,
+            NOW + 2,
+            &core::SessionGrowthThresholds::default(),
+        )
+        .unwrap();
+    assert_eq!(page.summaries.len(), 2);
+    assert!(
+        page.summaries
+            .iter()
+            .all(|agent| agent.chat && agent.project.is_empty())
+    );
+    let response: core::api::AgentListResponse = serde_json::from_value(json!({"agents":page.summaries,"next":page.next,"total":page.total,"truncated":page.truncated})).unwrap();
+    let request: core::api::AgentListRequest = serde_json::from_value(json!({})).unwrap();
+    request.validate_response(&response).unwrap();
+}
+
+#[test]
 fn registration_commits_tokenless_child_and_only_its_observation_source() {
     let mut store = store();
     let parent = producer(&mut store, "parent");

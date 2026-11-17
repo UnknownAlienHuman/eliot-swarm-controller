@@ -351,9 +351,9 @@ impl Store {
         db!(tx.execute(
             "INSERT INTO agents(generation, project, harness, profile, profile_snapshot,
                  native_scope, native_ref, state, origin, observe_only, token,
-                 parent, root, depth, control, created_at, updated_at)
+                 parent, root, depth, control, created_at, updated_at, chat)
              VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 'unknown', 'native', 1, NULL,
-                 ?7, ?8, ?9, 'self', ?10, ?10)",
+                 ?7, ?8, ?9, 'self', ?10, ?10, ?11)",
             params![
                 parent.project,
                 parent.harness,
@@ -364,7 +364,8 @@ impl Store {
                 parent_num,
                 root_num,
                 depth,
-                now
+                now,
+                parent.chat
             ],
         ));
         let child_num = tx.last_insert_rowid();

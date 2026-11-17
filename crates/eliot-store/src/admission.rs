@@ -807,10 +807,22 @@ fn admit_launch_tx(
     if let Some(parent) = parent_link.as_ref() {
         hierarchy::check_child_fanout(tx, parent, limits)?;
     }
+    let chat = request
+        .args
+        .get("chat")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let inherited_chat = parent_link
+        .as_ref()
+        .map(|p| load_agent_by_num(tx, p.num))
+        .transpose()?
+        .flatten()
+        .is_some_and(|p| p.chat);
     let project = match parent_link.as_ref() {
         // A child inherits its parent's project label; the caller
         // value is descriptive input, not authority.
         Some(parent) => parent.project.clone(),
+        None if chat && principal == "owner" => String::new(),
         None => required_string(&request.args, "project")?,
     };
     let harness = required_string(&request.args, "harness")?;
@@ -909,6 +921,22 @@ fn admit_launch_tx(
         ],
     ));
     let agent_num = tx.last_insert_rowid();
+    if inherited_chat {
+        db!(tx.execute("UPDATE agents SET chat=1 WHERE id=?1", [agent_num]));
+    }
+    if chat {
+        if principal != "owner" || parent_link.is_some() || preparation.is_some() {
+            return Err(Error::new(
+                "not_allowed",
+                "private chat launch is owner-only without a parent or worktree",
+            ));
+        }
+        let path = std::path::Path::new(&workspace).join(format_agent_id(agent_num));
+        db!(tx.execute(
+            "UPDATE agents SET chat=1,workspace=?1 WHERE id=?2",
+            params![path.to_string_lossy(), agent_num]
+        ));
+    }
     if let Some(choice) = request.args.get("profile_choice") {
         let choice: core::RoutingDecision = serde_json::from_value(choice.clone())
             .map_err(|_| Error::new("invalid", "invalid routing decision"))?;

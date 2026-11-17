@@ -734,3 +734,15 @@ current full-access posture. Implementation:
 [`crates/eliot-daemon/src/adhoc.rs`](../../crates/eliot-daemon/src/adhoc.rs)
 (`apply_adhoc_access`).
 
+
+## Observed subscription quota
+
+Meta supplies subscription usage during a turn, not through a provider quota
+endpoint. When the native MSP forwards `usage/changed`, the plugin retains only
+the typed 5-hour/weekly percentages, resets and original `observedAtMs` as
+`quota.observed` under the exact generation's session source. `harness.quota`
+reads the newest exact-profile observation and labels it "observed during a turn".
+A native `usage/read` observation is also accepted, under `details.usage`; an
+empty read or unsupported MSP method returns `unsupported` with that reason.
+No synthetic usage, probing turn or account identity is persisted. The pattern
+reference is OpenCodex 2.84.0 `muse-subscription-usage.ts`; no code was copied.

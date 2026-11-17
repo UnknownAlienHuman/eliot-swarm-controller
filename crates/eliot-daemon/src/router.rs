@@ -385,6 +385,30 @@ impl Router {
             "harness.doctor" => self.harness_doctor(&params, &principal).await,
             "models.catalog" => self.models_catalog(&params, &principal).await,
             "agent.history" => self.agent_history(&params, &principal).await,
+            "agent.archive" => {
+                require_owner(&principal)?;
+                let request: eliot_core::api::AgentArchiveRequest =
+                    eliot_core::api::discovery::decode_params(params.clone())?;
+                request.validate()?;
+                self.inner.store.lock().await.change_agent_tree(
+                    &request.id,
+                    &request.agent,
+                    Some(request.archived),
+                    now_ms(),
+                )
+            }
+            "agent.delete" => {
+                require_owner(&principal)?;
+                let request: eliot_core::api::AgentDeleteRequest =
+                    eliot_core::api::discovery::decode_params(params.clone())?;
+                request.validate()?;
+                self.inner.store.lock().await.change_agent_tree(
+                    &request.id,
+                    &request.agent,
+                    None,
+                    now_ms(),
+                )
+            }
             "agent.list" => self.agent_list(&params, &principal).await,
             "agent.result" => self.agent_result(&params, &principal).await,
             "agent.processes" => self.agent_processes(&params, &principal).await,
@@ -788,6 +812,15 @@ impl Router {
             self.schedule_admission(&admission);
         }
         self.signal_progress();
+        crate::logging::record_debug(
+            &self.secret_policy_snapshot(),
+            "command.admitted",
+            &[
+                ("command_id", &admission.command.id),
+                ("verb", &admission.command.verb),
+            ],
+            &[],
+        );
         serde_json::to_value(submit_result(
             &admission.command,
             admission.linked_command.as_ref(),
@@ -842,6 +875,14 @@ impl Router {
             "launch" => {
                 reject_launch_derived_keys(&request.args)?;
                 if let Some(retained) = retained_launch_profile(&store, request)? {
+                    if request.args.get("chat") == Some(&Value::Bool(true))
+                        && request.args.get("workspace").is_none()
+                    {
+                        if let Some(workspace) = retained.workspace.clone() {
+                            request.args["workspace"] = workspace;
+                        }
+                        request.args["project"] = json!("");
+                    }
                     align_retained_workspace_alias(request, retained.workspace.as_ref());
                     install_retained_profile(request, retained)?;
                 }
@@ -1673,8 +1714,41 @@ impl Router {
                         let store = self.inner.store.lock().await;
                         hierarchy::default_agent_child_workspace(&store, &mut request, principal)?;
                     }
+                    let chat = match request.args.get("chat") {
+                        None => false,
+                        Some(Value::Bool(value)) => *value,
+                        _ => return Err(Error::new("invalid", "launch chat must be a boolean")),
+                    };
+                    if chat {
+                        require_owner(principal)?;
+                        if ["workspace", "worktree", "base", "parent", "project"]
+                            .iter()
+                            .any(|key| request.args.get(*key).is_some())
+                        {
+                            return Err(Error::new(
+                                "invalid",
+                                "chat launch omits workspace, project, parent and worktree",
+                            ));
+                        }
+                        let configured = crate::config::load_daemon_config(&self.inner.data_root)?;
+                        let root = crate::config::validate_chats_location(
+                            &self.inner.data_root,
+                            configured.chats_root.as_deref(),
+                        )?;
+                        let root = cleanup::private_chat_root(&root)?;
+                        let data = std::fs::canonicalize(&self.inner.data_root)
+                            .map_err(|_| Error::new("unavailable", "data root unavailable"))?;
+                        if root.starts_with(&data) || data.starts_with(&root) {
+                            return Err(Error::new(
+                                "invalid",
+                                "chats_root must be outside the daemon data directory",
+                            ));
+                        }
+                        request.args["workspace"] = json!(root.to_string_lossy());
+                    }
                     normalize_launch(&mut request, principal)?;
                     if matches!(principal, Principal::Owner)
+                        && !chat
                         && let Some(workspace) =
                             request.args.get("workspace").and_then(Value::as_str)
                     {
@@ -1806,6 +1880,14 @@ impl Router {
         let store = self.inner.store.lock().await;
         store.ensure_committed_reads()?;
         if let Some(retained) = retained_launch_profile(&store, request)? {
+            if request.args.get("chat") == Some(&Value::Bool(true))
+                && request.args.get("workspace").is_none()
+            {
+                if let Some(workspace) = retained.workspace.clone() {
+                    request.args["workspace"] = workspace;
+                }
+                request.args["project"] = json!("");
+            }
             align_retained_workspace_alias(request, retained.workspace.as_ref());
             install_retained_profile(request, retained)?;
             return Ok(true);
@@ -3160,7 +3242,22 @@ impl Router {
             ));
         }
         let profile = request.profile.as_deref().map(str::trim);
-        let (snapshot, label) = self.resolve_catalog_snapshot(&harness, profile, false)?;
+        let (mut snapshot, label) = self.resolve_catalog_snapshot(&harness, profile, true)?;
+        if harness == "claude" && snapshot.is_none() {
+            let cmd = crate::adhoc::discover_cmd_for_harness(&harness)?;
+            let mut resolved = crate::adhoc::adhoc_snapshot(
+                &harness,
+                None,
+                None,
+                cmd,
+                crate::adhoc::AdhocAuth::Skip,
+                None,
+            )?;
+            crate::config::capture_native_store_inputs(&mut resolved, |name| {
+                std::env::var_os(name)
+            })?;
+            snapshot = Some(resolved);
+        }
         self.quota_for_snapshot(harness, snapshot, label).await
     }
 
@@ -3175,165 +3272,99 @@ impl Router {
             profile: None,
         };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
-        let now = now_ms();
+        if harness == "muse"
+            && let Some(profile) = snapshot.as_ref()
+            && let Some(observation) = self
+                .inner
+                .store
+                .lock()
+                .await
+                .latest_quota_observation(profile)?
+        {
+            return serde_json::to_value(eliot_core::api::HarnessQuotaResponse {
+                harness,scope,credential,fetched_at_ms:observation.observed_at_ms,ttl_ms:catalog::CATALOG_TTL_MS,
+                status:"supported".to_owned(),note:Some("Muse subscription usage observed during a turn".to_owned()),
+                details:Some(json!({"windows":observation.windows,"state":"ready","origin":"provider","source":"Muse MSP usage/changed"})),
+            }).map_err(|_|Error::new("internal","quota encoding failed"));
+        }
         if let Some(hit) = self
             .inner
             .catalog_cache
             .lock_recover()
-            .get_quota(&scope, now)
+            .get_quota(&scope, now_ms())
         {
             request.validate_response(&hit)?;
             return serde_json::to_value(hit)
-                .map_err(|_| Error::new("internal", "harness quota could not be encoded"));
+                .map_err(|_| Error::new("internal", "quota encoding failed"));
         }
-        if matches!(harness.as_str(), "codex" | "muse") {
-            let Some(snapshot) = snapshot else {
-                return Err(Error::new(
-                    "internal",
-                    "live harness quota requires a frozen snapshot",
-                ));
-            };
-            let checked = match harness.as_str() {
-                "codex" => "account/rateLimits/read",
-                _ => "usage/read",
-            };
-            let response = match self.inner.plugin_host.quota(snapshot).await {
-                Ok(raw) => {
-                    let details = raw
-                        .get("details")
-                        .cloned()
-                        .filter(|details| details.is_object());
-                    match details {
-                        Some(details) => {
-                            let empty = details.as_object().is_some_and(|map| map.is_empty());
-                            let note = if harness == "codex" {
-                                Some(
-                                    "Codex quota from account/rateLimits/read \
-                                     (account/usage/read when available); windows carry used \
-                                     percent, reset time, credits and plan"
-                                        .to_owned(),
-                                )
-                            } else if empty {
-                                Some(
-                                    "Muse usage/read reports no observed subscription usage"
-                                        .to_owned(),
-                                )
-                            } else {
-                                Some(
-                                    "Muse quota from usage/read \
-                                     (window and weekly used percent, reset time, tier)"
-                                        .to_owned(),
-                                )
-                            };
-                            eliot_core::api::HarnessQuotaResponse {
-                                harness: harness.clone(),
-                                scope: scope.clone(),
-                                fetched_at_ms: now_ms(),
-                                ttl_ms: catalog::CATALOG_TTL_MS,
-                                credential: credential.clone(),
-                                status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
-                                note,
-                                details: Some(details),
-                            }
-                        }
-                        None => Self::quota_unavailable(
-                            &harness,
-                            &scope,
-                            &credential,
-                            checked,
-                            "unknown",
-                            format!("{checked} result did not match the installed schema"),
-                        ),
-                    }
-                }
-                Err(error) => {
-                    let message = error.message.to_ascii_lowercase();
-                    let status = if error.code == "unsupported"
-                        || message.contains("method not found")
-                        || message.contains("not implemented")
-                        || message.contains("unknown method")
-                        || message.contains("no such method")
-                    {
-                        eliot_core::api::HARNESS_QUOTA_UNSUPPORTED
-                    } else {
-                        eliot_core::api::HARNESS_QUOTA_UNKNOWN
-                    };
-                    Self::quota_unavailable(
-                        &harness,
-                        &scope,
-                        &credential,
-                        checked,
-                        status,
-                        format!("{checked}: {}", error.message),
-                    )
-                }
-            };
-            request.validate_response(&response)?;
-            self.inner
-                .catalog_cache
-                .lock_recover()
-                .insert_quota(response.clone());
-            return serde_json::to_value(response)
-                .map_err(|_| Error::new("internal", "harness quota could not be encoded"));
-        }
-        let note = match harness.as_str() {
-            "opencode" => Some(
-                "OpenCode exposes no read-only account quota endpoint; auth list carries \
-                 providers and model inventory carries limits only"
-                    .to_owned(),
-            ),
-            "claude" => Some(
-                "Claude accepts model aliases and the CLI default; no live quota surface exists"
-                    .to_owned(),
-            ),
-            "antigravity" => Some("Antigravity exposes no read-only quota surface".to_owned()),
-            _ => {
-                return Err(Error::new(
-                    "unsupported",
-                    format!("unsupported harness {harness}"),
-                ));
-            }
-        };
-        let response = eliot_core::api::HarnessQuotaResponse {
+        let profile = snapshot
+            .ok_or_else(|| Error::new("profile_error", "quota requires a native profile"))?;
+        let raw = self.inner.plugin_host.quota(profile).await;
+        let mut response = eliot_core::api::HarnessQuotaResponse {
             harness: harness.clone(),
-            scope: scope.clone(),
+            scope,
             fetched_at_ms: now_ms(),
             ttl_ms: catalog::CATALOG_TTL_MS,
-            credential: credential.clone(),
-            status: eliot_core::api::HARNESS_QUOTA_UNSUPPORTED.to_owned(),
-            note,
+            credential,
+            status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
+            note: None,
             details: None,
         };
+        match raw {
+            Ok(raw) => {
+                if raw.get("status").and_then(Value::as_str) == Some("unsupported") {
+                    response.status = "unsupported".to_owned();
+                    response.note = Some(
+                        raw.get("note")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Native quota source unavailable")
+                            .to_owned(),
+                    );
+                } else if let Some(details) = raw.get("details").filter(|v| v.is_object()) {
+                    if let Some(windows) = details.get("windows") {
+                        let observation: eliot_core::api::harness::QuotaObservation =
+                            serde_json::from_value(
+                                json!({"observedAtMs":now_ms(),"windows":windows}),
+                            )
+                            .map_err(|_| Error::new("source_integrity", "quota windows invalid"))?;
+                        observation.validate()?;
+                    }
+                    response.details = Some(details.clone());
+                    response.note=Some(match harness.as_str() {
+                        "codex" => "Codex account/rateLimits/read; provider read-only values",
+                        "muse" => "Muse subscription usage observed during a turn; timestamp is the native observation",
+                        "claude" => "Claude CLI OAuth usage; provider read-only values",
+                        "antigravity" => "Antigravity account quota; provider read-only values",
+                        _ => "OpenCode Go account usage; provider read-only values",
+                    }.to_owned());
+                    if harness == "muse" {
+                        if let Some(at) = details
+                            .pointer("/usage/observedAtMs")
+                            .and_then(Value::as_i64)
+                        {
+                            response.fetched_at_ms = at;
+                        } else {
+                            response.status = "unsupported".to_owned();
+                            response.details = None;
+                            response.note=Some("Muse MSP usage/read has no observed subscription usage; no turn is started to obtain quota".to_owned());
+                        }
+                    }
+                } else {
+                    response.details = Some(
+                        json!({"state":"error","origin":"provider","error":"native quota schema unavailable"}),
+                    );
+                }
+            }
+            Err(error) => {
+                catalog::quota_read_error(&mut response, error);
+            }
+        }
         request.validate_response(&response)?;
         self.inner
             .catalog_cache
             .lock_recover()
             .insert_quota(response.clone());
-        serde_json::to_value(response)
-            .map_err(|_| Error::new("internal", "harness quota could not be encoded"))
-    }
-
-    fn quota_unavailable(
-        harness: &str,
-        scope: &str,
-        credential: &str,
-        checked: &str,
-        status: &str,
-        detail: String,
-    ) -> eliot_core::api::HarnessQuotaResponse {
-        const MAX_DETAIL: usize = 512;
-        // Floor to a character boundary first: byte truncate panics mid-codepoint.
-        let note = eliot_core::bound_chars(&format!("{checked}; {detail}"), MAX_DETAIL);
-        eliot_core::api::HarnessQuotaResponse {
-            harness: harness.to_owned(),
-            scope: scope.to_owned(),
-            fetched_at_ms: now_ms(),
-            ttl_ms: catalog::CATALOG_TTL_MS,
-            credential: credential.to_owned(),
-            status: status.to_owned(),
-            note: Some(note),
-            details: None,
-        }
+        serde_json::to_value(response).map_err(|_| Error::new("internal", "quota encoding failed"))
     }
 
     /// One owner-scoped read-only search over every installed harness
@@ -4104,6 +4135,7 @@ impl Router {
         let request: AgentListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let filter = AgentListFilter {
+            archived: request.archived,
             state: request.state,
             project: request.project.clone(),
             harness: request.harness.clone(),
@@ -6324,7 +6356,14 @@ fn normalize_launch(request: &mut SubmitCommand, _principal: &Principal) -> Resu
         }
     }
     args.insert("workspace".to_owned(), Value::String(workspace.clone()));
-    args.insert("project".to_owned(), Value::String(workspace));
+    args.insert(
+        "project".to_owned(),
+        Value::String(if args.get("chat") == Some(&Value::Bool(true)) {
+            String::new()
+        } else {
+            workspace
+        }),
+    );
     Ok(())
 }
 
@@ -7118,33 +7157,6 @@ mod tests {
         MaintenanceRunRequest::default()
             .validate_response(&typed)
             .unwrap();
-    }
-
-    #[test]
-    fn quota_unavailable_note_truncation_respects_char_boundary() {
-        // Byte 512 of the note lands inside the Cyrillic tail: the old
-        // byte 'truncate' panicked on this input instead of flooring to
-        // the boundary.
-        let response = Router::quota_unavailable(
-            "harness",
-            "scope",
-            "credential",
-            "checked",
-            "status",
-            "ж".repeat(300),
-        );
-        let note = response.note.expect("quota unavailable carries a note");
-        assert!(note.len() <= 512);
-        assert!(note.starts_with("checked; "));
-        let short = Router::quota_unavailable(
-            "harness",
-            "scope",
-            "credential",
-            "checked",
-            "status",
-            "ok".to_owned(),
-        );
-        assert_eq!(short.note, Some("checked; ok".to_owned()));
     }
 
     #[tokio::test]
@@ -15802,17 +15814,33 @@ mod run_authorization_tests {
     }
 
     #[tokio::test]
-    async fn catalog_quota_reports_unsupported_with_scope_and_caches() {
+    async fn catalog_quota_retains_supported_errors_with_scope_and_caches() {
         let router = router();
-        // Antigravity exposes no quota surface: quota reports unsupported
-        // with scope and freshness, without spawning any native reader.
+        // This check covers cache/error semantics only, without native/provider I/O.
+        let (scope, credential) = catalog::describe_snapshot(
+            "adhoc",
+            "antigravity",
+            Some(&json!({"harness":"antigravity"})),
+        );
+        router.inner.catalog_cache.lock_recover().insert_quota(
+            eliot_core::api::HarnessQuotaResponse {
+                harness: "antigravity".to_owned(),
+                scope,
+                credential,
+                fetched_at_ms: now_ms(),
+                ttl_ms: catalog::CATALOG_TTL_MS,
+                status: "supported".to_owned(),
+                note: Some("Native credential unavailable".to_owned()),
+                details: Some(json!({"state":"error","origin":"environment"})),
+            },
+        );
         let first = router
             .harness_quota(&json!({"harness": "antigravity"}), &Principal::Owner)
             .await
             .unwrap();
-        assert_eq!(first["status"], json!("unsupported"));
+        assert_eq!(first["status"], json!("supported"));
         assert_eq!(first["scope"], json!("profile:adhoc harness:antigravity"));
-        assert_eq!(first["credential"], json!("none"));
+        assert_eq!(first["credential"], json!("antigravity-cli-keyring"));
         assert!(first["fetched_at_ms"].as_i64().unwrap_or(-1) >= 0);
         assert!(first["note"].as_str().is_some_and(|note| !note.is_empty()));
         let second = router
