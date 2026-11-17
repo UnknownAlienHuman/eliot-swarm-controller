@@ -1,5 +1,5 @@
 use super::*;
-use eliot_core::api::AgentSummary;
+use eliot_core::api::{AGENT_LIST_STATES, AgentStateTotal, AgentSummary};
 
 impl Store {
     /// Compact fleet projection for `agent.list`: scope-checked, filtered,
@@ -57,7 +57,13 @@ impl Store {
         let probe = i64::try_from(limit)
             .map_err(|_| Error::new("invalid", "page limit must fit the index bound"))?
             + 1;
-        let page = agent_list_select(filter, caller, Some(after_num), Some(probe), false)?;
+        let page = agent_list_select(
+            filter,
+            caller,
+            Some(after_num),
+            Some(probe),
+            AgentListProjection::Rows,
+        )?;
         let mut statement = self.connection.prepare(&page.sql).map_err(sql_error)?;
         let rows = statement
             .query_map(
@@ -73,7 +79,7 @@ impl Store {
                 growth_thresholds,
             )?);
         }
-        let total_page = agent_list_select(filter, caller, None, None, true)?;
+        let total_page = agent_list_select(filter, caller, None, None, AgentListProjection::Count)?;
         let total: i64 = self
             .connection
             .query_row(
@@ -82,6 +88,42 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
+        let state_totals = if filter.states.is_some() {
+            let mut all_states = filter.clone();
+            all_states.states = None;
+            let select = agent_list_select(
+                &all_states,
+                caller,
+                None,
+                None,
+                AgentListProjection::StateTotals,
+            )?;
+            let mut statement = self.connection.prepare(&select.sql).map_err(sql_error)?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(select.params.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sql_error)?;
+            let mut totals: Vec<_> = AGENT_LIST_STATES
+                .into_iter()
+                .map(|state| AgentStateTotal { state, total: 0 })
+                .collect();
+            for row in rows {
+                let (state, total) = row.map_err(sql_error)?;
+                let state: AgentState = parse_enum(&state, "Agent state")?;
+                let entry = totals
+                    .iter_mut()
+                    .find(|entry| entry.state == state)
+                    .ok_or_else(|| {
+                        Error::new("internal", "Agent state missing from state totals")
+                    })?;
+                entry.total = usize::try_from(total)
+                    .map_err(|_| Error::new("internal", "Agent state count exceeds usize"))?;
+            }
+            Some(totals)
+        } else {
+            None
+        };
         let mut truncated = summaries.len() > limit;
         summaries.truncate(limit);
         let kept = summaries.len();
@@ -90,6 +132,7 @@ impl Store {
         let next = summaries.last().map(|summary| summary.id.clone());
         Ok(AgentListPage {
             summaries,
+            state_totals,
             total: usize::try_from(total.max(0)).unwrap_or(0),
             truncated,
             next,
@@ -236,6 +279,7 @@ impl Store {
 pub struct AgentListFilter {
     pub archived: core::api::ArchivedFilter,
     pub state: Option<AgentState>,
+    pub states: Option<Vec<AgentState>>,
     pub project: Option<String>,
     pub harness: Option<String>,
     pub parent: Option<String>,
@@ -244,6 +288,17 @@ pub struct AgentListFilter {
 
 impl AgentListFilter {
     fn validate(&self) -> Result<()> {
+        if let Some(states) = &self.states
+            && (self.state.is_some()
+                || states.is_empty()
+                || states.len() > 9
+                || states
+                    .iter()
+                    .enumerate()
+                    .any(|(i, state)| states[..i].contains(state)))
+        {
+            return Err(Error::new("invalid", "invalid Agent state set"));
+        }
         if let Some(project) = &self.project {
             require_filter_text(project)?;
         }
@@ -266,6 +321,7 @@ impl AgentListFilter {
 /// total ignoring the cursor, honest truncation, and the continuation cursor.
 pub struct AgentListPage {
     pub summaries: Vec<AgentSummary>,
+    pub state_totals: Option<Vec<AgentStateTotal>>,
     pub total: usize,
     pub truncated: bool,
     pub next: Option<String>,
@@ -277,6 +333,13 @@ type LastTerminalTurn = (String, Option<TurnOutcome>, Option<TurnUsage>);
 
 /// Stored terminal-turn columns before canonical classification.
 type StoredTerminalTurn = (String, Option<String>, Option<String>, Option<String>);
+
+#[derive(Clone, Copy)]
+enum AgentListProjection {
+    Rows,
+    Count,
+    StateTotals,
+}
 
 struct AgentListSelect {
     sql: String,
@@ -302,9 +365,12 @@ fn agent_list_select(
     caller: Option<&Agent>,
     after_num: Option<i64>,
     limit: Option<i64>,
-    count: bool,
+    projection: AgentListProjection,
 ) -> Result<AgentListSelect> {
-    let columns = if count {
+    let count = !matches!(projection, AgentListProjection::Rows);
+    let columns = if matches!(projection, AgentListProjection::StateTotals) {
+        "agents.state, COUNT(*)".to_owned()
+    } else if count {
         "COUNT(*)".to_owned()
     } else {
         "agents.id, agents.generation, agents.name, agents.project, agents.harness, agents.profile,
@@ -371,6 +437,18 @@ fn agent_list_select(
         core::api::ArchivedFilter::Only => equality("archived", 1.into()),
         core::api::ArchivedFilter::Include => {}
     }
+    if let Some(states) = &filter.states {
+        let placeholders = vec!["?"; states.len()].join(",");
+        predicates.push(format!("agents.state IN ({placeholders})"));
+        params.extend(
+            states
+                .iter()
+                .map(|state| rusqlite::types::Value::from(agent_state_name(*state).to_owned())),
+        );
+        if fallback.is_none() {
+            fallback = Some("agents_list_state");
+        }
+    }
     let mut forced_index = structural.or(fallback).or(match filter.archived {
         core::api::ArchivedFilter::Include => None,
         _ => Some("agents_list_archived"),
@@ -416,6 +494,9 @@ fn agent_list_select(
     if !predicates.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&predicates.join(" AND "));
+    }
+    if matches!(projection, AgentListProjection::StateTotals) {
+        sql.push_str(" GROUP BY agents.state");
     }
     if !count {
         sql.push_str(" ORDER BY agents.id");
@@ -575,8 +656,9 @@ mod tests {
                 "agents_list_root",
             ),
         ] {
-            let select = agent_list_select(&filter, None, Some(0), Some(2), false)
-                .expect("build fleet query");
+            let select =
+                agent_list_select(&filter, None, Some(0), Some(2), AgentListProjection::Rows)
+                    .expect("build fleet query");
             let mut statement = store
                 .connection
                 .prepare(&format!("EXPLAIN QUERY PLAN {}", select.sql))
@@ -729,6 +811,77 @@ mod tests {
             .expect("list the fleet self row");
         assert_eq!(scoped.total, 1);
         assert_eq!(scoped.summaries[0].id, first);
+
+        // One state-set page is bounded globally; all-state totals share the
+        // row scope and filters, but ignore the state set and cursor.
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET state='stopped' WHERE id=?1",
+                [second_num],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET state='busy' WHERE id=?1",
+                [parse_agent_id(&third).unwrap()],
+            )
+            .unwrap();
+        let states = AgentListFilter {
+            states: Some(vec![AgentState::Starting, AgentState::Busy]),
+            ..Default::default()
+        };
+        for (caller, expected, stopped, busy) in [
+            (None, 2, 1, 1),
+            (Some(&agent), 1, 0, 0),
+            (Some(&tree), 1, 1, 0),
+            (Some(&project_caller), 1, 1, 0),
+        ] {
+            for after in [None, Some(first.as_str())] {
+                let page = store
+                    .list_agent_summaries_inner(
+                        caller,
+                        &states,
+                        after,
+                        1,
+                        now + 10,
+                        &core::SessionGrowthThresholds::default(),
+                    )
+                    .unwrap();
+                assert_eq!(page.total, expected);
+                assert!(page.summaries.len() <= 1);
+                assert_eq!(page.truncated, after.is_none() && expected > 1);
+                let totals = page.state_totals.unwrap();
+                assert_eq!(totals.len(), 9);
+                let count = |state| {
+                    totals
+                        .iter()
+                        .find(|entry| entry.state == state)
+                        .unwrap()
+                        .total
+                };
+                assert_eq!(count(AgentState::Stopped), stopped);
+                assert_eq!(count(AgentState::Busy), busy);
+                assert_eq!(count(AgentState::Starting), 1);
+                assert_eq!(count(AgentState::Idle), 0);
+            }
+        }
+        let select =
+            agent_list_select(&states, None, Some(0), Some(1), AgentListProjection::Rows).unwrap();
+        let mut statement = store
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", select.sql))
+            .unwrap();
+        let plan = statement
+            .query_map(rusqlite::params_from_iter(select.params.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        assert!(plan.contains("USING INDEX agents_list_state"), "{plan}");
     }
 
     #[test]
@@ -744,8 +897,18 @@ mod tests {
         caller.control = eliot_core::AgentControl::Tree;
         let filter = AgentListFilter::default();
         for count in [false, true] {
-            let select = agent_list_select(&filter, Some(&caller), None, Some(2), count)
-                .expect("build tree scope query");
+            let select = agent_list_select(
+                &filter,
+                Some(&caller),
+                None,
+                Some(2),
+                if count {
+                    AgentListProjection::Count
+                } else {
+                    AgentListProjection::Rows
+                },
+            )
+            .expect("build tree scope query");
             assert!(
                 select.sql.contains(&ANCESTOR_WALK_CAP.to_string()),
                 "tree scope must bound depth with the shared cap: {}",
@@ -764,8 +927,9 @@ mod tests {
             parent: Some("a42".to_owned()),
             ..Default::default()
         };
-        let select = agent_list_select(&combined, None, Some(0), Some(2), false)
-            .expect("build combined filter query");
+        let select =
+            agent_list_select(&combined, None, Some(0), Some(2), AgentListProjection::Rows)
+                .expect("build combined filter query");
         assert!(
             select.sql.contains("INDEXED BY agents_list_parent"),
             "combined filters must prefer the parent index: {}",

@@ -389,6 +389,7 @@ fn flattened_get_and_list_roundtrip_and_reject_nested_arrays() {
     malformed["pending"] = json!([["request", "a1", 0, "turn", "approval", {}]]);
     assert!(serde_json::from_value::<AgentGetResponse>(malformed).is_err());
     let reply = AgentListResponse {
+        state_totals: None,
         agents: vec![AgentListRow {
             summary: summary(),
             observation: None,
@@ -612,6 +613,7 @@ fn list_context_allows_self_principal_and_checks_projection_and_cursor() {
         ..Default::default()
     };
     let mut reply = AgentListResponse {
+        state_totals: None,
         agents: vec![AgentListRow {
             summary: summary(),
             observation: None,
@@ -651,6 +653,7 @@ fn list_filters_match_projection_and_report_counts_honestly() {
     };
     request.validate().unwrap();
     let reply = AgentListResponse {
+        state_totals: None,
         agents: vec![AgentListRow {
             summary: summary(),
             observation: None,
@@ -724,6 +727,7 @@ fn default_list_admits_only_ended_archived_rows() {
         summary.state = state;
         summary.archived = archived;
         AgentListResponse {
+            state_totals: None,
             agents: vec![AgentListRow {
                 summary,
                 observation: None,
@@ -759,6 +763,7 @@ fn list_pagination_requires_cursor_on_every_nonempty_page() {
     // Every nonempty page carries `next` at the last returned id, even
     // when nothing is truncated; an empty page carries no cursor.
     let ok = AgentListResponse {
+        state_totals: None,
         agents: vec![row()],
         next: Some("a1".to_owned()),
         total: 1,
@@ -772,6 +777,7 @@ fn list_pagination_requires_cursor_on_every_nonempty_page() {
     wrong_cursor.next = Some("a2".to_owned());
     unknown(request.validate_response(&wrong_cursor));
     let empty_ok = AgentListResponse {
+        state_totals: None,
         agents: vec![],
         next: None,
         total: 1,
@@ -1179,4 +1185,71 @@ fn source_projection_retains_null_counters_and_pending_workspace_generation() {
     let mut missing = wire;
     missing.as_object_mut().unwrap().remove("last_store_seq");
     assert!(serde_json::from_value::<SourceState>(missing).is_err());
+}
+
+#[test]
+fn multi_state_list_requires_complete_scoped_totals_and_a_bounded_page() {
+    let request = AgentListRequest {
+        states: Some(vec![AgentState::Idle, AgentState::Busy]),
+        limit: 1,
+        ..Default::default()
+    };
+    let mut reply = AgentListResponse {
+        state_totals: Some(
+            AGENT_LIST_STATES
+                .into_iter()
+                .map(|state| AgentStateTotal {
+                    state,
+                    total: match state {
+                        AgentState::Idle => 2,
+                        AgentState::Busy => 3,
+                        AgentState::Stopped => 20,
+                        _ => 0,
+                    },
+                })
+                .collect(),
+        ),
+        agents: vec![AgentListRow {
+            summary: summary(),
+            observation: None,
+        }],
+        total: 5,
+        truncated: true,
+        next: Some("a1".to_owned()),
+    };
+    request.validate_response(&reply).unwrap();
+    let good = reply.clone();
+    reply.state_totals = None;
+    unknown(request.validate_response(&reply));
+    reply = good.clone();
+    reply.state_totals.as_mut().unwrap()[0].state = AgentState::Idle;
+    unknown(request.validate_response(&reply));
+    reply = good.clone();
+    reply.total = 4;
+    unknown(request.validate_response(&reply));
+    reply = good.clone();
+    reply.agents[0].summary.state = AgentState::Stopped;
+    unknown(request.validate_response(&reply));
+    reply = good;
+    reply.agents.push(reply.agents[0].clone());
+    unknown(request.validate_response(&reply));
+    for states in [vec![], vec![AgentState::Busy, AgentState::Busy]] {
+        assert!(
+            AgentListRequest {
+                states: Some(states),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    assert!(
+        AgentListRequest {
+            state: Some(AgentState::Idle),
+            ..request
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(serde_json::from_value::<AgentListRequest>(json!({"states":["busy","done"]})).is_err());
 }

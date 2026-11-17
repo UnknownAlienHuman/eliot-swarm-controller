@@ -422,8 +422,32 @@ impl AgentListRow {
     }
 }
 
+/// Persisted lifecycle states counted by the fleet projection (not activity buckets).
+pub const AGENT_LIST_STATES: [AgentState; 9] = [
+    AgentState::Unknown,
+    AgentState::Created,
+    AgentState::Starting,
+    AgentState::Idle,
+    AgentState::Busy,
+    AgentState::Waiting,
+    AgentState::Stopped,
+    AgentState::Failed,
+    AgentState::Lost,
+];
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStateTotal {
+    pub state: AgentState,
+    pub total: usize,
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentListResponse {
+    /// Present for a multi-state request: all nine lifecycle totals in the same
+    /// scope and non-state filters, ignoring both the state set and cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_totals: Option<Vec<AgentStateTotal>>,
     #[serde(deserialize_with = "objects")]
     pub agents: Vec<AgentListRow>,
     #[serde(deserialize_with = "nullable")]

@@ -3522,6 +3522,7 @@ impl Router {
         let filter = AgentListFilter {
             archived: request.archived,
             state: request.state,
+            states: request.states.clone(),
             project: request.project.clone(),
             harness: request.harness.clone(),
             parent: request.parent.clone(),
@@ -3568,6 +3569,7 @@ impl Router {
         };
         if !observations {
             return serde_json::to_value(AgentListResponse {
+                state_totals: page.state_totals,
                 agents: page
                     .summaries
                     .into_iter()
@@ -3629,6 +3631,7 @@ impl Router {
         }
         let next = rows.last().map(|row| row.summary.id.clone());
         serde_json::to_value(AgentListResponse {
+            state_totals: page.state_totals,
             agents: rows,
             next,
             total: page.total,
