@@ -521,6 +521,15 @@ pub mod winui {
             })
         }
 
+        /// Settings usage status for a reported percentage remaining.
+        pub fn quota_status(self, remaining: i64) -> Brush {
+            match remaining {
+                ..20 => self.error(),
+                20..=50 => self.warning(),
+                _ => self.role(|s| s.success, ThemeBrush::AccentText),
+            }
+        }
+
         /// The composer's visible quota track, including low-quota attention.
         pub fn quota_track(self, remaining: f64) -> Brush {
             if remaining < 5.0 {

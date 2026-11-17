@@ -659,15 +659,14 @@ pub fn badge(palette: Palette, text: &str) -> View {
         .content(secondary(text.to_owned()))
 }
 
-/// A quota ring: the share remaining (0–100) as a determinate ring.
-pub fn ring(remaining: f64) -> View {
-    ProgressRing::new()
-        .is_indeterminate(false)
-        .minimum(0.0)
-        .maximum(100.0)
-        .value(remaining.clamp(0.0, 100.0))
+/// A colored outline marks the quota band, including at zero remaining.
+pub fn status_ring(status: Brush) -> View {
+    Border::new()
         .width(layout::RING)
         .height(layout::RING)
+        .corner_radius(radius::CONTROL)
+        .border_thickness(Thickness::uniform(2.0))
+        .border_brush(status)
         .vertical_alignment(VerticalAlignment::Center)
         .into()
 }
