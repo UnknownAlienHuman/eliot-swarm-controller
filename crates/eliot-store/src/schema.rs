@@ -1219,6 +1219,16 @@ mod continuity_tests {
         let (owners, total) = store.live_process_owners(1).unwrap();
         assert_eq!(owners.len(), 1);
         assert_eq!(total, 2);
+        // The exited `agent:a1#1` sorts first; a page that dropped the state
+        // filter would return it here.
+        assert_eq!(
+            (
+                owners[0].agent.as_str(),
+                owners[0].generation,
+                owners[0].workspace
+            ),
+            ("a2", 1, false)
+        );
         for sql in [
             "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM (SELECT DISTINCT owner FROM processes INDEXED BY processes_live_owner WHERE state IN ('running','unknown'))",
             "EXPLAIN QUERY PLAN SELECT DISTINCT owner FROM processes INDEXED BY processes_live_owner WHERE state IN ('running','unknown') ORDER BY owner LIMIT 1",
@@ -1261,12 +1271,25 @@ mod continuity_tests {
             "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM events WHERE kind='activity.heavy' AND agent=?1 AND generation=?2",
             "EXPLAIN QUERY PLAN SELECT data FROM events WHERE kind='activity.heavy' AND agent=?1 AND generation=?2 ORDER BY seq DESC LIMIT 201",
         ] {
-            let plan: String = store
+            let plans: Vec<String> = store
                 .connection
-                .query_row(sql, params![1, 2], |row| row.get(3))
+                .prepare(sql)
+                .unwrap()
+                .query_map(params![1, 2], |row| row.get(3))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
                 .unwrap();
-            assert!(plan.contains("events_heavy_agent_generation"), "{plan}");
-            assert!(plan.contains("agent=? AND generation=?"), "{plan}");
+            assert!(
+                plans
+                    .iter()
+                    .any(|plan| plan.contains("events_heavy_agent_generation")
+                        && plan.contains("agent=? AND generation=?")),
+                "{plans:?}"
+            );
+            assert!(
+                plans.iter().all(|plan| !plan.contains("TEMP B-TREE")),
+                "{plans:?}"
+            );
         }
     }
 
