@@ -993,7 +993,9 @@ Unselected sections keep their bytes and semantic values. A stale revision is
 `conflict`; invalid or secret-bearing drafts never replace the file. Unsupported
 later-layer fields fail validation. Legacy `config.profiles.*` uses this same writer.
 Every proxy is validated independently, including unused routes. Candidate projects
-resolve to canonical Git identities before both dry-run success and publication.
+resolve to canonical Git identities before both dry-run success and publication; a
+candidate that cannot be resolved, such as a missing folder, is refused as `invalid`,
+never as `unavailable`, because nothing was written.
 Resolved registrations carry their source revision, rechecked under the settings
 writer lock; publication and Store reconciliation hold that lock and the Store writer
 without asynchronous Git work between them. A delayed save cannot restore older

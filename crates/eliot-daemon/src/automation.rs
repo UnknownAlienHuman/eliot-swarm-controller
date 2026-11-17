@@ -350,11 +350,23 @@ fn project_registration_input(
 
 /// Load the canonical project registrations represented by `projects.*` in
 /// config.toml for a settings.save reconciliation. Keep this on the same
-/// resolver path used by daemon startup and automation reloads.
+/// resolver path used by daemon startup and automation reloads. It runs
+/// before anything is written, so a candidate that cannot be resolved (a
+/// missing folder, no Git) is a definite `invalid`, never `unavailable`:
+/// clients read that code as an unknown outcome.
 pub(crate) async fn project_registration_inputs(
     configured: Vec<crate::config::ProjectRegistrationConfig>,
 ) -> Result<Vec<eliot_store::ProjectRegistrationInput>> {
-    let registrations = projects::resolve_registrations(configured).await?;
+    let registrations =
+        projects::resolve_registrations(configured)
+            .await
+            .map_err(|mut error| {
+                if error.code == "unavailable" {
+                    error.code = "invalid".to_owned();
+                    *error.message = format!("project checkout cannot be used: {}", error.message);
+                }
+                error
+            })?;
     for registration in &registrations {
         validate_project_git_endpoints(registration.git.as_ref())?;
     }

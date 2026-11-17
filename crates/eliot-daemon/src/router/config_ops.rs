@@ -428,6 +428,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_project_folder_is_a_definite_invalid_refusal() {
+        let root = SettingsRoot::new();
+        let router = crate::router::tests::router_with_data_root(root.0.clone());
+        let original = std::fs::read(root.0.join("config.toml")).unwrap();
+        let request = project_request(&root, &root.0.join("missing"), "launch");
+        let error = router
+            .settings_save(&serde_json::to_value(&request).unwrap(), &Principal::Owner)
+            .await
+            .unwrap_err();
+        // Nothing was written: never `unavailable`, which clients must read
+        // as an unknown outcome.
+        assert_eq!(error.code, "invalid");
+        assert!(error.message.contains("workspace cannot be resolved"));
+        assert_eq!(std::fs::read(root.0.join("config.toml")).unwrap(), original);
+    }
+
+    #[tokio::test]
     async fn delayed_project_resolution_cannot_restore_stale_authority() {
         let root = SettingsRoot::new();
         let router = crate::router::tests::router_with_data_root(root.0.clone());
