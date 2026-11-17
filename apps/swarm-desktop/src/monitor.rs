@@ -293,11 +293,11 @@ pub fn restart_loss(summary: &str) -> bool {
 pub const RESTART_LOSS_WORDS: &str = "Stopped by a Swarm restart";
 
 /// A turn outcome in words ("completed", "interrupted", "failed",
-/// "ended with an unknown result").
+/// "ended without a confirmed result").
 pub fn outcome_words(outcome: &str) -> String {
     match outcome {
         "success" | "completed" => "completed".to_owned(),
-        "unknown" => "ended with an unknown result".to_owned(),
+        "unknown" => "ended without a confirmed result".to_owned(),
         other => other.replace('_', " "),
     }
 }

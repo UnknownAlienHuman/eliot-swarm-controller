@@ -143,7 +143,7 @@ impl DesktopApp {
                     epoch,
                     from: agent.clone(),
                     from_generation: generation,
-                    status: format!("Reading the SENDs of {agent} generation {generation}…"),
+                    status: format!("Reading the SENDs of {agent} run {generation}…"),
                     ..DialogState::default()
                 };
                 let Ok(data_dir) = self.data_dir.clone() else {
@@ -168,7 +168,7 @@ impl DesktopApp {
                 }
                 self.handoff.status = match &sends {
                     Ok(rows) => format!(
-                        "{} SEND(s) on this generation, {} undispatched.{}",
+                        "{} SEND(s) in this run, {} undispatched.{}",
                         rows.len(),
                         rows.iter().filter(|row| row.transferable()).count(),
                         handoff::omitted_note(omitted, client::MAX_LISTED_SENDS)
@@ -743,7 +743,7 @@ impl DesktopApp {
             if transferable.is_empty() {
                 push(
                 "no-sends",
-                small("None are waiting on this generation: the transfer carries context, claims, Goal and children only.")
+                small("None are waiting in this run: the transfer carries context, claims, Goal and children only.")
                     .opacity(theme::MUTED_OPACITY)
                     .into(),
             );

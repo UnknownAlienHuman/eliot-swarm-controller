@@ -313,7 +313,7 @@ impl Coverage {
             notes.push("Older turns exist; Load older messages shows them.".to_owned());
         }
         if self.generation > 1 {
-            notes.push("Earlier generations are not shown.".to_owned());
+            notes.push("Earlier runs are not shown.".to_owned());
         }
         if self.activity_pruned() {
             notes.push("Older activity was removed by retention.".to_owned());
@@ -950,7 +950,7 @@ impl Conversation {
                 "Assistant".to_owned()
             }
             TurnStatus::Completed(Some(outcome)) => format!("Assistant · {}", outcome.as_str()),
-            TurnStatus::Unknown => "Assistant · outcome unknown".to_owned(),
+            TurnStatus::Unknown => "Assistant · result not confirmed".to_owned(),
             TurnStatus::Running => "Assistant · working".to_owned(),
         };
         match (final_text, &turn.status) {

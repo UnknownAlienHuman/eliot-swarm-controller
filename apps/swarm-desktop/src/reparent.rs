@@ -60,11 +60,11 @@ impl MoveBinding {
     pub fn describe(&self) -> String {
         match self.form {
             MoveForm::Agent => format!(
-                "{} (generation {}) and its subtree to {} (generation {})",
+                "{} (run {}) and its subtree to {} (run {})",
                 self.source, self.source_generation, self.parent, self.parent_generation
             ),
             MoveForm::Children => format!(
-                "all children of {} (generation {}) to {} (generation {})",
+                "all children of {} (run {}) to {} (run {})",
                 self.source, self.source_generation, self.parent, self.parent_generation
             ),
         }
@@ -122,12 +122,12 @@ pub fn refusal_line(binding: &MoveBinding, error: &str) -> String {
         "invalid" => "a cycle (the new manager is inside the moving subtree) or a bad source form",
         "fanout_limit" => "the new manager's direct-child or tree limit would be exceeded",
         "not_allowed" => {
-            "an observe-only Agent is involved (its parent binding belongs to the native harness), or the moved rows are in another project"
+            "one of these Agents is managed by its native application, or belongs to another project"
         }
         "stale_generation" => {
-            "a generation changed after this was shown; wait for the monitor to refresh and choose again"
+            "an Agent started a new run; wait for the monitor to refresh and choose again"
         }
-        "bad_state" => "the new manager must be a controlled, live, non-unknown Agent",
+        "bad_state" => "choose an Agent Swarm controls whose current run is confirmed and still active",
         "not_found" => "an Agent no longer exists",
         "frame_too_large" => "the result would exceed the reply bound",
         "id_conflict" => "this mutation id was already used for a different move",

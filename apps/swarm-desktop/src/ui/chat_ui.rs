@@ -352,7 +352,7 @@ impl DesktopApp {
                         }
                         let next = if resnapshot {
                             Next::Resnapshot {
-                                reason: "a newer generation started".to_owned(),
+                                reason: "a new run started".to_owned(),
                             }
                         } else {
                             live::after_page(
@@ -1288,7 +1288,7 @@ impl DesktopApp {
                                 .grid_column(1)
                                 .is_enabled(!self.submitting())
                                 .automation_name(format!(
-                                    "Resume after the Swarm restart (generation {generation})"
+                                    "Resume after the Swarm restart (run {generation})"
                                 ))
                                 .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
                                     DraftAction::Resume {
@@ -1994,7 +1994,7 @@ impl DesktopApp {
             (Some(agent), Some(detail)) if resumable => m3::filled(palette)
                 .is_enabled(enabled)
                 .automation_name(format!(
-                    "{} (generation {})",
+                    "{} (run {})",
                     if draft_blank {
                         "Resume"
                     } else {
@@ -2153,7 +2153,7 @@ impl DesktopApp {
                                     .text_trimming(TextTrimming::CharacterEllipsis),
                                 m3::text(
                                     format!(
-                                        "Ends Agent {} (generation {}) at once instead of a clean stop; an active turn is cut off.",
+                                        "Ends Agent {} (run {}) at once instead of a clean stop; an active turn is cut off.",
                                         bound.agent, bound.generation
                                     ),
                                     tokens::text::SECONDARY,
@@ -2176,7 +2176,7 @@ impl DesktopApp {
                                 m3::destructive(palette)
                                     .is_enabled(!self.submitting())
                                     .automation_name(format!(
-                                        "Force stop {} generation {}",
+                                        "Force stop {} run {}",
                                         bound.agent, bound.generation
                                     ))
                                     .on_click(context.message(Message::Chat(

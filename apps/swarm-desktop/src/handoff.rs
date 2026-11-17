@@ -252,7 +252,7 @@ pub fn outcome_summary(outcome: &Outcome) -> String {
             (Some(done), _, _) => format!("Switched. {}", handoff(done)),
             (None, _, Some(error)) => format!("The switch stopped: {error}"),
             (None, Some(created), None) => format!(
-                "Started {} (generation {}); next: {}.",
+                "Started {} (run {}); next: {}.",
                 created.agent,
                 created.generation,
                 reply.next_action.replace('_', " ")
