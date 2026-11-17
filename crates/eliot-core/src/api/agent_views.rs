@@ -426,9 +426,13 @@ impl AgentSummary {
         Some((tokens, scope))
     }
 
-    /// Human-readable fleet STATE cell.
+    /// Human-readable fleet STATE cell. A native child that ended with its
+    /// parent reads as its lifecycle state, not as its last activity.
     pub fn display_state(&self) -> String {
         match &self.activity {
+            Some(_) if self.state == AgentState::Stopped => {
+                "stopped (ended with parent)".to_owned()
+            }
             Some(activity) => format!("{} (observed)", activity_state_name(activity.state)),
             None => agent_state_name(self.state).to_owned(),
         }
@@ -437,6 +441,7 @@ impl AgentSummary {
     /// Fleet counting bucket for one summary.
     pub fn fleet_bucket(&self) -> &'static str {
         match &self.activity {
+            Some(_) if self.state == AgentState::Stopped => "stopped",
             Some(activity) => match activity.state {
                 NativeChildActivityState::Running => "running",
                 NativeChildActivityState::Idle => "idle",
@@ -2682,6 +2687,10 @@ mod tests {
             row
         };
         assert_eq!(observed(Activity::Idle).display_state(), "idle (observed)");
+        let mut ended = observed(Activity::Idle);
+        ended.state = AgentState::Stopped;
+        assert_eq!(ended.display_state(), "stopped (ended with parent)");
+        assert_eq!(ended.fleet_bucket(), "stopped");
         assert_eq!(
             observed(Activity::Running).display_state(),
             "running (observed)"

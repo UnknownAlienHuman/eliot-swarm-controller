@@ -1650,16 +1650,15 @@ impl DesktopApp {
                 let group = view.group;
                 let checked = !state.cleanup_unchecked.contains(&group);
                 let kept = view.items.len() - view.removable;
+                let size = if crate::worktrees::sized(group) {
+                    format!(" · {}", crate::worktrees::size_words(view.bytes))
+                } else {
+                    String::new()
+                };
                 let summary = match (view.removable, kept) {
                     (0, kept) => format!("{kept} kept"),
-                    (removable, 0) => format!(
-                        "{removable} to remove · {}",
-                        crate::worktrees::size_words(view.bytes)
-                    ),
-                    (removable, kept) => format!(
-                        "{removable} to remove · {} · {kept} kept",
-                        crate::worktrees::size_words(view.bytes)
-                    ),
+                    (removable, 0) => format!("{removable} to remove{size}"),
+                    (removable, kept) => format!("{removable} to remove{size} · {kept} kept"),
                 };
                 let header: View = if view.removable > 0 {
                     CheckBox::new()

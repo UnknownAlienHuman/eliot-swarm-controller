@@ -180,10 +180,17 @@ pub fn reason_words(reason: &str) -> String {
         "terminal_owned_artifact" => "its task finished".to_owned(),
         "native_archive_pending" => "archive the finished Codex session".to_owned(),
         "no_native_archive" => "this harness has no archive method".to_owned(),
-        "agent_not_quiescent" => "its task is still live".to_owned(),
+        "agent_not_quiescent" => "its task is not finished (live or lost)".to_owned(),
         "merged" => "merged upstream".to_owned(),
-        "merged_upstream_deleted" => "merged; the upstream branch is gone".to_owned(),
+        "merged_remote_deleted" => {
+            "merged into the default branch; no remote branch left".to_owned()
+        }
         "unmerged" => "not merged upstream".to_owned(),
+        "branch_read_failed" => "the branch could not be read".to_owned(),
+        "no_upstream_remote" => "the repository has no upstream remote".to_owned(),
+        "fetch_failed" => "the upstream fetch failed".to_owned(),
+        "remote_check_failed" | "merge_check_failed" => "the merge check failed".to_owned(),
+        "unavailable" => "it could not be reached now".to_owned(),
         "ahead" => "has unpushed commits".to_owned(),
         "dirty" | "worktree_dirty" => "has uncommitted changes".to_owned(),
         "hard_link" => "shares files with another folder".to_owned(),
@@ -207,13 +214,26 @@ pub fn item_line(item: &CleanupCandidate) -> (String, String) {
         .next()
         .map(|name| name.trim_start_matches("refs/heads/"))
         .unwrap_or(path);
-    let name = if item.artifact.kind == ArtifactKind::Branch {
-        tail.to_owned()
-    } else {
+    let folder = || {
         std::path::Path::new(tail).file_name().map_or_else(
             || tail.to_owned(),
             |name| name.to_string_lossy().into_owned(),
         )
+    };
+    let name = match item.artifact.kind {
+        ArtifactKind::Branch => tail.to_owned(),
+        // A native session is named by its harness and Agent, not its
+        // store reference.
+        ArtifactKind::NativeSession => format!(
+            "{} session of {}",
+            crate::picker::harness_label(&item.artifact.purpose),
+            item.artifact.agent
+        ),
+        ArtifactKind::Worktree => match &item.artifact.git {
+            Some(git) => format!("{} · branch {}", folder(), git.branch),
+            None => folder(),
+        },
+        _ => folder(),
     };
     let size = match (item.artifact.kind, item.bytes) {
         (ArtifactKind::Branch | ArtifactKind::NativeSession, _) => String::new(),
@@ -225,14 +245,20 @@ pub fn item_line(item: &CleanupCandidate) -> (String, String) {
     } else {
         "Keep"
     };
+    let place = match item.artifact.kind {
+        ArtifactKind::NativeSession => String::new(),
+        _ => format!(" · {}", crate::nav::display_path(path)),
+    };
     (
         name,
-        format!(
-            "{size}{verdict}: {} · {}",
-            reason_words(&item.reason),
-            crate::nav::display_path(path)
-        ),
+        format!("{size}{verdict}: {}{place}", reason_words(&item.reason)),
     )
+}
+
+/// Whether a group's size means anything (branches and archived native
+/// sessions free no folder).
+pub fn sized(group: CleanupGroup) -> bool {
+    !matches!(group, CleanupGroup::Branches | CleanupGroup::Sessions)
 }
 
 /// The result of one apply, in words: what was removed, kept (with why) and
@@ -386,7 +412,12 @@ mod tests {
             "{line}"
         );
         let (_, kept) = item_line(&plan.items[3]);
-        assert!(kept.contains("Keep: its task is still live"), "{kept}");
+        assert!(kept.contains("Keep: its task is not finished"), "{kept}");
+        let session = candidate(ArtifactKind::NativeSession, "codex", "safe", None);
+        let (name, line) = item_line(&session);
+        assert_eq!(name, "Codex session of a1");
+        assert_eq!(line, "Remove: its task finished");
+        assert!(!sized(CleanupGroup::Branches) && sized(CleanupGroup::Temp));
         let mut unchecked = std::collections::HashSet::new();
         assert_eq!(selected_artifacts(&plan, &unchecked).len(), 2);
         unchecked.insert(CleanupGroup::Temp);
@@ -431,6 +462,6 @@ mod tests {
         assert_eq!(lines[0], "Removed 1 (10 B) · kept 1 · unknown 1");
         assert_eq!(lines[1], "Removed temp");
         assert!(lines[2].starts_with("Unknown target"), "{}", lines[2]);
-        assert_eq!(lines[3], "Kept wt: its task is still live");
+        assert_eq!(lines[3], "Kept wt: its task is not finished (live or lost)");
     }
 }

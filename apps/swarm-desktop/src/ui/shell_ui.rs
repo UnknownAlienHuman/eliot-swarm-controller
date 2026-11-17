@@ -1455,15 +1455,11 @@ impl DesktopApp {
             bottom.push(KeyedView::new(
                 format!("attention:{attention}"),
                 m3::row(palette, attention)
-                    .automation_name(format!(
-                        "{} ({})",
-                        fleet.attention_label(),
-                        if attention { "listed" } else { "list them" }
-                    ))
+                    .automation_name(fleet.attention_row_label(attention))
                     .on_click(context.message(Message::Shell(ShellMsg::AttentionToggled)))
                     .content(m3::row_content(
                         Some(m3::glyph::FLAG),
-                        &fleet.attention_label(),
+                        &fleet.attention_row_label(attention),
                         "",
                         palette
                             .dot(StatusTone::Attention)

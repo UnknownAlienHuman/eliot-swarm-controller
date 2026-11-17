@@ -642,12 +642,15 @@ impl Fleet {
         crate::monitor::live_words(working, self.attention, idle)
     }
 
-    /// The attention row's label ("1 needs attention", "3 need attention").
-    pub fn attention_label(&self) -> String {
+    /// The attention filter row: an action, since the fleet line above it
+    /// already says how many need attention ("List the 2 that need
+    /// attention"; "Listing …" while the list is filtered).
+    pub fn attention_row_label(&self, listed: bool) -> String {
+        let verb = if listed { "Listing" } else { "List" };
         if self.attention == 1 {
-            "1 needs attention".to_owned()
+            format!("{verb} the 1 that needs attention")
         } else {
-            format!("{} need attention", self.attention)
+            format!("{verb} the {} that need attention", self.attention)
         }
     }
 }
@@ -1304,15 +1307,18 @@ mod tests {
             busy.summary(40, none),
             "2 working · 1 needs attention · 3 idle"
         );
-        assert_eq!(busy.attention_label(), "1 needs attention");
+        assert_eq!(
+            busy.attention_row_label(false),
+            "List the 1 that needs attention"
+        );
         assert_eq!(
             Fleet {
                 running: 0,
                 attention: 3,
                 idle: 0,
             }
-            .attention_label(),
-            "3 need attention"
+            .attention_row_label(true),
+            "Listing the 3 that need attention"
         );
         // Failed and lost need a decision; a native child never counts.
         let fleet = Fleet::of(&[
