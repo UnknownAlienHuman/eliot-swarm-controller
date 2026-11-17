@@ -14,6 +14,7 @@
 
 use std::{ffi::OsStr, process::Stdio, time::Duration};
 
+use eliot_core::api::harness::native_model_display_name;
 use eliot_core::{Error, Result};
 use serde_json::Value;
 use tokio::{
@@ -37,7 +38,7 @@ pub(crate) const MAX_MODELS: usize = 1024;
 /// Maximum model id bytes, mirroring `MAX_HARNESS_MODEL_ID_BYTES` in Core.
 pub(crate) const MAX_MODEL_ID_BYTES: usize = 256;
 
-/// Exact argv for the variant read: `api model.list --standalone`. The
+/// Exact argv for the model metadata read: `api model.list --standalone`. The
 /// same read-only native surface as `models --standalone` (no shared server, no
 /// session, no turn, no inference): it answers the installed `model.list`
 /// operation (`GET /api/model`) against a private server, so
@@ -46,7 +47,7 @@ pub(crate) fn model_list_argv() -> [&'static str; 3] {
     ["api", "model.list", "--standalone"]
 }
 
-/// Output cap for the variant read: the observed inventory is ~320 KiB
+/// Output cap for the metadata read: the observed inventory is ~320 KiB
 /// UTF-8 (425 entries), so 2 MiB leaves headroom while bounding a
 /// misbehaving child.
 pub(crate) const MAX_MODEL_LIST_BYTES: usize = 2 * 1024 * 1024;
@@ -55,26 +56,28 @@ pub(crate) const MAX_MODEL_LIST_BYTES: usize = 2 * 1024 * 1024;
 /// seven, so anything larger is a corrupt read, never a wider wardrobe.
 pub(crate) const MAX_VARIANTS_PER_MODEL: usize = 64;
 
-/// One catalogue model's selectable variant ids in wire order.
+/// One catalogue model's presentation label and selectable variant ids.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NativeVariantEntry {
+pub(crate) struct NativeModelMetadata {
     /// Native `provider/model` id, verbatim.
     pub id: String,
-    /// Selectable `Model.Variant` ids; empty when the model reports none.
-    pub variants: Vec<String>,
+    /// Verbatim `Model.Info.name` when present and valid.
+    pub display_name: Option<String>,
+    /// Selectable `Model.Variant` ids, when the model reports a variants array.
+    pub variants: Option<Vec<String>>,
 }
 
 /// Run the frozen native exe with exact argv `api model.list --standalone` and return
-/// one entry per reported model with its selectable variant ids, in wire
+/// one entry per reported model with metadata, in wire
 /// order. Bounded by `deadline` and [`MAX_MODEL_LIST_BYTES`]; like
 /// [`run_models`] this is read-only (no session, no inference) and any
 /// failure is a static typed string naming the `model.list` surface. The
 /// daemon closes this reader's whole family before deciding whether an
-/// optional variants failure permits the ids-only catalogue.
-pub(crate) async fn run_model_variants(
+/// optional metadata failure permits the ids-only catalogue.
+pub(crate) async fn run_model_metadata(
     program: &OsStr,
     deadline: Instant,
-) -> Result<Vec<NativeVariantEntry>> {
+) -> Result<Vec<NativeModelMetadata>> {
     let mut command = Command::new(program);
     command
         .args(model_list_argv())
@@ -151,11 +154,10 @@ pub(crate) async fn run_model_variants(
 
 /// Parse `opencode api model.list --standalone` stdout: the installed `{"data":
 /// [Model.Info]}` envelope (a bare array decodes too). Entries join
-/// `providerID`/`id` verbatim; their `variants` map to selectable ids in
-/// wire order. Entries with an unusable identity or a missing variants
-/// member are skipped, never guessed; anything else structural (bad JSON,
-/// a non-array inventory, more than 1024 entries) fails the read.
-pub(crate) fn parse_model_list_output(text: &str) -> Result<Vec<NativeVariantEntry>> {
+/// `providerID`/`id` verbatim, keep `name` as the display name, and map
+/// `variants` to selectable ids in wire order. Entries with an unusable
+/// identity or no usable metadata are skipped.
+pub(crate) fn parse_model_list_output(text: &str) -> Result<Vec<NativeModelMetadata>> {
     let value: Value = serde_json::from_str(text).map_err(|_| {
         Error::new(
             "native_readback",
@@ -183,12 +185,10 @@ pub(crate) fn parse_model_list_output(text: &str) -> Result<Vec<NativeVariantEnt
         let provider = item
             .get("providerID")
             .and_then(Value::as_str)
-            .map(str::trim)
             .filter(|provider| !provider.is_empty());
         let id = item
             .get("id")
             .and_then(Value::as_str)
-            .map(str::trim)
             .filter(|id| !id.is_empty());
         let (Some(provider), Some(id)) = (provider, id) else {
             continue;
@@ -201,37 +201,47 @@ pub(crate) fn parse_model_list_output(text: &str) -> Result<Vec<NativeVariantEnt
         {
             continue;
         }
-        let Some(variants) = item.get("variants").and_then(Value::as_array) else {
-            continue;
-        };
-        if variants.len() > MAX_VARIANTS_PER_MODEL {
+        let display_name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(native_model_display_name)
+            .map(str::to_owned);
+        let variants = item.get("variants").and_then(Value::as_array);
+        if variants.is_some_and(|variants| variants.len() > MAX_VARIANTS_PER_MODEL) {
             return Err(Error::new(
                 "source_integrity",
                 "OpenCode model.list reports too many variants",
             ));
         }
-        let mut ids = Vec::with_capacity(variants.len());
-        for variant in variants {
-            let Some(variant) = variant
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|variant| {
-                    !variant.is_empty()
-                        && variant.len() <= 128
-                        && !variant.chars().any(char::is_control)
-                        && !variant.chars().any(char::is_whitespace)
-                })
-            else {
-                continue;
-            };
-            if !ids.iter().any(|known: &String| known == variant) {
-                ids.push(variant.to_owned());
+        let variants = variants.map(|variants| {
+            let mut ids = Vec::with_capacity(variants.len());
+            for variant in variants {
+                let Some(variant) = variant
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|variant| {
+                        !variant.is_empty()
+                            && variant.len() <= 128
+                            && !variant.chars().any(char::is_control)
+                            && !variant.chars().any(char::is_whitespace)
+                    })
+                else {
+                    continue;
+                };
+                if !ids.iter().any(|known: &String| known == variant) {
+                    ids.push(variant.to_owned());
+                }
             }
+            ids
+        });
+        if display_name.is_none() && variants.is_none() {
+            continue;
         }
-        entries.push(NativeVariantEntry {
+        entries.push(NativeModelMetadata {
             id: format!("{provider}/{id}"),
-            variants: ids,
+            display_name,
+            variants,
         });
     }
     Ok(entries)
@@ -433,28 +443,31 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(
             entries[0],
-            NativeVariantEntry {
+            NativeModelMetadata {
                 id: "opencode/longcat-2.5-free".to_owned(),
-                variants: Vec::new(),
+                display_name: Some("LongCat 2.5 Free".to_owned()),
+                variants: Some(Vec::new()),
             }
         );
         assert_eq!(
             entries[1],
-            NativeVariantEntry {
+            NativeModelMetadata {
                 id: "opencode/deepseek-v4.1-flash-free".to_owned(),
-                variants: vec!["low".to_owned(), "high".to_owned(), "max".to_owned()],
+                display_name: Some("DeepSeek V4.1 Flash Free".to_owned()),
+                variants: Some(vec!["low".to_owned(), "high".to_owned(), "max".to_owned()]),
             }
         );
         assert_eq!(
             entries[2],
-            NativeVariantEntry {
+            NativeModelMetadata {
                 id: "openrouter/meta/muse-spark-open".to_owned(),
-                variants: vec![
+                display_name: Some("Muse Spark Open".to_owned()),
+                variants: Some(vec![
                     "low".to_owned(),
                     "medium".to_owned(),
                     "high".to_owned(),
                     "xhigh".to_owned(),
-                ],
+                ]),
             }
         );
     }
@@ -467,11 +480,12 @@ mod tests {
     }
 
     #[test]
-    fn entries_without_a_variants_member_are_skipped() {
+    fn keeps_valid_names_independently_of_variants() {
         let entries = parse_model_list_output(
-            r#"{"data": [{"providerID": "p", "id": "novar"},
+            r#"{"data": [{"providerID": "p", "id": "novar", "name": " Model Name "},
+                          {"providerID": "p", "id": "nometa", "name": "bad\nname"},
                           {"providerID": "p", "id": "empty", "variants": []},
-                          {"providerID": "", "id": "m", "variants": []},
+                          {"providerID": " p", "id": "m", "name": "Invalid Identity", "variants": []},
                           {"providerID": "p", "id": "ok",
                            "variants": [{"id": "low"}]}]}"#,
         )
@@ -479,13 +493,20 @@ mod tests {
         assert_eq!(
             entries,
             vec![
-                NativeVariantEntry {
-                    id: "p/empty".to_owned(),
-                    variants: Vec::new(),
+                NativeModelMetadata {
+                    id: "p/novar".to_owned(),
+                    display_name: Some(" Model Name ".to_owned()),
+                    variants: None,
                 },
-                NativeVariantEntry {
+                NativeModelMetadata {
+                    id: "p/empty".to_owned(),
+                    display_name: None,
+                    variants: Some(Vec::new()),
+                },
+                NativeModelMetadata {
                     id: "p/ok".to_owned(),
-                    variants: vec!["low".to_owned()],
+                    display_name: None,
+                    variants: Some(vec!["low".to_owned()]),
                 },
             ]
         );
@@ -501,7 +522,7 @@ mod tests {
         )
         .expect("drops parse");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].variants, vec!["low".to_owned()]);
+        assert_eq!(entries[0].variants, Some(vec!["low".to_owned()]));
     }
 
     #[test]

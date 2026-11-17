@@ -260,6 +260,8 @@ pub struct NativeModelListResult {
 pub struct NativeModelCatalogEntry {
     pub model_id: String,
     pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
     #[serde(default)]
     pub variants: Option<NativeModelEffortVariants>,
 }

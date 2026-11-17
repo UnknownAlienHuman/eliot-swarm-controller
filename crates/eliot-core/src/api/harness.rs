@@ -23,6 +23,8 @@ pub const MAX_HARNESS_NAME_BYTES: usize = 32;
 pub const MAX_HARNESS_MODELS: usize = 1024;
 /// Maximum model id length.
 pub const MAX_HARNESS_MODEL_ID_BYTES: usize = 256;
+/// Maximum native model display name length in UTF-8 bytes.
+pub const MAX_HARNESS_MODEL_DISPLAY_NAME_BYTES: usize = 512;
 /// Maximum profile name length on catalogue/quota reads.
 pub const MAX_HARNESS_PROFILE_BYTES: usize = 256;
 /// Maximum native route/account scope key length.
@@ -251,6 +253,9 @@ fn validate_freshness(fetched_at_ms: i64, ttl_ms: u64) -> Result<()> {
 pub struct HarnessModelEntry {
     /// Native model id (`provider/model` for OpenCode).
     pub id: String,
+    /// Verbatim native presentation label, when reported and valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// True for the harness native default entry.
     #[serde(default)]
     pub default: bool,
@@ -266,6 +271,21 @@ pub struct HarnessModelEntry {
     /// asserted from catalogue membership).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+impl HarnessModelEntry {
+    /// Presentation label with the native model id as the default label.
+    pub fn display_name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.id)
+    }
+}
+
+/// Accept a native catalogue label as-is when it fits the display contract.
+pub fn native_model_display_name(name: &str) -> Option<&str> {
+    (name.len() <= MAX_HARNESS_MODEL_DISPLAY_NAME_BYTES
+        && !name.trim().is_empty()
+        && !name.chars().any(char::is_control))
+    .then_some(name)
 }
 
 /// Response for `harness.models`.
@@ -356,6 +376,16 @@ impl HarnessModelsResponse {
                 return Err(Error::new(
                     "invalid",
                     "harness model id must be non-empty of at most 256 characters",
+                ));
+            }
+            if model
+                .display_name
+                .as_deref()
+                .is_some_and(|name| native_model_display_name(name).is_none())
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "harness model display name must be non-blank, control-free and at most 512 bytes",
                 ));
             }
             validate_source(model.source.as_deref())?;
@@ -577,8 +607,7 @@ pub struct ModelsCatalogEntry {
     pub harness: String,
     /// Native model id verbatim (`provider/model` for OpenCode).
     pub id: String,
-    /// Display name (native id verbatim; OpenCode shows the full
-    /// `provider/model` id).
+    /// Verbatim native display name, or the native model id when absent.
     pub display_name: String,
     /// Provider (`openai` for Codex, `anthropic` for Claude, `meta` for Muse,
     /// the `provider/` prefix for OpenCode, the leading family for
@@ -614,10 +643,10 @@ impl ModelsCatalogEntry {
                 "catalogue model id must be non-empty of at most 256 characters",
             ));
         }
-        if self.display_name.trim().is_empty() || self.display_name.len() > 512 {
+        if native_model_display_name(&self.display_name).is_none() {
             return Err(Error::new(
                 "invalid",
-                "catalogue display name must be non-empty of at most 512 characters",
+                "catalogue display name must be non-blank, control-free and at most 512 bytes",
             ));
         }
         if self.provider.trim().is_empty() || self.provider.len() > 128 {
@@ -779,11 +808,6 @@ pub fn catalog_provider(harness: &str, id: &str) -> String {
     }
 }
 
-/// Display name for one catalogue id: the native id verbatim.
-pub fn catalog_display_name(id: &str) -> String {
-    id.to_owned()
-}
-
 /// Cursor for one catalogue entry: `harness:id`.
 pub fn catalog_cursor(harness: &str, id: &str) -> String {
     format!("{harness}:{id}")
@@ -939,6 +963,7 @@ mod tests {
             (0..(MAX_HARNESS_MODELS + 1))
                 .map(|index| HarnessModelEntry {
                     id: format!("m{index}"),
+                    display_name: None,
                     default: false,
                     efforts: None,
                     default_effort: None,
@@ -1070,7 +1095,7 @@ mod tests {
         ModelsCatalogEntry {
             harness: harness.to_owned(),
             id: id.to_owned(),
-            display_name: catalog_display_name(id),
+            display_name: id.to_owned(),
             provider: catalog_provider(harness, id),
             efforts: None,
             default_effort: None,
@@ -1102,6 +1127,7 @@ b"
             "claude",
             vec![HarnessModelEntry {
                 id: "haiku".to_owned(),
+                display_name: None,
                 default: false,
                 efforts: None,
                 default_effort: None,
@@ -1111,6 +1137,31 @@ b"
         response.validate().unwrap();
         response.models[0].source = Some(String::new());
         assert_eq!(response.validate().unwrap_err().code, "invalid");
+    }
+
+    #[test]
+    fn native_display_name_is_optional_bounded_and_verbatim() {
+        let mut entry: HarnessModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "p/model"
+        }))
+        .unwrap();
+        assert_eq!(entry.display_name(), "p/model");
+        assert!(
+            serde_json::to_value(&entry)
+                .unwrap()
+                .get("display_name")
+                .is_none()
+        );
+
+        let name = " Ω Model  ";
+        entry.display_name = native_model_display_name(name).map(str::to_owned);
+        assert_eq!(entry.display_name(), name);
+        assert_eq!(entry.id, "p/model");
+        assert_eq!(native_model_display_name(" \t"), None);
+        assert_eq!(native_model_display_name("Model\u{0085}Name"), None);
+        let limit = "é".repeat(MAX_HARNESS_MODEL_DISPLAY_NAME_BYTES / 2);
+        assert_eq!(native_model_display_name(&limit), Some(limit.as_str()));
+        assert_eq!(native_model_display_name(&format!("{limit}x")), None);
     }
 
     #[test]

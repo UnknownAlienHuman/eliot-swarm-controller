@@ -3,7 +3,7 @@ use crate::{
     native::{
         AuthSetup, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider, OpenCodeHttp,
         OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
-        models::{run_model_variants, run_models},
+        models::{run_model_metadata, run_models},
         types::{InboxUser, McpServerReadback, ModelRef, NativeModelEntry, SessionInfo},
     },
 };
@@ -632,7 +632,7 @@ impl OpenCodePlugin {
     }
 
     /// One read-only `harness.models` phase: `models --standalone` ids or
-    /// `api model.list --standalone` variants. The daemon gives each phase
+    /// `api model.list --standalone` metadata. The daemon gives each phase
     /// its own reader Job and proves family closure before overlaying results.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
         if self.session.is_some() || self.failed_start.is_some() {
@@ -666,10 +666,12 @@ impl OpenCodePlugin {
                 .into_iter()
                 .map(|id| json!({"id": id, "default": false}))
                 .collect(),
-            ModelListPart::Variants => run_model_variants(std::ffi::OsStr::new(program), until)
+            ModelListPart::Variants => run_model_metadata(std::ffi::OsStr::new(program), until)
                 .await?
                 .into_iter()
-                .map(|entry| json!({"id": entry.id, "default": false, "efforts": entry.variants}))
+                .map(|entry| {
+                    json!({"id": entry.id, "default": false, "efforts": entry.variants, "display_name": entry.display_name})
+                })
                 .collect(),
         };
         Ok(json!({"models": models, "default": Value::Null}))

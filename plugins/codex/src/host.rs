@@ -462,6 +462,7 @@ impl CodexPlugin {
             .map(|entry| {
                 json!({
                     "id": entry.id,
+                    "display_name": eliot_core::api::harness::native_model_display_name(&entry.display_name),
                     "default": entry.is_default,
                     "efforts": entry.supported_reasoning_efforts.into_iter().map(|effort| effort.reasoning_effort).collect::<Vec<_>>(),
                     "default_effort": entry.default_reasoning_effort,

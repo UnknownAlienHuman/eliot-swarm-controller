@@ -280,7 +280,7 @@ pub fn as_catalog(reply: &HarnessModelsResponse) -> ModelsCatalogResponse {
             .map(|entry| ModelsCatalogEntry {
                 harness: reply.harness.clone(),
                 id: entry.id.clone(),
-                display_name: entry.id.clone(),
+                display_name: entry.display_name().to_owned(),
                 provider: eliot_core::api::catalog_provider(&reply.harness, &entry.id),
                 efforts: entry
                     .efforts
@@ -344,6 +344,7 @@ mod tests {
             models: vec![
                 HarnessModelEntry {
                     id: "m1".to_owned(),
+                    display_name: Some("Model One".to_owned()),
                     default: true,
                     efforts: Some(vec!["low".to_owned(), "high".to_owned()]),
                     default_effort: Some("low".to_owned()),
@@ -351,6 +352,7 @@ mod tests {
                 },
                 HarnessModelEntry {
                     id: "m2".to_owned(),
+                    display_name: None,
                     default: false,
                     efforts: Some(vec!["medium".to_owned(), "xhigh".to_owned()]),
                     default_effort: None,
@@ -462,6 +464,10 @@ mod tests {
     fn a_change_sends_only_what_differs_and_what_the_route_lists() {
         let reply = reply(ConfigureSupport::default());
         let settings = running("m1", "low");
+        let catalog = as_catalog(&reply);
+        assert_eq!(catalog.models[0].display_name, "Model One");
+        assert_eq!(catalog.models[1].display_name, "m2");
+        assert_eq!(change(&reply, &settings, Some("Model One"), None), None);
         // The same effort changes nothing; another listed one changes it.
         assert_eq!(change(&reply, &settings, None, Some("low")), None);
         assert_eq!(

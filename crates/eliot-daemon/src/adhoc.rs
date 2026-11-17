@@ -140,6 +140,7 @@ pub(crate) fn claude_documented_models() -> Vec<core::api::HarnessModelEntry> {
         .chain(CLAUDE_DOCUMENTED_MODEL_IDS.iter())
         .map(|id| core::api::HarnessModelEntry {
             id: (*id).to_owned(),
+            display_name: None,
             default: false,
             efforts: Some(efforts.clone()),
             default_effort: None,

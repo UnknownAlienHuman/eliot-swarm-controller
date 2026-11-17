@@ -538,7 +538,7 @@ impl PluginHost {
     ) -> MetadataRead<Value> {
         // OpenCode's two CLI operations must never share a reader lifetime:
         // closing the first Job proves its standalone server is gone before
-        // starting the variants command. Retain one admission slot throughout.
+        // starting the metadata command. Retain one admission slot throughout.
         let opencode = profile["harness"] == "opencode";
         let until = Instant::now() + READER_DEADLINE;
         let mut catalogue = self
@@ -553,21 +553,21 @@ impl PluginHost {
         if !opencode || catalogue.result.is_err() || catalogue.cleanup != ReaderCleanup::Confirmed {
             return catalogue;
         }
-        let variants = self
+        let metadata = self
             .read_model_catalogue_part(profile, environment, stop, ModelListPart::Variants, until)
             .await;
         // A missing optional inventory can degrade only after proven cleanup.
         // In particular a cancelled read or unknown family cannot become success.
-        if variants.cleanup != ReaderCleanup::Confirmed
-            || variants
+        if metadata.cleanup != ReaderCleanup::Confirmed
+            || metadata
                 .result
                 .as_ref()
                 .is_err_and(|error| matches!(error.code.as_str(), "unknown" | "cancelled"))
         {
-            return variants;
+            return metadata;
         }
-        if let (Ok(catalogue), Ok(variants)) = (&mut catalogue.result, variants.result) {
-            overlay_model_variants(catalogue, &variants);
+        if let (Ok(catalogue), Ok(metadata)) = (&mut catalogue.result, metadata.result) {
+            overlay_model_metadata(catalogue, &metadata);
         }
         catalogue
     }
@@ -997,20 +997,24 @@ impl PluginHost {
     }
 }
 
-fn overlay_model_variants(catalogue: &mut Value, variants: &Value) {
-    let (Some(models), Some(variants)) = (
+fn overlay_model_metadata(catalogue: &mut Value, metadata: &Value) {
+    let (Some(models), Some(metadata)) = (
         catalogue.get_mut("models").and_then(Value::as_array_mut),
-        variants.get("models").and_then(Value::as_array),
+        metadata.get("models").and_then(Value::as_array),
     ) else {
         return;
     };
     for model in models {
-        if let Some(efforts) = variants
+        let Some(entry) = metadata
             .iter()
             .find(|entry| entry.get("id") == model.get("id"))
-            .and_then(|entry| entry.get("efforts"))
-        {
-            model["efforts"] = efforts.clone();
+        else {
+            continue;
+        };
+        for field in ["efforts", "display_name"] {
+            if let Some(value) = entry.get(field).filter(|value| !value.is_null()) {
+                model[field] = value.clone();
+            }
         }
     }
 }
