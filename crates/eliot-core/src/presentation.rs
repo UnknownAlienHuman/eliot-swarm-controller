@@ -1,4 +1,6 @@
 //! Owner-facing words. Protocol codes remain unchanged for decisions/readback.
+//! Plain words only: no internal terms (generation, harness, observe-only),
+//! and an unknown outcome reads "couldn't be confirmed", never success.
 
 use crate::Error;
 
@@ -13,22 +15,23 @@ pub fn reason_words(code: &str) -> String {
         "queued" => "Waiting to run",
         "dispatched" => "Sent to the Agent",
         "bad_state" => "The Agent is not ready for this action",
-        "stale_generation" => "The Agent started a new run; refresh and try again",
+        "stale_generation" => "The task restarted since then; refresh and try again",
         "unsupported" => "This action is not supported",
-        "unknown" => "The result could not be confirmed",
+        "unknown" => "The result couldn't be confirmed",
         "unavailable" => "This action is unavailable",
         "not_allowed" => "This action is not permitted here",
         "invalid" => "Check the supplied values",
+        "profile_error" => "The settings are not valid",
         "not_found" => "The requested item no longer exists",
         "timeout" => "The request took too long",
         "internal" => "Swarm could not complete the request",
         "frame_too_large" => "The reply is too large to display",
         "history_gap" => "Older activity is no longer available",
         "fanout_limit" => "The manager's Agent limit would be exceeded",
-        "id_conflict" => "This action's receipt belongs to a different request",
-        "daemon_restart" => "Stopped by a Swarm restart",
+        "id_conflict" => "This request was already used for a different action",
+        "daemon_restart" => "Interrupted by a Swarm restart",
         "no_progress" => "No progress for a while",
-        "source_unhealthy" => "Lost contact with its harness",
+        "source_unhealthy" => "Lost contact with its agent app",
         "children_unattended" => "Its subagents are unattended",
         "failure" | "failed" | "agent.failed" => "The Agent could not finish",
         "lost" | "agent.lost" => "Lost contact with the Agent",
@@ -40,6 +43,13 @@ pub fn reason_words(code: &str) -> String {
         _ => return code.replace(['_', '.'], " "),
     };
     words.to_owned()
+}
+
+/// A count with its noun in the right number: "1 turn", "2 turns" (never
+/// "turn(s)").
+pub fn count_words(count: impl Into<u64>, one: &str, many: &str) -> String {
+    let count = count.into();
+    format!("{count} {}", if count == 1 { one } else { many })
 }
 
 pub fn origin_words(origin: &str) -> &'static str {
@@ -85,7 +95,7 @@ impl crate::api::DiagnoseStep {
         if self.kind == "agent" && self.message.is_none() {
             match self.code.as_deref() {
                 Some("busy") => return "Working".to_owned(),
-                Some("unknown") => return "State not confirmed".to_owned(),
+                Some("unknown") => return "State couldn't be confirmed".to_owned(),
                 _ => {}
             }
         }
@@ -138,7 +148,31 @@ mod tests {
             .unwrap();
             let shown = step.user_message();
             assert!(shown.starts_with(words), "{shown}");
-            assert!(shown.contains("Stopped by a Swarm restart"), "{shown}");
+            assert!(shown.contains("Interrupted by a Swarm restart"), "{shown}");
         }
+    }
+
+    #[test]
+    fn owner_words_carry_no_internal_terms_and_unknown_is_never_success() {
+        for code in [
+            "stale_generation",
+            "source_unhealthy",
+            "daemon_restart",
+            "id_conflict",
+            "unknown",
+        ] {
+            let words = reason_words(code).to_lowercase();
+            for term in ["generation", "harness", "observe", "receipt", "daemon"] {
+                assert!(!words.contains(term), "{code}: {words}");
+            }
+        }
+        assert_eq!(reason_words("unknown"), "The result couldn't be confirmed");
+        let step: crate::api::DiagnoseStep =
+            serde_json::from_value(serde_json::json!({"kind": "agent", "code": "unknown"}))
+                .unwrap();
+        assert_eq!(step.user_message(), "State couldn't be confirmed");
+        assert_eq!(count_words(1_u32, "turn", "turns"), "1 turn");
+        assert_eq!(count_words(0_u32, "turn", "turns"), "0 turns");
+        assert_eq!(count_words(12_u64, "item", "items"), "12 items");
     }
 }

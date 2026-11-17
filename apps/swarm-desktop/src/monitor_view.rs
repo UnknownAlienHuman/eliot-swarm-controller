@@ -7,8 +7,8 @@
 use windows_reactor::*;
 
 use crate::monitor::{
-    self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, bytes_label, cpu_time_label, state_words,
-    tokens_label,
+    self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, bytes_label, cpu_time_label, group,
+    state_words, tokens_label,
 };
 use crate::theme;
 use crate::theme::winui::Palette;
@@ -45,18 +45,15 @@ pub struct CardActions {
 pub fn card(
     row: &MonitorRow,
     title: &str,
-    nested: bool,
+    parent: Option<&str>,
     note: Option<&CardNote>,
     actions: CardActions,
     palette: Palette,
 ) -> View {
     let status = row.status_words();
     // A nested child sits under its parent's card already; a top-level one
-    // whose parent is not shown names it.
-    let under = row
-        .parent
-        .as_deref()
-        .filter(|_| !nested)
+    // whose parent is not shown names that task (`parent`: its title).
+    let under = parent
         .map(|parent| format!(" · under {parent}"))
         .unwrap_or_default();
     let (note_line, note_name): (View, String) = match note {
@@ -314,16 +311,18 @@ pub fn identity_lines(read: &DetailRead) -> Vec<String> {
     }
     if agent.observe_only {
         lines.push(format!(
-            "Watched only: {harness} runs it; Swarm cannot steer or stop it."
+            "{harness} runs this one itself: Swarm shows it but cannot steer or stop it."
         ));
     }
     if agent.active_turn.is_some() {
         lines.push("Working on a turn".to_owned());
     }
-    if !agent.pending.is_empty() {
-        lines.push(format!("{} request(s) wait for you", agent.pending.len()));
+    match agent.pending.len() {
+        0 => {}
+        1 => lines.push("1 request waits for you".to_owned()),
+        many => lines.push(format!("{many} requests wait for you")),
     }
-    lines.push(format!("ID {} · run {}", agent.id, agent.generation));
+    lines.push(format!("ID {}", agent.id));
     lines
 }
 
@@ -342,8 +341,8 @@ pub fn observe_lines(read: &DetailRead) -> Vec<String> {
             .map(|category| format!(", latest {}", category.replace('_', " ")))
             .unwrap_or_default();
         lines.push(format!(
-            "Heavy work: {} episode(s){what}, {:.1} s of CPU",
-            heavy.episodes,
+            "Heavy work: {}{what}, {:.1} s of CPU",
+            eliot_core::count_words(heavy.episodes, "episode", "episodes"),
             heavy.total_cpu_ms as f64 / 1000.0
         ));
     }
@@ -379,9 +378,9 @@ pub fn usage_lines(read: &DetailRead) -> Vec<String> {
                 lines.push("No token usage reported yet.".to_owned());
             } else {
                 lines.push(format!(
-                    "{} tokens over {} turn(s)",
+                    "{} tokens over {}",
                     group(total),
-                    turns.turns_counted
+                    eliot_core::count_words(turns.turns_counted as u64, "turn", "turns")
                 ));
                 if input > 0 || output > 0 {
                     lines.push(format!("{} in · {} out", group(input), group(output)));
@@ -389,8 +388,8 @@ pub fn usage_lines(read: &DetailRead) -> Vec<String> {
             }
             if turns.turns_without_usage > 0 {
                 lines.push(format!(
-                    "{} turn(s) reported no usage",
-                    turns.turns_without_usage
+                    "{} reported no usage",
+                    eliot_core::count_words(turns.turns_without_usage as u64, "turn", "turns")
                 ));
             }
             if turns.turns_running_excluded > 0 {
@@ -406,19 +405,6 @@ pub fn usage_lines(read: &DetailRead) -> Vec<String> {
         Err(_) => lines.push("Usage not reported for this Agent.".to_owned()),
     }
     lines
-}
-
-/// `1234567` as `1,234,567`.
-fn group(value: i64) -> String {
-    let digits = value.abs().to_string();
-    let mut out = String::new();
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-    if value < 0 { format!("-{out}") } else { out }
 }
 
 /// The CPU and memory charts of `id`, with the sampling note.
@@ -456,7 +442,7 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
                         ""
                     }
                 ),
-                None => "rate unknown for the latest interval".to_owned(),
+                None => "no rate measured for the latest interval yet".to_owned(),
             };
             views.push(KeyedView::new(
                 "cpu",
@@ -492,8 +478,8 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
             views.push(KeyedView::new(
                 "series",
                 small(format!(
-                    "{} sample(s) kept while this panel is open (capped at {}).",
-                    series.points().len(),
+                    "{} kept while this panel is open (at most {}).",
+                    eliot_core::count_words(series.points().len() as u64, "sample", "samples"),
                     monitor::RING_CAPACITY
                 ))
                 .opacity(theme::MUTED_OPACITY),

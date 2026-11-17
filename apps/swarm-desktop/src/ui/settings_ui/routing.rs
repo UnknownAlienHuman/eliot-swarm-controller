@@ -6,7 +6,6 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let busy = self.settings.busy();
         let mut groups: Vec<KeyedView> = vec![KeyedView::new(
             "intro",
             m3::secondary(
@@ -55,21 +54,20 @@ impl DesktopApp {
                     .orientation(Orientation::Horizontal)
                     .children((
                         m3::icon_button(palette)
-                            .is_enabled(!busy && !first)
+                            .is_enabled(!first)
                             .automation_name(format!("Move {name} earlier in {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingMoved(role.clone(), index, true),
                             )))
                             .content(m3::icon(m3::glyph::ARROW_UP)),
                         m3::icon_button(palette)
-                            .is_enabled(!busy && !last)
+                            .is_enabled(!last)
                             .automation_name(format!("Move {name} later in {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingMoved(role.clone(), index, false),
                             )))
                             .content(m3::icon(m3::glyph::ARROW_DOWN)),
                         m3::icon_button(palette)
-                            .is_enabled(!busy)
                             .automation_name(format!("Remove {name} from {role}"))
                             .on_click(context.message(Message::Settings(
                                 SettingsMsg::RoutingRemoved(role.clone(), index),
@@ -95,7 +93,6 @@ impl DesktopApp {
                                 .items_source(addable)
                                 .selected_index(None)
                                 .placeholder_text("Add a profile")
-                                .is_enabled(!busy)
                                 .automation_name(format!("Add a profile to {role}"))
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .on_selection_changed(context.callback(move |index| {
@@ -133,7 +130,7 @@ impl DesktopApp {
                             .into(),
                         Some(
                             m3::outlined(palette)
-                                .is_enabled(!busy && !self.settings.new_role.trim().is_empty())
+                                .is_enabled(!self.settings.new_role.trim().is_empty())
                                 .automation_name("Add role")
                                 .on_click(
                                     context.message(Message::Settings(SettingsMsg::RoleAdded)),
@@ -143,11 +140,6 @@ impl DesktopApp {
                     ),
                 )],
             ),
-        ));
-        let dirty = self.settings.dirty(Page::Routing);
-        groups.push(KeyedView::new(
-            "save",
-            self.save_bar(Page::Routing, dirty, context, palette),
         ));
         StackPanel::new()
             .spacing(tokens::spacing::MD)

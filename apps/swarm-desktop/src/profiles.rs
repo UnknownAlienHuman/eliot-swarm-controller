@@ -11,7 +11,7 @@
 
 /// The first choice of an enumerated field: the key is left out, so the
 /// harness default applies.
-pub const DEFAULT_CHOICE: &str = "Harness default";
+pub const DEFAULT_CHOICE: &str = "Default";
 
 /// One enumerated form field of a profile: its key, label and the values
 /// the profile's harness accepts.

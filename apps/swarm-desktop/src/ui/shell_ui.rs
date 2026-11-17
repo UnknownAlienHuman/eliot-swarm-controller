@@ -97,6 +97,11 @@ pub(super) enum ShellMsg {
     AlertDismissed,
     /// Re-read the listed Agents (states, Recents order).
     ListTick,
+    /// Hide the sidebar to a rail of icons, or show it again.
+    SidebarToggled,
+    /// Unregistered task folders and the Git common directory each one is
+    /// a worktree of (None: not a Git worktree or not readable).
+    WorktreesResolved(Vec<(String, String, Option<String>)>),
 }
 
 /// Reactor 0.100.0 reports the window's Light/Dark scheme only, and a High
@@ -107,6 +112,11 @@ const HIGH_CONTRAST_POLL_MS: u64 = 2_000;
 const PRIME_RETRY_MS: u64 = 16;
 /// The sidebar's padding around its rows.
 const SIDEBAR_PADDING: f64 = tokens::spacing::SM;
+/// The hidden sidebar: a rail of icon buttons, one control wide.
+const RAIL_WIDTH: f64 = tokens::height::CONTROL + 2.0 * SIDEBAR_PADDING;
+/// Segoe Fluent Icons ClosePane and OpenPane: hide and show the sidebar.
+const GLYPH_HIDE_SIDEBAR: &str = "\u{E89F}";
+const GLYPH_SHOW_SIDEBAR: &str = "\u{E8A0}";
 /// Rows in Recents.
 const RECENTS: usize = 8;
 /// Focus attempts for Ctrl+K, and the wait between them: right after a
@@ -179,6 +189,15 @@ pub(super) struct ShellState {
     pub(super) search_ref: ElementRef<AutoSuggestBox>,
     /// Ctrl+N and Ctrl+K from the window's keyboard hook.
     pub(super) shortcuts: Option<Arc<Mutex<Receiver<Shortcut>>>>,
+    /// The sidebar is hidden to its rail (this session).
+    pub(super) sidebar_collapsed: bool,
+    /// Task folders no registered checkout holds, by [`nav::path_key`]:
+    /// the folder as listed and the Git common directory it is a worktree
+    /// of, if any. A worktree of a registered repository lists under that
+    /// project with its folder as a quiet tag (`wt-k111`), not as a
+    /// project of its own.
+    pub(super) worktree_repos: std::collections::BTreeMap<String, (String, Option<String>)>,
+    pub(super) worktrees_resolving: bool,
 }
 
 /// The sidebar search: what the box shows, what was typed and the
@@ -281,6 +300,7 @@ impl DesktopApp {
                         // A new task starts in the first project until one is picked.
                         self.pick_project(&first.workspace);
                     }
+                    self.resolve_worktrees(context);
                 }
                 Err(error) => self.alert(format!("Projects not read: {error}")),
             },
@@ -323,6 +343,7 @@ impl DesktopApp {
                         }
                         self.open_startup_conversation(context);
                         self.refresh_search();
+                        self.resolve_worktrees(context);
                     }
                     Err(error) => {
                         // A daemon without the archived filter: the toggle
@@ -333,6 +354,16 @@ impl DesktopApp {
                         self.alert(format!("Agents not read: {error}"));
                     }
                 }
+            }
+            ShellMsg::SidebarToggled => self.nav.sidebar_collapsed = !self.nav.sidebar_collapsed,
+            ShellMsg::WorktreesResolved(found) => {
+                self.nav.worktrees_resolving = false;
+                for (key, folder, common) in found {
+                    self.nav.worktree_repos.insert(key, (folder, common));
+                }
+                self.refresh_search();
+                // Folders listed while this read ran.
+                self.resolve_worktrees(context);
             }
             ShellMsg::AgentOpened(agent) => {
                 self.close_popover();
@@ -476,10 +507,9 @@ impl DesktopApp {
                 // A choice made on the page reports there; window-size
                 // and composer writes stay quiet.
                 if self.main == Main::Settings || result.is_err() {
-                    self.settings.notes.insert(
-                        self.settings_page,
-                        crate::settings_model::save_note(false, &result),
-                    );
+                    self.settings
+                        .notes
+                        .insert(self.settings_page, settings_ui::Note::of(false, &result));
                 }
                 // A newer change arrived while this one was written.
                 if saved != self.prefs || window != self.window_size {
@@ -487,6 +517,9 @@ impl DesktopApp {
                 } else if self.settings.loaded && result.is_ok() {
                     // The revision moved: the page's drafts save against it.
                     self.load_settings(context);
+                } else {
+                    // Page saves that waited for this write go now.
+                    self.drain_saves(context);
                 }
             }
             ShellMsg::ProjectToggled(key) => {
@@ -720,7 +753,7 @@ impl DesktopApp {
         if self.prefs.startup != Startup::LastConversation || self.chat.convo.is_some() {
             return;
         }
-        if let Some(agent) = nav::recents(&self.nav.agents, 1, &HashSet::new())
+        if let Some(agent) = nav::recents(&self.nav.agents, 1, &|_| true)
             .first()
             .cloned()
             .cloned()
@@ -731,15 +764,84 @@ impl DesktopApp {
     }
 
     /// The registered checkouts with their repositories, for grouping.
+    /// Every registered checkout, then each unregistered task folder that
+    /// is a Git worktree of a registered repository (it lists under that
+    /// repository's project, tagged with its folder).
     pub(super) fn checkouts(&self) -> Vec<Checkout> {
-        self.nav
+        let mut checkouts: Vec<Checkout> = self
+            .nav
             .projects
             .iter()
             .map(|project| Checkout {
                 path: project.workspace.clone(),
                 common_dir: project.common_dir.clone(),
             })
-            .collect()
+            .collect();
+        let repositories: HashSet<String> = checkouts
+            .iter()
+            .map(|checkout| nav::path_key(&checkout.common_dir))
+            .collect();
+        let registered: HashSet<String> = checkouts
+            .iter()
+            .map(|checkout| nav::path_key(&checkout.path))
+            .collect();
+        for (key, (folder, common)) in &self.nav.worktree_repos {
+            if let Some(common) = common
+                && repositories.contains(&nav::path_key(common))
+                && !registered.contains(key)
+            {
+                checkouts.push(Checkout {
+                    path: folder.clone(),
+                    common_dir: common.clone(),
+                });
+            }
+        }
+        checkouts
+    }
+
+    /// Read, once per folder, which Git repository each unregistered task
+    /// folder is a worktree of (a file read in the background; see
+    /// [`worktree_common_dir`]).
+    fn resolve_worktrees(&mut self, context: &ComponentContext<Self>) {
+        if self.nav.worktrees_resolving {
+            return;
+        }
+        let registered: Vec<Checkout> = self
+            .nav
+            .projects
+            .iter()
+            .map(|project| Checkout {
+                path: project.workspace.clone(),
+                common_dir: project.common_dir.clone(),
+            })
+            .collect();
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        for agent in &self.nav.agents {
+            let key = nav::path_key(&agent.project);
+            if agent.chat
+                || agent.project.trim().is_empty()
+                || self.nav.worktree_repos.contains_key(&key)
+                || wanted.iter().any(|(known, _)| *known == key)
+                || nav::is_registered(&agent.project, &registered)
+            {
+                continue;
+            }
+            wanted.push((key, agent.project.clone()));
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        self.nav.worktrees_resolving = true;
+        let _task = context.spawn_background(move |_| {
+            let found = wanted
+                .into_iter()
+                .map(|(key, folder)| {
+                    let common = worktree_common_dir(nav::display_path(&folder));
+                    (key, folder, common)
+                })
+                .collect();
+            Message::Shell(ShellMsg::WorktreesResolved(found))
+        });
     }
 
     /// The listed or fetched Agent with this id.
@@ -785,6 +887,8 @@ impl DesktopApp {
             self.main = Main::Conversation;
             self.reprime_fields(context);
         }
+        // The search box lives in the full sidebar.
+        self.nav.sidebar_collapsed = false;
         let Some(left) = tries.checked_sub(1) else {
             return;
         };
@@ -1068,8 +1172,15 @@ impl DesktopApp {
             Main::Conversation => self.chat_view(context, palette),
             Main::Settings => self.settings_view(context, palette),
         };
+        // Settings always shows its navigation; tasks may hide the sidebar
+        // to its rail.
+        let rail = self.nav.sidebar_collapsed && self.main != Main::Settings && !self.startup_error;
         let mut columns = vec![
-            GridLength::Pixel(tokens::layout::SIDEBAR_WIDTH),
+            GridLength::Pixel(if rail {
+                RAIL_WIDTH
+            } else {
+                tokens::layout::SIDEBAR_WIDTH
+            }),
             GridLength::STAR,
         ];
         let panel: View = if !self.panel_shown() {
@@ -1084,6 +1195,7 @@ impl DesktopApp {
         // Settings replaces the sidebar with its own navigation.
         let side: View = match self.main {
             Main::Settings if !self.startup_error => self.settings_nav(context, palette),
+            _ if rail => self.rail_view(context, palette),
             _ => self.sidebar_view(context, palette),
         };
         let columns_grid = Grid::new()
@@ -1122,15 +1234,22 @@ impl DesktopApp {
     /// and Settings at the bottom. Section labels are secondary text.
     fn sidebar_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let pad = SIDEBAR_PADDING;
-        let header = m3::section_title("Eliot Swarm")
-            .height(tokens::height::CONTROL)
-            .margin(Thickness::new(
-                pad + tokens::spacing::INSET,
-                tokens::spacing::SM,
-                pad,
-                0.0,
-            ))
-            .vertical_alignment(VerticalAlignment::Center);
+        // The app name, and the button that hides the sidebar to its rail.
+        let header = Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .margin(Thickness::new(pad, tokens::spacing::SM, pad, 0.0))
+            .children((
+                m3::section_title("Eliot Swarm")
+                    .height(tokens::height::CONTROL)
+                    .margin(Thickness::new(tokens::spacing::INSET, 0.0, 0.0, 0.0))
+                    .vertical_alignment(VerticalAlignment::Center),
+                m3::icon_button(palette)
+                    .grid_column(1)
+                    .height(tokens::height::CONTROL)
+                    .automation_name("Hide sidebar")
+                    .on_click(context.message(Message::Shell(ShellMsg::SidebarToggled)))
+                    .content(m3::icon(GLYPH_HIDE_SIDEBAR)),
+            ));
         let search = AutoSuggestBox::new()
             .element_ref(&self.nav.search_ref)
             .placeholder_text("Search tasks (Ctrl+K)")
@@ -1378,26 +1497,14 @@ impl DesktopApp {
                 }
             }
         }
-        // Recents lists only what the list above does not show now (a
-        // collapsed project's tasks, older ones folded away).
-        let mut listed: HashSet<&str> = sections
+        // Recents: the newest tasks of collapsed projects, one per title;
+        // never what the list shows or folds under "Show N older".
+        let collapsed: HashSet<&str> = sections
             .iter()
-            .filter(|section| !section.collapsed)
-            .flat_map(|section| section.rows.iter().map(|row| row.agent.id.as_str()))
+            .filter(|section| section.collapsed)
+            .map(|section| section.key.as_str())
             .collect();
-        for chat in nav::chats(&self.nav.agents) {
-            listed.insert(chat.id.as_str());
-            if self.nav.expanded.contains(&chat.id) {
-                listed.extend(
-                    self.nav
-                        .agents
-                        .iter()
-                        .filter(|child| child.parent.as_deref() == Some(chat.id.as_str()))
-                        .map(|child| child.id.as_str()),
-                );
-            }
-        }
-        let recents = nav::recents(&self.nav.agents, RECENTS, &listed);
+        let recents = nav::sidebar_recents(&self.nav.agents, &checkouts, &collapsed, RECENTS);
         if !filtered && !recents.is_empty() {
             items.push(KeyedView::new("recents-caption", section_label("Recents")));
             for agent in recents {
@@ -1577,7 +1684,10 @@ impl DesktopApp {
             } else {
                 (
                     m3::glyph::CHEVRON_RIGHT,
-                    format!("Show {} worker(s) of {title}", row.children),
+                    format!(
+                        "Show {} of {title}",
+                        eliot_core::count_words(row.children as u64, "worker", "workers")
+                    ),
                 )
             };
             m3::icon_button(palette)
@@ -1632,12 +1742,15 @@ impl DesktopApp {
                     .content(m3::row_content(
                         None,
                         title,
-                        if agent.archived {
-                            "archived"
-                        } else {
-                            row.place.as_deref().unwrap_or("")
-                        },
-                        task_dot(palette, agent),
+                        "",
+                        row_tag(
+                            if agent.archived {
+                                "archived"
+                            } else {
+                                row.place.as_deref().unwrap_or("")
+                            },
+                            task_dot(palette, agent),
+                        ),
                     )),
                 note,
             ))
@@ -1698,10 +1811,12 @@ impl DesktopApp {
             .content(m3::row_content(None, &label, "", task_dot(palette, agent)))
     }
 
-    /// The fleet in one calm row ("6 running", "All quiet · 40 Agents");
-    /// it opens the monitor.
+    /// The fleet in one calm row that is never cut off ("2 working · 1
+    /// needs attention", "All quiet"); it opens the monitor, and its name
+    /// carries every count.
     fn fleet_row(&self, fleet: Fleet, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let summary = fleet.summary(self.nav.agents_total, self.nav.archived);
+        let line = fleet.compact(self.nav.agents_total, self.nav.archived);
         // One row: it opens the Monitor, whose filter lists only the
         // Agents that need attention; the dot says the most urgent tone.
         let tone = if fleet.attention > 0 {
@@ -1721,7 +1836,81 @@ impl DesktopApp {
                 if open { "open" } else { "closed" }
             ))
             .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Monitor))))
-            .content(m3::row_content(Some(m3::glyph::PULSE), &summary, "", dot))
+            .content(m3::row_content(Some(m3::glyph::PULSE), &line, "", dot))
+    }
+
+    /// The hidden sidebar's rail: show the sidebar, New task, then at the
+    /// bottom the Monitor (with the fleet's most urgent dot) and Settings.
+    fn rail_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let pad = SIDEBAR_PADDING;
+        let fleet = Fleet::of(&self.nav.agents);
+        let summary = fleet.summary(self.nav.agents_total, self.nav.archived);
+        let tone = if fleet.attention > 0 {
+            Some(StatusTone::Attention)
+        } else if fleet.running > 0 {
+            Some(StatusTone::Active)
+        } else {
+            None
+        };
+        // The dot sits on the button's corner, clear of the icon.
+        let dot: View = tone
+            .and_then(|tone| palette.dot(tone))
+            .map_or_else(View::empty, |fill| {
+                Border::new()
+                    .horizontal_alignment(HorizontalAlignment::Right)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .margin(Thickness::new(0.0, 2.0, 2.0, 0.0))
+                    .content(m3::dot(fill))
+            });
+        let button = |glyph: &str, name: String, message: Message| {
+            m3::icon_button(palette)
+                .height(tokens::height::CONTROL)
+                .automation_name(name)
+                .on_click(context.message(message))
+                .content(m3::icon(glyph))
+        };
+        let top = StackPanel::new()
+            .margin(Thickness::new(pad, tokens::spacing::SM, pad, 0.0))
+            .spacing(tokens::spacing::XS)
+            .children((
+                button(
+                    GLYPH_SHOW_SIDEBAR,
+                    "Show sidebar".to_owned(),
+                    Message::Shell(ShellMsg::SidebarToggled),
+                ),
+                button(
+                    m3::glyph::NEW_TASK,
+                    "New task (Ctrl+N)".to_owned(),
+                    Message::Shell(ShellMsg::NewTask),
+                ),
+            ));
+        let open = self.panel == Panel::Monitor;
+        let bottom = StackPanel::new()
+            .grid_row(1)
+            .vertical_alignment(VerticalAlignment::Bottom)
+            .margin(Thickness::new(pad, 0.0, pad, pad))
+            .spacing(tokens::spacing::XS)
+            .children((
+                Grid::new().children((
+                    button(
+                        m3::glyph::PULSE,
+                        format!(
+                            "Monitor: {summary} ({})",
+                            if open { "open" } else { "closed" }
+                        ),
+                        Message::Shell(ShellMsg::PanelToggled(Panel::Monitor)),
+                    ),
+                    dot,
+                )),
+                button(
+                    m3::glyph::SETTINGS,
+                    "Settings".to_owned(),
+                    Message::Shell(ShellMsg::SettingsOpened),
+                ),
+            ));
+        Grid::new()
+            .rows([GridLength::Auto, GridLength::STAR])
+            .children((top, bottom))
     }
 
     /// Settings in the sidebar's place (the Codex settings navigation): a
@@ -1833,6 +2022,27 @@ fn quiet_row(text: &str, indent: f64) -> View {
         .into()
 }
 
+/// A task row's quiet tag (its worktree folder, "archived") before its
+/// dot. It sits in the row's trailing cell so the title keeps the free
+/// width and trims with an ellipsis; a note column after an auto-sized
+/// title got no width at all and the tag never showed.
+fn row_tag(tag: &str, dot: View) -> View {
+    if tag.is_empty() {
+        return dot;
+    }
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(tokens::spacing::SM)
+        .vertical_alignment(VerticalAlignment::Center)
+        .children((
+            m3::secondary(tag.to_owned())
+                .max_width(tokens::layout::TREE_INDENT * 4.0)
+                .text_trimming(TextTrimming::CharacterEllipsis)
+                .vertical_alignment(VerticalAlignment::Center),
+            dot,
+        ))
+}
+
 /// A task's state dot, only while it runs or needs attention: a calm
 /// list carries no marks.
 fn task_dot(palette: Palette, agent: &UiAgent) -> View {
@@ -1851,4 +2061,27 @@ fn today_start_ms() -> i64 {
         .and_hms_opt(0, 0, 0)
         .and_then(|midnight| Local.from_local_datetime(&midnight).earliest())
         .map_or(0, |start| start.timestamp_millis())
+}
+
+/// The Git common directory a folder is a linked worktree of, from Git's
+/// own layout (git-worktree(1)): the folder's `.git` file names its
+/// administrative directory (`gitdir: <repo>/.git/worktrees/<name>`), whose
+/// `commondir` file names the repository's `.git` (relative to it). A main
+/// checkout (a `.git` directory) is its own common directory. `None` when
+/// the folder is not a Git checkout or cannot be read; the path is
+/// canonical so it compares with the daemon's.
+fn worktree_common_dir(folder: &str) -> Option<String> {
+    let folder = std::path::Path::new(folder);
+    let dot_git = folder.join(".git");
+    let common = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let link = std::fs::read_to_string(&dot_git).ok()?;
+        let admin = folder.join(link.trim().strip_prefix("gitdir:")?.trim());
+        let common = std::fs::read_to_string(admin.join("commondir")).ok()?;
+        admin.join(common.trim())
+    };
+    std::fs::canonicalize(common)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
 }

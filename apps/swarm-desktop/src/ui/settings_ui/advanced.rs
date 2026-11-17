@@ -82,8 +82,12 @@ impl DesktopApp {
                             m3::form_row(
                                 "History",
                                 m3::body(format!(
-                                    "{} recent change(s): who changed which section, and when.",
-                                    self.settings.history.len()
+                                    "{}: who changed which section, and when.",
+                                    eliot_core::count_words(
+                                        self.settings.history.len() as u64,
+                                        "recent change",
+                                        "recent changes"
+                                    )
                                 ))
                                 .text_trimming(TextTrimming::CharacterEllipsis)
                                 .into(),

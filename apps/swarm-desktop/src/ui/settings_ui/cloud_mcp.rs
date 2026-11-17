@@ -2,13 +2,11 @@ use super::*;
 
 impl DesktopApp {
     pub(super) fn cloud_section(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let busy = self.settings.busy();
         let enabled = model::cloud_enabled(&self.settings.cloud);
         let switch = Grid::new().keyed_children(vec![KeyedView::new(
             format!("cloud:{enabled}"),
             CheckBox::new()
                 .is_checked(enabled)
-                .is_enabled(!busy)
                 .automation_name("Cloud MCP configured")
                 .on_is_checked_changed(
                     context.callback(|on: bool| Message::Settings(SettingsMsg::CloudEnabled(on))),
@@ -37,7 +35,6 @@ impl DesktopApp {
                                 m3::field()
                                     .text(model::cloud_field(&self.settings.cloud, key))
                                     .automation_name(*label)
-                                    .is_enabled(!busy)
                                     .on_text_changed(context.callback(move |text| {
                                         Message::Settings(SettingsMsg::CloudField(index, text))
                                     }))
@@ -48,10 +45,6 @@ impl DesktopApp {
                     }),
             );
         }
-        let dirty = self.settings.dirty(Page::CloudMcp);
-        StackPanel::new().spacing(tokens::spacing::MD).children((
-            m3::group(palette, rows),
-            self.save_bar(Page::CloudMcp, dirty, context, palette),
-        ))
+        m3::group(palette, rows)
     }
 }

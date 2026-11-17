@@ -581,7 +581,7 @@ impl Component for DesktopApp {
             in_flight_key: None,
             main: Main::Conversation,
             panel: Panel::Closed,
-            settings_page: Page::Appearance,
+            settings_page: Page::General,
             configure: configure_ui::ConfigureState::default(),
             editor: profiles_ui::ProfilesEditor::default(),
             settings: settings_ui::SettingsState::default(),
@@ -607,6 +607,9 @@ impl Component for DesktopApp {
                 search: shell_ui::Search::default(),
                 search_ref: ElementRef::new(),
                 shortcuts: None,
+                sidebar_collapsed: false,
+                worktree_repos: Default::default(),
+                worktrees_resolving: false,
             },
             launch: launch_ui::LaunchState {
                 workspace: input.workspace.to_string_lossy().into_owned(),

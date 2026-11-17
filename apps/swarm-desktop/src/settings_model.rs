@@ -478,7 +478,7 @@ pub fn save_note(
             String::new()
         } else {
             format!(
-                " Restart the daemon to apply {}.",
+                " Restart Swarm to apply {}.",
                 sections
                     .iter()
                     .map(|section| section_label(*section))
@@ -494,19 +494,21 @@ pub fn save_note(
         ),
         // Revisions and history numbers stay in Advanced (no hashes in the
         // main pages).
-        Ok(reply) if reply.saved => format!(
-            "Saved. The change is in Advanced › History.{}",
-            restart(&reply.restart_required)
-        ),
+        Ok(reply) if reply.saved => format!("Saved.{}", restart(&reply.restart_required)),
         Ok(_) => "No change to save.".to_owned(),
+        // The next read decides: the change goes again on the new revision
+        // only if the sections it edits are unchanged there (see
+        // `SettingsState::take`).
         Err(error) if error.code == "conflict" => {
-            "Not saved: the settings changed elsewhere. Your draft is kept; Reload to see the current values.".to_owned()
+            "Not saved yet: the settings changed elsewhere. Your change is kept and checked against them.".to_owned()
         }
+        // Never "Saved": the read that follows shows whether it landed.
         Err(error) if crate::state::uncertain(error) => format!(
-            "Outcome unknown; Reload and check Advanced › History before saving again. ({error})"
+            "The save couldn't be confirmed ({}). The page shows the saved values once they are read again.",
+            error.user_message()
         ),
-        Err(error) if dry_run => format!("Invalid: {error}"),
-        Err(error) => format!("Not saved: {error}"),
+        Err(error) if dry_run => format!("Invalid: {}", error.user_message()),
+        Err(error) => format!("Not saved: {}", error.user_message()),
     }
 }
 
@@ -821,12 +823,15 @@ mod tests {
         };
         assert_eq!(
             save_note(false, &Ok(saved)),
-            "Saved. The change is in Advanced › History. Restart the daemon to apply Cloud MCP."
+            "Saved. Restart Swarm to apply Cloud MCP."
         );
         assert!(
             save_note(false, &Err(eliot_core::Error::new("conflict", "stale")))
-                .contains("draft is kept")
+                .contains("change is kept")
         );
+        let unknown = save_note(false, &Err(eliot_core::Error::new("unknown", "timed out")));
+        assert!(unknown.contains("couldn't be confirmed"), "{unknown}");
+        assert!(!unknown.contains("Saved"), "{unknown}");
         assert!(
             save_note(true, &Err(eliot_core::Error::new("profile_error", "bad")))
                 .starts_with("Invalid")

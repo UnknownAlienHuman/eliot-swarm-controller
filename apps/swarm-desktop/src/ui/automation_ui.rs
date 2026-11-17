@@ -42,7 +42,10 @@ impl DesktopApp {
                     .iter()
                     .map(|namespace| namespace.rules.as_ref().map_or(0, Vec::len))
                     .sum();
-                self.automation.status = format!("{count} rule(s) and timer(s) read.");
+                self.automation.status = format!(
+                    "{} read.",
+                    eliot_core::count_words(count as u64, "rule or timer", "rules and timers")
+                );
             }
             AutomationMsg::AutomationRefreshRequested => self.load_rules(context),
         }

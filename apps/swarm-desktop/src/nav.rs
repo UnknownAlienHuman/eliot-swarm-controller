@@ -280,6 +280,11 @@ fn checkout_of<'a>(label: &str, checkouts: &'a [Checkout]) -> Option<&'a Checkou
         .max_by_key(|checkout| path_key(&checkout.path).len())
 }
 
+/// Whether a registered checkout holds `label` (an Agent's workspace).
+pub fn is_registered(label: &str, checkouts: &[Checkout]) -> bool {
+    checkout_of(label, checkouts).is_some()
+}
+
 /// A worktree folder as a task row names it: without its repository's
 /// name in front (`atlas-wt-tiles` in `atlas` reads `wt-tiles`).
 fn place_name(folder: &str, repository: &str) -> String {
@@ -291,8 +296,9 @@ fn place_name(folder: &str, repository: &str) -> String {
         .to_owned()
 }
 
-/// The project key of a label: its repository's, or its own folder's.
-fn project_key(label: &str, checkouts: &[Checkout]) -> String {
+/// The project key of a label (a sidebar section's key): its
+/// repository's, or its own folder's.
+pub fn project_key(label: &str, checkouts: &[Checkout]) -> String {
     match checkout_of(label, checkouts) {
         Some(checkout) => format!("repo:{}", path_key(&checkout.common_dir)),
         None => format!("folder:{}", path_key(label)),
@@ -570,26 +576,44 @@ pub fn search(listed: &[UiAgent], checkouts: &[Checkout], query: &str) -> Vec<(S
         .collect()
 }
 
-/// The most recently changed tasks the sidebar does not list elsewhere
-/// (`listed`), newest first (ties by id), at most `limit`: top-level tasks
-/// only, never a worker or a native subagent (each lives under its
-/// parent), and nothing archived.
+/// The most recently changed tasks `keep` admits, newest first (ties by
+/// id), at most `limit`: top-level tasks only, never a worker or a native
+/// subagent (each lives under its parent), nothing archived, and one row
+/// per title (a prompt run again and again shows its newest run once).
 pub fn recents<'a>(
     agents: &'a [UiAgent],
     limit: usize,
-    listed: &HashSet<&str>,
+    keep: &dyn Fn(&UiAgent) -> bool,
 ) -> Vec<&'a UiAgent> {
     let mut recent: Vec<&UiAgent> = agents
         .iter()
-        .filter(|agent| agent.parent.is_none() && !agent.archived)
-        .filter(|agent| !listed.contains(agent.id.as_str()))
+        .filter(|agent| agent.parent.is_none() && !agent.archived && keep(agent))
         .collect();
     recent.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
-    // An id read on two pages shows once, at its newest time.
+    // An id read on two pages shows once, at its newest time; so does a
+    // repeated title.
     let mut seen = HashSet::new();
-    recent.retain(|agent| seen.insert(agent.id.as_str()));
+    let mut titles = HashSet::new();
+    recent.retain(|agent| {
+        seen.insert(agent.id.as_str()) && titles.insert(agent.title.trim().to_lowercase())
+    });
     recent.truncate(limit);
     recent
+}
+
+/// The sidebar's Recents: the newest tasks of collapsed projects (section
+/// keys in `collapsed`), the ones the list above hides. Tasks folded under
+/// "Show N older" stay there, and chats stay under Chats, so Recents never
+/// repeats the list or brings back old runs.
+pub fn sidebar_recents<'a>(
+    agents: &'a [UiAgent],
+    checkouts: &[Checkout],
+    collapsed: &HashSet<&str>,
+    limit: usize,
+) -> Vec<&'a UiAgent> {
+    recents(agents, limit, &|agent: &UiAgent| {
+        !agent.chat && collapsed.contains(project_key(&agent.project, checkouts).as_str())
+    })
 }
 
 /// The chats without a project (`chat: true`), newest first; a chat's own
@@ -662,14 +686,40 @@ impl Fleet {
     /// (k98: "No Agents yet" while one was live). "All quiet" when nothing
     /// is live; "No Agents yet" when there is none at all.
     pub fn summary(&self, total: usize, archived: Archived) -> String {
-        let working = self.running + archived.running;
-        // An archived live Agent that is not running is idle (archive
-        // accepts only idle or ended trees).
-        let idle = self.idle + archived.live.saturating_sub(archived.running);
+        let (working, idle) = self.live(archived);
         if total == 0 && archived.total == 0 {
             return "No Agents yet".to_owned();
         }
         crate::monitor::live_words(working, self.attention, idle)
+    }
+
+    /// The sidebar's fleet line, short enough never to be cut off: at most
+    /// two counts, the most urgent first ("2 working · 1 needs attention",
+    /// "12 idle"); the full [`Self::summary`] is its accessible name and
+    /// the Monitor's line.
+    pub fn compact(&self, total: usize, archived: Archived) -> String {
+        let (working, idle) = self.live(archived);
+        if total == 0 && archived.total == 0 {
+            return "No Agents yet".to_owned();
+        }
+        // Idle is the least urgent: it gives way when both others show.
+        let idle = if working > 0 && self.attention > 0 {
+            0
+        } else {
+            idle
+        };
+        let attention = self.attention;
+        crate::monitor::live_words(working, attention, idle)
+    }
+
+    /// Working and idle, with the live archived Agents (an archived live
+    /// Agent that is not running is idle: archive accepts only idle or
+    /// ended trees).
+    fn live(&self, archived: Archived) -> (usize, usize) {
+        (
+            self.running + archived.running,
+            self.idle + archived.live.saturating_sub(archived.running),
+        )
     }
 }
 
@@ -1336,6 +1386,22 @@ mod tests {
             busy.summary(40, none),
             "2 working · 1 needs attention · 3 idle"
         );
+        // The sidebar line keeps the two most urgent counts.
+        assert_eq!(busy.compact(40, none), "2 working · 1 needs attention");
+        let calm = Fleet {
+            running: 2,
+            attention: 0,
+            idle: 12,
+        };
+        assert_eq!(calm.compact(40, none), "2 working · 12 idle");
+        let waiting = Fleet {
+            running: 0,
+            attention: 3,
+            idle: 12,
+        };
+        assert_eq!(waiting.compact(40, none), "3 need attention · 12 idle");
+        assert_eq!(quiet.compact(0, none), "No Agents yet");
+        assert_eq!(quiet.compact(35, none), "All quiet");
         // Failed and lost need a decision; a native child never counts.
         let fleet = Fleet::of(&[
             with(agent("a3", "/p", None), "lost", 1),
@@ -1360,8 +1426,8 @@ mod tests {
         listed[0].updated_at = 10;
         listed[1].updated_at = 30;
         listed[2].updated_at = 20;
-        let none = HashSet::new();
-        let ids: Vec<&str> = recents(&listed, 2, &none)
+        let all = |_: &UiAgent| true;
+        let ids: Vec<&str> = recents(&listed, 2, &all)
             .into_iter()
             .map(|agent| agent.id.as_str())
             .collect();
@@ -1371,18 +1437,58 @@ mod tests {
             updated_at: 5,
             ..listed[1].clone()
         });
-        let ids: Vec<&str> = recents(&repeated, 9, &none)
+        let ids: Vec<&str> = recents(&repeated, 9, &all)
             .into_iter()
             .map(|agent| agent.id.as_str())
             .collect();
         assert_eq!(ids, ["a2", "a3", "a1"]);
-        // What the sidebar already lists elsewhere stays out of Recents.
-        let shown: HashSet<&str> = ["a2"].into_iter().collect();
-        let ids: Vec<&str> = recents(&repeated, 9, &shown)
+        // A prompt run three times shows once, its newest run.
+        let mut runs = listed.clone();
+        for (index, run) in runs.iter_mut().enumerate() {
+            run.title = if index == 0 {
+                "Fix the build".to_owned()
+            } else {
+                "Reply with exactly OK".to_owned()
+            };
+        }
+        let ids: Vec<&str> = recents(&runs, 9, &all)
             .into_iter()
             .map(|agent| agent.id.as_str())
             .collect();
-        assert_eq!(ids, ["a3", "a1"]);
+        assert_eq!(ids, ["a2", "a1"]);
+    }
+
+    #[test]
+    fn sidebar_recents_hold_only_collapsed_projects_tasks() {
+        let checkouts = [
+            Checkout {
+                path: "C:\\w\\atlas".to_owned(),
+                common_dir: "C:\\w\\atlas\\.git".to_owned(),
+            },
+            Checkout {
+                path: "C:\\w\\atlas-wt-1".to_owned(),
+                common_dir: "C:\\w\\atlas\\.git".to_owned(),
+            },
+        ];
+        let mut listed = vec![
+            with(agent("a1", "C:\\w\\atlas", None), "stopped", 10),
+            with(agent("a2", "C:\\w\\atlas-wt-1", None), "idle", 30),
+            with(agent("a3", "C:\\w\\other", None), "stopped", 20),
+            with(agent("a4", "C:\\chats\\a4", None), "idle", 40),
+        ];
+        listed[3].chat = true;
+        let key = project_key("C:\\w\\atlas", &checkouts);
+        // Nothing collapsed: the list shows every task, Recents is empty
+        // (older tasks stay folded under their project).
+        assert!(sidebar_recents(&listed, &checkouts, &HashSet::new(), 8).is_empty());
+        let collapsed: HashSet<&str> = [key.as_str()].into_iter().collect();
+        let ids: Vec<&str> = sidebar_recents(&listed, &checkouts, &collapsed, 8)
+            .into_iter()
+            .map(|agent| agent.id.as_str())
+            .collect();
+        // Both checkouts of the collapsed repository; the other project
+        // and the chat stay where they are.
+        assert_eq!(ids, ["a2", "a1"]);
     }
 
     #[test]
@@ -1400,7 +1506,7 @@ mod tests {
         let worker = with(agent("a5", "/w", Some("a1")), "idle", 60);
         let far_worker = with(agent("a6", "/w", Some("a9")), "idle", 70);
         let listed = vec![parent, child, orphan, chat, worker, far_worker];
-        let recent: Vec<&str> = recents(&listed, 8, &HashSet::new())
+        let recent: Vec<&str> = recents(&listed, 8, &|_| true)
             .iter()
             .map(|a| a.id.as_str())
             .collect();

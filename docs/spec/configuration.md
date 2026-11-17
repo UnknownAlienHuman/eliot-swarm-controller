@@ -993,12 +993,29 @@ Unselected sections keep their bytes and semantic values. A stale revision is
 `conflict`; invalid or secret-bearing drafts never replace the file. Unsupported
 later-layer fields fail validation. Legacy `config.profiles.*` uses this same writer.
 Every proxy is validated independently, including unused routes. Candidate projects
-resolve to canonical Git identities before both dry-run success and publication.
+resolve to canonical Git identities before both dry-run success and publication; a
+candidate that cannot be resolved, such as a missing folder, is refused as `invalid`,
+never as `unavailable`, because nothing was written.
 Resolved registrations carry their source revision, rechecked under the settings
 writer lock; publication and Store reconciliation hold that lock and the Store writer
 without asynchronous Git work between them. A delayed save cannot restore older
 project authority after a newer settings save.
 An uncertain post-replacement failure is `unknown`; read the revision before retrying.
+
+A stale revision writes nothing. An editor such as the desktop sends only the sections
+the owner edited, and it re-applies a change refused as `conflict` automatically only
+when a fresh read shows every edited section still holding the value the edit started
+from. Then only another writer's other sections moved, and they are kept: the merge
+loses nothing. An edit made while the editor's own save of that section was in flight,
+or of unknown outcome, started from that save's value: the read must hold exactly what
+that save stored, as the store normalizes it. Having saved the section is not enough.
+When an edited section itself changed, the change is never re-applied: the editor
+shows the refusal and the stored values. The same rule applies when a read
+shows that another writer changed a section with an unsaved edit: the edit is dropped
+with the same refusal, so it can never overwrite that writer's value. A definite
+refusal, such as an invalid value, leaves the revision unchanged. A form then shows the
+stored values under the error, and a raw TOML or JSON editor keeps its draft for
+correction.
 
 Every actual save records old/new revisions, changed sections, time and authenticated
 author in bounded Store history. Public callers cannot claim `bootstrap` or another
@@ -1076,8 +1093,8 @@ with `swarm settings save request.json` (add `--dry-run` to validate only):
 ```
 
 Each named section is a complete replacement; leave unmodified sections out of the
-request. The desktop Settings screen uses the same read/save contract and reports
-conflicts without discarding the draft.
+request. The desktop Settings screen uses the same read/save contract and follows the
+stale-revision rule of [unified settings](#unified-settings).
 
 ## Legacy profile-only editing (`config.profiles.*`)
 

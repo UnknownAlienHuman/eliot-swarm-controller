@@ -497,13 +497,19 @@ of the explicitly selected release scope.
       harness, through WinUI's AutoSuggestBox), Automations and Usage,
       collapsible projects with their Agents nested (manager, then workers,
       collapsed), Recents, a fleet line that opens the monitor and says what
-      is live ("2 working · 1 needs attention · 3 idle", "All quiet" when
-      nothing is), a separate "N need attention" row that lists Agents waiting
+      is live in at most two counts, so it is never cut off ("2 working · 1
+      needs attention", "12 idle", "All quiet" when nothing is; every count
+      is its accessible name and the Monitor's line), a separate "N need attention" row that lists Agents waiting
       on a request, failed or lost ones, and controlled Agents in `unknown`
       (observe-only native children never count), and Settings. A project is a repository:
       checkouts registered with the same Git common directory group under the
       repository's name, and a task row names its worktree only where the
-      project spans several. Running tasks stay on top, then newest first;
+      project spans several, as a quiet tag before its dot (the title trims
+      first). A task folder the desktop's project list does not hold yet
+      lists under its repository when its Git worktree link (the `.git` file,
+      then `commondir`) names a registered one. A button in the sidebar's
+      header hides it to a rail (show sidebar, New task, the Monitor with the
+      fleet's dot, Settings) for the session; Settings keeps its navigation. Running tasks stay on top, then newest first;
       stopped tasks last changed before today fold into "Show N older" (a
       project whose tasks are all older keeps its newest three in view); a
       collapsed project shows its running count, and `[desktop]
@@ -539,15 +545,22 @@ of the explicitly selected release scope.
       actions. The Details panel has only a close button. (Refs #407)
 - [x] **D8 Settings and routing in the desktop.** Every Settings page reads and
       writes the unified `settings.read/save` (S1) through `config_client`; the
-      desktop has no other store. Appearance and Startup write `[desktop]`
-      theme and startup ("reopen the last task" opens the most recently active
-      Agent). Routing edits each role's ordered candidates; Projects edits
+      desktop has no other store. General writes `[desktop]` theme and
+      startup ("reopen the last task" opens the most recently active Agent),
+      and Default access `last_access`, each when chosen. Routing edits each role's ordered candidates; Projects edits
       path, allowed profiles and Agent actions; Automations edits assignments
       ("keep N busy from folder X", S4) above the read-only rules and timers,
       and the script entries; Cloud MCP edits its six fields; Advanced holds
       every section as JSON and the settings history (author, time, sections,
-      revision). Each save shows its result and restart need (revisions only in
-      Advanced); a fresh read keeps drafts with unsaved edits. Main's startup
+      revision). A control change saves at once (a typed one when typing
+      rests), one revision-checked save at a time; the line under the page
+      says Saving…, Saved (with any restart need) or the refusal, and a
+      refused draft stays. A stale revision is read again and the change sent
+      once more only when no one changed that page's sections; an unknown
+      outcome is read back, never resent. Only the raw editors (the presets'
+      TOML and every section's JSON in Advanced) keep Save, Validate and
+      Discard; revisions stay in Advanced, and a fresh read keeps drafts with
+      unsaved edits. Main's startup
       behaviors stay: Owner daemon autostart, the opened checkout's
       `project.discover`, the fresh private directory remedy and the one-time
       legacy `swarm-desktop.json` import. Auto launches with no profile, so
@@ -583,10 +596,10 @@ of the explicitly selected release scope.
       by the window's pointer hook while the pointer is over it: WinUI's
       TextBox keeps its presses and Reactor has no focus events).
       Settings follows Codex: a Search field over the settings of every page,
-      then the groups General (Appearance, Startup, Keyboard shortcuts),
-      Agents (Models & presets, Default access, Routing, Usage), Work
-      (Projects, Automations, Worktrees & cleanup), Integrations (Cloud MCP)
-      and Advanced (the settings file and history); each page has a title, a
+      then the groups General (General: appearance and startup on one page;
+      Keyboard shortcuts), Agents (Models & presets, Default access, Usage),
+      Work (Projects, Automations, Worktrees & cleanup), Integrations (Cloud
+      MCP) and Advanced (Routing, the settings file and history); each page has a title, a
       one-line subtitle and cards of rows with the control on the right, and
       "Open config.toml" where a section backs it. Usage shows each harness's
       remaining provider quota as two-line rows ("Weekly limit remaining",
@@ -610,7 +623,8 @@ of the explicitly selected release scope.
       shows its typed error with Retry. The selected effort
       segment is filled, so it reads on a highlighted search row. Settings ›
       Models & presets picks a preset's model with the same picker filtered to
-      its harness (a field like its dropdowns, the picker over the rows below),
+      its harness (a field like its dropdowns naming the model as the
+      catalogue does, the picker just under the field and never past the card),
       and its dropdowns carry that harness's real fields (Codex
       sandbox and approval policy, Claude Code permission mode, Muse approval
       and sandbox, Antigravity mode); no text box offers Windows text
@@ -640,7 +654,9 @@ of the explicitly selected release scope.
       Swarm workers and observed native subagents nest under their parent in
       the monitor, collapsed, with their count and states ("22 workers · 2
       working"); a worker that needs attention raises its parent into Needs
-      attention, named on the card. Recents lists top-level tasks only. Delete
+      attention, named on the card. Recents lists the newest top-level tasks
+      of collapsed projects, one per title; older tasks stay under "Show N
+      older" and chats under Chats. Delete
       follows the Store (stopped or failed trees, once drained); a lost task
       offers Resume or Archive instead. (Refs #407)
 
