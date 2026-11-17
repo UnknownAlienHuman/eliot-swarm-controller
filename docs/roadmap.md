@@ -517,9 +517,13 @@ of the explicitly selected release scope.
       dot, details toggle, a "…" menu for Hand off/Switch, Move under another
       task, Resume, Detach, Stop and Force stop); coverage, ids and readback live in
       the details panel. The composer of a conversation carries its project,
-      the model-and-effort and access chips, Send (which steers the running
-      turn, D10), and Interrupt only while a turn runs; a new task's composer
-      is D9. Settings replaces the
+      harness and access as plain read-only text, the model-and-effort chip
+      (Codex's effort popover: the route's effort steps, applied for the next
+      turn, and "Change model…" into the picker filtered to that Agent's
+      route; one plain line instead when the harness keeps them), Send (which
+      steers the running turn, D10; a stopped or lost task's one Resume, with
+      the typed message once there is one), and Interrupt only while a turn
+      runs; a new task's composer is D9. Settings replaces the
       sidebar with its own navigation and shows one centred page of at most
       840 DIPs (D9). One component system at Codex density with Material 3
       color roles (owner reviews 2026-11-15 and 2026-11-16), every size from
@@ -551,8 +555,8 @@ of the explicitly selected release scope.
       recorded `profile_choice`. (Refs #407)
 - [x] **D9 A desktop you can work in.** Owner review 2026-11-16, the Codex,
       OpenCode and Antigravity apps as references. A new task's composer has
-      no profiles: the project chip (a searchable project list and "Other
-      folder…") on top, "Describe a task…", then the model chip
+      no profiles: the project selector (a searchable project list and "Other
+      folder…") on a bar above it, "Describe a task…", then the model chip
       (`Harness · Model · effort`), the access chip and Send. The model chip
       (Ctrl+M) opens OpenCode's picker pattern fed by `models.catalog` (k76a):
       a search over harnesses, providers and models; Auto with Swarm's pick
@@ -569,8 +573,10 @@ of the explicitly selected release scope.
       and `access`. The access chip opens Codex's menu (Ask for approval /
       Approve for me / Full access → `ask` / `auto` / `full`, Full in the
       warning color, refused up front for OpenCode), remembered in
-      `[desktop] last_access`. The popovers are drawn above the composer, not
-      as WinUI flyouts (Reactor 0.100.0 cannot close a flyout it opened).
+      `[desktop] last_access`; the chip itself is borderless, Full access as
+      warning text. The popovers overlay the conversation right above the
+      composer, so nothing behind them moves, and are not WinUI flyouts
+      (Reactor 0.100.0 cannot close a flyout it opened).
       Settings follows Codex: a Search field over the settings of every page,
       then the groups General (Appearance, Startup, Keyboard shortcuts),
       Agents (Models & presets, Default access, Routing, Usage), Work
@@ -578,9 +584,11 @@ of the explicitly selected release scope.
       and Advanced (the settings file and history); each page has a title, a
       one-line subtitle and cards of rows with the control on the right, and
       "Open config.toml" where a section backs it. Usage shows each harness's
-      remaining provider quota as rings (weekly and 5-hour where `harness.quota`
-      reports them, "Not supported" otherwise), running Agents and the tokens
-      of Agents active today. Worktrees & cleanup lists the managed worktrees
+      remaining provider quota as two-line rows ("Weekly limit remaining",
+      "Resets in 5 days", the share left and its ring; weekly and 5-hour where
+      `harness.quota` reports them, "Not supported" otherwise), running Agents
+      and the tokens of Agents active today; the store's size and retention are
+      in Advanced. Worktrees & cleanup lists the managed worktrees
       under the data directory by project with Open, and Clean up finished work
       reviews a `cleanup.plan` by kind (sizes, keep or remove reasons, a checkbox
       per group) and applies the checked groups' safe items through
@@ -618,9 +626,10 @@ of the explicitly selected release scope.
       and "No project (chat)" launch `chat: true`; Archive/Delete call
       `agent.archive`/`agent.delete` and Show archived filters `agent.list`:
       these, and Claude/Antigravity/OpenCode/Muse quota windows (read by shape,
-      one line per window such as "Weekly · 43% left · resets in 5 days", a
-      refusal in plain words, Muse's "Shown after a Muse turn" until observed,
-      then "as of HH:MM", and the composer's usage ring), need the k92
+      each window a limit, its share left and when it resets, a refusal in
+      plain words, Muse's "Shown after a Muse turn" until observed, then "as of
+      HH:MM", and the composer's usage ring, which opens Codex's usage popover
+      over the composer with Manage usage), need the k92
       daemon contract and say so on an older daemon. Details and monitor speak
       plain words and hide empty rows (`swarm why`'s origin line stays);
       Swarm workers and observed native subagents nest under their parent in

@@ -109,6 +109,15 @@ impl DesktopApp {
                     "Resume" => outcome.linked.as_deref(),
                     _ => None,
                 };
+                // A resume's own command never starts a turn: its message
+                // continues under the linked SEND, so the copy shown under
+                // the resume's id ("Sending…") goes, or it would wait forever.
+                if outcome.what == "Resume"
+                    && let Some(convo) = self.chat.convo.as_mut()
+                    && convo.agent() == outcome.agent
+                {
+                    convo.forget_local(&outcome.command_id);
+                }
                 let harness = self
                     .chat
                     .detail

@@ -1,6 +1,8 @@
 //! The new-task composer's chips and the popovers they open: the project
 //! list, the model picker and the access menu (see [`super::launch_ui`]
-//! for their state and keys).
+//! for their state and keys). The open Agent's effort and usage popovers
+//! are drawn by the conversation's composer; every popover overlays the
+//! conversation right above the composer.
 
 use super::launch_ui::{CHAT_PROJECT, OTHER_FOLDER, Pop};
 use super::*;
@@ -12,10 +14,14 @@ use crate::theme::winui::Palette;
 const PICKER_HINTS: &str = "↑↓ move   ←→ effort   Enter choose   Ctrl+F favorite   Esc close";
 /// Models a Manage models group lists before it asks for a search.
 const MANAGE_GROUP_ROWS: usize = 150;
+/// The conversation rows a popover overlays: the transcript, pending
+/// requests and the notice row, down to the composer.
+pub(super) const POPOVER_ROWS: i32 = 4;
 
 impl DesktopApp {
-    /// The composer's top row for a new task: the project chip (and the
-    /// folder field for a folder outside the projects).
+    /// The bar above a new task's composer (Codex's): the project selector
+    /// as a borderless chip (and the folder field for a folder outside the
+    /// projects) on a strip tucked under the composer's corners.
     pub(super) fn composer_top_row(
         &self,
         context: &mut ViewContext<Self>,
@@ -38,7 +44,7 @@ impl DesktopApp {
         } else {
             m3::glyph::FOLDER
         };
-        let chip = m3::chip(palette)
+        let chip = m3::text_chip(palette)
             .automation_name(format!(
                 "Project: {label} ({})",
                 if open { "list open" } else { "choose" }
@@ -61,14 +67,33 @@ impl DesktopApp {
         } else {
             View::empty()
         };
-        StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::SM)
-            .children((chip, folder))
+        Border::new()
+            .margin(Thickness::new(
+                tokens::radius::COMPOSER,
+                0.0,
+                tokens::radius::COMPOSER,
+                0.0,
+            ))
+            .background(palette.card())
+            .corner_radius(CornerRadius::new(
+                tokens::radius::CONTAINER,
+                tokens::radius::CONTAINER,
+                0.0,
+                0.0,
+            ))
+            .padding(Thickness::xy(tokens::spacing::XS, tokens::spacing::XS))
+            .content(
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(tokens::spacing::SM)
+                    .children((chip, folder)),
+            )
     }
 
     /// The composer's bottom-left chips for a new task: the model chip
-    /// (`Harness · Model · effort`) and the access chip.
+    /// (`Harness · Model · effort`) and the access level, borderless (Full
+    /// access as warning text, Codex's); a preset's access is read-only
+    /// text.
     pub(super) fn composer_chips(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let label = self.launch.choice.chip_label(self.launch.auto_profile());
         let glyph = match self.launch.choice {
@@ -87,9 +112,9 @@ impl DesktopApp {
                 Grid::new().keyed_children(vec![KeyedView::new(
                     format!("access:{}", access.wire()),
                     if full {
-                        m3::chip(palette).resource_overrides(palette.warning_chip())
+                        m3::warning_text_chip(palette)
                     } else {
-                        m3::chip(palette)
+                        m3::text_chip(palette)
                     }
                     .automation_name(format!("Access: {}", access.label()))
                     .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Access))))
@@ -101,8 +126,7 @@ impl DesktopApp {
                 )])
             }
             // A preset (or Auto's pick) carries its own permissions.
-            _ => m3::chip_static(
-                palette,
+            _ => m3::meta(
                 m3::glyph::SHIELD,
                 &match self.launch.profile() {
                     Some(profile) => format!(
@@ -119,8 +143,10 @@ impl DesktopApp {
             .children((model, access))
     }
 
-    /// The open popover, left-aligned in the reading column right above the
-    /// composer (empty when none is open).
+    /// The open popover in the reading column right above the composer
+    /// (empty when none is open). It overlays the conversation (the rows
+    /// above the composer), so the transcript never moves when it opens;
+    /// the usage popover sits at the right, under its ring.
     pub(super) fn popover_view(
         &self,
         column: Option<f64>,
@@ -139,13 +165,16 @@ impl DesktopApp {
             Pop::Manage => self.manage_popover(context, palette),
             Pop::Access => self.access_popover(context, palette),
             Pop::Project => self.project_popover(context, palette),
+            Pop::Effort => self.effort_popover(context, palette),
+            Pop::Usage => self.usage_popover(context, palette),
         };
         Border::new()
-            .grid_row(5)
+            .grid_row(1)
+            .grid_row_span(POPOVER_ROWS)
+            .vertical_alignment(VerticalAlignment::Bottom)
             .width(column)
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
-            .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
             .content(content)
     }
 

@@ -19,8 +19,8 @@
 //! Code and Antigravity name their windows: "Weekly", "Fable weekly") or
 //! else its duration; a model scope from `model`, `modelId` or a
 //! `seven_day_<model>` key. A harness whose read is not `supported` has no
-//! windows. Each window reads as one line, like Codex's usage popover:
-//! "Weekly · 43% left · resets in 5 days".
+//! windows. Each window reads as a limit and when it refreshes, like
+//! Codex's usage popover: "Weekly limit", "43% left", "Resets in 5 days".
 
 use eliot_core::api::HarnessQuotaResponse;
 use eliot_core::api::harness::HARNESS_QUOTA_SUPPORTED;
@@ -66,15 +66,51 @@ impl Window {
         }
     }
 
-    /// One concise line: "Weekly · 43% left · resets in 5 days".
-    pub fn line(&self, now_ms: i64) -> String {
-        format!(
-            "{} · {}% left · {}",
-            self.label,
-            self.remaining,
-            self.resets_in(now_ms)
-        )
+    /// The limit's name for a row title: "Weekly limit", "5-hour limit",
+    /// "Opus weekly limit" (a model-scoped window leads with its model).
+    pub fn name(&self) -> String {
+        let base = self.label.split(" · ").next().unwrap_or(&self.label);
+        let base = match &self.model {
+            Some(model) => format!("{model} {}", lower_first(base)),
+            None => base.to_owned(),
+        };
+        if base.to_lowercase().ends_with("limit") {
+            base
+        } else {
+            format!("{base} limit")
+        }
     }
+}
+
+/// A phrase as a sentence start: "resets in 5 days" → "Resets in 5 days".
+pub fn sentence(phrase: &str) -> String {
+    let mut chars = phrase.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+fn lower_first(word: &str) -> String {
+    let mut chars = word.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_lowercase().chain(chars).collect()
+    })
+}
+
+/// The account plan a read names ("Pro" from Codex `rateLimits.planType`
+/// `pro`), for the usage popover's source line.
+pub fn plan(reply: &HarnessQuotaResponse) -> Option<String> {
+    if reply.status != HARNESS_QUOTA_SUPPORTED {
+        return None;
+    }
+    let plan = reply
+        .details
+        .as_ref()?
+        .get("rateLimits")?
+        .get("planType")?
+        .as_str()?
+        .trim();
+    (!plan.is_empty() && plan != "unknown").then(|| sentence(&plan.replace(['_', '-'], " ")))
 }
 
 /// What a read without windows says, in plain words: "Shown after a Muse
@@ -326,13 +362,24 @@ mod tests {
         assert_eq!(windows[1].remaining, 88);
         assert_eq!(windows[1].resets_at_ms, Some(1_000_000));
         assert_eq!(
-            windows[1].line(1_000_000 - 130 * 60_000),
-            "5-hour · 88% left · resets in 2 h 10 min"
+            windows[1].resets_in(1_000_000 - 130 * 60_000),
+            "resets in 2 h 10 min"
         );
-        assert_eq!(
-            windows[0].line(0),
-            "Weekly · 60% left · reset time not reported"
+        assert_eq!(windows[0].resets_in(0), "reset time not reported");
+    }
+
+    #[test]
+    fn the_plan_and_reset_read_as_words() {
+        let read = reply(
+            HARNESS_QUOTA_SUPPORTED,
+            Some(json!({"rateLimits": {
+                "planType": "pro",
+                "primary": {"usedPercent": 12, "windowDurationMins": 300}
+            }})),
         );
+        assert_eq!(plan(&read).as_deref(), Some("Pro"));
+        assert_eq!(plan(&reply(HARNESS_QUOTA_SUPPORTED, Some(json!({})))), None);
+        assert_eq!(sentence("resets in 5 days"), "Resets in 5 days");
     }
 
     #[test]
@@ -351,11 +398,10 @@ mod tests {
         let windows = windows(&read);
         let labels: Vec<&str> = windows.iter().map(|window| window.label.as_str()).collect();
         assert_eq!(labels, ["Weekly", "5-hour", "Fable weekly"]);
-        assert_eq!(windows[0].line(now), "Weekly · 43% left · resets in 5 days");
-        assert_eq!(
-            windows[1].line(now),
-            "5-hour · 60% left · resets in 1 h 0 min"
-        );
+        assert_eq!(windows[0].remaining, 43);
+        assert_eq!(windows[0].resets_in(now), "resets in 5 days");
+        assert_eq!(windows[1].remaining, 60);
+        assert_eq!(windows[1].resets_in(now), "resets in 1 h 0 min");
         assert!(windows.iter().all(|window| window.model.is_none()));
     }
 
@@ -439,6 +485,9 @@ mod tests {
         assert_eq!(windows[1].remaining, 77);
         assert!(windows[1].resets_at_ms.is_some());
         assert_eq!(windows[2].label, "Weekly · Opus");
+        assert_eq!(windows[2].name(), "Opus weekly limit");
+        assert_eq!(windows[0].name(), "Weekly limit");
+        assert_eq!(windows[1].name(), "5-hour limit");
         assert_eq!(tightest(&read).unwrap().remaining, 10);
         let google = reply(
             HARNESS_QUOTA_SUPPORTED,

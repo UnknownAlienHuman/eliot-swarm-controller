@@ -345,20 +345,48 @@ pub fn chip(palette: Palette) -> Button {
     button(palette.chip())
 }
 
-/// The read-only form of [`chip`]: the same outline and label, no button.
-pub fn chip_static(palette: Palette, glyph: &str, label: &str) -> View {
+/// A borderless chip (Codex's composer pills: the project selector above
+/// the composer, the access level): the label in on-surface, a state layer
+/// on hover, no outline.
+pub fn text_chip(palette: Palette) -> Button {
+    button(palette.row(false))
+}
+
+/// [`text_chip`] in the warning color (Full access).
+pub fn warning_text_chip(palette: Palette) -> Button {
+    button(palette.warning_row())
+}
+
+/// Read-only context (an open Agent's project, harness, access; a preset's
+/// access): a plain icon and label at lowered emphasis. No outline and no
+/// button, so it never reads as a control.
+pub fn meta(glyph: &str, label: &str) -> View {
     Border::new()
-        .height(height::CONTROL)
-        .corner_radius(radius::CONTROL)
-        .border_thickness(Thickness::uniform(layout::HAIRLINE))
-        .border_brush(palette.outline_variant())
-        .padding(Thickness::xy(spacing::INSET, 0.0))
-        .content(
+        .opacity(theme::MUTED_OPACITY)
+        .vertical_alignment(VerticalAlignment::Center)
+        .automation_name(label.to_owned())
+        .content(icon_label(glyph, label))
+}
+
+/// [`meta`] with its label in `foreground` at full emphasis (Full access in
+/// the warning color; the icon keeps the muted text color).
+pub fn meta_tinted(glyph: &str, label: &str, foreground: Brush) -> View {
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(spacing::SM)
+        .vertical_alignment(VerticalAlignment::Center)
+        .automation_name(label.to_owned())
+        .children((
             Border::new()
                 .opacity(theme::MUTED_OPACITY)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(icon_label(glyph, label)),
-        )
+                .content(icon(glyph)),
+            TextBlock::new()
+                .text(label.to_owned())
+                .foreground(foreground)
+                .vertical_alignment(VerticalAlignment::Center)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+        ))
 }
 
 /// One segment of a segmented button (see [`segmented`]).

@@ -104,6 +104,7 @@ impl DesktopApp {
                     ],
                 ),
                 history_view,
+                m3::settings_card(palette, vec![KeyedView::new("storage", self.storage_row())]),
                 m3::section_heading(
                     "All settings",
                     &format!(

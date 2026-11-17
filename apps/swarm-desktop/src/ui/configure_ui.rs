@@ -1,16 +1,20 @@
 //! Model and effort of the open Agent: the catalogue read under its own
-//! route, and `configure` from the composer's model chip. The requested
-//! versus effective readback lives in the details panel.
+//! route, and `configure` from the composer's effort popover and model
+//! picker. The requested versus effective readback lives in the details
+//! panel.
 
 use super::*;
-use crate::configure::Pick;
 
 #[derive(Clone, Debug)]
 pub(super) enum ConfigureMsg {
     CatalogLoaded(Box<configure::Catalog>),
-    /// A model-chip menu entry (its label), for the Agent generation the
-    /// chip shows when the click is handled.
-    Chosen(String),
+    /// A model and/or effort for the next turn (an effort step, a model
+    /// picker row), for the Agent generation shown when the click is
+    /// handled; only what differs and the route lists is sent.
+    Chosen {
+        model: Option<String>,
+        effort: Option<String>,
+    },
     /// The configured Agent; outer error: the submission itself; inner: the
     /// settled command read.
     ConfigureSettled(String, Box<Result<Fallible<Command>, eliot_core::Error>>),
@@ -42,18 +46,27 @@ impl DesktopApp {
                     self.configure.catalog = Some(catalog);
                 }
             }
-            ConfigureMsg::Chosen(label) => {
-                let (Some(agent), Some(generation)) = (
-                    self.selected_agent_id(),
-                    self.chat.detail.as_ref().map(|detail| detail.generation),
-                ) else {
+            ConfigureMsg::Chosen { model, effort } => {
+                let (Some(agent), Some(detail)) =
+                    (self.selected_agent_id(), self.chat.detail.as_ref())
+                else {
                     return;
                 };
+                let generation = detail.generation;
                 // Only the catalogue read for this exact generation applies.
-                let (model, effort) = match self.configure_pick(&agent, generation, &label) {
-                    Some(Pick::Model(Some(model))) => (Some(model), None),
-                    Some(Pick::Effort(Some(effort))) => (None, Some(effort)),
-                    _ => return,
+                let Some(Ok(reply)) = self
+                    .configure
+                    .catalog
+                    .as_ref()
+                    .filter(|catalog| catalog.is_for(&agent, generation))
+                    .map(|catalog| &catalog.reply)
+                else {
+                    return;
+                };
+                let Some((model, effort)) =
+                    configure::change(reply, &detail.settings, model.as_deref(), effort.as_deref())
+                else {
+                    return;
                 };
                 if self.submitting() {
                     return;
@@ -67,7 +80,7 @@ impl DesktopApp {
                 let mutation_id = self.ledger.id_for(&key);
                 self.in_flight_key = Some(key);
                 self.alert = None;
-                self.configure.status = format!("Configure {mutation_id}…");
+                self.configure.status = "Changing the model or effort…".to_owned();
                 let _task = context.spawn_background(move |cancel| {
                     let cancelled = || cancel.is_cancelled();
                     let submitted = client::block_on(client::submit_configure(
@@ -96,7 +109,7 @@ impl DesktopApp {
                 }
                 match result {
                     Ok(Ok(command)) => {
-                        self.configure.status = configure::outcome_line(&command);
+                        self.configure.status = configure::outcome_words(&command);
                         if command.state != eliot_core::CommandState::Applied {
                             self.alert(format!(
                                 "Model or effort not changed: {}",
@@ -105,18 +118,22 @@ impl DesktopApp {
                         }
                     }
                     Ok(Err(error)) => {
-                        self.configure.status =
-                            format!("Configure admitted; outcome not read: {error}");
+                        self.configure.status = format!(
+                            "The change was accepted, but its outcome could not be read: {}",
+                            crate::state::plain_error(&error)
+                        );
                         self.alert(self.configure.status.clone());
                     }
                     Err(error) if uncertain => {
                         self.configure.status = format!(
-                            "Configure not confirmed (choosing it again reuses its id): {error}"
+                            "The change may not have reached Swarm; choosing it again repeats the same request. {}",
+                            error.user_message()
                         );
                         self.alert(self.configure.status.clone());
                     }
                     Err(error) => {
-                        self.configure.status = format!("Configure refused: {error}");
+                        self.configure.status =
+                            format!("Model or effort not changed: {}", error.user_message());
                         self.alert(self.configure.status.clone());
                     }
                 }

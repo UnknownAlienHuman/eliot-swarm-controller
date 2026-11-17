@@ -1,18 +1,21 @@
-//! Model and effort of a live Agent: pickers fed by `harness.models` for the
-//! Agent's own frozen route, applied through `configure`, and the requested
-//! versus effective readback with the native verification marks.
+//! Model and effort of a live Agent: the composer's effort popover and its
+//! model picker, fed by `harness.models` for the Agent's own frozen route,
+//! applied through `configure`, and the requested versus effective readback
+//! with the native verification marks.
 //!
 //! The catalogue and the per-field refusals come from the daemon
 //! (`harness.models` with `agent`, whose `configure` member is the same table
-//! `configure` admission uses), so a disabled picker shows the daemon's own
-//! reason. `effective` values are the last natively admitted ones; a value
+//! `configure` admission uses), so the popover hides what the harness keeps
+//! and says so in plain words. `effective` values are the last natively admitted ones; a value
 //! is marked verified only when a turn proved the harness carried it
 //! (`model_verified`/`effort_verified`), never from the request.
 
 use eliot_core::Command;
-use eliot_core::api::{AgentConfigView, AgentGetResponse, HarnessModelsResponse};
+use eliot_core::api::{
+    AgentConfigView, AgentGetResponse, HarnessEntry, HarnessModelsResponse, ModelsCatalogEntry,
+    ModelsCatalogResponse,
+};
 use serde_json::Value;
-use windows_reactor::MenuItem;
 
 /// Settings facts of one Agent generation, read from `agent.get`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -89,40 +92,41 @@ impl Settings {
     }
 
     /// What the Agent runs with, in words. The model and effort the
-    /// harness reports, each marked confirmed only once the harness admitted
-    /// it (its launch readback or a turn that carried it; a request is not
-    /// proof); a change for the next turn when one was asked for. Rows with
-    /// nothing to say are left out.
+    /// harness reports, plain once the harness admitted it (its launch
+    /// readback or a turn that carried it) and "Requested" until then (a
+    /// request is not proof); a change for the next turn when one was asked
+    /// for. Rows with nothing to say are left out.
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        let mark = |verified: bool| {
+        let said = |what: &str, value: &str, verified: bool| {
             if verified {
-                "confirmed"
+                format!("{what} {value}")
             } else {
-                "not confirmed yet"
+                format!("Requested {} {value}", what.to_lowercase())
             }
         };
         match (&self.effective_model, &self.effective_effort) {
-            (Some(model), Some(effort)) => {
-                lines.push(format!("Model {model} ({})", mark(self.model_verified)));
-                lines.push(format!("Effort {effort} ({})", mark(self.effort_verified)));
-            }
-            (Some(model), None) => {
-                lines.push(format!("Model {model} ({})", mark(self.model_verified)));
+            (Some(model), effort) => {
+                lines.push(said("Model", model, self.model_verified));
+                if let Some(effort) = effort {
+                    lines.push(said("Effort", &effort_words(effort), self.effort_verified));
+                }
             }
             _ => match (&self.profile_model, &self.profile_effort) {
-                (Some(model), Some(effort)) => {
-                    lines.push(format!(
-                        "Asked for {model} · {effort} effort (not confirmed yet)"
-                    ));
-                }
-                (Some(model), None) => lines.push(format!("Asked for {model} (not confirmed yet)")),
-                _ => lines.push("Uses the harness's default model".to_owned()),
+                (Some(model), Some(effort)) => lines.push(format!(
+                    "Requested model {model} · {} effort",
+                    effort_words(effort)
+                )),
+                (Some(model), None) => lines.push(format!("Requested model {model}")),
+                _ => lines.push("Default model".to_owned()),
             },
         }
         if let Some(config) = &self.config {
             let model = config.model.as_deref().unwrap_or("the same model");
-            let effort = config.effort.as_deref().unwrap_or("the same effort");
+            let effort = config
+                .effort
+                .as_deref()
+                .map_or_else(|| "the same effort".to_owned(), effort_words);
             lines.push(format!("Next turn: {model} · {effort}"));
         }
         lines
@@ -150,135 +154,129 @@ pub fn picked(options: &[String], pick: Option<usize>) -> Option<String> {
         .cloned()
 }
 
-/// Settled `configure` command in one line: state, the daemon's code and
-/// message, and the applied revision when the outcome names one.
-pub fn outcome_line(command: &Command) -> String {
-    let state = format!("{:?}", command.state).to_lowercase();
+/// A settled `configure` command in the owner's words: when it applies,
+/// or why it did not (no command id or revision).
+pub fn outcome_words(command: &Command) -> String {
     let outcome = command.outcome.as_ref();
     let text = |key: &str| {
         outcome
             .and_then(|value| value.get(key))
             .and_then(Value::as_str)
+            .unwrap_or("")
     };
-    let mut line = format!("configure {} {state}", command.id);
-    if let Some(code) = text("code") {
-        line.push_str(&format!(" · {code}"));
-    }
-    if let Some(message) = text("message") {
-        line.push_str(&format!(": {message}"));
-    }
-    if let Some(revision) = outcome
-        .and_then(|value| value.get("config_revision"))
-        .and_then(Value::as_i64)
-    {
-        line.push_str(&format!(" · revision {revision}"));
-    }
-    line
-}
-
-/// The "Default model" entry of an ad-hoc launch's model menu.
-pub const DEFAULT_MODEL: &str = "Default model";
-/// The "Default effort" entry of an ad-hoc launch's effort menu.
-pub const DEFAULT_EFFORT: &str = "Default effort";
-
-/// What one entry of the model-and-effort menu picks.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Pick {
-    /// A model; `None` is the harness default (ad-hoc launch only).
-    Model(Option<String>),
-    /// An effort; `None` is the harness default (ad-hoc launch only).
-    Effort(Option<String>),
-}
-
-/// The one model-and-effort menu, flat: a "Model" section and an "Effort"
-/// section, each under a disabled heading (no submenus: WinUI draws a
-/// submenu's chevron at a fixed 12 DIPs, off the icon scale). With
-/// `defaults` each starts with its "Default …" entry (an ad-hoc launch may
-/// leave either to the harness). A refusal replaces that section's entries
-/// with the daemon's reason, disabled.
-pub fn menu_items(
-    models: &[String],
-    efforts: &[String],
-    defaults: bool,
-    model_refusal: Option<&str>,
-    effort_refusal: Option<&str>,
-) -> Vec<MenuItem> {
-    let entries = |prefix: &str, default: &str, values: &[String], refusal: Option<&str>| {
-        if let Some(reason) = refusal {
-            return vec![MenuItem::disabled(format!("{prefix}:refused"), reason)];
-        }
-        let mut items = Vec::new();
-        if defaults {
-            items.push(MenuItem::item(format!("{prefix}:default"), default));
-        }
-        items.extend(values.iter().map(|value| {
-            let label = if prefix == "e" {
-                effort_label(value, models)
+    match command.state {
+        eliot_core::CommandState::Applied => "Applies from the next turn.".to_owned(),
+        _ => {
+            let code = text("code");
+            let code = if code.is_empty() {
+                format!("{:?}", command.state).to_lowercase()
             } else {
-                value.clone()
+                code.to_owned()
             };
-            MenuItem::item(format!("{prefix}:{value}"), label)
-        }));
-        if items.is_empty() {
-            items.push(MenuItem::disabled(
-                format!("{prefix}:none"),
-                "None listed by the harness",
-            ));
+            eliot_core::reason_message(&code, text("message"))
         }
-        items
-    };
-    let mut items = vec![MenuItem::disabled("model", "Model")];
-    items.extend(entries("m", DEFAULT_MODEL, models, model_refusal));
-    items.push(MenuItem::separator("model-effort"));
-    items.push(MenuItem::disabled("effort", "Effort"));
-    items.extend(entries("e", DEFAULT_EFFORT, efforts, effort_refusal));
-    items
-}
-
-/// The entries of one section of a flat menu (after its heading, up to the
-/// next separator).
-#[cfg(test)]
-fn section<'a>(items: &'a [MenuItem], heading: &str) -> &'a [MenuItem] {
-    let start = items
-        .iter()
-        .position(
-            |item| matches!(item, MenuItem::Item { label, enabled: false, .. } if label == heading),
-        )
-        .map_or(items.len(), |index| index + 1);
-    let end = items[start..]
-        .iter()
-        .position(|item| matches!(item, MenuItem::Separator { .. }))
-        .map_or(items.len(), |offset| start + offset);
-    &items[start..end]
-}
-
-/// An effort's menu label: its name, or "<name> effort" when a model has
-/// the same id (Reactor reports only the clicked label).
-fn effort_label(effort: &str, models: &[String]) -> String {
-    if models.iter().any(|model| model == effort) {
-        format!("{effort} effort")
-    } else {
-        effort.to_owned()
     }
 }
 
-/// The pick a clicked menu label names (labels are unique by
-/// construction, see [`effort_label`]). Pass an empty list for a field the
-/// daemon refuses, so it can never resolve.
-pub fn resolve(label: &str, models: &[String], efforts: &[String]) -> Option<Pick> {
-    if label == DEFAULT_MODEL {
-        Some(Pick::Model(None))
-    } else if label == DEFAULT_EFFORT {
-        Some(Pick::Effort(None))
-    } else if let Some(effort) = efforts
-        .iter()
-        .find(|effort| effort_label(effort, models) == label)
-    {
-        Some(Pick::Effort(Some(effort.clone())))
-    } else if models.iter().any(|model| model == label) {
-        Some(Pick::Model(Some(label.to_owned())))
-    } else {
-        None
+/// An effort level in words: `xhigh` → "Extra high", `medium` → "Medium".
+pub fn effort_words(effort: &str) -> String {
+    match effort {
+        "xhigh" => "Extra high".to_owned(),
+        "max" => "Max".to_owned(),
+        other => {
+            let words = other.replace(['_', '-'], " ");
+            let mut chars = words.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        }
+    }
+}
+
+/// What the harness keeps for the whole task, in one plain sentence, or
+/// `None` when both model and effort can change.
+pub fn locked_words(harness: &str, model_locked: bool, effort_locked: bool) -> Option<String> {
+    match (model_locked, effort_locked) {
+        (true, true) => Some(format!(
+            "{harness} keeps the model and effort it started with."
+        )),
+        (true, false) => Some(format!(
+            "{harness} can't switch models during a task; start a new task for another model."
+        )),
+        (false, true) => Some(format!("{harness} keeps the effort it started with.")),
+        (false, false) => None,
+    }
+}
+
+/// The `configure` a choice asks for, checked against the catalogue of the
+/// exact Agent generation: only the fields that change, each one the
+/// daemon accepts for this route (a refused field, an unknown model or an
+/// effort the model does not list never goes out). `None`: nothing valid
+/// to change.
+pub fn change(
+    reply: &HarnessModelsResponse,
+    settings: &Settings,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Option<(Option<String>, Option<String>)> {
+    let current_model = settings.next_model();
+    let model = match model {
+        Some(model) if Some(model) != current_model => {
+            let known = reply.models.iter().any(|entry| entry.id == model);
+            if reply.configure.model_refusal.is_some() || !known {
+                return None;
+            }
+            Some(model.to_owned())
+        }
+        _ => None,
+    };
+    let target = model.as_deref().or(current_model);
+    let effort = match effort {
+        Some(effort) if model.is_some() || Some(effort) != settings.next_effort() => {
+            let (_, efforts) = options(reply, target);
+            if reply.configure.effort_refusal.is_some() || !efforts.iter().any(|e| e == effort) {
+                return None;
+            }
+            Some(effort.to_owned())
+        }
+        _ => None,
+    };
+    (model.is_some() || effort.is_some()).then_some((model, effort))
+}
+
+/// The Agent's route catalogue in the model picker's shape (one installed
+/// harness), so the picker lists exactly what `configure` admission checks
+/// for this Agent, not the unified catalogue of new tasks.
+pub fn as_catalog(reply: &HarnessModelsResponse) -> ModelsCatalogResponse {
+    ModelsCatalogResponse {
+        harnesses: vec![HarnessEntry {
+            harness: reply.harness.clone(),
+            installed: true,
+            cmd: None,
+            version: None,
+            code: None,
+            error: None,
+            candidates: None,
+        }],
+        models: reply
+            .models
+            .iter()
+            .map(|entry| ModelsCatalogEntry {
+                harness: reply.harness.clone(),
+                id: entry.id.clone(),
+                display_name: entry.id.clone(),
+                provider: eliot_core::api::catalog_provider(&reply.harness, &entry.id),
+                efforts: entry.efforts.clone(),
+                default_effort: entry.default_effort.clone(),
+                default: entry.default || reply.default.as_deref() == Some(entry.id.as_str()),
+                availability: eliot_core::api::harness::CATALOG_AVAILABLE.to_owned(),
+                source: entry.source.clone(),
+            })
+            .collect(),
+        next: None,
+        fetched_at_ms: reply.fetched_at_ms,
+        ttl_ms: reply.ttl_ms,
+        failures: Vec::new(),
     }
 }
 
@@ -305,55 +303,57 @@ mod tests {
     use super::*;
     use eliot_core::api::{ConfigureSupport, HarnessModelEntry};
 
-    fn catalog(configure: ConfigureSupport) -> Catalog {
-        Catalog {
-            agent: "a1".to_owned(),
-            generation: 1,
-            reply: Ok(HarnessModelsResponse {
-                harness: "codex".to_owned(),
-                catalogue: "native".to_owned(),
-                models: vec![
-                    HarnessModelEntry {
-                        id: "m1".to_owned(),
-                        default: true,
-                        efforts: Some(vec!["low".to_owned(), "high".to_owned()]),
-                        default_effort: Some("low".to_owned()),
-                        source: None,
-                    },
-                    HarnessModelEntry {
-                        id: "m2".to_owned(),
-                        default: false,
-                        efforts: None,
-                        default_effort: None,
-                        source: None,
-                    },
-                ],
-                default: Some("m1".to_owned()),
-                note: None,
-                scope: "profile:p@a1g1 harness:codex".to_owned(),
-                fetched_at_ms: 1,
-                ttl_ms: 1,
-                credential: "ambient".to_owned(),
-                configure,
-            }),
+    fn reply(configure: ConfigureSupport) -> HarnessModelsResponse {
+        HarnessModelsResponse {
+            harness: "codex".to_owned(),
+            catalogue: "native".to_owned(),
+            models: vec![
+                HarnessModelEntry {
+                    id: "m1".to_owned(),
+                    default: true,
+                    efforts: Some(vec!["low".to_owned(), "high".to_owned()]),
+                    default_effort: Some("low".to_owned()),
+                    source: None,
+                },
+                HarnessModelEntry {
+                    id: "m2".to_owned(),
+                    default: false,
+                    efforts: Some(vec!["medium".to_owned(), "xhigh".to_owned()]),
+                    default_effort: None,
+                    source: None,
+                },
+            ],
+            default: Some("m1".to_owned()),
+            note: None,
+            scope: "profile:p@a1g1 harness:codex".to_owned(),
+            fetched_at_ms: 1,
+            ttl_ms: 1,
+            credential: "ambient".to_owned(),
+            configure,
+        }
+    }
+
+    fn running(model: &str, effort: &str) -> Settings {
+        Settings {
+            profile: "p".to_owned(),
+            effective_model: Some(model.to_owned()),
+            effective_effort: Some(effort.to_owned()),
+            ..Settings::default()
         }
     }
 
     #[test]
-    fn verified_marks_come_only_from_the_turn_flags() {
-        let mut settings = Settings {
-            profile: "p".to_owned(),
-            effective_model: Some("m1".to_owned()),
-            effective_effort: Some("high".to_owned()),
-            ..Settings::default()
-        };
+    fn requested_until_a_turn_confirms_it() {
+        let mut settings = running("m1", "xhigh");
         let lines = settings.lines();
-        assert_eq!(lines[0], "Model m1 (not confirmed yet)");
-        assert_eq!(lines[1], "Effort high (not confirmed yet)");
+        assert_eq!(lines[0], "Requested model m1");
+        assert_eq!(lines[1], "Requested effort Extra high");
         settings.effort_verified = true;
         let lines = settings.lines();
-        assert_eq!(lines[1], "Effort high (confirmed)");
-        assert_eq!(lines[0], "Model m1 (not confirmed yet)");
+        assert_eq!(lines[1], "Effort Extra high");
+        assert_eq!(lines[0], "Requested model m1");
+        settings.model_verified = true;
+        assert_eq!(settings.lines()[0], "Model m1");
     }
 
     #[test]
@@ -376,8 +376,8 @@ mod tests {
             ..Settings::default()
         };
         let lines = settings.lines();
-        assert_eq!(lines[0], "Uses the harness's default model");
-        assert_eq!(lines[1], "Next turn: m1 · high");
+        assert_eq!(lines[0], "Default model");
+        assert_eq!(lines[1], "Next turn: m1 · High");
         assert_eq!(settings.next_model(), Some("m1"));
     }
 
@@ -390,72 +390,61 @@ mod tests {
     }
 
     #[test]
-    fn menu_labels_resolve_to_their_pick() {
-        let models = vec!["m1".to_owned(), "m2".to_owned()];
-        let efforts = vec!["low".to_owned(), "high".to_owned()];
-        assert_eq!(
-            resolve("m2", &models, &efforts),
-            Some(Pick::Model(Some("m2".to_owned())))
-        );
-        assert_eq!(
-            resolve("high", &models, &efforts),
-            Some(Pick::Effort(Some("high".to_owned())))
-        );
-        assert_eq!(
-            resolve(DEFAULT_MODEL, &models, &efforts),
-            Some(Pick::Model(None))
-        );
-        assert_eq!(
-            resolve(DEFAULT_EFFORT, &models, &efforts),
-            Some(Pick::Effort(None))
-        );
-        assert_eq!(resolve("other", &models, &efforts), None);
+    fn efforts_read_as_words() {
+        assert_eq!(effort_words("xhigh"), "Extra high");
+        assert_eq!(effort_words("medium"), "Medium");
+        assert_eq!(effort_words("low"), "Low");
+        assert_eq!(effort_words("max"), "Max");
     }
 
     #[test]
-    fn an_effort_named_like_a_model_gets_its_own_label() {
-        let models = vec!["high".to_owned(), "m1".to_owned()];
-        let efforts = vec!["low".to_owned(), "high".to_owned()];
-        let items = menu_items(&models, &efforts, false, None, None);
-        let effort = section(&items, "Effort");
-        assert!(matches!(&effort[1], MenuItem::Item { label, .. } if label == "high effort"));
+    fn a_change_sends_only_what_differs_and_what_the_route_lists() {
+        let reply = reply(ConfigureSupport::default());
+        let settings = running("m1", "low");
+        // The same effort changes nothing; another listed one changes it.
+        assert_eq!(change(&reply, &settings, None, Some("low")), None);
         assert_eq!(
-            resolve("high effort", &models, &efforts),
-            Some(Pick::Effort(Some("high".to_owned())))
+            change(&reply, &settings, None, Some("high")),
+            Some((None, Some("high".to_owned())))
         );
+        // An effort the model does not list never goes out.
+        assert_eq!(change(&reply, &settings, None, Some("xhigh")), None);
+        // A model change carries the row's effort, checked against that model.
         assert_eq!(
-            resolve("high", &models, &efforts),
-            Some(Pick::Model(Some("high".to_owned())))
+            change(&reply, &settings, Some("m2"), Some("xhigh")),
+            Some((Some("m2".to_owned()), Some("xhigh".to_owned())))
         );
-        // A refused model list resolves no model.
-        assert_eq!(resolve("m1", &[], &efforts), None);
+        assert_eq!(change(&reply, &settings, Some("m2"), Some("low")), None);
+        assert_eq!(change(&reply, &settings, Some("m9"), None), None);
+        assert_eq!(change(&reply, &settings, Some("m1"), Some("low")), None);
     }
 
     #[test]
-    fn a_refusal_replaces_the_section_with_the_reason() {
-        let items = menu_items(
-            &["m1".to_owned()],
-            &[],
-            false,
-            None,
-            Some("fixed by the harness"),
+    fn a_refused_field_never_changes() {
+        let reply = reply(ConfigureSupport {
+            model_refusal: Some("model changes need a new session".to_owned()),
+            effort_refusal: None,
+        });
+        let settings = running("m1", "low");
+        assert_eq!(change(&reply, &settings, Some("m2"), None), None);
+        assert_eq!(
+            change(&reply, &settings, None, Some("high")),
+            Some((None, Some("high".to_owned())))
         );
-        assert_eq!(section(&items, "Model").len(), 1);
-        let effort = section(&items, "Effort");
-        assert_eq!(effort.len(), 1);
-        assert!(matches!(
-            &effort[0],
-            MenuItem::Item { label, enabled: false, .. } if label == "fixed by the harness"
-        ));
+        let locked = self::reply(ConfigureSupport::for_harness("claude"));
+        assert_eq!(change(&locked, &settings, None, Some("high")), None);
+        assert_eq!(
+            locked_words("Claude Code", true, true).as_deref(),
+            Some("Claude Code keeps the model and effort it started with.")
+        );
+        assert_eq!(locked_words("Codex", false, false), None);
     }
 
     #[test]
     fn options_follow_the_chosen_model_or_the_default() {
-        let Ok(reply) = catalog(ConfigureSupport::default()).reply else {
-            panic!("catalogue");
-        };
+        let reply = reply(ConfigureSupport::default());
         assert_eq!(options(&reply, None).1, ["low", "high"]);
-        assert!(options(&reply, Some("m2")).1.is_empty());
+        assert_eq!(options(&reply, Some("m2")).1, ["medium", "xhigh"]);
         assert_eq!(options(&reply, None).0, ["m1", "m2"]);
     }
 }
