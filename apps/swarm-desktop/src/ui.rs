@@ -14,9 +14,11 @@
 //!
 //! Reactor 0.100.0 integration gaps, stated rather than papered over:
 //! `ScrollViewer` exposes no offset, `ViewChanged`, `ChangeView` or anchor
-//! ratio, so the transcript cannot detect "at the bottom" or auto-follow;
-//! "Jump to latest" moves focus to the end anchor, which WinUI brings into
-//! view. There is no font-family property (code is not monospace), no
+//! ratio, so the transcript cannot detect "at the bottom" or auto-follow.
+//! A "N new" jump button cannot know it is already at the bottom, so there
+//! is none (k98: it stayed shown at the bottom); opening a conversation
+//! focuses the end anchor, which WinUI brings into view. There is no
+//! font-family property (code is not monospace), no
 //! clipboard (see [`crate::clipboard`]) and no key events on `TextBox`: Enter
 //! sends through the window's thread keyboard hook, which marks the line
 //! break that Enter without Shift typed into the composer
@@ -117,6 +119,8 @@ struct AgentPage {
     rows: Vec<UiAgent>,
     next: Option<String>,
     total: usize,
+    /// The archived Agents the default list leaves out (first page only).
+    archived: nav::Archived,
 }
 
 /// UI copy of one pending request with its exact control binding.
@@ -367,6 +371,27 @@ fn load_agents_blocking(
                     error.to_string()
                 }
             })?;
+        // The default list leaves archived Agents out; the fleet line still
+        // counts the live ones (an archived chat may be idle, not stopped).
+        let archived = if archived.is_none() && request.after.is_none() {
+            let only = AgentListRequest {
+                limit: request.limit,
+                ..AgentListRequest::default()
+            };
+            match client::list_agents_flagged(data_dir, &only, Some("only")).await {
+                Ok((page, _)) => {
+                    let rows: Vec<UiAgent> = page
+                        .agents
+                        .iter()
+                        .map(|row| UiAgent::from_summary(&row.summary))
+                        .collect();
+                    nav::Archived::of(&rows, page.total)
+                }
+                Err(_) => nav::Archived::default(),
+            }
+        } else {
+            nav::Archived::default()
+        };
         Ok(AgentPage {
             rows: reply
                 .agents
@@ -382,6 +407,7 @@ fn load_agents_blocking(
                 .collect(),
             next: reply.next,
             total: reply.total,
+            archived,
         })
     })
 }
@@ -547,6 +573,7 @@ impl Component for DesktopApp {
                 tree_epoch: 0,
                 agents_next: None,
                 agents_total: 0,
+                archived: nav::Archived::default(),
                 agents_loading: false,
                 list_epoch: 0,
                 pending_select: None,
@@ -577,7 +604,6 @@ impl Component for DesktopApp {
                 items: Rc::new(Vec::new()),
                 items_revision: 0,
                 expanded: HashSet::new(),
-                unseen: 0,
                 end_anchor: ElementRef::new(),
                 composer_ref: ElementRef::new(),
                 pending_local: None,

@@ -78,6 +78,11 @@ impl UiAgent {
         )
     }
 
+    /// Its process may still exist: neither stopped, failed nor lost.
+    pub fn live(&self) -> bool {
+        !matches!(self.state.as_str(), "stopped" | "failed" | "lost")
+    }
+
     /// The owner has something to do: answer a pending request
     /// (`waiting`), or settle an Agent Swarm controls whose state it cannot
     /// prove (`unknown`). An observe-only native child is never counted:
@@ -539,6 +544,34 @@ pub fn chats(agents: &[UiAgent]) -> Vec<&UiAgent> {
     chats
 }
 
+/// Archived Agents the default list leaves out: those still live (not
+/// stopped, failed or lost), those running, and every archived record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Archived {
+    pub live: usize,
+    pub running: usize,
+    pub total: usize,
+}
+
+impl Archived {
+    /// Counts over one `agent.list {archived: only}` page and its total.
+    pub fn of(agents: &[UiAgent], total: usize) -> Self {
+        let mut seen = HashSet::new();
+        let mut archived = Self {
+            total,
+            ..Self::default()
+        };
+        for agent in agents {
+            if !seen.insert(agent.id.as_str()) {
+                continue;
+            }
+            archived.live += usize::from(agent.live());
+            archived.running += usize::from(agent.running());
+        }
+        archived
+    }
+}
+
 /// The fleet line's counts over the listed Agents.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fleet {
@@ -561,16 +594,34 @@ impl Fleet {
         fleet
     }
 
-    /// The line itself: live work, or how quiet the fleet is.
-    pub fn summary(&self, total: usize) -> String {
-        if self.running > 0 {
-            format!("{} running", self.running)
+    /// The line itself: live work, or how quiet the fleet is. `total`
+    /// counts the listed Agents; a live archived Agent still counts, said
+    /// as archived (k98: "No Agents yet" while one was live).
+    pub fn summary(&self, total: usize, archived: Archived) -> String {
+        let running = self.running + archived.running;
+        let agents = |count: usize| if count == 1 { "Agent" } else { "Agents" };
+        if running > 0 {
+            format!("{running} running")
+        } else if total == 0 && archived.live == 0 {
+            if archived.total == 0 {
+                "No Agents yet".to_owned()
+            } else {
+                format!("All quiet · {} archived", archived.total)
+            }
+        } else if archived.live == 0 {
+            format!("All quiet · {total} {}", agents(total))
         } else if total == 0 {
-            "No Agents yet".to_owned()
-        } else {
             format!(
-                "All quiet · {total} {}",
-                if total == 1 { "Agent" } else { "Agents" }
+                "All quiet · {} {} (archived)",
+                archived.live,
+                agents(archived.live)
+            )
+        } else {
+            let all = total + archived.live;
+            format!(
+                "All quiet · {all} {} ({} archived)",
+                agents(all),
+                archived.live
             )
         }
     }
@@ -1182,13 +1233,37 @@ mod tests {
     #[test]
     fn the_fleet_line_reports_work_calmly() {
         let quiet = Fleet::default();
-        assert_eq!(quiet.summary(0), "No Agents yet");
-        assert_eq!(quiet.summary(1), "All quiet · 1 Agent");
+        let none = Archived::default();
+        assert_eq!(quiet.summary(0, none), "No Agents yet");
+        assert_eq!(quiet.summary(1, none), "All quiet · 1 Agent");
+        // k98: an archived Agent that is still live is counted.
+        let idle = with(agent("a1", "/p", None), "idle", 1);
+        let stopped = with(agent("a2", "/p", None), "stopped", 1);
+        let archived = Archived::of(&[idle.clone(), stopped], 2);
+        assert_eq!(
+            archived,
+            Archived {
+                live: 1,
+                running: 0,
+                total: 2
+            }
+        );
+        assert_eq!(quiet.summary(0, archived), "All quiet · 1 Agent (archived)");
+        assert_eq!(
+            quiet.summary(3, archived),
+            "All quiet · 4 Agents (1 archived)"
+        );
+        assert_eq!(
+            quiet.summary(0, Archived::of(&[], 2)),
+            "All quiet · 2 archived"
+        );
+        let busy_archived = Archived::of(&[with(idle, "busy", 1)], 1);
+        assert_eq!(quiet.summary(0, busy_archived), "1 running");
         let busy = Fleet {
             running: 6,
             attention: 1,
         };
-        assert_eq!(busy.summary(40), "6 running");
+        assert_eq!(busy.summary(40, none), "6 running");
         assert_eq!(busy.attention_label(), "1 needs attention");
         assert_eq!(
             Fleet {

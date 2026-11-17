@@ -136,25 +136,27 @@ impl DesktopApp {
         profiles::form_fields(&harness, efforts.as_deref())
     }
 
-    /// The selected preset's Model control: a chip naming its model that
-    /// opens the composer's catalogue picker, filtered to its harness; the
-    /// picker opens right under it.
+    /// The selected preset's Model control: a field styled like the form's
+    /// dropdowns (width, outline, chevron) naming its model, and, while
+    /// open, the composer's catalogue picker filtered to its harness as a
+    /// popover over the rows below it (with a layer a click on closes it).
     fn preset_model_control(
         &self,
         name: &str,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> Option<View> {
+    ) -> Option<(View, Option<View>)> {
         let harness = self.preset_harness(name)?;
         let model = match profiles::field(&self.editor.draft, name, "model") {
             profiles::Field::Simple(model) => Some(model),
             profiles::Field::Absent => None,
             profiles::Field::Complex => {
-                return Some(
+                return Some((
                     m3::secondary("Complex value: edit it as TOML")
                         .vertical_alignment(VerticalAlignment::Center)
                         .into(),
-                );
+                    None,
+                ));
             }
         };
         let label = model
@@ -165,8 +167,7 @@ impl DesktopApp {
                 .launch
                 .preset_target()
                 .is_some_and(|(preset, _)| preset == name);
-        let chip = m3::chip(palette)
-            .horizontal_alignment(HorizontalAlignment::Left)
+        let field = m3::field_button(palette)
             .automation_name(format!(
                 "Profile Model: {label} ({})",
                 if open {
@@ -180,17 +181,27 @@ impl DesktopApp {
                 name.to_owned(),
                 harness,
             ))))
-            .content(m3::icon_label(m3::glyph::MODEL, &format!("{label}  ▾")));
-        let picker: View = if open {
-            self.model_popover(context, palette)
-        } else {
-            View::empty()
-        };
-        Some(
-            StackPanel::new()
-                .spacing(tokens::spacing::SM)
-                .children((chip, picker)),
-        )
+            .content(m3::field_button_content(&label));
+        let popover = open.then(|| {
+            Grid::new().children((
+                Border::new()
+                    .background(Brush::Solid(Color::transparent()))
+                    .on_pointer_pressed(
+                        context.callback(|_: PointerEventInfo| Message::Launch(LaunchMsg::Close)),
+                    ),
+                Border::new()
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .margin(Thickness::new(
+                        tokens::layout::LABEL_WIDTH + tokens::spacing::SM,
+                        tokens::height::FORM_ROW,
+                        0.0,
+                        0.0,
+                    ))
+                    .content(self.model_popover(context, palette)),
+            ))
+        });
+        Some((field, popover))
     }
 
     pub(super) fn profiles_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
@@ -204,9 +215,10 @@ impl DesktopApp {
             .as_deref()
             .map(|name| self.preset_fields(name))
             .unwrap_or_default();
-        let model = selected
+        let (model, model_popover) = selected
             .as_deref()
-            .and_then(|name| self.preset_model_control(name, context, palette));
+            .and_then(|name| self.preset_model_control(name, context, palette))
+            .map_or((None, None), |(field, popover)| (Some(field), popover));
         let count = fields.len();
         let data = ProfilesData {
             file_valid: list.is_none_or(|list| list.valid),
@@ -223,6 +235,7 @@ impl DesktopApp {
             source_open: self.editor.source_open,
             fields,
             model,
+            model_popover,
         };
         let actions = ProfilesActions {
             draft_changed: context

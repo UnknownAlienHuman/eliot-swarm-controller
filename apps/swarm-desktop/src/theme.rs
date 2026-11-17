@@ -491,6 +491,19 @@ pub mod winui {
         }
 
         /// An assist chip: outlined in outline-variant.
+        /// A field that opens a list (the preset Model field): the
+        /// outlined text field's outline and on-surface text, like the
+        /// form's dropdowns.
+        pub fn field_button(self) -> ResourceOverrides {
+            self.with(|s| {
+                Family {
+                    outline: Some(s.outline),
+                    ..Family::new(None, s.on_surface)
+                }
+                .overrides(s)
+            })
+        }
+
         pub fn chip(self) -> ResourceOverrides {
             self.with(|s| {
                 Family {

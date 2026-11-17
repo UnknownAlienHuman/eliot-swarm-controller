@@ -198,6 +198,34 @@ impl DesktopApp {
                             tokens::spacing::XS,
                         )),
                 )),
+                Row::Failure { key, text } => items.push(KeyedView::new(
+                    format!("{key}:{}", self.launch.catalog_loading),
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .column_spacing(tokens::spacing::SM)
+                        .margin(Thickness::new(
+                            tokens::spacing::INSET + tokens::layout::CHECK_COLUMN,
+                            tokens::spacing::XS,
+                            tokens::spacing::SM,
+                            tokens::spacing::XS,
+                        ))
+                        .children((
+                            m3::secondary(text.clone())
+                                .foreground(palette.error())
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text_wrapping(TextWrapping::Wrap),
+                            m3::text_button(palette)
+                                .grid_column(1)
+                                .is_enabled(!self.launch.catalog_loading)
+                                .automation_name(format!("Retry: {text}"))
+                                .on_click(context.message(Message::Launch(LaunchMsg::CatalogRetry)))
+                                .content(m3::label(if self.launch.catalog_loading {
+                                    "Reading…"
+                                } else {
+                                    "Retry"
+                                })),
+                        )),
+                )),
                 Row::Choice(item) => {
                     let highlighted = highlight == Some(item.key.as_str());
                     // Not keyed by the highlight: the highlight is the row's
@@ -643,15 +671,16 @@ impl DesktopApp {
                                 .grid_column(1)
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_trimming(TextTrimming::CharacterEllipsis),
-                            CheckBox::new()
+                            ToggleSwitch::new()
                                 .grid_column(2)
-                                .is_checked(model.visible)
-                                .min_width(0.0)
+                                .width(tokens::layout::SWITCH_WIDTH)
+                                .is_on(model.visible)
+                                .vertical_alignment(VerticalAlignment::Center)
                                 .automation_name(format!(
                                     "Show {} in the model selector",
                                     model.title
                                 ))
-                                .on_is_checked_changed(context.callback(move |on: bool| {
+                                .on_toggled(context.callback(move |on: bool| {
                                     Message::Launch(LaunchMsg::ManageModel {
                                         harness: harness.clone(),
                                         provider: provider.clone(),
@@ -720,7 +749,7 @@ impl DesktopApp {
 }
 
 /// A Manage models group row: its chevron and title collapse it; the
-/// check box shows or hides the whole group.
+/// switch shows or hides the whole group (OpenCode's Manage models).
 fn manage_group_row(
     group: &ManageGroup,
     context: &mut ViewContext<DesktopApp>,
@@ -751,13 +780,13 @@ fn manage_group_row(
                 )),
         );
     let group_key = group.key.clone();
-    let check = CheckBox::new()
+    let check = ToggleSwitch::new()
         .grid_column(1)
-        .is_checked(group.visible)
-        .min_width(0.0)
+        .width(tokens::layout::SWITCH_WIDTH)
+        .is_on(group.visible)
         .vertical_alignment(VerticalAlignment::Center)
         .automation_name(format!("Show every {} model", group.title))
-        .on_is_checked_changed(context.callback(move |on: bool| {
+        .on_toggled(context.callback(move |on: bool| {
             Message::Launch(LaunchMsg::ManageGroup(group_key.clone(), on))
         }));
     Grid::new()

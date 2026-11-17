@@ -428,6 +428,33 @@ pub fn form_row(label: &str, control: View, action: Option<View>) -> View {
         .keyed_children(cells)
 }
 
+/// A form field that opens a list as a popover (the preset Model field):
+/// the dropdowns' width, outline and corner; [`field_button_content`]
+/// puts the value at the left and their chevron at the right.
+pub fn field_button(palette: Palette) -> Button {
+    button(palette.field_button())
+        .width(layout::ENUM_WIDTH)
+        .horizontal_alignment(HorizontalAlignment::Left)
+        .horizontal_content_alignment(HorizontalAlignment::Stretch)
+}
+
+/// A [`field_button`]'s value and chevron.
+pub fn field_button_content(value: &str) -> View {
+    Grid::new()
+        .columns([GridLength::STAR, GridLength::Auto])
+        .column_spacing(spacing::SM)
+        .children((
+            TextBlock::new()
+                .text(value.to_owned())
+                .vertical_alignment(VerticalAlignment::Center)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+            Border::new()
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(icon_sized(glyph::CHEVRON_DOWN, icon_size::CHEVRON)),
+        ))
+}
+
 /// A dropdown sized for an enum value.
 pub fn enum_width(combo: ComboBox) -> ComboBox {
     combo

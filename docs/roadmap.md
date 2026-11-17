@@ -427,9 +427,10 @@ of the explicitly selected release scope.
       stable keys and bounded resident turns and bytes. Live events follow a
       committed `events.bounds` cursor: a limit-1 wake with an explicit `wait_ms`,
       then drains from `next`. A lag or `history_gap` marks the view stale and
-      rereads it; transport failures back off and resnapshot. Jump to latest is
-      explicit. Reactor 0.100.0 has no scroll offset API, so the view does not
-      auto-follow the bottom. (Refs #407)
+      rereads it; transport failures back off and resnapshot. Reactor 0.100.0
+      has no scroll offset or `ViewChanged`, so the view neither auto-follows the
+      bottom nor shows a "N new" jump button it could not hide at the bottom;
+      opening a conversation brings its latest turn into view. (Refs #407)
 - [x] **D3 Swarm monitor.** An openable monitor panel uses one demand-driven
       refresh chain, active only while open. Each refresh reads `agent.list` per
       attention state with observations (with `total` as the exact counter), then
@@ -572,11 +573,14 @@ of the explicitly selected release scope.
       harness, and each OpenCode provider) collapse, remembered in `[desktop]
       collapsed_model_groups`; OpenCode's Manage models (the sliders button at
       the end of the search row) toggles provider groups and single models into
-      `[desktop] model_visibility`, the picker lists only shown models and a
-      search still finds a hidden one, marked hidden. The selected effort
+      `[desktop] model_visibility` with toggle switches, the picker lists only
+      shown models and a search still finds a hidden one, marked hidden. Every
+      picker open revalidates `models.catalog`; a harness whose read failed
+      shows its typed error with Retry. The selected effort
       segment is filled, so it reads on a highlighted search row. Settings ›
       Models & presets picks a preset's model with the same picker filtered to
-      its harness, and its dropdowns carry that harness's real fields (Codex
+      its harness (a field like its dropdowns, the picker over the rows below),
+      and its dropdowns carry that harness's real fields (Codex
       sandbox and approval policy, Claude Code permission mode, Muse approval
       and sandbox, Antigravity mode); no text box offers Windows text
       prediction. Enter sends and Shift+Enter keeps the line break (the window
@@ -586,13 +590,19 @@ of the explicitly selected release scope.
       The message shows at once with "Sending…"/"Starting Codex…" until its
       turn starts. Right-click menus on projects (New task here, Open folder,
       Rename, Collapse/Expand, Remove project) and on tasks and chats (Rename,
-      Stop, Archive/Unarchive, Delete after a confirmation naming it, Copy
-      Agent ID, Open folder) are drawn in the window; Rename writes `[desktop]
+      Stop while live, idle included, Archive/Unarchive, Delete after a
+      confirmation naming it, a live one's "Stop and delete" stopping, waiting
+      until stopped, then deleting, with a refused step's typed error, Copy
+      Agent ID, Open folder) are drawn in the window; archiving the open chat
+      returns to a new task with "Archived · Undo", and the fleet line counts
+      live archived Agents; Rename writes `[desktop]
       display_names`, Remove project the `projects` section. A Chats section
       and "No project (chat)" launch `chat: true`; Archive/Delete call
       `agent.archive`/`agent.delete` and Show archived filters `agent.list`:
       these, and Claude/Antigravity/OpenCode/Muse quota windows (read by shape,
-      shown with reset times and the composer's usage ring), need the k92
+      one line per window such as "Weekly · 43% left · resets in 5 days", a
+      refusal in plain words, Muse's "Shown after a Muse turn" until observed,
+      then "as of HH:MM", and the composer's usage ring), need the k92
       daemon contract and say so on an older daemon. Details and monitor speak
       plain words and hide empty rows (`swarm why`'s origin line stays);
       observed native children nest under their parent and stay out of

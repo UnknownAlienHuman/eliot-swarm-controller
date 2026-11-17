@@ -58,6 +58,8 @@ pub(super) enum LaunchMsg {
     PreviewLoaded(Box<Fallible<eliot_core::RoutingDecision>>),
     /// `models.catalog`, every page.
     CatalogLoaded(Box<Fallible<ModelsCatalogResponse>>),
+    /// A failed harness's Retry: read the catalogue again.
+    CatalogRetry,
     /// Open a popover, or close it when it is the one open.
     Toggle(Pop),
     /// Close the open popover (a click outside it, Esc).
@@ -307,9 +309,17 @@ impl DesktopApp {
             LaunchMsg::WorkspaceChanged(text) => self.launch.workspace = text,
             LaunchMsg::CatalogLoaded(reply) => {
                 self.launch.catalog_loading = false;
-                self.launch.catalog = Some(*reply);
+                // Stale while revalidating: a failed refresh keeps the last
+                // catalogue it read and says why.
+                match (*reply, self.launch.catalog.as_ref()) {
+                    (Err(error), Some(Ok(_))) => {
+                        self.set_status(format!("Models not refreshed: {error}"));
+                    }
+                    (reply, _) => self.launch.catalog = Some(reply),
+                }
                 self.keep_highlight();
             }
+            LaunchMsg::CatalogRetry => self.load_catalog(context),
             LaunchMsg::Toggle(pop) => {
                 if self.launch.open == Some(pop) {
                     self.close_popover();
@@ -371,9 +381,7 @@ impl DesktopApp {
                 self.launch.open = Some(Pop::Manage);
                 self.launch.manage_query.clear();
                 crate::shortcuts::set_popover(HookPopover::Menu);
-                if self.launch.catalog.is_none() || matches!(self.launch.catalog, Some(Err(_))) {
-                    self.load_catalog(context);
-                }
+                self.load_catalog(context);
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
             }
             LaunchMsg::ManageClosed => {
@@ -514,9 +522,10 @@ impl DesktopApp {
             Pop::Model => {
                 self.launch.query.clear();
                 self.launch.highlight = picker::initial(&self.picker_rows());
-                if self.launch.catalog.is_none() || matches!(self.launch.catalog, Some(Err(_))) {
-                    self.load_catalog(context);
-                }
+                // Every open revalidates (the daemon serves a complete
+                // catalogue from its cache and reads a failed harness again);
+                // the rows show the last read meanwhile.
+                self.load_catalog(context);
                 crate::shortcuts::set_popover(HookPopover::Picker);
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
                 self.reveal(context);

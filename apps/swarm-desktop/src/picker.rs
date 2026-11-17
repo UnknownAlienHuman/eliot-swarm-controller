@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 
 use eliot_core::api::{
-    HarnessEntry, ModelsCatalogEntry, ModelsCatalogResponse, ProfileSummary, catalog_matches,
+    HarnessEntry, ModelsCatalogEntry, ModelsCatalogFailure, ModelsCatalogResponse, ProfileSummary,
+    catalog_matches,
 };
 
 use crate::settings::{ModelRef, Preferences};
@@ -232,6 +233,12 @@ pub enum Row {
         key: String,
         text: String,
     },
+    /// A harness whose catalogue read failed (`models.catalog` failures):
+    /// its typed error and a Retry action.
+    Failure {
+        key: String,
+        text: String,
+    },
     Choice(Item),
 }
 
@@ -239,7 +246,10 @@ impl Row {
     #[cfg(test)]
     pub fn key(&self) -> &str {
         match self {
-            Self::Heading { key, .. } | Self::Provider { key, .. } | Self::Note { key, .. } => key,
+            Self::Heading { key, .. }
+            | Self::Provider { key, .. }
+            | Self::Note { key, .. }
+            | Self::Failure { key, .. } => key,
             Self::Choice(item) => &item.key,
         }
     }
@@ -432,14 +442,24 @@ fn harness_rows(
     if models.is_empty() {
         if named {
             rows.push(group_heading(inputs, code, label, &version, searching));
-            rows.push(note(
-                &format!("{code}:none"),
-                if all.is_empty() {
-                    "No models reported by this harness right now."
-                } else {
-                    "Every model is hidden. Manage models shows them again."
-                },
-            ));
+            match reply
+                .failures
+                .iter()
+                .find(|failure| failure.harness == code)
+            {
+                Some(failure) if all.is_empty() => rows.push(Row::Failure {
+                    key: format!("failure:{code}"),
+                    text: failure_text(label, failure),
+                }),
+                _ => rows.push(note(
+                    &format!("{code}:none"),
+                    if all.is_empty() {
+                        "No models reported by this harness right now."
+                    } else {
+                        "Every model is hidden. Manage models shows them again."
+                    },
+                )),
+            }
         }
         return;
     }
@@ -481,6 +501,20 @@ fn harness_rows(
         item.hidden = !visible(inputs, model);
         rows.push(Row::Choice(item));
     }
+}
+
+/// A failed harness read in plain words, with its typed code.
+pub fn failure_text(label: &str, failure: &ModelsCatalogFailure) -> String {
+    let why = match failure.code.as_str() {
+        "busy" => "Swarm was busy reading other harnesses".to_owned(),
+        _ if failure.message.trim().is_empty() => "the read failed".to_owned(),
+        _ => failure.message.trim().trim_end_matches('.').to_owned(),
+    };
+    format!(
+        "{label} models could not be read: {why} ({}, {}).",
+        failure.code,
+        failure.origin.as_str()
+    )
 }
 
 /// Whether Manage models shows `model`.
@@ -985,6 +1019,48 @@ mod tests {
             ttl_ms: HARNESS_READ_TTL_MS,
             failures: Vec::new(),
         })
+    }
+
+    #[test]
+    fn a_failed_harness_read_shows_its_error_not_an_empty_catalogue() {
+        // k98: the connect-time Codex read was refused `busy`; the picker
+        // said "No models reported" until the daemon cache expired.
+        let mut read = catalog();
+        if let Ok(reply) = read.as_mut() {
+            reply.models.retain(|model| model.harness != "codex");
+            reply.failures.push(ModelsCatalogFailure {
+                harness: "codex".to_owned(),
+                code: "busy".to_owned(),
+                message: "metadata_readers in-flight bound reached (limit=4)".to_owned(),
+                origin: eliot_core::FailureOrigin::Swarm,
+            });
+        }
+        let rows = rows(&Inputs {
+            catalog: Some(&read),
+            query: "",
+            prefs: &Preferences::default(),
+            only_harness: None,
+            presets: &[],
+            current: &Choice::Auto,
+            auto_detail: "",
+            efforts: &HashMap::new(),
+            claude_efforts: &[],
+        });
+        let failure = rows
+            .iter()
+            .find_map(|row| match row {
+                Row::Failure { key, text } if key == "failure:codex" => Some(text.clone()),
+                _ => None,
+            })
+            .expect("a Codex failure row");
+        assert!(failure.starts_with("Codex models could not be read"));
+        assert!(failure.contains("(busy, swarm)"));
+        assert!(!rows.iter().any(|row| row.key() == "note:codex:none"));
+        assert!(
+            rows.iter()
+                .filter_map(Row::choosable)
+                .all(|item| item.key != "failure:codex")
+        );
     }
 
     fn prefs_with_recent() -> Preferences {

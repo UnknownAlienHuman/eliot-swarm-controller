@@ -657,6 +657,68 @@ fn selection_controls(s: &Scheme) -> Vec<(&'static str, Value)> {
         ],
         clear(s),
     ));
+    all.extend(switches(s));
+    all
+}
+
+/// Switches in M3 switch roles: selected, a primary track with an
+/// on-primary handle; unselected, a surface-container-highest track with an
+/// outline border and an outline handle; disabled at 12% / 38% on-surface.
+fn switches(s: &Scheme) -> Vec<(&'static str, Value)> {
+    let mut all = every(
+        &[
+            "ToggleSwitchFillOn",
+            "ToggleSwitchFillOnPointerOver",
+            "ToggleSwitchFillOnPressed",
+            "ToggleSwitchStrokeOn",
+            "ToggleSwitchStrokeOnPointerOver",
+            "ToggleSwitchStrokeOnPressed",
+        ],
+        opaque(s.primary),
+    );
+    all.extend(every(
+        &[
+            "ToggleSwitchKnobFillOn",
+            "ToggleSwitchKnobFillOnPointerOver",
+            "ToggleSwitchKnobFillOnPressed",
+        ],
+        opaque(s.on_primary),
+    ));
+    all.extend(every(
+        &[
+            "ToggleSwitchFillOff",
+            "ToggleSwitchFillOffPointerOver",
+            "ToggleSwitchFillOffPressed",
+        ],
+        opaque(s.surface_container_highest),
+    ));
+    all.extend(every(
+        &[
+            "ToggleSwitchStrokeOff",
+            "ToggleSwitchStrokeOffPointerOver",
+            "ToggleSwitchStrokeOffPressed",
+            "ToggleSwitchKnobFillOff",
+            "ToggleSwitchKnobFillOffPointerOver",
+            "ToggleSwitchKnobFillOffPressed",
+        ],
+        opaque(s.outline),
+    ));
+    all.extend(every(
+        &[
+            "ToggleSwitchFillOnDisabled",
+            "ToggleSwitchStrokeOffDisabled",
+            "ToggleSwitchStrokeOnDisabled",
+        ],
+        layer(s.on_surface, state::DISABLED_CONTAINER),
+    ));
+    all.extend(every(
+        &[
+            "ToggleSwitchKnobFillOffDisabled",
+            "ToggleSwitchKnobFillOnDisabled",
+        ],
+        layer(s.on_surface, state::DISABLED_CONTENT),
+    ));
+    all.push(("ToggleSwitchFillOffDisabled", clear(s)));
     all
 }
 
@@ -807,6 +869,9 @@ pub fn dictionary_xaml(scheme: &Scheme) -> String {
 /// - `AccentButtonStyle`: the hand-off dialog's primary, which keeps the
 ///   theme's filled colors there (based on WinUI's own AccentButtonStyle).
 ///
+/// Switches carry no On/Off words and no 154-DIP minimum: a Manage
+/// models row ends in the bare switch (OpenCode's dialog).
+///
 /// Text fields never offer Windows text
 /// prediction or spell check (`IsTextPredictionEnabled`,
 /// `IsSpellCheckEnabled` false: owner review 2026-11-16, prediction junk in
@@ -858,6 +923,11 @@ pub fn styles_xaml() -> String {
          </Style>\
          <Style TargetType=\"CheckBox\">\
            <Setter Property=\"CornerRadius\" Value=\"{check}\"/>\
+         </Style>\
+         <Style TargetType=\"ToggleSwitch\">\
+           <Setter Property=\"OnContent\" Value=\"\"/>\
+           <Setter Property=\"OffContent\" Value=\"\"/>\
+           <Setter Property=\"MinWidth\" Value=\"0\"/>\
          </Style>\
          <Style TargetType=\"ContentDialog\">\
            <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
@@ -1404,7 +1474,10 @@ mod tests {
             assert!(xaml.contains(&format!("x:Key=\"{key}\"")), "{key}");
         }
         assert!(!xaml.contains("ThemeResource"));
-        assert_eq!(xaml.matches("<Style ").count(), 11);
+        // The four button shapes, seven implicit control styles and the
+        // switch without On/Off words.
+        assert_eq!(xaml.matches("<Style ").count(), 12);
+        assert!(xaml.contains("<Style TargetType=\"ToggleSwitch\">"));
         // Only the token radii appear: control, container, the Send circle
         // and the M3 check box.
         for radius in xaml

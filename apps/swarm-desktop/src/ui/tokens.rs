@@ -87,6 +87,8 @@ pub mod icon {
     pub const ROW: f64 = 16.0;
     /// In toolbars: the conversation and panel headers.
     pub const TOOLBAR: f64 = 20.0;
+    /// A dropdown's chevron (WinUI's ComboBox draws it at 12).
+    pub const CHEVRON: f64 = 12.0;
 }
 
 /// Widths and the few fixed sizes of the shell.
@@ -144,6 +146,10 @@ pub mod layout {
     pub const POPOVER_LIST_HEIGHT: f64 = 360.0;
     /// The check column of a popover row.
     pub const CHECK_COLUMN: f64 = 16.0;
+    /// A switch's pill: WinUI's ToggleSwitch template keeps a 154-DIP
+    /// content area after it (a StaticResource minimum), so a bare switch
+    /// is sized to the pill and ends flush with its row.
+    pub const SWITCH_WIDTH: f64 = 40.0;
     /// A quota ring (Models & Usage).
     pub const RING: f64 = 32.0;
 }

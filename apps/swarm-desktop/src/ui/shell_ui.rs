@@ -162,6 +162,9 @@ pub(super) struct ShellState {
     pub(super) tree_epoch: u64,
     pub(super) agents_next: Option<String>,
     pub(super) agents_total: usize,
+    /// Archived Agents the list leaves out (the fleet line counts the
+    /// live ones); empty while Show archived lists them.
+    pub(super) archived: nav::Archived,
     pub(super) agents_loading: bool,
     /// Tags agent-list loads; a reply for an older request is dropped.
     pub(super) list_epoch: u64,
@@ -303,6 +306,9 @@ impl DesktopApp {
                         }
                         self.nav.agents_next = page.next;
                         self.nav.agents_total = page.total;
+                        if !append {
+                            self.nav.archived = page.archived;
+                        }
                         // A just-launched Agent may not be on this page yet;
                         // its id is already the selection.
                         if let Some(wanted) = self.nav.pending_select.take()
@@ -664,7 +670,6 @@ impl DesktopApp {
         self.chat.live = LiveStatus::Idle;
         self.chat.items = Rc::new(Vec::new());
         self.chat.items_revision = 0;
-        self.chat.unseen = 0;
         if self.panel == Panel::Details {
             self.close_panel();
         }
@@ -1695,7 +1700,7 @@ impl DesktopApp {
     /// The fleet in one calm row ("6 running", "All quiet · 40 Agents");
     /// it opens the monitor.
     fn fleet_row(&self, fleet: Fleet, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let summary = fleet.summary(self.nav.agents_total);
+        let summary = fleet.summary(self.nav.agents_total, self.nav.archived);
         let dot = if fleet.running > 0 {
             palette
                 .dot(StatusTone::Active)

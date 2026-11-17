@@ -27,7 +27,6 @@ pub(super) enum ChatMsg {
     RereadLoaded(u64, Result<Box<Reread>, (String, Invalidation)>),
     RereadRetry(u64),
     LoadOlderRequested,
-    JumpToLatest,
     /// Bring the latest turn into view once it is realized (epoch, tries).
     FollowLatest(u64, u32),
     ToolsToggled(String, bool),
@@ -189,10 +188,9 @@ pub(super) struct ChatState {
     pub(super) items: Rc<Vec<Rc<RenderedItem>>>,
     pub(super) items_revision: u64,
     pub(super) expanded: HashSet<String>,
-    pub(super) unseen: usize,
     /// A button of the latest turn, rendered outside the virtualized
-    /// repeater so it always exists: "Jump to latest" focuses it, and WinUI
-    /// brings a focused control into view (Reactor 0.100.0 exposes no
+    /// repeater so it always exists: opening a conversation focuses it, and
+    /// WinUI brings a focused control into view (Reactor 0.100.0 exposes no
     /// ScrollViewer offset or ChangeView).
     pub(super) end_anchor: ElementRef<Button>,
     /// The composer, focused again after input is admitted, a launch and New.
@@ -280,7 +278,6 @@ impl DesktopApp {
                         self.rebuild_items();
                         if first_load {
                             // Opened at the newest turn, like a chat.
-                            self.chat.unseen = 0;
                             self.follow_latest(0, context);
                         }
                         self.set_status("Retained history loaded; following live events.");
@@ -397,14 +394,6 @@ impl DesktopApp {
                 self.chat.depth = self.chat.depth.older();
                 self.set_status("Loading older retained history…");
                 self.start_snapshot(context);
-            }
-            ChatMsg::JumpToLatest => {
-                self.chat.unseen = 0;
-                if !self.chat.end_anchor.request_focus() {
-                    self.set_status(
-                        "Jump to latest: the latest turn has no control to move to yet.",
-                    );
-                }
             }
             ChatMsg::FollowLatest(epoch, tries) => {
                 if epoch != self.chat.epoch {
@@ -951,19 +940,6 @@ impl DesktopApp {
             .map(Conversation::items)
             .unwrap_or_default();
         let rendered = self.chat.render_cache.render(&items, &self.chat.docs);
-        let previous: HashSet<&str> = self
-            .chat
-            .items
-            .iter()
-            .map(|item| item.key.as_str())
-            .collect();
-        let added = rendered
-            .iter()
-            .filter(|item| !previous.contains(item.key.as_str()))
-            .count();
-        if !self.chat.items.is_empty() {
-            self.chat.unseen += added;
-        }
         self.chat.items_revision = views::key_revision(&rendered);
         self.chat.items = Rc::new(rendered);
         let live: HashSet<u64> = items
@@ -1125,7 +1101,6 @@ impl DesktopApp {
         self.chat.detail = None;
         self.chat.depth = Depth::default();
         self.chat.failures = 0;
-        self.chat.unseen = 0;
         self.chat.items = Rc::new(Vec::new());
         self.chat.live = LiveStatus::Loading;
         self.chat.confirm_force = None;
@@ -1208,18 +1183,6 @@ impl DesktopApp {
                     .into()
             }
         };
-        let jump: View = if self.chat.unseen > 0 && !self.chat.items.is_empty() {
-            let label = format!("{} new", self.chat.unseen);
-            m3::outlined(palette)
-                .grid_row(2)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                .automation_name(format!("Jump to latest, {label}"))
-                .on_click(context.message(Message::Chat(ChatMsg::JumpToLatest)))
-                .content(m3::icon_label(m3::glyph::ARROW_DOWN, &label))
-        } else {
-            View::empty()
-        };
         let pending = self.pending_view(column, context, palette);
         let alert: View = match (&self.chat.confirm_force, &self.alert) {
             (Some((bound, title)), _) => {
@@ -1255,7 +1218,9 @@ impl DesktopApp {
                                 .content(m3::icon(m3::glyph::CLOSE)),
                         )),
                 ),
-            (None, None) => View::empty(),
+            (None, None) => self
+                .archived_notice(column, context, palette)
+                .unwrap_or_else(View::empty),
         };
         let composer = self.composer_view(column, context, palette);
         // An open popover sits in its own row right above the composer (the
@@ -1287,7 +1252,6 @@ impl DesktopApp {
                 header,
                 body,
                 dismiss,
-                jump,
                 pending,
                 alert,
                 popover,
@@ -1884,11 +1848,7 @@ impl DesktopApp {
             return View::empty();
         };
         let label = crate::picker::harness_label(&harness);
-        let note = window.reset_note(crate::handoff::now_ms());
-        let tip = format!(
-            "{label}: {} {}% left. {note}",
-            window.label, window.remaining
-        );
+        let tip = format!("{label}: {}", window.line(crate::handoff::now_ms()));
         m3::text_button(palette)
             .height(tokens::height::CONTROL)
             .automation_name(format!("Usage: {tip}"))

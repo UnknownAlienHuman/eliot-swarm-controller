@@ -1,8 +1,13 @@
 //! The sidebar's right-click menus (owner review 2026-11-16): a project's
 //! New task here, Open folder, Rename, Collapse or Expand and Remove
-//! project; a chat's or task's Rename, Stop (while it runs), Archive or
-//! Unarchive, Delete (stopped only, after a confirmation naming it), Copy
-//! Agent ID and Open folder.
+//! project; a chat's or task's Rename, Stop (while it is live, idle
+//! included), Archive or Unarchive, Delete, Copy Agent ID and Open folder.
+//!
+//! Delete asks once, naming the chat. A live chat's Delete is "Stop and
+//! delete" (k98): stop, wait until the Agent reads stopped, then
+//! `agent.delete`; the dialog shows each step and a refused step's typed
+//! error. Archiving the open chat returns to New task with an
+//! "Archived · Undo" notice (the Codex app's archive).
 //!
 //! Reactor 0.100.0 attaches a `Menu` only as a Button's left-click flyout
 //! and has no `ContextFlyout`, so the menu is drawn in the window, at the
@@ -83,6 +88,21 @@ pub(super) enum MenuMsg {
     Done(String, Fallible<String>),
     /// Put the keyboard in the rename field (tries left).
     FocusRename(u8),
+    /// Stop and delete: the stop was submitted (its outcome).
+    RemovalStopped(Fallible<String>),
+    /// Stop and delete: the Agent reads stopped (its state), or not.
+    RemovalSettled(Fallible<String>),
+    /// Stop and delete: `agent.delete` settled.
+    RemovalDeleted(Fallible<String>),
+    /// Close the Stop and delete dialog after a refused step.
+    RemovalClosed,
+    /// `agent.archive` settled (the Agent, archived or not, whether to
+    /// reopen its conversation, the outcome).
+    Archived(UiAgent, bool, bool, Fallible<usize>),
+    /// The "Archived · Undo" notice's Undo.
+    UndoArchive,
+    /// The notice was closed, or its time ran out (its epoch).
+    ArchivedNoticeClosed(Option<u64>),
     /// A left press on a row: nothing to do here (its button acts).
     Ignored,
 }
@@ -95,7 +115,56 @@ pub(super) struct MenuState {
     pub(super) renaming: Option<(Target, String)>,
     pub(super) confirm: Option<(Target, Action)>,
     pub(super) rename_ref: ElementRef<TextBox>,
+    /// A live Agent's Stop and delete in progress (its dialog stays open).
+    pub(super) removal: Option<Removal>,
+    /// "Archived · Undo" after an archive: the Agent, whether it was the
+    /// open conversation, and the notice's epoch (it expires).
+    pub(super) archived: Option<(UiAgent, bool, u64)>,
+    pub(super) archived_epoch: u64,
 }
+
+/// A live Agent's Stop and delete: the step it is at, and a refused step's
+/// typed error.
+#[derive(Clone, Debug)]
+pub(super) struct Removal {
+    pub(super) agent: UiAgent,
+    /// The stop command's id: `agent.delete` refuses while it is open.
+    pub(super) command: String,
+    pub(super) step: RemovalStep,
+    pub(super) error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RemovalStep {
+    Stopping,
+    Waiting,
+    Deleting,
+}
+
+impl RemovalStep {
+    fn progress(self) -> &'static str {
+        match self {
+            Self::Stopping => "Stopping…",
+            Self::Waiting => "Waiting for it to stop…",
+            Self::Deleting => "Deleting…",
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            Self::Stopping => "Stop",
+            Self::Waiting => "Waiting for the stop",
+            Self::Deleting => "Delete",
+        }
+    }
+}
+
+/// How long Stop and delete waits for the Agent to read stopped.
+const REMOVAL_WAIT_MS: u64 = 60_000;
+/// Between two reads of the stopping Agent.
+const REMOVAL_POLL_MS: u64 = 400;
+/// How long the "Archived · Undo" notice stays.
+const ARCHIVED_NOTICE_MS: u64 = 10_000;
 
 /// The menu's width.
 const MENU_WIDTH: f64 = 220.0;
@@ -168,8 +237,293 @@ impl DesktopApp {
                     self.focus_rename(tries - 1, context);
                 }
             }
+            MenuMsg::RemovalStopped(outcome) => self.removal_stopped(outcome, context),
+            MenuMsg::RemovalSettled(outcome) => self.removal_settled(outcome, context),
+            MenuMsg::RemovalDeleted(outcome) => {
+                self.settle_mutation(
+                    outcome
+                        .as_ref()
+                        .err()
+                        .is_none_or(|error| !crate::state::uncertain(error)),
+                );
+                match outcome {
+                    Ok(note) => {
+                        let title = self
+                            .menu
+                            .removal
+                            .take()
+                            .map(|removal| self.agent_label(&removal.agent))
+                            .unwrap_or_default();
+                        self.set_status(format!("Stopped and deleted “{title}”: {note}."));
+                    }
+                    Err(error) => self.removal_failed(error),
+                }
+                self.shell_update(ShellMsg::RefreshRequested, context);
+            }
+            MenuMsg::RemovalClosed => {
+                self.menu.removal = None;
+                self.shell_update(ShellMsg::RefreshRequested, context);
+            }
+            MenuMsg::Archived(agent, archived, reopen, outcome) => {
+                self.settle_mutation(
+                    outcome
+                        .as_ref()
+                        .err()
+                        .is_none_or(|error| !crate::state::uncertain(error)),
+                );
+                let what = if archived { "Archive" } else { "Unarchive" };
+                match outcome {
+                    Ok(_) if archived => {
+                        let open = self.selected_agent_id().as_deref() == Some(agent.id.as_str());
+                        if open {
+                            // The Codex app's archive: back to a new task.
+                            self.new_task(context);
+                        }
+                        self.menu.archived_epoch += 1;
+                        let epoch = self.menu.archived_epoch;
+                        self.set_status(format!("Archived “{}”.", self.agent_label(&agent)));
+                        self.menu.archived = Some((agent, open, epoch));
+                        let _task = context.spawn_background(move |cancel| {
+                            let cancelled = || cancel.is_cancelled();
+                            let _ = feed::backoff(ARCHIVED_NOTICE_MS, &cancelled);
+                            Message::Menu(MenuMsg::ArchivedNoticeClosed(Some(epoch)))
+                        });
+                    }
+                    Ok(_) => {
+                        self.menu.archived = None;
+                        self.set_status(format!("Unarchived “{}”.", self.agent_label(&agent)));
+                        if reopen {
+                            let mut agent = agent;
+                            agent.archived = false;
+                            self.shell_update(ShellMsg::AgentOpened(agent), context);
+                        }
+                    }
+                    Err(error) if crate::state::uncertain(&error) => self.alert(format!(
+                        "{what}: not confirmed (trying again reuses its id): {error}"
+                    )),
+                    Err(error) => self.alert(format!("{what} refused: {error}")),
+                }
+                self.shell_update(ShellMsg::RefreshRequested, context);
+            }
+            MenuMsg::UndoArchive => {
+                if let Some((agent, open, _)) = self.menu.archived.take() {
+                    self.submit_archive(agent, false, open, context);
+                }
+            }
+            MenuMsg::ArchivedNoticeClosed(epoch) => {
+                if epoch.is_none()
+                    || self
+                        .menu
+                        .archived
+                        .as_ref()
+                        .is_some_and(|(_, _, shown)| Some(*shown) == epoch)
+                {
+                    self.menu.archived = None;
+                }
+            }
             MenuMsg::Ignored => {}
         }
+    }
+
+    /// Stop and delete of a live Agent, step one: submit its stop.
+    fn start_removal(&mut self, agent: UiAgent, context: &ComponentContext<Self>) {
+        if self.submitting() {
+            self.alert("Waiting for the last action to settle.");
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let bound = BoundAction::agent_control(&agent.id, agent.generation);
+        let key = format!("stop:{}:{}:false", bound.agent, bound.generation);
+        let mutation_id = self.ledger.id_for(&key);
+        self.in_flight_key = Some(key);
+        self.set_status(format!("Stop ({mutation_id})…"));
+        self.menu.removal = Some(Removal {
+            agent,
+            command: mutation_id.clone(),
+            step: RemovalStep::Stopping,
+            error: None,
+        });
+        let _task = context.spawn_background(move |_| {
+            Message::Menu(MenuMsg::RemovalStopped(
+                client::block_on(client::submit_stop(
+                    &data_dir,
+                    mutation_id,
+                    &bound.agent,
+                    bound.generation,
+                    false,
+                ))
+                .map(|reply| submit_note(&reply))
+                .map_err(|error| error.to_string()),
+            ))
+        });
+    }
+
+    /// Step two: wait until the stop command has settled and the Agent
+    /// reads stopped (bounded): `agent.delete` refuses `busy` while either
+    /// is still open.
+    fn removal_stopped(&mut self, outcome: Fallible<String>, context: &ComponentContext<Self>) {
+        self.settle_mutation(
+            outcome
+                .as_ref()
+                .err()
+                .is_none_or(|error| !crate::state::uncertain(error)),
+        );
+        if let Err(error) = outcome {
+            self.removal_failed(error);
+            return;
+        }
+        let (Some(removal), Ok(data_dir)) = (self.menu.removal.as_mut(), self.data_dir.clone())
+        else {
+            return;
+        };
+        removal.step = RemovalStep::Waiting;
+        let id = removal.agent.id.clone();
+        let command = removal.command.clone();
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let mut waited = 0;
+            let outcome = loop {
+                let read = client::block_on(async {
+                    let stop = client::read_command(&data_dir, &command).await?;
+                    let agent = client::get_agent(&data_dir, &id).await?;
+                    Ok::<_, eliot_core::Error>((stop.state, agent.agent.state))
+                });
+                match read {
+                    Ok((stop, state)) => {
+                        use eliot_core::{AgentState, CommandState};
+                        if matches!(stop, CommandState::Rejected | CommandState::Failed) {
+                            break Err(format!(
+                                "stop_{}: the stop did not apply; nothing was deleted",
+                                format!("{stop:?}").to_lowercase()
+                            ));
+                        }
+                        let stopped = matches!(
+                            state,
+                            AgentState::Stopped | AgentState::Failed | AgentState::Lost
+                        );
+                        if stop.is_terminal() && stopped {
+                            break Ok(format!("{state:?}").to_lowercase());
+                        }
+                        if waited >= REMOVAL_WAIT_MS {
+                            break Err(format!(
+                                "timeout: Agent {}, stop {} after {} s; nothing was deleted",
+                                format!("{state:?}").to_lowercase(),
+                                format!("{stop:?}").to_lowercase(),
+                                REMOVAL_WAIT_MS / 1000
+                            ));
+                        }
+                    }
+                    Err(error) => break Err(error.to_string()),
+                }
+                if !feed::backoff(REMOVAL_POLL_MS, &cancelled) {
+                    break Err("cancelled: the window stopped waiting".to_owned());
+                }
+                waited += REMOVAL_POLL_MS;
+            };
+            Message::Menu(MenuMsg::RemovalSettled(outcome))
+        });
+    }
+
+    /// Step three: the Agent is stopped, so `agent.delete` it. The Store
+    /// refuses `busy` until the stopped generation's processes and sources
+    /// are released; such a definite refusal records nothing, so the same
+    /// mutation id asks again (bounded) and any other outcome is final.
+    fn removal_settled(&mut self, outcome: Fallible<String>, context: &ComponentContext<Self>) {
+        if let Err(error) = outcome {
+            self.removal_failed(error);
+            return;
+        }
+        let Some(agent) = self
+            .menu
+            .removal
+            .as_ref()
+            .map(|removal| removal.agent.clone())
+        else {
+            return;
+        };
+        if self.submitting() {
+            self.removal_failed("busy: waiting for the last action to settle".to_owned());
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.selected_agent_id().as_deref() == Some(agent.id.as_str()) {
+            self.new_task(context);
+        }
+        if let Some(removal) = self.menu.removal.as_mut() {
+            removal.step = RemovalStep::Deleting;
+        }
+        let key = format!("delete:{}", agent.id);
+        let mutation_id = self.ledger.id_for(&key);
+        self.in_flight_key = Some(key);
+        let id = agent.id;
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let mut waited = 0;
+            let outcome = loop {
+                match client::block_on(client::delete_agent(&data_dir, mutation_id.clone(), &id)) {
+                    Ok(count) => break Ok(format!("{count} record tree(s) removed")),
+                    Err(error) if error.code == "busy" && waited < REMOVAL_WAIT_MS => {}
+                    Err(error) => break Err(error.to_string()),
+                }
+                if !feed::backoff(REMOVAL_POLL_MS, &cancelled) {
+                    break Err("cancelled: the window stopped waiting".to_owned());
+                }
+                waited += REMOVAL_POLL_MS;
+            };
+            Message::Menu(MenuMsg::RemovalDeleted(outcome))
+        });
+    }
+
+    /// A refused (or unconfirmed) step: its typed error, in the dialog.
+    fn removal_failed(&mut self, error: String) {
+        let Some(removal) = self.menu.removal.as_mut() else {
+            self.alert(error);
+            return;
+        };
+        let what = removal.step.what();
+        removal.error = Some(if crate::state::uncertain(&error) {
+            format!("{what}: not confirmed (trying again reuses its id): {error}")
+        } else {
+            format!("{what} refused: {error}")
+        });
+        let line = removal.error.clone().unwrap_or_default();
+        self.set_status(line);
+    }
+
+    /// `agent.archive` (or unarchive) with a ledger-held mutation id.
+    fn submit_archive(
+        &mut self,
+        agent: UiAgent,
+        archived: bool,
+        reopen: bool,
+        context: &ComponentContext<Self>,
+    ) {
+        if self.submitting() {
+            self.alert("Waiting for the last action to settle.");
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let key = format!("archive:{}:{archived}", agent.id);
+        let mutation_id = self.ledger.id_for(&key);
+        self.in_flight_key = Some(key);
+        let what = if archived { "Archive" } else { "Unarchive" };
+        self.set_status(format!("{what} ({mutation_id})…"));
+        let _task = context.spawn_background(move |_| {
+            let outcome = client::block_on(client::archive_agent(
+                &data_dir,
+                mutation_id,
+                &agent.id,
+                archived,
+            ))
+            .map_err(|error| error.to_string());
+            Message::Menu(MenuMsg::Archived(agent, archived, reopen, outcome))
+        });
     }
 
     pub(super) fn close_menu(&mut self) {
@@ -220,14 +574,7 @@ impl DesktopApp {
                 });
             }
             (Action::Archive(archived), Target::Agent(agent)) => {
-                let what = if archived { "Archive" } else { "Unarchive" };
-                let agent = agent.id.clone();
-                let key = format!("archive:{agent}:{archived}");
-                self.submit_lifecycle(what, key, context, move |data_dir, id| {
-                    client::block_on(client::archive_agent(data_dir, id, &agent, archived))
-                        .map(|count| format!("{count} Agent(s)"))
-                        .map_err(|error| error.to_string())
-                });
+                self.submit_archive(agent.clone(), archived, false, context);
             }
             _ => {}
         }
@@ -240,6 +587,9 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
     ) {
         match (action, target) {
+            (Action::Delete, Target::Agent(agent)) if agent.live() => {
+                self.start_removal(agent, context);
+            }
             (Action::Delete, Target::Agent(agent)) => {
                 if self.selected_agent_id().as_deref() == Some(agent.id.as_str()) {
                     self.new_task(context);
@@ -369,7 +719,7 @@ impl DesktopApp {
                     m3::glyph::RENAME,
                     false,
                 )];
-                if agent.running() && !agent.native_child {
+                if agent.live() && !agent.native_child {
                     entries.push((Action::Stop, "Stop".to_owned(), m3::glyph::STOP, false));
                 }
                 if !agent.native_child {
@@ -389,10 +739,15 @@ impl DesktopApp {
                         )
                     });
                 }
-                if agent.state == "stopped" && !agent.native_child {
+                if !agent.native_child {
                     entries.push((
                         Action::Delete,
-                        "Delete…".to_owned(),
+                        if agent.live() {
+                            "Stop and delete…"
+                        } else {
+                            "Delete…"
+                        }
+                        .to_owned(),
                         m3::glyph::DELETE,
                         true,
                     ));
@@ -419,6 +774,9 @@ impl DesktopApp {
     /// The window-wide layer: the open menu at the pointer (a press outside
     /// closes it) or the confirmation dialog over a scrim.
     pub(super) fn menu_overlay(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        if let Some(removal) = &self.menu.removal {
+            return self.removal_dialog(removal, context, palette);
+        }
         if let Some((target, action)) = &self.menu.confirm {
             return self.confirm_dialog(target, *action, context, palette);
         }
@@ -473,7 +831,13 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
+        let live = matches!(target, Target::Agent(agent) if agent.live());
         let (title, body, button) = match action {
+            Action::Delete if live => (
+                format!("Stop and delete “{}”?", target.title()),
+                "Swarm stops it, waits until it has stopped, then removes its conversation and records for good. Its folder, files and branches stay.",
+                "Stop and delete",
+            ),
             Action::Delete => (
                 format!("Delete “{}”?", target.title()),
                 "Its conversation and records leave Swarm for good. Its folder, files and branches stay.",
@@ -517,6 +881,112 @@ impl DesktopApp {
                     )),
                 ),
         ))
+    }
+
+    /// Stop and delete in progress: the step it is at, or a refused step's
+    /// typed error and Close.
+    fn removal_dialog(
+        &self,
+        removal: &Removal,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let title = format!("Stop and delete “{}”", self.agent_label(&removal.agent));
+        let status: View = match &removal.error {
+            Some(error) => m3::body(error.clone())
+                .foreground(palette.error())
+                .text_wrapping(TextWrapping::Wrap)
+                .is_text_selection_enabled(true)
+                .into(),
+            None => StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::SM)
+                .children((
+                    ProgressRing::new()
+                        .is_indeterminate(true)
+                        .width(16.0)
+                        .height(16.0)
+                        .vertical_alignment(VerticalAlignment::Center),
+                    m3::secondary(removal.step.progress())
+                        .vertical_alignment(VerticalAlignment::Center),
+                )),
+        };
+        let close: View = if removal.error.is_some() {
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .children((m3::text_button(palette)
+                    .automation_name("Close")
+                    .on_click(context.message(Message::Menu(MenuMsg::RemovalClosed)))
+                    .content(m3::label("Close")),))
+        } else {
+            View::empty()
+        };
+        Grid::new().children((
+            Border::new().background(palette.scrim()),
+            m3::card_high(palette)
+                .width(420.0)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .automation_name(title.clone())
+                .content(StackPanel::new().spacing(tokens::spacing::MD).children((
+                    m3::section_title(title).text_wrapping(TextWrapping::Wrap),
+                    status,
+                    close,
+                ))),
+        ))
+    }
+
+    /// "Archived “title”" with Undo, above the composer.
+    pub(super) fn archived_notice(
+        &self,
+        column: Option<f64>,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> Option<View> {
+        let (agent, _, _) = self.menu.archived.as_ref()?;
+        let text = format!("Archived “{}”", self.agent_label(agent));
+        Some(
+            Border::new()
+                .grid_row(4)
+                .width(column)
+                .max_width(tokens::layout::READING_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                .background(palette.card())
+                .corner_radius(tokens::radius::CONTAINER)
+                .padding(Thickness::new(
+                    tokens::spacing::MD,
+                    tokens::spacing::XS,
+                    tokens::spacing::XS,
+                    tokens::spacing::XS,
+                ))
+                .automation_name(text.clone())
+                .content(
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto, GridLength::Auto])
+                        .column_spacing(tokens::spacing::SM)
+                        .children((
+                            m3::body(text)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text_trimming(TextTrimming::CharacterEllipsis),
+                            m3::text_button(palette)
+                                .grid_column(1)
+                                .automation_name("Undo archive")
+                                .on_click(context.message(Message::Menu(MenuMsg::UndoArchive)))
+                                .content(m3::label("Undo")),
+                            m3::icon_button(palette)
+                                .grid_column(2)
+                                .automation_name("Dismiss")
+                                .on_click(
+                                    context.message(Message::Menu(MenuMsg::ArchivedNoticeClosed(
+                                        None,
+                                    ))),
+                                )
+                                .content(m3::icon(m3::glyph::CLOSE)),
+                        )),
+                ),
+        )
     }
 
     /// The inline rename editor in place of a row's title, with Save and

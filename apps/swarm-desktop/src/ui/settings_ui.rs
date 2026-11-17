@@ -1338,45 +1338,37 @@ impl DesktopApp {
                 )],
                 Some(Err(error)) => vec![KeyedView::new(
                     "error",
-                    m3::setting_row("Quota", &format!("Not read: {error}"), View::empty()),
+                    m3::setting_row(
+                        &format!("{label}: quota not read"),
+                        &crate::state::plain_error(error),
+                        View::empty(),
+                    ),
                 )],
                 Some(Ok(reply)) => {
                     let windows = crate::quota::windows(reply);
                     if windows.is_empty() {
-                        let why = reply
-                            .note
-                            .clone()
-                            .unwrap_or_else(|| "the harness reports no quota".to_owned());
-                        let line = if reply.status
-                            == eliot_core::api::harness::HARNESS_QUOTA_UNSUPPORTED
-                        {
-                            format!("Not supported: {why}.")
-                        } else {
-                            format!("Not read now: {why}.")
-                        };
                         vec![KeyedView::new(
-                            "unsupported",
-                            m3::setting_row("Quota", &line, View::empty()),
+                            "status",
+                            m3::setting_row(
+                                &crate::quota::status_line(label, reply),
+                                "",
+                                View::empty(),
+                            ),
                         )]
                     } else {
+                        let now = crate::handoff::now_ms();
+                        let observed = crate::quota::observed_note(reply);
                         windows
                             .iter()
                             .enumerate()
                             .map(|(index, window)| {
+                                let mut line = window.line(now);
+                                if let Some(observed) = &observed {
+                                    line = format!("{line} · {observed}");
+                                }
                                 KeyedView::new(
-                                    format!("{index}:{}:{}", window.label, window.remaining),
-                                    m3::setting_row(
-                                        &format!("{} remaining", window.label),
-                                        &window.reset_note(crate::handoff::now_ms()),
-                                        StackPanel::new()
-                                            .orientation(Orientation::Horizontal)
-                                            .spacing(tokens::spacing::SM)
-                                            .children((
-                                                m3::body(format!("{}%", window.remaining))
-                                                    .vertical_alignment(VerticalAlignment::Center),
-                                                m3::ring(window.remaining as f64),
-                                            )),
-                                    ),
+                                    format!("{index}:{line}"),
+                                    m3::setting_row(&line, "", m3::ring(window.remaining as f64)),
                                 )
                             })
                             .collect()

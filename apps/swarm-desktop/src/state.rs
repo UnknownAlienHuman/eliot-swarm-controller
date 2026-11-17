@@ -124,6 +124,18 @@ pub fn uncertain(error: &str) -> bool {
     error.starts_with("unknown:") || error.starts_with("unavailable:")
 }
 
+/// A read's `code: message` error in plain words: a busy daemon says so,
+/// anything else keeps its typed code at the end.
+pub fn plain_error(error: &str) -> String {
+    match error.split_once(": ") {
+        Some(("busy", _)) => "Swarm was busy with other reads; Refresh reads again.".to_owned(),
+        Some((code, message)) if !code.contains(' ') => {
+            format!("{} ({code}).", message.trim().trim_end_matches('.'))
+        }
+        _ => error.to_owned(),
+    }
+}
+
 /// Exact control binding captured at click time. The UI moves these values
 /// into the background submission; whatever the selection becomes afterwards
 /// cannot change them.
