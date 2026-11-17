@@ -126,9 +126,9 @@ pub mod layout {
     /// The Monitor's state bar, a project's bar, and the surface gap
     /// between two segments of a stacked bar.
     pub const STATE_BAR: f64 = 12.0;
-    /// The state bar under High Contrast, tall enough for each segment's
-    /// glyph.
-    pub const STATE_BAR_MARKED: f64 = 20.0;
+    /// A High Contrast state filter button has room for its glyph.
+    pub const STATE_FILTER_HEIGHT: f64 = 20.0;
+    pub const STATE_FILTER_MIN_WIDTH: f64 = 24.0;
     pub const PROJECT_BAR: f64 = 8.0;
     pub const BAR_GAP: f64 = 2.0;
     /// A Monitor project row: its name and count over its bar.

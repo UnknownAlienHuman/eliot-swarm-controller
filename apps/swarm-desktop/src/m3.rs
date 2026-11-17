@@ -557,6 +557,27 @@ pub fn bar_button(overrides: ResourceOverrides, height: f64) -> Button {
         .horizontal_alignment(HorizontalAlignment::Stretch)
 }
 
+/// A High Contrast chart filter, sized independently of the fill.
+pub fn bar_glyph_button(overrides: ResourceOverrides) -> Button {
+    bar_button(overrides, layout::STATE_FILTER_HEIGHT).min_width(layout::STATE_FILTER_MIN_WIDTH)
+}
+
+#[cfg(test)]
+#[test]
+fn high_contrast_filter_has_room_for_a_glyph_at_one_percent() {
+    let plot_width = layout::PANEL_WIDTH - 2.0 * spacing::MD - layout::BAR_GAP;
+    let proportional_width = plot_width / 100.0;
+    let control_min_width = layout::STATE_FILTER_MIN_WIDTH;
+
+    assert!(proportional_width < icon_size::ROW);
+    assert!(control_min_width >= icon_size::ROW);
+    assert_eq!(
+        bar_glyph_button(ResourceOverrides::new()),
+        bar_button(ResourceOverrides::new(), layout::STATE_FILTER_HEIGHT)
+            .min_width(control_min_width)
+    );
+}
+
 /// A divider.
 pub fn divider(palette: Palette) -> Border {
     Border::new()

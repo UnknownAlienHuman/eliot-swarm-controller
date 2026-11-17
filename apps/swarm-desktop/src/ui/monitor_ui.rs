@@ -64,7 +64,7 @@ fn group_tone(group: Group) -> StatusTone {
         Group::Working => StatusTone::Active,
         Group::Attention => StatusTone::Attention,
         Group::Idle => StatusTone::Ready,
-        Group::Stopped => StatusTone::Neutral,
+        Group::UnparentedSubagents | Group::Stopped => StatusTone::Neutral,
     }
 }
 
@@ -75,6 +75,7 @@ fn group_glyph(group: Group) -> &'static str {
         Group::Working => m3::glyph::PULSE,
         Group::Attention => m3::glyph::WARNING,
         Group::Idle => m3::glyph::PAUSE,
+        Group::UnparentedSubagents => m3::glyph::PROFILE,
         Group::Stopped => m3::glyph::STOP,
     }
 }
@@ -108,8 +109,7 @@ impl DesktopApp {
                 if let Some(snapshot) = snapshot {
                     self.monitor.data.apply(*snapshot);
                     // A filter whose group or project has no live Agent
-                    // left is cleared after a refresh with no failed read,
-                    // so a stale chip never hides new Agents elsewhere.
+                    // left is cleared after a complete refresh.
                     if self.monitor.data.errors.is_empty() {
                         let checkouts = self.checkouts();
                         let project_of = |row: &MonitorRow| self.monitor_project(row, &checkouts);
@@ -479,18 +479,54 @@ impl DesktopApp {
         let segments = counts.segments();
         let mut items: Vec<KeyedView> = Vec::new();
 
-        // Under High Contrast every segment is a system button, so each
-        // also carries its group's glyph (the legend shows the same one):
-        // the states stay apart without color.
+        // Under High Contrast the glyph buttons have their own space,
+        // even when the corresponding proportional segment is very small.
         let marked = palette.scheme().is_none();
-        let bar_height = if marked {
-            tokens::layout::STATE_BAR_MARKED
-        } else {
-            tokens::layout::STATE_BAR
-        };
+        let bar_height = tokens::layout::STATE_BAR;
         let bar = if segments.is_empty() {
             // Nothing live: the empty track.
             m3::bar_segment(palette.well(), bar_height)
+        } else if marked {
+            let plot = m3::stacked_bar(
+                segments
+                    .iter()
+                    .map(|&(group, count)| {
+                        (
+                            count,
+                            format!("fill:{group:?}"),
+                            m3::bar_segment(palette.chart_fill(group_tone(group)), bar_height),
+                        )
+                    })
+                    .collect(),
+                0,
+                bar_height,
+            );
+            let controls =
+                Grid::new()
+                    .columns(vec![GridLength::Auto; segments.len()])
+                    .column_spacing(tokens::layout::BAR_GAP)
+                    .keyed_children(segments.iter().enumerate().map(
+                        |(column, &(group, count))| {
+                            let dimmed = filter.group.is_some_and(|only| only != group);
+                            KeyedView::new(
+                                format!("segment:{group:?}"),
+                                m3::bar_glyph_button(palette.chart_button(group_tone(group)))
+                                    .grid_column(column as i32)
+                                    .opacity(if dimmed { FILTERED_OUT } else { 1.0 })
+                                    .automation_name(format!(
+                                        "{}: {count} of {total}",
+                                        group.title()
+                                    ))
+                                    .on_click(context.message(Message::Monitor(
+                                        MonitorMsg::GroupFiltered(group),
+                                    )))
+                                    .content(m3::icon(group_glyph(group))),
+                            )
+                        },
+                    ));
+            StackPanel::new()
+                .spacing(tokens::layout::BAR_GAP)
+                .children((plot, controls))
         } else {
             m3::stacked_bar(
                 segments
@@ -508,11 +544,7 @@ impl DesktopApp {
                                         group,
                                     ))),
                                 )
-                                .content(if marked {
-                                    m3::icon(group_glyph(group))
-                                } else {
-                                    View::empty()
-                                }),
+                                .content(View::empty()),
                         )
                     })
                     .collect(),
@@ -757,7 +789,7 @@ impl DesktopApp {
 
     /// The monitor: the overview, then Needs attention, Working, Idle and a
     /// collapsed Recently stopped, workers and subagents under their
-    /// parent's row; under a filter, exactly the Agents it counts, flat.
+    /// parent's row; under a filter the chart's loaded Agents are listed flat.
     pub(super) fn monitor_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let data = &self.monitor.data;
         let now = crate::handoff::now_ms();
@@ -809,11 +841,23 @@ impl DesktopApp {
                 )),
             ));
         }
-        let sections = if filter.is_active() {
-            overview.filtered(filter)
+        let (sections, showing_loaded) = if filter.is_active() {
+            overview.list_for_filter(filter)
         } else {
-            tree.sections()
+            (tree.sections(), false)
         };
+        let no_rows = sections.iter().all(|section| section.rows.is_empty());
+        if showing_loaded {
+            let note = if no_rows {
+                "No live Agents were loaded in this partial read."
+            } else {
+                "No matches on this page. Showing loaded Agents."
+            };
+            items.push(KeyedView::new(
+                "filter-unavailable",
+                m3::secondary(note).text_wrapping(TextWrapping::Wrap),
+            ));
+        }
         let nest = (!filter.is_active()).then_some(&tree);
         for section in &sections {
             let top = section.rows.len();
@@ -878,7 +922,7 @@ impl DesktopApp {
                 );
             }
         }
-        if data.read_at_ms.is_some() && sections.iter().all(|section| section.rows.is_empty()) {
+        if data.read_at_ms.is_some() && no_rows && !showing_loaded {
             let none = if filter.is_active() {
                 "No live Agents match this filter."
             } else {
