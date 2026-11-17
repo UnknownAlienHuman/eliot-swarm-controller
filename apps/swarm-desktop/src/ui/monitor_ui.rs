@@ -68,6 +68,27 @@ fn group_tone(group: Group) -> StatusTone {
     }
 }
 
+/// A group's glyph: its mark under High Contrast, where the chart's
+/// colors are system colors.
+fn group_glyph(group: Group) -> &'static str {
+    match group {
+        Group::Working => m3::glyph::PULSE,
+        Group::Attention => m3::glyph::WARNING,
+        Group::Idle => m3::glyph::PAUSE,
+        Group::Stopped => m3::glyph::STOP,
+    }
+}
+
+/// A group's mark in the legend: its chart-colored dot, or its glyph under
+/// High Contrast (the same one its bar segment shows).
+fn group_mark(palette: Palette, group: Group) -> View {
+    if palette.scheme().is_none() {
+        m3::icon(group_glyph(group))
+    } else {
+        m3::dot(palette.chart_fill(group_tone(group)))
+    }
+}
+
 /// Opacity of the segments and project bars a filter leaves out.
 const FILTERED_OUT: f64 = 0.38;
 
@@ -86,6 +107,19 @@ impl DesktopApp {
                 self.monitor.refreshing = false;
                 if let Some(snapshot) = snapshot {
                     self.monitor.data.apply(*snapshot);
+                    // A filter whose group or project has no live Agent
+                    // left is cleared after a refresh with no failed read,
+                    // so a stale chip never hides new Agents elsewhere.
+                    if self.monitor.data.errors.is_empty() {
+                        let checkouts = self.checkouts();
+                        let project_of = |row: &MonitorRow| self.monitor_project(row, &checkouts);
+                        let overview = self
+                            .monitor
+                            .data
+                            .overview(crate::handoff::now_ms(), &project_of);
+                        let filter = self.monitor.filter.reconciled(&overview);
+                        self.monitor.filter = filter;
+                    }
                     self.monitor.task = Some(context.spawn_background(move |cancel| {
                         feed::backoff(monitor::PERIOD_MS, &|| cancel.is_cancelled());
                         Message::Monitor(MonitorMsg::RefreshDue(epoch))
@@ -354,13 +388,9 @@ impl DesktopApp {
                 row.generation,
             )))
         });
-        let (quiet, output) = row.quiet_ms(crate::handoff::now_ms());
-        let elapsed = monitor::elapsed_label(quiet);
-        let elapsed_words = if output {
-            format!("last output {elapsed} ago")
-        } else {
-            format!("changed {elapsed} ago")
-        };
+        let quiet = row.quiet(crate::handoff::now_ms());
+        let elapsed = quiet.label();
+        let elapsed_words = quiet.words();
         let group = row.group(data.incident(row));
         rows.push(KeyedView::new(
             format!("row:{}:{}", row.id, selected == Some(row.id.as_str())),
@@ -449,9 +479,18 @@ impl DesktopApp {
         let segments = counts.segments();
         let mut items: Vec<KeyedView> = Vec::new();
 
+        // Under High Contrast every segment is a system button, so each
+        // also carries its group's glyph (the legend shows the same one):
+        // the states stay apart without color.
+        let marked = palette.scheme().is_none();
+        let bar_height = if marked {
+            tokens::layout::STATE_BAR_MARKED
+        } else {
+            tokens::layout::STATE_BAR
+        };
         let bar = if segments.is_empty() {
             // Nothing live: the empty track.
-            m3::bar_segment(palette.well(), tokens::layout::STATE_BAR)
+            m3::bar_segment(palette.well(), bar_height)
         } else {
             m3::stacked_bar(
                 segments
@@ -461,21 +500,24 @@ impl DesktopApp {
                         (
                             count,
                             format!("segment:{group:?}"),
-                            m3::bar_button(
-                                palette.chart_button(group_tone(group)),
-                                tokens::layout::STATE_BAR,
-                            )
-                            .opacity(if dimmed { FILTERED_OUT } else { 1.0 })
-                            .automation_name(format!("{}: {count} of {total}", group.title()))
-                            .on_click(
-                                context.message(Message::Monitor(MonitorMsg::GroupFiltered(group))),
-                            )
-                            .into(),
+                            m3::bar_button(palette.chart_button(group_tone(group)), bar_height)
+                                .opacity(if dimmed { FILTERED_OUT } else { 1.0 })
+                                .automation_name(format!("{}: {count} of {total}", group.title()))
+                                .on_click(
+                                    context.message(Message::Monitor(MonitorMsg::GroupFiltered(
+                                        group,
+                                    ))),
+                                )
+                                .content(if marked {
+                                    m3::icon(group_glyph(group))
+                                } else {
+                                    View::empty()
+                                }),
                         )
                     })
                     .collect(),
                 0,
-                tokens::layout::STATE_BAR,
+                bar_height,
             )
         };
         let legend: View = if segments.is_empty() {
@@ -518,9 +560,7 @@ impl DesktopApp {
                                                     .orientation(Orientation::Horizontal)
                                                     .spacing(tokens::spacing::XS)
                                                     .children((
-                                                        m3::dot(
-                                                            palette.chart_fill(group_tone(group)),
-                                                        ),
+                                                        group_mark(palette, group),
                                                         m3::secondary(words).text_trimming(
                                                             TextTrimming::CharacterEllipsis,
                                                         ),
@@ -543,7 +583,7 @@ impl DesktopApp {
             notes.push(status);
         }
         let partial: View = match overview.partial_note() {
-            Some(note) => m3::icon_label(m3::glyph::WARNING, &note),
+            Some(note) => m3::icon_label(m3::glyph::WARNING, note),
             None => View::empty(),
         };
         items.push(KeyedView::new(
@@ -701,11 +741,13 @@ impl DesktopApp {
             ));
         }
         if !chips.is_empty() {
+            // One chip per line: side by side, a group chip and a long
+            // project chip outgrow the narrow panel; each alone fits
+            // (its label is capped at `FILTER_CHIP_TEXT`).
             items.push(KeyedView::new(
                 "filters",
                 StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::SM)
+                    .spacing(tokens::spacing::XS)
                     .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
                     .keyed_children(chips),
             ));

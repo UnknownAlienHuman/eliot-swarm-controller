@@ -14,8 +14,9 @@
 //! failed, lost, a controlled Agent whose state is not confirmed, or an open
 //! attention report), Working (busy or starting), Idle, and a collapsed
 //! Recently stopped. Children nest under their parent row, collapsed:
-//! native observed subagents and Swarm workers alike; a worker that needs
-//! attention raises its parent into Needs attention.
+//! native observed subagents and Swarm workers alike. Every row sits in its
+//! own group, as the charts count it; a worker that needs attention is
+//! named on its parent's row.
 //!
 //! `ProcessStatsView` carries cumulative `cpu_time_ns`, not a rate. A rate
 //! is derived here only between two distinct samples of the same process
@@ -520,14 +521,16 @@ impl MonitorRow {
                 && self.state != AgentState::Stopped)
     }
 
-    /// How long the row has been quiet, for its list line: since a
-    /// working Agent's last output (its daemon-reported progress age),
-    /// else since the Agent record last changed. `true` when it is the
-    /// output's age.
-    pub fn quiet_ms(&self, now_ms: i64) -> (i64, bool) {
-        match self.progress_age_ms.filter(|_| self.in_turn()) {
-            Some(age) => (age, true),
-            None => (now_ms.saturating_sub(self.updated_at), false),
+    /// How long the row has been quiet, for its list line: a working
+    /// Agent's last progress (the daemon's `last_progress_at`: turns,
+    /// messages, tools and requests, `docs/spec/monitoring.md` Liveness),
+    /// else the last change of its record.
+    pub fn quiet(&self, now_ms: i64) -> Quiet {
+        let changed = now_ms.saturating_sub(self.updated_at);
+        match (self.in_turn(), self.progress_age_ms) {
+            (true, Some(age)) => Quiet::Progress(age),
+            (true, None) => Quiet::NoProgress(changed),
+            (false, _) => Quiet::Changed(changed),
         }
     }
 
@@ -541,8 +544,8 @@ impl MonitorRow {
         );
         match (working, &self.last_outcome) {
             (true, _) => match self.progress_age_ms {
-                Some(age) => format!("Working · last output {} ago", seconds(age)),
-                None => "Working · no output yet".to_owned(),
+                Some(age) => format!("Working · last progress {} ago", seconds(age)),
+                None => "Working · no progress reported yet".to_owned(),
             },
             (false, Some(outcome)) => format!("Last turn {}", outcome_words(outcome)),
             // An open turn cut off by the end has no result; nothing is
@@ -552,6 +555,41 @@ impl MonitorRow {
             }
             (false, None) if ended || self.activity.is_some() => "No finished turn".to_owned(),
             (false, None) => "No turns yet".to_owned(),
+        }
+    }
+}
+
+/// How long a list row has been quiet ([`MonitorRow::quiet`]), in ms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quiet {
+    /// A working Agent's last progress.
+    Progress(i64),
+    /// A working Agent with no progress reported: its record's last change.
+    NoProgress(i64),
+    /// Any other Agent: its record's last change.
+    Changed(i64),
+}
+
+impl Quiet {
+    /// What the row shows ("2 s", "4 min", "no progress yet").
+    pub fn label(self) -> String {
+        match self {
+            Self::Progress(ms) | Self::Changed(ms) => elapsed_label(ms),
+            Self::NoProgress(_) => "no progress yet".to_owned(),
+        }
+    }
+
+    /// The same in words, for the row's accessible name.
+    pub fn words(self) -> String {
+        match self {
+            Self::Progress(ms) => format!("last progress {} ago", elapsed_label(ms)),
+            Self::NoProgress(ms) => {
+                format!(
+                    "no progress reported yet, changed {} ago",
+                    elapsed_label(ms)
+                )
+            }
+            Self::Changed(ms) => format!("changed {} ago", elapsed_label(ms)),
         }
     }
 }
@@ -838,10 +876,11 @@ impl<'a> Tree<'a> {
         found
     }
 
-    /// The sections in order, each with its top-level rows: attention by
-    /// urgency, working and idle by id, recently stopped newest first. A
-    /// parent with a worker that needs attention is raised into Needs
-    /// attention.
+    /// The sections in order, each with its top-level rows in their own
+    /// group (the one the charts count): attention by urgency, working and
+    /// idle by id, recently stopped newest first. A parent whose worker
+    /// needs attention stays in its own section; its row names the worker
+    /// ([`Tree::worker_attention_words`]).
     pub fn sections(&self) -> Vec<Section<'a>> {
         let mut sections: Vec<Section> = [
             Group::Attention,
@@ -856,10 +895,7 @@ impl<'a> Tree<'a> {
         })
         .collect();
         for row in &self.top {
-            let mut group = row.group(self.monitor.incident(row));
-            if group != Group::Attention && !self.attention_workers(&row.id).is_empty() {
-                group = Group::Attention;
-            }
+            let group = row.group(self.monitor.incident(row));
             if let Some(section) = sections.iter_mut().find(|section| section.group == group) {
                 section.rows.push(row);
             }
@@ -1065,6 +1101,27 @@ impl Filter {
         self.group.is_some() || self.project.is_some()
     }
 
+    /// The filter after a complete refresh (no failed read, no partial
+    /// count): a group with no live Agent and a project with none are
+    /// cleared, each on its own, so a kept group and a kept project stay
+    /// combined even when nothing matches both; a kept project takes its
+    /// current name. A partial overview keeps the filter as it is.
+    pub fn reconciled(&self, overview: &Overview) -> Self {
+        if overview.partial {
+            return self.clone();
+        }
+        Self {
+            group: self.group.filter(|group| overview.counts.get(*group) > 0),
+            project: self.project.as_ref().and_then(|project| {
+                overview
+                    .projects
+                    .iter()
+                    .find(|live| live.project.key == project.key)
+                    .map(|live| live.project.clone())
+            }),
+        }
+    }
+
     fn keeps(&self, counted: &Counted) -> bool {
         self.group.is_none_or(|group| counted.group == group)
             && self
@@ -1082,9 +1139,11 @@ pub struct Overview<'a> {
     pub rows: Vec<Counted<'a>>,
     pub counts: LiveCounts,
     pub projects: Vec<ProjectLive>,
-    /// Live Agents the read did not return: when non-zero, every count is
-    /// partial.
-    pub unread: usize,
+    /// A live state holds more Agents than the read returned (its
+    /// `state_totals` count exceeds its rows): every count is partial.
+    /// Those totals include native children the chart leaves out, so no
+    /// number of missing Agents is claimed.
+    pub partial: bool,
 }
 
 impl<'a> Overview<'a> {
@@ -1098,18 +1157,9 @@ impl<'a> Overview<'a> {
     }
 
     /// The note beside the chart when the counts are partial.
-    pub fn partial_note(&self) -> Option<String> {
-        (self.unread > 0).then(|| {
-            format!(
-                "Partial counts: {} more live {} not read",
-                self.unread,
-                if self.unread == 1 {
-                    "Agent was"
-                } else {
-                    "Agents were"
-                }
-            )
-        })
+    pub fn partial_note(&self) -> Option<&'static str> {
+        self.partial
+            .then_some("Partial counts: more Agents are live than one read returns")
     }
 
     /// The list under a filter: exactly the counted rows it keeps, flat,
@@ -1337,17 +1387,15 @@ impl Monitor {
         });
         // A live state with more Agents than the bounded read returned,
         // including one with no rows in the page at all.
-        let unread = self
-            .counts
-            .iter()
-            .filter(|count| count.state != AgentState::Stopped)
-            .map(|count| count.total.unwrap_or(0).saturating_sub(count.shown))
-            .sum();
+        let partial = self.counts.iter().any(|count| {
+            count.state != AgentState::Stopped
+                && count.total.is_some_and(|total| total > count.shown)
+        });
         Overview {
             rows,
             counts,
             projects,
-            unread,
+            partial,
         }
     }
 
@@ -2264,9 +2312,11 @@ mod tests {
             .collect();
         assert_eq!(
             sections,
+            // The busy parent of a waiting worker stays Working, the group
+            // the charts count it in.
             vec![
-                (Group::Attention, vec!["a1"]),
-                (Group::Working, vec!["a5"]),
+                (Group::Attention, vec![]),
+                (Group::Working, vec!["a1", "a5"]),
                 (Group::Idle, vec!["a6"]),
                 (Group::Stopped, vec!["a7"])
             ]
@@ -2477,7 +2527,7 @@ mod tests {
     }
 
     #[test]
-    fn swarm_workers_nest_count_their_states_and_raise_their_parent() {
+    fn swarm_workers_nest_count_their_states_and_are_named_on_their_parent() {
         let mut monitor = Monitor::default();
         monitor.apply(MonitorSnapshot {
             groups: vec![
@@ -2527,11 +2577,12 @@ mod tests {
                 .map(|row| row.id.clone())
                 .collect()
         };
-        // The waiting worker raises its working parent; workers are no
-        // top-level rows. A live worker of a stopped parent stays at the
-        // top instead of hiding in Recently stopped.
-        assert_eq!(ids(Group::Attention), ["a10"]);
-        assert!(ids(Group::Working).is_empty());
+        // The working parent of a waiting worker stays Working (its row
+        // names the worker); workers are no top-level rows. A live worker
+        // of a stopped parent stays at the top instead of hiding in
+        // Recently stopped.
+        assert!(ids(Group::Attention).is_empty());
+        assert_eq!(ids(Group::Working), ["a10"]);
         assert_eq!(ids(Group::Idle), ["a21", "a30"]);
         assert_eq!(ids(Group::Stopped), ["a20"]);
         let children: Vec<&str> = tree
@@ -2611,14 +2662,27 @@ mod tests {
         assert_eq!(elapsed_label(3 * 3_600_000), "3 h");
         assert_eq!(elapsed_label(2 * 86_400_000), "2 d");
         assert_eq!(elapsed_label(-5), "0 s");
-        // A working row is quiet since its last output, any other since
-        // its record changed.
+        // A working row is quiet since its last progress, never called
+        // output; without one it says so; any other row since its record
+        // changed.
         let mut working = MonitorRow::from_list(&summary("a9", AgentState::Busy, None, false));
         working.active_turn = Some("t1".to_owned());
         working.progress_age_ms = Some(180_000);
-        assert_eq!(working.quiet_ms(5_000), (180_000, true));
+        assert_eq!(working.quiet(5_000), Quiet::Progress(180_000));
+        assert_eq!(working.quiet(5_000).label(), "3 min");
+        assert_eq!(working.quiet(5_000).words(), "last progress 3 min ago");
+        assert_eq!(working.operation(), "Working · last progress 3 min ago");
+        working.progress_age_ms = None;
+        assert_eq!(working.quiet(5_000), Quiet::NoProgress(4_000));
+        assert_eq!(working.quiet(5_000).label(), "no progress yet");
+        assert_eq!(
+            working.quiet(5_000).words(),
+            "no progress reported yet, changed 4 s ago"
+        );
         working.active_turn = None;
-        assert_eq!(working.quiet_ms(5_000), (4_000, false));
+        working.progress_age_ms = Some(180_000);
+        assert_eq!(working.quiet(5_000), Quiet::Changed(4_000));
+        assert_eq!(working.quiet(5_000).words(), "changed 4 s ago");
     }
 
     #[test]
@@ -2778,11 +2842,130 @@ mod tests {
             .map(|row| row.id.as_str())
             .collect();
         assert_eq!(attention, ["a2", "a4"]);
-        // Truncated: every count is marked partial, never passed as a total.
-        assert_eq!(overview.unread, 5);
+        // Truncated: every count is marked partial, never passed as a
+        // total, and no number of missing Agents is claimed (the state
+        // totals include native children the chart leaves out).
+        assert!(overview.partial);
         assert_eq!(
-            overview.partial_note().as_deref(),
-            Some("Partial counts: 5 more live Agents were not read")
+            overview.partial_note(),
+            Some("Partial counts: more Agents are live than one read returns")
+        );
+        // A partial overview keeps any filter: its project may be beyond
+        // the page.
+        let gone = Filter {
+            group: Some(Group::Attention),
+            project: Some(ProjectRef {
+                key: "gone".to_owned(),
+                name: "gone".to_owned(),
+            }),
+        };
+        assert_eq!(gone.reconciled(&overview), gone);
+        // The default sections hold each top-level row in the group the
+        // charts count it in: the busy parent of a waiting worker stays
+        // Working and names the worker; the worker and the native child
+        // nest under it.
+        let tree = monitor.tree(2_000);
+        let sections: Vec<(Group, Vec<&str>)> = tree
+            .sections()
+            .iter()
+            .map(|section| {
+                (
+                    section.group,
+                    section.rows.iter().map(|row| row.id.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sections,
+            [
+                (Group::Attention, vec!["a4"]),
+                (Group::Working, vec!["a1", "a5"]),
+                (Group::Idle, vec!["a6", "a7"]),
+                (Group::Stopped, vec!["a8"]),
+            ]
+        );
+        for section in tree.sections() {
+            for row in section.rows.iter().filter(|row| !row.ended()) {
+                let counted = overview
+                    .rows
+                    .iter()
+                    .find(|counted| counted.row.id == row.id)
+                    .expect("a live top-level row is counted");
+                assert_eq!(counted.group, section.group, "{}", row.id);
+            }
+        }
+        let children: Vec<&str> = tree
+            .children("a1")
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(children, ["a2", "a3"]);
+        let words = tree.worker_attention_words("a1").unwrap();
+        assert!(words.starts_with("Waiting for you · worker a2"), "{words}");
+
+        // A complete refresh: shop has no live Agent left, nothing needs
+        // attention, docs has one working Agent and a chat is idle.
+        monitor.apply(MonitorSnapshot {
+            groups: vec![
+                (
+                    AgentState::Busy,
+                    page(vec![row("a5", AgentState::Busy, None, false, "docs")]),
+                ),
+                (
+                    AgentState::Idle,
+                    page(vec![row("a7", AgentState::Idle, None, false, "")]),
+                ),
+            ],
+            counts: vec![(AgentState::Stopped, Ok(1))],
+            stopped: None,
+            attention: None,
+            detail: None,
+            losses: Vec::new(),
+            read_at_ms: 3_000,
+        });
+        let complete = monitor.overview(3_000, &project_of);
+        assert!(!complete.partial);
+        let docs = |name: &str| ProjectRef {
+            key: "docs".to_owned(),
+            name: name.to_owned(),
+        };
+        // A group and a project that each still have live Agents stay
+        // combined though no Agent matches both; the project takes its
+        // current name.
+        let kept = Filter {
+            group: Some(Group::Idle),
+            project: Some(docs("old name")),
+        };
+        assert_eq!(
+            kept.reconciled(&complete),
+            Filter {
+                group: Some(Group::Idle),
+                project: Some(docs("docs")),
+            }
+        );
+        // A group and a project with no live Agent left are cleared, so new
+        // Agents elsewhere are never hidden behind a stale chip.
+        let stale = Filter {
+            group: Some(Group::Attention),
+            project: Some(ProjectRef {
+                key: "shop".to_owned(),
+                name: "shop".to_owned(),
+            }),
+        };
+        assert_eq!(stale.reconciled(&complete), Filter::default());
+        let only_group = Filter {
+            group: Some(Group::Working),
+            project: Some(ProjectRef {
+                key: "shop".to_owned(),
+                name: "shop".to_owned(),
+            }),
+        };
+        assert_eq!(
+            only_group.reconciled(&complete),
+            Filter {
+                group: Some(Group::Working),
+                project: None,
+            }
         );
     }
 }

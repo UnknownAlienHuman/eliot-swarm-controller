@@ -41,9 +41,9 @@ pub struct RowActions {
 /// What one list row shows besides its Agent.
 pub struct RowLook<'a> {
     pub title: &'a str,
-    /// How long it has been quiet ([`MonitorRow::quiet_ms`]), as shown
-    /// ([`monitor::elapsed_label`]) and in words for its accessible name
-    /// ("last output 3 min ago").
+    /// How long it has been quiet ([`MonitorRow::quiet`]), as shown
+    /// ("3 min", "no progress yet") and in words for its accessible name
+    /// ("last progress 3 min ago").
     pub elapsed: &'a str,
     pub elapsed_words: &'a str,
     /// The dot in its group's chart color.

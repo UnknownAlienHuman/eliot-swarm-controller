@@ -40,6 +40,7 @@ pub mod glyph {
     pub const SHIELD: &str = "\u{EA18}";
     pub const PROFILE: &str = "\u{E77B}";
     pub const PULSE: &str = "\u{E9D9}";
+    pub const PAUSE: &str = "\u{E769}";
     pub const TOOLS: &str = "\u{E90F}";
     pub const CHECK: &str = "\u{E73E}";
     pub const STAR: &str = "\u{E734}";
