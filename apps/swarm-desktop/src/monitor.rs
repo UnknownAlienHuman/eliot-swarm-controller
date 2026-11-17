@@ -87,6 +87,7 @@ pub enum Group {
     Attention,
     Working,
     Idle,
+    UnparentedSubagents,
     Stopped,
 }
 
@@ -96,6 +97,7 @@ impl Group {
             Self::Attention => "Needs attention",
             Self::Working => "Working",
             Self::Idle => "Idle",
+            Self::UnparentedSubagents => "Subagents without a visible parent",
             Self::Stopped => "Recently stopped",
         }
     }
@@ -375,6 +377,7 @@ pub struct MonitorRow {
     pub harness: String,
     pub active_turn: Option<String>,
     pub activity: Option<NativeChildActivityState>,
+    pub last_progress_at: Option<i64>,
     pub progress_age_ms: Option<i64>,
     pub last_outcome: Option<String>,
     /// Fleet token count from the shared [`AgentSummary::fleet_usage`]
@@ -445,6 +448,7 @@ impl MonitorRow {
             harness: summary.harness.clone(),
             active_turn: summary.active_turn.clone(),
             activity: summary.activity.as_ref().map(|activity| activity.state),
+            last_progress_at: summary.last_progress_at,
             progress_age_ms: summary.progress_age_ms,
             last_outcome: summary
                 .last_outcome
@@ -492,8 +496,7 @@ impl MonitorRow {
             && self.active_turn.is_none()
     }
 
-    /// Which section the row belongs to. A native child nests under its
-    /// parent instead (`None`), unless the parent is not shown.
+    /// The row's own state group, also used for nested child summaries.
     pub fn group(&self, attention: Option<&Incident>) -> Group {
         if self.native_child {
             return match (self.state, self.activity) {
@@ -529,6 +532,7 @@ impl MonitorRow {
         let changed = now_ms.saturating_sub(self.updated_at);
         match (self.in_turn(), self.progress_age_ms) {
             (true, Some(age)) => Quiet::Progress(age),
+            (true, None) if self.last_progress_at.is_some() => Quiet::ProgressAgeUnavailable,
             (true, None) => Quiet::NoProgress(changed),
             (false, _) => Quiet::Changed(changed),
         }
@@ -545,6 +549,9 @@ impl MonitorRow {
         match (working, &self.last_outcome) {
             (true, _) => match self.progress_age_ms {
                 Some(age) => format!("Working · last progress {} ago", seconds(age)),
+                None if self.last_progress_at.is_some() => {
+                    "Working · progress age unavailable".to_owned()
+                }
                 None => "Working · no progress reported yet".to_owned(),
             },
             (false, Some(outcome)) => format!("Last turn {}", outcome_words(outcome)),
@@ -564,6 +571,8 @@ impl MonitorRow {
 pub enum Quiet {
     /// A working Agent's last progress.
     Progress(i64),
+    /// The Agent reported progress, but the read could not measure its age.
+    ProgressAgeUnavailable,
     /// A working Agent with no progress reported: its record's last change.
     NoProgress(i64),
     /// Any other Agent: its record's last change.
@@ -575,6 +584,7 @@ impl Quiet {
     pub fn label(self) -> String {
         match self {
             Self::Progress(ms) | Self::Changed(ms) => elapsed_label(ms),
+            Self::ProgressAgeUnavailable => "progress age unavailable".to_owned(),
             Self::NoProgress(_) => "no progress yet".to_owned(),
         }
     }
@@ -583,6 +593,7 @@ impl Quiet {
     pub fn words(self) -> String {
         match self {
             Self::Progress(ms) => format!("last progress {} ago", elapsed_label(ms)),
+            Self::ProgressAgeUnavailable => "progress age unavailable".to_owned(),
             Self::NoProgress(ms) => {
                 format!(
                     "no progress reported yet, changed {} ago",
@@ -877,8 +888,8 @@ impl<'a> Tree<'a> {
     }
 
     /// The sections in order, each with its top-level rows in their own
-    /// group (the one the charts count): attention by urgency, working and
-    /// idle by id, recently stopped newest first. A parent whose worker
+    /// group: attention by urgency, working, idle and subagents without a
+    /// visible parent by id, recently stopped newest first. A parent whose worker
     /// needs attention stays in its own section; its row names the worker
     /// ([`Tree::worker_attention_words`]).
     pub fn sections(&self) -> Vec<Section<'a>> {
@@ -886,6 +897,7 @@ impl<'a> Tree<'a> {
             Group::Attention,
             Group::Working,
             Group::Idle,
+            Group::UnparentedSubagents,
             Group::Stopped,
         ]
         .into_iter()
@@ -895,7 +907,11 @@ impl<'a> Tree<'a> {
         })
         .collect();
         for row in &self.top {
-            let group = row.group(self.monitor.incident(row));
+            let group = if row.native_child {
+                Group::UnparentedSubagents
+            } else {
+                row.group(self.monitor.incident(row))
+            };
             if let Some(section) = sections.iter_mut().find(|section| section.group == group) {
                 section.rows.push(row);
             }
@@ -912,7 +928,9 @@ impl<'a> Tree<'a> {
                         .cmp(&a.updated_at)
                         .then_with(|| id_order(&a.id, &b.id))
                 }),
-                Group::Working | Group::Idle => section.rows.sort_by(|a, b| id_order(&a.id, &b.id)),
+                Group::Working | Group::Idle | Group::UnparentedSubagents => {
+                    section.rows.sort_by(|a, b| id_order(&a.id, &b.id));
+                }
             }
         }
         sections
@@ -956,6 +974,7 @@ impl<'a> Tree<'a> {
                 Group::Working => working += 1,
                 Group::Idle => idle += 1,
                 Group::Stopped => stopped += 1,
+                Group::UnparentedSubagents => unreachable!("display-only group"),
             }
         }
         if working + attention + idle > 0 {
@@ -1017,7 +1036,7 @@ impl LiveCounts {
             Group::Working => self.working,
             Group::Attention => self.attention,
             Group::Idle => self.idle,
-            Group::Stopped => 0,
+            Group::UnparentedSubagents | Group::Stopped => 0,
         }
     }
 
@@ -1030,7 +1049,7 @@ impl LiveCounts {
             Group::Working => self.working += 1,
             Group::Attention => self.attention += 1,
             Group::Idle => self.idle += 1,
-            Group::Stopped => {}
+            Group::UnparentedSubagents | Group::Stopped => {}
         }
     }
 
@@ -1068,6 +1087,7 @@ pub fn group_words(group: Group, count: usize) -> &'static str {
         Group::Attention if count == 1 => "needs attention",
         Group::Attention => "need attention",
         Group::Idle => "idle",
+        Group::UnparentedSubagents => "subagents",
         Group::Stopped => "stopped",
     }
 }
@@ -1162,10 +1182,22 @@ impl<'a> Overview<'a> {
             .then_some("Partial counts: more Agents are live than one read returns")
     }
 
+    /// Keep the selected filter on a partial read, but show all loaded
+    /// chart rows if none match it.
+    pub fn list_for_filter(&self, filter: &Filter) -> (Vec<Section<'a>>, bool) {
+        let showing_loaded = self.partial && !self.rows.iter().any(|row| filter.keeps(row));
+        let sections = if showing_loaded {
+            self.filtered(&Filter::default())
+        } else {
+            self.filtered(filter)
+        };
+        (sections, showing_loaded)
+    }
+
     /// The list under a filter: exactly the counted rows it keeps, flat,
     /// in the list's section order (attention by urgency, the others by
     /// id), so the list always matches the number that was clicked.
-    pub fn filtered(&self, filter: &Filter) -> Vec<Section<'a>> {
+    fn filtered(&self, filter: &Filter) -> Vec<Section<'a>> {
         [Group::Attention, Group::Working, Group::Idle]
             .into_iter()
             .map(|group| {
@@ -2318,6 +2350,7 @@ mod tests {
                 (Group::Attention, vec![]),
                 (Group::Working, vec!["a1", "a5"]),
                 (Group::Idle, vec!["a6"]),
+                (Group::UnparentedSubagents, vec![]),
                 (Group::Stopped, vec!["a7"])
             ]
         );
@@ -2686,6 +2719,123 @@ mod tests {
     }
 
     #[test]
+    fn working_row_and_details_distinguish_unknown_progress_age_from_no_progress() {
+        let mut listed = summary("a1", AgentState::Busy, None, false);
+        listed.summary.active_turn = Some("t1".to_owned());
+        listed.summary.last_progress_at = Some(6_000);
+        let row = MonitorRow::from_list(&listed);
+        assert_eq!(row.quiet(5_000), Quiet::ProgressAgeUnavailable);
+        assert_eq!(row.quiet(5_000).label(), "progress age unavailable");
+        assert_eq!(row.quiet(5_000).words(), "progress age unavailable");
+        assert_eq!(row.operation(), "Working · progress age unavailable");
+
+        listed.summary.last_progress_at = None;
+        let row = MonitorRow::from_list(&listed);
+        assert_eq!(row.quiet(5_000).label(), "no progress yet");
+        assert_eq!(row.operation(), "Working · no progress reported yet");
+    }
+
+    #[test]
+    fn stale_filter_shows_loaded_live_agents_until_matches_return() {
+        let mut docs = summary("a1", AgentState::Busy, None, false);
+        docs.summary.project = "demo-docs".to_owned();
+        let mut shop = summary("a2", AgentState::Busy, None, false);
+        shop.summary.project = "demo-shop".to_owned();
+        let filter = Filter {
+            group: Some(Group::Working),
+            project: Some(ProjectRef {
+                key: "demo-shop".to_owned(),
+                name: "demo-shop".to_owned(),
+            }),
+        };
+        let ids = |sections: Vec<Section<'_>>| {
+            sections
+                .into_iter()
+                .flat_map(|section| section.rows)
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut monitor = Monitor::default();
+        let refresh = |rows| MonitorSnapshot {
+            groups: vec![(AgentState::Busy, page(rows))],
+            counts: vec![(AgentState::Idle, Ok(3))],
+            stopped: None,
+            attention: None,
+            detail: None,
+            losses: Vec::new(),
+            read_at_ms: 2_000,
+        };
+        monitor.apply(refresh(vec![shop.clone()]));
+        let overview = monitor.overview(2_000, &by_label);
+        let (sections, showing_loaded) = overview.list_for_filter(&filter);
+        assert!(!showing_loaded);
+        assert_eq!(ids(sections), ["a2"]);
+
+        monitor.apply(refresh(vec![docs.clone()]));
+        let overview = monitor.overview(2_000, &by_label);
+        assert_eq!(filter.reconciled(&overview), filter);
+        let (sections, showing_loaded) = overview.list_for_filter(&filter);
+        assert!(showing_loaded);
+        assert_eq!(ids(sections), ["a1"]);
+        assert_eq!(overview.counts.segments(), [(Group::Working, 1)]);
+
+        monitor.apply(refresh(vec![docs, shop]));
+        let overview = monitor.overview(2_000, &by_label);
+        let (sections, showing_loaded) = overview.list_for_filter(&filter);
+        assert!(!showing_loaded);
+        assert_eq!(ids(sections), ["a2"]);
+    }
+
+    #[test]
+    fn native_child_missing_its_parent_is_separate_from_chart_sections() {
+        let mut native = summary("a2", AgentState::Busy, Some("a1"), true);
+        native.summary.activity.as_mut().unwrap().state = NativeChildActivityState::Running;
+        let mut busy = page(vec![native, summary("a3", AgentState::Busy, None, false)]).unwrap();
+        busy.total += 1;
+        busy.truncated = true;
+        let mut monitor = Monitor::default();
+        monitor.apply(MonitorSnapshot {
+            groups: vec![(AgentState::Busy, Ok(busy))],
+            counts: Vec::new(),
+            stopped: None,
+            attention: None,
+            detail: None,
+            losses: Vec::new(),
+            read_at_ms: 2_000,
+        });
+        let overview = monitor.overview(2_000, &by_label);
+        assert!(overview.partial);
+        let tree = monitor.tree(2_000);
+        let sections = tree.sections();
+        let section_ids = |group| {
+            sections
+                .iter()
+                .find(|section| section.group == group)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(section_ids(Group::Working), ["a3"]);
+        assert_eq!(section_ids(Group::UnparentedSubagents), ["a2"]);
+        assert_eq!(overview.counts.segments(), [(Group::Working, 1)]);
+        let (filtered, showing_loaded) = overview.list_for_filter(&Filter {
+            group: Some(Group::Working),
+            project: None,
+        });
+        assert!(!showing_loaded);
+        assert_eq!(
+            filtered
+                .iter()
+                .flat_map(|section| &section.rows)
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a3"]
+        );
+    }
+
+    #[test]
     fn overview_bar_legend_projects_headline_and_filtered_list_agree() {
         let row = |id: &str, state, parent: Option<&str>, native, project: &str| {
             let mut row = summary(id, state, parent, native);
@@ -2881,6 +3031,7 @@ mod tests {
                 (Group::Attention, vec!["a4"]),
                 (Group::Working, vec!["a1", "a5"]),
                 (Group::Idle, vec!["a6", "a7"]),
+                (Group::UnparentedSubagents, vec![]),
                 (Group::Stopped, vec!["a8"]),
             ]
         );
