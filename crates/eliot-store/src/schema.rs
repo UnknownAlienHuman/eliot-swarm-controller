@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 50;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 51;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1192,6 +1192,26 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 51 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX events_git_hints ON events(agent, generation, seq)
+                 WHERE kind = 'tool.completed' AND native_id IS NOT NULL
+                   AND source NOT IN ('git', 'os', 'daemon')
+                   AND json_extract(data, '$.tool') = 'fileChange'
+                   AND json_extract(data, '$.status') = 'completed'
+                   AND (CASE WHEN json_type(data, '$.changed_paths') = 'array'
+                             THEN json_array_length(data, '$.changed_paths') > 0 ELSE 0 END
+                        OR json_type(data, '$.changed_paths_truncated') = 'true'
+                        OR json_type(data, '$.redacted') = 'true');
+                 INSERT INTO schema_migrations(version) VALUES (51);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1206,7 +1226,8 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX processes_live_owner;
+                "DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
+                 DROP INDEX processes_live_owner;
              DELETE FROM schema_migrations WHERE version=50;
              INSERT INTO processes(host_boot_id,pid,start_time,owner,role,state,updated_at) VALUES
                  ('boot',1,1,'agent:a1#1','plugin','exited',1),
@@ -1260,7 +1281,8 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX processes_live_owner;
+                "DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
+                 DROP INDEX processes_live_owner;
                  DELETE FROM schema_migrations WHERE version=50;
                  DROP INDEX events_heavy_agent_generation;
              DELETE FROM schema_migrations WHERE version=49;",
@@ -1299,7 +1321,8 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX processes_live_owner;
+                "DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
+                 DROP INDEX processes_live_owner;
                  DELETE FROM schema_migrations WHERE version=50;
                  DROP INDEX events_heavy_agent_generation;
                  DELETE FROM schema_migrations WHERE version=49;
@@ -1381,7 +1404,8 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX processes_live_owner;
+                "DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
+                 DROP INDEX processes_live_owner;
                  DELETE FROM schema_migrations WHERE version=50;
                  DROP INDEX events_heavy_agent_generation;
                  DELETE FROM schema_migrations WHERE version=49;
