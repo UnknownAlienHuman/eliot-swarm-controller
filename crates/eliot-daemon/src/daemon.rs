@@ -145,9 +145,7 @@ async fn run_owned(
         mail_config,
     );
 
-    let startup_cwd = std::env::current_dir().ok();
-    crate::bootstrap::ensure_hot_start(data_dir.path(), &store, &policy, startup_cwd.as_deref())
-        .await?;
+    crate::bootstrap::ensure_hot_start(data_dir.path(), &store, &policy).await?;
 
     // A previous run's panic is reported once: in the log as
     // `daemon.panicked` (with when, where and which code in ids), in

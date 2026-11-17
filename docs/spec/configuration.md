@@ -700,6 +700,10 @@ an unregistered Git checkout, S2 creates an entry through the settings writer,
 recorded as a machine change. Its profile allowlist is the existing profiles;
 its action allowlist grants ordinary launch/send only, without script/interpreter,
 Git fetch or additional automation authority. Existing registrations are preserved.
+Daemon startup performs no project discovery: a removed project stays removed
+across restarts, and no checkout is ever registered implicitly. Registration
+runs only through an explicit Owner open (`project.discover`), an Owner
+launch in the checkout, or the desktop's workspace checkout.
 `path` names the canonical
 Git checkout; `profiles` and `actions` are explicit allowlists over existing global
 profiles and implemented actions. Missing or empty allowlists deny all. Project
