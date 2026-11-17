@@ -36,6 +36,9 @@ pub async fn wait_for_stop_turn(until: Instant, mut terminal: impl FnMut() -> bo
 /// still proved separately by the daemon's owned child and reader.
 pub fn run_plugin_entry<F: Future>(entry: F) -> Result<F::Output> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        // One Agent's transport/event pumps do not need a worker per host core.
+        // Keep parallel progress and the separate blocking pool for stdio/files.
+        .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|_| Error::new("plugin_runtime", "plugin runtime could not be started"))?;

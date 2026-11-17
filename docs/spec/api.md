@@ -248,7 +248,10 @@ never reset versions. The advertised capability is `0.19-M1.2`.
 
 ### MCP stdio server
 
-`swarm mcp` is one local stdio server and never starts the daemon. It exposes exactly one
+`swarm mcp` is one local stdio server and never starts the daemon. Each stdio
+bridge uses two async runtime workers, independent of the host's core count;
+the on-demand blocking pool remains available for stdio and IPC. Daemon and
+StreamableHTTP runtime sizing is unchanged. It exposes exactly one
 tool, `swarm`, with required `method` (non-empty string) and `params` (object), and
 forwards calls through the existing authenticated local client. Ordinary mode uses
 [`eliot_daemon::client_call`](../../crates/eliot-daemon/src/daemon.rs); `--require-agent`

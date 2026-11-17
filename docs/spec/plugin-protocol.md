@@ -586,7 +586,10 @@ an explicit unknown retirement error, never successful tail settlement. Retireme
 still ends the unusable plugin; the daemon records missing native evidence as gaps
 and preserves unknown outcomes after its separate custody and reader settlement.
 Every plugin command runs through the shared `native_lifecycle::run_plugin_entry`
-runtime owner. After adapter drains and replies finish, it flushes stdout with a
+runtime owner. Each per-Agent runtime uses two async workers rather than a worker
+per host core; Tokio's separate on-demand blocking pool remains available for
+stdio and file reads. This changes no reader ownership, native custody or drain
+ordering. After adapter drains and replies finish, it flushes stdout with a
 one-second deadline and bounds runtime shutdown to one second. An open daemon
 stdin cannot keep an uncancellable Tokio blocking read alive indefinitely at
 runtime teardown. This bound is not proof of native or plugin custody exit.

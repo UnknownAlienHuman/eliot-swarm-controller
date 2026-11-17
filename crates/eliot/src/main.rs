@@ -8,7 +8,7 @@ use std::{
 mod cli;
 mod mcp;
 
-use cli::args::{Cli, CliCommand, PluginArgs, PluginCommand};
+use cli::args::{Cli, CliCommand, McpArgs, PluginArgs, PluginCommand};
 use cli::support::Failure;
 
 fn main() -> ExitCode {
@@ -27,6 +27,20 @@ fn main() -> ExitCode {
     if is_plugin {
         match eliot_plugin::native_lifecycle::run_plugin_entry(run_inner(cli)) {
             Ok(exit_code) => exit_code,
+            Err(error) => report_failure(Failure::new(1, error.to_string())),
+        }
+    } else if matches!(
+        &cli.command,
+        Some(CliCommand::Mcp(McpArgs { http: false, .. }))
+    ) {
+        // Each native client starts its own thin stdio bridge. A host-sized
+        // scheduler in each bridge duplicates idle threads across the fleet.
+        match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(run_inner(cli)),
             Err(error) => report_failure(Failure::new(1, error.to_string())),
         }
     } else {
