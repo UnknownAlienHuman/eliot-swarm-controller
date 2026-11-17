@@ -41,7 +41,6 @@ pub mod glyph {
     pub const PROFILE: &str = "\u{E77B}";
     pub const PULSE: &str = "\u{E9D9}";
     pub const TOOLS: &str = "\u{E90F}";
-    pub const FLAG: &str = "\u{E7C1}";
     pub const CHECK: &str = "\u{E73E}";
     pub const STAR: &str = "\u{E734}";
     pub const STAR_FILLED: &str = "\u{E735}";
@@ -142,19 +141,6 @@ pub fn dot(fill: Brush) -> View {
         .height(layout::DOT)
         .vertical_alignment(VerticalAlignment::Center)
         .into()
-}
-
-/// An Agent state (its code picks the dot's tone) with its label in
-/// secondary text (no container, so a card holds no extra shape).
-pub fn status(palette: Palette, state: &str, label: &str) -> View {
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(spacing::XS)
-        .vertical_alignment(VerticalAlignment::Center)
-        .children((
-            dot(palette.header_dot(StatusTone::of_activity_state(state))),
-            secondary(label.to_owned()).vertical_alignment(VerticalAlignment::Center),
-        ))
 }
 
 /// A system icon of `size` DIPs; it takes the foreground of the control
@@ -305,28 +291,6 @@ pub fn row_content(glyph: Option<&str>, title: &str, note: &str, trailing: View)
         .columns(columns)
         .column_spacing(spacing::SM)
         .keyed_children(cells)
-}
-
-/// A card that is one button (monitor cards): the card's container clips a
-/// full-size button, so its state layers take the container corner.
-pub fn card_button(
-    palette: Palette,
-    name: String,
-    open: Callback<()>,
-    content: impl Into<View>,
-) -> View {
-    Border::new()
-        .background(palette.card_high())
-        .corner_radius(radius::CONTAINER)
-        .content(
-            Button::new()
-                .resource_overrides(palette.card_button())
-                .horizontal_alignment(HorizontalAlignment::Stretch)
-                .horizontal_content_alignment(HorizontalAlignment::Stretch)
-                .automation_name(name)
-                .on_click(open)
-                .content(content),
-        )
 }
 
 /// An assist chip that opens a menu (`.content(icon_label(..))` last, then
@@ -542,6 +506,54 @@ pub fn section_heading(title: &str, supporting: &str, action: Option<View>) -> V
                 .vertical_alignment(VerticalAlignment::Center)
                 .content(action.unwrap_or_else(View::empty)),
         ))
+}
+
+/// A stacked bar (the Monitor's state bar and its project bars): each
+/// `(count, key, segment)` on a star column proportional to its count, a
+/// 2-DIP gap between segments, then `rest` left empty, so bars drawn on one
+/// scale compare by length. A segment with no count takes no column. Give
+/// each segment a [`bar_segment`] or a [`bar_button`] of the bar's height.
+pub fn stacked_bar(segments: Vec<(usize, String, View)>, rest: usize, height: f64) -> View {
+    let mut columns = Vec::new();
+    let mut cells: Vec<KeyedView> = Vec::new();
+    for (count, key, segment) in segments.into_iter().filter(|(count, ..)| *count > 0) {
+        cells.push(KeyedView::new(
+            key,
+            Border::new()
+                .grid_column(columns.len() as i32)
+                .content(segment),
+        ));
+        columns.push(GridLength::Star(count as f64));
+    }
+    if rest > 0 {
+        columns.push(GridLength::Star(rest as f64));
+    }
+    Grid::new()
+        .height(height)
+        .columns(columns)
+        .column_spacing(layout::BAR_GAP)
+        .keyed_children(cells)
+}
+
+/// One drawn segment of a [`stacked_bar`]: `fill` with rounded ends.
+pub fn bar_segment(fill: Brush, height: f64) -> View {
+    Border::new()
+        .height(height)
+        .corner_radius(height / 2.0)
+        .background(fill)
+        .into()
+}
+
+/// A clickable segment of a [`stacked_bar`] in its fill's button family
+/// (`Palette::chart_button`): no padding, the bar's height (the control
+/// corner rounds its ends). Give it an accessible name.
+pub fn bar_button(overrides: ResourceOverrides, height: f64) -> Button {
+    Button::new()
+        .resource_overrides(overrides)
+        .style(ButtonStyle::Subtle)
+        .height(height)
+        .min_height(height)
+        .horizontal_alignment(HorizontalAlignment::Stretch)
 }
 
 /// A divider.
