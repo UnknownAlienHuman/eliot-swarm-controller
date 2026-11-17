@@ -5,7 +5,9 @@
 //! The picker reads its own candidates ([`search_managers`]): every page of
 //! `agent.list {project, state}` for each state the daemon accepts as a
 //! destination, up to [`SEARCH_BOUND`] rows, and says how many it left
-//! unread. The sidebar's single page is not the search set.
+//! unread. The sidebar's single page is not the search set. `agent.list`
+//! filters only a nonblank project label, so a chat's search reads every
+//! project and says so ([`Scope`]).
 //!
 //! The binding is captured when the owner confirms: the exact source and
 //! destination generations go into the request, so a click acts on exactly
@@ -34,7 +36,8 @@ pub const MANAGER_STATES: [AgentState; 5] = [
 /// Rows per `agent.list` page of the picker's search.
 pub const SEARCH_PAGE: usize = 200;
 
-/// Most rows one picker search reads, across states and pages.
+/// Most rows one picker search reads, across states and pages, including
+/// the reads of each state's total.
 pub const SEARCH_BOUND: usize = 1_000;
 
 /// One `agent.list` page as the search reads it.
@@ -57,9 +60,15 @@ pub struct Managers {
 
 /// Page through `agent.list {project, state}` for every state in
 /// [`MANAGER_STATES`], `page` rows at a time and at most `bound` rows in
-/// all. `fetch` is one validated page read. A chat (empty project label)
-/// has no project filter, so its search reads every project's rows and
-/// [`eligible_parents`] keeps the chats.
+/// all. `fetch` is one validated page read (at most its `limit` rows).
+/// A chat (empty project label) has no project filter, so its search
+/// reads every project's rows ([`Scope::AllProjects`]) and
+/// [`eligible_parents`] keeps the ones without a project.
+///
+/// A state's total arrives only with a read of at least one row, so one
+/// row of the bound stays reserved for each state not yet read: every
+/// total is counted inside the bound, and those rows are candidates too.
+/// A bound below one row per state is raised to that.
 pub async fn search_managers<F, Fut, E>(
     project: &str,
     page: usize,
@@ -70,46 +79,87 @@ where
     F: FnMut(AgentListRequest) -> Fut,
     Fut: std::future::Future<Output = Result<Page, E>>,
 {
+    let bound = bound.max(MANAGER_STATES.len());
     let mut managers = Managers::default();
-    for state in MANAGER_STATES {
+    for (index, state) in MANAGER_STATES.into_iter().enumerate() {
+        let reserved = MANAGER_STATES.len() - index - 1;
+        let room = |read: usize| bound.saturating_sub(read + reserved);
         let mut after = None;
         let mut read = 0;
-        let mut total: Option<usize> = None;
         loop {
-            let room = bound.saturating_sub(managers.agents.len());
-            if room == 0
-                && let Some(total) = total
-            {
-                managers.unread += total.saturating_sub(read);
-                break;
-            }
+            // At least one row: the previous state stopped one row short.
+            let limit = page.min(room(managers.agents.len())).max(1);
             let reply = fetch(AgentListRequest {
                 project: (!project.is_empty()).then(|| project.to_owned()),
                 state: Some(state),
-                // Past the bound, one row still reads the state's total.
-                limit: page.min(room).max(1),
+                limit,
                 after: after.take(),
                 ..AgentListRequest::default()
             })
             .await?;
-            if room == 0 {
-                managers.unread += reply.total;
-                break;
-            }
-            total = Some(reply.total);
             read += reply.rows.len();
             let empty = reply.rows.is_empty();
             managers.agents.extend(reply.rows);
+            let left = reply.total.saturating_sub(read);
             match reply.next {
-                Some(next) if !empty && read < reply.total => after = Some(next),
+                Some(next) if !empty && left > 0 && room(managers.agents.len()) > 0 => {
+                    after = Some(next)
+                }
                 _ => {
-                    managers.unread += reply.total.saturating_sub(read);
+                    managers.unread += left;
                     break;
                 }
             }
         }
     }
     Ok(managers)
+}
+
+/// What a picker search covers. `agent.list` filters only a nonblank
+/// project label, so a chat's search (empty label) reads running or ready
+/// tasks of every project and keeps the ones without a project; its counts
+/// cover every project.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Project,
+    AllProjects,
+}
+
+impl Scope {
+    pub fn of(project: &str) -> Self {
+        if project.is_empty() {
+            Self::AllProjects
+        } else {
+            Self::Project
+        }
+    }
+
+    /// The rows the search reads, in words.
+    pub fn read(self) -> &'static str {
+        match self {
+            Self::Project => "of this project",
+            Self::AllProjects => "of every project",
+        }
+    }
+
+    /// The tasks the picker offers, in words.
+    pub fn offered(self) -> &'static str {
+        match self {
+            Self::Project => "task of this project",
+            Self::AllProjects => "task without a project",
+        }
+    }
+}
+
+/// What a bounded search left unread, in words, over its [`Scope`]; None
+/// when it read every matching row.
+pub fn unread_words(project: &str, read: usize, unread: usize) -> Option<String> {
+    (unread > 0).then(|| {
+        format!(
+            "Searched {read} running or ready tasks {}; {unread} more were not read, so the one you want may be missing.",
+            Scope::of(project).read()
+        )
+    })
 }
 
 /// A move of one Agent (with its subtree) under a new parent, bound to the
@@ -339,5 +389,51 @@ mod tests {
         }))
         .unwrap();
         assert_eq!((bounded.agents.len(), bounded.unread), (5, 5));
+    }
+
+    #[test]
+    fn the_search_reads_at_most_its_bound_including_every_states_total() {
+        // More Idle tasks than the bound, then one Busy and one Waiting task:
+        // their totals are read inside the bound, never one row past it.
+        let mut rows: Vec<UiAgent> = (1..=SEARCH_BOUND + 3)
+            .map(|n| agent(&format!("a{n}"), None, AgentState::Idle, n as i64))
+            .collect();
+        rows.push(agent("a2000", None, AgentState::Busy, 2000));
+        rows.push(agent("a2001", None, AgentState::Waiting, 2001));
+        let mut fetched = 0;
+        let managers = crate::client::block_on(search_managers(
+            "/w",
+            SEARCH_PAGE,
+            SEARCH_BOUND,
+            |request| {
+                let page = list(&rows, &request);
+                fetched += page.rows.len();
+                async move { Ok::<_, ()>(page) }
+            },
+        ))
+        .unwrap();
+        assert!(fetched <= SEARCH_BOUND, "read {fetched} rows");
+        assert_eq!(managers.agents.len(), fetched);
+        assert_eq!(managers.agents.len() + managers.unread, rows.len());
+    }
+
+    #[test]
+    fn a_chats_search_says_it_read_every_project() {
+        // `agent.list` filters only a nonblank project label: a chat's
+        // search reads every project, and its counts say so.
+        let mut requests = Vec::new();
+        let rows = [agent("a1", None, AgentState::Idle, 1)];
+        crate::client::block_on(search_managers("", 2, 10, |request| {
+            requests.push(request.clone());
+            let page = list(&rows, &request);
+            async move { Ok::<_, ()>(page) }
+        }))
+        .unwrap();
+        assert!(requests.iter().all(|request| request.project.is_none()));
+        let chat = unread_words("", 1_000, 4).unwrap();
+        assert!(chat.contains("of every project"), "{chat}");
+        let task = unread_words("/w", 1_000, 4).unwrap();
+        assert!(task.contains("of this project"), "{task}");
+        assert_eq!(unread_words("", 3, 0), None);
     }
 }

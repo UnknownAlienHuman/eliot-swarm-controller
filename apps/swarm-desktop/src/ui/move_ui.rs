@@ -1,7 +1,7 @@
 //! "Move under another task…" (k113): a task's ⋯ menu in the conversation
 //! header and its right-click menu in the sidebar open one picker of the
 //! tasks it can work under ([`reparent::eligible_parents`]: the same
-//! project, running or ready), with a search box. Picking a task and
+//! project, or none for a chat, running or ready), with a search box. Picking a task and
 //! pressing Move is the one confirmation. The picker reads its own
 //! candidates ([`reparent::search_managers`], every page up to a bound),
 //! not the sidebar's single page, and says when it left some unread.
@@ -228,6 +228,7 @@ impl DesktopApp {
             _ => (&[], 0),
         };
         let eligible = reparent::eligible_parents(candidates, &self.nav.agents, &dialog.agent);
+        let scope = reparent::Scope::of(&dialog.agent.project);
         // A parent past the sidebar's page is named from the candidates.
         let title_of = |id: &str| {
             dialog
@@ -290,17 +291,21 @@ impl DesktopApp {
             })
             .collect();
         let list: View = match &dialog.search {
-            Search::Reading => m3::secondary("Reading the tasks of this project…").into(),
-            Search::Failed(error) => {
-                m3::body(format!("Could not read the tasks of this project: {error}"))
-                    .foreground(palette.error())
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true)
-                    .into()
+            Search::Reading => {
+                m3::secondary(format!("Reading running or ready tasks {}…", scope.read())).into()
             }
-            Search::Read(_) if eligible.is_empty() && unread == 0 => m3::secondary(
-                "No other task in this project is running or ready, so there is none to move it under.",
-            )
+            Search::Failed(error) => m3::body(format!(
+                "Could not read the tasks {}: {error}",
+                scope.read()
+            ))
+            .foreground(palette.error())
+            .text_wrapping(TextWrapping::Wrap)
+            .is_text_selection_enabled(true)
+            .into(),
+            Search::Read(_) if eligible.is_empty() && unread == 0 => m3::secondary(format!(
+                "No other {} is running or ready, so there is none to move it under.",
+                scope.offered()
+            ))
             .text_wrapping(TextWrapping::Wrap)
             .into(),
             Search::Read(_) if eligible.is_empty() => {
@@ -320,16 +325,13 @@ impl DesktopApp {
                 .content(StackPanel::new().keyed_children(rows)),
         };
         // The search is bounded: say what it left unread.
-        let incomplete: View = if unread > 0 {
-            m3::secondary(format!(
-                "Searched {} running or ready tasks of this project; {unread} more were not read, so the one you want may be missing.",
-                candidates.len()
-            ))
-            .text_wrapping(TextWrapping::Wrap)
-            .into()
-        } else {
-            View::empty()
-        };
+        let incomplete: View =
+            match reparent::unread_words(&dialog.agent.project, candidates.len(), unread) {
+                Some(words) => m3::secondary(words)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into(),
+                None => View::empty(),
+            };
         let summary: View = match (&dialog.error, picked) {
             (Some(error), _) => m3::body(error.clone())
                 .foreground(palette.error())
@@ -377,9 +379,10 @@ impl DesktopApp {
                 .content(
                     StackPanel::new().spacing(tokens::spacing::MD).children((
                         m3::section_title(heading).text_wrapping(TextWrapping::Wrap),
-                        m3::secondary(
-                            "Pick a running or ready task of this project (archived ones are not listed). It then shows under that task in the sidebar and the Monitor.",
-                        )
+                        m3::secondary(format!(
+                            "Pick a running or ready {} (archived ones are not listed). It then shows under that task in the sidebar and the Monitor.",
+                            scope.offered()
+                        ))
                         .text_wrapping(TextWrapping::Wrap),
                         m3::field()
                             .text(dialog.query.clone())

@@ -482,7 +482,9 @@ of the explicitly selected release scope.
       through `swarm.reparent`: a picker with a search box and one
       confirmation, bound to the generations shown; the daemon's refusal reads
       in plain words. The picker pages `agent.list {project, state}` itself
-      (bounded, not the sidebar's page) and says how many tasks it left unread. A Hand off / Switch dialog selects the original task SEND
+      (at most 1,000 rows, totals included; not the sidebar's page) and says how
+      many tasks it left unread; a chat's search has no project filter, so it
+      says it read every project. A Hand off / Switch dialog selects the original task SEND
       and up to 64 undispatched SENDs, then hands off to an existing Agent
       (`swarm.handoff`) or switches to a new profile or ad-hoc Agent
       (`swarm.switch`, cross-harness). It shows cancellations, successors, brief
