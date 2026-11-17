@@ -141,7 +141,7 @@ pub(crate) enum CliCommand {
     Archive(ShowArgs),
     /// Restore an archived Agent tree.
     Unarchive(ShowArgs),
-    /// Delete stopped Agent tree records, preserving files.
+    /// Delete stopped or failed Agent tree records after custody drains, preserving files.
     Delete(ShowArgs),
     /// Switch a live Agent's model and/or effort for its next turn.
     Configure(ConfigureArgs),

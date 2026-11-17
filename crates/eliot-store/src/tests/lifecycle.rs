@@ -527,3 +527,55 @@ fn startup_lost_agents_pages_beyond_the_first_bound() {
         "missing evidence surfaces as no sequence, never seq 0"
     );
 }
+
+#[test]
+fn failed_agent_deletion_retains_custody_and_unknown_turn_guards() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('','antigravity','p','failed',1,?1,?1)",[now]).unwrap();
+    store.connection.execute("INSERT INTO source_state(agent,generation,source,state,health,updated_at) VALUES (1,1,'stream','open','error',?1)",[now]).unwrap();
+    let assert_busy = |store: &mut Store| {
+        assert_eq!(
+            store
+                .change_agent_tree(&Ulid::new().to_string(), "a1", None, now)
+                .unwrap_err()
+                .code,
+            "busy"
+        );
+        assert!(store.get_agent("a1").unwrap().is_some());
+    };
+    assert_busy(&mut store);
+    store
+        .connection
+        .execute("UPDATE source_state SET state='closed' WHERE agent=1", [])
+        .unwrap();
+    insert_process(&store, "failed-start-boot", 10, 1, "agent:a1#1", "running");
+    assert_busy(&mut store);
+    store
+        .connection
+        .execute("UPDATE processes SET state='exited',exit_code=1", [])
+        .unwrap();
+    store.connection.execute("INSERT INTO turns(agent,generation,turn_id,state,started_at) VALUES (1,1,'failed-start-turn','unknown',?1)",[now]).unwrap();
+    assert_busy(&mut store);
+    store
+        .connection
+        .execute("DELETE FROM turns WHERE agent=1", [])
+        .unwrap();
+    store
+        .connection
+        .execute("UPDATE agents SET state='lost' WHERE id=1", [])
+        .unwrap();
+    assert_busy(&mut store);
+    store
+        .connection
+        .execute("UPDATE agents SET state='failed' WHERE id=1", [])
+        .unwrap();
+    let id = Ulid::new().to_string();
+    let reply = store.change_agent_tree(&id, "a1", None, now).unwrap();
+    assert_eq!(reply["deleted"], true);
+    assert!(store.get_agent("a1").unwrap().is_none());
+    assert_eq!(
+        store.change_agent_tree(&id, "a1", None, now).unwrap(),
+        reply
+    );
+}

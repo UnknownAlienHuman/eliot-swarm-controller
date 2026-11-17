@@ -659,8 +659,10 @@ target, including selector members, so new activity appears in the default list.
 totals and cursors use the same filter. Summaries and full Agents expose `archived`.
 CLI: `swarm archive aN`, `swarm unarchive aN`, `swarm ls --archived include`.
 
-`agent.delete {id, agent:"aN"}` is Owner-only and removes one stopped Agent tree's
-Store records, using retention's leaf-first command cleanup. Live custody, open
+`agent.delete {id, agent:"aN"}` is Owner-only and removes a tree whose Agents are
+stopped or failed, using retention's leaf-first command cleanup. A failed launch
+can be removed after its sources and custody drain; an already-terminal `stop`
+does not need to rewrite its failure state. Live custody, open
 commands, uncertain turns, applicable unconsumed cleanup plans or a pinned history
 floor return `busy`; oversized operations return `unavailable` atomically. It never stops an Agent or deletes
 workspace files, native stores or Git branches. Run artifact cleanup separately

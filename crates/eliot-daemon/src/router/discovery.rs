@@ -45,7 +45,7 @@ macro_rules! method {
 // omission deliberate: new methods must be described before they can ship.
 const METHODS: &[Method] = &[
     method!("agent.archive", AgentArchiveRequest, AgentTreeResponse, true, true, "Archive or unarchive an idle or stopped Agent tree, without stopping it.", {"id":EXAMPLE_ID,"agent":"a1","archived":true}),
-    method!("agent.delete", AgentDeleteRequest, AgentTreeResponse, true, true, "Delete stopped Agent tree records only; native files and workspaces remain.", {"id":EXAMPLE_ID,"agent":"a1"}),
+    method!("agent.delete", AgentDeleteRequest, AgentTreeResponse, true, true, "Delete stopped or failed Agent trees after custody drains; preserve files.", {"id":EXAMPLE_ID,"agent":"a1"}),
     method!("artifact.register", ArtifactRegisterRequest, ArtifactView, false, true, "Register an existing Agent-owned artifact directory with exact generation and opened identity.", {"id":EXAMPLE_ID,"path":"C:/scratch/build","kind":"build","purpose":"assignment build"}),
     method!("cleanup.plan", CleanupPlanRequest, CleanupPlan, false, false, "Plan bounded cleanup: Agents own subtree; Owner project or all. No deletion.", {"scope":"self_tree"}),
     method!("cleanup.apply", CleanupApplyRequest, CleanupApplyResponse, false, true, "Consume one plan, rechecking safe entries; replay returns retained outcomes.", {"id":EXAMPLE_ID,"plan_id":EXAMPLE_ID}),

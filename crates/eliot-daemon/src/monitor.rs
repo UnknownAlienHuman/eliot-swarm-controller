@@ -515,7 +515,7 @@ impl Monitoring {
             .map(|target| target.cache.lock_recover().clone())
             .unwrap_or_default();
         let unavailable = self.inner.unavailable.lock_recover().clone();
-        let (processes, last_model_progress, source_healthy) = {
+        let (mut processes, last_model_progress, source_healthy) = {
             let store = self.inner.store.lock().await;
             let processes =
                 store.list_processes(&owner(&agent.id, agent.generation), None, PAGE_LIMIT)?;
@@ -526,6 +526,7 @@ impl Monitoring {
                 .and_then(native_sources_healthy);
             (processes, progress, healthy)
         };
+        refresh_process_timestamps(&mut processes, &cache);
         let now = now_ms();
         let model_clock_regressed = last_model_progress.is_some_and(|at| at > now);
         let workspace = match self.workspace_view(agent).await {
@@ -556,7 +557,7 @@ impl Monitoring {
     /// Agent.generation remains native/control state. Workspace observation is
     /// explicitly named by its retained target, including target 1 while Agent is 0.
     pub(crate) async fn workspace_view(&self, agent: &Agent) -> Result<Option<WorkspaceView>> {
-        let (preparation, processes, source) = {
+        let (preparation, mut processes, source) = {
             let store = self.inner.store.lock().await;
             let Some(preparation) = store.get_workspace(&agent.id)? else {
                 return Ok(None);
@@ -575,6 +576,7 @@ impl Monitoring {
             (preparation, processes, source)
         };
         let cache = self.workspace_cache(&agent.id, preparation.target_generation);
+        refresh_process_timestamps(&mut processes, &cache);
         let unavailable = self.inner.unavailable.lock_recover().clone();
         Ok(Some(WorkspaceView::Data(Box::new(WorkspaceObservation {
             owner: workspace_owner(&agent.id, preparation.target_generation),
@@ -638,6 +640,23 @@ impl Monitoring {
             sampled_at,
             error,
         }
+    }
+
+    pub(crate) fn refresh_process_timestamps(
+        &self,
+        agent: &str,
+        generation: i64,
+        scope: &str,
+        processes: &mut [ProcessRecord],
+    ) {
+        let cache = if scope == "workspace" {
+            self.workspace_cache(agent, generation)
+        } else {
+            self.target(agent, generation)
+                .map(|target| target.cache.lock_recover().clone())
+                .unwrap_or_default()
+        };
+        refresh_process_timestamps(processes, &cache);
     }
 
     pub(crate) async fn git_view(&self, agent: &Agent) -> Result<GitView> {
@@ -2128,6 +2147,32 @@ fn owner(agent: &str, generation: i64) -> String {
     format!("agent:{agent}#{generation}")
 }
 
+/// A cache is installed only after Store accepts the exact observation.
+/// Never let an older cache or a different process fact refresh a durable row.
+fn refresh_process_timestamps(processes: &mut [ProcessRecord], cache: &Cache) {
+    let Some(snapshot) = &cache.snapshot else {
+        return;
+    };
+    let samples: HashMap<_, _> = snapshot
+        .samples
+        .iter()
+        .map(|sample| (&sample.record.identity, &sample.record))
+        .collect();
+    for process in processes {
+        let Some(sample) = samples.get(&process.identity) else {
+            continue;
+        };
+        if sample.updated_at > process.updated_at
+            && sample.owner == process.owner
+            && sample.role == process.role
+            && sample.state == process.state
+            && sample.exit_code == process.exit_code
+        {
+            process.updated_at = sample.updated_at;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2274,6 +2319,40 @@ mod tests {
             },
             cpu_time_ns,
             rss_bytes,
+        }
+    }
+
+    #[test]
+    fn process_freshness_uses_only_matching_accepted_sample_facts() {
+        let mut accepted = sample(None, None);
+        let retained = accepted.record.clone();
+        accepted.record.updated_at = 2000;
+        let cache = Cache {
+            snapshot: Some(ProcessSnapshot {
+                samples: vec![accepted],
+                complete: false,
+            }),
+            sampled_at: Some(3000),
+            error: None,
+        };
+        let mut records = vec![retained.clone()];
+        refresh_process_timestamps(&mut records, &cache);
+        assert_eq!(records[0].updated_at, 2000);
+        // PID reuse, another owner/role, changed state, and a newer durable
+        // timestamp must never acquire freshness from the cached observation.
+        for mismatch in 0..6 {
+            let mut record = retained.clone();
+            match mismatch {
+                0 => record.identity.start_time += 1,
+                1 => record.owner = owner("a1", 2),
+                2 => record.role = "plugin".to_owned(),
+                3 => record.state = ProcessState::Exited,
+                4 => record.exit_code = Some(1),
+                _ => record.updated_at = 4000,
+            }
+            let before = record.clone();
+            refresh_process_timestamps(std::slice::from_mut(&mut record), &cache);
+            assert_eq!(record, before);
         }
     }
 

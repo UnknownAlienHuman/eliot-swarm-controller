@@ -74,13 +74,13 @@ impl Store {
             let allowed = if archived.is_some() {
                 matches!(row.state, AgentState::Idle | AgentState::Stopped)
             } else {
-                row.state == AgentState::Stopped
+                matches!(row.state, AgentState::Stopped | AgentState::Failed)
             };
             let open: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM commands WHERE target=?1 AND state IN ('accepted','queued','dispatched','unknown')) OR EXISTS(SELECT 1 FROM turns WHERE agent=?1 AND state IN ('running','unknown'))",[num],|r|r.get(0)).map_err(sql_error)?;
             if !allowed || open || row.active_turn.is_some() || !row.pending.is_empty() {
                 return Err(Error::new(
                     "busy",
-                    "Agent tree must be idle or stopped to archive, and stopped to delete",
+                    "Agent tree must be idle or stopped to archive, and stopped or failed to delete",
                 ));
             }
             if archived.is_none() {
