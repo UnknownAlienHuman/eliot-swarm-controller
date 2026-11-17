@@ -21,7 +21,8 @@ const NATIVE_PROGRESS_SQL: &str = "SELECT ts FROM events WHERE agent = ?1 AND ge
 const TERMINAL_ACTIVITY_SQL: &str =
     "SELECT status FROM turns WHERE agent = ?1 AND generation = ?2 AND state = 'completed'
     ORDER BY COALESCE(completed_at, started_at, 0) DESC, rowid DESC LIMIT 1";
-const CHILDREN_ATTENTION_PAGE_SQL: &str = "SELECT r.child, c.generation, c.origin, c.observe_only
+const CHILDREN_ATTENTION_PAGE_SQL: &str = "SELECT r.child, c.generation, c.origin, c.observe_only,
+    c.state IN ('stopped', 'failed', 'lost')
     FROM native_child_registrations r JOIN agents c ON c.id = r.child
     WHERE r.producer = ?1 AND r.producer_generation = ?2 AND r.child > ?3 AND r.child <= ?4
     ORDER BY r.child LIMIT ?5";
@@ -192,6 +193,7 @@ impl Store {
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, bool>(3)?,
+                        row.get::<_, bool>(4)?,
                     ))
                 },
             )
@@ -200,10 +202,11 @@ impl Store {
         let mut count = 0;
         let mut last = None;
         for row in rows {
-            let (child, child_generation, origin, observe_only) = row.map_err(sql_error)?;
+            let (child, child_generation, origin, observe_only, ended) = row.map_err(sql_error)?;
             count += 1;
             last = Some(format_agent_id(child));
-            if origin != "native" || !observe_only {
+            // A child that ended with its parent is finished work.
+            if origin != "native" || !observe_only || ended {
                 continue;
             }
             let activity = activity(&self.connection, child, child_generation)?;
@@ -555,6 +558,123 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// The typed reason a native child settles with when its producer generation ends.
+pub const ENDED_WITH_PARENT: &str = "ended_with_parent";
+
+/// Settle every still-`unknown` observed native child whose exact controlled
+/// producer generation has ended: the producer is stopped, failed or lost, or
+/// its generation moved on. Such a child can never receive another fact (its
+/// grant requires that live producer generation), so it becomes `stopped` with
+/// `agent.stopped {reason: ended_with_parent}` in the same transaction. Turn
+/// facts stay as they are, except a still-running turn, which is retained
+/// `unknown`, never completed. Source rows are untouched here. `producer`
+/// narrows the sweep to one producer generation; `None` sweeps every
+/// retained registration (restart recovery).
+pub(crate) fn end_native_children_with_parent_tx(
+    tx: &Transaction<'_>,
+    producer: Option<(i64, i64)>,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let (producer_num, producer_generation) = producer.unzip();
+    let rows = {
+        let mut statement = tx
+            .prepare(
+                "SELECT r.child, c.generation, r.producer, r.producer_generation, p.generation, p.state
+                 FROM native_child_registrations r
+                 JOIN agents c ON c.id = r.child
+                 JOIN agents p ON p.id = r.producer
+                 WHERE c.state = 'unknown' AND c.origin = 'native' AND c.observe_only = 1
+                   AND (p.generation != r.producer_generation
+                        OR p.state IN ('stopped', 'failed', 'lost'))
+                   AND (?1 IS NULL OR (r.producer = ?1 AND r.producer_generation = ?2))
+                 ORDER BY r.child",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![producer_num, producer_generation], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(sql_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?
+    };
+    for (child, generation, producer, producer_generation, current, state) in rows {
+        // The producer's end of exactly this generation; a later generation
+        // says only that this one is over.
+        let producer_state = if current == producer_generation {
+            state
+        } else {
+            "superseded".to_owned()
+        };
+        let running = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT turn_id FROM turns WHERE agent = ?1 AND generation = ?2
+                     AND state = 'running' ORDER BY turn_id",
+                )
+                .map_err(sql_error)?;
+            let rows = statement
+                .query_map(params![child, generation], |row| row.get::<_, String>(0))
+                .map_err(sql_error)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_error)?
+        };
+        for turn_id in running {
+            db!(tx.execute(
+                "UPDATE turns SET state = 'unknown' WHERE agent = ?1 AND generation = ?2
+                 AND turn_id = ?3 AND state = 'running'",
+                params![child, generation, turn_id],
+            ));
+            events.push(insert_daemon_event(
+                tx,
+                now,
+                "turn.unknown",
+                "turn",
+                Some(child),
+                Some(generation),
+                json!({"turn_id": turn_id, "reason": ENDED_WITH_PARENT}),
+            )?);
+        }
+        let changed = db!(tx.execute(
+            "UPDATE agents SET state = 'stopped', active_turn = NULL, pending = '[]', updated_at = ?1
+             WHERE id = ?2 AND generation = ?3 AND state = 'unknown'",
+            params![now, child, generation],
+        ));
+        if changed != 1 {
+            return Err(Error::new(
+                "source_integrity",
+                "native child changed while it ended with its parent",
+            ));
+        }
+        // Source rows stay with the producer's retirement, which owns the
+        // reader-closure proof (`mark_native_children_unavailable`).
+        events.push(insert_daemon_event(
+            tx,
+            now,
+            "agent.stopped",
+            "agent",
+            Some(child),
+            Some(generation),
+            json!({
+                "agent_id": format_agent_id(child),
+                "reason": ENDED_WITH_PARENT,
+                "producer": format_agent_id(producer),
+                "producer_generation": producer_generation,
+                "producer_state": producer_state,
+            }),
+        )?);
+    }
+    Ok(())
 }
 
 fn mark_one_native_child_unavailable_tx(

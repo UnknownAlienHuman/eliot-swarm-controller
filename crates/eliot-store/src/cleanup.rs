@@ -500,6 +500,21 @@ impl Store {
             ));
         }
         validate_id_age(&request.id, now)?;
+        if let Some(selected) = &request.artifacts
+            && selected.iter().any(|id| {
+                !plan
+                    .items
+                    .iter()
+                    .any(|item| item.verdict == "safe" && item.artifact.id == *id)
+            })
+        {
+            return Err(Error::new(
+                "invalid",
+                "cleanup selection names an artifact that is not a safe candidate of the plan",
+            ));
+        }
+        let attempted =
+            |item: &CleanupCandidate| item.verdict == "safe" && request.selects(&item.artifact.id);
         let mut response = CleanupApplyResponse {
             plan_id: plan.plan_id.clone(),
             bytes_reclaimed: 0,
@@ -508,15 +523,17 @@ impl Store {
                 .iter()
                 .map(|item| CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
-                    outcome: if item.verdict == "safe" {
+                    outcome: if attempted(item) {
                         "unknown"
                     } else {
                         "skipped"
                     }
                     .to_owned(),
                     reason: Some(
-                        if item.verdict == "safe" {
+                        if attempted(item) {
                             "attempt_reserved"
+                        } else if item.verdict == "safe" {
+                            "not_selected"
                         } else {
                             &item.reason
                         }
@@ -544,7 +561,7 @@ impl Store {
         }
         // Fence every attempted artifact across new plans and daemon restarts.
         for (index, item) in plan.items.iter().enumerate() {
-            if item.verdict == "safe" {
+            if attempted(item) {
                 let body: Option<String> = tx
                     .query_row(
                         "SELECT body FROM artifacts WHERE id=?1",
@@ -778,6 +795,7 @@ mod tests {
             id: Ulid::new().to_string(),
             plan_id: plan.plan_id.clone(),
             delete_remote: false,
+            artifacts: None,
         };
         let (_, mut first, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
         assert!(is_new);
@@ -797,12 +815,14 @@ mod tests {
             id: Ulid::new().to_string(),
             plan_id: plan.plan_id,
             delete_remote: false,
+            artifacts: None,
         };
         assert!(store.begin_cleanup_apply("owner", &different, now).is_err());
         let other = CleanupApplyRequest {
             id: Ulid::new().to_string(),
             plan_id: other_plan.plan_id,
             delete_remote: false,
+            artifacts: None,
         };
         let (_, result, _) = store.begin_cleanup_apply("owner", &other, now).unwrap();
         assert_eq!(result.items[0].outcome, "skipped");
@@ -812,6 +832,88 @@ mod tests {
         );
         let agent = store.get_agent("a1").unwrap().unwrap();
         assert!(require_no_cleanup_attempt(&store.connection, &agent).is_err());
+    }
+
+    #[test]
+    fn a_selection_attempts_only_its_safe_candidates_and_leaves_the_rest_unfenced() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','stopped',1,?1,?1)",[now]).unwrap();
+        let artifact = |path: &str, kind: ArtifactKind| ArtifactView {
+            id: Ulid::new().to_string(),
+            agent: "a1".to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: vec!["a1:1".to_owned()],
+            path: path.to_owned(),
+            kind,
+            purpose: "scratch".to_owned(),
+            identity: path.to_owned(),
+            created_at: now,
+            state: "registered".to_owned(),
+            git: None,
+        };
+        let build = artifact("C:/scratch/target", ArtifactKind::Build);
+        let temp = artifact("C:/scratch/temp", ArtifactKind::Temp);
+        store.record_known_artifact(build.clone()).unwrap();
+        store.record_known_artifact(temp.clone()).unwrap();
+        let candidate = |artifact: &ArtifactView| CleanupCandidate {
+            artifact: artifact.clone(),
+            bytes: Some(7),
+            verdict: "safe".to_owned(),
+            reason: "terminal_owned_artifact".to_owned(),
+        };
+        let plan = CleanupPlan {
+            plan_id: Ulid::new().to_string(),
+            created_at: now,
+            items: vec![candidate(&build), candidate(&temp)],
+            truncated: false,
+        };
+        store.retain_cleanup_plan("owner", &plan).unwrap();
+        let foreign = CleanupApplyRequest {
+            id: Ulid::new().to_string(),
+            plan_id: plan.plan_id.clone(),
+            delete_remote: false,
+            artifacts: Some(vec![Ulid::new().to_string()]),
+        };
+        assert_eq!(
+            store
+                .begin_cleanup_apply("owner", &foreign, now)
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+        let request = CleanupApplyRequest {
+            id: Ulid::new().to_string(),
+            plan_id: plan.plan_id.clone(),
+            delete_remote: false,
+            artifacts: Some(vec![temp.id.clone()]),
+        };
+        let (_, response, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
+        assert!(is_new);
+        assert_eq!(response.items[0].outcome, "skipped");
+        assert_eq!(response.items[0].reason.as_deref(), Some("not_selected"));
+        assert_eq!(response.items[1].outcome, "unknown");
+        // The unselected artifact stays registered for a later plan; the
+        // attempted one is fenced.
+        let state = |id: &str| -> String {
+            let body: String = store
+                .connection
+                .query_row("SELECT body FROM artifacts WHERE id=?1", [id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            serde_json::from_str::<ArtifactView>(&body).unwrap().state
+        };
+        assert_eq!(state(&build.id), "registered");
+        assert_eq!(state(&temp.id), "unknown");
+        // The selection is part of the request binding.
+        let mut changed = request.clone();
+        changed.artifacts = Some(vec![build.id.clone()]);
+        assert!(store.begin_cleanup_apply("owner", &changed, now).is_err());
+        let (_, replay, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
+        assert!(!is_new);
+        assert_eq!(replay.items[1].outcome, "unknown");
     }
 
     #[test]

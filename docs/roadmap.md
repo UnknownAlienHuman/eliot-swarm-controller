@@ -435,8 +435,14 @@ of the explicitly selected release scope.
       refresh chain, active only while open. Each refresh reads `agent.list` per
       attention state with observations (with `total` as the exact counter), then
       `agent.get` and `usage.summary` for the selected Agent only. At most four
-      reads run concurrently. Rows show attention first, with the daemon-reported
-      sample age and TTL, coverage and clock regression. CPU is core-equivalent
+      reads run concurrently. The panel groups Needs attention (waiting, failed,
+      lost, a controlled Agent in `unknown`, or an open `x.user.agent.attention`
+      report read incrementally from the journal), Working, Idle and a collapsed
+      Recently stopped (last 24 hours, its rows read every tenth refresh); native
+      observed children nest collapsed under their parent card and read as their
+      activity, or "Ended with parent"; the line under the title says what is
+      live ("2 working · 1 needs attention · 3 idle"). Cards carry the
+      daemon-reported sample age and TTL, coverage and clock regression. CPU is core-equivalent
       and differenced only between samples of matching process identities; a
       changed set is marked partial. RSS is shown, the UI-only history is capped
       and deduplicated; CPU and memory are bar charts with the latest value and a
@@ -483,14 +489,16 @@ of the explicitly selected release scope.
       one tonal New task row (Ctrl+N), Search tasks (Ctrl+K: title, project and
       harness, through WinUI's AutoSuggestBox), Automations and Usage,
       collapsible projects with their Agents nested (manager, then workers,
-      collapsed), Recents, a calm fleet line that opens the monitor ("6
-      running"), a separate "N need attention" row that lists only Agents
-      waiting on a request or controlled Agents in `unknown` (observe-only
-      native children never count), and Settings. A project is a repository:
+      collapsed), Recents, a fleet line that opens the monitor and says what
+      is live ("2 working · 1 needs attention · 3 idle", "All quiet" when
+      nothing is), a separate "N need attention" row that lists Agents waiting
+      on a request, failed or lost ones, and controlled Agents in `unknown`
+      (observe-only native children never count), and Settings. A project is a repository:
       checkouts registered with the same Git common directory group under the
       repository's name, and a task row names its worktree only where the
       project spans several. Running tasks stay on top, then newest first;
-      stopped tasks last changed before today fold into "Show N older"; a
+      stopped tasks last changed before today fold into "Show N older" (a
+      project whose tasks are all older keeps its newest three in view); a
       collapsed project shows its running count, and `[desktop]
       collapsed_projects` keeps the collapse across restarts. Titles come with
       each `agent.list` page (the first meaningful line of the summary
@@ -566,8 +574,11 @@ of the explicitly selected release scope.
       remaining provider quota as rings (weekly and 5-hour where `harness.quota`
       reports them, "Not supported" otherwise), running Agents and the tokens
       of Agents active today. Worktrees & cleanup lists the managed worktrees
-      under the data directory by project with Open; cleanup waits for
-      `cleanup.plan` / `cleanup.apply`. Shortcuts: Ctrl+N, Ctrl+K, Ctrl+M,
+      under the data directory by project with Open, and Clean up finished work
+      reviews a `cleanup.plan` by kind (sizes, keep or remove reasons, a checkbox
+      per group) and applies the checked groups' safe items through
+      `cleanup.apply` after one confirmation. Automations show times on the
+      local clock. Shortcuts: Ctrl+N, Ctrl+K, Ctrl+M,
       Ctrl+,. (Refs #407)
 - [x] **D10 The owner's second pass (2026-11-16).** Picker groups (each
       harness, and each OpenCode provider) collapse, remembered in `[desktop]

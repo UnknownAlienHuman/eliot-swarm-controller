@@ -327,6 +327,7 @@ fn delete_refuses_unconsumed_cleanup_and_preserves_consumed_replay() {
         id: Ulid::new().to_string(),
         plan_id: plan.plan_id.clone(),
         delete_remote: false,
+        artifacts: None,
     };
     let (_, first, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
     assert!(is_new);

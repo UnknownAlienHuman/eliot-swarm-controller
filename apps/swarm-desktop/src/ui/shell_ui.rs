@@ -1287,10 +1287,16 @@ impl DesktopApp {
                 continue;
             }
             if section.rows.is_empty() {
+                // Older tasks fold below; "No tasks yet" only when there
+                // are none at all.
                 items.push(KeyedView::new(
                     format!("empty:{}", section.key),
                     quiet_row(
-                        "No tasks yet: start one with New task",
+                        if section.older > 0 {
+                            "No recent tasks"
+                        } else {
+                            "No tasks yet: start one with New task"
+                        },
                         tokens::layout::TREE_INDENT,
                     ),
                 ));
@@ -1449,15 +1455,11 @@ impl DesktopApp {
             bottom.push(KeyedView::new(
                 format!("attention:{attention}"),
                 m3::row(palette, attention)
-                    .automation_name(format!(
-                        "{} ({})",
-                        fleet.attention_label(),
-                        if attention { "listed" } else { "list them" }
-                    ))
+                    .automation_name(fleet.attention_row_label(attention))
                     .on_click(context.message(Message::Shell(ShellMsg::AttentionToggled)))
                     .content(m3::row_content(
                         Some(m3::glyph::FLAG),
-                        &fleet.attention_label(),
+                        &fleet.attention_row_label(attention),
                         "",
                         palette
                             .dot(StatusTone::Attention)

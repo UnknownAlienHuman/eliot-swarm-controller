@@ -1065,13 +1065,15 @@ fn parent_terminal_never_completes_child_and_retired_producer_cannot_publish() {
             NOW + 3,
         )
         .unwrap();
+    // The child ends with its parent: its open turn is retained unknown,
+    // never completed.
     assert_eq!(
         store.list_turns(&child.agent.id, 1, 100).unwrap()[0].state,
-        TurnState::Running
+        TurnState::Unknown
     );
     assert_eq!(
         store.get_agent(&child.agent.id).unwrap().unwrap().state,
-        AgentState::Unknown
+        AgentState::Stopped
     );
     assert!(
         store
@@ -1282,17 +1284,8 @@ fn producer_loss_marks_nested_children_unknown_then_closes_without_another_gap()
         )
         .unwrap();
     let first_metadata = store.get_agent(&first.agent.id).unwrap().unwrap();
-    store
-        .put_batch(
-            batch(
-                &root,
-                "root-ended",
-                vec![event("session.ended", "root-ended", json!({}))],
-            ),
-            NOW + 3,
-        )
-        .unwrap();
-
+    // The reader is lost while the producer generation still runs: the
+    // children stay unknown (ending with the parent is covered below).
     let lost = store
         .mark_native_children_unavailable(&root, 1, "reader_lost", false, NOW + 4)
         .unwrap();
@@ -1376,6 +1369,176 @@ fn producer_loss_marks_nested_children_unknown_then_closes_without_another_gap()
             .is_empty()
     );
     assert_eq!(store.high_water().unwrap(), high_water);
+}
+
+#[test]
+fn children_end_with_their_stopped_parent_and_stay_ended_across_restart() {
+    let mut store = store();
+    let root = producer(&mut store, "root");
+    let foreign = producer(&mut store, "foreign");
+    let first = register(&mut store, &root, request(&root, "root", "first"));
+    let nested = register(
+        &mut store,
+        &root,
+        request(&first.agent.id, "first", "nested"),
+    );
+    let unrelated = register(
+        &mut store,
+        &foreign,
+        request(&foreign, "foreign", "unrelated"),
+    );
+    store
+        .put_native_child_batch(
+            &root,
+            1,
+            batch(
+                &first.agent.id,
+                "first-done",
+                vec![
+                    event("turn.started", "first-start", json!({"turn_id":"done"})),
+                    event(
+                        "turn.completed",
+                        "first-end",
+                        json!({"turn_id":"done", "status":"completed"}),
+                    ),
+                ],
+            ),
+            NOW + 2,
+        )
+        .unwrap();
+    let completed = store.get_turn(&first.agent.id, 1, "done").unwrap().unwrap();
+    start_child_turn(&mut store, &root, &nested.agent.id, "nested-active");
+    start_child_turn(&mut store, &foreign, &unrelated.agent.id, "foreign-active");
+    assert_eq!(
+        attention_summary(&store, &root, 1, NOW + 2, 1_000).unfinished,
+        1
+    );
+
+    let ended = store
+        .put_batch(
+            batch(
+                &root,
+                "root-ended",
+                vec![event("session.ended", "root-ended", json!({}))],
+            ),
+            NOW + 3,
+        )
+        .unwrap()
+        .events;
+    let stopped: Vec<&Event> = ended
+        .iter()
+        .filter(|event| event.kind == "agent.stopped")
+        .collect();
+    assert_eq!(stopped.len(), 2);
+    for event in &stopped {
+        assert_eq!(event.data["reason"], ENDED_WITH_PARENT);
+        assert_eq!(event.data["producer"], root);
+        assert_eq!(event.data["producer_generation"], 1);
+        assert_eq!(event.data["producer_state"], "stopped");
+    }
+    for child in [&first.agent.id, &nested.agent.id] {
+        let row = store.get_agent(child).unwrap().unwrap();
+        assert_eq!(row.state, AgentState::Stopped);
+        assert!(row.observe_only && !row.own_identity);
+    }
+    // Completed work stays completed; the open turn is retained unknown.
+    assert_eq!(
+        store.get_turn(&first.agent.id, 1, "done").unwrap().unwrap(),
+        completed
+    );
+    assert_eq!(
+        store
+            .get_turn(&nested.agent.id, 1, "nested-active")
+            .unwrap()
+            .unwrap()
+            .state,
+        TurnState::Unknown
+    );
+    // An ended cohort opens no manager incident; another producer's child
+    // is untouched.
+    assert_eq!(
+        attention_summary(&store, &root, 1, NOW + 3, 1_000).unfinished,
+        0
+    );
+    assert_eq!(
+        store.get_agent(&unrelated.agent.id).unwrap().unwrap().state,
+        AgentState::Unknown
+    );
+    assert_eq!(
+        store
+            .get_turn(&unrelated.agent.id, 1, "foreign-active")
+            .unwrap()
+            .unwrap()
+            .state,
+        TurnState::Running
+    );
+
+    // A restart keeps the ended rows ended and does not emit them again.
+    let recovered = store.recover_on_restart(NOW + 4).unwrap();
+    assert!(!recovered.iter().any(|event| {
+        event.kind == "agent.stopped"
+            && [first.agent.id.as_str(), nested.agent.id.as_str()]
+                .contains(&event.agent.as_deref().unwrap_or_default())
+    }));
+    for child in [&first.agent.id, &nested.agent.id] {
+        assert_eq!(
+            store.get_agent(child).unwrap().unwrap().state,
+            AgentState::Stopped
+        );
+    }
+    // The other producer was live at the restart: lost, and its child ends.
+    assert_eq!(
+        store.get_agent(&foreign).unwrap().unwrap().state,
+        AgentState::Lost
+    );
+    let unrelated_end = recovered
+        .iter()
+        .find(|event| {
+            event.kind == "agent.stopped"
+                && event.agent.as_deref() == Some(unrelated.agent.id.as_str())
+        })
+        .expect("child of the lost producer ends");
+    assert_eq!(unrelated_end.data["producer_state"], "lost");
+    assert_eq!(
+        store.get_agent(&unrelated.agent.id).unwrap().unwrap().state,
+        AgentState::Stopped
+    );
+}
+
+#[test]
+fn restart_ends_children_left_unknown_by_an_earlier_parent_stop() {
+    let mut store = store();
+    let root = producer(&mut store, "root");
+    let child = register(&mut store, &root, request(&root, "root", "child"));
+    // A row written before the rule existed: the producer is stopped while
+    // its child still reads unknown.
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET state = 'stopped' WHERE id = ?1",
+            [parse_agent_id(&root).unwrap()],
+        )
+        .unwrap();
+    let recovered = store.recover_on_restart(NOW + 4).unwrap();
+    let end = recovered
+        .iter()
+        .find(|event| event.kind == "agent.stopped")
+        .expect("retained child ends");
+    assert_eq!(end.agent.as_deref(), Some(child.agent.id.as_str()));
+    assert_eq!(end.data["reason"], ENDED_WITH_PARENT);
+    assert_eq!(
+        store.get_agent(&child.agent.id).unwrap().unwrap().state,
+        AgentState::Stopped
+    );
+    let high_water = store.high_water().unwrap();
+    assert!(
+        store
+            .recover_on_restart(NOW + 5)
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != "agent.stopped")
+    );
+    assert!(store.high_water().unwrap() >= high_water);
 }
 
 #[test]

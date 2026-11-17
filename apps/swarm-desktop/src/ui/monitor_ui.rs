@@ -3,6 +3,7 @@
 //! on one refresh chain that runs only while the panel is open.
 
 use super::*;
+use crate::monitor::MonitorRow;
 use crate::theme::winui::Palette;
 
 #[derive(Clone, Debug)]
@@ -10,11 +11,16 @@ pub(super) enum MonitorMsg {
     MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
     /// A monitor card: open its conversation and its details.
     CardOpened(String),
+    /// Show or hide the native children of one card.
+    ChildrenToggled(String),
+    /// Show or hide Recently stopped.
+    StoppedToggled,
     ReparentRequested(reparent::MoveBinding),
     ReparentSettled(reparent::MoveBinding, Fallible<ReparentResponse>),
 }
 
 /// The panel's refresh chain and the Agent whose details it reads.
+#[derive(Default)]
 pub(super) struct MonitorState {
     pub(super) data: Monitor,
     /// Tags refreshes; a reply for an older chain is dropped.
@@ -23,6 +29,10 @@ pub(super) struct MonitorState {
     /// The Agent whose details (and usage) each refresh reads.
     pub(super) selected: Option<String>,
     pub(super) reparent_status: String,
+    /// Cards whose native children are shown (collapsed by default).
+    pub(super) expanded: HashSet<String>,
+    /// Recently stopped is open (collapsed by default).
+    pub(super) stopped_open: bool,
 }
 
 impl DesktopApp {
@@ -70,6 +80,12 @@ impl DesktopApp {
                     self.show_details(&agent.id, context);
                 }
             }
+            MonitorMsg::ChildrenToggled(id) => {
+                if !self.monitor.expanded.remove(&id) {
+                    self.monitor.expanded.insert(id);
+                }
+            }
+            MonitorMsg::StoppedToggled => self.monitor.stopped_open = !self.monitor.stopped_open,
             MonitorMsg::ReparentRequested(binding) => {
                 if self.submitting() {
                     return;
@@ -160,13 +176,17 @@ impl DesktopApp {
         };
         self.monitor.epoch += 1;
         let epoch = self.monitor.epoch;
-        let selected = self.monitor.selected.clone();
+        let plan = monitor::RefreshPlan {
+            selected: self.monitor.selected.clone(),
+            stopped: self.monitor.data.wants_stopped(),
+            attention_cursor: self.monitor.data.attention_cursor,
+        };
         self.monitor.task = Some(context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
             if delay_ms > 0 && !feed::backoff(delay_ms, &cancelled) {
                 return Message::Monitor(MonitorMsg::MonitorLoaded(epoch, None));
             }
-            let snapshot = client::block_on(monitor::refresh(&data_dir, selected, &cancelled));
+            let snapshot = client::block_on(monitor::refresh(&data_dir, plan, &cancelled));
             Message::Monitor(MonitorMsg::MonitorLoaded(epoch, snapshot.map(Box::new)))
         }));
     }
@@ -193,9 +213,86 @@ impl DesktopApp {
             ))
     }
 
-    /// The monitor: every Agent as one card, attention first.
+    /// One card, and below it its native children's toggle and, when open,
+    /// their cards one step in (recursively: a child may have its own).
+    fn monitor_cards(
+        &self,
+        row: &MonitorRow,
+        depth: usize,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+        cards: &mut Vec<KeyedView>,
+    ) {
+        let data = &self.monitor.data;
+        let indent = depth as f64 * tokens::layout::TREE_INDENT;
+        let title = self.agent_title(&row.id);
+        let attention = data
+            .incident(row)
+            .filter(|_| row.state != eliot_core::AgentState::Stopped)
+            .map(|incident| monitor::attention_words(&incident.reason));
+        cards.push(KeyedView::new(
+            format!("card:{}", row.id),
+            Border::new()
+                .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
+                .content(monitor_view::card(
+                    row,
+                    &title,
+                    attention.as_deref(),
+                    context.message(Message::Monitor(MonitorMsg::CardOpened(row.id.clone()))),
+                    palette,
+                )),
+        ));
+        let children = data.children(&row.id);
+        if children.is_empty() || depth > 4 {
+            return;
+        }
+        let open = self.monitor.expanded.contains(&row.id);
+        let ended = children
+            .iter()
+            .filter(|child| child.state == eliot_core::AgentState::Stopped)
+            .count();
+        let label = match (children.len(), ended) {
+            (1, 1) => "1 subagent · ended with parent".to_owned(),
+            (1, _) => "1 subagent".to_owned(),
+            (all, ended) if ended == all => format!("{all} subagents · ended with parent"),
+            (all, _) => format!("{all} subagents"),
+        };
+        cards.push(KeyedView::new(
+            format!("children:{}:{open}", row.id),
+            m3::sub_row(palette, false)
+                .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
+                .automation_name(format!(
+                    "{label} of {title} ({})",
+                    if open { "shown" } else { "hidden" }
+                ))
+                .on_click(
+                    context.message(Message::Monitor(MonitorMsg::ChildrenToggled(
+                        row.id.clone(),
+                    ))),
+                )
+                .content(m3::row_content(
+                    Some(if open {
+                        m3::glyph::CHEVRON_DOWN
+                    } else {
+                        m3::glyph::CHEVRON_RIGHT
+                    }),
+                    &label,
+                    "",
+                    View::empty(),
+                )),
+        ));
+        if open {
+            for child in children {
+                self.monitor_cards(child, depth + 1, context, palette, cards);
+            }
+        }
+    }
+
+    /// The monitor: Needs attention, Working, Idle, then a collapsed
+    /// Recently stopped; native children under their parent card.
     pub(super) fn monitor_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let data = &self.monitor.data;
+        let now = data.read_at_ms.unwrap_or(0);
         let mut cards: Vec<KeyedView> = Vec::new();
         if data.read_at_ms.is_none() {
             cards.push(KeyedView::new(
@@ -214,26 +311,61 @@ impl DesktopApp {
                 .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        for row in &data.rows {
-            let title = self.agent_title(&row.id);
-            cards.push(KeyedView::new(
-                row.id.clone(),
-                monitor_view::card(
-                    row,
-                    &title,
-                    context.message(Message::Monitor(MonitorMsg::CardOpened(row.id.clone()))),
-                    palette,
-                ),
-            ));
+        let sections = data.sections(now);
+        for section in &sections {
+            let top = section.rows.len();
+            if section.group == monitor::Group::Stopped {
+                if top == 0 {
+                    continue;
+                }
+                let open = self.monitor.stopped_open;
+                let label = format!("{} ({top})", section.group.title());
+                cards.push(KeyedView::new(
+                    format!("section:stopped:{open}"),
+                    m3::sub_row(palette, false)
+                        .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                        .automation_name(format!(
+                            "{label} ({})",
+                            if open { "shown" } else { "hidden" }
+                        ))
+                        .on_click(context.message(Message::Monitor(MonitorMsg::StoppedToggled)))
+                        .content(m3::row_content(
+                            Some(if open {
+                                m3::glyph::CHEVRON_DOWN
+                            } else {
+                                m3::glyph::CHEVRON_RIGHT
+                            }),
+                            &label,
+                            "",
+                            View::empty(),
+                        )),
+                ));
+                if !open {
+                    continue;
+                }
+            } else {
+                if top == 0 {
+                    continue;
+                }
+                cards.push(KeyedView::new(
+                    format!("section:{:?}", section.group),
+                    m3::section_label(format!("{} ({top})", section.group.title())).margin(
+                        Thickness::new(tokens::spacing::INSET, tokens::spacing::SM, 0.0, 0.0),
+                    ),
+                ));
+            }
+            for row in &section.rows {
+                self.monitor_cards(row, 0, context, palette, &mut cards);
+            }
         }
-        if data.read_at_ms.is_some() && data.rows.is_empty() {
+        if data.read_at_ms.is_some() && sections.iter().all(|section| section.rows.is_empty()) {
             cards.push(KeyedView::new("none", m3::secondary("No Agents to show.")));
         }
         Grid::new()
             .rows([GridLength::Auto, GridLength::Auto, GridLength::STAR])
             .children((
                 self.panel_header("Monitor", context, palette),
-                m3::secondary(data.counter_line())
+                m3::secondary(data.live_line(now))
                     .grid_row(1)
                     .text_wrapping(TextWrapping::Wrap)
                     .margin(Thickness::new(

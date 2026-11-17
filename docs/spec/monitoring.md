@@ -536,7 +536,9 @@ controlled ancestor, including nested observe-only children. Aggregate its curre
 generation's unfinished children: notify when the manager is idle or stopped, or
 has no committed native progress through the suspicion window. A stalled or lost
 child also warrants attention while the manager is busy. All-finished children,
-and a progressing manager with healthy progressing children, open no child incident.
+children that ended with their producer generation (`ended_with_parent`,
+[core](core.md)), and a progressing manager with healthy progressing children, open
+no child incident.
 An open turn with a lost/gapped source remains unfinished; silence is never completion.
 
 These reports capture complete unfinished/lost/stalled counts and at most sixteen

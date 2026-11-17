@@ -84,11 +84,21 @@ impl UiAgent {
     }
 
     /// The owner has something to do: answer a pending request
-    /// (`waiting`), or settle an Agent Swarm controls whose state it cannot
+    /// (`waiting`), decide about a failed or lost task (Resume, why, or
+    /// archive it), or settle an Agent Swarm controls whose state it cannot
     /// prove (`unknown`). An observe-only native child is never counted:
     /// its state is only observed and detach is all it offers.
     pub fn needs_attention(&self) -> bool {
-        self.state == "waiting" || (self.state == "unknown" && !self.native_child)
+        !self.native_child
+            && matches!(
+                self.state.as_str(),
+                "waiting" | "failed" | "lost" | "unknown"
+            )
+    }
+
+    /// Ready for the next message: idle and controlled.
+    pub fn idle(&self) -> bool {
+        self.state == "idle" && !self.native_child
     }
 
     /// Ended: stopped, failed or lost.
@@ -304,6 +314,9 @@ impl Section {
     }
 }
 
+/// Newest tasks a project keeps visible when every task of it is older.
+pub const RECENT_WHEN_ALL_OLDER: usize = 3;
+
 /// How the sidebar shows the tree.
 #[derive(Clone, Copy)]
 pub struct Shown<'a> {
@@ -430,8 +443,25 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
                 .then(b.updated_at.cmp(&a.updated_at))
                 .then_with(|| (a.id.len(), &a.id).cmp(&(b.id.len(), &b.id)))
         });
-        let folds =
-            |agent: &UiAgent| !filtered && agent.ended() && agent.updated_at < shown.today_start;
+        let mut folding: HashSet<&str> = group
+            .top
+            .iter()
+            .filter(|agent| !filtered && agent.ended() && agent.updated_at < shown.today_start)
+            .map(|agent| agent.id.as_str())
+            .collect();
+        // A project whose tasks are all older still shows its newest few
+        // (they sort first), never "No tasks yet" above "Show N older".
+        if !group.top.is_empty()
+            && group
+                .top
+                .iter()
+                .all(|agent| folding.contains(agent.id.as_str()))
+        {
+            for agent in group.top.iter().take(RECENT_WHEN_ALL_OLDER) {
+                folding.remove(agent.id.as_str());
+            }
+        }
+        let folds = |agent: &UiAgent| folding.contains(agent.id.as_str());
         let place_key = |agent: &UiAgent| match checkout_of(&agent.project, checkouts) {
             Some(checkout) => path_key(&checkout.path),
             None => path_key(&agent.project),
@@ -578,6 +608,8 @@ pub struct Fleet {
     pub running: usize,
     /// Agents that need the owner ([`UiAgent::needs_attention`]).
     pub attention: usize,
+    /// Controlled Agents ready for the next message.
+    pub idle: usize,
 }
 
 impl Fleet {
@@ -590,48 +622,35 @@ impl Fleet {
             }
             fleet.running += usize::from(agent.running());
             fleet.attention += usize::from(agent.needs_attention());
+            fleet.idle += usize::from(agent.idle());
         }
         fleet
     }
 
-    /// The line itself: live work, or how quiet the fleet is. `total`
-    /// counts the listed Agents; a live archived Agent still counts, said
-    /// as archived (k98: "No Agents yet" while one was live).
+    /// The line itself: what is live ("2 working · 1 needs attention · 3
+    /// idle"), never the stopped ones. A live archived Agent still counts
+    /// (k98: "No Agents yet" while one was live). "All quiet" when nothing
+    /// is live; "No Agents yet" when there is none at all.
     pub fn summary(&self, total: usize, archived: Archived) -> String {
-        let running = self.running + archived.running;
-        let agents = |count: usize| if count == 1 { "Agent" } else { "Agents" };
-        if running > 0 {
-            format!("{running} running")
-        } else if total == 0 && archived.live == 0 {
-            if archived.total == 0 {
-                "No Agents yet".to_owned()
-            } else {
-                format!("All quiet · {} archived", archived.total)
-            }
-        } else if archived.live == 0 {
-            format!("All quiet · {total} {}", agents(total))
-        } else if total == 0 {
-            format!(
-                "All quiet · {} {} (archived)",
-                archived.live,
-                agents(archived.live)
-            )
-        } else {
-            let all = total + archived.live;
-            format!(
-                "All quiet · {all} {} ({} archived)",
-                agents(all),
-                archived.live
-            )
+        let working = self.running + archived.running;
+        // An archived live Agent that is not running is idle (archive
+        // accepts only idle or stopped trees).
+        let idle = self.idle + archived.live.saturating_sub(archived.running);
+        if total == 0 && archived.total == 0 {
+            return "No Agents yet".to_owned();
         }
+        crate::monitor::live_words(working, self.attention, idle)
     }
 
-    /// The attention row's label ("1 needs attention", "3 need attention").
-    pub fn attention_label(&self) -> String {
+    /// The attention filter row: an action, since the fleet line above it
+    /// already says how many need attention ("List the 2 that need
+    /// attention"; "Listing …" while the list is filtered).
+    pub fn attention_row_label(&self, listed: bool) -> String {
+        let verb = if listed { "Listing" } else { "List" };
         if self.attention == 1 {
-            "1 needs attention".to_owned()
+            format!("{verb} the 1 that needs attention")
         } else {
-            format!("{} need attention", self.attention)
+            format!("{verb} the {} that need attention", self.attention)
         }
     }
 }
@@ -1144,6 +1163,30 @@ mod tests {
     }
 
     #[test]
+    fn a_project_with_only_older_tasks_shows_its_newest_ones() {
+        let listed: Vec<UiAgent> = (1..=5)
+            .map(|index| {
+                with(
+                    agent(&format!("a{index}"), "/p", None),
+                    "stopped",
+                    index * 10,
+                )
+            })
+            .collect();
+        let view = View {
+            today_start: 100,
+            ..View::default()
+        };
+        let section = &view.sections(&listed, &[])[0];
+        // Never empty above "Show N older": the newest three stay.
+        assert_eq!(ids(section), [("a5", 0), ("a4", 0), ("a3", 0)]);
+        assert_eq!((section.older, section.older_shown), (2, false));
+        let few = &view.sections(&listed[..2], &[])[0];
+        assert_eq!(ids(few), [("a2", 0), ("a1", 0)]);
+        assert_eq!(few.older, 0);
+    }
+
+    #[test]
     fn a_collapsed_project_keeps_only_its_running_count() {
         let listed = vec![
             with(agent("a1", "/p", None), "busy", 0),
@@ -1177,12 +1220,14 @@ mod tests {
         let attention = |agent: &UiAgent| agent.needs_attention();
         let sections = view.filtered(&listed, &[], Some(&attention));
         let flat: Vec<Vec<(&str, usize)>> = sections.iter().map(ids).collect();
-        assert_eq!(flat, [vec![("a2", 0)], vec![("a4", 0)]]);
+        // A lost task needs a decision too (Resume, why or archive).
+        assert_eq!(flat, [vec![("a2", 0)], vec![("a4", 0), ("a5", 0)]]);
         assert_eq!(
             Fleet::of(&listed),
             Fleet {
                 running: 1,
-                attention: 2
+                attention: 3,
+                idle: 1,
             }
         );
     }
@@ -1231,11 +1276,12 @@ mod tests {
     }
 
     #[test]
-    fn the_fleet_line_reports_work_calmly() {
+    fn the_fleet_line_says_what_is_live() {
         let quiet = Fleet::default();
         let none = Archived::default();
         assert_eq!(quiet.summary(0, none), "No Agents yet");
-        assert_eq!(quiet.summary(1, none), "All quiet · 1 Agent");
+        // Stopped Agents are not live: nothing to count.
+        assert_eq!(quiet.summary(35, none), "All quiet");
         // k98: an archived Agent that is still live is counted.
         let idle = with(agent("a1", "/p", None), "idle", 1);
         let stopped = with(agent("a2", "/p", None), "stopped", 1);
@@ -1248,31 +1294,44 @@ mod tests {
                 total: 2
             }
         );
-        assert_eq!(quiet.summary(0, archived), "All quiet · 1 Agent (archived)");
-        assert_eq!(
-            quiet.summary(3, archived),
-            "All quiet · 4 Agents (1 archived)"
-        );
-        assert_eq!(
-            quiet.summary(0, Archived::of(&[], 2)),
-            "All quiet · 2 archived"
-        );
+        assert_eq!(quiet.summary(0, archived), "1 idle");
+        assert_eq!(quiet.summary(0, Archived::of(&[], 2)), "All quiet");
         let busy_archived = Archived::of(&[with(idle, "busy", 1)], 1);
-        assert_eq!(quiet.summary(0, busy_archived), "1 running");
+        assert_eq!(quiet.summary(0, busy_archived), "1 working");
         let busy = Fleet {
-            running: 6,
+            running: 2,
             attention: 1,
+            idle: 3,
         };
-        assert_eq!(busy.summary(40, none), "6 running");
-        assert_eq!(busy.attention_label(), "1 needs attention");
+        assert_eq!(
+            busy.summary(40, none),
+            "2 working · 1 needs attention · 3 idle"
+        );
+        assert_eq!(
+            busy.attention_row_label(false),
+            "List the 1 that needs attention"
+        );
         assert_eq!(
             Fleet {
                 running: 0,
-                attention: 3
+                attention: 3,
+                idle: 0,
             }
-            .attention_label(),
-            "3 need attention"
+            .attention_row_label(true),
+            "Listing the 3 that need attention"
         );
+        // Failed and lost need a decision; a native child never counts.
+        let fleet = Fleet::of(&[
+            with(agent("a3", "/p", None), "lost", 1),
+            with(agent("a4", "/p", None), "failed", 1),
+            with(agent("a5", "/p", None), "idle", 1),
+            {
+                let mut child = with(agent("a6", "/p", Some("a5")), "unknown", 1);
+                child.native_child = true;
+                child
+            },
+        ]);
+        assert_eq!((fleet.attention, fleet.idle, fleet.running), (2, 1, 0));
     }
 
     #[test]

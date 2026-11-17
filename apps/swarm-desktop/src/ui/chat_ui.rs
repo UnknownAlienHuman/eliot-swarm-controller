@@ -51,6 +51,8 @@ pub(super) enum ChatMsg {
     InputsRecheck(u64),
     /// Retry a local input that did not start (its part key).
     RetryInput(String),
+    /// The `why` summary of the open lost Agent (Agent, generation).
+    LossRead(String, i64, Fallible<String>),
 }
 
 /// Between two reads of inputs that still wait while the Agent is idle or
@@ -225,6 +227,9 @@ pub(super) struct ChatState {
     /// The Force stop awaiting confirmation, bound at its menu click, with
     /// the title shown in the question.
     pub(super) confirm_force: Option<(BoundAction, String)>,
+    /// The open lost Agent's loss in words, read once per generation from
+    /// `diagnose` (`None` inside: nothing to say beyond Lost).
+    pub(super) loss: Option<(String, i64, Option<String>)>,
 }
 
 impl DesktopApp {
@@ -274,6 +279,7 @@ impl DesktopApp {
                         self.chat.failures = 0;
                         self.chat.docs.extend(snapshot.docs);
                         self.chat.detail = Some(detail_from(&snapshot.detail));
+                        self.check_loss(context);
                         self.sync_open_agent();
                         self.ensure_catalog(context);
                         let cursor = snapshot.coverage.cursor;
@@ -378,6 +384,7 @@ impl DesktopApp {
                         self.chat.docs.extend(reread.docs);
                         if let Some(detail) = reread.detail.as_ref() {
                             self.chat.detail = Some(detail_from(detail));
+                            self.check_loss(context);
                             self.sync_open_agent();
                             self.ensure_catalog(context);
                         }
@@ -464,6 +471,22 @@ impl DesktopApp {
             ChatMsg::RetryInput(key) => {
                 let command = key.strip_prefix("fail:").unwrap_or(&key).to_owned();
                 self.retry_input(&command, context);
+            }
+            ChatMsg::LossRead(agent, generation, summary) => {
+                if self
+                    .chat
+                    .loss
+                    .as_ref()
+                    .is_some_and(|(read, at, _)| *read == agent && *at == generation)
+                {
+                    // Only a loss Swarm caused itself gets its own words; any
+                    // other cause stays in Agent details ("What went wrong").
+                    let words = summary
+                        .ok()
+                        .filter(|summary| monitor::restart_loss(summary))
+                        .map(|_| monitor::RESTART_LOSS_WORDS.to_owned());
+                    self.chat.loss = Some((agent, generation, words));
+                }
             }
             ChatMsg::CopyPart(key) => {
                 let text = self
@@ -1186,6 +1209,95 @@ impl DesktopApp {
         });
     }
 
+    /// Read why the open Agent is lost, once per generation: a loss to a
+    /// Swarm restart reads "Stopped by a Swarm restart" with Resume.
+    fn check_loss(&mut self, context: &ComponentContext<Self>) {
+        let (Some(detail), Some(agent), Ok(data_dir)) = (
+            self.chat.detail.as_ref(),
+            self.selected_agent_id(),
+            self.data_dir.clone(),
+        ) else {
+            return;
+        };
+        if detail.state != "lost" || detail.observe_only {
+            self.chat.loss = None;
+            return;
+        }
+        let generation = detail.generation;
+        if self
+            .chat
+            .loss
+            .as_ref()
+            .is_some_and(|(read, at, _)| *read == agent && *at == generation)
+        {
+            return;
+        }
+        self.chat.loss = Some((agent.clone(), generation, None));
+        let _task = context.spawn_background(move |_| {
+            let summary = client::block_on(client::diagnose(&data_dir, &agent))
+                .map(|reply| reply.summary)
+                .map_err(|error| error.to_string());
+            Message::Chat(ChatMsg::LossRead(agent, generation, summary))
+        });
+    }
+
+    /// "Stopped by a Swarm restart · Resume" above the composer, bound to
+    /// the generation shown.
+    fn loss_notice(
+        &self,
+        column: Option<f64>,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> Option<View> {
+        let detail = self.chat.detail.as_ref()?;
+        let agent = self.selected_agent_id()?;
+        let (read, generation, words) = self.chat.loss.as_ref()?;
+        let words = words.as_deref()?;
+        if *read != agent || *generation != detail.generation || detail.state != "lost" {
+            return None;
+        }
+        Some(
+            Border::new()
+                .grid_row(4)
+                .width(column)
+                .max_width(tokens::layout::READING_WIDTH)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                .background(palette.card())
+                .corner_radius(tokens::radius::CONTAINER)
+                .padding(Thickness::new(
+                    tokens::spacing::MD,
+                    tokens::spacing::XS,
+                    tokens::spacing::XS,
+                    tokens::spacing::XS,
+                ))
+                .automation_name(format!("{words} · Resume"))
+                .content(
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .column_spacing(tokens::spacing::SM)
+                        .children((
+                            m3::body(words.to_owned())
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text_trimming(TextTrimming::CharacterEllipsis),
+                            m3::text_button(palette)
+                                .grid_column(1)
+                                .is_enabled(!self.submitting())
+                                .automation_name(format!(
+                                    "Resume after the Swarm restart (generation {generation})"
+                                ))
+                                .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
+                                    DraftAction::Resume {
+                                        agent,
+                                        generation: *generation,
+                                    },
+                                ))))
+                                .content(m3::label("Resume")),
+                        )),
+                ),
+        )
+    }
+
     /// Retry a local input that definitely did not start: a launch that
     /// never ran starts again as submitted (a new task, new mutation id);
     /// any other input goes back through Send (or Resume) with its text.
@@ -1346,6 +1458,7 @@ impl DesktopApp {
                 ),
             (None, None) => self
                 .archived_notice(column, context, palette)
+                .or_else(|| self.loss_notice(column, context, palette))
                 .unwrap_or_else(View::empty),
         };
         let composer = self.composer_view(column, context, palette);

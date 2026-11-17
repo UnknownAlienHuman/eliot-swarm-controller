@@ -1,12 +1,19 @@
 //! Swarm monitor: demand-driven rows, honest counters and UI-only metric
 //! history, as pure logic plus one bounded refresh read.
 //!
-//! One refresh is a fixed set of existing reads: `agent.list` per attention
-//! state with `observations=true` (rows), `agent.list` with `limit=1` for
-//! the remaining states (their `total` is an exact count), and, for the
-//! selected Agent only, `agent.get` and `usage.summary`. No per-Agent
-//! timers, no `agent.stats` per row, at most `MAX_CONCURRENT_READS` reads at
-//! once, and only while the monitor is open.
+//! One refresh is a fixed set of existing reads: `agent.list` per live state
+//! with `observations=true` (rows), the stopped total (and, every
+//! `STOPPED_EVERY` refreshes, the stopped rows for Recently stopped), the
+//! new `x.user.agent.attention` reports after the last cursor (the first
+//! read starts `ATTENTION_WINDOW_MS` back), and, for the selected Agent
+//! only, `agent.get`, `usage.summary` and `diagnose`. No per-Agent timers,
+//! no `agent.stats` per row, at most `MAX_CONCURRENT_READS` reads at once,
+//! and only while the monitor is open.
+//!
+//! The panel shows what matters: Needs attention (waiting for the owner,
+//! failed, lost, a controlled Agent whose state is not confirmed, or an open
+//! attention report), Working (busy or starting), Idle, and a collapsed
+//! Recently stopped. Native observed children nest under their parent.
 //!
 //! `ProcessStatsView` carries cumulative `cpu_time_ns`, not a rate. A rate
 //! is derived here only between two distinct samples of the same process
@@ -31,25 +38,84 @@ use crate::client::{self, MAX_CONCURRENT_READS};
 
 /// Refresh period while the monitor is open.
 pub const PERIOD_MS: u64 = 2_000;
-/// Rows read per attention state.
-pub const ROWS_PER_STATE: usize = 20;
+/// Rows read per live state.
+pub const ROWS_PER_STATE: usize = 100;
+/// Stopped rows read for Recently stopped (one page).
+pub const STOPPED_ROWS: usize = 1_000;
+/// The stopped rows are read again every this many refreshes (the total
+/// every refresh).
+pub const STOPPED_EVERY: u64 = 10;
+/// Recently stopped: last changed within a day.
+pub const RECENT_MS: i64 = 24 * 60 * 60 * 1000;
+/// How far back the first attention read starts.
+pub const ATTENTION_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+/// The daemon's typed attention report kind (`docs/spec/monitoring.md`).
+pub const ATTENTION_KIND: &str = "x.user.agent.attention";
+/// `events.read` calls one refresh spends on attention reports (each scans
+/// at most 1,000 journal rows server-side).
+pub const ATTENTION_SCAN_PAGES: usize = 4;
 /// UI-only samples kept per Agent series.
 pub const RING_CAPACITY: usize = 600;
 /// Bars drawn per graph; never more than useful at this width.
 pub const GRAPH_BARS: usize = 60;
 
-/// States shown as rows, attention first; idle sessions still hold processes.
-pub const ROW_STATES: [AgentState; 7] = [
+/// Live states read as rows, attention first; idle sessions still hold
+/// processes.
+pub const ROW_STATES: [AgentState; 8] = [
     AgentState::Waiting,
     AgentState::Failed,
     AgentState::Lost,
     AgentState::Unknown,
     AgentState::Busy,
     AgentState::Starting,
+    AgentState::Created,
     AgentState::Idle,
 ];
-/// States only counted.
-pub const COUNT_STATES: [AgentState; 2] = [AgentState::Created, AgentState::Stopped];
+/// States only counted every refresh.
+pub const COUNT_STATES: [AgentState; 1] = [AgentState::Stopped];
+
+/// The monitor's sections, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Group {
+    Attention,
+    Working,
+    Idle,
+    Stopped,
+}
+
+impl Group {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Attention => "Needs attention",
+            Self::Working => "Working",
+            Self::Idle => "Idle",
+            Self::Stopped => "Recently stopped",
+        }
+    }
+}
+
+/// One open attention report: its incident and reason code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Incident {
+    pub incident_id: String,
+    pub reason: String,
+}
+
+/// An attention reason code in words.
+pub fn attention_words(reason: &str) -> String {
+    match reason {
+        "no_progress" => "No progress for a while".to_owned(),
+        "source_unhealthy" => "Lost contact with its harness".to_owned(),
+        "children_unattended" => "Its subagents are unattended".to_owned(),
+        other => {
+            let text = other.replace('_', " ");
+            let mut chars = text.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        }
+    }
+}
 
 pub fn state_name(state: AgentState) -> &'static str {
     match state {
@@ -187,19 +253,41 @@ fn seconds(ms: i64) -> String {
     }
 }
 
-/// A state as a counter's noun ("3 working", "1 not confirmed").
-fn count_words(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Unknown => "not confirmed",
-        AgentState::Created | AgentState::Starting => "starting",
-        AgentState::Idle => "ready",
-        AgentState::Busy => "working",
-        AgentState::Waiting => "waiting for you",
-        AgentState::Stopped => "stopped",
-        AgentState::Failed => "failed",
-        AgentState::Lost => "lost",
+/// What is live, in words: "2 working · 1 needs attention · 3 idle", each
+/// part only when it has Agents; "All quiet" when nothing is live.
+pub fn live_words(working: usize, attention: usize, idle: usize) -> String {
+    let mut parts = Vec::new();
+    if working > 0 {
+        parts.push(format!("{working} working"));
+    }
+    if attention > 0 {
+        parts.push(format!(
+            "{attention} {}",
+            if attention == 1 {
+                "needs attention"
+            } else {
+                "need attention"
+            }
+        ));
+    }
+    if idle > 0 {
+        parts.push(format!("{idle} idle"));
+    }
+    if parts.is_empty() {
+        "All quiet".to_owned()
+    } else {
+        parts.join(" · ")
     }
 }
+
+/// A loss Swarm caused itself, from a `swarm why` summary: a daemon restart
+/// ("swarm origin: a2 agent.lost at daemon.restart: daemon_restart").
+pub fn restart_loss(summary: &str) -> bool {
+    summary.starts_with("swarm origin:") && summary.contains(" at daemon.restart")
+}
+
+/// The words for a loss to a Swarm restart.
+pub const RESTART_LOSS_WORDS: &str = "Stopped by a Swarm restart";
 
 /// A turn outcome in words ("completed", "interrupted", "failed",
 /// "ended with an unknown result").
@@ -230,6 +318,9 @@ pub fn state_words(state: AgentState) -> &'static str {
 /// usage limit reached"); `None` when there is nothing wrong to report (an
 /// unknown origin on an Agent that did not fail).
 pub fn diagnosis_line(summary: &str) -> Option<String> {
+    if restart_loss(summary) {
+        return Some(RESTART_LOSS_WORDS.to_owned());
+    }
     let (origin, rest) = summary.split_once(" origin: ")?;
     let (head, message) = match rest.split_once(": ") {
         Some((head, message)) => (head, Some(message.trim())),
@@ -309,6 +400,11 @@ pub struct MonitorRow {
     /// is `None`; a session count never renders without its marker.
     pub tokens_scope: Option<String>,
     pub obs: Obs,
+    /// A native observed child (the daemon reports `activity` only for
+    /// those): it nests under its parent.
+    pub native_child: bool,
+    /// Last change of the Agent record (ms since the epoch).
+    pub updated_at: i64,
 }
 
 /// Fleet token label for one monitor row: the count with its `(t)`/`(s)`
@@ -350,22 +446,84 @@ impl MonitorRow {
             tokens,
             tokens_scope,
             obs: Obs::from_view(row.observation.as_ref()),
+            native_child: summary.activity.is_some(),
+            updated_at: summary.updated_at,
+        }
+    }
+
+    /// The row's status in words. A native child reads as its observed
+    /// activity, and as "Ended with parent" once its parent's session ended
+    /// (`ended_with_parent`, `docs/spec/core.md`).
+    pub fn status_words(&self) -> &'static str {
+        if !self.native_child {
+            return state_words(self.state);
+        }
+        match (self.state, self.activity.as_deref()) {
+            (AgentState::Stopped, _) => "Ended with parent",
+            (_, Some("running")) => "Working",
+            (_, Some("idle")) => "Idle",
+            (_, Some("interrupted")) => "Interrupted",
+            (_, Some("lost")) => "Lost",
+            _ => state_words(self.state),
+        }
+    }
+
+    /// The status code its tone follows ([`crate::m3::status`]).
+    pub fn status_code(&self) -> &'static str {
+        match self.status_words() {
+            "Ended with parent" => "stopped",
+            "Working" if self.native_child => "busy",
+            "Idle" if self.native_child => "idle",
+            "Lost" if self.native_child => "lost",
+            _ => state_name(self.state),
+        }
+    }
+
+    /// Which section the row belongs to. A native child nests under its
+    /// parent instead (`None`), unless the parent is not shown.
+    pub fn group(&self, attention: Option<&Incident>) -> Group {
+        if self.native_child {
+            return match (self.state, self.activity.as_deref()) {
+                (AgentState::Stopped | AgentState::Failed | AgentState::Lost, _) => Group::Stopped,
+                (_, Some("running")) => Group::Working,
+                _ => Group::Idle,
+            };
+        }
+        match self.state {
+            AgentState::Waiting | AgentState::Failed | AgentState::Lost | AgentState::Unknown => {
+                Group::Attention
+            }
+            AgentState::Stopped => Group::Stopped,
+            _ if attention.is_some() => Group::Attention,
+            AgentState::Busy | AgentState::Starting | AgentState::Created => Group::Working,
+            AgentState::Idle => Group::Idle,
         }
     }
 
     /// What the Agent does, in words: the turn it works on, or how its
     /// last turn ended.
     pub fn operation(&self) -> String {
-        match (&self.active_turn, &self.last_outcome) {
-            (Some(_), _) => match self.progress_age_ms {
+        // A native child's turn is its observed activity, not a controlled
+        // active turn.
+        let working = self.active_turn.is_some()
+            || (self.activity.as_deref() == Some("running") && self.state != AgentState::Stopped);
+        let ended = matches!(
+            self.state,
+            AgentState::Stopped | AgentState::Failed | AgentState::Lost
+        );
+        match (working, &self.last_outcome) {
+            (true, _) => match self.progress_age_ms {
                 Some(age) => format!("Working · last output {} ago", seconds(age)),
                 None => "Working · no output yet".to_owned(),
             },
-            (None, Some(outcome)) => format!("Last turn {}", outcome_words(outcome)),
-            (None, None) if self.activity.is_some() => {
-                "Activity not reported by the harness".to_owned()
+            (false, Some(outcome)) => format!("Last turn {}", outcome_words(outcome)),
+            // An open turn cut off by the end has no result; nothing is
+            // invented for it.
+            (false, None) if ended && self.activity.as_deref() == Some("lost") => {
+                "Its open turn has no result".to_owned()
             }
-            (None, None) => "No turns yet".to_owned(),
+            (false, None) if ended || self.activity.is_some() => "No finished turn".to_owned(),
+            (false, None) => "No turns yet".to_owned(),
         }
     }
 }
@@ -534,21 +692,82 @@ pub struct DetailRead {
     pub diagnosis: Result<String, String>,
 }
 
+/// One attention report as read: its binding, phase and reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttentionReport {
+    pub agent: String,
+    pub generation: i64,
+    pub incident_id: String,
+    /// `incident` or `recovery`.
+    pub phase: String,
+    pub reason: String,
+}
+
+impl AttentionReport {
+    /// The typed report of one `x.user.agent.attention` event (at
+    /// `data.data`); `None` for anything else.
+    pub fn from_event(event: &eliot_core::Event) -> Option<Self> {
+        if event.kind != ATTENTION_KIND {
+            return None;
+        }
+        let report = event.data.get("data")?;
+        let text = |key: &str| report.get(key)?.as_str().map(str::to_owned);
+        Some(Self {
+            agent: text("agent_id").or_else(|| event.agent.clone())?,
+            generation: report
+                .get("generation")
+                .and_then(serde_json::Value::as_i64)
+                .or(event.generation)?,
+            incident_id: text("incident_id")?,
+            phase: text("phase")?,
+            reason: text("reason").unwrap_or_default(),
+        })
+    }
+}
+
+/// The attention reports one refresh read and the cursor after them.
+#[derive(Clone, Debug)]
+pub struct AttentionRead {
+    pub reports: Vec<AttentionReport>,
+    pub next: i64,
+}
+
 /// Everything one refresh read.
 #[derive(Clone, Debug)]
 pub struct MonitorSnapshot {
     pub groups: Vec<(AgentState, Result<AgentListResponse, String>)>,
     pub counts: Vec<(AgentState, Result<usize, String>)>,
+    /// The stopped rows, when this refresh read them.
+    pub stopped: Option<Result<AgentListResponse, String>>,
+    pub attention: Option<Result<AttentionRead, String>>,
     pub detail: Option<Result<DetailRead, String>>,
     pub read_at_ms: i64,
 }
 
-/// Monitor model: rows (attention first), counters and per-Agent series.
+/// One monitor section: its top-level rows (each with its nested native
+/// children) and how many it has.
+#[derive(Clone, Debug)]
+pub struct Section<'a> {
+    pub group: Group,
+    pub rows: Vec<&'a MonitorRow>,
+}
+
+/// Monitor model: rows, counters, open attention reports and per-Agent
+/// series.
 #[derive(Clone, Debug, Default)]
 pub struct Monitor {
     pub rows: Vec<MonitorRow>,
+    /// The last stopped rows read (refreshed every `STOPPED_EVERY`).
+    pub stopped: Vec<MonitorRow>,
     pub counts: Vec<StateCount>,
     pub series: HashMap<String, Series>,
+    /// Open attention reports by Agent and generation.
+    pub incidents: HashMap<(String, i64), Incident>,
+    /// The attention read's cursor (`None` until the first read).
+    pub attention_cursor: Option<i64>,
+    /// A live row left the live states: read the stopped rows next, so a
+    /// just-stopped Agent does not vanish until the periodic read.
+    pub stopped_due: bool,
     pub detail: Option<Result<DetailRead, String>>,
     pub read_at_ms: Option<i64>,
     pub errors: Vec<String>,
@@ -556,9 +775,174 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    /// Whether the next refresh reads the stopped rows.
+    pub fn wants_stopped(&self) -> bool {
+        self.stopped_due || self.refreshes.is_multiple_of(STOPPED_EVERY) || self.stopped.is_empty()
+    }
+
+    /// The open attention report of a row's current generation.
+    pub fn incident(&self, row: &MonitorRow) -> Option<&Incident> {
+        self.incidents.get(&(row.id.clone(), row.generation))
+    }
+
+    fn take_attention(&mut self, read: AttentionRead) {
+        for report in read.reports {
+            let key = (report.agent.clone(), report.generation);
+            match report.phase.as_str() {
+                "incident" => {
+                    self.incidents.insert(
+                        key,
+                        Incident {
+                            incident_id: report.incident_id,
+                            reason: report.reason,
+                        },
+                    );
+                }
+                "recovery"
+                    if self
+                        .incidents
+                        .get(&key)
+                        .is_some_and(|open| open.incident_id == report.incident_id) =>
+                {
+                    self.incidents.remove(&key);
+                }
+                _ => {}
+            }
+        }
+        self.attention_cursor = Some(read.next);
+    }
+
+    /// Every row shown: the live rows, then the stopped ones not already
+    /// listed live.
+    fn all_rows(&self) -> impl Iterator<Item = &MonitorRow> {
+        let live: HashSet<&str> = self.rows.iter().map(|row| row.id.as_str()).collect();
+        self.rows.iter().chain(
+            self.stopped
+                .iter()
+                .filter(move |row| !live.contains(row.id.as_str())),
+        )
+    }
+
+    /// The sections in order, each with its top-level rows: attention by
+    /// urgency, working and idle by id, recently stopped newest first. A
+    /// native child is not a top-level row while its parent is shown; a
+    /// stopped one whose parent is not shown is left out (it ended).
+    pub fn sections(&self, now_ms: i64) -> Vec<Section<'_>> {
+        let rows: Vec<&MonitorRow> = self.all_rows().collect();
+        let shown: HashSet<&str> = rows
+            .iter()
+            .filter(|row| self.visible(row, now_ms))
+            .map(|row| row.id.as_str())
+            .collect();
+        let mut sections: Vec<Section> = [
+            Group::Attention,
+            Group::Working,
+            Group::Idle,
+            Group::Stopped,
+        ]
+        .into_iter()
+        .map(|group| Section {
+            group,
+            rows: Vec::new(),
+        })
+        .collect();
+        for row in &rows {
+            if !self.visible(row, now_ms) {
+                continue;
+            }
+            if row.native_child
+                && (row
+                    .parent
+                    .as_deref()
+                    .is_some_and(|parent| shown.contains(parent))
+                    || row.state == AgentState::Stopped)
+            {
+                continue;
+            }
+            let group = row.group(self.incident(row));
+            if let Some(section) = sections.iter_mut().find(|section| section.group == group) {
+                section.rows.push(row);
+            }
+        }
+        for section in &mut sections {
+            match section.group {
+                Group::Attention => section.rows.sort_by(|a, b| {
+                    attention_rank(a.state)
+                        .cmp(&attention_rank(b.state))
+                        .then_with(|| id_order(&a.id, &b.id))
+                }),
+                Group::Stopped => section.rows.sort_by(|a, b| {
+                    b.updated_at
+                        .cmp(&a.updated_at)
+                        .then_with(|| id_order(&a.id, &b.id))
+                }),
+                Group::Working | Group::Idle => section.rows.sort_by(|a, b| id_order(&a.id, &b.id)),
+            }
+        }
+        sections
+    }
+
+    /// A stopped row is shown only while recent.
+    fn visible(&self, row: &MonitorRow, now_ms: i64) -> bool {
+        row.state != AgentState::Stopped || now_ms.saturating_sub(row.updated_at) <= RECENT_MS
+    }
+
+    /// The native children of `parent` that are shown, by id.
+    pub fn children(&self, parent: &str) -> Vec<&MonitorRow> {
+        let mut children: Vec<&MonitorRow> = self
+            .all_rows()
+            .filter(|row| row.native_child && row.parent.as_deref() == Some(parent))
+            .collect();
+        children.sort_by(|a, b| id_order(&a.id, &b.id));
+        children
+    }
+
+    /// The footer: what is live, from the top-level rows of the sections.
+    pub fn live_line(&self, now_ms: i64) -> String {
+        let sections = self.sections(now_ms);
+        let count = |group: Group| {
+            sections
+                .iter()
+                .find(|section| section.group == group)
+                .map_or(0, |section| {
+                    section.rows.iter().filter(|row| !row.native_child).count()
+                })
+        };
+        let mut line = live_words(
+            count(Group::Working),
+            count(Group::Attention),
+            count(Group::Idle),
+        );
+        let truncated = self.counts.iter().any(|count| {
+            count.state != AgentState::Stopped
+                && count.total.is_some_and(|total| total > count.shown)
+                && count.shown > 0
+        });
+        if truncated {
+            line.push_str(" (more than shown)");
+        }
+        if !self.errors.is_empty() {
+            line.push_str(" · some reads failed");
+        }
+        line
+    }
+
     pub fn apply(&mut self, snapshot: MonitorSnapshot) {
         self.refreshes += 1;
         self.errors.clear();
+        match snapshot.stopped {
+            Some(Ok(page)) => {
+                self.stopped = page.agents.iter().map(MonitorRow::from_list).collect();
+                self.stopped_due = false;
+            }
+            Some(Err(error)) => self.errors.push(format!("stopped: {error}")),
+            None => {}
+        }
+        match snapshot.attention {
+            Some(Ok(read)) => self.take_attention(read),
+            Some(Err(error)) => self.errors.push(format!("attention reports: {error}")),
+            None => {}
+        }
         let mut rows = Vec::new();
         let mut counts = Vec::new();
         for (state, group) in &snapshot.groups {
@@ -625,6 +1009,10 @@ impl Monitor {
             let present: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
             self.series.retain(|id, _| present.contains(id.as_str()));
         }
+        let live: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        if self.errors.is_empty() && self.rows.iter().any(|row| !live.contains(row.id.as_str())) {
+            self.stopped_due = true;
+        }
         self.rows = rows;
         self.counts = counts;
         if snapshot.detail.is_some() {
@@ -632,29 +1020,11 @@ impl Monitor {
         }
         self.read_at_ms = Some(snapshot.read_at_ms);
     }
+}
 
-    /// Fleet counter line: exact totals per state; "?" when a read failed.
-    /// The fleet by state, attention first, naming only states that have
-    /// Agents (and those whose count was not read): "30 busy (20 shown) ·
-    /// 3 idle".
-    pub fn counter_line(&self) -> String {
-        let mut counts = self.counts.clone();
-        counts.sort_by_key(|count| attention_rank(count.state));
-        counts
-            .iter()
-            .filter_map(|count| match count.total {
-                Some(0) => None,
-                Some(total) if count.shown < total && count.shown > 0 => Some(format!(
-                    "{total} {} ({} shown)",
-                    count_words(count.state),
-                    count.shown
-                )),
-                Some(total) => Some(format!("{total} {}", count_words(count.state))),
-                None => Some(format!("{} not counted", count_words(count.state))),
-            })
-            .collect::<Vec<_>>()
-            .join(" · ")
-    }
+/// Agent ids in creation order (`a9` before `a10`).
+fn id_order(a: &str, b: &str) -> std::cmp::Ordering {
+    (a.len(), a).cmp(&(b.len(), b))
 }
 
 type ReadFuture<'a> = Pin<Box<dyn Future<Output = Read> + 'a>>;
@@ -662,8 +1032,61 @@ type ReadFuture<'a> = Pin<Box<dyn Future<Output = Read> + 'a>>;
 enum Read {
     Group(AgentState, Result<AgentListResponse, String>),
     Count(AgentState, Result<usize, String>),
+    Stopped(Result<AgentListResponse, String>),
+    Attention(Result<AttentionRead, String>),
     Detail(Box<Result<DetailRead, String>>),
     Cancelled,
+}
+
+/// The attention reports after `cursor` (or, on the first read, from
+/// `ATTENTION_WINDOW_MS` back) toward the current high-water mark, at most
+/// `ATTENTION_SCAN_PAGES` reads per refresh. A backlog larger than that
+/// continues from where this refresh stopped, so a busy journal never holds
+/// a refresh for thousands of calls.
+async fn read_attention(
+    data_dir: &Path,
+    cursor: Option<i64>,
+    now_ms: i64,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<AttentionRead, String> {
+    let filter = eliot_core::api::EventsFilter {
+        agents: Vec::new(),
+        kinds: vec![ATTENTION_KIND.to_owned()],
+        sources: Vec::new(),
+    };
+    let bounds = client::events_bounds(data_dir, &filter)
+        .await
+        .map_err(|error| error.to_string())?;
+    let from = match cursor {
+        // A cursor below the retention floor restarts at the floor.
+        Some(cursor) => cursor.max(bounds.pruned_through),
+        None => client::seq_before(
+            data_dir,
+            now_ms - ATTENTION_WINDOW_MS,
+            bounds.pruned_through,
+            bounds.hi,
+        )
+        .await
+        .map_err(|error| error.to_string())?,
+    };
+    let scan = client::scan_events_budgeted(
+        data_dir,
+        from,
+        bounds.hi,
+        &filter,
+        ATTENTION_SCAN_PAGES,
+        cancelled,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(AttentionRead {
+        reports: scan
+            .events
+            .iter()
+            .filter_map(AttentionReport::from_event)
+            .collect(),
+        next: scan.next,
+    })
 }
 
 fn list_request(state: AgentState, limit: usize, observations: bool) -> AgentListRequest {
@@ -675,13 +1098,49 @@ fn list_request(state: AgentState, limit: usize, observations: bool) -> AgentLis
     }
 }
 
+/// What one refresh reads besides the fixed live set.
+#[derive(Clone, Debug, Default)]
+pub struct RefreshPlan {
+    pub selected: Option<String>,
+    pub stopped: bool,
+    pub attention_cursor: Option<i64>,
+}
+
 /// One refresh: the fixed read set, at most `MAX_CONCURRENT_READS` at once.
 pub async fn refresh(
     data_dir: &Path,
-    selected: Option<String>,
+    plan: RefreshPlan,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Option<MonitorSnapshot> {
+    let read_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0);
+    let RefreshPlan {
+        selected,
+        stopped,
+        attention_cursor,
+    } = plan;
     let mut reads: Vec<ReadFuture<'_>> = Vec::new();
+    if stopped {
+        reads.push(Box::pin(async move {
+            if cancelled() {
+                return Read::Cancelled;
+            }
+            let request = list_request(AgentState::Stopped, STOPPED_ROWS, false);
+            Read::Stopped(
+                client::list_agents(data_dir, &request)
+                    .await
+                    .map_err(|error| error.to_string()),
+            )
+        }));
+    }
+    reads.push(Box::pin(async move {
+        if cancelled() {
+            return Read::Cancelled;
+        }
+        Read::Attention(read_attention(data_dir, attention_cursor, read_at_ms, cancelled).await)
+    }));
     for state in ROW_STATES {
         reads.push(Box::pin(async move {
             if cancelled() {
@@ -743,11 +1202,10 @@ pub async fn refresh(
     let mut snapshot = MonitorSnapshot {
         groups: Vec::new(),
         counts: Vec::new(),
+        stopped: None,
+        attention: None,
         detail: None,
-        read_at_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis() as i64)
-            .unwrap_or(0),
+        read_at_ms,
     };
     if cancelled() || results.iter().any(|read| matches!(read, Read::Cancelled)) {
         return None;
@@ -756,6 +1214,8 @@ pub async fn refresh(
         match result {
             Read::Group(state, page) => snapshot.groups.push((state, page)),
             Read::Count(state, total) => snapshot.counts.push((state, total)),
+            Read::Stopped(page) => snapshot.stopped = Some(page),
+            Read::Attention(read) => snapshot.attention = Some(read),
             Read::Detail(detail) => snapshot.detail = Some(*detail),
             Read::Cancelled => {}
         }
@@ -928,6 +1388,8 @@ mod tests {
                 (AgentState::Busy, Ok(page(AgentState::Busy))),
             ],
             counts: Vec::new(),
+            stopped: None,
+            attention: None,
             detail: None,
             read_at_ms: 0,
         });
@@ -1074,42 +1536,171 @@ mod tests {
         assert_eq!(diagnosis_line("unknown origin: a3 unknown"), None);
     }
 
+    fn summary(id: &str, state: AgentState, parent: Option<&str>, native: bool) -> AgentListRow {
+        use eliot_core::api::AgentSummary;
+        use eliot_core::{NativeChildActivity, NativeChildActivityState};
+        AgentListRow {
+            summary: AgentSummary {
+                archived: false,
+                chat: false,
+                id: id.to_owned(),
+                generation: 1,
+                project: "p".to_owned(),
+                harness: "codex".to_owned(),
+                name: None,
+                profile: None,
+                preview: None,
+                state,
+                parent: parent.map(str::to_owned),
+                root: parent.unwrap_or(id).to_owned(),
+                active_turn: None,
+                last_progress_at: None,
+                progress_age_ms: None,
+                last_turn_id: None,
+                last_outcome: None,
+                activity: native.then_some(NativeChildActivity {
+                    state: NativeChildActivityState::Idle,
+                    has_open_turn: false,
+                    last_progress_at: None,
+                }),
+                usage: None,
+                usage_scope: None,
+                updated_at: 1_000,
+                heavy: None,
+                session_growth: None,
+            },
+            observation: None,
+        }
+    }
+
+    fn page(rows: Vec<AgentListRow>) -> Result<AgentListResponse, String> {
+        Ok(AgentListResponse {
+            next: rows.last().map(|row| row.summary.id.clone()),
+            total: rows.len(),
+            agents: rows,
+            truncated: false,
+        })
+    }
+
     #[test]
-    fn counter_line_marks_partial_rows_and_failed_reads() {
-        let monitor = Monitor {
-            counts: vec![
-                StateCount {
-                    state: AgentState::Busy,
-                    total: Some(30),
-                    shown: 20,
-                },
-                StateCount {
-                    state: AgentState::Idle,
-                    total: None,
-                    shown: 0,
-                },
+    fn sections_group_what_matters_and_nest_native_children() {
+        let mut monitor = Monitor::default();
+        monitor.apply(MonitorSnapshot {
+            groups: vec![
+                (
+                    AgentState::Lost,
+                    page(vec![summary("a2", AgentState::Lost, None, false)]),
+                ),
+                (
+                    AgentState::Busy,
+                    page(vec![summary("a3", AgentState::Busy, None, false)]),
+                ),
+                (
+                    AgentState::Idle,
+                    page(vec![
+                        summary("a4", AgentState::Idle, None, false),
+                        summary("a5", AgentState::Idle, None, false),
+                    ]),
+                ),
+                (
+                    AgentState::Unknown,
+                    page(vec![summary("a6", AgentState::Unknown, Some("a3"), true)]),
+                ),
             ],
-            ..Monitor::default()
+            counts: vec![(AgentState::Stopped, Ok(3))],
+            stopped: Some(page(vec![
+                summary("a1", AgentState::Stopped, None, false),
+                summary("a7", AgentState::Stopped, Some("a1"), true),
+                summary("a8", AgentState::Stopped, Some("a1"), true),
+            ])),
+            attention: Some(Ok(AttentionRead {
+                reports: vec![AttentionReport {
+                    agent: "a5".to_owned(),
+                    generation: 1,
+                    incident_id: "i1".to_owned(),
+                    phase: "incident".to_owned(),
+                    reason: "no_progress".to_owned(),
+                }],
+                next: 9,
+            })),
+            detail: None,
+            read_at_ms: 2_000,
+        });
+        let sections = monitor.sections(2_000);
+        let ids = |group: Group| -> Vec<&str> {
+            sections
+                .iter()
+                .find(|section| section.group == group)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect()
         };
+        // An idle Agent with an open attention report needs attention.
+        assert_eq!(ids(Group::Attention), ["a2", "a5"]);
+        assert_eq!(ids(Group::Working), ["a3"]);
+        assert_eq!(ids(Group::Idle), ["a4"]);
+        assert_eq!(ids(Group::Stopped), ["a1"]);
+        // Native children nest under their parent, not as rows of their own.
+        let children: Vec<&str> = monitor
+            .children("a1")
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(children, ["a7", "a8"]);
         assert_eq!(
-            monitor.counter_line(),
-            "30 working (20 shown) · ready not counted"
+            monitor.children("a1")[0].status_words(),
+            "Ended with parent"
         );
-        let quiet = Monitor {
-            counts: vec![
-                StateCount {
-                    state: AgentState::Waiting,
-                    total: Some(0),
-                    shown: 0,
-                },
-                StateCount {
-                    state: AgentState::Idle,
-                    total: Some(3),
-                    shown: 3,
-                },
-            ],
-            ..Monitor::default()
-        };
-        assert_eq!(quiet.counter_line(), "3 ready");
+        assert_eq!(monitor.children("a3")[0].status_words(), "Idle");
+        assert_eq!(monitor.children("a1")[0].operation(), "No finished turn");
+        assert_eq!(
+            monitor.live_line(2_000),
+            "1 working · 2 need attention · 1 idle"
+        );
+        assert_eq!(monitor.attention_cursor, Some(9));
+        // A row that leaves the live states makes the next refresh read the
+        // stopped rows.
+        assert!(!monitor.stopped_due);
+        monitor.apply(MonitorSnapshot {
+            groups: vec![(AgentState::Busy, page(Vec::new()))],
+            counts: Vec::new(),
+            stopped: None,
+            attention: None,
+            detail: None,
+            read_at_ms: 2_100,
+        });
+        assert!(monitor.stopped_due && monitor.wants_stopped());
+        // A recovery closes the incident; a day later the stopped rows age out.
+        monitor.take_attention(AttentionRead {
+            reports: vec![AttentionReport {
+                agent: "a5".to_owned(),
+                generation: 1,
+                incident_id: "i1".to_owned(),
+                phase: "recovery".to_owned(),
+                reason: "no_progress".to_owned(),
+            }],
+            next: 12,
+        });
+        assert!(monitor.incidents.is_empty());
+        let later = monitor.sections(2_000 + RECENT_MS + 1);
+        assert!(
+            later
+                .iter()
+                .find(|section| section.group == Group::Stopped)
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        assert_eq!(live_words(0, 0, 0), "All quiet");
+    }
+
+    #[test]
+    fn a_restart_loss_reads_as_stopped_by_swarm() {
+        let summary = "swarm origin: a2 agent.lost at daemon.restart: daemon_restart";
+        assert!(restart_loss(summary));
+        assert_eq!(diagnosis_line(summary).as_deref(), Some(RESTART_LOSS_WORDS));
+        assert!(!restart_loss("unknown origin: a2 lost"));
     }
 }

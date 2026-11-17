@@ -137,11 +137,39 @@ pub struct CleanupApplyRequest {
     /// local-only deletions.
     #[serde(default)]
     pub delete_remote: bool,
+    /// Apply only these safe candidates of the plan (artifact ids). The other
+    /// safe candidates settle `skipped(not_selected)` with no attempt fence, so
+    /// a later plan can offer them again. Omitted applies every safe candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub artifacts: Option<Vec<String>>,
 }
 impl CleanupApplyRequest {
     pub fn validate(&self) -> Result<()> {
         cleanup_id(&self.id)?;
-        cleanup_id(&self.plan_id)
+        cleanup_id(&self.plan_id)?;
+        if let Some(artifacts) = &self.artifacts {
+            let mut seen = std::collections::BTreeSet::new();
+            if artifacts.len() > MAX_CLEANUP_ITEMS
+                || artifacts.iter().any(|id| !seen.insert(id.as_str()))
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "cleanup artifact selection must be unique and at most 64 ids",
+                ));
+            }
+            for id in artifacts {
+                cleanup_id(id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this apply attempts `artifact` (a safe candidate's id).
+    pub fn selects(&self, artifact: &str) -> bool {
+        self.artifacts
+            .as_ref()
+            .is_none_or(|selected| selected.iter().any(|id| id == artifact))
     }
 }
 

@@ -1713,7 +1713,8 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         db!(tx.execute("UPDATE agents SET token = NULL WHERE token IS NOT NULL", []));
-        db!(tx.execute("UPDATE agents SET state = 'unknown', active_turn = NULL, pending = '[]', updated_at = ?1 WHERE observe_only = 1", [now]));
+        // A native child that ended with its parent stays ended.
+        db!(tx.execute("UPDATE agents SET state = 'unknown', active_turn = NULL, pending = '[]', updated_at = ?1 WHERE observe_only = 1 AND state NOT IN ('stopped', 'failed', 'lost')", [now]));
         db!(tx.execute(
             "UPDATE source_state SET health = 'stale', updated_at = ?1 WHERE state = 'open'
              AND EXISTS(SELECT 1 FROM agents a WHERE a.id = source_state.agent AND a.observe_only = 1)", [now],
@@ -1811,12 +1812,15 @@ impl Store {
                 agent_num,
                 generation,
                 now,
-                "daemon_restart",
+                core::DAEMON_RESTART_REASON,
                 None,
                 None,
                 &mut events,
             )?;
         }
+        // Retained children of producer generations that ended before this
+        // start (including rows written before this rule existed).
+        native_children::end_native_children_with_parent_tx(&tx, None, now, &mut events)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }

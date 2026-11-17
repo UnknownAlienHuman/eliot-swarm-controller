@@ -100,10 +100,17 @@ pub(crate) async fn run_show(
             .validate_response(&response)
             .map_err(|error| Failure::from_core(error, false))?;
         if let Some(activity) = response.agent.activity.as_ref() {
-            println!(
-                "state: {} (observed) (lifecycle state=unknown)",
-                activity_state_name(activity.state)
-            );
+            if response.agent.state == AgentState::Stopped {
+                println!(
+                    "state: stopped (ended with parent; last activity {})",
+                    activity_state_name(activity.state)
+                );
+            } else {
+                println!(
+                    "state: {} (observed) (lifecycle state=unknown)",
+                    activity_state_name(activity.state)
+                );
+            }
         }
         let value = serde_json::to_value(response)
             .map_err(|_| Failure::new(4, "agent.get response is invalid"))?;

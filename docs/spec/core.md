@@ -117,6 +117,7 @@ not duplicated Agent columns. No managed row means these projections are absent.
 | first request / last resolved request | waiting / busy |
 | exact active turn terminal result | idle, clear that turn's pending requests |
 | normal session end / fatal error / proven loss | stopped / failed / lost |
+| exact controlled producer generation ends (native observed child) | stopped, `agent.stopped {reason: ended_with_parent}` |
 
 An open stop/transition is a command beside the observed state, not another state
 machine. Generation transition blocks ordinary turn work. Terminal settlement cancels
@@ -152,6 +153,21 @@ The projection is derived from existing turns, events and source/registration ro
 with no new activity table. Retention can leave the progress timestamp unknown.
 `ls`, `show`, `top` and MCP reads expose this field next to unchanged lifecycle
 `state=unknown`; activity grants neither a principal nor child control verbs.
+
+`unknown` lasts only while the child's source can still be live. A native child ends
+with its exact controlled producer generation: when that generation becomes stopped,
+failed or lost, or is superseded, every still-`unknown` registered child of it
+(including nested ones) becomes `stopped` in the same Store transaction, with
+`agent.stopped {reason: "ended_with_parent", producer, producer_generation,
+producer_state}` (`superseded` when the producer generation moved on). This is proven
+end of observation, not a guess about native completion: the child's grant requires
+that live producer generation, so it can never publish again. A turn still `running`
+is retained `unknown`, never completed; completed turns and `activity` keep their
+facts, and source rows stay with the producer's retirement
+(`mark_native_children_unavailable`, which owns the reader-closure proof). Restart
+recovery applies the same rule to retained rows and never resets an ended child to
+`unknown`. An ended child opens no `children_unattended` incident. Detached external
+observers keep their `unknown` state.
 
 Observe attachment records `origin=external`, `observe_only=true`, `own_identity=false`
 and no token. The generation/source fence commits before reader I/O. Owner-issued native
@@ -508,11 +524,17 @@ codes, never from message text. Exit codes ride alongside (`exit_code`, plus an
 | Evidence | Origin |
 |---|---|
 | Swarm validation, schema, queue or implementation failure | `swarm` |
+| A loss Swarm caused itself: a daemon restart fences every live generation | `swarm` at `daemon.restart` |
 | Missing executable; OS, disk, network or external credential failure | `environment` |
 | Native harness refusal, including an unavailable model without upstream evidence | `harness` |
 | Structured upstream rate, quota, auth or model error | `provider` |
 | Observed contradiction of a documented harness protocol | `harness_contract_mismatch`, with `docs/harnesses/<h>.md#section` |
 | Insufficient evidence | `unknown`, stating the missing evidence |
+
+The restart's `agent.lost` and `turn.unknown` events carry `origin: swarm` and
+`where: daemon.restart` beside `reason: daemon_restart`
+([`swarm_loss_location`](../../crates/eliot-core/src/lib.rs)); a retained loss
+written before those fields existed classifies from that typed reason code alone.
 
 Redact complete messages and evidence before imposing their persistence/wire bounds.
 Constructors retain complete text until the owning policy is available. No minimum
