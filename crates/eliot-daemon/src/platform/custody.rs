@@ -36,9 +36,17 @@ pub struct OwnedChild {
 #[derive(Debug)]
 pub enum AgentSpawnError {
     NotSpawned(Error),
+    #[cfg_attr(
+        not(windows),
+        expect(
+            dead_code,
+            reason = "only the Windows suspended spawn can return a child whose cleanup failed"
+        )
+    )]
     Uncertain(Error),
 }
 
+#[cfg(windows)]
 impl AgentSpawnError {
     pub fn into_error(self) -> Error {
         match self {
