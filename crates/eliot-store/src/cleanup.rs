@@ -605,10 +605,24 @@ impl Store {
                 "cleanup plan is already consumed; read the original apply id",
             ));
         }
-        // Read ownership in the same transaction that reserves attempts. Agent
-        // ids are never reused, so deletion supersedes even a snapshot retained
-        // after the Agent was removed.
         for (index, item) in plan.items.iter().enumerate() {
+            // A project registration belongs to settings, not to an Agent, so
+            // Agent deletion never supersedes it.
+            if item.artifact.kind == ArtifactKind::ProjectRegistration {
+                if attempted(item) {
+                    if principal != "owner" {
+                        return Err(Error::new("not_allowed", "project cleanup requires Owner"));
+                    }
+                    if prior_project_cleanup(&tx, &request.id, &item.artifact)? {
+                        response.items[index].outcome = "skipped".to_owned();
+                        response.items[index].reason = Some("prior_cleanup_attempt".to_owned());
+                    }
+                }
+                continue;
+            }
+            // Read ownership in the same transaction that reserves attempts. Agent
+            // ids are never reused, so deletion supersedes even a snapshot retained
+            // after the Agent was removed.
             let agent = parse_agent_id(&item.artifact.agent)?;
             let retained: bool = tx
                 .query_row(
@@ -624,16 +638,6 @@ impl Store {
             }
             // Fence every attempted artifact across new plans and daemon restarts.
             if attempted(item) {
-                if item.artifact.kind == ArtifactKind::ProjectRegistration {
-                    if principal != "owner" {
-                        return Err(Error::new("not_allowed", "project cleanup requires Owner"));
-                    }
-                    if prior_project_cleanup(&tx, &request.id, &item.artifact)? {
-                        response.items[index].outcome = "skipped".to_owned();
-                        response.items[index].reason = Some("prior_cleanup_attempt".to_owned());
-                    }
-                    continue;
-                }
                 let body: Option<String> = tx
                     .query_row(
                         "SELECT body FROM artifacts WHERE id=?1 AND agent=?2",
