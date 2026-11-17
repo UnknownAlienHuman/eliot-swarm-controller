@@ -1178,7 +1178,14 @@ async fn probe_muse_command(
     let reaped = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
         .await
         .is_ok_and(|result| result.is_ok());
-    nonempty && terminated && reaped
+    #[cfg(windows)]
+    let empty = child
+        .wait_family_empty(std::time::Duration::from_secs(2))
+        .await
+        .is_ok_and(|empty| empty);
+    #[cfg(not(windows))]
+    let empty = true; // Unix custody remains explicitly degraded.
+    nonempty && terminated && reaped && empty
 }
 
 async fn muse_probe_catalogue(
@@ -1343,50 +1350,52 @@ pub(crate) fn harness_installation(harness: &str) -> Value {
 const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bounded `<exe> --version` first line, or `None` when the probe fails.
-/// A hung native executable must not stall `harness.list`: only the child
-/// this probe started is ever killed on timeout.
+/// The existing scoped process runner bounds output and owns the whole family.
 pub(crate) fn native_version_string(program: &str) -> Option<String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    let Ok(mut child) = Command::new(program)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return None;
-    };
-    let deadline = std::time::Instant::now() + VERSION_PROBE_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            // Timed out or unwaitable: kill only the child this probe started.
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-        }
-    };
-    let mut stdout = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    match status {
-        Some(status) if status.success() => {
-            let text = stdout.lines().next().unwrap_or_default().trim().to_owned();
-            if text.is_empty() || text.len() > 256 {
-                None
-            } else {
-                Some(text)
-            }
-        }
-        _ => None,
-    }
+    let bytes = native_read(program, &["--version"], VERSION_PROBE_TIMEOUT)?;
+    let stdout = std::str::from_utf8(&bytes).ok()?;
+    let text = stdout.lines().next()?.trim();
+    (!text.is_empty() && text.len() <= 256).then(|| text.to_owned())
+}
+
+/// Bridge synchronous installation/profile resolution to the same bounded
+/// process owner used by inference and actions. A joined thread permits calls
+/// both inside a Tokio runtime and during synchronous configuration loading.
+/// No process handle, pipe reader or runtime survives this call.
+fn native_read(program: &str, args: &[&str], budget: std::time::Duration) -> Option<Vec<u8>> {
+    use crate::scripts::process::{ProcessOutcome, run_owned_process};
+    use std::sync::Arc;
+
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("native-discovery".to_owned())
+            .spawn_scoped(scope, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                runtime.block_on(async {
+                    let mut command = tokio::process::Command::new(program);
+                    command.args(args);
+                    let (_cancel, cancellation) = tokio::sync::watch::channel(false);
+                    match run_owned_process(
+                        command,
+                        Vec::new(),
+                        budget,
+                        Arc::new(core::SecretPolicy::default()),
+                        cancellation,
+                    )
+                    .await
+                    {
+                        ProcessOutcome::Completed(capture) => Some(capture.stdout),
+                        _ => None,
+                    }
+                })
+            })
+            .ok()?
+            .join()
+            .ok()?
+    })
 }
 
 fn native_version(program: &str) -> Value {
@@ -1407,38 +1416,12 @@ const MAX_AUTH_LIST_BYTES: usize = 64 * 1024;
 /// unread. `None` when the helper cannot be spawned, times out, exits
 /// non-zero, or its document is unreadable.
 fn opencode_auth_ids(program: &str) -> Option<Vec<String>> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(program)
-        .args(["auth", "list", "--format", "json", "--standalone"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + AUTH_LIST_TIMEOUT;
-    let exited = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
-    if !exited {
-        return None;
-    }
-    let mut stdout = Vec::new();
-    let read_ok = child
-        .stdout
-        .take()
-        .is_some_and(|mut pipe| pipe.read_to_end(&mut stdout).is_ok());
-    if !read_ok || stdout.len() > MAX_AUTH_LIST_BYTES {
+    let stdout = native_read(
+        program,
+        &["auth", "list", "--format", "json", "--standalone"],
+        AUTH_LIST_TIMEOUT,
+    )?;
+    if stdout.len() > MAX_AUTH_LIST_BYTES {
         return None;
     }
     let entries: Vec<Value> = serde_json::from_slice(&stdout).ok()?;
@@ -1494,6 +1477,10 @@ fn resolve_opencode_default(model: Option<&str>, ids: &[String]) -> core::Result
         )),
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "adhoc/family_tests.rs"]
+mod family_tests;
 
 #[cfg(test)]
 mod tests {

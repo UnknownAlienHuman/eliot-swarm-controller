@@ -124,6 +124,14 @@ returns `process_custody_foreign`, leaves the Job untouched and settles unknown 
 replaying the command. Agent Jobs are kill-on-close and only their owning daemon holds
 custody, so a live Job under an older namespace belongs to another running daemon.
 
+No-Agent discovery (catalogue, quota, profile-store and installation/auth probes)
+and inference use the same scoped process-custody API. On Windows each helper
+family is assigned to a daemon-owned kill-on-close Job before it resumes, with
+no breakaway. Native helpers must select private/standalone execution rather
+than a shared service that can start outside that Job. A successful Windows read
+requires owned family closure; unconfirmed cleanup stays unknown. See
+[Windows exact custody](monitoring.md#windows-exact).
+
 The first v52 open always mints a new current namespace, including on the original
 production directory: a v51 backup cannot be distinguished from the original. Migration
 first records findable existing generations' legacy namespace (the stable Store identity),

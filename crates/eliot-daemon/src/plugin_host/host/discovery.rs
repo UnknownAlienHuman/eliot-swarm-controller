@@ -5,7 +5,9 @@ use super::{
     require_proxy_capability, signal_progress,
 };
 use eliot_core::{Error, Result, SecretPolicy, StderrSource, api::DiscoverPage};
-use eliot_plugin::protocol::{ProfileStoreParams, ProfileStoreResult};
+use eliot_plugin::protocol::{
+    ModelListParams, ModelListPart, ProfileStoreParams, ProfileStoreResult,
+};
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
 use std::{
@@ -532,13 +534,66 @@ impl PluginHost {
         &self,
         profile: Value,
         environment: Value,
+        stop: watch::Receiver<Option<Instant>>,
+    ) -> MetadataRead<Value> {
+        // OpenCode's two CLI operations must never share a reader lifetime:
+        // closing the first Job proves its standalone server is gone before
+        // starting the variants command. Retain one admission slot throughout.
+        let opencode = profile["harness"] == "opencode";
+        let until = Instant::now() + READER_DEADLINE;
+        let mut catalogue = self
+            .read_model_catalogue_part(
+                profile.clone(),
+                environment.clone(),
+                stop.clone(),
+                ModelListPart::Models,
+                until,
+            )
+            .await;
+        if !opencode || catalogue.result.is_err() || catalogue.cleanup != ReaderCleanup::Confirmed {
+            return catalogue;
+        }
+        let variants = self
+            .read_model_catalogue_part(profile, environment, stop, ModelListPart::Variants, until)
+            .await;
+        // A missing optional inventory can degrade only after proven cleanup.
+        // In particular a cancelled read or unknown family cannot become success.
+        if variants.cleanup != ReaderCleanup::Confirmed
+            || variants
+                .result
+                .as_ref()
+                .is_err_and(|error| matches!(error.code.as_str(), "unknown" | "cancelled"))
+        {
+            return variants;
+        }
+        if let (Ok(catalogue), Ok(variants)) = (&mut catalogue.result, variants.result) {
+            overlay_model_variants(catalogue, &variants);
+        }
+        catalogue
+    }
+
+    async fn read_model_catalogue_part(
+        &self,
+        profile: Value,
+        environment: Value,
         mut stop: watch::Receiver<Option<Instant>>,
+        part: ModelListPart,
+        until: Instant,
     ) -> MetadataRead<Value> {
         if stop.borrow().is_some() {
             return MetadataRead {
                 result: Err(Error::new(
                     "cancelled",
                     "model.list was cancelled before spawn",
+                )),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        }
+        if Instant::now() >= until {
+            return MetadataRead {
+                result: Err(Error::new(
+                    "unavailable",
+                    "model.list deadline exceeded before spawn",
                 )),
                 cleanup: ReaderCleanup::Confirmed,
             };
@@ -571,11 +626,11 @@ impl PluginHost {
         let mut known: Vec<_> = self.state.secrets.lock_recover().iter().cloned().collect();
         known.extend([self.state.owner_token.clone(), reader.credential.clone()]);
         let metadata_secrets = metadata_secret_snapshot(&profile, &environment, known);
-        let until = Instant::now() + READER_DEADLINE;
         let read = async {
             let manifest = reader.initialize(&harness, until).await?;
             require_proxy_capability(&profile, &manifest)?;
-            let request = serde_json::json!({"profile": profile});
+            let request = serde_json::to_value(ModelListParams { profile, part })
+                .map_err(|_| Error::new("internal", "model.list params encoding failed"))?;
             let value = reader.client.call("model.list", request, until).await?;
             if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
                 return Err(Error::new(
@@ -942,6 +997,24 @@ impl PluginHost {
     }
 }
 
+fn overlay_model_variants(catalogue: &mut Value, variants: &Value) {
+    let (Some(models), Some(variants)) = (
+        catalogue.get_mut("models").and_then(Value::as_array_mut),
+        variants.get("models").and_then(Value::as_array),
+    ) else {
+        return;
+    };
+    for model in models {
+        if let Some(efforts) = variants
+            .iter()
+            .find(|entry| entry.get("id") == model.get("id"))
+            .and_then(|entry| entry.get("efforts"))
+        {
+            model["efforts"] = efforts.clone();
+        }
+    }
+}
+
 fn metadata_reader_close_deadline(stop: &watch::Receiver<Option<Instant>>) -> Instant {
     (*stop.borrow()).unwrap_or_else(|| Instant::now() + READER_CLOSE_BUDGET)
 }
@@ -966,7 +1039,7 @@ fn require_reader_cleanup<T>(
         result
     } else {
         Err(Error::new(
-            "unavailable",
+            "unknown",
             format!("{operation} reader cleanup is unconfirmed"),
         ))
     }
@@ -1080,6 +1153,36 @@ fn valid_text(value: &str, max: usize) -> bool {
 mod tests {
     use super::*;
     use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn unconfirmed_metadata_cleanup_overrides_success_and_known_failure() {
+        for result in [
+            Ok(json!({"models": []})),
+            Err(Error::new("native_readback", "unreadable")),
+        ] {
+            let error = require_reader_cleanup(result, false, "model.list").unwrap_err();
+            assert_eq!(error.code, "unknown");
+            assert!(error.message.contains("cleanup is unconfirmed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_variants_remain_cancelled_when_read_deadline_also_expired() {
+        let host = host();
+        let until = Instant::now();
+        let (_stop, stopped) = watch::channel(Some(until));
+        let read = host
+            .read_model_catalogue_part(
+                json!({"harness": "opencode"}),
+                json!({}),
+                stopped,
+                ModelListPart::Variants,
+                until,
+            )
+            .await;
+        assert_eq!(read.cleanup, ReaderCleanup::Confirmed);
+        assert_eq!(read.result.unwrap_err().code, "cancelled");
+    }
 
     fn host() -> PluginHost {
         use crate::{bus::Bus, monitor::Monitoring, plugin_host::host::PluginHostOptions};

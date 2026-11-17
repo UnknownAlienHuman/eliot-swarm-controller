@@ -1,12 +1,13 @@
 //! Read-only OpenCode model catalogue from the frozen native child.
 //!
-//! The plugin runs its frozen snapshot `cmd` with the exact argv `models`
-//! (observed `opencode models`, opencode 2.2.7): no session, no turn and no
+//! The plugin runs its frozen snapshot `cmd` with `models --standalone`
+//! (observed `opencode models --standalone`, opencode 2.2.7): no session, no turn and no
 //! inference. donor: `plugins/antigravity/src/native/models.rs`
 //! (`run_models`) for the bounded child pattern (exact argv, stdin null,
 //! piped stdout with an output cap, stderr discarded, kill-and-reap under a
-//! deadline, static error strings). The installed `--help` documents
-//! `models` as "List all available models" (the read-only surface);
+//! deadline, static error strings). The daemon owns one reader Job per
+//! invocation and confirms family closure before returning its result. The
+//! installed `--help` documents `models --standalone` as a read-only surface;
 //! `GET /openapi.json` of `opencode serve` describes the per-session
 //! `GET /api/model` inventory instead, which needs a live session and is
 //! therefore not the catalogue reader.
@@ -21,9 +22,9 @@ use tokio::{
     time::{Instant, timeout, timeout_at},
 };
 
-/// Exact argv for the catalogue child: `models`, nothing else.
-pub(crate) fn models_argv() -> [&'static str; 1] {
-    ["models"]
+/// Keep the private server under the reader Job, never the background service.
+pub(crate) fn models_argv() -> [&'static str; 2] {
+    ["models", "--standalone"]
 }
 
 /// Output cap for the catalogue read: the observed catalogue is tens of KiB
@@ -36,13 +37,13 @@ pub(crate) const MAX_MODELS: usize = 1024;
 /// Maximum model id bytes, mirroring `MAX_HARNESS_MODEL_ID_BYTES` in Core.
 pub(crate) const MAX_MODEL_ID_BYTES: usize = 256;
 
-/// Exact argv for the variant read: `api model.list`, nothing else. The
-/// same read-only native surface as `models` (no server management, no
+/// Exact argv for the variant read: `api model.list --standalone`. The
+/// same read-only native surface as `models --standalone` (no shared server, no
 /// session, no turn, no inference): it answers the installed `model.list`
-/// operation (`GET /api/model`) against the owner's background service, so
-/// it sees the same authenticated providers as `models`.
-pub(crate) fn model_list_argv() -> [&'static str; 2] {
-    ["api", "model.list"]
+/// operation (`GET /api/model`) against a private server, so
+/// it sees the same authenticated providers as `models --standalone`.
+pub(crate) fn model_list_argv() -> [&'static str; 3] {
+    ["api", "model.list", "--standalone"]
 }
 
 /// Output cap for the variant read: the observed inventory is ~320 KiB
@@ -63,12 +64,13 @@ pub(crate) struct NativeVariantEntry {
     pub variants: Vec<String>,
 }
 
-/// Run the frozen native exe with exact argv `api model.list` and return
+/// Run the frozen native exe with exact argv `api model.list --standalone` and return
 /// one entry per reported model with its selectable variant ids, in wire
 /// order. Bounded by `deadline` and [`MAX_MODEL_LIST_BYTES`]; like
 /// [`run_models`] this is read-only (no session, no inference) and any
-/// failure is a static typed string naming the `model.list` surface, so
-/// the caller can fall back to the ids-only catalogue.
+/// failure is a static typed string naming the `model.list` surface. The
+/// daemon closes this reader's whole family before deciding whether an
+/// optional variants failure permits the ids-only catalogue.
 pub(crate) async fn run_model_variants(
     program: &OsStr,
     deadline: Instant,
@@ -147,7 +149,7 @@ pub(crate) async fn run_model_variants(
     parse_model_list_output(&text)
 }
 
-/// Parse `opencode api model.list` stdout: the installed `{"data":
+/// Parse `opencode api model.list --standalone` stdout: the installed `{"data":
 /// [Model.Info]}` envelope (a bare array decodes too). Entries join
 /// `providerID`/`id` verbatim; their `variants` map to selectable ids in
 /// wire order. Entries with an unusable identity or a missing variants
@@ -238,7 +240,7 @@ pub(crate) fn parse_model_list_output(text: &str) -> Result<Vec<NativeVariantEnt
 /// Grace for reaping a catalogue child after the kill signal.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
-/// Run the frozen native exe with exact argv `models` and return its
+/// Run the frozen native exe with exact argv `models --standalone` and return its
 /// `provider/model` ids verbatim, in wire order. Bounded by `deadline` and
 /// [`MAX_MODELS_BYTES`]; stderr is discarded like every other helper, so
 /// failures are static typed strings naming the `models` surface.
@@ -313,7 +315,7 @@ pub(crate) async fn run_models(program: &OsStr, deadline: Instant) -> Result<Vec
     parse_models_output(&text)
 }
 
-/// Parse `opencode models` stdout verbatim: one `provider/model` id per
+/// Parse `opencode models --standalone` stdout verbatim: one `provider/model` id per
 /// line (nested segments such as `modal/deepseek-ai/DeepSeek-V4.1-Flash`
 /// stay intact). Ids keep their exact bytes (a trailing `\r` is a line
 /// ending, not part of the id); blank lines are skipped, never
