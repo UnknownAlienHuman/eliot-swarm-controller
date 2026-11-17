@@ -23,7 +23,6 @@ impl DesktopApp {
 
     /// "Keep N busy from folder X": the `[automation.assignments.*]` entries.
     fn assignments_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let busy = self.settings.busy();
         let automation = &self.settings.automation;
         let roles = model::routing_roles(&self.settings.routing);
         let mut groups: Vec<KeyedView> = vec![KeyedView::new(
@@ -53,7 +52,6 @@ impl DesktopApp {
                         )
                         .placeholder_text(hint)
                         .automation_name(format!("{label} of {key}"))
-                        .is_enabled(!busy)
                         .on_text_changed(context.callback(move |text| {
                             Message::Settings(SettingsMsg::AssignmentText(
                                 callback_key.clone(),
@@ -97,7 +95,6 @@ impl DesktopApp {
                             .minimum(1.0)
                             .maximum(1000.0)
                             .value(busy_count.map(|count| count as f64))
-                            .is_enabled(!busy)
                             .automation_name(format!("Agents kept busy by {key}"))
                             .on_value_changed(context.callback(move |value| {
                                 Message::Settings(SettingsMsg::AssignmentBusy(
@@ -120,7 +117,6 @@ impl DesktopApp {
                             m3::enum_width(ComboBox::new())
                                 .items_source(role_items)
                                 .selected_index(role_index)
-                                .is_enabled(!busy)
                                 .automation_name(format!("Routing role of {key}"))
                                 .on_selection_changed(context.callback(move |index| {
                                     Message::Settings(SettingsMsg::AssignmentRole(
@@ -142,7 +138,6 @@ impl DesktopApp {
                             0.0,
                             0.0,
                         ))
-                        .is_enabled(!busy)
                         .automation_name(format!("Remove assignment {key}"))
                         .on_click(context.message(Message::Settings(
                             SettingsMsg::AssignmentRemoved(key.clone()),
@@ -173,9 +168,7 @@ impl DesktopApp {
                             .into(),
                         Some(
                             m3::outlined(palette)
-                                .is_enabled(
-                                    !busy && !self.settings.new_assignment.trim().is_empty(),
-                                )
+                                .is_enabled(!self.settings.new_assignment.trim().is_empty())
                                 .automation_name("Add assignment")
                                 .on_click(
                                     context
@@ -186,11 +179,6 @@ impl DesktopApp {
                     ),
                 )],
             ),
-        ));
-        let dirty = self.settings.dirty(Page::Automations);
-        groups.push(KeyedView::new(
-            "save",
-            self.save_bar(Page::Automations, dirty, context, palette),
         ));
         StackPanel::new()
             .spacing(tokens::spacing::MD)

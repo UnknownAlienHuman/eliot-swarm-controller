@@ -213,6 +213,15 @@ impl DesktopApp {
         let data = &self.monitor.data;
         let indent = depth as f64 * tokens::layout::TREE_INDENT;
         let title = self.agent_title(&row.id);
+        // A top-level card whose parent is not shown names its parent task
+        // by title (never a bare id: an unknown title leaves it out).
+        let parent = row
+            .parent
+            .as_deref()
+            .filter(|_| depth == 0)
+            .map(|parent| (parent, self.agent_title(parent)))
+            .filter(|(id, title)| title != id)
+            .map(|(_, title)| title);
         // A lost or failed card says why it ended, as its conversation does;
         // a harness-contact report is only the consequence of that end. A
         // card raised by its workers names the first one that needs you.
@@ -242,7 +251,7 @@ impl DesktopApp {
                 .content(monitor_view::card(
                     row,
                     &title,
-                    depth > 0,
+                    parent.as_deref(),
                     note.as_ref(),
                     monitor_view::CardActions {
                         open: context
@@ -458,13 +467,13 @@ impl DesktopApp {
                 }
                 if detail.observe_only {
                     agent_lines.push(format!(
-                        "Watched only: {harness} runs it; Swarm cannot steer or stop it."
+                        "{harness} runs this one itself: Swarm shows it but cannot steer or stop it."
                     ));
                 }
                 if detail.active_turn.is_some() {
                     agent_lines.push("Working on a turn".to_owned());
                 }
-                agent_lines.push(format!("ID {id} · generation {}", detail.generation));
+                agent_lines.push(format!("ID {id}"));
             }
             (None, Some(read)) => agent_lines.extend(monitor_view::identity_lines(read)),
             (None, None) => agent_lines.push("Reading…".to_owned()),
@@ -509,7 +518,7 @@ impl DesktopApp {
                         .collect()
                 }
                 None if profile.starts_with("adhoc-") => {
-                    vec!["You chose its harness and model when you started it.".to_owned()]
+                    vec!["You chose its app and model when you started it.".to_owned()]
                 }
                 None => vec![format!("You started it on the preset {profile}.")],
             };
@@ -598,7 +607,7 @@ fn state_label(state: eliot_core::AgentState) -> &'static str {
         eliot_core::AgentState::Stopped => "Stopped",
         eliot_core::AgentState::Failed => "Failed",
         eliot_core::AgentState::Lost => "Lost",
-        eliot_core::AgentState::Unknown => "State not confirmed",
+        eliot_core::AgentState::Unknown => "State couldn't be confirmed",
     }
 }
 

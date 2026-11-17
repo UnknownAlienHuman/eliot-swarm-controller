@@ -53,8 +53,6 @@ pub mod glyph {
     pub const EXTERNAL: &str = "\u{E8A7}";
     pub const OPEN_FOLDER: &str = "\u{E838}";
     pub const KEYBOARD: &str = "\u{E765}";
-    pub const APPEARANCE: &str = "\u{E790}";
-    pub const STARTUP: &str = "\u{E7E8}";
     pub const ROUTING: &str = "\u{E8AB}";
     pub const WORKTREE: &str = "\u{E8F1}";
     pub const CLOUD: &str = "\u{E753}";

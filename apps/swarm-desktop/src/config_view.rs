@@ -4,8 +4,8 @@
 //! Profiles: one document draft (the `profiles` settings section as
 //! `[profiles.*]` TOML) shown both as a few common form fields for the
 //! selected profile and, on request, as the full source text; both edit the
-//! same text. The Settings save bar validates and saves it through the
-//! daemon; an invalid draft stays here. Rules and timers are read-only: no daemon
+//! same text. A form change saves at once through the daemon; typed source
+//! keeps the Settings save bar; an invalid draft stays here. Rules and timers are read-only: no daemon
 //! operation pauses or resumes a rule or timer; assignments stay editable.
 
 use windows_reactor::*;
@@ -44,6 +44,8 @@ pub struct ProfilesData<'a> {
     pub status: &'a str,
     pub busy: bool,
     pub summaries: &'a [ProfileSummary],
+    /// A saved preset's line: its app, model name and effort.
+    pub detail: &'a dyn Fn(&ProfileSummary) -> String,
     /// The TOML source editor is shown.
     pub source_open: bool,
     /// The selected profile's enumerated fields, with its harness's values.
@@ -77,21 +79,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
     for (index, name) in names.iter().enumerate() {
         let selected = data.selected == Some(name.as_str());
         let summary = data.summaries.iter().find(|profile| &profile.name == name);
-        let detail = match summary {
-            Some(profile) => {
-                let mut line = format!(
-                    "{} · {} · {}",
-                    profile.harness,
-                    profile.model.as_deref().unwrap_or("default model"),
-                    profile.effort.as_deref().unwrap_or("default effort")
-                );
-                if !profile.launchable {
-                    line.push_str(" · cannot launch now");
-                }
-                line
-            }
-            None => "not saved yet".to_owned(),
-        };
+        let detail = summary.map_or_else(|| "not saved yet".to_owned(), data.detail);
         let select = actions.select.clone();
         rows.push(KeyedView::new(
             format!("{name}:{selected}"),
@@ -244,8 +232,7 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
             .on_text_changed(actions.draft_changed)
             .into()
     });
-    // The Settings page scrolls, so the save bar follows. Only shown parts
-    // take a place, so no empty child adds a gap.
+    // Only shown parts take a place, so no empty child adds a gap.
     let mut parts = vec![KeyedView::new("profiles", crate::m3::list(palette, rows))];
     if !form.is_empty() {
         parts.push(KeyedView::new("form", crate::m3::group(palette, form)));
@@ -334,7 +321,7 @@ fn quoted(action: &serde_json::Value) -> String {
 
 /// One rule action in words.
 fn action_words(action: &serde_json::Value) -> String {
-    let kind = text_field(action, "action").unwrap_or("unknown action");
+    let kind = text_field(action, "action").unwrap_or("an action without a name");
     let workspace = action
         .get("workspace")
         .map(|value| format!(" in {}", value_words(value)))
@@ -494,7 +481,7 @@ fn trigger_words(entry: &RuleListEntry) -> String {
             )
         }
         Some(on) => format!("on {}", compact(on)),
-        None => "on an unknown trigger".to_owned(),
+        None => "with no trigger set".to_owned(),
     }
 }
 
@@ -523,7 +510,10 @@ fn limit_words(limit: &serde_json::Value) -> String {
                 })
                 .map(|window| format!(" within {window}"))
                 .unwrap_or_default();
-            format!("At most {max} firing(s){per}{window}.")
+            format!(
+                "At most {}{per}{window}.",
+                eliot_core::count_words(max.max(0) as u64, "firing", "firings")
+            )
         }
         _ => format!("Limit {}.", compact(limit)),
     }
@@ -1142,12 +1132,12 @@ mod tests {
         );
         assert_eq!(
             limited.limit.as_deref(),
-            Some("At most 3 firing(s) per Agent within 1h.")
+            Some("At most 3 firings per Agent within 1h.")
         );
         // As `rule.list` returns it: the window normalized to milliseconds.
         assert_eq!(
             limit_words(&json!({"max": 3, "per": "agent", "window_ms": 3_600_000})),
-            "At most 3 firing(s) per Agent within 1 h."
+            "At most 3 firings per Agent within 1 h."
         );
     }
 

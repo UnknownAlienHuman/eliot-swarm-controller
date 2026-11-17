@@ -202,8 +202,10 @@ pub fn reason_words(reason: &str) -> String {
     match reason {
         "terminal_owned_artifact" => "its task finished".to_owned(),
         "native_archive_pending" => "archive the finished Codex session".to_owned(),
-        "no_native_archive" => "this harness has no archive method".to_owned(),
-        "agent_not_quiescent" => "its task is not finished (live or lost)".to_owned(),
+        "no_native_archive" => "its app cannot archive sessions".to_owned(),
+        "agent_not_quiescent" => {
+            "its task is not finished: it is running or was interrupted".to_owned()
+        }
         "merged" => "merged upstream".to_owned(),
         "merged_remote_deleted" => {
             "merged into the default branch; no remote branch left".to_owned()
@@ -221,9 +223,9 @@ pub fn reason_words(reason: &str) -> String {
         "prior_cleanup_attempt" => "an earlier cleanup already tried it".to_owned(),
         "identity_changed" => "it changed since the review".to_owned(),
         "branch_checked_out" => "the branch is checked out".to_owned(),
-        "no_default_branch" => "the upstream default branch is unknown".to_owned(),
+        "no_default_branch" => "the upstream default branch couldn't be found".to_owned(),
         "removed" => "already removed".to_owned(),
-        "unknown" => "an earlier attempt has no confirmed result".to_owned(),
+        "unknown" => "an earlier attempt couldn't be confirmed".to_owned(),
         other => other.replace('_', " "),
     }
 }
@@ -251,7 +253,8 @@ pub fn item_line(item: &CleanupCandidate, title: Option<&str>) -> (String, Strin
         (ArtifactKind::Branch, _) => tail.to_owned(),
         // A native session is named by its task, not its store reference.
         (ArtifactKind::NativeSession, Some(title)) => title.to_owned(),
-        (ArtifactKind::NativeSession, None) => format!("{harness} session of {agent}"),
+        // No title read: the app's session, its Agent on the second line.
+        (ArtifactKind::NativeSession, None) => format!("{harness} session"),
         (_, Some(title)) if chat => title.to_owned(),
         (ArtifactKind::Worktree, _) => match &item.artifact.git {
             Some(git) => format!("{} · branch {}", folder(), git.branch),
@@ -261,6 +264,7 @@ pub fn item_line(item: &CleanupCandidate, title: Option<&str>) -> (String, Strin
     };
     let owner = match (item.artifact.kind, title) {
         (ArtifactKind::NativeSession, Some(_)) => format!("{harness} session · {agent} · "),
+        (ArtifactKind::NativeSession, None) => format!("Agent {agent} · "),
         (_, Some(_)) if chat => format!("{agent} · "),
         _ => String::new(),
     };
@@ -278,13 +282,12 @@ pub fn item_line(item: &CleanupCandidate, title: Option<&str>) -> (String, Strin
         ArtifactKind::NativeSession => String::new(),
         _ => format!(" · {}", crate::nav::display_path(path)),
     };
-    (
-        name,
-        format!(
-            "{owner}{size}{verdict}: {}{place}",
-            reason_words(&item.reason)
-        ),
-    )
+    // The app is known here: name it rather than "its app".
+    let reason = match item.reason.as_str() {
+        "no_native_archive" => format!("{harness} cannot archive its sessions"),
+        other => reason_words(other),
+    };
+    (name, format!("{owner}{size}{verdict}: {reason}{place}"))
 }
 
 /// Whether a group's size means anything (branches and archived native
@@ -317,7 +320,7 @@ pub fn result_lines(
             .count()
     };
     let mut lines = vec![format!(
-        "Removed {} ({}) · kept {} · unknown {}",
+        "Removed {} ({}) · kept {} · couldn't confirm {}",
         count("removed"),
         size_words(reply.bytes_reclaimed),
         count("skipped"),
@@ -329,7 +332,7 @@ pub fn result_lines(
             "removed" => format!("Removed {}", name(&item.artifact_id)),
             "skipped" => format!("Kept {}: {reason}", name(&item.artifact_id)),
             _ => format!(
-                "Unknown {}: {reason}; it is never retried automatically",
+                "Couldn't confirm {}: {reason}; it is never retried automatically",
                 name(&item.artifact_id)
             ),
         });
@@ -454,8 +457,16 @@ mod tests {
         assert!(kept.contains("Keep: its task is not finished"), "{kept}");
         let session = candidate(ArtifactKind::NativeSession, "codex", "safe", None);
         let (name, line) = item_line(&session, None);
-        assert_eq!(name, "Codex session of a1");
-        assert_eq!(line, "Remove: its task finished");
+        assert_eq!(name, "Codex session");
+        assert_eq!(line, "Agent a1 · Remove: its task finished");
+        let mut claude = candidate(ArtifactKind::NativeSession, "claude", "keep", None);
+        claude.reason = "no_native_archive".to_owned();
+        let (name, line) = item_line(&claude, None);
+        assert_eq!(name, "Claude Code session");
+        assert_eq!(
+            line,
+            "Agent a1 · Keep: Claude Code cannot archive its sessions"
+        );
         let (name, line) = item_line(&session, Some("Fix the login bug"));
         assert_eq!(name, "Fix the login bug");
         assert_eq!(line, "Codex session · a1 · Remove: its task finished");
@@ -505,9 +516,16 @@ mod tests {
             bytes_reclaimed: 10,
         };
         let lines = result_lines(&plan, &reply, &|_| None);
-        assert_eq!(lines[0], "Removed 1 (10 B) · kept 1 · unknown 1");
+        assert_eq!(lines[0], "Removed 1 (10 B) · kept 1 · couldn't confirm 1");
         assert_eq!(lines[1], "Removed temp");
-        assert!(lines[2].starts_with("Unknown target"), "{}", lines[2]);
-        assert_eq!(lines[3], "Kept wt: its task is not finished (live or lost)");
+        assert!(
+            lines[2].starts_with("Couldn't confirm target"),
+            "{}",
+            lines[2]
+        );
+        assert_eq!(
+            lines[3],
+            "Kept wt: its task is not finished: it is running or was interrupted"
+        );
     }
 }

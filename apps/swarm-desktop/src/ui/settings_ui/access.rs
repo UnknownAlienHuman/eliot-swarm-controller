@@ -2,28 +2,22 @@ use super::*;
 
 impl DesktopApp {
     /// Default access: the level a new task starts with (the composer's
-    /// access chip and `[desktop] last_access`), saved with this page.
+    /// access chip and `[desktop] last_access`), saved when chosen.
     pub(super) fn access_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let shown = self
-            .settings
-            .access_draft
-            .or_else(|| self.settings.saved_access())
-            .unwrap_or(Access::Ask);
+        let shown = self.prefs.last_access.unwrap_or(Access::Ask);
         let index = Access::ALL.iter().position(|access| *access == shown);
         let labels: Vec<String> = Access::ALL
             .iter()
             .map(|access| access.label().to_owned())
             .collect();
-        let busy = self.settings.busy();
         let picker = Grid::new().keyed_children(vec![KeyedView::new(
             format!("access:{}", shown.wire()),
             m3::enum_width(ComboBox::new())
                 .items_source(labels)
                 .selected_index(index)
-                .is_enabled(!busy)
                 .automation_name("Default access for new tasks")
                 .on_selection_changed(
-                    context.callback(|index| Message::Settings(SettingsMsg::AccessDraft(index))),
+                    context.callback(|index| Message::Settings(SettingsMsg::AccessChosen(index))),
                 ),
         )]);
         let levels: Vec<KeyedView> = Access::ALL
@@ -55,7 +49,6 @@ impl DesktopApp {
                 )
             })
             .collect();
-        let dirty = self.settings.dirty(Page::Access);
         StackPanel::new().spacing(tokens::spacing::MD).children((
             m3::settings_card(
                 palette,
@@ -76,7 +69,6 @@ impl DesktopApp {
                 )
                 .text_wrapping(TextWrapping::Wrap),
             )),
-            self.save_bar(Page::Access, dirty, context, palette),
         ))
     }
 }

@@ -295,7 +295,7 @@ pub fn restart_loss(reply: &DiagnoseResponse) -> bool {
     })
 }
 
-pub const RESTART_LOSS_WORDS: &str = "Stopped by a Swarm restart";
+pub const RESTART_LOSS_WORDS: &str = "Interrupted by a Swarm restart";
 
 /// A turn outcome in words ("completed", "interrupted", "failed",
 /// "ended without a confirmed result").
@@ -310,7 +310,7 @@ pub fn outcome_words(outcome: &str) -> String {
 /// An Agent state in words, for people.
 pub fn state_words(state: AgentState) -> &'static str {
     match state {
-        AgentState::Unknown => "State not confirmed",
+        AgentState::Unknown => "State couldn't be confirmed",
         AgentState::Created | AgentState::Starting => "Starting",
         AgentState::Idle => "Ready",
         AgentState::Busy => "Working",
@@ -399,14 +399,20 @@ pub struct MonitorRow {
     pub updated_at: i64,
 }
 
-/// Fleet token label for one monitor row: the count with its `(t)`/`(s)`
-/// provenance suffix, or an em dash when the summary carries no usage.
-/// The suffix is what stops a session fallback from passing as turn usage.
+/// Fleet token label for one monitor row: the grouped count and, in
+/// words, what it covers ("1,234 tokens · last turn", "47,272 tokens ·
+/// whole session"), or an em dash when the summary carries no usage. The
+/// words are what stop a session fallback from passing as turn usage.
 pub fn tokens_label(row: &MonitorRow) -> String {
     match (row.tokens, row.tokens_scope.as_deref()) {
         (Some(tokens), Some(scope)) => format!(
-            "{tokens} tokens ({})",
-            if scope == "session" { "s" } else { "t" }
+            "{} tokens · {}",
+            crate::monitor_view::group(tokens),
+            if scope == "session" {
+                "whole session"
+            } else {
+                "last turn"
+            }
         ),
         _ => "—".to_owned(),
     }
@@ -965,7 +971,8 @@ impl Monitor {
     }
 
     /// The card's words about why a resumable row ended, from its loss
-    /// origin as the conversation words it ("Stopped by a Swarm restart").
+    /// origin as the conversation words it ("Interrupted by a Swarm
+    /// restart").
     /// `None` until read, and for rows that did not end that way.
     pub fn loss_words(&self, row: &MonitorRow) -> Option<String> {
         if !row.resumable() {
@@ -1698,7 +1705,7 @@ mod tests {
         let row = make_row(Some(turn), Some("turn"));
         assert_eq!(row.tokens, Some(15));
         assert_eq!(row.tokens_scope.as_deref(), Some("turn"));
-        assert_eq!(tokens_label(&row), "15 tokens (t)");
+        assert_eq!(tokens_label(&row), "15 tokens · last turn");
         // A Muse-style session fallback (no native total) still reads its
         // count, and the row carries the session marker with it.
         let session = TurnUsage {
@@ -1715,7 +1722,7 @@ mod tests {
         let row = make_row(Some(session), Some("session"));
         assert_eq!(row.tokens, Some(47_272));
         assert_eq!(row.tokens_scope.as_deref(), Some("session"));
-        assert_eq!(tokens_label(&row), "47272 tokens (s)");
+        assert_eq!(tokens_label(&row), "47,272 tokens · whole session");
         let row = make_row(None, None);
         assert_eq!(row.tokens, None);
         assert_eq!(row.tokens_scope, None);

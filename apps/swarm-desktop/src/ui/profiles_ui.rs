@@ -1,6 +1,8 @@
 //! Profile editing: one draft for form and source over the `profiles`
-//! settings section. Settings' save bar validates and saves it
-//! (`settings.save`, revision-checked); see [`super::settings_ui`].
+//! settings section. A form change (a dropdown, the Model picker,
+//! Duplicate) saves at once through Settings' revision-checked writer;
+//! typed TOML keeps Settings' save bar (`settings.save`); see
+//! [`super::settings_ui`].
 
 use super::*;
 use crate::theme::winui::Palette;
@@ -35,6 +37,14 @@ pub(super) struct ProfilesEditor {
     pub(super) loaded: bool,
     /// The TOML source editor is shown.
     pub(super) source_open: bool,
+    /// The draft holds typed TOML not saved yet: form changes then wait
+    /// for the save bar instead of saving it unseen.
+    pub(super) raw_dirty: bool,
+    /// The draft the running save sent.
+    pub(super) sending: Option<String>,
+    /// The draft the last save wrote, until a read shows it (the read's
+    /// TOML is formatted anew, so a draft equal to it follows the read).
+    pub(super) sent: Option<String>,
 }
 
 impl DesktopApp {
@@ -42,7 +52,11 @@ impl DesktopApp {
         match msg {
             ProfilesMsg::ProfilesDraftChanged(text) => {
                 if self.editor.editable {
-                    self.editor.draft = profiles::normalize_newlines(&text);
+                    let draft = profiles::normalize_newlines(&text);
+                    if draft != self.editor.draft {
+                        self.editor.raw_dirty = draft != self.editor.base;
+                        self.editor.draft = draft;
+                    }
                     self.editor.view = text;
                 }
             }
@@ -77,6 +91,7 @@ impl DesktopApp {
                     Ok(draft) => {
                         self.editor.view = draft.clone();
                         self.editor.draft = draft;
+                        self.autosave_profiles(context);
                     }
                     Err(error) => self.editor.status = error,
                 }
@@ -91,9 +106,8 @@ impl DesktopApp {
                             self.editor.draft = draft;
                             self.editor.selected = Some(to.clone());
                             self.editor.duplicate_name.clear();
-                            self.editor.status = format!(
-                                "Duplicated {from} as {to} in the draft; Validate, then Save."
-                            );
+                            self.editor.status = format!("Duplicated {from} as {to}.");
+                            self.autosave_profiles(context);
                         }
                         Err(error) => self.editor.status = error,
                     }
@@ -105,6 +119,56 @@ impl DesktopApp {
                 self.reprime_fields(context);
             }
         }
+    }
+
+    /// Save a form change of the presets at once, unless typed TOML is
+    /// waiting for the save bar.
+    pub(super) fn autosave_profiles(&mut self, context: &ComponentContext<Self>) {
+        if !self.editor.raw_dirty {
+            self.autosave(settings_ui::Page::Models, context);
+        }
+    }
+
+    /// A model's name as the catalogue gives it ("GPT-6.1 Sol"), else its
+    /// id (a model the catalogue does not list, such as Claude's aliases).
+    pub(super) fn model_name(&self, harness: &str, model: &str) -> String {
+        match self.launch.catalog.as_ref() {
+            Some(Ok(reply)) => reply
+                .models
+                .iter()
+                .find(|entry| entry.harness == harness && entry.id == model)
+                .map(|entry| {
+                    if harness == "opencode" {
+                        crate::picker::short_model(&entry.display_name).to_owned()
+                    } else {
+                        entry.display_name.clone()
+                    }
+                })
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| model.to_owned()),
+            _ => model.to_owned(),
+        }
+    }
+
+    /// A preset's line in the presets list: its app, model name and
+    /// effort ("Codex · GPT-6.1 Sol · xhigh"), and whether it can launch.
+    pub(super) fn preset_detail(&self, profile: &eliot_core::api::ProfileSummary) -> String {
+        let mut line = format!(
+            "{} · {} · {}",
+            crate::picker::harness_label(&profile.harness),
+            profile.model.as_deref().map_or_else(
+                || "Default model".to_owned(),
+                |model| self.model_name(&profile.harness, model)
+            ),
+            profile.effort.as_deref().map_or_else(
+                || "default effort".to_owned(),
+                |effort| format!("{effort} effort")
+            )
+        );
+        if !profile.launchable {
+            line.push_str(" · cannot launch now");
+        }
+        line
     }
 
     /// The harness a preset in the draft names.
@@ -159,9 +223,12 @@ impl DesktopApp {
                 ));
             }
         };
-        let label = model
-            .clone()
-            .unwrap_or_else(|| format!("{} default", crate::picker::harness_label(&harness)));
+        // The model's name, not its id; "Default" leaves the choice to the
+        // app.
+        let label = model.as_deref().map_or_else(
+            || "Default".to_owned(),
+            |model| self.model_name(&harness, model),
+        );
         let open = self.launch.open == Some(launch_ui::Pop::Model)
             && self
                 .launch
@@ -182,6 +249,22 @@ impl DesktopApp {
                 harness,
             ))))
             .content(m3::field_button_content(&label));
+        // Anchored to the field: just under it, at its left edge (the form
+        // row's label column and gap). Where the field's column is
+        // narrower than the list, the list ends at the card's right edge
+        // instead, so it is never cut off. The layer behind it closes it.
+        let field_left = tokens::layout::LABEL_WIDTH + tokens::spacing::SM;
+        let left = match self.settings_column_width() {
+            Some(column) => {
+                let inner = column - 2.0 * tokens::spacing::MD;
+                if inner - field_left < tokens::layout::PICKER_WIDTH {
+                    (inner - tokens::layout::PICKER_WIDTH).max(0.0)
+                } else {
+                    field_left
+                }
+            }
+            None => field_left,
+        };
         let popover = open.then(|| {
             Grid::new().children((
                 Border::new()
@@ -192,12 +275,7 @@ impl DesktopApp {
                 Border::new()
                     .horizontal_alignment(HorizontalAlignment::Left)
                     .vertical_alignment(VerticalAlignment::Top)
-                    .margin(Thickness::new(
-                        tokens::layout::LABEL_WIDTH + tokens::spacing::SM,
-                        tokens::height::FORM_ROW,
-                        0.0,
-                        0.0,
-                    ))
+                    .margin(Thickness::new(left, tokens::height::FORM_ROW, 0.0, 0.0))
                     .content(self.model_popover(context, palette)),
             ))
         });
@@ -232,6 +310,7 @@ impl DesktopApp {
             status: &self.editor.status,
             busy: self.settings.reading,
             summaries: &self.launch.profile_summaries,
+            detail: &|profile| self.preset_detail(profile),
             source_open: self.editor.source_open,
             fields,
             model,

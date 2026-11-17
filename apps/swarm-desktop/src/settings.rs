@@ -84,7 +84,7 @@ impl Access {
     pub fn description(self) -> &'static str {
         match self {
             Self::Ask => "Every command and file change waits for your approval",
-            Self::Auto => "Works inside the project; asks only where the harness must",
+            Self::Auto => "Works inside the project; asks only where the agent app must",
             Self::Full => "Unrestricted access to your files and the network, no approvals",
         }
     }

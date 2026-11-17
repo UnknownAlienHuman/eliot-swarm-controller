@@ -677,9 +677,10 @@ impl DesktopApp {
         }
         if let Some((name, _)) = self.launch.preset.clone() {
             // A preset's Model field: the model (and an effort chosen on the
-            // row) go into the preset's draft; Save writes config.toml.
+            // row) go into the preset's draft, saved at once.
             if let Choice::Model(pick) = choice {
                 self.set_preset_model(&name, pick.model.as_deref(), pick.effort.as_deref());
+                self.autosave_profiles(context);
             }
             self.close_popover();
             return;

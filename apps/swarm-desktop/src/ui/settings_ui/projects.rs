@@ -6,7 +6,6 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let busy = self.settings.busy();
         let drafts = &self.settings.projects;
         let profiles = self.known_profiles();
         let mut rows: Vec<KeyedView> = Vec::new();
@@ -48,7 +47,6 @@ impl DesktopApp {
                         format!("{profile}:{on}"),
                         CheckBox::new()
                             .is_checked(on)
-                            .is_enabled(!busy)
                             .automation_name(format!("Allow {profile} for rules of {name}"))
                             .on_is_checked_changed(context.callback(move |on: bool| {
                                 Message::Settings(SettingsMsg::ProjectProfile(
@@ -71,7 +69,6 @@ impl DesktopApp {
                         m3::field()
                             .text(nav::display_path(&path).to_owned())
                             .automation_name(format!("Checkout folder of {name}"))
-                            .is_enabled(!busy)
                             .on_text_changed(context.callback(move |text| {
                                 Message::Settings(SettingsMsg::ProjectPath(path_id.clone(), text))
                             }))
@@ -92,7 +89,6 @@ impl DesktopApp {
                             .text(model::project_actions(drafts, &id))
                             .placeholder_text("For example send, stop, git.fetch")
                             .automation_name(format!("Rule actions of {name}"))
-                            .is_enabled(!busy)
                             .on_text_changed(context.callback(move |text| {
                                 Message::Settings(SettingsMsg::ProjectActions(
                                     actions_id.clone(),
@@ -109,7 +105,6 @@ impl DesktopApp {
                             0.0,
                             0.0,
                         ))
-                        .is_enabled(!busy)
                         .automation_name(format!("Remove project {name}"))
                         .on_click(
                             context.message(Message::Settings(SettingsMsg::ProjectRemoved(
@@ -162,9 +157,7 @@ impl DesktopApp {
                             .into(),
                         Some(
                             m3::outlined(palette)
-                                .is_enabled(
-                                    !busy && !self.settings.new_project_id.trim().is_empty(),
-                                )
+                                .is_enabled(!self.settings.new_project_id.trim().is_empty())
                                 .automation_name("Add project")
                                 .on_click(
                                     context.message(Message::Settings(SettingsMsg::ProjectAdded)),
@@ -175,13 +168,11 @@ impl DesktopApp {
                 ),
             ],
         );
-        let dirty = self.settings.dirty(Page::Projects);
         StackPanel::new().spacing(tokens::spacing::MD).children((
             m3::list(palette, rows),
             StackPanel::new()
                 .spacing(tokens::spacing::SM)
                 .children((m3::section_heading("Add a project", "", None), add)),
-            self.save_bar(Page::Projects, dirty, context, palette),
         ))
     }
 }

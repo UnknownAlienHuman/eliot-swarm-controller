@@ -179,8 +179,8 @@ impl DesktopApp {
                 .filter_map(|item| item.bytes)
                 .sum();
             let what = format!(
-                "{} item(s), {}",
-                selected.len(),
+                "{}, {}",
+                eliot_core::count_words(selected.len() as u64, "item", "items"),
                 crate::worktrees::size_words(bytes)
             );
             if state.cleanup_confirm {
@@ -310,7 +310,9 @@ impl DesktopApp {
                 "{} of {total} shown (the read stopped at its page bound)",
                 rows.len()
             ),
-            Some(Ok(_)) => format!("{total} managed worktree(s)"),
+            Some(Ok(_)) => {
+                eliot_core::count_words(total as u64, "managed worktree", "managed worktrees")
+            }
         };
         if matches!(self.settings.worktrees, Some(Ok(_))) && managed.is_empty() {
             groups.push(KeyedView::new(
@@ -355,7 +357,7 @@ impl DesktopApp {
                 StackPanel::new().spacing(tokens::spacing::SM).children((
                     m3::section_heading(
                         &project,
-                        &format!("{} worktree(s)", worktrees.len()),
+                        &eliot_core::count_words(worktrees.len() as u64, "worktree", "worktrees"),
                         None,
                     ),
                     m3::settings_card(palette, rows),
