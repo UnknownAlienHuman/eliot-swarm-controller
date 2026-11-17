@@ -1077,12 +1077,14 @@ impl Store {
     /// `owners.len() < total`, so no omission can read back as completeness.
     /// A held workspace operation lock alone writes no process record and
     /// never appears here; only observed live children do.
+    /// Pin the live-only index: without statistics SQLite can prefer the
+    /// full owner/state index and visit every retained exited incarnation.
     pub fn live_process_owners(&self, limit: usize) -> Result<(Vec<LiveProcessOwner>, usize)> {
         validate_limit(limit)?;
         let total: i64 = self
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM (SELECT DISTINCT owner FROM processes WHERE state IN ('running','unknown'))",
+                "SELECT COUNT(*) FROM (SELECT DISTINCT owner FROM processes INDEXED BY processes_live_owner WHERE state IN ('running','unknown'))",
                 [],
                 |row| row.get(0),
             )
@@ -1090,7 +1092,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT DISTINCT owner FROM processes WHERE state IN ('running','unknown')
+                "SELECT DISTINCT owner FROM processes INDEXED BY processes_live_owner WHERE state IN ('running','unknown')
                  ORDER BY owner LIMIT ?1",
             )
             .map_err(sql_error)?;

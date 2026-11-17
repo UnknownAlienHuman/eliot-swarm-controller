@@ -7631,7 +7631,9 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP INDEX events_heavy_agent_generation;
+            "DROP INDEX processes_live_owner;
+             DELETE FROM schema_migrations WHERE version=50;
+             DROP INDEX events_heavy_agent_generation;
              DELETE FROM schema_migrations WHERE version=49;
              DROP INDEX agents_list_archived;
                  ALTER TABLE agents DROP COLUMN archived;
