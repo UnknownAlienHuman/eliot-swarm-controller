@@ -1,0 +1,549 @@
+//! Bounded attention sweeps, check queues, and incident reservations.
+
+use super::{
+    ActiveIncident, AgentKey, AttentionState, FrozenReport, IncidentKey, Router, Trigger,
+    delivery::persist_and_notify, incidents::retire_superseded_incidents, inspect_agent,
+};
+use eliot_core::Result;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::task::JoinSet;
+
+const PAGE_SIZE: usize = 128;
+const MAX_CHECKS_IN_FLIGHT: usize = 32;
+const MAX_SWEEP_CHECKS: usize = 8;
+const MAX_RETAINED_INCIDENTS: usize = 512;
+const MAX_PENDING_CHECKS: usize = 512;
+const MAX_STARTUP_LOSSES: usize = 32;
+
+pub(super) fn launch_sweep(
+    router: &Router,
+    state: Arc<Mutex<AttentionState>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    suspicion_window: Duration,
+    tasks: &mut JoinSet<()>,
+) {
+    use std::sync::atomic::Ordering;
+
+    if tasks.len() >= MAX_CHECKS_IN_FLIGHT {
+        request_full_reconcile(&state);
+        return;
+    }
+    if running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let router = router.clone();
+    tasks.spawn(async move {
+        let _reset = SweepReset(running);
+        if let Err(error) =
+            scan_attention_agents(&router, Arc::clone(&state), suspicion_window).await
+        {
+            crate::logging::record(
+                &eliot_core::SecretPolicy::default(),
+                "daemon.attention_scan_failed",
+                &[],
+                Some(&error),
+            );
+        }
+        if let Err(error) = reconcile_attention_state(&router, state, suspicion_window).await {
+            crate::logging::record(
+                &eliot_core::SecretPolicy::default(),
+                "daemon.attention_reconcile_failed",
+                &[],
+                Some(&error),
+            );
+        }
+    });
+}
+
+struct SweepReset(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SweepReset {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub(super) fn launch_check(
+    router: &Router,
+    state: Arc<Mutex<AttentionState>>,
+    tasks: &mut JoinSet<()>,
+    agent: &str,
+    generation: i64,
+    suspicion_window: Duration,
+    trigger: Trigger,
+) {
+    let key = AgentKey {
+        agent: agent.to_owned(),
+        generation,
+    };
+    if tasks.len() >= MAX_CHECKS_IN_FLIGHT || !reserve_check(&state, &key) {
+        queue_check(&state, key, trigger);
+        return;
+    }
+    let router = router.clone();
+    tasks.spawn(run_check(router, state, key, suspicion_window, trigger));
+}
+
+fn reserve_check(state: &Arc<Mutex<AttentionState>>, key: &AgentKey) -> bool {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    if state.in_flight.len() >= MAX_CHECKS_IN_FLIGHT || !state.in_flight.insert(key.clone()) {
+        return false;
+    }
+    true
+}
+
+fn queue_check(state: &Arc<Mutex<AttentionState>>, key: AgentKey, trigger: Trigger) {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(pending) = state.pending_checks.get_mut(&key) {
+        *pending = merge_trigger(*pending, trigger);
+    } else if state.pending_checks.len() < MAX_PENDING_CHECKS {
+        state.pending_checks.insert(key, trigger);
+    } else {
+        state.reconcile_all = true;
+    }
+}
+
+fn merge_trigger(current: Trigger, incoming: Trigger) -> Trigger {
+    match (current, incoming) {
+        (_, lost @ Trigger::AgentLost { .. }) => lost,
+        (lost @ Trigger::AgentLost { .. }, _) => lost,
+        (Trigger::SourceEvent { event_seq: current }, Trigger::SourceEvent { event_seq }) => {
+            Trigger::SourceEvent {
+                event_seq: current.max(event_seq),
+            }
+        }
+        (Trigger::SourceEvent { .. }, Trigger::Sweep) => current,
+        (Trigger::Sweep, trigger) => trigger,
+    }
+}
+
+pub(super) fn request_full_reconcile(state: &Arc<Mutex<AttentionState>>) {
+    state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .reconcile_all = true;
+}
+
+/// Drain retained startup losses as `AgentLost` triggers in bounded,
+/// resumable pages. Each entry flows through `inspect_lost_agent` (or the
+/// child cohort path when the lost manager still has unfinished children),
+/// so reporting stays deduplicated per incident by the reservation map and no
+/// second incident engine is introduced. Rows whose exact `agent.lost`
+/// evidence was pruned carry no sequence and are skipped here, never
+/// synthesized. A lost Agent whose evidence went stale before commit is
+/// classified and dropped there, never mailed.
+pub(super) async fn queue_startup_losses(router: &Router, state: &Arc<Mutex<AttentionState>>) {
+    let mut after: Option<(i64, i64)> = None;
+    loop {
+        let page = {
+            let store = router.inner.store.lock().await;
+            store.startup_lost_agents(MAX_STARTUP_LOSSES, after)
+        };
+        let page = match page {
+            Ok(page) => page,
+            Err(error) => {
+                crate::logging::record(
+                    &eliot_core::SecretPolicy::default(),
+                    "daemon.attention_startup_losses_failed",
+                    &[],
+                    Some(&error),
+                );
+                return;
+            }
+        };
+        if page.is_empty() {
+            return;
+        }
+        after = page.last().map(|loss| (loss.updated_at, loss.agent_num));
+        for loss in &page {
+            let Some(event_seq) = loss.event_seq else {
+                continue;
+            };
+            queue_check(
+                state,
+                AgentKey {
+                    agent: loss.agent.clone(),
+                    generation: loss.generation,
+                },
+                Trigger::AgentLost { event_seq },
+            );
+        }
+        if page.len() < MAX_STARTUP_LOSSES {
+            return;
+        }
+    }
+}
+
+fn reserve_pending_checks(
+    state: &Arc<Mutex<AttentionState>>,
+    limit: usize,
+) -> Vec<(AgentKey, Trigger)> {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    let available = MAX_CHECKS_IN_FLIGHT.saturating_sub(state.in_flight.len());
+    let keys = state
+        .pending_checks
+        .keys()
+        .filter(|key| !state.in_flight.contains(*key))
+        .take(limit.min(available))
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.into_iter()
+        .filter_map(|key| {
+            let trigger = state.pending_checks.remove(&key)?;
+            state.in_flight.insert(key.clone());
+            Some((key, trigger))
+        })
+        .collect()
+}
+
+fn active_reconcile_batch(state: &Arc<Mutex<AttentionState>>, limit: usize) -> Vec<AgentKey> {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    let mut keys = state
+        .active
+        .keys()
+        .map(|key| AgentKey {
+            agent: key.agent.clone(),
+            generation: key.generation,
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    keys.sort_by(|left, right| {
+        left.agent
+            .cmp(&right.agent)
+            .then_with(|| left.generation.cmp(&right.generation))
+    });
+    if keys.is_empty() {
+        state.active_reconcile_cursor = 0;
+        return keys;
+    }
+    let count = limit.min(keys.len());
+    let start = state.active_reconcile_cursor % keys.len();
+    let batch = (0..count)
+        .map(|offset| keys[(start + offset) % keys.len()].clone())
+        .collect();
+    state.active_reconcile_cursor = (start + count) % keys.len();
+    batch
+}
+
+async fn run_check(
+    router: Router,
+    state: Arc<Mutex<AttentionState>>,
+    key: AgentKey,
+    suspicion_window: Duration,
+    trigger: Trigger,
+) {
+    let _guard = CheckGuard {
+        state: Arc::clone(&state),
+        key: key.clone(),
+    };
+    if let Err(error) = inspect_agent(
+        &router,
+        state,
+        &key.agent,
+        key.generation,
+        suspicion_window,
+        trigger,
+    )
+    .await
+    {
+        crate::logging::record(
+            &eliot_core::SecretPolicy::default(),
+            "daemon.attention_check_failed",
+            &[],
+            Some(&error),
+        );
+    }
+}
+
+struct CheckGuard {
+    state: Arc<Mutex<AttentionState>>,
+    key: AgentKey,
+}
+
+impl Drop for CheckGuard {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .in_flight
+            .remove(&self.key);
+    }
+}
+
+pub(super) struct IncidentReservation {
+    state: Arc<Mutex<AttentionState>>,
+    committed: bool,
+}
+
+impl IncidentReservation {
+    pub(super) fn commit(&mut self, key: IncidentKey, incident: ActiveIncident) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.reserved_incidents = state.reserved_incidents.saturating_sub(1);
+        state.active.insert(key, incident);
+        self.committed = true;
+    }
+}
+
+impl Drop for IncidentReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.reserved_incidents = state.reserved_incidents.saturating_sub(1);
+        }
+    }
+}
+
+async fn scan_attention_agents(
+    router: &Router,
+    state: Arc<Mutex<AttentionState>>,
+    suspicion_window: Duration,
+) -> Result<()> {
+    let mut after: Option<String> = None;
+    let mut checks = JoinSet::new();
+    loop {
+        let page = {
+            let store = router.inner.store.lock().await;
+            store.list_attention_agents(after.as_deref(), PAGE_SIZE)?
+        };
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|agent| agent.id.clone());
+        for agent in page {
+            while checks.len() >= MAX_SWEEP_CHECKS {
+                let _ = checks.join_next().await;
+            }
+            let key = AgentKey {
+                agent: agent.id.clone(),
+                generation: agent.generation,
+            };
+            if !reserve_check(&state, &key) {
+                queue_check(&state, key, Trigger::Sweep);
+                continue;
+            }
+            let router = router.clone();
+            checks.spawn(run_check(
+                router,
+                Arc::clone(&state),
+                key,
+                suspicion_window,
+                Trigger::Sweep,
+            ));
+        }
+        if after.is_none() || checks.len() >= MAX_SWEEP_CHECKS {
+            tokio::task::yield_now().await;
+        }
+    }
+    while checks.join_next().await.is_some() {}
+    Ok(())
+}
+
+async fn reconcile_attention_state(
+    router: &Router,
+    state: Arc<Mutex<AttentionState>>,
+    suspicion_window: Duration,
+) -> Result<()> {
+    retire_superseded_incidents(router, &state).await?;
+    retry_pending_deliveries(router, Arc::clone(&state)).await;
+    let reconcile_all = {
+        let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+        std::mem::take(&mut state.reconcile_all)
+    };
+    if reconcile_all {
+        scan_all_agents(router, Arc::clone(&state), suspicion_window).await?;
+    }
+
+    let pending = reserve_pending_checks(&state, MAX_SWEEP_CHECKS);
+    let active = active_reconcile_batch(&state, MAX_SWEEP_CHECKS);
+    if pending.is_empty() && active.is_empty() {
+        return Ok(());
+    }
+    let mut checks = JoinSet::new();
+    for (key, trigger) in pending {
+        checks.spawn(run_check(
+            router.clone(),
+            Arc::clone(&state),
+            key,
+            suspicion_window,
+            trigger,
+        ));
+    }
+    for key in active {
+        if reserve_check(&state, &key) {
+            checks.spawn(run_check(
+                router.clone(),
+                Arc::clone(&state),
+                key,
+                suspicion_window,
+                Trigger::Sweep,
+            ));
+        } else {
+            queue_check(&state, key, Trigger::Sweep);
+        }
+    }
+    while checks.join_next().await.is_some() {}
+    Ok(())
+}
+
+fn reserve_pending_deliveries(
+    state: &Arc<Mutex<AttentionState>>,
+    limit: usize,
+) -> Vec<(IncidentKey, String, FrozenReport, bool)> {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    let available = MAX_CHECKS_IN_FLIGHT.saturating_sub(state.in_flight.len());
+    let mut selected_agents = HashSet::new();
+    let selected = state
+        .active
+        .iter()
+        .filter_map(|(key, incident)| {
+            let agent_key = AgentKey {
+                agent: key.agent.clone(),
+                generation: key.generation,
+            };
+            if state.in_flight.contains(&agent_key) || selected_agents.contains(&agent_key) {
+                return None;
+            }
+            let (delivery, recovery) = incident
+                .incident_delivery
+                .as_ref()
+                .map(|delivery| (delivery, false))
+                .or(incident
+                    .recovery_delivery
+                    .as_ref()
+                    .map(|delivery| (delivery, true)))?;
+            selected_agents.insert(agent_key.clone());
+            Some((
+                key.clone(),
+                incident.incident_id.clone(),
+                delivery.clone(),
+                recovery,
+                agent_key,
+            ))
+        })
+        .take(limit.min(available))
+        .collect::<Vec<_>>();
+    selected
+        .into_iter()
+        .map(|(key, incident_id, delivery, recovery, agent_key)| {
+            state.in_flight.insert(agent_key);
+            (key, incident_id, delivery, recovery)
+        })
+        .collect()
+}
+
+async fn retry_pending_deliveries(router: &Router, state: Arc<Mutex<AttentionState>>) {
+    let pending = reserve_pending_deliveries(&state, MAX_SWEEP_CHECKS);
+    if pending.is_empty() {
+        return;
+    }
+    let mut tasks = JoinSet::new();
+    for (key, incident_id, delivery, recovery) in pending {
+        let router = router.clone();
+        let state = Arc::clone(&state);
+        tasks.spawn(async move {
+            let _guard = CheckGuard {
+                state: Arc::clone(&state),
+                key: AgentKey {
+                    agent: key.agent.clone(),
+                    generation: key.generation,
+                },
+            };
+            if let Err(error) = persist_and_notify(&router, &delivery).await {
+                crate::logging::record(
+                    &eliot_core::SecretPolicy::default(),
+                    "daemon.attention_delivery_retry_failed",
+                    &[],
+                    Some(&error),
+                );
+                return;
+            }
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if !state
+                .active
+                .get(&key)
+                .is_some_and(|incident| incident.incident_id == incident_id)
+            {
+                return;
+            }
+            if recovery {
+                state.active.remove(&key);
+            } else if let Some(incident) = state.active.get_mut(&key)
+                && incident
+                    .incident_delivery
+                    .as_ref()
+                    .is_some_and(|current| current.emit_command_id == delivery.emit_command_id)
+            {
+                incident.incident_delivery = None;
+            }
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn scan_all_agents(
+    router: &Router,
+    state: Arc<Mutex<AttentionState>>,
+    suspicion_window: Duration,
+) -> Result<()> {
+    let mut after: Option<String> = None;
+    let mut checks = JoinSet::new();
+    loop {
+        let page = {
+            let store = router.inner.store.lock().await;
+            store.list_agents(after.as_deref(), PAGE_SIZE)?
+        };
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|agent| agent.id.clone());
+        for agent in page {
+            while checks.len() >= MAX_SWEEP_CHECKS {
+                let _ = checks.join_next().await;
+            }
+            let key = AgentKey {
+                agent: agent.id,
+                generation: agent.generation,
+            };
+            if reserve_check(&state, &key) {
+                checks.spawn(run_check(
+                    router.clone(),
+                    Arc::clone(&state),
+                    key,
+                    suspicion_window,
+                    Trigger::Sweep,
+                ));
+            } else {
+                queue_check(&state, key, Trigger::Sweep);
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    while checks.join_next().await.is_some() {}
+    Ok(())
+}
+
+pub(super) fn reserve_incident(
+    state: &Arc<Mutex<AttentionState>>,
+    key: &IncidentKey,
+) -> Option<IncidentReservation> {
+    let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+    if guard.active.contains_key(key)
+        || guard.active.len() + guard.reserved_incidents >= MAX_RETAINED_INCIDENTS
+    {
+        return None;
+    }
+    guard.reserved_incidents += 1;
+    drop(guard);
+    Some(IncidentReservation {
+        state: Arc::clone(state),
+        committed: false,
+    })
+}
