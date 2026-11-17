@@ -5,7 +5,12 @@
 //! with Enter or a click; and whether the last key was Enter without Shift,
 //! which turns the line break it typed into the composer into Send
 //! (Reactor 0.100.0 has no key events on `TextBox`; Shift+Enter keeps the
-//! line break).
+//! line break); and a press on the composer's message field while a
+//! popover is open, which closes it (WinUI's `TextBox` handles its own
+//! pointer presses and Reactor 0.100.0 has no focus events, so only the
+//! field's `PointerEntered`/`PointerExited` reach the window: they tell
+//! this hook where the pointer is, and the press itself goes on to the
+//! field).
 //!
 //! Reactor 0.100.0 has no key events, and its `KeyAccelerator` keys are R,
 //! Enter and the number pad only; WinUI's own `KeyboardAccelerator` needs
@@ -29,7 +34,7 @@ use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_F, VK_K, VK_LEFT, VK_M, VK_N, VK_OEM_COMMA,
-    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, HC_ACTION, MSG, PM_REMOVE, SetWindowsHookExW, WH_GETMESSAGE, WH_KEYBOARD,
@@ -47,6 +52,8 @@ pub enum PopoverKey {
     Escape,
     /// Ctrl+F: mark the highlighted model a favorite.
     Favorite,
+    /// Tab or Shift+Tab: keyboard focus leaves the popover for the composer.
+    Tab,
 }
 
 /// What the window acts on.
@@ -65,6 +72,9 @@ pub enum Shortcut {
     /// Enter outside a popover, passed on to the focused control; carries
     /// the input epoch at the press (see [`last_input`]).
     Enter(u64),
+    /// A pointer press on the composer's message field while a popover is
+    /// open; the press itself goes on to the field.
+    ComposerPressed,
 }
 
 /// Which popover is open: none, the model picker (all popover keys), or a
@@ -91,6 +101,10 @@ pub enum Input {
 
 static CHORDS: OnceLock<Mutex<Sender<Shortcut>>> = OnceLock::new();
 static POPOVER: AtomicU8 = AtomicU8::new(Popover::None as u8);
+/// The pointer is over the composer's message field (its `PointerEntered`
+/// since the last `PointerExited`). Cleared whenever a popover opens or
+/// closes, so a field rebuilt under a still pointer never reads as hovered.
+static COMPOSER_OVER: AtomicU8 = AtomicU8::new(0);
 static LAST_INPUT: AtomicU8 = AtomicU8::new(0);
 static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
 /// Counts inputs that end a keyboard walk through suggestions: any key
@@ -115,6 +129,19 @@ pub fn take_plain_enter() -> bool {
 /// Tell the hook which popover is open (its keys are taken while it is).
 pub fn set_popover(popover: Popover) {
     POPOVER.store(popover as u8, Ordering::SeqCst);
+    COMPOSER_OVER.store(0, Ordering::SeqCst);
+}
+
+/// Tell the hook whether the pointer is over the composer's message field
+/// (the field's `PointerEntered` / `PointerExited`).
+pub fn set_composer_over(over: bool) {
+    COMPOSER_OVER.store(u8::from(over), Ordering::SeqCst);
+}
+
+/// Whether a pointer press is one on the composer's field while a popover
+/// is open.
+fn composer_press(popover: u8, over: u8) -> bool {
+    popover != Popover::None as u8 && over == 1
 }
 
 /// How the last input arrived, how long ago (ms) and the input epoch.
@@ -193,7 +220,13 @@ fn chord(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<Shortcut> {
 
 /// The popover key of a key press while `popover` is open.
 fn popover_key(popover: u8, key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<PopoverKey> {
-    if popover == Popover::None as u8 || shift || alt {
+    if popover == Popover::None as u8 || alt {
+        return None;
+    }
+    if key == VK_TAB && !ctrl {
+        return Some(PopoverKey::Tab);
+    }
+    if shift {
         return None;
     }
     let picker = popover == Popover::Picker as u8;
@@ -275,6 +308,12 @@ unsafe extern "system" fn messages(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_NCLBUTTONDOWN | WM_POINTERDOWN
         ) {
             note_input(Input::Pointer);
+            if composer_press(
+                POPOVER.load(Ordering::SeqCst),
+                COMPOSER_OVER.load(Ordering::SeqCst),
+            ) {
+                send(Shortcut::ComposerPressed);
+            }
         }
     }
     // SAFETY: passes the message on unchanged.
@@ -320,5 +359,30 @@ mod tests {
         );
         assert_eq!(popover_key(picker, VK_F, false, false, false), None);
         assert_eq!(popover_key(picker, VK_UP, false, true, false), None);
+    }
+
+    #[test]
+    fn returning_to_the_composer_leaves_an_open_popover() {
+        let menu = Popover::Menu as u8;
+        let picker = Popover::Picker as u8;
+        // Tab or Shift+Tab: keyboard focus goes back to the composer.
+        for popover in [menu, picker] {
+            assert_eq!(
+                popover_key(popover, VK_TAB, false, false, false),
+                Some(PopoverKey::Tab)
+            );
+            assert_eq!(
+                popover_key(popover, VK_TAB, false, true, false),
+                Some(PopoverKey::Tab)
+            );
+        }
+        assert_eq!(popover_key(0, VK_TAB, false, false, false), None);
+        assert_eq!(popover_key(menu, VK_TAB, true, false, false), None);
+        // A press on the message field closes the popover only while one is
+        // open and the pointer is over the field.
+        assert!(composer_press(menu, 1));
+        assert!(composer_press(picker, 1));
+        assert!(!composer_press(menu, 0));
+        assert!(!composer_press(0, 1));
     }
 }

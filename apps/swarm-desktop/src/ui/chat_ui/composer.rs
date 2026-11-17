@@ -70,19 +70,10 @@ impl DesktopApp {
         };
         let first = usize::from(context_row.is_some());
         let field = TextBox::new()
-            .grid_row(first as i32)
             .element_ref(&self.chat.composer_ref)
             .text(self.primed(&self.composer_text()).to_owned())
             .placeholder_text(placeholder)
             .automation_name("Message")
-            // Its text starts where the chips' icons do: the chips' content
-            // inset less WinUI's own left text padding.
-            .margin(Thickness::new(
-                tokens::spacing::INSET - WINUI_TEXT_PADDING,
-                0.0,
-                0.0,
-                0.0,
-            ))
             .background(Brush::Solid(Color::transparent()))
             .border_thickness(Thickness::uniform(0.0))
             .accepts_return(true)
@@ -92,6 +83,35 @@ impl DesktopApp {
             .on_text_changed(
                 context.callback(|value| Message::Chat(ChatMsg::ComposerChanged(value))),
             );
+        // WinUI's TextBox handles its own presses and Reactor 0.100.0 has no
+        // focus events: around it, only where the pointer is reaches the
+        // window. The pointer hook reports a press while it is over the
+        // field, which closes an open popover (`shortcuts`).
+        let field = Border::new()
+            .grid_row(first as i32)
+            // Its text starts where the chips' icons do: the chips' content
+            // inset less WinUI's own left text padding.
+            .margin(Thickness::new(
+                tokens::spacing::INSET - WINUI_TEXT_PADDING,
+                0.0,
+                0.0,
+                0.0,
+            ))
+            .on_pointer_entered(context.callback(|info: PointerEventInfo| {
+                Message::Launch(LaunchMsg::ComposerPointer {
+                    over: true,
+                    pressed: info.is_left_button_pressed
+                        || info.is_right_button_pressed
+                        || info.is_middle_button_pressed,
+                })
+            }))
+            .on_pointer_exited(context.callback(|_: PointerEventInfo| {
+                Message::Launch(LaunchMsg::ComposerPointer {
+                    over: false,
+                    pressed: false,
+                })
+            }))
+            .content(field);
         let actions = self.composer_actions(agent, context, palette);
         let bottom = Grid::new()
             .grid_row(first as i32 + 1)
@@ -278,13 +298,7 @@ impl DesktopApp {
         let shown = self.launch.effort_highlight.as_deref().or(current);
         let header = StackPanel::new().children((
             m3::section_title(shown.map_or_else(|| "Default effort".to_owned(), effort_words)),
-            m3::secondary(
-                detail
-                    .settings
-                    .next_model()
-                    .unwrap_or("Default model")
-                    .to_owned(),
-            ),
+            m3::secondary(detail.settings.next_model_words()),
         ));
         let enabled = !self.submitting();
         let steps: View = match read {

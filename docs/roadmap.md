@@ -519,7 +519,8 @@ of the explicitly selected release scope.
       the details panel. The composer of a conversation carries its project,
       harness and access as plain read-only text, the model-and-effort chip
       (Codex's effort popover: the route's effort steps, applied for the next
-      turn, and "Change model…" into the picker filtered to that Agent's
+      turn, the model as "Requested model X" until a turn carries it, and
+      "Change model…" into the picker filtered to that Agent's
       route; one plain line instead when the harness keeps them), Send (which
       steers the running turn, D10; a stopped or lost task's one Resume, with
       the typed message once there is one), and Interrupt only while a turn
@@ -576,7 +577,11 @@ of the explicitly selected release scope.
       `[desktop] last_access`; the chip itself is borderless, Full access as
       warning text. The popovers overlay the conversation right above the
       composer, so nothing behind them moves, and are not WinUI flyouts
-      (Reactor 0.100.0 cannot close a flyout it opened).
+      (Reactor 0.100.0 cannot close a flyout it opened). A click on the
+      conversation or into the message field, Tab, or Esc closes one, so its
+      keys never take the composer's Enter (the message field's press is seen
+      by the window's pointer hook while the pointer is over it: WinUI's
+      TextBox keeps its presses and Reactor has no focus events).
       Settings follows Codex: a Search field over the settings of every page,
       then the groups General (Appearance, Startup, Keyboard shortcuts),
       Agents (Models & presets, Default access, Routing, Usage), Work

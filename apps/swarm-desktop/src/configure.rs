@@ -82,6 +82,22 @@ impl Settings {
             .or(self.profile_model.as_deref())
     }
 
+    /// The model the next turn carries, in words: plain once the harness
+    /// confirmed carrying it (a turn, or the native switch, proved it) and
+    /// "Requested model X" until then, as in [`Self::lines`]. A model asked
+    /// for the next turn stays requested until a turn reports it.
+    pub fn next_model_words(&self) -> String {
+        match self.next_model() {
+            None => "Default model".to_owned(),
+            Some(model)
+                if self.model_verified && self.effective_model.as_deref() == Some(model) =>
+            {
+                model.to_owned()
+            }
+            Some(model) => format!("Requested model {model}"),
+        }
+    }
+
     /// The effort the next turn carries, like [`Self::next_model`].
     pub fn next_effort(&self) -> Option<&str> {
         self.config
@@ -379,6 +395,33 @@ mod tests {
         assert_eq!(lines[0], "Default model");
         assert_eq!(lines[1], "Next turn: m1 · High");
         assert_eq!(settings.next_model(), Some("m1"));
+    }
+
+    #[test]
+    fn a_requested_model_reads_requested_until_a_turn_carries_it() {
+        let mut settings = running("m1", "low");
+        assert_eq!(settings.next_model_words(), "Requested model m1");
+        settings.model_verified = true;
+        assert_eq!(settings.next_model_words(), "m1");
+        // Codex: a model switch for the next turn, not carried yet.
+        settings.config = Some(AgentConfigView {
+            revision: 1,
+            application: "next_turn".to_owned(),
+            provenance: "configure".to_owned(),
+            profile: "p".to_owned(),
+            profile_inherited: false,
+            requested_model: Some("m2".to_owned()),
+            requested_effort: None,
+            model: Some("m2".to_owned()),
+            effort: Some("low".to_owned()),
+            original_model: Some("m1".to_owned()),
+            original_effort: Some("low".to_owned()),
+        });
+        assert_eq!(settings.next_model_words(), "Requested model m2");
+        // The next turn reported carrying it.
+        settings.effective_model = Some("m2".to_owned());
+        assert_eq!(settings.next_model_words(), "m2");
+        assert_eq!(Settings::default().next_model_words(), "Default model");
     }
 
     #[test]

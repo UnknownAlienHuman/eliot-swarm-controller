@@ -71,6 +71,12 @@ pub(super) enum LaunchMsg {
     Toggle(Pop),
     /// Close the open popover (a click outside it, Esc).
     Close,
+    /// The pointer entered (true) or left the composer's message field,
+    /// and whether a button was already down as it entered.
+    ComposerPointer {
+        over: bool,
+        pressed: bool,
+    },
     /// The model search field's text.
     PickerQuery(String),
     /// A picker row was clicked (its key).
@@ -366,6 +372,12 @@ impl DesktopApp {
                 }
             }
             LaunchMsg::Close => self.close_popover(),
+            LaunchMsg::ComposerPointer { over, pressed } => {
+                crate::shortcuts::set_composer_over(over);
+                if over && pressed {
+                    self.composer_pressed();
+                }
+            }
             LaunchMsg::PickerQuery(text) => {
                 if self.launch.query != text {
                     self.launch.query = text;
@@ -623,6 +635,17 @@ impl DesktopApp {
         }
     }
 
+    /// A press on the composer's message field (the pointer hook's report,
+    /// or the field's `PointerEntered` with a button already down: touch,
+    /// or a press without a move first) closes the open popover, so its
+    /// keys stop taking the composer's Enter; the press itself reached the
+    /// field. A preset's picker in Settings has no composer.
+    pub(super) fn composer_pressed(&mut self) {
+        if self.main == Main::Conversation && self.launch.preset.is_none() {
+            self.close_popover();
+        }
+    }
+
     /// Close the open popover; its keys go back to the focused control.
     pub(super) fn close_popover(&mut self) {
         if self.launch.open.take().is_some() {
@@ -715,13 +738,18 @@ impl DesktopApp {
         let Some(pop) = self.launch.open else {
             return;
         };
-        if key == PopoverKey::Escape {
-            if pop == Pop::Manage {
+        match key {
+            PopoverKey::Escape if pop == Pop::Manage => {
                 self.launch_update(LaunchMsg::ManageClosed, context);
-            } else {
-                self.close_popover();
+                return;
             }
-            return;
+            // Tab returns the keyboard to the composer: the popover would
+            // otherwise keep taking its Enter.
+            PopoverKey::Escape | PopoverKey::Tab => {
+                self.close_popover();
+                return;
+            }
+            _ => {}
         }
         match pop {
             Pop::Manage | Pop::Usage => {}
@@ -775,7 +803,7 @@ impl DesktopApp {
                             self.toggle_favorite(&key, context);
                         }
                     }
-                    PopoverKey::Escape => {}
+                    PopoverKey::Escape | PopoverKey::Tab => {}
                 }
             }
             Pop::Access => {
