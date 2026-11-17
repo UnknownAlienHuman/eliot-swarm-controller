@@ -71,8 +71,13 @@ impl Store {
         for num in &members {
             let row = load_agent_by_num(&tx, *num)?
                 .ok_or_else(|| Error::new("source_integrity", "Agent tree changed"))?;
+            // Archive hides a tree that is not working: idle, or ended
+            // (stopped, failed or lost). Delete needs a settled end.
             let allowed = if archived.is_some() {
-                matches!(row.state, AgentState::Idle | AgentState::Stopped)
+                matches!(
+                    row.state,
+                    AgentState::Idle | AgentState::Stopped | AgentState::Failed | AgentState::Lost
+                )
             } else {
                 matches!(row.state, AgentState::Stopped | AgentState::Failed)
             };
@@ -85,7 +90,7 @@ impl Store {
                         row.state,
                         method,
                         if archived.is_some() {
-                            "idle or stopped"
+                            "idle or ended (stopped, failed or lost)"
                         } else {
                             "stopped or failed"
                         },
@@ -140,11 +145,28 @@ impl Store {
                     ),
                 ));
             }
-            if archived.is_none() {
-                let live = generation_liveness_tx(&tx, *num)?;
-                if live {
-                    return Err(Error::new("busy", "Agent tree still has live custody"));
-                }
+            // Delete needs drained custody. Archive of an ended member needs
+            // resolved custody, so it never hides a process, artifact or
+            // native source the owner must still resolve; Eliot's own os, git
+            // and workspace-process observers of a resumable Agent may stay
+            // open. An idle member keeps its live custody (archive never
+            // stops a generation); unarchive only reveals.
+            let guard = match archived {
+                None => Some(true),
+                Some(true) if row.state != AgentState::Idle => Some(false),
+                Some(_) => None,
+            };
+            if let Some(observers) = guard
+                && let Some(blocker) = custody_blocker_tx(&tx, *num, observers)?
+            {
+                return Err(Error::new(
+                    "busy",
+                    format!(
+                        "{} still has {blocker}; {method} requires {} custody",
+                        row.id,
+                        if observers { "drained" } else { "resolved" }
+                    ),
+                ));
             }
         }
         if let Some(value) = archived {
@@ -170,8 +192,33 @@ impl Store {
     }
 }
 
-fn generation_liveness_tx(tx: &Transaction<'_>, agent: i64) -> Result<bool> {
-    tx.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE agent=?1 AND json_extract(body,'$.state')='unknown') OR EXISTS(SELECT 1 FROM source_state WHERE agent=?1 AND state='open' AND source!='daemon') OR EXISTS(SELECT 1 FROM processes WHERE owner LIKE ?2 AND state!='exited') OR EXISTS(SELECT 1 FROM processes WHERE owner LIKE ?3 AND state!='exited')",params![agent,format!("agent:{}#%",format_agent_id(agent)),format!("workspace:{}#%",format_agent_id(agent))],|r|r.get(0)).map_err(sql_error)
+/// Unresolved custody of the Agent whose numeric id is the SQL expression
+/// `agent`, across its generations, one blocker in words per row: an
+/// unexited owned process, an `unknown` artifact or an open non-daemon
+/// source. Eliot's os, git and workspace-process observers count only where
+/// the SQL boolean `observers` holds (delete's drain). Archive's guard and
+/// the default `agent.list` filter share it.
+pub(crate) fn custody_blockers_sql(agent: &str, observers: &str) -> String {
+    format!(
+        "SELECT state||' '||role||' process '||pid||' ('||owner||')' FROM processes
+             WHERE state IN ('running','unknown')
+               AND (owner GLOB 'agent:a'||{agent}||'#*' OR owner GLOB 'workspace:a'||{agent}||'#*')
+         UNION ALL SELECT 'unknown artifact '||id FROM artifacts WHERE agent={agent} AND json_extract(body,'$.state')='unknown'
+         UNION ALL SELECT 'open '||source||' source (generation '||generation||')' FROM source_state
+             WHERE agent={agent} AND state='open' AND source!='daemon'
+               AND ({observers} OR source NOT IN ('os','git','workspace_process'))"
+    )
+}
+
+/// First unresolved custody of an Agent ([`custody_blockers_sql`]).
+fn custody_blocker_tx(tx: &Transaction<'_>, agent: i64, observers: bool) -> Result<Option<String>> {
+    tx.query_row(
+        &format!("{} LIMIT 1", custody_blockers_sql("?1", "?2")),
+        params![agent, observers],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(sql_error)
 }
 
 fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()> {

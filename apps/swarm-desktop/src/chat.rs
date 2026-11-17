@@ -45,6 +45,8 @@ pub const MAX_TURN_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 pub const CHAT_KINDS: &[&str] = &[
     "agent.created",
     "agent.failed",
+    "agent.lost",
+    "agent.stopped",
     "session.ready",
     "session.ended",
     "turn.started",
@@ -541,8 +543,13 @@ impl Conversation {
                 continue;
             }
             match event.kind.as_str() {
+                // The Agent's state changed: its detail (and with it the
+                // sidebar row and its menu) reads it again, a loss or stop
+                // included (k113: a lost Agent offers Resume, not Delete).
                 "request.opened" | "request.closed" | "request.resolved" | "agent.failed"
-                | "session.ready" | "session.ended" => invalidation.detail = true,
+                | "agent.lost" | "agent.stopped" | "session.ready" | "session.ended" => {
+                    invalidation.detail = true
+                }
                 _ => {}
             }
             let Some(turn_id) = data_str(event, "turn_id") else {
@@ -1121,6 +1128,17 @@ mod tests {
         assert_eq!(keys, vec!["in:c1", "n3", "tools:i1", "final:t1"]);
         assert_eq!(items[0].parts[3].text, "**done**");
         assert!(chat.coverage().reached_creation);
+    }
+
+    #[test]
+    fn a_loss_or_stop_rereads_the_detail() {
+        for kind in ["agent.lost", "agent.stopped"] {
+            assert!(CHAT_KINDS.contains(&kind), "{kind} reaches the feed");
+            let mut chat = Conversation::new("a1");
+            chat.reset(coverage(), &[], &sample_events());
+            let invalidation = chat.apply_events(&[event(8, kind, json!({}))]);
+            assert!(invalidation.detail, "{kind} rereads the detail");
+        }
     }
 
     #[test]

@@ -1,9 +1,10 @@
-//! The right panel: the monitor (every Agent as a simple card) and the open
-//! Agent's details (settings, coverage, resources, usage, Change manager),
-//! on one refresh chain that runs only while the panel is open.
+//! The right panel: the monitor (every task as a simple card, its workers
+//! and subagents nested under it) and the open Agent's details (settings,
+//! coverage, resources, usage), on one refresh chain that runs only while
+//! the panel is open.
 
 use super::*;
-use crate::monitor::MonitorRow;
+use crate::monitor::{MonitorRow, Tree};
 use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
 use crate::ui::chat_ui::DraftAction;
@@ -16,14 +17,12 @@ pub(super) enum MonitorMsg {
     /// A lost or failed card's Resume, bound to the generation shown: open
     /// its conversation and resume it there.
     ResumeRequested(String, i64),
-    /// Show or hide the native children of one card.
+    /// Show or hide the children (workers and subagents) of one card.
     ChildrenToggled(String),
     /// Show or hide Recently stopped.
     StoppedToggled,
     /// Show only the Needs attention section, or everything again.
     AttentionToggled,
-    ReparentRequested(reparent::MoveBinding),
-    ReparentSettled(reparent::MoveBinding, eliot_core::Result<ReparentResponse>),
 }
 
 /// The panel's refresh chain and the Agent whose details it reads.
@@ -35,8 +34,7 @@ pub(super) struct MonitorState {
     pub(super) task: Option<ComponentTask>,
     /// The Agent whose details (and usage) each refresh reads.
     pub(super) selected: Option<String>,
-    pub(super) reparent_status: String,
-    /// Cards whose native children are shown (collapsed by default).
+    /// Cards whose children are shown (collapsed by default).
     pub(super) expanded: HashSet<String>,
     /// Recently stopped is open (collapsed by default).
     pub(super) stopped_open: bool,
@@ -111,43 +109,6 @@ impl DesktopApp {
             MonitorMsg::AttentionToggled => {
                 self.monitor.attention_only = !self.monitor.attention_only;
             }
-            MonitorMsg::ReparentRequested(binding) => {
-                if self.submitting() {
-                    return;
-                }
-                let Ok(data_dir) = self.data_dir.clone() else {
-                    return;
-                };
-                let key = binding.key();
-                let mutation_id = self.ledger.id_for(&key);
-                self.in_flight_key = Some(key);
-                self.monitor.reparent_status =
-                    format!("Moving {} ({mutation_id})…", binding.describe());
-                let request = binding.request(mutation_id);
-                let _task = context.spawn_background(move |_| {
-                    let result = client::block_on(client::reparent(&data_dir, &request));
-                    Message::Monitor(MonitorMsg::ReparentSettled(binding, result))
-                });
-            }
-            MonitorMsg::ReparentSettled(binding, result) => {
-                let uncertain = result.as_ref().err().is_some_and(crate::state::uncertain);
-                self.settle_mutation(!uncertain);
-                self.monitor.reparent_status = match result {
-                    Ok(reply) => reparent::result_lines(&binding, &reply).join("\n"),
-                    Err(error) if uncertain => {
-                        format!(
-                            "Move not confirmed (the same click reuses its id): {}",
-                            error.user_message()
-                        )
-                    }
-                    Err(error) => reparent::refusal_line(&binding, &error),
-                };
-                if self.panel != Panel::Closed {
-                    self.spawn_monitor(context, 0);
-                }
-                // The tree in the sidebar follows the new manager.
-                self.shell_update(ShellMsg::RefreshRequested, context);
-            }
         }
     }
 
@@ -156,7 +117,6 @@ impl DesktopApp {
         let changed = self.monitor.selected.as_deref() != Some(agent);
         if changed {
             self.monitor.selected = Some(agent.to_owned());
-            self.monitor.reparent_status.clear();
         }
         let was_closed = self.panel == Panel::Closed;
         self.panel = Panel::Details;
@@ -238,12 +198,14 @@ impl DesktopApp {
             ))
     }
 
-    /// One card, and below it its native children's toggle and, when open,
-    /// their cards one step in (recursively: a child may have its own).
+    /// One card, and below it its children's toggle (workers and
+    /// subagents, collapsed by default) and, when open, their cards one
+    /// step in (recursively: a child may have its own).
     fn monitor_cards(
         &self,
         row: &MonitorRow,
         depth: usize,
+        tree: &Tree,
         context: &mut ViewContext<Self>,
         palette: Palette,
         cards: &mut Vec<KeyedView>,
@@ -252,15 +214,20 @@ impl DesktopApp {
         let indent = depth as f64 * tokens::layout::TREE_INDENT;
         let title = self.agent_title(&row.id);
         // A lost or failed card says why it ended, as its conversation does;
-        // a harness-contact report is only the consequence of that end.
+        // a harness-contact report is only the consequence of that end. A
+        // card raised by its workers names the first one that needs you.
         let note = if row.resumable() {
             data.loss_words(row).map(monitor_view::CardNote::Ended)
         } else {
             data.incident(row)
                 .filter(|_| row.state != eliot_core::AgentState::Stopped)
-                .map(|incident| {
-                    monitor_view::CardNote::Attention(monitor::attention_words(&incident.reason))
+                .map(|incident| monitor::attention_words(&incident.reason))
+                .or_else(|| {
+                    (!data.needs_attention(row))
+                        .then(|| tree.worker_attention_words(&row.id))
+                        .flatten()
                 })
+                .map(monitor_view::CardNote::Attention)
         };
         let resume = row.resumable().then(|| {
             context.message(Message::Monitor(MonitorMsg::ResumeRequested(
@@ -275,6 +242,7 @@ impl DesktopApp {
                 .content(monitor_view::card(
                     row,
                     &title,
+                    depth > 0,
                     note.as_ref(),
                     monitor_view::CardActions {
                         open: context
@@ -284,21 +252,12 @@ impl DesktopApp {
                     palette,
                 )),
         ));
-        let children = data.children(&row.id);
+        let children = tree.children(&row.id);
         if children.is_empty() || depth > 4 {
             return;
         }
         let open = self.monitor.expanded.contains(&row.id);
-        let ended = children
-            .iter()
-            .filter(|child| child.state == eliot_core::AgentState::Stopped)
-            .count();
-        let label = match (children.len(), ended) {
-            (1, 1) => "1 subagent · ended with parent".to_owned(),
-            (1, _) => "1 subagent".to_owned(),
-            (all, ended) if ended == all => format!("{all} subagents · ended with parent"),
-            (all, _) => format!("{all} subagents"),
-        };
+        let label = tree.children_label(&row.id);
         cards.push(KeyedView::new(
             format!("children:{}:{open}", row.id),
             m3::sub_row(palette, false)
@@ -325,13 +284,13 @@ impl DesktopApp {
         ));
         if open {
             for child in children {
-                self.monitor_cards(child, depth + 1, context, palette, cards);
+                self.monitor_cards(child, depth + 1, tree, context, palette, cards);
             }
         }
     }
 
     /// The monitor: Needs attention, Working, Idle, then a collapsed
-    /// Recently stopped; native children under their parent card.
+    /// Recently stopped; workers and subagents under their parent card.
     pub(super) fn monitor_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let data = &self.monitor.data;
         let now = data.read_at_ms.unwrap_or(0);
@@ -353,7 +312,8 @@ impl DesktopApp {
                 .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        let sections = data.sections(now);
+        let tree = data.tree(now);
+        let sections = tree.sections();
         let attention_count = sections
             .iter()
             .find(|section| section.group == monitor::Group::Attention)
@@ -422,7 +382,7 @@ impl DesktopApp {
                 ));
             }
             for row in &section.rows {
-                self.monitor_cards(row, 0, context, palette, &mut cards);
+                self.monitor_cards(row, 0, &tree, context, palette, &mut cards);
             }
         }
         if data.read_at_ms.is_some() && sections.iter().all(|section| section.rows.is_empty()) {
@@ -459,9 +419,10 @@ impl DesktopApp {
             ))
     }
 
-    /// The open Agent's details: its settings and coverage, resources,
-    /// usage and Change manager. Ids and readback text live here, not in
-    /// the conversation.
+    /// The open Agent's details: its settings and coverage, resources and
+    /// usage. Ids and readback text live here, not in the conversation.
+    /// Moving it under another task is a menu action
+    /// ([`super::move_ui`]), not a section here.
     pub(super) fn details_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let Some(id) = self.monitor.selected.clone() else {
             return View::empty();
@@ -601,53 +562,6 @@ impl DesktopApp {
             sections.push(KeyedView::new(
                 "observe",
                 section(palette, "Heavy work", &observe),
-            ));
-        }
-
-        // Change manager: one row per possible manager, each button bound
-        // to that row's generation and the shown source generation.
-        let source = read.map(|read| &read.agent.agent);
-        let movable = source.is_some_and(|agent| !agent.observe_only);
-        let enabled = !self.submitting() && movable;
-        let rows: Vec<monitor_view::MoveRow> = reparent::candidates(&self.monitor.data.rows, &id)
-            .into_iter()
-            .map(|manager| {
-                let bind = |form| {
-                    source.map(|agent| {
-                        context.message(Message::Monitor(MonitorMsg::ReparentRequested(
-                            reparent::MoveBinding {
-                                form,
-                                source: agent.id.clone(),
-                                source_generation: agent.generation,
-                                parent: manager.id.clone(),
-                                parent_generation: manager.generation,
-                            },
-                        )))
-                    })
-                };
-                monitor_view::MoveRow {
-                    id: manager.id.clone(),
-                    label: format!(
-                        "{} · {}",
-                        self.agent_title(&manager.id),
-                        reparent::candidate_label(manager)
-                    ),
-                    move_agent: bind(reparent::MoveForm::Agent),
-                    move_children: bind(reparent::MoveForm::Children),
-                }
-            })
-            .collect();
-        // Shown only when a move is possible, or to report the last one.
-        if (movable && !rows.is_empty()) || !self.monitor.reparent_status.is_empty() {
-            sections.push(KeyedView::new(
-                "manager",
-                monitor_view::manager_section(
-                    &id,
-                    if movable { rows } else { Vec::new() },
-                    &self.monitor.reparent_status,
-                    enabled,
-                    palette,
-                ),
             ));
         }
 

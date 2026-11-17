@@ -13,7 +13,9 @@
 //! The panel shows what matters: Needs attention (waiting for the owner,
 //! failed, lost, a controlled Agent whose state is not confirmed, or an open
 //! attention report), Working (busy or starting), Idle, and a collapsed
-//! Recently stopped. Native observed children nest under their parent.
+//! Recently stopped. Children nest under their parent card, collapsed:
+//! native observed subagents and Swarm workers alike; a worker that needs
+//! attention raises its parent into Needs attention.
 //!
 //! `ProcessStatsView` carries cumulative `cpu_time_ns`, not a rate. A rate
 //! is derived here only between two distinct samples of the same process
@@ -748,12 +750,169 @@ pub struct MonitorSnapshot {
     pub read_at_ms: i64,
 }
 
-/// One monitor section: its top-level rows (each with its nested native
-/// children) and how many it has.
+/// One monitor section: its top-level rows (each with its nested
+/// children, see [`Tree`]).
 #[derive(Clone, Debug)]
 pub struct Section<'a> {
     pub group: Group,
     pub rows: Vec<&'a MonitorRow>,
+}
+
+/// A stopped row is shown only while recent.
+fn visible(row: &MonitorRow, now_ms: i64) -> bool {
+    row.state != AgentState::Stopped || now_ms.saturating_sub(row.updated_at) <= RECENT_MS
+}
+
+/// The rows shown at one instant: the top-level cards and, under each
+/// parent, its children (native subagents and Swarm workers alike), in id
+/// order. Built once per render.
+pub struct Tree<'a> {
+    monitor: &'a Monitor,
+    top: Vec<&'a MonitorRow>,
+    children: HashMap<&'a str, Vec<&'a MonitorRow>>,
+}
+
+impl<'a> Tree<'a> {
+    /// The children shown under `parent`.
+    pub fn children(&self, parent: &str) -> &[&'a MonitorRow] {
+        self.children.get(parent).map_or(&[], Vec::as_slice)
+    }
+
+    /// The workers anywhere under `parent` that need attention themselves,
+    /// in id order (each Agent once, even if links changed between reads).
+    pub fn attention_workers(&self, parent: &str) -> Vec<&'a MonitorRow> {
+        let mut found = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::from([parent]);
+        let mut stack: Vec<&str> = vec![parent];
+        while let Some(id) = stack.pop() {
+            for child in self.children(id) {
+                if !seen.insert(child.id.as_str()) {
+                    continue;
+                }
+                if self.monitor.needs_attention(child) {
+                    found.push(*child);
+                }
+                stack.push(child.id.as_str());
+            }
+        }
+        found.sort_by(|a, b| id_order(&a.id, &b.id));
+        found
+    }
+
+    /// The sections in order, each with its top-level rows: attention by
+    /// urgency, working and idle by id, recently stopped newest first. A
+    /// parent with a worker that needs attention is raised into Needs
+    /// attention.
+    pub fn sections(&self) -> Vec<Section<'a>> {
+        let mut sections: Vec<Section> = [
+            Group::Attention,
+            Group::Working,
+            Group::Idle,
+            Group::Stopped,
+        ]
+        .into_iter()
+        .map(|group| Section {
+            group,
+            rows: Vec::new(),
+        })
+        .collect();
+        for row in &self.top {
+            let mut group = row.group(self.monitor.incident(row));
+            if group != Group::Attention && !self.attention_workers(&row.id).is_empty() {
+                group = Group::Attention;
+            }
+            if let Some(section) = sections.iter_mut().find(|section| section.group == group) {
+                section.rows.push(row);
+            }
+        }
+        for section in &mut sections {
+            match section.group {
+                Group::Attention => section.rows.sort_by(|a, b| {
+                    attention_rank(a.state)
+                        .cmp(&attention_rank(b.state))
+                        .then_with(|| id_order(&a.id, &b.id))
+                }),
+                Group::Stopped => section.rows.sort_by(|a, b| {
+                    b.updated_at
+                        .cmp(&a.updated_at)
+                        .then_with(|| id_order(&a.id, &b.id))
+                }),
+                Group::Working | Group::Idle => section.rows.sort_by(|a, b| id_order(&a.id, &b.id)),
+            }
+        }
+        sections
+    }
+
+    /// The line under a parent card that opens its children: how many
+    /// workers and subagents, then their states ("22 workers · 2 working ·
+    /// 20 idle"). Native-only children keep their own words ("2 subagents ·
+    /// ended with parent").
+    pub fn children_label(&self, parent: &str) -> String {
+        let children = self.children(parent);
+        let subagents = children.iter().filter(|row| row.native_child).count();
+        let workers = children.len() - subagents;
+        let plural = |count: usize, one: &str| {
+            if count == 1 {
+                format!("1 {one}")
+            } else {
+                format!("{count} {one}s")
+            }
+        };
+        if workers == 0 {
+            let ended = children
+                .iter()
+                .filter(|row| row.state == AgentState::Stopped)
+                .count();
+            let label = plural(subagents, "subagent");
+            return if ended == subagents {
+                format!("{label} · ended with parent")
+            } else {
+                label
+            };
+        }
+        let mut parts = vec![plural(workers, "worker")];
+        if subagents > 0 {
+            parts.push(plural(subagents, "subagent"));
+        }
+        let (mut working, mut attention, mut idle, mut stopped) = (0, 0, 0, 0);
+        for row in children {
+            match row.group(self.monitor.incident(row)) {
+                Group::Attention => attention += 1,
+                Group::Working => working += 1,
+                Group::Idle => idle += 1,
+                Group::Stopped => stopped += 1,
+            }
+        }
+        if working + attention + idle > 0 {
+            parts.push(live_words(working, attention, idle));
+        }
+        if stopped > 0 {
+            parts.push(format!("{stopped} stopped"));
+        }
+        parts.join(" · ")
+    }
+
+    /// The parent card's attention line when its workers need attention
+    /// and it does not itself: the first worker by id, named, with what it
+    /// needs ("Waiting for you · worker a59 · Reply with exactly…").
+    pub fn worker_attention_words(&self, parent: &str) -> Option<String> {
+        let workers = self.attention_workers(parent);
+        let first = workers.first()?;
+        let words = match self.monitor.incident(first) {
+            Some(incident) if !first.ended() && first.state != AgentState::Waiting => {
+                attention_words(&incident.reason)
+            }
+            _ => first.status_words().to_owned(),
+        };
+        let more = match workers.len() - 1 {
+            0 => String::new(),
+            count => format!(" and {count} more"),
+        };
+        Some(format!(
+            "{words} · worker {}{more} · {}",
+            first.id, first.title
+        ))
+    }
 }
 
 /// Monitor model: rows, counters, open attention reports and per-Agent
@@ -790,6 +949,12 @@ impl Monitor {
     /// The open attention report of a row's current generation.
     pub fn incident(&self, row: &MonitorRow) -> Option<&Incident> {
         self.incidents.get(&(row.id.clone(), row.generation))
+    }
+
+    /// A controlled row that needs the owner itself (its own section would
+    /// be Needs attention); an observed native child never does.
+    pub fn needs_attention(&self, row: &MonitorRow) -> bool {
+        !row.native_child && row.group(self.incident(row)) == Group::Attention
     }
 
     /// The shown row of one Agent, live or recently stopped.
@@ -858,96 +1023,63 @@ impl Monitor {
         )
     }
 
-    /// The sections in order, each with its top-level rows: attention by
-    /// urgency, working and idle by id, recently stopped newest first. A
-    /// native child is not a top-level row while its parent is shown; a
-    /// stopped one whose parent is not shown is left out (it ended).
-    pub fn sections(&self, now_ms: i64) -> Vec<Section<'_>> {
+    /// Who sits under whom among the rows shown at `now_ms`: a child
+    /// (native subagent or Swarm worker) nests under its shown parent.
+    pub fn tree(&self, now_ms: i64) -> Tree<'_> {
         let rows: Vec<&MonitorRow> = self.all_rows().collect();
-        let shown: HashSet<&str> = rows
+        let shown: HashMap<&str, &MonitorRow> = rows
             .iter()
-            .filter(|row| self.visible(row, now_ms))
-            .map(|row| row.id.as_str())
+            .filter(|row| visible(row, now_ms))
+            .map(|row| (row.id.as_str(), *row))
             .collect();
-        let mut sections: Vec<Section> = [
-            Group::Attention,
-            Group::Working,
-            Group::Idle,
-            Group::Stopped,
-        ]
-        .into_iter()
-        .map(|group| Section {
-            group,
-            rows: Vec::new(),
-        })
-        .collect();
-        for row in &rows {
-            if !self.visible(row, now_ms) {
-                continue;
-            }
-            if row.native_child
-                && (row
-                    .parent
-                    .as_deref()
-                    .is_some_and(|parent| shown.contains(parent))
-                    || row.state == AgentState::Stopped)
-            {
-                continue;
-            }
-            let group = row.group(self.incident(row));
-            if let Some(section) = sections.iter_mut().find(|section| section.group == group) {
-                section.rows.push(row);
-            }
-        }
-        for section in &mut sections {
-            match section.group {
-                Group::Attention => section.rows.sort_by(|a, b| {
-                    attention_rank(a.state)
-                        .cmp(&attention_rank(b.state))
-                        .then_with(|| id_order(&a.id, &b.id))
-                }),
-                Group::Stopped => section.rows.sort_by(|a, b| {
-                    b.updated_at
-                        .cmp(&a.updated_at)
-                        .then_with(|| id_order(&a.id, &b.id))
-                }),
-                Group::Working | Group::Idle => section.rows.sort_by(|a, b| id_order(&a.id, &b.id)),
-            }
-        }
-        sections
-    }
-
-    /// A stopped row is shown only while recent.
-    fn visible(&self, row: &MonitorRow, now_ms: i64) -> bool {
-        row.state != AgentState::Stopped || now_ms.saturating_sub(row.updated_at) <= RECENT_MS
-    }
-
-    /// The native children of `parent` that are shown, by id.
-    pub fn children(&self, parent: &str) -> Vec<&MonitorRow> {
-        let mut children: Vec<&MonitorRow> = self
-            .all_rows()
-            .filter(|row| row.native_child && row.parent.as_deref() == Some(parent))
-            .collect();
-        children.sort_by(|a, b| id_order(&a.id, &b.id));
-        children
-    }
-
-    /// The footer: what is live, from the top-level rows of the sections.
-    pub fn live_line(&self, now_ms: i64) -> String {
-        let sections = self.sections(now_ms);
-        let count = |group: Group| {
-            sections
-                .iter()
-                .find(|section| section.group == group)
-                .map_or(0, |section| {
-                    section.rows.iter().filter(|row| !row.native_child).count()
-                })
+        let mut tree = Tree {
+            monitor: self,
+            top: Vec::new(),
+            children: HashMap::new(),
         };
-        let mut line = live_words(
-            count(Group::Working),
-            count(Group::Attention),
-            count(Group::Idle),
-        );
+        for row in rows {
+            let parent = row.parent.as_deref().and_then(|id| shown.get(id));
+            // A native child sits under its shown parent, ended or not. A
+            // worker does while shown, except a live worker of a stopped
+            // parent: it stays at the top, never hidden in Recently stopped.
+            let nests = parent.is_some_and(|parent| {
+                row.native_child
+                    || (visible(row, now_ms)
+                        && (row.ended() || parent.state != AgentState::Stopped))
+            });
+            if let Some(parent) = row.parent.as_deref().filter(|_| nests) {
+                tree.children.entry(parent).or_default().push(row);
+            } else if visible(row, now_ms)
+                // A stopped native child whose parent is not shown ended.
+                && !(row.native_child && row.state == AgentState::Stopped)
+            {
+                tree.top.push(row);
+            }
+        }
+        for children in tree.children.values_mut() {
+            children.sort_by(|a, b| id_order(&a.id, &b.id));
+        }
+        tree
+    }
+
+    /// The header: what is live in the fleet, every shown controlled Agent
+    /// by its own state (workers nested under a card included, native
+    /// subagents not), as the sidebar's fleet line that opens the Monitor
+    /// counts them.
+    pub fn live_line(&self, now_ms: i64) -> String {
+        let (mut working, mut attention, mut idle) = (0, 0, 0);
+        for row in self
+            .all_rows()
+            .filter(|row| !row.native_child && visible(row, now_ms))
+        {
+            match row.group(self.incident(row)) {
+                Group::Attention => attention += 1,
+                Group::Working => working += 1,
+                Group::Idle => idle += 1,
+                Group::Stopped => {}
+            }
+        }
+        let mut line = live_words(working, attention, idle);
         let truncated = self.counts.iter().any(|count| {
             count.state != AgentState::Stopped
                 && count.total.is_some_and(|total| total > count.shown)
@@ -1732,7 +1864,8 @@ mod tests {
             losses: Vec::new(),
             read_at_ms: 2_000,
         });
-        let sections = monitor.sections(2_000);
+        let tree = monitor.tree(2_000);
+        let sections = tree.sections();
         let ids = |group: Group| -> Vec<&str> {
             sections
                 .iter()
@@ -1749,18 +1882,17 @@ mod tests {
         assert_eq!(ids(Group::Idle), ["a4"]);
         assert_eq!(ids(Group::Stopped), ["a1"]);
         // Native children nest under their parent, not as rows of their own.
-        let children: Vec<&str> = monitor
+        let children: Vec<&str> = tree
             .children("a1")
             .iter()
             .map(|row| row.id.as_str())
             .collect();
         assert_eq!(children, ["a7", "a8"]);
-        assert_eq!(
-            monitor.children("a1")[0].status_words(),
-            "Ended with parent"
-        );
-        assert_eq!(monitor.children("a3")[0].status_words(), "Idle");
-        assert_eq!(monitor.children("a1")[0].operation(), "No finished turn");
+        assert_eq!(tree.children("a1")[0].status_words(), "Ended with parent");
+        assert_eq!(tree.children("a3")[0].status_words(), "Idle");
+        assert_eq!(tree.children("a1")[0].operation(), "No finished turn");
+        assert_eq!(tree.children_label("a1"), "2 subagents · ended with parent");
+        assert_eq!(tree.children_label("a3"), "1 subagent");
         assert_eq!(
             monitor.live_line(2_000),
             "1 working · 2 need attention · 1 idle"
@@ -1791,7 +1923,7 @@ mod tests {
             next: 12,
         });
         assert!(monitor.incidents.is_empty());
-        let later = monitor.sections(2_000 + RECENT_MS + 1);
+        let later = monitor.tree(2_000 + RECENT_MS + 1).sections();
         assert!(
             later
                 .iter()
@@ -1801,6 +1933,92 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(live_words(0, 0, 0), "All quiet");
+    }
+
+    #[test]
+    fn swarm_workers_nest_count_their_states_and_raise_their_parent() {
+        let mut monitor = Monitor::default();
+        monitor.apply(MonitorSnapshot {
+            groups: vec![
+                (
+                    AgentState::Busy,
+                    page(vec![
+                        summary("a10", AgentState::Busy, None, false),
+                        summary("a11", AgentState::Busy, Some("a10"), false),
+                    ]),
+                ),
+                (
+                    AgentState::Idle,
+                    page(vec![
+                        summary("a12", AgentState::Idle, Some("a10"), false),
+                        summary("a21", AgentState::Idle, Some("a20"), false),
+                        summary("a30", AgentState::Idle, None, false),
+                    ]),
+                ),
+                (
+                    AgentState::Waiting,
+                    page(vec![summary(
+                        "a13",
+                        AgentState::Waiting,
+                        Some("a10"),
+                        false,
+                    )]),
+                ),
+            ],
+            counts: Vec::new(),
+            stopped: Some(page(vec![
+                summary("a14", AgentState::Stopped, Some("a10"), false),
+                summary("a20", AgentState::Stopped, None, false),
+            ])),
+            attention: None,
+            detail: None,
+            losses: Vec::new(),
+            read_at_ms: 2_000,
+        });
+        let tree = monitor.tree(2_000);
+        let ids = |group: Group| -> Vec<String> {
+            tree.sections()
+                .iter()
+                .find(|section| section.group == group)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row.id.clone())
+                .collect()
+        };
+        // The waiting worker raises its working parent; workers are no
+        // top-level cards. A live worker of a stopped parent stays at the
+        // top instead of hiding in Recently stopped.
+        assert_eq!(ids(Group::Attention), ["a10"]);
+        assert!(ids(Group::Working).is_empty());
+        assert_eq!(ids(Group::Idle), ["a21", "a30"]);
+        assert_eq!(ids(Group::Stopped), ["a20"]);
+        let children: Vec<&str> = tree
+            .children("a10")
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(children, ["a11", "a12", "a13", "a14"]);
+        assert!(tree.children("a20").is_empty());
+        assert_eq!(
+            tree.children_label("a10"),
+            "4 workers · 1 working · 1 needs attention · 1 idle · 1 stopped"
+        );
+        let words = tree.worker_attention_words("a10").unwrap();
+        assert!(
+            words.starts_with("Waiting for you · worker a13 · "),
+            "{words}"
+        );
+        assert_eq!(tree.worker_attention_words("a30"), None);
+        // The header counts the fleet, workers included, each by its own
+        // state (as the sidebar's fleet line does).
+        assert_eq!(
+            monitor.live_line(2_000),
+            "2 working · 1 needs attention · 3 idle"
+        );
+        // A day later the stopped worker is no longer counted.
+        let later = monitor.tree(2_000 + RECENT_MS + 1);
+        assert_eq!(later.children("a10").len(), 3);
     }
 
     #[test]

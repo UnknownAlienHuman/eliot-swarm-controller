@@ -1,8 +1,8 @@
 //! WinUI pieces of the right panel: the monitor's Agent cards, the CPU and
 //! RSS charts (bars built from `Border`s, each with its latest value and a
-//! labelled scale; no canvas), the usage lines and the Change manager
-//! section. Buttons carry the Agent and generations shown on screen, so a
-//! click acts on exactly what was displayed.
+//! labelled scale; no canvas) and the usage lines. Buttons carry the Agent
+//! and generation shown on screen, so a click acts on exactly what was
+//! displayed.
 
 use windows_reactor::*;
 
@@ -13,14 +13,6 @@ use crate::monitor::{
 use crate::theme;
 use crate::theme::winui::Palette;
 use crate::ui::tokens;
-
-/// One possible new manager with its two bound moves.
-pub struct MoveRow {
-    pub id: String,
-    pub label: String,
-    pub move_agent: Option<Callback<()>>,
-    pub move_children: Option<Callback<()>>,
-}
 
 /// A note: secondary size, wrapped and selectable (callers lower its
 /// emphasis where it is supporting text).
@@ -53,16 +45,18 @@ pub struct CardActions {
 pub fn card(
     row: &MonitorRow,
     title: &str,
+    nested: bool,
     note: Option<&CardNote>,
     actions: CardActions,
     palette: Palette,
 ) -> View {
     let status = row.status_words();
-    // A nested native child sits under its parent already.
+    // A nested child sits under its parent's card already; a top-level one
+    // whose parent is not shown names it.
     let under = row
         .parent
         .as_deref()
-        .filter(|_| !row.native_child)
+        .filter(|_| !nested)
         .map(|parent| format!(" · under {parent}"))
         .unwrap_or_default();
     let (note_line, note_name): (View, String) = match note {
@@ -513,71 +507,6 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
         )),
     }
     views
-}
-
-/// "Change manager": move the Agent with its subtree, or only its
-/// children, under another live Agent. Each button is already bound. The
-/// caller leaves it out when there is nothing to move and nothing to report.
-pub fn manager_section(
-    id: &str,
-    rows: Vec<MoveRow>,
-    status: &str,
-    enabled: bool,
-    palette: Palette,
-) -> View {
-    let moves: Vec<KeyedView> = rows
-        .into_iter()
-        .map(|row| {
-            let button = |text: &str, name: String, callback: Option<Callback<()>>| -> View {
-                match callback {
-                    Some(callback) => crate::m3::outlined(palette)
-                        .is_enabled(enabled)
-                        .automation_name(name)
-                        .on_click(callback)
-                        .content(crate::m3::label(text)),
-                    None => View::empty(),
-                }
-            };
-            KeyedView::new(
-                row.id.clone(),
-                StackPanel::new().spacing(tokens::spacing::XS).children((
-                    small(row.label.clone()),
-                    StackPanel::new()
-                        .orientation(Orientation::Horizontal)
-                        .spacing(tokens::spacing::SM)
-                        .children((
-                            button(
-                                "Move here",
-                                format!("Move {id} under {}", row.id),
-                                row.move_agent,
-                            ),
-                            button(
-                                "Move its workers here",
-                                format!("Move the workers of {id} under {}", row.id),
-                                row.move_children,
-                            ),
-                        )),
-                )),
-            )
-        })
-        .collect();
-    let note: View = if moves.is_empty() {
-        View::empty()
-    } else {
-        small("Swarm checks the manager links, Agent limits and the runs shown here.")
-            .opacity(theme::MUTED_OPACITY)
-            .into()
-    };
-    crate::m3::card_high(palette).content(
-        StackPanel::new().spacing(tokens::spacing::SM).children((
-            crate::m3::section_title("Change manager"),
-            note,
-            StackPanel::new()
-                .spacing(tokens::spacing::MD)
-                .keyed_children(moves),
-            small(status.to_owned()),
-        )),
-    )
 }
 
 #[cfg(test)]

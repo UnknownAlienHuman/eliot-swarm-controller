@@ -87,7 +87,7 @@ pub(super) struct MenuBinding {
 /// "…" menu entries.
 const MENU_DETAILS: &str = "Agent details";
 const MENU_HANDOFF: &str = "Hand off or switch…";
-const MENU_MANAGER: &str = "Change manager…";
+const MENU_MOVE: &str = "Move under another task…";
 const MENU_RESUME: &str = "Resume";
 const MENU_DETACH: &str = "Detach";
 const MENU_STOP: &str = "Stop";
@@ -971,7 +971,30 @@ impl DesktopApp {
     fn agent_menu(&mut self, label: &str, binding: MenuBinding, context: &ComponentContext<Self>) {
         let bound = BoundAction::agent_control(&binding.agent, binding.generation);
         match label {
-            MENU_DETAILS | MENU_MANAGER => self.show_details(&binding.agent, context),
+            MENU_DETAILS => self.show_details(&binding.agent, context),
+            MENU_MOVE => {
+                // Bound to the generation the header shows.
+                let agent = self.find_agent(&binding.agent).cloned().or_else(|| {
+                    self.chat.detail.as_ref().map(|detail| UiAgent {
+                        id: binding.agent.clone(),
+                        generation: binding.generation,
+                        harness: detail.harness.clone(),
+                        state: detail.state,
+                        project: detail.project.clone(),
+                        parent: None,
+                        updated_at: 0,
+                        title: self.agent_title(&binding.agent),
+                        native_child: detail.observe_only,
+                        tokens: None,
+                        chat: false,
+                        archived: false,
+                    })
+                });
+                if let Some(mut agent) = agent {
+                    agent.generation = binding.generation;
+                    self.move_update(super::move_ui::MoveMsg::Open(agent), context);
+                }
+            }
             MENU_HANDOFF => self.handoff_update(
                 handoff_ui::HandoffMsg::Open {
                     agent: binding.agent,
@@ -1591,7 +1614,9 @@ impl DesktopApp {
                 ];
                 if !self.submitting() {
                     items.push(MenuItem::item("handoff", MENU_HANDOFF));
-                    items.push(MenuItem::item("manager", MENU_MANAGER));
+                    if controllable {
+                        items.push(MenuItem::item("move", MENU_MOVE));
+                    }
                     if controllable && ended && detail.active_turn.is_none() {
                         items.push(MenuItem::item("resume", MENU_RESUME));
                     }

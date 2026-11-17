@@ -1,13 +1,18 @@
 //! The sidebar's right-click menus (owner review 2026-11-16): a project's
 //! New task here, Open folder, Rename, Collapse or Expand and Remove
 //! project; a chat's or task's Rename, Stop (while it is live, idle
-//! included), Archive or Unarchive, Delete, Copy Agent ID and Open folder.
+//! included), Move under another task (k113, [`super::move_ui`]), Resume
+//! (a lost one), Archive or Unarchive, Delete, Copy Agent ID and Open
+//! folder.
 //!
-//! Delete asks once, naming the chat. A live chat's Delete is "Stop and
-//! delete" (k98): stop, wait until the Agent reads stopped, then
-//! `agent.delete`; the dialog shows each step and a refused step's typed
-//! error. Archiving the open chat returns to New task with an
-//! "Archived · Undo" notice (the Codex app's archive).
+//! Delete follows the Store's rule (`docs/spec/core.md`, explicit Agent
+//! tree removal): only a stopped or failed tree, once drained. It asks
+//! once, naming the chat. A live chat's Delete is "Stop and delete" (k98):
+//! stop, wait until the Agent reads stopped or failed, then `agent.delete`;
+//! the dialog shows each step and a refused step's typed error. A lost
+//! task cannot be deleted: its menu offers Resume or Archive instead.
+//! Archiving the open chat returns to New task with an "Archived · Undo"
+//! notice (the Codex app's archive).
 //!
 //! Reactor 0.100.0 attaches a `Menu` only as a Button's left-click flyout
 //! and has no `ContextFlyout`, so the menu is drawn in the window, at the
@@ -66,6 +71,10 @@ pub(super) enum Action {
     ToggleCollapse,
     RemoveProject,
     Stop,
+    /// "Move under another task…": open the picker.
+    MoveUnder,
+    /// Resume a lost task in its conversation.
+    Resume,
     Archive(bool),
     Delete,
     CopyId,
@@ -119,6 +128,8 @@ pub(super) struct MenuState {
     pub(super) rename_ref: ElementRef<TextBox>,
     /// A live Agent's Stop and delete in progress (its dialog stays open).
     pub(super) removal: Option<Removal>,
+    /// "Move under another task…" is open.
+    pub(super) moving: Option<super::move_ui::MoveDialog>,
     /// "Archived · Undo" after an archive: the Agent, whether it was the
     /// open conversation, and the notice's epoch (it expires).
     pub(super) archived: Option<(UiAgent, bool, u64)>,
@@ -177,7 +188,7 @@ const REMOVAL_POLL_MS: u64 = 400;
 const ARCHIVED_NOTICE_MS: u64 = 10_000;
 
 /// The menu's width.
-const MENU_WIDTH: f64 = 220.0;
+const MENU_WIDTH: f64 = 248.0;
 
 impl DesktopApp {
     pub(super) fn menu_update(&mut self, msg: MenuMsg, context: &ComponentContext<Self>) {
@@ -434,10 +445,15 @@ impl DesktopApp {
                                 "the stop did not apply; nothing was deleted",
                             ));
                         }
-                        let stopped = matches!(
-                            state,
-                            AgentState::Stopped | AgentState::Failed | AgentState::Lost
-                        );
+                        // The Store deletes only a stopped or failed tree;
+                        // one lost on the way out stays (Resume or Archive).
+                        if stop.is_terminal() && state == AgentState::Lost {
+                            break Err(eliot_core::Error::new(
+                                "lost",
+                                "it was lost while stopping, so Swarm cannot delete it; nothing was deleted. Resume it, or archive it to hide it",
+                            ));
+                        }
+                        let stopped = matches!(state, AgentState::Stopped | AgentState::Failed);
                         if stop.is_terminal() && stopped {
                             break Ok(format!("{state:?}").to_lowercase());
                         }
@@ -625,6 +641,24 @@ impl DesktopApp {
             (Action::Archive(archived), Target::Agent(agent)) => {
                 self.submit_archive(agent.clone(), archived, false, context);
             }
+            (Action::MoveUnder, Target::Agent(agent)) => {
+                self.move_update(super::move_ui::MoveMsg::Open(agent.clone()), context);
+            }
+            (Action::Resume, Target::Agent(agent)) => {
+                if self.submitting() {
+                    self.alert("Waiting for the last action to settle.");
+                    return;
+                }
+                // Resume in its conversation, bound to the run shown.
+                self.shell_update(ShellMsg::AgentOpened(agent.clone()), context);
+                self.chat_update(
+                    ChatMsg::DraftRequested(super::chat_ui::DraftAction::Resume {
+                        agent: agent.id.clone(),
+                        generation: agent.generation,
+                    }),
+                    context,
+                );
+            }
             _ => {}
         }
     }
@@ -770,6 +804,24 @@ impl DesktopApp {
                     entries.push((Action::Stop, "Stop".to_owned(), m3::glyph::STOP, false));
                 }
                 if !agent.native_child {
+                    entries.push((
+                        Action::MoveUnder,
+                        "Move under another task…".to_owned(),
+                        m3::glyph::MOVE,
+                        false,
+                    ));
+                }
+                // A lost task cannot be deleted (the Store keeps it):
+                // resume it, or archive it to hide it.
+                if agent.state == eliot_core::AgentState::Lost && !agent.native_child {
+                    entries.push((
+                        Action::Resume,
+                        "Resume".to_owned(),
+                        m3::glyph::RESUME,
+                        false,
+                    ));
+                }
+                if !agent.native_child {
                     entries.push(if agent.archived {
                         (
                             Action::Archive(false),
@@ -786,7 +838,7 @@ impl DesktopApp {
                         )
                     });
                 }
-                if !agent.native_child {
+                if !agent.native_child && (agent.live() || agent.deletable()) {
                     entries.push((
                         Action::Delete,
                         if agent.live() {
@@ -826,6 +878,9 @@ impl DesktopApp {
         }
         if let Some((target, action)) = &self.menu.confirm {
             return self.confirm_dialog(target, *action, context, palette);
+        }
+        if let Some(dialog) = &self.menu.moving {
+            return self.move_dialog(dialog, context, palette);
         }
         let Some((target, x, y)) = &self.menu.open else {
             return View::empty();

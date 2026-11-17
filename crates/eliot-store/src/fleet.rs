@@ -361,7 +361,13 @@ fn agent_list_select(
         note_index("agents_list_harness", false);
     }
     match filter.archived {
-        core::api::ArchivedFilter::Exclude => equality("archived", 0.into()),
+        // Archive never hides custody the owner must still resolve: an ended
+        // Agent that lost control after it was archived stays listed while
+        // its process, artifact or native source is unresolved.
+        core::api::ArchivedFilter::Exclude => predicates.push(format!(
+            "(agents.archived = 0 OR (agents.state IN ('stopped','failed','lost') AND EXISTS({})))",
+            super::agent_lifecycle::custody_blockers_sql("agents.id", "0")
+        )),
         core::api::ArchivedFilter::Only => equality("archived", 1.into()),
         core::api::ArchivedFilter::Include => {}
     }

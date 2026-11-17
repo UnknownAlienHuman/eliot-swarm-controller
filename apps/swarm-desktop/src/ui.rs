@@ -58,6 +58,7 @@ mod handoff_ui;
 mod launch_ui;
 mod menu_ui;
 mod monitor_ui;
+mod move_ui;
 mod picker_ui;
 mod profiles_ui;
 mod scripts_ui;
@@ -71,6 +72,7 @@ use configure_ui::ConfigureMsg;
 use launch_ui::LaunchMsg;
 use menu_ui::MenuMsg;
 use monitor_ui::MonitorMsg;
+use move_ui::MoveMsg;
 use profiles_ui::ProfilesMsg;
 use scripts_ui::ScriptsMsg;
 use settings_ui::{Page, SettingsMsg};
@@ -212,6 +214,7 @@ enum Message {
     Handoff(handoff_ui::HandoffMsg),
     Settings(SettingsMsg),
     Menu(MenuMsg),
+    Move(MoveMsg),
 }
 
 /// The input to the single desktop window: the workspace plus the shared
@@ -676,6 +679,7 @@ impl Component for DesktopApp {
             Message::Scripts(msg) => self.scripts_update(msg, context),
             Message::Handoff(msg) => self.handoff_update(msg, context),
             Message::Menu(msg) => self.menu_update(msg, context),
+            Message::Move(msg) => self.move_update(msg, context),
         }
     }
 

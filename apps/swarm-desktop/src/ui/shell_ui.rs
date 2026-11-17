@@ -741,7 +741,7 @@ impl DesktopApp {
     }
 
     /// The listed or fetched Agent with this id.
-    fn find_agent(&self, id: &str) -> Option<&UiAgent> {
+    pub(super) fn find_agent(&self, id: &str) -> Option<&UiAgent> {
         let branch_children = self.nav.branches.values().flat_map(|branch| match branch {
             Branch::Loaded { children, .. } => children.as_slice(),
             _ => &[],

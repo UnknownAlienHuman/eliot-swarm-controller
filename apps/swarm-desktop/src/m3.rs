@@ -64,6 +64,10 @@ pub mod glyph {
     pub const CHAT: &str = "\u{E8BD}";
     pub const ARCHIVE: &str = "\u{E7B8}";
     pub const DELETE: &str = "\u{E74D}";
+    /// Move under another task: Segoe Fluent MoveToFolder.
+    pub const MOVE: &str = "\u{E8DE}";
+    /// Resume a lost task: Segoe Fluent Play.
+    pub const RESUME: &str = "\u{E768}";
     pub const RENAME: &str = "\u{E8AC}";
 }
 
