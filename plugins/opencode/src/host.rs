@@ -3,7 +3,7 @@ use crate::{
     native::{
         AuthSetup, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider, OpenCodeHttp,
         OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
-        models::run_models,
+        models::{run_model_variants, run_models},
         types::{InboxUser, McpServerReadback, ModelRef, NativeModelEntry, SessionInfo},
     },
 };
@@ -332,6 +332,12 @@ struct ParsedStart {
     override_model: Option<String>,
     /// Split override ref, present exactly when an override was carried.
     override_model_ref: Option<ModelRef>,
+    /// Frozen profile effort (`Model.Ref.variant`), or `None` for the
+    /// configured native default.
+    requested_effort: Option<String>,
+    /// Inherited-overlay effort for a resume, resolved like
+    /// `override_model`.
+    override_effort: Option<String>,
     requested_agent: Option<String>,
     /// Frozen worker MCP policy. The owned serve never sees the owner's
     /// global config (isolated per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`),
@@ -624,9 +630,12 @@ impl OpenCodePlugin {
     }
 
     /// Read-only model list for `harness.models`: the native `opencode
-    /// models` catalogue (`provider/model` ids verbatim). No server, no
-    /// session, no model turn and no inference. An omitted model still
-    /// leaves the configured native default, read back from the session at
+    /// models` catalogue (`provider/model` ids verbatim) with the
+    /// selectable `Model.Variant` ids overlaid as `efforts` from the
+    /// installed `api model.list` operation (`GET /api/model`). No
+    /// session, no model turn and no inference. A failed variant read
+    /// degrades to the ids-only catalogue; an omitted model still leaves
+    /// the configured native default, read back from the session at
     /// launch.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
         if self.session.is_some() || self.failed_start.is_some() {
@@ -654,13 +663,33 @@ impl OpenCodePlugin {
                 )
             })?;
         let ids = run_models(std::ffi::OsStr::new(program), Instant::now() + RPC_TIMEOUT).await?;
+        let variants =
+            run_model_variants(std::ffi::OsStr::new(program), Instant::now() + RPC_TIMEOUT)
+                .await
+                .ok();
         let models: Vec<Value> = ids
             .into_iter()
             .map(|id| {
-                json!({
-                    "id": id,
-                    "default": false,
-                })
+                let mut entry = serde_json::Map::from_iter([
+                    ("id".to_owned(), Value::String(id.clone())),
+                    ("default".to_owned(), Value::Bool(false)),
+                ]);
+                if let Some(overlay) = variants
+                    .as_ref()
+                    .and_then(|overlay| overlay.iter().find(|candidate| candidate.id == id))
+                {
+                    entry.insert(
+                        "efforts".to_owned(),
+                        Value::Array(
+                            overlay
+                                .variants
+                                .iter()
+                                .map(|variant| Value::String(variant.clone()))
+                                .collect(),
+                        ),
+                    );
+                }
+                Value::Object(entry)
             })
             .collect();
         Ok(json!({"models": models, "default": Value::Null}))
@@ -801,12 +830,22 @@ impl OpenCodePlugin {
                 )
             })
             .transpose()?;
-        let (requested_model, model_ref) = start_model_ref(profile)?;
+        let (requested_model, model_ref, requested_effort) = start_model_ref(profile)?;
         // A resume that inherited a `configure` overlay carries its
-        // effective model as the native realignment target. A carried
-        // effort is ignored here: the native API has no effort knob.
-        let (override_model, override_model_ref) = start_config_override(&params)?;
+        // effective model and effort as the native realignment target
+        // (the effort selects the documented `Model.Ref.variant`).
+        let (override_model, override_model_ref, override_effort) = start_config_override(&params)?;
         let requested_agent = optional_profile_text(profile, "agent", "OpenCode")?;
+        if model_ref
+            .as_ref()
+            .is_some_and(|model_ref| model_ref.variant.is_some())
+            && has_local_fields(profile)
+        {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode effort has no adopted-backend mapping",
+            ));
+        }
         // A local-backend profile always carries an explicit model (the
         // eliot-local segment): local fields without a model fail closed
         // instead of falling back to the native default.
@@ -864,6 +903,8 @@ impl OpenCodePlugin {
             model_ref,
             override_model,
             override_model_ref,
+            requested_effort,
+            override_effort,
             requested_agent,
             requested_mcp_policy,
             mcp_cloud_hostname,
@@ -1152,6 +1193,54 @@ impl OpenCodePlugin {
         } else {
             None
         };
+        // A requested effort selects the documented `Model.Ref.variant` on
+        // the create below: the installed server echoes even bogus
+        // switches, so the live catalogue proves the variant belongs to
+        // the requested model before the session exists. A miss or an
+        // unreadable catalogue is a definite failed start, never unknown.
+        if let Some(requested) = parsed.requested_model.as_deref()
+            && let Some(variant) = parsed
+                .model_ref
+                .as_ref()
+                .and_then(|model_ref| model_ref.variant.as_deref())
+        {
+            let catalogue = match session
+                .http
+                .list_native_models(phase_deadline(envelope, RPC_TIMEOUT))
+                .await
+            {
+                Ok(catalogue) => catalogue,
+                Err(error) => {
+                    let failure = Error::new(
+                        "native_readback",
+                        format!(
+                            "OpenCode start catalogue readback failed ({})",
+                            error.message
+                        ),
+                    );
+                    discard_failed_start(&mut session, failure.clone(), envelope).await;
+                    return Ok(CreateOutcome::ProvenFailed(
+                        self.retain_proven_no_effect_start(
+                            &parsed.params,
+                            StartPhase::Verify,
+                            failure,
+                        ),
+                    ));
+                }
+            };
+            let known = catalogue_variants(&catalogue, requested)
+                .is_some_and(|variants| variants.iter().any(|known| known == variant));
+            if !known {
+                let failure = Error::new(
+                    "profile_error",
+                    format!("OpenCode effort {variant} is not a variant of model {requested}"),
+                );
+                discard_failed_start(&mut session, failure.clone(), envelope).await;
+                return Ok(CreateOutcome::ProvenFailed(
+                    self.retain_proven_no_effect_start(&parsed.params, StartPhase::Verify, failure),
+                ));
+            }
+        }
         // Workspace project MCP layer: the owned serve already merged it,
         // so an owner-identity entry there must refuse the start before the
         // native session exists. Every policy, whatever the entry is named.
@@ -1237,11 +1326,21 @@ impl OpenCodePlugin {
             .as_ref()
             .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
         // An omitted request accepts the configured native default as
-        // effective; an explicit request must match exactly.
+        // effective; an explicit request must match exactly. A requested
+        // effort must echo as the native variant.
         let model_verified = parsed
             .requested_model
             .as_deref()
             .is_none_or(|requested| effective_model.as_deref() == Some(requested));
+        let effective_variant = created
+            .model
+            .as_ref()
+            .and_then(|model| model.variant.clone());
+        let effort_verified = parsed.requested_effort.as_deref().is_none_or(|effort| {
+            effective_variant
+                .as_deref()
+                .is_some_and(|variant| variant == effort)
+        });
         let location_ok = created
             .location
             .as_ref()
@@ -1259,7 +1358,9 @@ impl OpenCodePlugin {
         let mut effective = json!({
             "model": effective_model.clone(),
             "model_verified": model_verified,
-            "model_variant": created.model.as_ref().and_then(|model| model.variant.clone()),
+            "model_variant": effective_variant.clone(),
+            "effort": effective_variant,
+            "effort_verified": effort_verified,
             "cwd": created.location.as_ref().map(|location| location.directory.clone()),
         });
         // The adopted provider fragment was proven before the session
@@ -1306,14 +1407,14 @@ impl OpenCodePlugin {
         } else {
             with_context_points(effective, &[InjectPoint::NextInput])
         };
-        if !model_verified || !location_ok {
+        if !model_verified || !effort_verified || !location_ok {
             let kill_note = delete_created_session(&mut session, &created.id, envelope).await;
             let error = discard_failed_start(
                 &mut session,
                 Error::new(
                     "profile_error",
                     format!(
-                        "OpenCode effective model or session directory did not match the frozen profile; {kill_note}"
+                        "OpenCode effective model, effort or session directory did not match the frozen profile; {kill_note}"
                     ),
                 ),
                 envelope,
@@ -1434,6 +1535,7 @@ impl OpenCodePlugin {
             "native_ref": retained.id,
             "requested": {
                 "model": parsed.requested_model,
+                "effort": parsed.requested_effort,
                 "cwd": parsed.workspace.to_string_lossy(),
             },
             "effective": effective,
@@ -1684,13 +1786,22 @@ impl OpenCodePlugin {
             ));
         }
         // The realignment target is the inherited overlay's effective
-        // model when a resume carries one (the retained session already
-        // runs it), else the frozen request. An omitted request keeps the
-        // retained server-selected model.
+        // model and effort when a resume carries them (the retained
+        // session already runs them), else the frozen request. An omitted
+        // request keeps the retained server-selected model and variant. A
+        // carried model without an effort means the server default.
         let target_model = parsed
             .override_model
             .as_deref()
             .or(parsed.requested_model.as_deref());
+        let target_variant = if parsed.override_model.is_some() {
+            parsed.override_effort.as_deref()
+        } else {
+            parsed
+                .override_effort
+                .as_deref()
+                .or(parsed.requested_effort.as_deref())
+        };
         let target_ref = parsed
             .override_model_ref
             .as_ref()
@@ -1701,6 +1812,13 @@ impl OpenCodePlugin {
                 .as_ref()
                 .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
                 != Some(target.to_owned())
+        });
+        let variant_needed = target_variant.is_some_and(|target| {
+            current
+                .model
+                .as_ref()
+                .and_then(|model| model.variant.as_deref())
+                != Some(target)
         });
         let agent_needed = parsed
             .requested_agent
@@ -1731,17 +1849,24 @@ impl OpenCodePlugin {
                 "agent",
             )?;
         }
-        if model_needed {
-            let model_ref = target_ref.ok_or_else(|| {
-                Error::new(
-                    "source_integrity",
-                    "OpenCode resume needs a model ref for its retained target model",
-                )
-            })?;
+        if model_needed || variant_needed {
+            let mut model_ref = match target_ref.cloned() {
+                Some(model_ref) => model_ref,
+                // An effort-only overlay on a session the server started
+                // without reporting a model keeps the retained model and
+                // only selects the variant.
+                None => current.model.clone().ok_or_else(|| {
+                    Error::new(
+                        "source_integrity",
+                        "OpenCode resume needs a model ref for its retained target model",
+                    )
+                })?,
+            };
+            model_ref.variant = target_variant.map(str::to_owned);
             Self::resume_switch(
                 session
                     .http
-                    .switch_model(session_id, model_ref, deadline)
+                    .switch_model(session_id, &model_ref, deadline)
                     .await,
                 "model",
             )?;
@@ -1756,6 +1881,7 @@ impl OpenCodePlugin {
                     &session.http,
                     session_id,
                     target,
+                    target_variant,
                     deadline,
                     "resume configure",
                 )
@@ -1786,10 +1912,27 @@ impl OpenCodePlugin {
                 "OpenCode effective agent contradicts the applied configuration",
             ));
         }
+        let effective_variant = effective
+            .model
+            .as_ref()
+            .and_then(|model| model.variant.clone());
+        let effort_verified = target_variant.is_none_or(|target| {
+            effective_variant
+                .as_deref()
+                .is_some_and(|variant| variant == target)
+        });
+        if target_variant.is_some() && !effort_verified {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode effective effort contradicts the applied configuration",
+            ));
+        }
         let mut effective_value = json!({
             "model": effective.model.as_ref().map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim())),
             "model_verified": model_verified,
-            "model_variant": effective.model.as_ref().and_then(|model| model.variant.clone()),
+            "model_variant": effective_variant.clone(),
+            "effort": effective_variant,
+            "effort_verified": effort_verified,
             "agent": effective.agent.clone(),
             "agent_verified": agent_verified,
             "cwd": effective.location.as_ref().map(|location| location.directory.clone()),
@@ -1831,6 +1974,7 @@ impl OpenCodePlugin {
         http: &OpenCodeHttp,
         session_id: &str,
         target: &str,
+        target_variant: Option<&str>,
         deadline: Instant,
         context: &str,
     ) -> Result<SessionInfo> {
@@ -1854,6 +1998,16 @@ impl OpenCodePlugin {
             return Err(Error::new(
                 "unknown",
                 format!("OpenCode {context} model contradicts the applied configuration"),
+            ));
+        }
+        let echoed_variant = echoed
+            .model
+            .as_ref()
+            .and_then(|model| model.variant.as_deref());
+        if target_variant.is_some_and(|target| echoed_variant != Some(target)) {
+            return Err(Error::new(
+                "unknown",
+                format!("OpenCode {context} effort contradicts the applied configuration"),
             ));
         }
         Ok(echoed)
@@ -1955,6 +2109,7 @@ impl OpenCodePlugin {
             "native_ref": created.id,
             "requested": {
                 "model": parsed.requested_model,
+                "effort": parsed.requested_effort,
                 "cwd": parsed.workspace.to_string_lossy(),
             },
             "effective": effective,
@@ -1985,14 +2140,15 @@ impl OpenCodePlugin {
         }
     }
 
-    /// Native `configure`: switch the retained session's model through the
-    /// installed `POST /api/session/{id}/model` setter and prove the
-    /// switch with a fresh `session.get`. `effort` has no native knob and
-    /// is refused outright; a requested model outside the live native
-    /// catalogue is rejected before any write, never substituted. A
-    /// refused write proves no effect (`rejected`); anything ambiguous
-    /// after a write may have been admitted (`unknown`). The session that
-    /// already runs the requested model skips the write and verifies by
+    /// Native `configure`: switch the retained session's model and/or
+    /// effort through the installed `POST /api/session/{id}/model`
+    /// setter (the effort selects the documented `Model.Ref.variant`)
+    /// and prove the switch with a fresh `session.get`. A requested
+    /// model or variant outside the live native catalogue is rejected
+    /// before any write, never substituted. A refused write proves no
+    /// effect (`rejected`); anything ambiguous after a write may have
+    /// been admitted (`unknown`). The session that already runs the
+    /// requested model and variant skips the write and verifies by
     /// readback, so a retried configure after an uncertain outcome is
     /// idempotent.
     async fn configure_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -2017,7 +2173,7 @@ impl OpenCodePlugin {
         // (nothing has been written yet), so the settings lane stays free.
         // Only an ambiguous outcome at or after the first write is unknown.
         let requested = match parse_configure_model(&params.args) {
-            Ok(model) => model,
+            Ok(request) => request,
             Err(error) if matches!(error.code.as_str(), "invalid" | "unsupported") => {
                 return Ok(json!({
                     "state": "rejected",
@@ -2048,10 +2204,12 @@ impl OpenCodePlugin {
                     ),
                 )
             })?;
-        if !catalogue_contains(&catalogue, &requested) {
+        if let Some(model) = requested.model.as_deref()
+            && !catalogue_contains(&catalogue, model)
+        {
             return Ok(json!({
                 "state": "rejected",
-                "reason": format!("OpenCode model {requested} is not in the native catalogue"),
+                "reason": format!("OpenCode model {model} is not in the native catalogue"),
             }));
         }
         let current = session
@@ -2071,13 +2229,45 @@ impl OpenCodePlugin {
             .model
             .as_ref()
             .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
-        if current_model.as_deref() != Some(requested.as_str()) {
-            let model_ref = split_model(&requested).ok_or_else(|| {
+        let current_variant = current
+            .model
+            .as_ref()
+            .and_then(|model| model.variant.clone());
+        let Some(target_model) = requested.model.clone().or(current_model.clone()) else {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": "OpenCode configure effort needs a session model",
+            }));
+        };
+        if let Some(effort) = requested.effort.as_deref() {
+            let known = catalogue_variants(&catalogue, &target_model)
+                .is_some_and(|variants| variants.iter().any(|known| known == effort));
+            if !known {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": format!(
+                        "OpenCode effort {effort} is not a variant of model {target_model}"
+                    ),
+                }));
+            }
+        }
+        // A model switch without an effort runs the server default
+        // variant; otherwise the retained variant carries over.
+        let target_variant = requested.effort.clone().or(if requested.model.is_some() {
+            None
+        } else {
+            current_variant.clone()
+        });
+        let switch_needed = Some(target_model.as_str()) != current_model.as_deref()
+            || target_variant.as_deref() != current_variant.as_deref();
+        if switch_needed {
+            let mut model_ref = split_model(&target_model).ok_or_else(|| {
                 Error::new(
-                    "invalid",
-                    "OpenCode configure model must be provider/model with non-empty slash segments and no variant suffix",
+                    "source_integrity",
+                    "OpenCode retained session model is not provider/model with non-empty slash segments",
                 )
             })?;
+            model_ref.variant = target_variant.clone();
             match session
                 .http
                 .switch_model(&session_id, &model_ref, deadline)
@@ -2105,20 +2295,26 @@ impl OpenCodePlugin {
             }
         }
         // The single shared echo verification: only a readback that
-        // names the requested model proves the switch.
+        // names the requested model and variant proves the switch.
         Self::readback_session_model(
             &session.http,
             &session_id,
-            &requested,
+            &target_model,
+            target_variant.as_deref(),
             deadline,
             "configure",
         )
         .await?;
-        Ok(json!({
+        let mut response = json!({
             "state": "applied",
-            "model": requested,
+            "model": target_model,
             "model_verified": true,
-        }))
+        });
+        if let Some(effort) = requested.effort {
+            response["effort"] = Value::String(effort);
+            response["effort_verified"] = Value::Bool(true);
+        }
+        Ok(response)
     }
 
     async fn send_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -3695,12 +3891,21 @@ async fn verify_local_effective(
     }))
 }
 
-/// The requested configure model: exactly one `provider/model` string.
-/// `effort` has no native knob on this harness and refuses the whole
-/// command, as does any other unknown field. Pure and natively ignorant:
-/// the caller gates the write on the live native catalogue and proves the
-/// switch with `session.get`.
-fn parse_configure_model(args: &Value) -> Result<String> {
+/// A configure model/effort request: at least one of the two is present.
+/// A requested model switches the session model; a requested effort
+/// selects the documented `Model.Ref.variant` on that switch. Model and
+/// effort travel together: a model switch without an effort runs the
+/// server default variant.
+#[derive(Debug)]
+struct ConfigureModelRequest {
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// The requested configure model and/or effort. Unknown fields refuse the
+/// whole command; a missing or malformed member is `invalid`. A null
+/// effort is absent; a null or empty model is invalid when present.
+fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
     let args = args
         .as_object()
         .ok_or_else(|| Error::new("invalid", "OpenCode configure args must be a JSON object"))?;
@@ -3712,24 +3917,40 @@ fn parse_configure_model(args: &Value) -> Result<String> {
             ));
         }
     }
-    if args.get("effort").is_some_and(|effort| !effort.is_null()) {
+    let model = match args.get("model") {
+        None => None,
+        Some(value) => {
+            let model = value
+                .as_str()
+                .filter(|model| !model.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::new("invalid", "OpenCode configure requires a non-empty model")
+                })?;
+            split_model(model).ok_or_else(|| {
+                Error::new(
+                    "invalid",
+                    "OpenCode configure model must be provider/model with non-empty slash segments and no variant suffix",
+                )
+            })?;
+            Some(model.to_owned())
+        }
+    };
+    let effort = match args.get("effort") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let text = value.as_str().ok_or_else(|| {
+                Error::new("invalid", "OpenCode configure effort must be a string")
+            })?;
+            checked_effort(Some(text), "invalid")?
+        }
+    };
+    if model.is_none() && effort.is_none() {
         return Err(Error::new(
-            "unsupported",
-            "configure --effort is not supported for the opencode harness: no native effort knob",
+            "invalid",
+            "OpenCode configure requires a model and/or an effort",
         ));
     }
-    let model = args
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|model| !model.trim().is_empty())
-        .ok_or_else(|| Error::new("invalid", "OpenCode configure requires a non-empty model"))?;
-    split_model(model).ok_or_else(|| {
-        Error::new(
-            "invalid",
-            "OpenCode configure model must be provider/model with non-empty slash segments and no variant suffix",
-        )
-    })?;
-    Ok(model.to_owned())
+    Ok(ConfigureModelRequest { model, effort })
 }
 
 /// Whether the live native catalogue carries the exact requested
@@ -3745,45 +3966,102 @@ fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
     )
 }
 
-/// The inherited-overlay realignment target for a resume: the retained
-/// effective model the session already runs. `None` on launch and on
-/// resumes without an overlay; the daemon resolves it from the resume
-/// command's retained revision, so a value that no longer splits is
-/// retained-state corruption, never a profile verdict.
-fn start_config_override(params: &AgentStartParams) -> Result<(Option<String>, Option<ModelRef>)> {
-    let Some(model) = params.model_override.as_deref() else {
-        return Ok((None, None));
+/// The live native catalogue's selectable variant ids for one exact
+/// `provider/model` id (`Model.Variant` ids in wire order). `None` when
+/// the entry is absent or reports no variants member: unknown, never an
+/// empty wardrobe.
+fn catalogue_variants(catalogue: &[NativeModelEntry], requested: &str) -> Option<Vec<String>> {
+    catalogue
+        .iter()
+        .find_map(
+            |entry| match (entry.provider_id.as_deref(), entry.id.as_deref()) {
+                (Some(provider), Some(id))
+                    if format!("{}/{}", provider.trim(), id.trim()) == requested =>
+                {
+                    Some(entry.variants.as_ref().map(|variants| {
+                        variants
+                            .iter()
+                            .filter_map(|variant| variant.id.clone())
+                            .collect()
+                    }))
+                }
+                _ => None,
+            },
+        )
+        .flatten()
+}
+
+/// A frozen effort value: the trimmed string, non-empty, at most 128
+/// bytes, no controls. The live catalogue gate proves membership; this
+/// only rejects unusable shapes before any native I/O.
+fn checked_effort(raw: Option<&str>, code: &'static str) -> Result<Option<String>> {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
     };
-    let model_ref = split_model(model).ok_or_else(|| {
+    if value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(Error::new(
+            code,
+            "OpenCode effort must be non-empty, at most 128 characters and contain no controls",
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+/// The inherited-overlay realignment target for a resume: the retained
+/// effective model and effort the session already runs. `None` on launch
+/// and on resumes without an overlay; the daemon resolves both from the
+/// resume command's retained revision, so a value that no longer splits
+/// is retained-state corruption, never a profile verdict.
+fn start_config_override(
+    params: &AgentStartParams,
+) -> Result<(Option<String>, Option<ModelRef>, Option<String>)> {
+    let effort = checked_effort(params.effort_override.as_deref(), "source_integrity")?;
+    let Some(model) = params.model_override.as_deref() else {
+        return Ok((None, None, effort));
+    };
+    let mut model_ref = split_model(model).ok_or_else(|| {
         Error::new(
             "source_integrity",
             "OpenCode retained configure model is not provider/model with non-empty slash segments and no variant suffix",
         )
     })?;
-    Ok((Some(model.to_owned()), Some(model_ref)))
+    model_ref.variant = effort.clone();
+    Ok((Some(model.to_owned()), Some(model_ref), effort))
 }
 
 /// The frozen profile model: an exact `provider/id` selection plus its
-/// native reference, or absent when the profile omitted it and the
+/// native reference, with the frozen `effort` as the documented
+/// `Model.Ref.variant`. Both absent when the profile omitted them and the
 /// configured native default applies.
 fn start_model_ref(
     profile: &serde_json::Map<String, Value>,
-) -> Result<(Option<String>, Option<ModelRef>)> {
+) -> Result<(Option<String>, Option<ModelRef>, Option<String>)> {
     let requested_model: Option<String> = profile
         .get("model")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned);
+    let effort = checked_effort(
+        profile.get("effort").and_then(Value::as_str),
+        "profile_error",
+    )?;
     let Some(requested) = requested_model else {
-        return Ok((None, None));
+        if effort.is_some() {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode effort without a model has no native mapping",
+            ));
+        }
+        return Ok((None, None, None));
     };
-    let model_ref = split_model(&requested).ok_or_else(|| {
+    let mut model_ref = split_model(&requested).ok_or_else(|| {
         Error::new(
             "profile_error",
             "OpenCode profile model must be provider/model with non-empty slash segments and no variant suffix",
         )
     })?;
-    Ok((Some(requested), Some(model_ref)))
+    model_ref.variant = effort.clone();
+    Ok((Some(requested), Some(model_ref), effort))
 }
 
 /// The frozen start paths: an existing workspace directory and the explicit
@@ -4050,7 +4328,7 @@ mod tests {
     use super::{
         BackendKind, DAEMON_START_TIMEOUT, LocalProvider, McpSettle, OpenCodeHttp, OpenCodePlugin,
         PhaseFailure, START_CLEANUP_BUDGET, START_ENVELOPE, START_SETTLE_RESERVE,
-        SWARM_MCP_SERVER_NAME, StartAdmission, StartPhase, catalogue_contains,
+        SWARM_MCP_SERVER_NAME, StartAdmission, StartPhase, catalogue_contains, catalogue_variants,
         fetch_backend_inventory, local_key_value, mcp_names, mcp_settle, normalize_endpoint,
         opencode_manifest, opencode_scope, parse_configure_model, parse_local_provider,
         phase_budget, phase_deadline, policy_from_snapshot, presession_reason, split_model,
@@ -4143,24 +4421,31 @@ mod tests {
     const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
 
     #[test]
-    fn configure_model_parsing_refuses_effort_and_malformed_ids() {
-        // One exact provider/model id configures; effort and unknown
-        // fields refuse the whole command, never partially apply.
-        assert_eq!(
-            parse_configure_model(&json!({"model": "opencode/kimi"})).unwrap(),
-            "opencode/kimi"
-        );
-        assert_eq!(
-            parse_configure_model(&json!({"model": "p/a/b"})).unwrap(),
-            "p/a/b",
-            "later slashes stay in the model id"
-        );
+    fn configure_model_parsing_accepts_model_and_effort() {
+        // One exact provider/model id and/or one effort configures; a
+        // null effort is absent, unknown fields refuse the whole command,
+        // never partially apply.
+        let only_model = parse_configure_model(&json!({"model": "opencode/kimi"})).unwrap();
+        assert_eq!(only_model.model.as_deref(), Some("opencode/kimi"));
+        assert!(only_model.effort.is_none());
+        let nested = parse_configure_model(&json!({"model": "p/a/b"})).unwrap();
+        assert_eq!(nested.model.as_deref(), Some("p/a/b"));
+        let only_effort = parse_configure_model(&json!({"effort": "low"})).unwrap();
+        assert!(only_effort.model.is_none());
+        assert_eq!(only_effort.effort.as_deref(), Some("low"));
+        let both =
+            parse_configure_model(&json!({"model": "opencode/kimi", "effort": "low"})).unwrap();
+        assert_eq!(both.model.as_deref(), Some("opencode/kimi"));
+        assert_eq!(both.effort.as_deref(), Some("low"));
+        let nulled =
+            parse_configure_model(&json!({"model": "opencode/kimi", "effort": null})).unwrap();
+        assert_eq!(nulled.model.as_deref(), Some("opencode/kimi"));
+        assert!(nulled.effort.is_none(), "null effort is absent");
+        let blanked =
+            parse_configure_model(&json!({"model": "opencode/kimi", "effort": ""})).unwrap();
+        assert_eq!(blanked.model.as_deref(), Some("opencode/kimi"));
+        assert!(blanked.effort.is_none(), "blank effort is absent");
         for (args, code) in [
-            (json!({"effort": "low"}), "unsupported"),
-            (
-                json!({"model": "opencode/kimi", "effort": "low"}),
-                "unsupported",
-            ),
             (json!({"model": "opencode/kimi", "bogus": 1}), "unsupported"),
             (json!({}), "invalid"),
             (json!({"model": ""}), "invalid"),
@@ -4169,56 +4454,81 @@ mod tests {
             (json!({"model": "trailing/"}), "invalid"),
             (json!({"model": "p/a#b"}), "invalid"),
             (json!({"model": null}), "invalid"),
+            (json!({"effort": 5}), "invalid"),
+            (json!({"effort": ""}), "invalid"),
+            (json!({"effort": "   "}), "invalid"),
         ] {
             let error = parse_configure_model(&args).unwrap_err();
             assert_eq!(error.code, code, "configure args must be refused honestly");
         }
-        let effort = parse_configure_model(&json!({
-            "model": "opencode/kimi",
-            "effort": "low"
-        }))
-        .unwrap_err();
-        assert!(
-            effort.message.contains("no native effort knob"),
-            "effort refusal names the missing knob: {}",
-            effort.message
-        );
     }
 
     #[test]
     fn configure_catalogue_matches_exact_provider_model_ids() {
+        use crate::native::types::NativeModelVariant;
         let catalogue = vec![
             NativeModelEntry {
                 id: Some("kimi".to_owned()),
                 provider_id: Some("opencode".to_owned()),
                 limit: None,
+                variants: Some(vec![
+                    NativeModelVariant {
+                        id: Some("low".to_owned()),
+                    },
+                    NativeModelVariant {
+                        id: Some("high".to_owned()),
+                    },
+                ]),
             },
             NativeModelEntry {
                 id: None,
                 provider_id: Some("opencode".to_owned()),
                 limit: None,
+                variants: None,
             },
         ];
         assert!(catalogue_contains(&catalogue, "opencode/kimi"));
         assert!(!catalogue_contains(&catalogue, "opencode/other"));
         assert!(!catalogue_contains(&catalogue, "other/kimi"));
         assert!(!catalogue_contains(&[], "opencode/kimi"));
+        assert_eq!(
+            catalogue_variants(&catalogue, "opencode/kimi"),
+            Some(vec!["low".to_owned(), "high".to_owned()])
+        );
+        assert!(catalogue_variants(&catalogue, "opencode/other").is_none());
+        assert!(catalogue_variants(&[], "opencode/kimi").is_none());
     }
 
     #[test]
     fn resume_override_resolves_the_retained_effective_model() {
         let mut params = AgentStartParams::new("a1", 1, "c1");
-        assert!(start_config_override(&params).unwrap().0.is_none());
+        let (model, model_ref, effort) = start_config_override(&params).unwrap();
+        assert!(model.is_none());
+        assert!(model_ref.is_none());
+        assert!(effort.is_none());
         params.model_override = Some("opencode/kimi".to_owned());
-        let (model, model_ref) = start_config_override(&params).unwrap();
+        params.effort_override = Some("low".to_owned());
+        let (model, model_ref, effort) = start_config_override(&params).unwrap();
         assert_eq!(model.as_deref(), Some("opencode/kimi"));
-        assert!(model_ref.is_some());
+        assert_eq!(effort.as_deref(), Some("low"));
+        let model_ref = model_ref.expect("override ref");
+        assert_eq!(model_ref.variant.as_deref(), Some("low"));
+        // An effort-only overlay carries no model ref.
+        params.model_override = None;
+        let (model, model_ref, effort) = start_config_override(&params).unwrap();
+        assert!(model.is_none());
+        assert!(model_ref.is_none());
+        assert_eq!(effort.as_deref(), Some("low"));
         params.model_override = Some("noslash".to_owned());
         assert_eq!(
             start_config_override(&params).unwrap_err().code,
             "source_integrity",
             "a retained override that no longer splits is corruption"
         );
+        params.model_override = None;
+        params.effort_override = Some("   ".to_owned());
+        let (_, _, effort) = start_config_override(&params).unwrap();
+        assert!(effort.is_none(), "blank override effort is absent");
     }
 
     #[test]
@@ -4294,8 +4604,9 @@ mod tests {
     fn profile_model_preserves_nested_native_id_and_unmapped_variant_selection() {
         let requested = "openrouter/stealth/crouton-alpha";
         let profile = json!({"model":requested});
-        let (frozen, model) = start_model_ref(profile.as_object().unwrap()).unwrap();
+        let (frozen, model, effort) = start_model_ref(profile.as_object().unwrap()).unwrap();
         assert_eq!(frozen.as_deref(), Some(requested));
+        assert!(effort.is_none());
         let model = model.expect("requested model splits");
         assert_eq!(model.provider_id, "openrouter");
         assert_eq!(model.id, "stealth/crouton-alpha");
@@ -4305,12 +4616,42 @@ mod tests {
             json!({"providerID":"openrouter", "id":"stealth/crouton-alpha"})
         );
         assert_eq!(format!("{}/{}", model.provider_id, model.id), requested);
+        // A frozen effort selects the documented variant on the create.
+        let profile = json!({"model": requested, "effort": "xhigh"});
+        let (frozen, model, effort) = start_model_ref(profile.as_object().unwrap()).unwrap();
+        assert_eq!(frozen.as_deref(), Some(requested));
+        assert_eq!(effort.as_deref(), Some("xhigh"));
+        let model = model.expect("requested model splits");
+        assert_eq!(model.variant.as_deref(), Some("xhigh"));
+        assert_eq!(
+            serde_json::to_value(&model).unwrap(),
+            json!({"providerID":"openrouter", "id":"stealth/crouton-alpha", "variant":"xhigh"})
+        );
         // Omitted model defers to the configured native default: requested
         // stays absent separately from the effective readback.
         let absent = json!({});
-        let (frozen, model) = start_model_ref(absent.as_object().unwrap()).unwrap();
+        let (frozen, model, effort) = start_model_ref(absent.as_object().unwrap()).unwrap();
         assert!(frozen.is_none(), "requested absent");
         assert!(model.is_none(), "no ref without a request");
+        assert!(effort.is_none(), "no effort without a request");
+        assert_eq!(
+            start_model_ref(json!({"effort": "low"}).as_object().unwrap())
+                .unwrap_err()
+                .code,
+            "profile_error",
+            "effort without a model has no native mapping"
+        );
+        assert_eq!(
+            start_model_ref(
+                json!({"model": requested, "effort": ""})
+                    .as_object()
+                    .unwrap()
+            )
+            .unwrap()
+            .2,
+            None,
+            "blank effort is absent"
+        );
         // Empty is absent (native default), not malformed: the daemon
         // profile path still rejects empty models before the plugin.
         for malformed in [

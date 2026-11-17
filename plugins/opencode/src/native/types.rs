@@ -519,9 +519,12 @@ pub struct ProviderSettingsReadback {
     pub api_key: Option<serde::de::IgnoredAny>,
 }
 
-/// `GET /api/model` item subset: one entry per effective model. The endpoint
-/// answers an array; the caller selects the exact API model id locally.
-/// Limits absent on the wire report unavailable, never zero.
+/// `GET /api/model` item subset (`Model.Info`): one entry per effective
+/// model. The endpoint answers an array; the caller selects the exact API
+/// model id locally. Limits absent on the wire report unavailable, never
+/// zero. `variants` carries the installed selectable `Model.Variant` ids
+/// (the TUI "Variant" switch); a missing member decodes as unknown, never
+/// as no variants.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeModelEntry {
@@ -531,6 +534,19 @@ pub struct NativeModelEntry {
     pub provider_id: Option<String>,
     #[serde(default)]
     pub limit: Option<NativeModelLimit>,
+    #[serde(default)]
+    pub variants: Option<Vec<NativeModelVariant>>,
+}
+
+/// Installed `Model.Variant` subset: only the selectable id is modelled.
+/// Its `settings` differ per provider package (`reasoningEffort`,
+/// `reasoning.effort`, `thinking`, ...) and stay ignored: the id alone
+/// selects the variant through `Model.Ref.variant`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeModelVariant {
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// Effective per-model limit subset (`limit.context/input/output`).
@@ -1117,9 +1133,27 @@ mod tests {
         assert_eq!(limit.context, Some(131072));
         assert_eq!(limit.output, Some(8192));
         assert_eq!(limit.input, None);
+        assert!(entry.variants.is_none(), "absent variants stay unknown");
         let bare: NativeModelEntry =
             serde_json::from_value(serde_json::json!({"id": "m"})).expect("sparse entry decodes");
         assert!(bare.limit.is_none());
+
+        // Recorded `Model.Info` variant shape (`opencode api model.list`,
+        // installed 2.2.7): variant ids decode, provider-specific settings
+        // stay ignored.
+        let varied: NativeModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "deepseek-v4.1-flash-free", "providerID": "opencode",
+            "variants": [
+                {"id": "low", "settings": {"reasoningEffort": "low"}},
+                {"id": "high", "settings": {"reasoningEffort": "high"}},
+                {"id": "max", "settings": {"reasoningEffort": "max"}},
+            ],
+        }))
+        .expect("variant entry decodes");
+        let variants = varied.variants.expect("variants");
+        assert_eq!(variants.len(), 3);
+        assert_eq!(variants[0].id.as_deref(), Some("low"));
+        assert_eq!(variants[2].id.as_deref(), Some("max"));
     }
 
     #[test]
