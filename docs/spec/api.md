@@ -645,8 +645,8 @@ optional members are omitted when requests are serialized.
 
 `agent.archive {id, agent:"aN", archived:bool}` is Owner-only and atomically
 archives or unarchives the selected Agent and all current descendants. Every
-member must be idle or stopped, with no active/uncertain turn, pending request or
-open command; otherwise it returns typed `busy` and stops nothing. The flag is
+member must be idle or ended (stopped, failed or lost), with no active/uncertain
+turn, pending request or open command; otherwise it returns typed `busy` and stops nothing. The flag is
 durable. Admission of send, resume, steer or inject atomically unarchives its
 target, including selector members, so new activity appears in the default list.
 `agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;

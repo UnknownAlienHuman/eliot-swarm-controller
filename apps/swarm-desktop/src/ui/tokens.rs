@@ -42,6 +42,9 @@ pub mod height {
     pub const FORM_ROW: f64 = 36.0;
     /// A sidebar sub-row: a task under its project, Recents and "No tasks".
     pub const SUB_ROW: f64 = 28.0;
+    /// A picker row with a supporting line under its title (the move
+    /// picker's tasks).
+    pub const TWO_LINE_ROW: f64 = 48.0;
 }
 
 /// The four type styles.

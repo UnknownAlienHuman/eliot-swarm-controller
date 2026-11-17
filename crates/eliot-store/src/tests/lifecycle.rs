@@ -579,3 +579,31 @@ fn failed_agent_deletion_retains_custody_and_unknown_turn_guards() {
         reply
     );
 }
+
+#[test]
+fn a_lost_tree_archives_and_unarchives_but_does_not_delete() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let agent = ready_steer_agent(&mut store, "archive-lost", now);
+    store.mark_lost(&agent, 1, now + 1).unwrap();
+    assert_eq!(
+        store.get_agent(&agent).unwrap().unwrap().state,
+        AgentState::Lost
+    );
+    assert_eq!(
+        store
+            .change_agent_tree(&Ulid::new().to_string(), &agent, None, now + 2)
+            .unwrap_err()
+            .code,
+        "busy"
+    );
+    let reply = store
+        .change_agent_tree(&Ulid::new().to_string(), &agent, Some(true), now + 2)
+        .unwrap();
+    assert_eq!(reply["archived"], true);
+    assert!(store.get_agent(&agent).unwrap().unwrap().archived);
+    store
+        .change_agent_tree(&Ulid::new().to_string(), &agent, Some(false), now + 3)
+        .unwrap();
+    assert!(!store.get_agent(&agent).unwrap().unwrap().archived);
+}

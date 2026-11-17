@@ -476,9 +476,12 @@ of the explicitly selected release scope.
       effort from `harness.models` read under that Agent's frozen route (`agent`),
       with the daemon's per-field `configure` refusals; the details show
       requested, next-turn (revision, application point) and effective values with
-      their turn-proven verified marks. Change manager moves an Agent, or all of a
-      manager's children, to another manager through `swarm.reparent`, each move
-      a button bound to the generations shown. A Hand off / Switch dialog selects the original task SEND
+      their turn-proven verified marks. "Move under another task…" (a task's
+      "…" and right-click menus, not the details panel) moves an Agent with its
+      own workers under another running or ready task of the same project
+      through `swarm.reparent`: a picker with a search box and one
+      confirmation, bound to the generations shown; the daemon's refusal reads
+      in plain words. A Hand off / Switch dialog selects the original task SEND
       and up to 64 undispatched SENDs, then hands off to an existing Agent
       (`swarm.handoff`) or switches to a new profile or ad-hoc Agent
       (`swarm.switch`, cross-harness). It shows cancellations, successors, brief
@@ -508,8 +511,8 @@ of the explicitly selected release scope.
       shortcuts and popover keys come from hooks scoped to the window's thread;
       a search suggestion reached with ↑/↓ is only highlighted, and Enter or a
       click opens it. The conversation has a one-line header (title, status
-      dot, details toggle, a "…" menu for Hand off/Switch, Change manager,
-      Resume, Detach, Stop and Force stop); coverage, ids and readback live in
+      dot, details toggle, a "…" menu for Hand off/Switch, Move under another
+      task, Resume, Detach, Stop and Force stop); coverage, ids and readback live in
       the details panel. The composer of a conversation carries its project,
       the model-and-effort and access chips, Send (which steers the running
       turn, D10), and Interrupt only while a turn runs; a new task's composer
@@ -617,8 +620,12 @@ of the explicitly selected release scope.
       then "as of HH:MM", and the composer's usage ring), need the k92
       daemon contract and say so on an older daemon. Details and monitor speak
       plain words and hide empty rows (`swarm why`'s origin line stays);
-      observed native children nest under their parent and stay out of
-      Recents. (Refs #407)
+      Swarm workers and observed native subagents nest under their parent in
+      the monitor, collapsed, with their count and states ("22 workers · 2
+      working"); a worker that needs attention raises its parent into Needs
+      attention, named on the card. Recents lists top-level tasks only. Delete
+      follows the Store (stopped or failed trees, once drained); a lost task
+      offers Resume or Archive instead. (Refs #407)
 
 - [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider
       readers, durable archive/delete, settings project removal and private chats.

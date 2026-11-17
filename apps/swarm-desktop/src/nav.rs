@@ -90,6 +90,15 @@ impl UiAgent {
         )
     }
 
+    /// The Store deletes only a stopped or failed tree (`docs/spec/core.md`,
+    /// explicit Agent tree removal); a lost one is resumed or archived.
+    pub fn deletable(&self) -> bool {
+        matches!(
+            self.state,
+            eliot_core::AgentState::Stopped | eliot_core::AgentState::Failed
+        )
+    }
+
     /// The owner has something to do: answer a pending request
     /// (`waiting`), decide about a failed or lost task (Resume, why, or
     /// archive it), or settle an Agent Swarm controls whose state it cannot
@@ -561,9 +570,10 @@ pub fn search(listed: &[UiAgent], checkouts: &[Checkout], query: &str) -> Vec<(S
         .collect()
 }
 
-/// The most recently changed conversations the sidebar does not list
-/// elsewhere (`listed`), newest first (ties by id), at most `limit`: no
-/// native observed child (it lives under its parent) and nothing archived.
+/// The most recently changed tasks the sidebar does not list elsewhere
+/// (`listed`), newest first (ties by id), at most `limit`: top-level tasks
+/// only, never a worker or a native subagent (each lives under its
+/// parent), and nothing archived.
 pub fn recents<'a>(
     agents: &'a [UiAgent],
     limit: usize,
@@ -571,7 +581,7 @@ pub fn recents<'a>(
 ) -> Vec<&'a UiAgent> {
     let mut recent: Vec<&UiAgent> = agents
         .iter()
-        .filter(|agent| !agent.native_child && !agent.archived)
+        .filter(|agent| agent.parent.is_none() && !agent.archived)
         .filter(|agent| !listed.contains(agent.id.as_str()))
         .collect();
     recent.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
@@ -654,7 +664,7 @@ impl Fleet {
     pub fn summary(&self, total: usize, archived: Archived) -> String {
         let working = self.running + archived.running;
         // An archived live Agent that is not running is idle (archive
-        // accepts only idle or stopped trees).
+        // accepts only idle or ended trees).
         let idle = self.idle + archived.live.saturating_sub(archived.running);
         if total == 0 && archived.total == 0 {
             return "No Agents yet".to_owned();
@@ -1385,7 +1395,11 @@ mod tests {
         orphan.native_child = true;
         let mut chat = with(agent("a4", "/home/Eliot/chats/a4", None), "idle", 30);
         chat.chat = true;
-        let listed = vec![parent, child, orphan, chat];
+        // Swarm workers stay out of Recents too, newest or not, whether
+        // their manager is listed (a1) or not (a9).
+        let worker = with(agent("a5", "/w", Some("a1")), "idle", 60);
+        let far_worker = with(agent("a6", "/w", Some("a9")), "idle", 70);
+        let listed = vec![parent, child, orphan, chat, worker, far_worker];
         let recent: Vec<&str> = recents(&listed, 8, &HashSet::new())
             .iter()
             .map(|a| a.id.as_str())
@@ -1393,10 +1407,11 @@ mod tests {
         assert_eq!(recent, ["a4", "a1"]);
         let sections = View::default().sections(&listed, &[]);
         assert_eq!(sections.len(), 1, "the chat makes no project of its own");
-        assert_eq!(ids(&sections[0]), [("a1", 0)]);
+        // A worker whose manager is not listed stays a top-level row.
+        assert_eq!(ids(&sections[0]), [("a6", 0), ("a1", 0)]);
         assert_eq!(
-            sections[0].rows[0].children, 1,
-            "the native child nests under a1"
+            sections[0].rows[1].children, 2,
+            "the native child and the worker nest under a1"
         );
         let chat_ids: Vec<&str> = chats(&listed).iter().map(|a| a.id.as_str()).collect();
         assert_eq!(chat_ids, ["a4"]);

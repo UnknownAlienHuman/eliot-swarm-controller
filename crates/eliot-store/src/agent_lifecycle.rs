@@ -71,8 +71,13 @@ impl Store {
         for num in &members {
             let row = load_agent_by_num(&tx, *num)?
                 .ok_or_else(|| Error::new("source_integrity", "Agent tree changed"))?;
+            // Archive hides a tree that is not working: idle, or ended
+            // (stopped, failed or lost). Delete needs a settled end.
             let allowed = if archived.is_some() {
-                matches!(row.state, AgentState::Idle | AgentState::Stopped)
+                matches!(
+                    row.state,
+                    AgentState::Idle | AgentState::Stopped | AgentState::Failed | AgentState::Lost
+                )
             } else {
                 matches!(row.state, AgentState::Stopped | AgentState::Failed)
             };
@@ -85,7 +90,7 @@ impl Store {
                         row.state,
                         method,
                         if archived.is_some() {
-                            "idle or stopped"
+                            "idle or ended (stopped, failed or lost)"
                         } else {
                             "stopped or failed"
                         },

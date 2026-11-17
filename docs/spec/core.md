@@ -893,8 +893,9 @@ read paths; a retried ack over it succeeds as already acked. An unset
 ## Explicit Agent tree presentation and removal
 
 `archived` is a durable presentation flag independent of lifecycle state; archiving
-never stops a generation. Archive/unarchive requires idle or stopped descendants,
-no active or unknown turns, pending requests or open commands.
+never stops a generation. Archive/unarchive requires idle or ended (stopped, failed
+or lost) descendants, no active or unknown turns, pending requests or open commands,
+so a lost tree that cannot be deleted can still be hidden.
 Send, resume, steer and inject admission atomically clears the target's archive flag.
 Deletion requires every descendant stopped or failed and drained, and shares retention's leaf-first command
 row cleanup. Store removes dependent records in one transaction and retains

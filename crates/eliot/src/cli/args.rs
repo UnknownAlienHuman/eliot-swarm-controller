@@ -137,7 +137,7 @@ pub(crate) enum CliCommand {
     Detach(DetachArgs),
     /// Stop an Agent.
     Stop(StopArgs),
-    /// Hide an idle or stopped Agent tree.
+    /// Hide an idle or ended (stopped, failed or lost) Agent tree.
     Archive(ShowArgs),
     /// Restore an archived Agent tree.
     Unarchive(ShowArgs),

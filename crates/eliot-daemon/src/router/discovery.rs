@@ -44,7 +44,7 @@ macro_rules! method {
 // Every Router match arm is described here. The coverage regression below makes
 // omission deliberate: new methods must be described before they can ship.
 const METHODS: &[Method] = &[
-    method!("agent.archive", AgentArchiveRequest, AgentTreeResponse, true, true, "Archive or unarchive an idle or stopped Agent tree, without stopping it.", {"id":EXAMPLE_ID,"agent":"a1","archived":true}),
+    method!("agent.archive", AgentArchiveRequest, AgentTreeResponse, true, true, "Archive or unarchive an idle or ended (stopped, failed or lost) Agent tree, without stopping it.", {"id":EXAMPLE_ID,"agent":"a1","archived":true}),
     method!("agent.delete", AgentDeleteRequest, AgentTreeResponse, true, true, "Delete stopped or failed Agent trees after custody drains; preserve files.", {"id":EXAMPLE_ID,"agent":"a1"}),
     method!("artifact.register", ArtifactRegisterRequest, ArtifactView, false, true, "Register an existing Agent-owned artifact directory with exact generation and opened identity.", {"id":EXAMPLE_ID,"path":"C:/scratch/build","kind":"build","purpose":"assignment build"}),
     method!("cleanup.plan", CleanupPlanRequest, CleanupPlan, false, false, "Plan bounded cleanup: Agents own subtree; Owner project or all. No deletion.", {"scope":"self_tree"}),
