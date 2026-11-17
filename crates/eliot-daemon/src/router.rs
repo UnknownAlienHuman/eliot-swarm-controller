@@ -3256,7 +3256,7 @@ impl Router {
         let scope = request.effective_scope();
         let after = request.cursor()?;
         let limit = request.limit;
-        let (generation, processes) = {
+        let (generation, mut processes) = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, generation)?;
             let agent = store
@@ -3302,6 +3302,9 @@ impl Router {
                 )?,
             )
         };
+        self.inner
+            .monitoring
+            .refresh_process_timestamps(id, generation, scope, &mut processes);
         let next = processes
             .last()
             .map(|process| {

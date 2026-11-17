@@ -204,6 +204,16 @@ and an omitted process is not proof of exit. Keep timestamps truthful and releas
 sweep snapshot after use. This does not strengthen Unix containment or replace Windows
 Job observation.
 
+Unchanged process observations still validate generation, source, ownership and
+the full process identity, but do not rewrite process or source rows. Their durable
+`updated_at` records the last changed process fact; the monitor retains each
+accepted sample and its freshness in memory. Process read views overlay the cached
+sample timestamp only when identity, owner, role, state and exit code still match
+the durable record, never advancing it past an actual accepted sample. Restart
+has no cache and exposes the retained timestamps. State/role/exit-code changes
+still commit before publication, and workspace-source closure is checked even
+when the sampled records are unchanged.
+
 ## Starting processes
 
 These rules apply to plugins, services, hooks, scripts, checks, Git and workspace setup:

@@ -21,6 +21,7 @@ impl Store {
         validate_process_generation(&tx, &current, generation, scope, false)?;
         let source = require_process_source(&tx, agent_num, generation, scope)?;
         let mut events = Vec::new();
+        let mut changed = false;
         for record in records {
             let start_time = validate_process_identity(&record.identity)?;
             let old = tx
@@ -41,6 +42,16 @@ impl Store {
                     "a closed OS source cannot admit a non-exited process",
                 ));
             }
+            if let Some(old) = &old {
+                // Sampling freshness lives in the monitor cache. Retain all
+                // validation and merge rules, but do not dirty WAL pages for
+                // another observation of the same durable process facts.
+                next.updated_at = old.updated_at;
+                if &next == old {
+                    continue;
+                }
+                next.updated_at = now;
+            }
             db!(tx.execute(
                 "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -52,6 +63,7 @@ impl Store {
                     next.role, process_state_name(next.state), next.exit_code, now,
                 ],
             ));
+            changed = true;
             if old.is_none() {
                 events.push(insert_process_event(
                     &tx,
@@ -86,7 +98,8 @@ impl Store {
                 )?);
             }
         }
-        db!(tx.execute(
+        if changed {
+            db!(tx.execute(
             "UPDATE source_state SET last_store_seq = COALESCE(?1, last_store_seq), updated_at = ?2
              WHERE agent = ?3 AND generation = ?4 AND source = ?5",
             params![
@@ -96,7 +109,8 @@ impl Store {
                 generation,
                 scope.source()
             ],
-        ));
+            ));
+        }
         if matches!(scope, ProcessSourceKind::Workspace) {
             close_finished_workspace_process_source(&tx, agent_num, generation, now, &mut events)?;
         }

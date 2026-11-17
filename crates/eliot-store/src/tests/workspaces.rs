@@ -1468,3 +1468,102 @@ fn managed_workspace_pages_list_every_retained_worktree_with_total_and_cursor() 
     assert!(after_last.is_empty());
     assert_eq!((total, more), (2, false));
 }
+
+#[test]
+fn unchanged_process_samples_do_not_write_but_transitions_and_guards_remain() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let (agent, _) = ready_capacity_agent(&mut store, "process-noop", now);
+    install_live_custody_observations(&mut store, &agent, 1, now + 1);
+    let process_owner = format!("agent:{agent}#1");
+    let mut record = store.list_processes(&process_owner, None, 10).unwrap()[0].clone();
+    let changes = |store: &Store| -> i64 {
+        store
+            .connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
+    };
+    let before = changes(&store);
+    let sources = store.list_source_states(&agent, 1).unwrap();
+    assert!(
+        store
+            .observe_processes(&agent, 1, &[record.clone()], now + 2)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .observe_processes(&agent, 1, &[], now + 3)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(changes(&store), before);
+    assert_eq!(store.list_source_states(&agent, 1).unwrap(), sources);
+    assert_eq!(
+        store.list_processes(&process_owner, None, 10).unwrap()[0],
+        record
+    );
+    assert!(
+        store
+            .observe_processes(&agent, 2, &[record.clone()], now + 4)
+            .is_err()
+    );
+    let mut foreign = record.clone();
+    foreign.owner = "agent:a999#1".to_owned();
+    assert!(
+        store
+            .observe_processes(&agent, 1, &[foreign], now + 4)
+            .is_err()
+    );
+    assert_eq!(changes(&store), before);
+
+    record.state = ProcessState::Unknown;
+    let events = store
+        .observe_processes(&agent, 1, &[record.clone()], now + 5)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "process.unknown");
+    assert_eq!(
+        store.list_processes(&process_owner, None, 10).unwrap()[0].state,
+        ProcessState::Unknown
+    );
+    record.state = ProcessState::Exited;
+    let events = store
+        .observe_processes(&agent, 1, &[record.clone()], now + 6)
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "process.exited");
+    record.exit_code = Some(0);
+    assert!(
+        store
+            .observe_processes(&agent, 1, &[record.clone()], now + 7)
+            .unwrap()
+            .is_empty()
+    );
+    let exited = store.list_processes(&process_owner, None, 10).unwrap()[0].clone();
+    assert_eq!(exited.exit_code, Some(0));
+    assert_eq!(exited.updated_at, now + 7);
+    let before = changes(&store);
+    record.state = ProcessState::Unknown;
+    record.exit_code = None;
+    assert!(
+        store
+            .observe_processes(&agent, 1, &[record.clone()], now + 8)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(changes(&store), before);
+    assert_eq!(
+        store.list_processes(&process_owner, None, 10).unwrap()[0],
+        exited
+    );
+    record.state = ProcessState::Running;
+    assert!(
+        store
+            .observe_processes(&agent, 1, &[record], now + 9)
+            .is_err()
+    );
+}
