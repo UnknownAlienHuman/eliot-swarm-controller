@@ -108,13 +108,43 @@ fn origin_urls_read_as_their_repository_name_without_credentials() {
         (r"C:\repos\atlas.git", Some("atlas")),
         ("https://host/acme/atlas.git?token=secret", Some("atlas")),
         ("atlas", Some("atlas")),
-        ("https://host/", Some("host")),
+        ("https://host/", None),
         ("", None),
         ("   ", None),
         ("https://host/acme/.git", None),
     ] {
         assert_eq!(repository_name_from_url(url).as_deref(), name, "{url:?}");
     }
+}
+
+#[test]
+fn hostile_origin_urls_never_yield_userinfo_or_authority() {
+    for remote in [
+        "https://alice:prefix?fragment@host",
+        "https://alice:prefix/fragment@host",
+        "https://alice/prefix#fragment@host/repo",
+        "https://alice:prefix#fragment@host/repo",
+        "https://alice:secret@host?query=/repo",
+        "https://host:8443",
+        "https://host:invalid/repo",
+        "https:///repo",
+        "https:/repo",
+        "ssh://git@host",
+        "git@host:",
+        "ext::git upload-pack repo",
+        "https://host/team/%40masked",
+        "https://host/team/repo\nhttps://other/another",
+    ] {
+        assert_eq!(repository_name_from_url(remote), None, "{remote:?}");
+    }
+    assert_eq!(
+        repository_name_from_url("git@[::1]:/srv/tools.git").as_deref(),
+        Some("tools")
+    );
+    assert_eq!(
+        repository_name_from_url("../local/tools.git").as_deref(),
+        Some("tools")
+    );
 }
 
 #[test]

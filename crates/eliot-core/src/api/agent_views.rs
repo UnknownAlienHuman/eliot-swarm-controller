@@ -642,13 +642,75 @@ fn is_repository_name(name: &str) -> bool {
 /// embeds credentials never reaches a readback. `None` when no valid name
 /// remains.
 pub fn repository_name_from_url(url: &str) -> Option<String> {
-    let url = url.trim();
-    let url = url.split(['?', '#']).next().unwrap_or(url);
-    let last = url
-        .rsplit(['/', '\\', ':'])
-        .find(|segment| !segment.is_empty())?;
+    let url = url.strip_suffix('\n').unwrap_or(url);
+    let url = url.strip_suffix('\r').unwrap_or(url);
+    if url.chars().any(char::is_control) {
+        return None;
+    }
+    let path = if let Some((scheme, after_scheme)) = url.split_once("://") {
+        let end = after_scheme.find(['/', '?', '#'])?;
+        let (authority, tail) = after_scheme.split_at(end);
+        if !tail.starts_with('/')
+            || (authority.is_empty() && !scheme.eq_ignore_ascii_case("file"))
+            || authority.matches('@').count() > 1
+            || tail.contains('@')
+            || url.contains('\\')
+            || url.chars().any(char::is_whitespace)
+        {
+            return None;
+        }
+        let parsed = url::Url::parse(url).ok()?;
+        if parsed.cannot_be_a_base()
+            || (parsed.host().is_none() && !scheme.eq_ignore_ascii_case("file"))
+        {
+            return None;
+        }
+        tail.split(['?', '#']).next()?
+    } else {
+        if url.contains(['?', '#']) {
+            return None;
+        }
+        // A drive path is local. Otherwise a colon before any slash is the
+        // SCP host separator (including a bracketed IPv6 host).
+        let drive = url.as_bytes().get(1) == Some(&b':') && url.as_bytes()[0].is_ascii_alphabetic();
+        let host_start = url.rsplit_once('@').map_or(url, |(_, host)| host);
+        let colon = if host_start.starts_with('[') {
+            host_start
+                .find("]:")
+                .map(|end| url.len() - host_start.len() + end + 1)
+        } else {
+            url.find(':')
+        };
+        match colon {
+            _ if drive => &url[2..],
+            Some(end) if !url[..end].contains(['/', '\\']) => {
+                let (host, path) = (&url[..end], &url[end + 1..]);
+                if host.is_empty()
+                    || ["http", "https", "file", "ssh", "git", "ftp", "ftps"]
+                        .iter()
+                        .any(|scheme| host.eq_ignore_ascii_case(scheme))
+                    || host.matches('@').count() > 1
+                    || host.chars().any(char::is_whitespace)
+                    || path.contains(['@', ':', '\\'])
+                    || url::Url::parse(&format!("ssh://{host}/"))
+                        .ok()?
+                        .host()
+                        .is_none()
+                {
+                    return None;
+                }
+                path
+            }
+            _ if url.contains('@') => return None,
+            _ => url,
+        }
+    };
+    let last = path
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()?;
     let name = last.strip_suffix(".git").unwrap_or(last);
-    is_repository_name(name).then(|| name.to_owned())
+    (is_repository_name(name) && !name.contains('%')).then(|| name.to_owned())
 }
 
 /// Result of project discovery; `None` means the path is not a Git checkout.
