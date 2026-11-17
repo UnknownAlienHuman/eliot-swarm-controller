@@ -131,18 +131,16 @@ pub struct HandoffResponse {
 #[serde(deny_unknown_fields)]
 pub struct CommandCancelRequest {
     pub id: String,
+    /// Exact nonblank command ID, at most 256 bytes; includes derived IDs.
     pub command_id: String,
 }
 
 impl CommandCancelRequest {
     pub fn validate(&self) -> Result<()> {
-        if self.id.trim().is_empty() || self.command_id.is_empty() || self.command_id.len() > 256 {
-            return Err(Error::new(
-                "invalid",
-                "cancel requires a mutation id and exact command id",
-            ));
+        if self.id.trim().is_empty() {
+            return Err(Error::new("invalid", "cancel mutation id must be nonblank"));
         }
-        Ok(())
+        crate::command::validate_command_id(&self.command_id)
     }
 }
 

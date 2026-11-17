@@ -105,8 +105,10 @@ impl RuleStateView {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandGetRequest {
-    #[serde(deserialize_with = "required_id")]
-    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
+    #[serde(deserialize_with = "required_command_id")]
+    #[schemars(
+        description = "Exact nonblank command ID, at most 256 bytes; includes derived IDs and is preserved without normalization."
+    )]
     pub id: String,
 }
 
@@ -116,7 +118,7 @@ impl CommandGetRequest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_id(&self.id)
+        crate::command::validate_command_id(&self.id)
     }
 }
 
@@ -209,16 +211,18 @@ impl AgentResultRequest {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandChildrenRequest {
-    #[serde(deserialize_with = "required_id")]
-    #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
+    #[serde(deserialize_with = "required_command_id")]
+    #[schemars(
+        description = "Exact nonblank command ID, at most 256 bytes; includes derived IDs and is preserved without normalization."
+    )]
     pub id: String,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "present_id"
+        deserialize_with = "present_command_id"
     )]
     #[schemars(
-        description = "Nonblank string; preserved without trimming or normalization.",
+        description = "Exact nonblank command ID, at most 256 bytes; preserved without normalization.",
         with = "String"
     )]
     pub after: Option<String>,
@@ -240,9 +244,9 @@ impl CommandChildrenRequest {
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_id(&self.id)?;
+        crate::command::validate_command_id(&self.id)?;
         if let Some(after) = &self.after {
-            validate_id(after)?;
+            crate::command::validate_command_id(after)?;
         }
         if !(1..=super::MAX_LIMIT).contains(&self.limit) {
             return Err(Error::new("invalid", "limit must be between 1 and 1000"));
@@ -268,6 +272,20 @@ pub struct AgentResultResponse {
     pub turns: Vec<Turn>,
     #[serde(deserialize_with = "object_agent")]
     pub agent_metadata: Agent,
+}
+
+fn required_command_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error> {
+    let id = String::deserialize(deserializer)?;
+    crate::command::validate_command_id(&id).map_err(serde::de::Error::custom)?;
+    Ok(id)
+}
+
+fn present_command_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    required_command_id(deserializer).map(Some)
 }
 
 fn validate_id(value: &str) -> Result<()> {
@@ -366,6 +384,44 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn all_command_reference_requests_share_the_bounded_validator() {
+        for id in [
+            "01M7MEN64NE9TXV12N4JNF3QCW/send".to_owned(),
+            " ".to_owned(),
+            "x".repeat(257),
+        ] {
+            let valid = crate::command::validate_command_id(&id).is_ok();
+            assert_eq!(CommandGetRequest::new(&id).validate().is_ok(), valid);
+            let mut children = CommandChildrenRequest::new(&id);
+            assert_eq!(children.validate().is_ok(), valid);
+            children.id = "parent".to_owned();
+            children.after = Some(id.clone());
+            assert_eq!(children.validate().is_ok(), valid);
+            assert_eq!(
+                serde_json::from_value::<CommandGetRequest>(json!({"id":id})).is_ok(),
+                valid
+            );
+            assert_eq!(
+                serde_json::from_value::<CommandChildrenRequest>(json!({"id":"parent","after":id}))
+                    .is_ok(),
+                valid
+            );
+            let cancel = super::super::CommandCancelRequest {
+                id: "mutation".to_owned(),
+                command_id: id.clone(),
+            };
+            assert_eq!(cancel.validate().is_ok(), valid);
+            let resolve = super::super::CommandResolveRequest {
+                id: "mutation".to_owned(),
+                command_id: id.clone(),
+                resolution: super::super::CommandResolution::Failed,
+                reason: "owner assertion".to_owned(),
+            };
+            assert_eq!(resolve.validate().is_ok(), valid);
+        }
+    }
+
+    #[test]
     fn command_ids_are_required_nonempty_and_not_normalized_or_quoted() {
         for request in [
             json!({}),
@@ -378,7 +434,10 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<CommandGetRequest>(request).is_err());
         }
-        for id in [" raw read id ".to_owned(), "x".repeat(4096)] {
+        for id in [
+            " raw read id ".to_owned(),
+            "x".repeat(crate::limits::MAX_COMMAND_ID_BYTES),
+        ] {
             let request: CommandGetRequest = serde_json::from_value(json!({"id":id})).unwrap();
             assert_eq!(request.id, id);
             request.validate().unwrap();

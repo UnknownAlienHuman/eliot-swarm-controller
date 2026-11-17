@@ -617,8 +617,11 @@ mod tests {
     }
 
     #[test]
-    fn reply_checks_add_no_id_normalization_or_length_quota() {
-        for id in [" command-1 ".to_owned(), "x".repeat(8192)] {
+    fn reply_checks_preserve_exact_bounded_command_ids() {
+        for id in [
+            " command-1 ".to_owned(),
+            "x".repeat(crate::limits::MAX_COMMAND_ID_BYTES),
+        ] {
             let request = CommandGetRequest { id: id.clone() };
             let mut reply = command();
             reply.id = id;
@@ -626,5 +629,8 @@ mod tests {
             reply.id.push('x');
             assert_unknown(request.validate_response(&reply));
         }
+        let mut reply = command();
+        reply.id = "x".repeat(crate::limits::MAX_COMMAND_ID_BYTES + 1);
+        assert_unknown(CommandGetRequest::new(&reply.id).validate_response(&reply));
     }
 }

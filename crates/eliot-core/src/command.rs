@@ -3,6 +3,19 @@
 
 use crate::CommandState;
 
+/// Validate an exact retained command identity, including bounded derived IDs.
+/// External mutation IDs have a separate ULID contract; command references are
+/// opaque and must not be trimmed, normalized, or parsed as mutation IDs.
+pub fn validate_command_id(id: &str) -> crate::Result<()> {
+    if id.trim().is_empty() || id.len() > crate::limits::MAX_COMMAND_ID_BYTES {
+        return Err(crate::Error::new(
+            "invalid",
+            "command ID must be nonblank and at most 256 bytes",
+        ));
+    }
+    Ok(())
+}
+
 /// Whether a code is a deterministic refusal before an external effect is
 /// dispatched. After dispatch, callers must use `classify_dispatched_error`;
 /// these codes alone do not prove that native I/O did not occur.
@@ -86,6 +99,32 @@ mod tests {
     use crate::CommandState::{
         Accepted, Applied, Cancelled, Dispatched, Failed, Queued, Rejected, Unknown,
     };
+
+    #[test]
+    fn command_references_accept_derived_ids_and_enforce_the_byte_bound() {
+        let root = "01M7MEN64NE9TXV12N4JNF3QCW";
+        for id in [
+            root.to_owned(),
+            format!("{root}/send"),
+            format!("{root}/a1"),
+            format!("{root}/send-0"),
+            format!("{root}/launch/send"),
+            " exact opaque id ".to_owned(),
+            "x".repeat(crate::limits::MAX_COMMAND_ID_BYTES),
+        ] {
+            super::validate_command_id(&id).unwrap();
+        }
+        for id in [
+            String::new(),
+            " \t ".to_owned(),
+            "x".repeat(257),
+            "é".repeat(129),
+        ] {
+            let error = super::validate_command_id(&id).unwrap_err();
+            assert_eq!(error.code, "invalid");
+            assert!(error.message.contains("command ID"));
+        }
+    }
 
     #[test]
     fn dispatched_errors_require_explicit_no_io_proof() {

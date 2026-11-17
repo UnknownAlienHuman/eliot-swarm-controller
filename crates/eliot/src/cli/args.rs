@@ -933,13 +933,15 @@ pub(crate) enum CmdCommand {
 
 #[derive(Args)]
 pub(crate) struct CmdShowArgs {
-    pub(crate) id: String,
+    #[arg(value_name = "COMMAND_ID", value_parser = command_id)]
+    pub(crate) command_id: String,
 }
 
 #[derive(Args)]
 pub(crate) struct CmdChildrenArgs {
-    pub(crate) id: String,
-    #[arg(long, value_name = "ID")]
+    #[arg(value_name = "COMMAND_ID", value_parser = command_id)]
+    pub(crate) command_id: String,
+    #[arg(long, value_name = "COMMAND_ID", value_parser = command_id)]
     pub(crate) after: Option<String>,
     #[command(flatten)]
     pub(crate) page: PageArgs,
@@ -947,11 +949,17 @@ pub(crate) struct CmdChildrenArgs {
 
 #[derive(Args)]
 pub(crate) struct CmdResolveArgs {
+    #[arg(value_name = "COMMAND_ID", value_parser = command_id)]
     pub(crate) command_id: String,
     #[arg(long = "as", value_name = "STATE")]
     pub(crate) resolution: String,
     #[arg(long, value_name = "TEXT")]
     pub(crate) reason: String,
+}
+
+fn command_id(value: &str) -> Result<String, String> {
+    eliot_core::validate_command_id(value).map_err(|error| *error.message)?;
+    Ok(value.to_owned())
 }
 
 #[derive(Subcommand)]
@@ -1320,6 +1328,62 @@ mod tests {
     };
     use crate::cli::agents::approval_reply_args;
     use clap::Parser;
+
+    #[test]
+    fn command_references_never_fill_the_global_mutation_id() {
+        let derived = "01M7MEN64NE9TXV12N4JNF3QCW/send";
+        let mutation = "01M7MEN64NE9TXV12N4JNF3QCX";
+        for verb in ["show", "cancel", "children", "resolve"] {
+            let mut command = vec!["cmd", verb, derived];
+            if verb == "resolve" {
+                command.extend(["--as", "failed", "--reason", "owner assertion"]);
+            }
+            if verb == "children" {
+                command.extend(["--after", derived]);
+            }
+            for placement in [0, 1, 2] {
+                let mut argv = vec!["swarm"];
+                if placement == 1 {
+                    argv.extend(["--id", mutation]);
+                }
+                argv.extend(command.iter().copied());
+                if placement == 2 {
+                    argv.extend(["--id", mutation]);
+                }
+                let cli = Cli::try_parse_from(argv).unwrap();
+                assert_eq!(cli.id.as_deref(), (placement != 0).then_some(mutation));
+                let Some(CliCommand::Cmd(args)) = cli.command else {
+                    panic!("cmd required")
+                };
+                let parsed = match args.command {
+                    super::CmdCommand::Show(args) | super::CmdCommand::Cancel(args) => {
+                        args.command_id
+                    }
+                    super::CmdCommand::Children(args) => {
+                        assert_eq!(args.after.as_deref(), Some(derived));
+                        args.command_id
+                    }
+                    super::CmdCommand::Resolve(args) => args.command_id,
+                };
+                assert_eq!(parsed, derived);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_command_references_name_the_positional_argument() {
+        for verb in ["show", "cancel", "children", "resolve"] {
+            for id in [" ".to_owned(), "x".repeat(257)] {
+                let error = Cli::try_parse_from(["swarm", "cmd", verb, &id])
+                    .err()
+                    .unwrap()
+                    .to_string();
+                assert!(error.contains("<COMMAND_ID>"), "{error}");
+                assert!(error.contains("command ID"), "{error}");
+                assert!(!error.contains("--id must"), "{error}");
+            }
+        }
+    }
     #[test]
     fn hot_start_launch_omits_profile_and_harness() {
         let cli =

@@ -35,7 +35,7 @@ pub(crate) async fn run_cmd(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
-        CmdCommand::Cancel(CmdShowArgs { id: command_id }) => {
+        CmdCommand::Cancel(CmdShowArgs { command_id }) => {
             let request = eliot_core::api::CommandCancelRequest {
                 id: mutation_id(id)?,
                 command_id,
@@ -59,8 +59,8 @@ pub(crate) async fn run_cmd(
             );
             Ok(0)
         }
-        CmdCommand::Show(CmdShowArgs { id }) => {
-            let params = CommandGetRequest::new(id);
+        CmdCommand::Show(CmdShowArgs { command_id }) => {
+            let params = CommandGetRequest::new(command_id);
             params
                 .validate()
                 .map_err(|error| Failure::from_core(error, false))?;
@@ -76,12 +76,16 @@ pub(crate) async fn run_cmd(
             Ok(0)
         }
         CmdCommand::Children(CmdChildrenArgs {
-            id,
+            command_id,
             after,
             page: PageArgs { limit },
         }) => {
             validate_limit(limit)?;
-            let request = CommandChildrenRequest { id, after, limit };
+            let request = CommandChildrenRequest {
+                id: command_id,
+                after,
+                limit,
+            };
             request
                 .validate()
                 .map_err(|error| Failure::from_core(error, false))?;
