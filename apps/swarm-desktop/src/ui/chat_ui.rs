@@ -1015,6 +1015,9 @@ impl DesktopApp {
             return;
         };
         self.chat.epoch += 1;
+        // A failed-input check in flight belongs to the old epoch: its reply
+        // is discarded, so the flag must not keep blocking new checks.
+        self.chat.inputs_checking = false;
         if let Some(task) = self.chat.live_task.take() {
             task.cancel();
         }
