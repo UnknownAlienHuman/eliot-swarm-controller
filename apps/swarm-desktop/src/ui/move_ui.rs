@@ -2,7 +2,9 @@
 //! header and its right-click menu in the sidebar open one picker of the
 //! tasks it can work under ([`reparent::eligible_parents`]: the same
 //! project, running or ready), with a search box. Picking a task and
-//! pressing Move is the one confirmation.
+//! pressing Move is the one confirmation. The picker reads its own
+//! candidates ([`reparent::search_managers`], every page up to a bound),
+//! not the sidebar's single page, and says when it left some unread.
 //!
 //! The picker is drawn in the window, over a scrim, in the window's own
 //! theme (the delete confirmation's pattern; a `ContentDialog` follows the
@@ -24,6 +26,8 @@ pub(super) enum MoveMsg {
     /// Open the picker for this task, bound to the generation shown.
     Open(UiAgent),
     QueryChanged(String),
+    /// The candidates read for this task and generation.
+    Searched(String, i64, Result<reparent::Managers, String>),
     /// A task was picked to work under (its id).
     Picked(String),
     /// Move: the one confirmation, bound to both shown generations.
@@ -32,14 +36,33 @@ pub(super) enum MoveMsg {
     Closed,
 }
 
-/// The open picker: the task to move, the search text, the picked task
-/// and the last refusal in words.
+/// The open picker: the task to move, its candidates, the search text,
+/// the picked task and the last refusal in words.
 #[derive(Clone, Debug)]
 pub(super) struct MoveDialog {
     agent: UiAgent,
+    search: Search,
     query: String,
     picked: Option<String>,
     error: Option<String>,
+}
+
+/// The picker's candidates: being read, read, or the read's error in words.
+#[derive(Clone, Debug)]
+enum Search {
+    Reading,
+    Read(reparent::Managers),
+    Failed(String),
+}
+
+impl MoveDialog {
+    /// The candidate row with this id, once read.
+    fn candidate(&self, id: &str) -> Option<&UiAgent> {
+        match &self.search {
+            Search::Read(managers) => managers.agents.iter().find(|agent| agent.id == id),
+            _ => None,
+        }
+    }
 }
 
 impl DesktopApp {
@@ -47,12 +70,25 @@ impl DesktopApp {
         match msg {
             MoveMsg::Open(agent) => {
                 self.close_menu();
+                self.spawn_move_search(&agent, context);
                 self.menu.moving = Some(MoveDialog {
                     agent,
+                    search: Search::Reading,
                     query: String::new(),
                     picked: None,
                     error: None,
                 });
+            }
+            MoveMsg::Searched(source, generation, result) => {
+                if let Some(dialog) = self.menu.moving.as_mut()
+                    && dialog.agent.id == source
+                    && dialog.agent.generation == generation
+                {
+                    dialog.search = match result {
+                        Ok(managers) => Search::Read(managers),
+                        Err(error) => Search::Failed(error),
+                    };
+                }
             }
             MoveMsg::QueryChanged(text) => {
                 if let Some(dialog) = self.menu.moving.as_mut()
@@ -94,7 +130,15 @@ impl DesktopApp {
                 let uncertain = result.as_ref().err().is_some_and(crate::state::uncertain);
                 self.settle_mutation(!uncertain);
                 let source = self.agent_title(&binding.source);
-                let parent = self.agent_title(&binding.parent);
+                let parent = match self
+                    .menu
+                    .moving
+                    .as_ref()
+                    .and_then(|dialog| dialog.candidate(&binding.parent))
+                {
+                    Some(agent) => self.agent_label(agent),
+                    None => self.agent_title(&binding.parent),
+                };
                 match result {
                     Ok(_) => {
                         self.menu.moving = None;
@@ -112,7 +156,13 @@ impl DesktopApp {
                         match self.menu.moving.as_mut() {
                             Some(dialog) => {
                                 dialog.error = Some(line.clone());
+                                // A refusal may follow a moved generation or
+                                // state: read the candidates again.
+                                let agent = (!uncertain).then(|| dialog.agent.clone());
                                 self.set_status(line);
+                                if let Some(agent) = agent {
+                                    self.spawn_move_search(&agent, context);
+                                }
                             }
                             None => self.alert(line),
                         }
@@ -128,6 +178,42 @@ impl DesktopApp {
         }
     }
 
+    /// Read the tasks `agent` can move under on a worker; the reply lands
+    /// only on the picker still open for that task and generation.
+    fn spawn_move_search(&self, agent: &UiAgent, context: &ComponentContext<Self>) {
+        let source = agent.id.clone();
+        let generation = agent.generation;
+        let project = agent.project.clone();
+        let data_dir = self.data_dir.clone();
+        let _task = context.spawn_background(move |_| {
+            let result = match data_dir {
+                Ok(data_dir) => client::block_on(reparent::search_managers(
+                    &project,
+                    reparent::SEARCH_PAGE,
+                    reparent::SEARCH_BOUND,
+                    |request| {
+                        let data_dir = data_dir.clone();
+                        async move {
+                            let reply = client::list_agents(&data_dir, &request).await?;
+                            Ok(reparent::Page {
+                                rows: reply
+                                    .agents
+                                    .iter()
+                                    .map(|row| UiAgent::from_summary(&row.summary))
+                                    .collect(),
+                                next: reply.next,
+                                total: reply.total,
+                            })
+                        }
+                    },
+                ))
+                .map_err(|error: eliot_core::Error| error.user_message()),
+                Err(error) => Err(error),
+            };
+            Message::Move(MoveMsg::Searched(source, generation, result))
+        });
+    }
+
     /// The picker: what moves, the search box, the tasks it can work under
     /// (the picked one selected), what Move will do, and Cancel / Move.
     pub(super) fn move_dialog(
@@ -137,7 +223,17 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let title = self.agent_label(&dialog.agent);
-        let eligible = reparent::eligible_parents(&self.nav.agents, &dialog.agent);
+        let (candidates, unread): (&[UiAgent], usize) = match &dialog.search {
+            Search::Read(managers) => (&managers.agents, managers.unread),
+            _ => (&[], 0),
+        };
+        let eligible = reparent::eligible_parents(candidates, &self.nav.agents, &dialog.agent);
+        // A parent past the sidebar's page is named from the candidates.
+        let title_of = |id: &str| {
+            dialog
+                .candidate(id)
+                .map_or_else(|| self.agent_title(id), |agent| self.agent_label(agent))
+        };
         let words: Vec<String> = dialog
             .query
             .split_whitespace()
@@ -172,7 +268,7 @@ impl DesktopApp {
                     monitor::state_words(agent.state)
                 );
                 if let Some(parent) = &agent.parent {
-                    note.push_str(&format!(" · works under “{}”", self.agent_title(parent)));
+                    note.push_str(&format!(" · works under “{}”", title_of(parent)));
                 }
                 KeyedView::new(
                     format!("{}:{selected}", agent.id),
@@ -193,22 +289,46 @@ impl DesktopApp {
                 )
             })
             .collect();
-        let list: View = if eligible.is_empty() {
-            m3::secondary(
+        let list: View = match &dialog.search {
+            Search::Reading => m3::secondary("Reading the tasks of this project…").into(),
+            Search::Failed(error) => {
+                m3::body(format!("Could not read the tasks of this project: {error}"))
+                    .foreground(palette.error())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true)
+                    .into()
+            }
+            Search::Read(_) if eligible.is_empty() && unread == 0 => m3::secondary(
                 "No other task in this project is running or ready, so there is none to move it under.",
             )
             .text_wrapping(TextWrapping::Wrap)
-            .into()
-        } else if rows.is_empty() {
-            m3::secondary(format!("No task matches “{}”.", dialog.query.trim()))
-                .text_wrapping(TextWrapping::Wrap)
-                .into()
-        } else {
-            ScrollViewer::new()
+            .into(),
+            Search::Read(_) if eligible.is_empty() => {
+                m3::secondary("None of the tasks read can take it.")
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into()
+            }
+            Search::Read(_) if rows.is_empty() => {
+                m3::secondary(format!("No task matches “{}”.", dialog.query.trim()))
+                    .text_wrapping(TextWrapping::Wrap)
+                    .into()
+            }
+            Search::Read(_) => ScrollViewer::new()
                 .max_height(LIST_HEIGHT)
                 .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
                 .automation_name("Tasks to move under")
-                .content(StackPanel::new().keyed_children(rows))
+                .content(StackPanel::new().keyed_children(rows)),
+        };
+        // The search is bounded: say what it left unread.
+        let incomplete: View = if unread > 0 {
+            m3::secondary(format!(
+                "Searched {} running or ready tasks of this project; {unread} more were not read, so the one you want may be missing.",
+                candidates.len()
+            ))
+            .text_wrapping(TextWrapping::Wrap)
+            .into()
+        } else {
+            View::empty()
         };
         let summary: View = match (&dialog.error, picked) {
             (Some(error), _) => m3::body(error.clone())
@@ -258,7 +378,7 @@ impl DesktopApp {
                     StackPanel::new().spacing(tokens::spacing::MD).children((
                         m3::section_title(heading).text_wrapping(TextWrapping::Wrap),
                         m3::secondary(
-                            "Pick the task it should work under. It then shows under that task in the sidebar and the Monitor.",
+                            "Pick a running or ready task of this project (archived ones are not listed). It then shows under that task in the sidebar and the Monitor.",
                         )
                         .text_wrapping(TextWrapping::Wrap),
                         m3::field()
@@ -269,6 +389,7 @@ impl DesktopApp {
                                 context.callback(|text| Message::Move(MoveMsg::QueryChanged(text))),
                             ),
                         list,
+                        incomplete,
                         summary,
                         StackPanel::new()
                             .orientation(Orientation::Horizontal)

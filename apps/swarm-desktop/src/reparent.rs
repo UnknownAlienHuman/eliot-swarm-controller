@@ -2,6 +2,11 @@
 //! Handoff methods): the task's menus open a picker of the tasks it can
 //! work under; one confirmation moves it with its own workers.
 //!
+//! The picker reads its own candidates ([`search_managers`]): every page of
+//! `agent.list {project, state}` for each state the daemon accepts as a
+//! destination, up to [`SEARCH_BOUND`] rows, and says how many it left
+//! unread. The sidebar's single page is not the search set.
+//!
 //! The binding is captured when the owner confirms: the exact source and
 //! destination generations go into the request, so a click acts on exactly
 //! what was displayed. One ULID per action key, reused only after an
@@ -12,9 +17,100 @@
 //! shown in words.
 
 use eliot_core::AgentState;
-use eliot_core::api::ReparentRequest;
+use eliot_core::api::{AgentListRequest, ReparentRequest};
 
 use crate::nav::UiAgent;
+
+/// The states `swarm.reparent` accepts for the new parent: controlled,
+/// nonterminal and not unknown (`docs/spec/coordination.md`).
+pub const MANAGER_STATES: [AgentState; 5] = [
+    AgentState::Created,
+    AgentState::Starting,
+    AgentState::Idle,
+    AgentState::Busy,
+    AgentState::Waiting,
+];
+
+/// Rows per `agent.list` page of the picker's search.
+pub const SEARCH_PAGE: usize = 200;
+
+/// Most rows one picker search reads, across states and pages.
+pub const SEARCH_BOUND: usize = 1_000;
+
+/// One `agent.list` page as the search reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Page {
+    pub rows: Vec<UiAgent>,
+    pub next: Option<String>,
+    /// Matching rows for the filters, ignoring the cursor.
+    pub total: usize,
+}
+
+/// What one search read: the project's tasks in [`MANAGER_STATES`] (ID
+/// order per state, as listed) and how many matching rows it left unread.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Managers {
+    pub agents: Vec<UiAgent>,
+    /// Matching rows past the bound; 0 when the search read them all.
+    pub unread: usize,
+}
+
+/// Page through `agent.list {project, state}` for every state in
+/// [`MANAGER_STATES`], `page` rows at a time and at most `bound` rows in
+/// all. `fetch` is one validated page read. A chat (empty project label)
+/// has no project filter, so its search reads every project's rows and
+/// [`eligible_parents`] keeps the chats.
+pub async fn search_managers<F, Fut, E>(
+    project: &str,
+    page: usize,
+    bound: usize,
+    mut fetch: F,
+) -> Result<Managers, E>
+where
+    F: FnMut(AgentListRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<Page, E>>,
+{
+    let mut managers = Managers::default();
+    for state in MANAGER_STATES {
+        let mut after = None;
+        let mut read = 0;
+        let mut total: Option<usize> = None;
+        loop {
+            let room = bound.saturating_sub(managers.agents.len());
+            if room == 0
+                && let Some(total) = total
+            {
+                managers.unread += total.saturating_sub(read);
+                break;
+            }
+            let reply = fetch(AgentListRequest {
+                project: (!project.is_empty()).then(|| project.to_owned()),
+                state: Some(state),
+                // Past the bound, one row still reads the state's total.
+                limit: page.min(room).max(1),
+                after: after.take(),
+                ..AgentListRequest::default()
+            })
+            .await?;
+            if room == 0 {
+                managers.unread += reply.total;
+                break;
+            }
+            total = Some(reply.total);
+            read += reply.rows.len();
+            let empty = reply.rows.is_empty();
+            managers.agents.extend(reply.rows);
+            match reply.next {
+                Some(next) if !empty && read < reply.total => after = Some(next),
+                _ => {
+                    managers.unread += reply.total.saturating_sub(read);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(managers)
+}
 
 /// A move of one Agent (with its subtree) under a new parent, bound to the
 /// generations shown at click time.
@@ -48,15 +144,26 @@ impl MoveBinding {
     }
 }
 
-/// The tasks `source` can be moved under, newest first: the same project
-/// (the daemon compares the project label exactly), controlled and not
-/// ended (`swarm.reparent` needs a live manager), neither `source` itself,
-/// its current parent, nor one of its own workers (a cycle), each once.
-pub fn eligible_parents<'a>(agents: &'a [UiAgent], source: &UiAgent) -> Vec<&'a UiAgent> {
-    let parents: std::collections::HashMap<&str, Option<&str>> = agents
+/// The `candidates` `source` can be moved under, newest first: the same
+/// project (the daemon compares the project label exactly), controlled and
+/// not ended (`swarm.reparent` needs a live manager), neither `source`
+/// itself, its current parent, nor one of its own workers (a cycle), each
+/// once. `links` (the sidebar's rows) only add parent links for the cycle
+/// check; the candidates' own rows are fresher and win.
+pub fn eligible_parents<'a>(
+    candidates: &'a [UiAgent],
+    links: &[UiAgent],
+    source: &UiAgent,
+) -> Vec<&'a UiAgent> {
+    let parents: std::collections::HashMap<&str, Option<&str>> = links
         .iter()
+        .chain(candidates)
         .map(|agent| (agent.id.as_str(), agent.parent.as_deref()))
         .collect();
+    let source_parent = match parents.get(source.id.as_str()) {
+        Some(parent) => *parent,
+        None => source.parent.as_deref(),
+    };
     // Whether `id` sits anywhere under `source` (bounded: links form a
     // tree, but rows read on different pages may disagree).
     let under_source = |id: &str| {
@@ -71,7 +178,7 @@ pub fn eligible_parents<'a>(agents: &'a [UiAgent], source: &UiAgent) -> Vec<&'a 
         false
     };
     let mut seen = std::collections::HashSet::new();
-    let mut eligible: Vec<&UiAgent> = agents
+    let mut eligible: Vec<&UiAgent> = candidates
         .iter()
         .filter(|agent| agent.id != source.id && seen.insert(agent.id.as_str()))
         .filter(|agent| agent.project == source.project && !agent.native_child)
@@ -81,7 +188,7 @@ pub fn eligible_parents<'a>(agents: &'a [UiAgent], source: &UiAgent) -> Vec<&'a 
                 AgentState::Stopped | AgentState::Failed | AgentState::Lost | AgentState::Unknown
             )
         })
-        .filter(|agent| source.parent.as_deref() != Some(agent.id.as_str()))
+        .filter(|agent| source_parent != Some(agent.id.as_str()))
         .filter(|agent| !under_source(&agent.id))
         .collect();
     eligible.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
@@ -149,12 +256,88 @@ mod tests {
             native,
             other_project,
         ];
-        let ids: Vec<&str> = eligible_parents(&agents, &source)
+        let ids: Vec<&str> = eligible_parents(&agents, &[], &source)
             .iter()
             .map(|agent| agent.id.as_str())
             .collect();
         // Not itself, its current parent a1, its workers a3/a4, the lost
         // a6, the native a8 or the other project's a9; newest first, once.
         assert_eq!(ids, ["a7", "a5"]);
+    }
+
+    /// `agent.list` over `rows` (listing order): the request's project and
+    /// state filters, `limit` rows after the cursor, and the exact total.
+    fn list(rows: &[UiAgent], request: &AgentListRequest) -> Page {
+        let matching: Vec<&UiAgent> = rows
+            .iter()
+            .filter(|row| request.project.as_deref().is_none_or(|p| row.project == p))
+            .filter(|row| request.state.is_none_or(|state| row.state == state))
+            .collect();
+        let start = request.after.as_deref().map_or(0, |after| {
+            matching
+                .iter()
+                .position(|row| row.id == after)
+                .map_or(matching.len(), |index| index + 1)
+        });
+        let rows: Vec<UiAgent> = matching
+            .iter()
+            .skip(start)
+            .take(request.limit)
+            .map(|row| (*row).clone())
+            .collect();
+        Page {
+            next: rows.last().map(|row| row.id.clone()),
+            rows,
+            total: matching.len(),
+        }
+    }
+
+    #[test]
+    fn the_search_finds_a_manager_past_the_first_page_and_counts_what_it_left_unread() {
+        let source = agent("a1", None, AgentState::Idle, 1);
+        let mut rows = vec![source.clone()];
+        // Six of its own workers fill the first pages (a cycle, never offered).
+        for n in 2..=7 {
+            rows.push(agent(&format!("a{n}"), Some("a1"), AgentState::Idle, n));
+        }
+        // The one valid manager: the fourth page at two rows a page.
+        rows.push(agent("a8", None, AgentState::Idle, 8));
+        let mut elsewhere = agent("a9", None, AgentState::Busy, 9);
+        elsewhere.project = "/elsewhere".to_owned();
+        rows.push(elsewhere);
+        rows.push(agent("a10", None, AgentState::Busy, 10));
+        // a12 works under a stopped worker a11 of a1: only the sidebar's
+        // rows know that link.
+        rows.push(agent("a12", Some("a11"), AgentState::Waiting, 12));
+        let links = [agent("a11", Some("a1"), AgentState::Stopped, 11)];
+        let mut requests = Vec::new();
+        let managers = crate::client::block_on(search_managers("/w", 2, 100, |request| {
+            requests.push(request.clone());
+            let page = list(&rows, &request);
+            async move { Ok::<_, ()>(page) }
+        }))
+        .unwrap();
+        assert_eq!(managers.unread, 0);
+        assert!(requests.iter().all(|request| {
+            request.project.as_deref() == Some("/w")
+                && request.limit <= 2
+                && request
+                    .state
+                    .is_some_and(|state| MANAGER_STATES.contains(&state))
+        }));
+        let ids: Vec<&str> = eligible_parents(&managers.agents, &links, &source)
+            .iter()
+            .map(|agent| agent.id.as_str())
+            .collect();
+        assert_eq!(ids, ["a10", "a8"]);
+
+        // Bounded: five rows read in all, and the other five of the
+        // project's ten are counted, never dropped silently.
+        let bounded = crate::client::block_on(search_managers("/w", 2, 5, |request| {
+            let page = list(&rows, &request);
+            async move { Ok::<_, ()>(page) }
+        }))
+        .unwrap();
+        assert_eq!((bounded.agents.len(), bounded.unread), (5, 5));
     }
 }

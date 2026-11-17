@@ -116,9 +116,10 @@ pub fn archived_filter_error(error: &Error) -> String {
     error.user_message()
 }
 
-/// `agent.archive` (Owner only): hide or show a stopped or idle Agent tree
-/// in the default list; durable, idempotent by mutation id. Returns the
-/// number of Agents it changed.
+/// `agent.archive` (Owner only): hide or show an idle or ended Agent tree
+/// in the default list (archiving an ended one needs its custody resolved);
+/// durable, idempotent by mutation id. Returns the number of Agents it
+/// changed.
 pub async fn archive_agent(
     data_dir: &Path,
     mutation_id: String,
