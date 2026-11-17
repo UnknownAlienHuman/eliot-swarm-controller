@@ -1,4 +1,5 @@
 use super::*;
+use eliot_core::api::process_state_name;
 
 impl Store {
     pub(super) fn observe_processes_inner(
@@ -197,14 +198,6 @@ fn merge_process_record(
         }
     }
     Ok(())
-}
-
-fn process_state_name(state: ProcessState) -> &'static str {
-    match state {
-        ProcessState::Running => "running",
-        ProcessState::Exited => "exited",
-        ProcessState::Unknown => "unknown",
-    }
 }
 
 fn insert_process_event(

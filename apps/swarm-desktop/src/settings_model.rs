@@ -469,7 +469,10 @@ fn short(revision: &str) -> &str {
 }
 
 /// What one Validate or Save reported, in one line.
-pub fn save_note(dry_run: bool, result: &Result<SettingsSaveResponse, String>) -> String {
+pub fn save_note(
+    dry_run: bool,
+    result: &Result<SettingsSaveResponse, eliot_core::Error>,
+) -> String {
     let restart = |sections: &[eliot_core::api::SettingsSection]| {
         if sections.is_empty() {
             String::new()
@@ -496,7 +499,7 @@ pub fn save_note(dry_run: bool, result: &Result<SettingsSaveResponse, String>) -
             restart(&reply.restart_required)
         ),
         Ok(_) => "No change to save.".to_owned(),
-        Err(error) if error.starts_with("conflict") => {
+        Err(error) if error.code == "conflict" => {
             "Not saved: the settings changed elsewhere. Your draft is kept; Reload to see the current values.".to_owned()
         }
         Err(error) if crate::state::uncertain(error) => format!(
@@ -820,8 +823,14 @@ mod tests {
             save_note(false, &Ok(saved)),
             "Saved. The change is in Advanced › History. Restart the daemon to apply Cloud MCP."
         );
-        assert!(save_note(false, &Err("conflict: stale".to_owned())).contains("draft is kept"));
-        assert!(save_note(true, &Err("profile_error: bad".to_owned())).starts_with("Invalid"));
+        assert!(
+            save_note(false, &Err(eliot_core::Error::new("conflict", "stale")))
+                .contains("draft is kept")
+        );
+        assert!(
+            save_note(true, &Err(eliot_core::Error::new("profile_error", "bad")))
+                .starts_with("Invalid")
+        );
         assert_eq!(utc_minute(0), "1970-01-01 00:00 UTC");
         assert_eq!(utc_minute(1_763_215_380_000), "2025-11-15 14:03 UTC");
     }

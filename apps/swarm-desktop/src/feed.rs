@@ -28,11 +28,7 @@ use crate::markdown::{self, Doc};
 /// a longer history continues through live delivery from where it stopped.
 const SNAPSHOT_PAGES: usize = 64;
 
-type Fallible<T> = Result<T, String>;
-
-fn text(error: eliot_core::Error) -> String {
-    error.to_string()
-}
+type Fallible<T> = eliot_core::Result<T>;
 
 /// How many authoritative turns a snapshot reads; its journal events always
 /// start at the Agent's creation (or the retention floor).
@@ -117,13 +113,9 @@ fn linked_commands(events: &[Event]) -> Vec<String> {
 pub fn snapshot(data_dir: &Path, agent: &str, depth: Depth) -> Fallible<Snapshot> {
     client::block_on(async {
         let filter = client::chat_filter(agent);
-        let bounds = client::events_bounds(data_dir, &filter)
-            .await
-            .map_err(text)?;
-        let detail = client::get_agent(data_dir, agent).await.map_err(text)?;
-        let results = client::agent_results(data_dir, agent, depth.result_limit)
-            .await
-            .map_err(text)?;
+        let bounds = client::events_bounds(data_dir, &filter).await?;
+        let detail = client::get_agent(data_dir, agent).await?;
+        let results = client::agent_results(data_dir, agent, depth.result_limit).await?;
         // Every retained event of this Agent, from its creation: Agent ids
         // are never reused, so nothing of it lies below the retention floor
         // except what retention removed. Live delivery resumes at `next`.
@@ -135,8 +127,7 @@ pub fn snapshot(data_dir: &Path, agent: &str, depth: Depth) -> Fallible<Snapshot
             SNAPSHOT_PAGES,
             &|| false,
         )
-        .await
-        .map_err(text)?;
+        .await?;
         let events = scan.events;
         let inputs = client::input_texts(data_dir, linked_commands(&events)).await;
         let docs = parse_docs(Conversation::markdown_texts(&results.turns, &events));
@@ -169,15 +160,14 @@ pub fn reread(
 ) -> Fallible<Reread> {
     client::block_on(async {
         let detail = if detail {
-            Some(client::get_agent(data_dir, agent).await.map_err(text)?)
+            Some(client::get_agent(data_dir, agent).await?)
         } else {
             None
         };
         let turns = if turns {
             Some(
                 client::agent_results(data_dir, agent, result_limit)
-                    .await
-                    .map_err(text)?
+                    .await?
                     .turns,
             )
         } else {
@@ -232,7 +222,7 @@ pub fn deliver(
             else {
                 return Ok(None);
             };
-            let page = page.map_err(text)?;
+            let page = page?;
             let woke = !page.events.is_empty();
             events.extend(page.events);
             cursor = page.next;
@@ -252,9 +242,7 @@ pub fn deliver(
         }
         let mut truncated = false;
         for _ in 0..DRAIN_PAGES {
-            let page = client::events_read(data_dir, cursor, DRAIN_LIMIT, &filter)
-                .await
-                .map_err(text)?;
+            let page = client::events_read(data_dir, cursor, DRAIN_LIMIT, &filter).await?;
             events.extend(page.events);
             truncated = page.truncated;
             if page.next <= cursor {

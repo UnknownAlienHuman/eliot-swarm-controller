@@ -6,7 +6,6 @@ use super::args::{
 };
 use super::support::read_and_print;
 use super::support::{Failure, PAGE_SIZE, print_value, validate_limit};
-use eliot_core::api::AgentSummary;
 use eliot_core::api::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse,
@@ -17,7 +16,8 @@ use eliot_core::api::{
     ObservationPage, ObserveHeavyRequest, ObserveHeavyResponse, TurnCounterMissing,
     UsageSummaryRequest, UsageSummaryResponse,
 };
-use eliot_core::{AgentState, Error as CoreError, NativeChildActivityState};
+use eliot_core::api::{AgentSummary, activity_state_name};
+use eliot_core::{AgentState, Error as CoreError};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1102,16 +1102,6 @@ pub(crate) fn missing_cell(missing: &TurnCounterMissing) -> String {
     )
 }
 
-pub(crate) fn activity_state_name(state: NativeChildActivityState) -> &'static str {
-    match state {
-        NativeChildActivityState::Running => "running",
-        NativeChildActivityState::Idle => "idle",
-        NativeChildActivityState::Interrupted => "interrupted",
-        NativeChildActivityState::Lost => "lost",
-        NativeChildActivityState::Unknown => "unknown",
-    }
-}
-
 pub(crate) fn age_cell(age_ms: Option<i64>) -> String {
     let Some(age_ms) = age_ms else {
         return "-".to_owned();
@@ -1169,13 +1159,38 @@ pub(crate) async fn run_why(
     }
 }
 
+fn why_heading(response: &DiagnoseResponse) -> String {
+    let Some(step) = eliot_core::api::diagnosis_reason(&response.steps) else {
+        return format!("No failure details are available for {}", response.target);
+    };
+    let in_flight = step.kind == "command"
+        && matches!(
+            step.code.as_deref(),
+            Some("accepted" | "queued" | "dispatched")
+        );
+    let healthy = step.kind == "agent"
+        && step.message.is_none()
+        && matches!(
+            step.code.as_deref(),
+            Some("created" | "starting" | "idle" | "busy" | "waiting" | "stopped" | "unknown")
+        )
+        && step
+            .origin
+            .as_deref()
+            .is_none_or(|origin| origin == "unknown");
+    let label = if healthy || in_flight {
+        response.target.as_str()
+    } else {
+        eliot_core::origin_words(step.origin.as_deref().unwrap_or("unknown"))
+    };
+    format!("{label}: {}", step.user_message())
+}
+
 fn print_why_diagnosis(response: &DiagnoseResponse) {
-    println!("{}", response.summary);
+    println!("{}", why_heading(response));
     for step in &response.steps {
         let mut line = format!("  [{}]", step.kind);
-        if let Some(code) = step.code.as_deref() {
-            line.push_str(&format!(" {code}"));
-        }
+        line.push_str(&format!(" {}", step.user_message()));
         if let Some(where_) = step.failure_where.as_deref() {
             line.push_str(&format!(" at {where_}"));
         }
@@ -1185,12 +1200,9 @@ fn print_why_diagnosis(response: &DiagnoseResponse) {
         if let Some(ntstatus) = step.ntstatus.as_deref() {
             line.push_str(&format!(" {ntstatus}"));
         }
-        if let Some(message) = step.message.as_deref() {
-            line.push_str(&format!(": {message}"));
-        }
         println!("{line}");
         if let Some(origin) = step.origin.as_deref() {
-            println!("    origin: {origin}");
+            println!("    {}", eliot_core::origin_words(origin));
         }
     }
     if let Some(preceded_by) = response.preceded_by.as_deref() {
@@ -1218,6 +1230,53 @@ mod tests {
     };
     use eliot_core::{AgentState, Error as CoreError, NativeChildActivityState, TurnUsage};
     use std::time::Duration;
+
+    #[test]
+    fn healthy_why_is_a_state_and_failure_prose_is_not_reparsed() {
+        let reply = |code, origin, message| {
+            serde_json::from_value::<eliot_core::api::DiagnoseResponse>(serde_json::json!({
+                "target": "a2", "summary": "not used: origin: provider",
+                "steps": [{"kind": "agent", "code": code, "origin": origin, "message": message}]
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            super::why_heading(&reply("idle", "unknown", None)),
+            "a2: Ready for a message"
+        );
+        assert_eq!(
+            super::why_heading(&reply("busy", "unknown", None)),
+            "a2: Working"
+        );
+        assert_eq!(
+            super::why_heading(&reply(
+                "failure",
+                "provider",
+                Some("origin: request: refused")
+            )),
+            "Model service: The Agent could not finish: origin: request: refused"
+        );
+    }
+
+    #[test]
+    fn starting_why_with_an_in_flight_launch_has_no_failure_heading() {
+        for (state, words) in [
+            ("accepted", "Request accepted"),
+            ("queued", "Waiting to run"),
+            ("dispatched", "Sent to the Agent"),
+        ] {
+            let reply =
+                serde_json::from_value::<eliot_core::api::DiagnoseResponse>(serde_json::json!({
+                    "target": "a2", "summary": "unused",
+                    "steps": [
+                        {"kind": "agent", "code": "starting"},
+                        {"kind": "command", "code": state}
+                    ]
+                }))
+                .unwrap();
+            assert_eq!(super::why_heading(&reply), format!("a2: {words}"));
+        }
+    }
 
     #[test]
     fn watch_rides_out_transport_timeouts_but_not_domain_rejections() {

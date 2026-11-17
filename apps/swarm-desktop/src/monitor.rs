@@ -27,11 +27,11 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
-use eliot_core::AgentState;
 use eliot_core::api::{
-    AgentGetResponse, AgentListRequest, AgentListResponse, AgentListRow, ObservationView,
-    ProcessStatsView, UsageSummaryResponse,
+    AgentGetResponse, AgentListRequest, AgentListResponse, AgentListRow, DiagnoseResponse,
+    ObservationView, ProcessStatsView, UsageSummaryResponse, agent_state_name, stats_coverage_name,
 };
+use eliot_core::{AgentState, NativeChildActivityState};
 use futures_util::StreamExt;
 
 use crate::client::{self, MAX_CONCURRENT_READS};
@@ -105,32 +105,7 @@ pub struct Incident {
 
 /// An attention reason code in words.
 pub fn attention_words(reason: &str) -> String {
-    match reason {
-        "no_progress" => "No progress for a while".to_owned(),
-        "source_unhealthy" => "Lost contact with its harness".to_owned(),
-        "children_unattended" => "Its subagents are unattended".to_owned(),
-        other => {
-            let text = other.replace('_', " ");
-            let mut chars = text.chars();
-            chars.next().map_or_else(String::new, |first| {
-                first.to_uppercase().chain(chars).collect()
-            })
-        }
-    }
-}
-
-pub fn state_name(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Unknown => "unknown",
-        AgentState::Created => "created",
-        AgentState::Starting => "starting",
-        AgentState::Idle => "idle",
-        AgentState::Busy => "busy",
-        AgentState::Waiting => "waiting",
-        AgentState::Stopped => "stopped",
-        AgentState::Failed => "failed",
-        AgentState::Lost => "lost",
-    }
+    eliot_core::reason_words(reason)
 }
 
 /// Lower ranks need attention first: pending requests, then unknown
@@ -184,7 +159,7 @@ impl Obs {
                     sampled_at: stats.sampled_at,
                     age_ms: stats.age_ms,
                     ttl_ms: stats.ttl_ms,
-                    coverage: format!("{:?}", stats.coverage).to_lowercase(),
+                    coverage: stats_coverage_name(stats.coverage).to_owned(),
                     clock_regressed: stats.clock_regressed,
                     error: stats.error.clone(),
                     processes: data.processes.len(),
@@ -308,21 +283,22 @@ pub fn attention_filter_label(count: usize, on: bool) -> String {
     }
 }
 
-/// A loss Swarm caused itself, from a `swarm why` summary: a daemon restart
-/// ("swarm origin: a2 agent.lost at daemon.restart: daemon_restart").
-pub fn restart_loss(summary: &str) -> bool {
-    summary.starts_with("swarm origin:") && summary.contains(" at daemon.restart")
+/// A restart loss is identified by structured facts, never summary prose.
+pub fn restart_loss(reply: &DiagnoseResponse) -> bool {
+    eliot_core::api::diagnosis_reason(&reply.steps).is_some_and(|step| {
+        step.origin.as_deref() == Some("swarm")
+            && step.failure_where.as_deref() == Some("daemon.restart")
+    })
 }
 
-/// The words for a loss to a Swarm restart.
 pub const RESTART_LOSS_WORDS: &str = "Stopped by a Swarm restart";
 
 /// A turn outcome in words ("completed", "interrupted", "failed",
-/// "ended with an unknown result").
+/// "ended without a confirmed result").
 pub fn outcome_words(outcome: &str) -> String {
     match outcome {
         "success" | "completed" => "completed".to_owned(),
-        "unknown" => "ended with an unknown result".to_owned(),
+        "unknown" => "ended without a confirmed result".to_owned(),
         other => other.replace('_', " "),
     }
 }
@@ -341,52 +317,36 @@ pub fn state_words(state: AgentState) -> &'static str {
     }
 }
 
-/// `swarm why`'s one-line summary ("provider origin: a3 failure: free usage
-/// limit reached") as the details panel's origin line ("Provider: free
-/// usage limit reached"); `None` when there is nothing wrong to report (an
-/// unknown origin on an Agent that did not fail).
-pub fn diagnosis_line(summary: &str) -> Option<String> {
-    if restart_loss(summary) {
+/// The selected structured diagnosis reason, in words; healthy state alone
+/// does not create a failure notice.
+pub fn diagnosis_line(reply: &DiagnoseResponse) -> Option<String> {
+    if restart_loss(reply) {
         return Some(RESTART_LOSS_WORDS.to_owned());
     }
-    let (origin, rest) = summary.split_once(" origin: ")?;
-    let (head, message) = match rest.split_once(": ") {
-        Some((head, message)) => (head, Some(message.trim())),
-        None => (rest, None),
-    };
-    let what = head
-        .split_once(' ')
-        .map_or("", |(_, what)| what)
-        .split(" at ")
-        .next()
-        .unwrap_or("")
-        .trim();
-    // An unknown state alone (an Agent Swarm only watches) is no failure.
-    let failed = matches!(
-        what,
-        "failure" | "failed" | "lost" | "interrupted" | "refused" | "crashed"
-    );
-    if origin == "unknown" && message.is_none() && !failed {
+    let step = eliot_core::api::diagnosis_reason(&reply.steps)?;
+    let code = step.code.as_deref().unwrap_or("unknown");
+    let origin = step.origin.as_deref().unwrap_or("unknown");
+    if origin == "unknown"
+        && step.message.is_none()
+        && !matches!(
+            code,
+            "failure"
+                | "failed"
+                | "lost"
+                | "agent.failed"
+                | "agent.lost"
+                | "interrupted"
+                | "refused"
+                | "crashed"
+        )
+    {
         return None;
     }
-    let label = match origin {
-        "provider" => "Provider".to_owned(),
-        "environment" => "Environment".to_owned(),
-        "harness" => "Harness".to_owned(),
-        "swarm" => "Swarm".to_owned(),
-        "user" | "owner" => "You".to_owned(),
-        "unknown" => "Cause not determined".to_owned(),
-        other => {
-            let mut chars = other.chars();
-            chars.next().map_or_else(String::new, |first| {
-                first.to_uppercase().chain(chars).collect()
-            })
-        }
-    };
-    let text = message
-        .filter(|message| !message.is_empty())
-        .map_or_else(|| what.replace('_', " "), str::to_owned);
-    Some(format!("{label}: {text}"))
+    Some(format!(
+        "{}: {}",
+        eliot_core::origin_words(origin),
+        step.user_message()
+    ))
 }
 
 pub fn bytes_label(bytes: Option<u64>) -> String {
@@ -416,7 +376,7 @@ pub struct MonitorRow {
     pub state: AgentState,
     pub harness: String,
     pub active_turn: Option<String>,
-    pub activity: Option<String>,
+    pub activity: Option<NativeChildActivityState>,
     pub progress_age_ms: Option<i64>,
     pub last_outcome: Option<String>,
     /// Fleet token count from the shared [`AgentSummary::fleet_usage`]
@@ -463,10 +423,7 @@ impl MonitorRow {
             state: summary.state,
             harness: summary.harness.clone(),
             active_turn: summary.active_turn.clone(),
-            activity: summary
-                .activity
-                .as_ref()
-                .map(|activity| format!("{:?}", activity.state).to_lowercase()),
+            activity: summary.activity.as_ref().map(|activity| activity.state),
             progress_age_ms: summary.progress_age_ms,
             last_outcome: summary
                 .last_outcome
@@ -486,12 +443,12 @@ impl MonitorRow {
         if !self.native_child {
             return state_words(self.state);
         }
-        match (self.state, self.activity.as_deref()) {
+        match (self.state, self.activity) {
             (AgentState::Stopped, _) => "Ended with parent",
-            (_, Some("running")) => "Working",
-            (_, Some("idle")) => "Idle",
-            (_, Some("interrupted")) => "Interrupted",
-            (_, Some("lost")) => "Lost",
+            (_, Some(NativeChildActivityState::Running)) => "Working",
+            (_, Some(NativeChildActivityState::Idle)) => "Idle",
+            (_, Some(NativeChildActivityState::Interrupted)) => "Interrupted",
+            (_, Some(NativeChildActivityState::Lost)) => "Lost",
             _ => state_words(self.state),
         }
     }
@@ -514,12 +471,12 @@ impl MonitorRow {
 
     /// The status code its tone follows ([`crate::m3::status`]).
     pub fn status_code(&self) -> &'static str {
-        match self.status_words() {
-            "Ended with parent" => "stopped",
-            "Working" if self.native_child => "busy",
-            "Idle" if self.native_child => "idle",
-            "Lost" if self.native_child => "lost",
-            _ => state_name(self.state),
+        match (self.native_child, self.state, self.activity) {
+            (true, AgentState::Stopped, _) => "stopped",
+            (true, _, Some(NativeChildActivityState::Running)) => "busy",
+            (true, _, Some(NativeChildActivityState::Idle)) => "idle",
+            (true, _, Some(NativeChildActivityState::Lost)) => "lost",
+            _ => agent_state_name(self.state),
         }
     }
 
@@ -527,9 +484,9 @@ impl MonitorRow {
     /// parent instead (`None`), unless the parent is not shown.
     pub fn group(&self, attention: Option<&Incident>) -> Group {
         if self.native_child {
-            return match (self.state, self.activity.as_deref()) {
+            return match (self.state, self.activity) {
                 (AgentState::Stopped | AgentState::Failed | AgentState::Lost, _) => Group::Stopped,
-                (_, Some("running")) => Group::Working,
+                (_, Some(NativeChildActivityState::Running)) => Group::Working,
                 _ => Group::Idle,
             };
         }
@@ -550,7 +507,8 @@ impl MonitorRow {
         // A native child's turn is its observed activity, not a controlled
         // active turn.
         let working = self.active_turn.is_some()
-            || (self.activity.as_deref() == Some("running") && self.state != AgentState::Stopped);
+            || (self.activity == Some(NativeChildActivityState::Running)
+                && self.state != AgentState::Stopped);
         let ended = matches!(
             self.state,
             AgentState::Stopped | AgentState::Failed | AgentState::Lost
@@ -563,7 +521,7 @@ impl MonitorRow {
             (false, Some(outcome)) => format!("Last turn {}", outcome_words(outcome)),
             // An open turn cut off by the end has no result; nothing is
             // invented for it.
-            (false, None) if ended && self.activity.as_deref() == Some("lost") => {
+            (false, None) if ended && self.activity == Some(NativeChildActivityState::Lost) => {
                 "Its open turn has no result".to_owned()
             }
             (false, None) if ended || self.activity.is_some() => "No finished turn".to_owned(),
@@ -733,7 +691,7 @@ fn rate(previous: &Sample, current: &Sample) -> (Option<f64>, bool) {
 pub struct DetailRead {
     pub agent: AgentGetResponse,
     pub usage: Result<UsageSummaryResponse, String>,
-    pub diagnosis: Result<String, String>,
+    pub diagnosis: Result<DiagnoseResponse, String>,
 }
 
 /// One attention report as read: its binding, phase and reason.
@@ -786,7 +744,7 @@ pub struct MonitorSnapshot {
     pub attention: Option<Result<AttentionRead, String>>,
     pub detail: Option<Result<DetailRead, String>>,
     /// `swarm why` summaries of the lost or failed generations it read.
-    pub losses: Vec<((String, i64), Result<String, String>)>,
+    pub losses: Vec<((String, i64), Result<DiagnoseResponse, String>)>,
     pub read_at_ms: i64,
 }
 
@@ -811,7 +769,7 @@ pub struct Monitor {
     pub incidents: HashMap<(String, i64), Incident>,
     /// `swarm why` summary of each lost or failed generation shown: read
     /// once, since the end of a generation does not change.
-    pub losses: HashMap<(String, i64), String>,
+    pub losses: HashMap<(String, i64), DiagnoseResponse>,
     /// The attention read's cursor (`None` until the first read).
     pub attention_cursor: Option<i64>,
     /// A live row left the live states: read the stopped rows next, so a
@@ -848,7 +806,7 @@ impl Monitor {
         }
         self.losses
             .get(&(row.id.clone(), row.generation))
-            .and_then(|summary| diagnosis_line(summary))
+            .and_then(diagnosis_line)
     }
 
     /// Lost or failed generations shown whose loss origin is not read yet,
@@ -1042,7 +1000,8 @@ impl Monitor {
                     });
                 }
                 Err(error) => {
-                    self.errors.push(format!("{}: {error}", state_name(*state)));
+                    self.errors
+                        .push(format!("{}: {error}", agent_state_name(*state)));
                     counts.push(StateCount {
                         state: *state,
                         total: None,
@@ -1059,7 +1018,8 @@ impl Monitor {
                     shown: 0,
                 }),
                 Err(error) => {
-                    self.errors.push(format!("{}: {error}", state_name(*state)));
+                    self.errors
+                        .push(format!("{}: {error}", agent_state_name(*state)));
                     counts.push(StateCount {
                         state: *state,
                         total: None,
@@ -1123,7 +1083,7 @@ enum Read {
     Stopped(Result<AgentListResponse, String>),
     Attention(Result<AttentionRead, String>),
     Detail(Box<Result<DetailRead, String>>),
-    Loss((String, i64), Result<String, String>),
+    Loss((String, i64), Result<DiagnoseResponse, String>),
     Cancelled,
 }
 
@@ -1276,7 +1236,6 @@ pub async fn refresh(
                     .map_err(|error| error.to_string());
                 let diagnosis = client::diagnose(data_dir, &agent)
                     .await
-                    .map(|reply| reply.summary)
                     .map_err(|error| error.to_string());
                 Ok(DetailRead {
                     agent: read,
@@ -1294,7 +1253,6 @@ pub async fn refresh(
             }
             let summary = client::diagnose(data_dir, &key.0)
                 .await
-                .map(|reply| reply.summary)
                 .map_err(|error| error.to_string());
             Read::Loss(key, summary)
         }));
@@ -1626,22 +1584,61 @@ mod tests {
         assert!(obs.freshness().starts_with("Out of date"));
     }
 
+    fn diagnosis(
+        origin: &str,
+        code: &str,
+        message: Option<&str>,
+        location: Option<&str>,
+    ) -> DiagnoseResponse {
+        serde_json::from_value(serde_json::json!({
+            "target": "a2", "summary": "arbitrary prose: origin: is not a parser input",
+            "steps": [{"kind": "agent", "code": code, "origin": origin,
+                "message": message, "where": location}]
+        }))
+        .unwrap()
+    }
+
     #[test]
-    fn diagnosis_reads_as_its_origin_and_hides_when_nothing_failed() {
+    fn diagnosis_reads_structured_origin_and_keeps_message_colons() {
         assert_eq!(
-            diagnosis_line("provider origin: a3 failure: free usage limit reached").as_deref(),
-            Some("Provider: free usage limit reached")
+            diagnosis_line(&diagnosis(
+                "provider",
+                "failure",
+                Some("origin: free usage: limit"),
+                None
+            ))
+            .as_deref(),
+            Some("Model service: The Agent could not finish: origin: free usage: limit")
         );
-        assert_eq!(diagnosis_line("unknown origin: a1 idle"), None);
         assert_eq!(
-            diagnosis_line("environment origin: a2 failed at plugin start").as_deref(),
-            Some("Environment: failed")
+            diagnosis_line(&diagnosis("unknown", "idle", None, None)),
+            None
         );
         assert_eq!(
-            diagnosis_line("unknown origin: a4 lost").as_deref(),
-            Some("Cause not determined: lost")
+            diagnosis_line(&diagnosis("unknown", "lost", None, None)).as_deref(),
+            Some("Cause not determined: Lost contact with the Agent")
         );
-        assert_eq!(diagnosis_line("unknown origin: a3 unknown"), None);
+    }
+
+    #[test]
+    fn process_diagnosis_uses_the_shared_reason_words() {
+        let mut reply = diagnosis("unknown", "agent.failed", Some("daemon_restart"), None);
+        reply.steps[0].kind = "process".to_owned();
+        assert_eq!(
+            diagnosis_line(&reply).as_deref(),
+            Some("Cause not determined: The Agent could not finish: Stopped by a Swarm restart")
+        );
+        for (code, words) in [
+            ("agent.failed", "The Agent could not finish"),
+            ("agent.lost", "Lost contact with the Agent"),
+        ] {
+            reply.steps[0].code = Some(code.to_owned());
+            reply.steps[0].message = None;
+            assert_eq!(
+                diagnosis_line(&reply),
+                Some(format!("Cause not determined: {words}"))
+            );
+        }
     }
 
     fn summary(id: &str, state: AgentState, parent: Option<&str>, native: bool) -> AgentListRow {
@@ -1808,10 +1805,13 @@ mod tests {
 
     #[test]
     fn a_restart_loss_reads_as_stopped_by_swarm() {
-        let summary = "swarm origin: a2 agent.lost at daemon.restart: daemon_restart";
-        assert!(restart_loss(summary));
-        assert_eq!(diagnosis_line(summary).as_deref(), Some(RESTART_LOSS_WORDS));
-        assert!(!restart_loss("unknown origin: a2 lost"));
+        let summary = diagnosis("swarm", "daemon_restart", None, Some("daemon.restart"));
+        assert!(restart_loss(&summary));
+        assert_eq!(
+            diagnosis_line(&summary).as_deref(),
+            Some(RESTART_LOSS_WORDS)
+        );
+        assert!(!restart_loss(&diagnosis("unknown", "lost", None, None)));
     }
 
     #[test]
@@ -1840,8 +1840,8 @@ mod tests {
         assert!(lost.resumable() && !monitor.row("a3").unwrap().resumable());
         assert_eq!(monitor.loss_reads(), [("a2".to_owned(), 1)]);
         assert_eq!(monitor.loss_words(&lost), None);
-        let why = "swarm origin: a2 agent.lost at daemon.restart: daemon_restart";
-        monitor.apply(snapshot(vec![(("a2".to_owned(), 1), Ok(why.to_owned()))]));
+        let why = diagnosis("swarm", "daemon_restart", None, Some("daemon.restart"));
+        monitor.apply(snapshot(vec![(("a2".to_owned(), 1), Ok(why))]));
         assert_eq!(
             monitor.loss_words(&lost).as_deref(),
             Some(RESTART_LOSS_WORDS)

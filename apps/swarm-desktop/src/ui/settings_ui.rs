@@ -230,13 +230,13 @@ pub(super) enum SettingsMsg {
     CleanupApply,
     /// The confirmation's answer: true removes the selected items.
     CleanupConfirmed(bool),
-    CleanupApplied(Fallible<eliot_core::api::CleanupApplyResponse>),
+    CleanupApplied(MutationResult<eliot_core::api::CleanupApplyResponse>),
     PageSelected(Page),
     Loaded(Fallible<SettingsReadResponse>),
     Reload,
     /// Validate (true) or save the page's section.
     Save(Page, bool),
-    Saved(Page, bool, Fallible<SettingsSaveResponse>),
+    Saved(Page, bool, MutationResult<SettingsSaveResponse>),
     /// Put the page's draft back to the saved values.
     Discard(Page),
     /// Role, candidate index, up (true) or down.
@@ -498,7 +498,7 @@ impl DesktopApp {
                             "cleanup.plan",
                             &request,
                         ))
-                        .map_err(|e| e.to_string()),
+                        .map_err(|error| error.to_string()),
                     ))
                 });
             }
@@ -574,22 +574,14 @@ impl DesktopApp {
                         delete_remote: false,
                         artifacts: Some(selected),
                     };
-                    Message::Settings(SettingsMsg::CleanupApplied(
-                        client::block_on(eliot_daemon::client_call_typed(
-                            &data,
-                            "cleanup.apply",
-                            &request,
-                        ))
-                        .map_err(|e| e.to_string()),
-                    ))
+                    Message::Settings(SettingsMsg::CleanupApplied(client::block_on(
+                        eliot_daemon::client_call_typed(&data, "cleanup.apply", &request),
+                    )))
                 });
             }
             SettingsMsg::CleanupApplied(result) => {
                 s.cleanup_busy = false;
-                let uncertain = result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| crate::state::uncertain(error));
+                let uncertain = result.as_ref().err().is_some_and(crate::state::uncertain);
                 let key = s.cleanup_key.take();
                 match result {
                     Ok(reply) => {
@@ -601,14 +593,11 @@ impl DesktopApp {
                         s.cleanup_key = key.clone();
                         s.cleanup_error = Some(format!(
                             "Cleanup not confirmed; Remove again retries the same request: {}",
-                            crate::state::plain_error(&error)
+                            error.user_message()
                         ));
                     }
                     Err(error) => {
-                        s.cleanup_error = Some(format!(
-                            "Cleanup refused: {}",
-                            crate::state::plain_error(&error)
-                        ))
+                        s.cleanup_error = Some(format!("Cleanup refused: {}", error.user_message()))
                     }
                 }
                 if !uncertain && let Some(key) = key {
@@ -973,8 +962,7 @@ impl DesktopApp {
             Message::Settings(SettingsMsg::Saved(
                 page,
                 dry_run,
-                client::block_on(config_client::save_settings(&data_dir, &request))
-                    .map_err(|error| error.to_string()),
+                client::block_on(config_client::save_settings(&data_dir, &request)),
             ))
         });
     }

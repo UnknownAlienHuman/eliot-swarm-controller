@@ -1,11 +1,13 @@
 //! Public Agent/daemon read grammar and pure reply binding checks.
 //! Store authorization and the exact workspace target remain Router decisions.
 
-use super::{GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView};
+use super::{
+    GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView, StatsCoverage,
+};
 use crate::{
     Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
-    NativeChildActivityState, ProcessIdentity, ProcessRecord, Result, SessionUsage, StderrSnapshot,
-    TurnOutcome, TurnUsage,
+    NativeChildActivityState, ProcessIdentity, ProcessRecord, ProcessState, Result, SessionUsage,
+    StderrSnapshot, TurnOutcome, TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -438,16 +440,13 @@ impl AgentSummary {
         }
     }
 
-    /// Fleet counting bucket for one summary.
+    /// Fleet counting bucket for one summary. Per docs/spec/api.md:722-727, a lost observed
+    /// activity counts as unknown; its display label still describes the loss.
     pub fn fleet_bucket(&self) -> &'static str {
         match &self.activity {
             Some(_) if self.state == AgentState::Stopped => "stopped",
-            Some(activity) => match activity.state {
-                NativeChildActivityState::Running => "running",
-                NativeChildActivityState::Idle => "idle",
-                NativeChildActivityState::Interrupted => "interrupted",
-                NativeChildActivityState::Unknown | NativeChildActivityState::Lost => "unknown",
-            },
+            Some(activity) if activity.state == NativeChildActivityState::Lost => "unknown",
+            Some(activity) => activity_state_name(activity.state),
             None => agent_state_name(self.state),
         }
     }
@@ -476,6 +475,25 @@ pub fn activity_state_name(state: NativeChildActivityState) -> &'static str {
         NativeChildActivityState::Interrupted => "interrupted",
         NativeChildActivityState::Lost => "lost",
         NativeChildActivityState::Unknown => "unknown",
+    }
+}
+
+/// Process state spelling shared by persisted observations and readbacks.
+pub fn process_state_name(state: ProcessState) -> &'static str {
+    match state {
+        ProcessState::Running => "running",
+        ProcessState::Exited => "exited",
+        ProcessState::Unknown => "unknown",
+    }
+}
+
+/// OS sample coverage spelling shared by observation readbacks.
+pub fn stats_coverage_name(coverage: StatsCoverage) -> &'static str {
+    match coverage {
+        StatsCoverage::Unknown => "unknown",
+        StatsCoverage::Stale => "stale",
+        StatsCoverage::Complete => "complete",
+        StatsCoverage::Partial => "partial",
     }
 }
 
@@ -1704,6 +1722,31 @@ pub struct DiagnoseStep {
     pub at: Option<i64>,
 }
 
+/// The same most-informative reason for every diagnosis presentation. Failure
+/// origin, terminal turn and process evidence take precedence over fallbacks.
+pub fn diagnosis_reason(steps: &[DiagnoseStep]) -> Option<&DiagnoseStep> {
+    steps
+        .iter()
+        .find(|step| {
+            step.origin
+                .as_deref()
+                .is_some_and(|origin| origin != "unknown")
+        })
+        .or_else(|| {
+            steps.iter().find(|step| {
+                step.kind == "turn"
+                    && matches!(
+                        step.code.as_deref(),
+                        Some("failure" | "interrupted" | "unknown")
+                    )
+            })
+        })
+        .or_else(|| steps.iter().find(|step| step.exit_code.is_some()))
+        .or_else(|| steps.iter().find(|step| step.kind == "command"))
+        .or_else(|| steps.iter().find(|step| step.kind == "turn"))
+        .or(steps.first())
+}
+
 impl DiagnoseStep {
     pub fn validate(&self) -> Result<()> {
         if self.kind.chars().count() > 64
@@ -2712,7 +2755,13 @@ mod tests {
             "interrupted"
         );
         assert_eq!(observed(Activity::Unknown).fleet_bucket(), "unknown");
-        assert_eq!(observed(Activity::Lost).fleet_bucket(), "unknown");
+        assert_eq!(
+            (
+                activity_state_name(Activity::Lost),
+                observed(Activity::Lost).fleet_bucket()
+            ),
+            ("lost", "unknown")
+        );
         assert_eq!(summary().fleet_bucket(), "idle");
         let mut unknown = summary();
         unknown.state = AgentState::Unknown;

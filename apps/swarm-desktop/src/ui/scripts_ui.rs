@@ -12,12 +12,12 @@ pub(super) enum ScriptsMsg {
     ScriptDraftChanged(String),
     ScriptValidateRequested,
     ScriptSaveRequested,
-    ScriptSaved(u64, bool, Fallible<ScriptSaveResponse>),
+    ScriptSaved(u64, bool, MutationResult<ScriptSaveResponse>),
     ScriptReloadRequested,
     EditorPathChanged(String),
     OpenInEditorRequested,
     ScriptRunRequested(String),
-    ScriptRunSubmitted(Box<Fallible<Command>>),
+    ScriptRunSubmitted(Box<MutationResult<Command>>),
     ScriptRunSettled(Box<Fallible<Command>>),
 }
 
@@ -167,12 +167,12 @@ impl DesktopApp {
                         );
                         self.load_script(context);
                     }
-                    Err(error) if error.starts_with("conflict:") => {
+                    Err(error) if error.code == "conflict" => {
                         self.scripts.status = format!(
                             "Not saved: the script changed on disk after it was read. Copy what you need from the draft, then Reload. ({error})"
                         );
                     }
-                    Err(error) if error.starts_with("unknown:") => {
+                    Err(error) if crate::state::uncertain(&error) => {
                         self.scripts.status = format!(
                             "Save outcome uncertain; Reload to see the current file (the draft is kept): {error}"
                         );
@@ -229,9 +229,7 @@ impl DesktopApp {
                 let _task = context.spawn_background(move |_| {
                     Message::Scripts(ScriptsMsg::ScriptRunSubmitted(Box::new(client::block_on(
                         async {
-                            config_client::run_timer(&data_dir, mutation_id, project, &rule)
-                                .await
-                                .map_err(|error| error.to_string())
+                            config_client::run_timer(&data_dir, mutation_id, project, &rule).await
                         },
                     ))))
                 });
@@ -240,10 +238,7 @@ impl DesktopApp {
                 let result = *result;
                 // Only an uncertain reply keeps the key (so a retry reuses the id);
                 // a definite refusal ends that action.
-                let uncertain = result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| crate::state::uncertain(error));
+                let uncertain = result.as_ref().err().is_some_and(crate::state::uncertain);
                 self.settle_mutation(!uncertain);
                 if result.is_err() && !uncertain {
                     self.scripts.run_seq += 1;
@@ -366,7 +361,6 @@ impl DesktopApp {
                 client::block_on(async {
                     config_client::save_script(&data_dir, project, path, revision, draft, dry_run)
                         .await
-                        .map_err(|error| error.to_string())
                 }),
             ))
         });

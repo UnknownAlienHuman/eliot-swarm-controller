@@ -10,7 +10,8 @@
 use eliot_core::AgentState;
 use eliot_core::api::{ReparentRequest, ReparentResponse};
 
-use crate::monitor::{MonitorRow, state_name};
+use crate::monitor::MonitorRow;
+use eliot_core::api::agent_state_name;
 
 /// The two `swarm.reparent` source forms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,11 +60,11 @@ impl MoveBinding {
     pub fn describe(&self) -> String {
         match self.form {
             MoveForm::Agent => format!(
-                "{} (generation {}) and its subtree to {} (generation {})",
+                "{} (run {}) and its subtree to {} (run {})",
                 self.source, self.source_generation, self.parent, self.parent_generation
             ),
             MoveForm::Children => format!(
-                "all children of {} (generation {}) to {} (generation {})",
+                "all children of {} (run {}) to {} (run {})",
                 self.source, self.source_generation, self.parent, self.parent_generation
             ),
         }
@@ -88,7 +89,7 @@ pub fn candidate_label(row: &MonitorRow) -> String {
     format!(
         "{} · {} · {} · generation {}",
         row.id,
-        state_name(row.state),
+        agent_state_name(row.state),
         row.harness,
         row.generation
     )
@@ -115,31 +116,12 @@ pub fn result_lines(binding: &MoveBinding, reply: &ReparentResponse) -> Vec<Stri
 }
 
 /// The daemon's refusal with what its code means for a manager change.
-pub fn refusal_line(binding: &MoveBinding, error: &str) -> String {
-    let code = error.split(':').next().unwrap_or_default().trim();
-    let meaning = match code {
-        "invalid" => "a cycle (the new manager is inside the moving subtree) or a bad source form",
-        "fanout_limit" => "the new manager's direct-child or tree limit would be exceeded",
-        "not_allowed" => {
-            "an observe-only Agent is involved (its parent binding belongs to the native harness), or the moved rows are in another project"
-        }
-        "stale_generation" => {
-            "a generation changed after this was shown; wait for the monitor to refresh and choose again"
-        }
-        "bad_state" => "the new manager must be a controlled, live, non-unknown Agent",
-        "not_found" => "an Agent no longer exists",
-        "frame_too_large" => "the result would exceed the reply bound",
-        "id_conflict" => "this mutation id was already used for a different move",
-        _ => "",
-    };
-    if meaning.is_empty() {
-        format!("Not moved: {} — {error}", binding.describe())
-    } else {
-        format!(
-            "Not moved: {} — {meaning}. Daemon: {error}",
-            binding.describe()
-        )
-    }
+pub fn refusal_line(binding: &MoveBinding, error: &eliot_core::Error) -> String {
+    format!(
+        "Not moved: {} — {}",
+        binding.describe(),
+        error.user_message()
+    )
 }
 
 #[cfg(test)]
@@ -205,13 +187,24 @@ mod tests {
         assert!(result_lines(&binding(MoveForm::Children), &empty)[1].contains("no children"));
         let line = refusal_line(
             &binding(MoveForm::Agent),
-            "invalid: reparent would create a cycle",
+            &eliot_core::Error::new("stale_generation", "internal generation details"),
         );
-        assert!(
-            line.contains("a cycle")
-                && line.ends_with("Daemon: invalid: reparent would create a cycle")
-        );
-        let line = refusal_line(&binding(MoveForm::Agent), "weird: thing");
-        assert!(line.ends_with("— weird: thing"));
+        assert!(line.ends_with(
+            "The Agent started a new run; refresh and try again: internal generation details"
+        ));
+        assert!(!line.contains("stale_generation"));
+        for (code, message) in [
+            ("invalid", "reparent would create a cycle"),
+            ("not_allowed", "observe-only Agent cannot be reparented"),
+            ("bad_state", "new parent is not a live manager"),
+        ] {
+            assert!(
+                refusal_line(
+                    &binding(MoveForm::Agent),
+                    &eliot_core::Error::new(code, message)
+                )
+                .ends_with(message)
+            );
+        }
     }
 }

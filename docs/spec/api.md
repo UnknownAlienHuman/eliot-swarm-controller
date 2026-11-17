@@ -391,14 +391,8 @@ After a request is written, local response read/integrity failures are `unknown`
 (mutation exit 4), never proof of non-execution. Pre-send validation and a valid,
 matching daemon domain rejection retain their own codes; no automatic retry occurs.
 
-Commands store the binding directly; other writes use:
-
-```sql
-CREATE TABLE writes (
-  id TEXT PRIMARY KEY, principal TEXT NOT NULL, method TEXT NOT NULL,
-  payload_digest BLOB NOT NULL, result TEXT NOT NULL, created_at INTEGER NOT NULL
-);
-```
+Commands store the binding directly; other writes use the durable `writes`
+receipt defined by the [Store migrations](../../crates/eliot-store/src/schema.rs).
 
 The writer checks both command/write namespaces. Later linked inputs, selectors and
 rule actions have bounded derived ids. No general receipt/floor framework.
@@ -436,7 +430,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `rule.list/get/catch_up` | owner-only paged rule list (state, timer state, canonical definition), one rule read, and finite committed-history catch-up |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
-| `models.catalog` | owner-only unified searchable catalogue across every installed harness: versioned per-harness entries with display name, provider, efforts, default and hold/quota availability; `available` requires complete hold readback and affirmative fresh native quota evidence, otherwise `unknown` (or `held` for a known hold); catalogue membership alone proves no availability; aggregate and native-read caches include executable/version identity with bounded TTL and coalesced concurrent callers; an installed harness whose `harness.models` read fails is named in `failures` (harness, code, message, origin; [`ModelsCatalogFailure`](../../crates/eliot-core/src/api/harness.rs)) and logged, never silently omitted, and such a partial aggregate serves only that listing's continuation pages (at most 30 s) while every first page reads the failed harness again; optional case-insensitive `query` over id, display name, provider and harness; bounded and paginated |
+| `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues; request, entries, failures and quota vocabulary: [canonical DTOs](../../crates/eliot-core/src/api/harness.rs). Membership never proves availability: affirmative fresh native quota and complete hold readback are required. Failed harness reads remain visible; a partial listing supports continuation but the next first page retries failed reads. Executable/version-bound caching and concurrent-read coalescing belong to the [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs). |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `config.profiles.read/save` | legacy profile-only read and validated, revision-guarded replacement of the `[profiles.*]` sections of `config.toml` (same writer as `settings.save`) |
 | `settings.read/save` | owner-only unified section read/save, revision CAS, dry run, restart indication and bounded author history; see configuration |
@@ -1066,6 +1060,14 @@ unknown outcomes. A terminal's typed `native_error.code` (for example
 `quota_exhausted`) and native quota reset hint are included in its turn step.
 At most 16 steps;
 no new store, only existing event and record readbacks.
+
+Human CLI and desktop explanations lead with shared words for the typed code,
+followed by the daemon's complete message when nonempty. Specific refusal reasons
+(including reparent cycles, observe-only Agents and non-live managers) remain
+visible; a generic code alone must not hide the reason or imply a temporary outage.
+Codes without specific words display their readable code name without implying a
+failure. Accepted, queued and dispatched commands describe progress; process steps
+retain whether the Agent was lost or failed and explain their recorded reason.
 
 For every failed terminal turn, with or without a structured provider restriction, status
 and exact command/turn binding remain authoritative when final text exceeds the event

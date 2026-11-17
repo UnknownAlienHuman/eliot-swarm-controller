@@ -165,7 +165,7 @@ pub fn card(
             .vertical_alignment(VerticalAlignment::Bottom)
             .margin(Thickness::xy(tokens::spacing::SM, tokens::spacing::SM))
             .is_enabled(enabled)
-            .automation_name(format!("Resume {title} (generation {})", row.generation))
+            .automation_name(format!("Resume {title} (run {})", row.generation))
             .on_click(resume)
             .content(crate::m3::label("Resume")),
     ))
@@ -329,7 +329,7 @@ pub fn identity_lines(read: &DetailRead) -> Vec<String> {
     if !agent.pending.is_empty() {
         lines.push(format!("{} request(s) wait for you", agent.pending.len()));
     }
-    lines.push(format!("ID {} · generation {}", agent.id, agent.generation));
+    lines.push(format!("ID {} · run {}", agent.id, agent.generation));
     lines
 }
 
@@ -564,7 +564,7 @@ pub fn manager_section(
     let note: View = if moves.is_empty() {
         View::empty()
     } else {
-        small("The daemon checks cycles, fanout limits, observe-only Agents and both generations.")
+        small("Swarm checks the manager links, Agent limits and the runs shown here.")
             .opacity(theme::MUTED_OPACITY)
             .into()
     };

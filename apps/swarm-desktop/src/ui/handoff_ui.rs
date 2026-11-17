@@ -69,13 +69,13 @@ pub(super) enum HandoffMsg {
     /// Epoch, whether this reply answers a submission (and so settles its
     /// ledger entry, even after the dialog closed), the mutation id it
     /// answers, and the reply.
-    Replied(u64, bool, String, Box<Fallible<Outcome>>),
+    Replied(u64, bool, String, Box<MutationResult<Outcome>>),
     RefreshRequested,
     ChildrenLoaded(u64, Fallible<Vec<Command>>),
     ReasonChanged(String),
     ResolveRequested(String, CommandResolution),
     CancelRequested(String),
-    OwnerDone(u64, String, Fallible<String>),
+    OwnerDone(u64, String, MutationResult<String>),
     Finish {
         agent: String,
         generation: i64,
@@ -143,7 +143,7 @@ impl DesktopApp {
                     epoch,
                     from: agent.clone(),
                     from_generation: generation,
-                    status: format!("Reading the SENDs of {agent} generation {generation}…"),
+                    status: format!("Reading the SENDs of {agent} run {generation}…"),
                     ..DialogState::default()
                 };
                 let Ok(data_dir) = self.data_dir.clone() else {
@@ -168,7 +168,7 @@ impl DesktopApp {
                 }
                 self.handoff.status = match &sends {
                     Ok(rows) => format!(
-                        "{} SEND(s) on this generation, {} undispatched.{}",
+                        "{} SEND(s) in this run, {} undispatched.{}",
                         rows.len(),
                         rows.iter().filter(|row| row.transferable()).count(),
                         handoff::omitted_note(omitted, client::MAX_LISTED_SENDS)
@@ -322,10 +322,7 @@ impl DesktopApp {
             }
             HandoffMsg::Replied(epoch, settles, id, reply) => {
                 let reply = *reply;
-                let uncertain = reply
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| crate::state::uncertain(error));
+                let uncertain = reply.as_ref().err().is_some_and(crate::state::uncertain);
                 // Only the reply to a submission settles its ledger entry; a
                 // readback never touches another action in flight.
                 if settles {
@@ -433,7 +430,6 @@ impl DesktopApp {
                         data_dir, id, &command, resolution, reason,
                     ))
                     .map(|reply| format!("now {}", handoff::state_name(reply.state)))
-                    .map_err(|error| error.to_string())
                 });
             }
             HandoffMsg::CancelRequested(command) => {
@@ -442,14 +438,10 @@ impl DesktopApp {
                 self.handoff_owner_action(key, label, context, move |data_dir, id| {
                     client::block_on(client::cancel_command(data_dir, id, &command))
                         .map(|reply| format!("now {}", handoff::state_name(reply.state)))
-                        .map_err(|error| error.to_string())
                 });
             }
             HandoffMsg::OwnerDone(epoch, label, result) => {
-                let uncertain = result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| crate::state::uncertain(error));
+                let uncertain = result.as_ref().err().is_some_and(crate::state::uncertain);
                 self.settle_mutation(!uncertain);
                 if epoch != self.handoff.epoch {
                     return;
@@ -493,8 +485,11 @@ impl DesktopApp {
             })
             .filter(|agent| {
                 !matches!(
-                    agent.state.as_str(),
-                    "stopped" | "failed" | "lost" | "unknown"
+                    agent.state,
+                    eliot_core::AgentState::Stopped
+                        | eliot_core::AgentState::Failed
+                        | eliot_core::AgentState::Lost
+                        | eliot_core::AgentState::Unknown
                 )
             })
             .collect()
@@ -604,7 +599,7 @@ impl DesktopApp {
                     epoch,
                     settles,
                     id,
-                    Box::new(Err("unknown: readback cancelled".to_owned())),
+                    Box::new(Err(eliot_core::Error::new("unknown", "readback cancelled"))),
                 ));
             }
             let reply = client::block_on(async {
@@ -616,8 +611,7 @@ impl DesktopApp {
                         .await
                         .map(Outcome::Switch),
                 }
-            })
-            .map_err(|error| error.to_string());
+            });
             Message::Handoff(HandoffMsg::Replied(epoch, settles, id, Box::new(reply)))
         });
     }
@@ -639,7 +633,7 @@ impl DesktopApp {
         key: String,
         label: String,
         context: &ComponentContext<Self>,
-        work: impl FnOnce(&Path, String) -> Fallible<String> + Send + 'static,
+        work: impl FnOnce(&Path, String) -> MutationResult<String> + Send + 'static,
     ) {
         if self.submitting() {
             return;
@@ -743,7 +737,7 @@ impl DesktopApp {
             if transferable.is_empty() {
                 push(
                 "no-sends",
-                small("None are waiting on this generation: the transfer carries context, claims, Goal and children only.")
+                small("None are waiting in this run: the transfer carries context, claims, Goal and children only.")
                     .opacity(theme::MUTED_OPACITY)
                     .into(),
             );
@@ -796,7 +790,12 @@ impl DesktopApp {
                 push(
                     &format!("existing-{}", agent.id),
                     destination(
-                        format!("{} · {} · {}", agent.id, agent.state, agent.harness),
+                        format!(
+                            "{} · {} · {}",
+                            agent.id,
+                            eliot_core::api::agent_state_name(agent.state),
+                            agent.harness
+                        ),
                         &choice,
                         state.choice.as_ref(),
                         can_act,

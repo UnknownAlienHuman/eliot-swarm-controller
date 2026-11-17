@@ -85,22 +85,22 @@ pub(super) enum MenuMsg {
     /// Show archived Agents in the sidebar, or not.
     ArchivedToggled,
     /// An Agent lifecycle call settled (what, the outcome).
-    Done(String, Fallible<String>),
+    Done(String, MutationResult<String>),
     /// Put the keyboard in the rename field (tries left).
     FocusRename(u8),
     /// Stop and delete: the stop was submitted (its outcome).
-    RemovalStopped(Fallible<String>),
+    RemovalStopped(MutationResult<String>),
     /// Stop and delete: the Agent reads stopped (its state), or not.
-    RemovalSettled(Fallible<String>),
+    RemovalSettled(MutationResult<String>),
     /// Stop and delete: `agent.delete` settled.
-    RemovalDeleted(Fallible<String>),
+    RemovalDeleted(MutationResult<String>),
     /// Close the Stop and delete dialog after a refused step.
     RemovalClosed,
     /// Stop and delete: a second passed; the progress line's seconds move.
     RemovalTick,
     /// `agent.archive` settled (the Agent, archived or not, whether to
     /// reopen its conversation, the outcome).
-    Archived(UiAgent, bool, bool, Fallible<usize>),
+    Archived(UiAgent, bool, bool, MutationResult<usize>),
     /// The "Archived · Undo" notice's Undo.
     UndoArchive,
     /// The notice was closed, or its time ran out (its epoch).
@@ -376,8 +376,7 @@ impl DesktopApp {
                     bound.generation,
                     false,
                 ))
-                .map(|reply| submit_note(&reply))
-                .map_err(|error| error.to_string()),
+                .map(|reply| submit_note(&reply)),
             ))
         });
     }
@@ -395,7 +394,11 @@ impl DesktopApp {
     /// Step two: wait until the stop command has settled and the Agent
     /// reads stopped (bounded): `agent.delete` refuses `busy` while either
     /// is still open.
-    fn removal_stopped(&mut self, outcome: Fallible<String>, context: &ComponentContext<Self>) {
+    fn removal_stopped(
+        &mut self,
+        outcome: MutationResult<String>,
+        context: &ComponentContext<Self>,
+    ) {
         self.settle_mutation(
             outcome
                 .as_ref()
@@ -426,9 +429,9 @@ impl DesktopApp {
                     Ok((stop, state)) => {
                         use eliot_core::{AgentState, CommandState};
                         if matches!(stop, CommandState::Rejected | CommandState::Failed) {
-                            break Err(format!(
-                                "stop_{}: the stop did not apply; nothing was deleted",
-                                format!("{stop:?}").to_lowercase()
+                            break Err(eliot_core::Error::new(
+                                format!("stop_{}", format!("{stop:?}").to_lowercase()),
+                                "the stop did not apply; nothing was deleted",
                             ));
                         }
                         let stopped = matches!(
@@ -439,18 +442,24 @@ impl DesktopApp {
                             break Ok(format!("{state:?}").to_lowercase());
                         }
                         if waited >= REMOVAL_WAIT_MS {
-                            break Err(format!(
-                                "timeout: Agent {}, stop {} after {} s; nothing was deleted",
-                                format!("{state:?}").to_lowercase(),
-                                format!("{stop:?}").to_lowercase(),
-                                REMOVAL_WAIT_MS / 1000
+                            break Err(eliot_core::Error::new(
+                                "timeout",
+                                format!(
+                                    "Agent {}, stop {} after {} s; nothing was deleted",
+                                    format!("{state:?}").to_lowercase(),
+                                    format!("{stop:?}").to_lowercase(),
+                                    REMOVAL_WAIT_MS / 1000
+                                ),
                             ));
                         }
                     }
-                    Err(error) => break Err(error.to_string()),
+                    Err(error) => break Err(error),
                 }
                 if !feed::backoff(REMOVAL_POLL_MS, &cancelled) {
-                    break Err("cancelled: the window stopped waiting".to_owned());
+                    break Err(eliot_core::Error::new(
+                        "cancelled",
+                        "the window stopped waiting",
+                    ));
                 }
                 waited += REMOVAL_POLL_MS;
             };
@@ -462,7 +471,11 @@ impl DesktopApp {
     /// refuses `busy` until the stopped generation's processes and sources
     /// are released; such a definite refusal records nothing, so the same
     /// mutation id asks again (bounded) and any other outcome is final.
-    fn removal_settled(&mut self, outcome: Fallible<String>, context: &ComponentContext<Self>) {
+    fn removal_settled(
+        &mut self,
+        outcome: MutationResult<String>,
+        context: &ComponentContext<Self>,
+    ) {
         if let Err(error) = outcome {
             self.removal_failed(error);
             return;
@@ -476,7 +489,10 @@ impl DesktopApp {
             return;
         };
         if self.submitting() {
-            self.removal_failed("busy: waiting for the last action to settle".to_owned());
+            self.removal_failed(eliot_core::Error::new(
+                "busy",
+                "waiting for the last action to settle",
+            ));
             return;
         }
         let Ok(data_dir) = self.data_dir.clone() else {
@@ -499,10 +515,13 @@ impl DesktopApp {
                 match client::block_on(client::delete_agent(&data_dir, mutation_id.clone(), &id)) {
                     Ok(count) => break Ok(format!("{count} record tree(s) removed")),
                     Err(error) if error.code == "busy" && waited < REMOVAL_WAIT_MS => {}
-                    Err(error) => break Err(error.to_string()),
+                    Err(error) => break Err(error),
                 }
                 if !feed::backoff(REMOVAL_POLL_MS, &cancelled) {
-                    break Err("cancelled: the window stopped waiting".to_owned());
+                    break Err(eliot_core::Error::new(
+                        "cancelled",
+                        "the window stopped waiting",
+                    ));
                 }
                 waited += REMOVAL_POLL_MS;
             };
@@ -511,9 +530,9 @@ impl DesktopApp {
     }
 
     /// A refused (or unconfirmed) step: its typed error, in the dialog.
-    fn removal_failed(&mut self, error: String) {
+    fn removal_failed(&mut self, error: eliot_core::Error) {
         let Some(removal) = self.menu.removal.as_mut() else {
-            self.alert(error);
+            self.alert(error.to_string());
             return;
         };
         let what = removal.step.what();
@@ -552,8 +571,7 @@ impl DesktopApp {
                 mutation_id,
                 &agent.id,
                 archived,
-            ))
-            .map_err(|error| error.to_string());
+            ));
             Message::Menu(MenuMsg::Archived(agent, archived, reopen, outcome))
         });
     }
@@ -602,7 +620,6 @@ impl DesktopApp {
                         false,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             (Action::Archive(archived), Target::Agent(agent)) => {
@@ -631,7 +648,6 @@ impl DesktopApp {
                 self.submit_lifecycle("Delete", key, context, move |data_dir, mutation| {
                     client::block_on(client::delete_agent(data_dir, mutation, &id))
                         .map(|count| format!("{count} record tree(s) removed"))
-                        .map_err(|error| error.to_string())
                 });
             }
             (
@@ -662,8 +678,7 @@ impl DesktopApp {
                     Message::Menu(MenuMsg::Done(
                         format!("Remove project {name}"),
                         client::block_on(config_client::remove_projects(&data_dir, &ids))
-                            .map(|_| "unregistered; its folder and tasks stay".to_owned())
-                            .map_err(|error| error.to_string()),
+                            .map(|_| "unregistered; its folder and tasks stay".to_owned()),
                     ))
                 });
             }
@@ -677,7 +692,7 @@ impl DesktopApp {
         what: &str,
         key: String,
         context: &ComponentContext<Self>,
-        work: impl FnOnce(&Path, String) -> Fallible<String> + Send + 'static,
+        work: impl FnOnce(&Path, String) -> MutationResult<String> + Send + 'static,
     ) {
         if self.submitting() {
             self.alert("Waiting for the last action to settle.");

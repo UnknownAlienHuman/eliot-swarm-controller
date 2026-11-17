@@ -120,8 +120,8 @@ impl MutationLedger {
 /// daemon unavailable). Only then may the same mutation id be reused by a
 /// retry; a definite refusal ends that action, and nothing ever retries with
 /// a new id on its own.
-pub fn uncertain(error: &str) -> bool {
-    error.starts_with("unknown:") || error.starts_with("unavailable:")
+pub fn uncertain(error: &eliot_core::Error) -> bool {
+    matches!(error.code.as_str(), "unknown" | "unavailable")
 }
 
 /// A read's `code: message` error in plain words: a busy daemon says so,
@@ -185,6 +185,20 @@ impl BoundAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncertainty_uses_the_typed_code_even_when_prose_looks_like_a_code() {
+        for code in ["unknown", "unavailable"] {
+            assert!(uncertain(&eliot_core::Error::new(
+                code,
+                "invalid: definite-looking prose"
+            )));
+        }
+        assert!(!uncertain(&eliot_core::Error::new(
+            "invalid",
+            "unknown: quoted native prose"
+        )));
+    }
 
     #[test]
     fn ack_clears_only_the_submitted_revision() {

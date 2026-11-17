@@ -186,7 +186,10 @@ impl Router {
         let generation = row.generation;
         let mut steps = vec![DiagnoseStep {
             kind: "agent".to_owned(),
-            code: Some(bound_chars(&format!("{:?}", row.state).to_lowercase(), 128)),
+            code: Some(bound_chars(
+                eliot_core::api::agent_state_name(row.state),
+                128,
+            )),
             message: None,
             failure_where: None,
             origin: None,
@@ -463,26 +466,7 @@ fn summary_for(target: &str, steps: &[DiagnoseStep], fallback_what: &str) -> Str
             MAX_DIAGNOSE_SUMMARY_CHARS,
         );
     }
-    let step = steps
-        .iter()
-        .find(|step| {
-            step.origin
-                .as_deref()
-                .is_some_and(|origin| origin != "unknown")
-        })
-        .or_else(|| {
-            steps.iter().find(|step| {
-                step.kind == "turn"
-                    && matches!(
-                        step.code.as_deref(),
-                        Some("failure" | "interrupted" | "unknown")
-                    )
-            })
-        })
-        .or_else(|| steps.iter().find(|step| step.exit_code.is_some()))
-        .or_else(|| steps.iter().find(|step| step.kind == "command"))
-        .or_else(|| steps.iter().find(|step| step.kind == "turn"))
-        .or(steps.first());
+    let step = eliot_core::api::diagnosis_reason(steps);
     let (origin, what, where_, message) = match step {
         Some(step) => (
             step.origin.as_deref().unwrap_or("unknown"),

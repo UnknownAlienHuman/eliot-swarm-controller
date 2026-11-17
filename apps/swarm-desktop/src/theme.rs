@@ -218,15 +218,28 @@ pub enum StatusTone {
 }
 
 impl StatusTone {
-    /// The tone of an Agent state name as the daemon reports it.
-    pub fn of_state(state: &str) -> Self {
+    /// The tone of a controlled Agent's typed lifecycle state.
+    pub fn of_state(state: eliot_core::AgentState) -> Self {
         match state {
-            "busy" | "running" => Self::Active,
+            eliot_core::AgentState::Busy => Self::Active,
+            eliot_core::AgentState::Idle => Self::Ready,
+            eliot_core::AgentState::Waiting => Self::Attention,
+            eliot_core::AgentState::Unknown => Self::Unknown,
+            eliot_core::AgentState::Failed | eliot_core::AgentState::Lost => Self::Failed,
+            eliot_core::AgentState::Created | eliot_core::AgentState::Starting => Self::Pending,
+            eliot_core::AgentState::Stopped => Self::Neutral,
+        }
+    }
+
+    /// The tone of native observed-child activity, which has a distinct state
+    /// vocabulary from a controlled Agent lifecycle.
+    pub fn of_activity_state(state: &str) -> Self {
+        match state {
+            "running" => Self::Active,
             "idle" => Self::Ready,
-            "waiting" => Self::Attention,
+            "interrupted" => Self::Attention,
             "unknown" => Self::Unknown,
-            "failed" | "lost" => Self::Failed,
-            "created" | "starting" => Self::Pending,
+            "lost" => Self::Failed,
             _ => Self::Neutral,
         }
     }
@@ -808,18 +821,18 @@ mod tests {
     #[test]
     fn every_agent_state_has_a_status_tone() {
         let tones = [
-            ("busy", StatusTone::Active),
-            ("idle", StatusTone::Ready),
-            ("waiting", StatusTone::Attention),
-            ("unknown", StatusTone::Unknown),
-            ("failed", StatusTone::Failed),
-            ("lost", StatusTone::Failed),
-            ("created", StatusTone::Pending),
-            ("starting", StatusTone::Pending),
-            ("stopped", StatusTone::Neutral),
+            (eliot_core::AgentState::Busy, StatusTone::Active),
+            (eliot_core::AgentState::Idle, StatusTone::Ready),
+            (eliot_core::AgentState::Waiting, StatusTone::Attention),
+            (eliot_core::AgentState::Unknown, StatusTone::Unknown),
+            (eliot_core::AgentState::Failed, StatusTone::Failed),
+            (eliot_core::AgentState::Lost, StatusTone::Failed),
+            (eliot_core::AgentState::Created, StatusTone::Pending),
+            (eliot_core::AgentState::Starting, StatusTone::Pending),
+            (eliot_core::AgentState::Stopped, StatusTone::Neutral),
         ];
         for (state, tone) in tones {
-            assert_eq!(StatusTone::of_state(state), tone, "{state}");
+            assert_eq!(StatusTone::of_state(state), tone, "{state:?}");
         }
     }
 

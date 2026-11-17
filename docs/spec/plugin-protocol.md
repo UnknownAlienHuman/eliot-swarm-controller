@@ -591,6 +591,14 @@ Public requests and answers are universal: `request.opened` details and kinds us
 shared [`eliot_core::requests`](../../crates/eliot-core/src/requests.rs) shapes
 (`QuestionRequest`/`ApprovalRequest`), and `answer` args use `AnswerArgs`. Only the
 plugin translates between these shapes and its vendor format in both directions.
+The desktop consumes the nested question DTOs: text entry, one-choice lists,
+multiple-choice checkboxes, number text entry without rounding, and a Yes/No choice. Unedited
+questions stay omitted from partial answers; Leave unanswered removes an
+edited question without conflating it with an explicit empty string. Controls never invent native
+selection bounds. Resource and confidential fields show instructions without
+accepting a value. Replies keep the universal string-list shape and the exact
+request/run binding; plugin-owned native validation remains authoritative.
+
 Native-private request metadata stays in the existing plugin pending objects; plugins
 normalize public event details and kinds only. There are no vendor-public
 compatibility formats.

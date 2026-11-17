@@ -21,11 +21,13 @@ use crate::theme::winui::Palette;
 #[derive(Clone, Debug)]
 pub(super) enum ChatMsg {
     ComposerChanged(String),
-    AnswerChanged(String, String),
-    SnapshotLoaded(u64, Fallible<Box<Snapshot>>),
-    Delivered(u64, Fallible<Option<Box<Delivery>>>),
+    AnswerChanged(String, String, Vec<String>),
+    AnswerUnchanged,
+    AnswerOptionChanged(String, String, String, bool),
+    SnapshotLoaded(u64, eliot_core::Result<Box<Snapshot>>),
+    Delivered(u64, eliot_core::Result<Option<Box<Delivery>>>),
     BackoffDone(u64, bool),
-    RereadLoaded(u64, Result<Box<Reread>, (String, Invalidation)>),
+    RereadLoaded(u64, Result<Box<Reread>, (eliot_core::Error, Invalidation)>),
     RereadRetry(u64),
     LoadOlderRequested,
     /// Bring the latest turn into view once it is realized (epoch, tries).
@@ -40,7 +42,7 @@ pub(super) enum ChatMsg {
     InterruptRequested(BoundAction),
     ApprovalRequested(UiPending, bool),
     AnswerRequested(UiPending),
-    ControlSubmitted(String, Fallible<String>),
+    ControlSubmitted(String, eliot_core::Result<String>),
     /// A "…" menu entry (its label).
     AgentMenu(String),
     /// The Force stop banner's answer: true confirms the bound action.
@@ -52,12 +54,27 @@ pub(super) enum ChatMsg {
     /// Retry a local input that did not start (its part key).
     RetryInput(String),
     /// The `why` summary of the open lost Agent (Agent, generation).
-    LossRead(String, i64, Fallible<String>),
+    LossRead(String, i64, Fallible<eliot_core::api::DiagnoseResponse>),
 }
 
 /// Between two reads of inputs that still wait while the Agent is idle or
 /// has ended (bounded: only while one is shown as waiting).
 const INPUT_RECHECK_MS: u64 = 2_000;
+
+fn can_answer(
+    request: &UiPending,
+    answers: &HashMap<String, eliot_core::requests::Answers>,
+) -> bool {
+    request
+        .binding
+        .request
+        .as_ref()
+        .and_then(|id| answers.get(id))
+        .is_some_and(|answer| !answer.is_empty())
+        && request.questions.iter().any(|question| {
+            !question.is_secret && question.kind != eliot_core::requests::QuestionKind::Resource
+        })
+}
 
 /// The Agent and generation a "…" entry acts on: the header shown when the
 /// click is handled.
@@ -114,8 +131,7 @@ pub(super) fn enter_send_text(previous: &str, text: &str) -> Option<String> {
 /// what was submitted (to give the text back or send it after a steer).
 #[derive(Clone, Debug)]
 pub(super) struct SendFailure {
-    pub(super) error: String,
-    pub(super) code: String,
+    pub(super) error: eliot_core::Error,
     pub(super) mutation_id: String,
     pub(super) text: String,
     pub(super) revision: u64,
@@ -131,14 +147,20 @@ impl SendFailure {
         action: &DraftAction,
     ) -> Self {
         Self {
-            error: error.to_string(),
-            code: error.code.clone(),
+            error: error.clone(),
             mutation_id: mutation_id.to_owned(),
             text: text.to_owned(),
             revision,
             action: action.clone(),
         }
     }
+}
+
+fn settles<T>(outcome: &Result<T, SendFailure>) -> bool {
+    outcome
+        .as_ref()
+        .err()
+        .is_none_or(|failure| !crate::state::uncertain(&failure.error))
 }
 
 /// What the composer's draft is submitted as, with the binding captured at
@@ -223,7 +245,7 @@ pub(super) struct ChatState {
     pub(super) opened_from_search: bool,
     // Mutations.
     pub(super) drafts: DraftStore,
-    pub(super) answers: HashMap<String, String>,
+    pub(super) answers: HashMap<String, eliot_core::requests::Answers>,
     /// The Force stop awaiting confirmation, bound at its menu click, with
     /// the title shown in the question.
     pub(super) confirm_force: Option<(BoundAction, String)>,
@@ -265,8 +287,30 @@ impl DesktopApp {
                     self.launch.launch_rev = self.launch.launch_rev.wrapping_add(1);
                 }
             }
-            ChatMsg::AnswerChanged(request, text) => {
-                self.chat.answers.insert(request, text);
+            ChatMsg::AnswerUnchanged => {}
+            ChatMsg::AnswerChanged(request, question, values) => {
+                let answers = self.chat.answers.entry(request).or_default();
+                if values.is_empty() {
+                    answers.remove(&question);
+                } else if values != [""] || answers.contains_key(&question) {
+                    answers.insert(question, eliot_core::requests::Answer { answers: values });
+                }
+            }
+            ChatMsg::AnswerOptionChanged(request, question, option, selected) => {
+                let answers = self.chat.answers.entry(request).or_default();
+                let values = &mut answers
+                    .entry(question.clone())
+                    .or_insert_with(|| eliot_core::requests::Answer {
+                        answers: Vec::new(),
+                    })
+                    .answers;
+                values.retain(|value| value != &option);
+                if selected {
+                    values.push(option);
+                }
+                if values.is_empty() {
+                    answers.remove(&question);
+                }
             }
             ChatMsg::SnapshotLoaded(epoch, result) => {
                 if epoch != self.chat.epoch {
@@ -308,9 +352,8 @@ impl DesktopApp {
                         self.queue_reread(Invalidation::default(), context);
                     }
                     Err(error) => {
-                        let (code, text) = live::split_error(&error);
-                        let next = live::after_error(code, text, self.chat.failures);
-                        self.set_status(format!("History read failed: {error}"));
+                        let next = live::after_error(&error, self.chat.failures);
+                        self.set_status(format!("History read failed: {}", error.user_message()));
                         match next {
                             // A snapshot that cannot read its own window retries later.
                             Next::Resnapshot { reason } => self.follow_next(
@@ -348,7 +391,7 @@ impl DesktopApp {
                         }
                         let next = if resnapshot {
                             Next::Resnapshot {
-                                reason: "a newer generation started".to_owned(),
+                                reason: "a new run started".to_owned(),
                             }
                         } else {
                             live::after_page(
@@ -361,8 +404,7 @@ impl DesktopApp {
                         self.follow_next(next, context);
                     }
                     Err(error) => {
-                        let (code, text) = live::split_error(&error);
-                        let next = live::after_error(code, text, self.chat.failures);
+                        let next = live::after_error(&error, self.chat.failures);
                         self.follow_next(next, context);
                     }
                 }
@@ -399,7 +441,10 @@ impl DesktopApp {
                         self.queue_reread(Invalidation::default(), context);
                     }
                     Err((error, work)) => {
-                        self.set_status(format!("Readback failed, retrying: {error}"));
+                        self.set_status(format!(
+                            "Readback failed, retrying: {}",
+                            error.user_message()
+                        ));
                         self.chat.invalidated.merge(work);
                         let delay = live::backoff_ms(self.chat.failures.min(4));
                         let _task = context.spawn_background(move |cancel| {
@@ -483,7 +528,7 @@ impl DesktopApp {
                     // other cause stays in Agent details ("What went wrong").
                     let words = summary
                         .ok()
-                        .filter(|summary| monitor::restart_loss(summary))
+                        .filter(monitor::restart_loss)
                         .map(|_| monitor::RESTART_LOSS_WORDS.to_owned());
                     self.chat.loss = Some((agent, generation, words));
                 }
@@ -580,7 +625,6 @@ impl DesktopApp {
                         turn,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             ChatMsg::ApprovalRequested(request, approve) => {
@@ -604,23 +648,20 @@ impl DesktopApp {
                         },
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             ChatMsg::AnswerRequested(request) => {
+                if !can_answer(&request, &self.chat.answers) {
+                    return;
+                }
                 let answer = self
                     .chat
                     .answers
                     .get(request.binding.request.as_deref().unwrap_or_default())
                     .cloned()
                     .unwrap_or_default();
-                let answers = match serde_json::from_str::<serde_json::Value>(&answer) {
-                    Ok(answers) if answers.is_object() => answers,
-                    _ => {
-                        self.alert("Answers must be a JSON object keyed by question id.");
-                        return;
-                    }
-                };
+                let answers = serde_json::to_value(&answer).expect("answer map encodes");
+                let answer = answers.to_string();
                 // The payload is part of the action: edited answers are a new
                 // action with a new id, never a same-id retry with other data.
                 let key = format!(
@@ -639,7 +680,6 @@ impl DesktopApp {
                         answers,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             ChatMsg::ControlSubmitted(what, outcome) => {
@@ -652,9 +692,10 @@ impl DesktopApp {
                 match outcome {
                     Ok(state) => self.set_status(format!("{what} admitted: {state}.")),
                     Err(error) if crate::state::uncertain(&error) => self.alert(format!(
-                        "{what}: not confirmed (trying again reuses its id): {error}"
+                        "{what}: not confirmed (trying again reuses its id): {}",
+                        error.user_message()
                     )),
-                    Err(error) => self.alert(format!("{what} refused: {error}")),
+                    Err(error) => self.alert(format!("{what} refused: {}", error.user_message())),
                 }
                 if self.chat.convo.is_some() {
                     self.queue_reread(
@@ -695,7 +736,6 @@ impl DesktopApp {
                         true,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
         }
@@ -796,11 +836,7 @@ impl DesktopApp {
     ) {
         // Keyboard focus goes back to the composer (no-op while it is unbound).
         let _ = self.chat.composer_ref.request_focus();
-        let definite = outcome
-            .as_ref()
-            .err()
-            .is_none_or(|failure| !crate::state::uncertain(&failure.error));
-        self.settle_mutation(definite);
+        self.settle_mutation(settles(&outcome));
         match outcome {
             Ok(outcome) => {
                 // Bound to the submitting Agent and draft revision, not
@@ -861,7 +897,7 @@ impl DesktopApp {
                 // a new action (its own ledger key and id), after a definite
                 // refusal only.
                 if let DraftAction::Steer(bound) = &failure.action
-                    && STEER_FALLBACK.contains(&failure.code.as_str())
+                    && STEER_FALLBACK.contains(&failure.error.code.as_str())
                 {
                     let action = DraftAction::Send {
                         agent: bound.agent.clone(),
@@ -895,10 +931,10 @@ impl DesktopApp {
                 if crate::state::uncertain(&failure.error) {
                     self.alert(format!(
                         "Not confirmed (sending again reuses the same id): {}",
-                        failure.error
+                        failure.error.user_message()
                     ));
                 } else {
-                    self.alert(format!("Not sent: {}", failure.error));
+                    self.alert(format!("Not sent: {}", failure.error.user_message()));
                 }
             }
         }
@@ -911,8 +947,12 @@ impl DesktopApp {
             return Some(Message::Launch(LaunchMsg::LaunchRequested));
         };
         let detail = self.chat.detail.as_ref()?;
-        let resumable = matches!(detail.state.as_str(), "stopped" | "failed" | "lost")
-            && detail.active_turn.is_none()
+        let resumable = matches!(
+            detail.state,
+            eliot_core::AgentState::Stopped
+                | eliot_core::AgentState::Failed
+                | eliot_core::AgentState::Lost
+        ) && detail.active_turn.is_none()
             && !detail.observe_only;
         let action = match (&detail.active_turn, resumable) {
             (_, true) => DraftAction::Resume {
@@ -950,7 +990,6 @@ impl DesktopApp {
                         None,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             MENU_DETACH => {
@@ -963,7 +1002,6 @@ impl DesktopApp {
                         bound.generation,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             MENU_STOP => {
@@ -977,7 +1015,6 @@ impl DesktopApp {
                         false,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             MENU_FORCE => {
@@ -1183,8 +1220,14 @@ impl DesktopApp {
         ) else {
             return;
         };
-        let ended = matches!(detail.state.as_str(), "failed" | "stopped" | "lost");
-        if detail.active_turn.is_some() || !(ended || detail.state == "idle") {
+        let ended = matches!(
+            detail.state,
+            eliot_core::AgentState::Failed
+                | eliot_core::AgentState::Stopped
+                | eliot_core::AgentState::Lost
+        );
+        if detail.active_turn.is_some() || !(ended || detail.state == eliot_core::AgentState::Idle)
+        {
             return;
         }
         let waiting = convo.waiting_locals();
@@ -1219,7 +1262,7 @@ impl DesktopApp {
         ) else {
             return;
         };
-        if detail.state != "lost" || detail.observe_only {
+        if detail.state != eliot_core::AgentState::Lost || detail.observe_only {
             self.chat.loss = None;
             return;
         }
@@ -1235,7 +1278,6 @@ impl DesktopApp {
         self.chat.loss = Some((agent.clone(), generation, None));
         let _task = context.spawn_background(move |_| {
             let summary = client::block_on(client::diagnose(&data_dir, &agent))
-                .map(|reply| reply.summary)
                 .map_err(|error| error.to_string());
             Message::Chat(ChatMsg::LossRead(agent, generation, summary))
         });
@@ -1253,7 +1295,10 @@ impl DesktopApp {
         let agent = self.selected_agent_id()?;
         let (read, generation, words) = self.chat.loss.as_ref()?;
         let words = words.as_deref()?;
-        if *read != agent || *generation != detail.generation || detail.state != "lost" {
+        if *read != agent
+            || *generation != detail.generation
+            || detail.state != eliot_core::AgentState::Lost
+        {
             return None;
         }
         Some(
@@ -1284,7 +1329,7 @@ impl DesktopApp {
                                 .grid_column(1)
                                 .is_enabled(!self.submitting())
                                 .automation_name(format!(
-                                    "Resume after the Swarm restart (generation {generation})"
+                                    "Resume after the Swarm restart (run {generation})"
                                 ))
                                 .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
                                     DraftAction::Resume {
@@ -1363,7 +1408,7 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
         what: &str,
         key: String,
-        work: impl FnOnce(&Path, String) -> Fallible<String> + Send + 'static,
+        work: impl FnOnce(&Path, String) -> eliot_core::Result<String> + Send + 'static,
     ) {
         if self.submitting() {
             return;
@@ -1522,8 +1567,9 @@ impl DesktopApp {
     ) -> View {
         let title = self.agent_title(agent);
         let detail = self.chat.detail.as_ref();
-        let state = detail.map_or("reading", |detail| detail.state.as_str());
-        let tone = StatusTone::of_state(state);
+        let tone = detail.map_or(StatusTone::Neutral, |detail| {
+            StatusTone::of_state(detail.state)
+        });
         let note = match &self.chat.live {
             LiveStatus::Stale(_) => "Catching up…",
             LiveStatus::Reconnecting { .. } => "Reconnecting…",
@@ -1532,7 +1578,12 @@ impl DesktopApp {
         };
         let menu: View = match detail {
             Some(detail) => {
-                let ended = matches!(detail.state.as_str(), "stopped" | "failed" | "lost");
+                let ended = matches!(
+                    detail.state,
+                    eliot_core::AgentState::Stopped
+                        | eliot_core::AgentState::Failed
+                        | eliot_core::AgentState::Lost
+                );
                 let controllable = !detail.observe_only;
                 let mut items = vec![
                     MenuItem::item("details", MENU_DETAILS),
@@ -1604,7 +1655,12 @@ impl DesktopApp {
                 Border::new()
                     .grid_column(1)
                     .vertical_alignment(VerticalAlignment::Center)
-                    .automation_name(format!("State: {state}"))
+                    .automation_name(format!(
+                        "State: {}",
+                        eliot_core::api::agent_state_name(
+                            detail.map_or(eliot_core::AgentState::Unknown, |detail| detail.state)
+                        )
+                    ))
                     .content(m3::dot(palette.header_dot(tone))),
                 m3::secondary(note)
                     .grid_column(2)
@@ -1725,70 +1781,94 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let pending_rows: Vec<KeyedView> = self
-            .chat
-            .detail
-            .as_ref()
-            .map(|detail| detail.pending.as_slice())
-            .unwrap_or_default()
-            .iter()
-            .map(|request| {
-                let key = request.binding.request.clone().unwrap_or_default();
-                let answer_box = m3::field()
-                    .text(self.chat.answers.get(&key).cloned().unwrap_or_default())
-                    .placeholder_text("{\"question\": {\"answers\": [\"…\"]}}")
-                    .automation_name("Answer JSON")
-                    .on_text_changed({
-                        let key = key.clone();
-                        context.callback(move |text: String| {
-                            Message::Chat(ChatMsg::AnswerChanged(key.clone(), text))
-                        })
+        let pending_rows: Vec<KeyedView> =
+            self.chat
+                .detail
+                .as_ref()
+                .map(|detail| detail.pending.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(|request| {
+                    let key = request.binding.request.clone().unwrap_or_default();
+                    let questions = request.questions.iter().map(|question| {
+                        KeyedView::new(
+                            question.id.clone(),
+                            self.question_view(&key, question, context),
+                        )
                     });
-                let (fill, on) = palette.attention();
-                KeyedView::new(
-                    key,
-                    Border::new()
-                        .background(fill)
-                        .corner_radius(tokens::radius::CONTAINER)
-                        .padding(Thickness::uniform(tokens::spacing::MD))
-                        .content(
-                            StackPanel::new().spacing(tokens::spacing::SM).children((
-                                m3::section_title(format!("The Agent asks: {}", request.kind))
+                    let answer_box: View = StackPanel::new()
+                        .spacing(tokens::spacing::SM)
+                        .keyed_children(questions.collect::<Vec<_>>());
+                    let mut actions = vec![KeyedView::new(
+                        "cancel",
+                        m3::outlined(palette)
+                            .is_enabled(!self.submitting())
+                            .on_click(context.message(Message::Chat(ChatMsg::ApprovalRequested(
+                                request.clone(),
+                                false,
+                            ))))
+                            .content(m3::label(if request.kind == "approval" {
+                                "Deny"
+                            } else {
+                                "Cancel request"
+                            })),
+                    )];
+                    if request.kind == "approval" {
+                        actions.insert(
+                            0,
+                            KeyedView::new(
+                                "approve",
+                                m3::filled(palette)
+                                    .is_enabled(!self.submitting())
+                                    .on_click(context.message(Message::Chat(
+                                        ChatMsg::ApprovalRequested(request.clone(), true),
+                                    )))
+                                    .content(m3::label("Approve")),
+                            ),
+                        );
+                    } else if request.kind == "question" {
+                        actions.push(KeyedView::new(
+                            "answer",
+                            m3::text_button(palette)
+                                .is_enabled(
+                                    !self.submitting() && can_answer(request, &self.chat.answers),
+                                )
+                                .on_click(context.message(Message::Chat(ChatMsg::AnswerRequested(
+                                    request.clone(),
+                                ))))
+                                .content(m3::label("Answer")),
+                        ));
+                    }
+                    let (fill, on) = palette.attention();
+                    KeyedView::new(
+                        key,
+                        Border::new()
+                            .background(fill)
+                            .corner_radius(tokens::radius::CONTAINER)
+                            .padding(Thickness::uniform(tokens::spacing::MD))
+                            .content(
+                                StackPanel::new().spacing(tokens::spacing::SM).children((
+                                    m3::section_title(if request.kind == "approval" {
+                                        "Permission requested"
+                                    } else {
+                                        "Your answer is needed"
+                                    })
                                     .foreground(on),
-                                TextBlock::new()
-                                    .text(request.summary.clone())
-                                    .foreground(on)
-                                    .text_wrapping(TextWrapping::Wrap)
-                                    .is_text_selection_enabled(true),
-                                answer_box,
-                                StackPanel::new()
-                                    .orientation(Orientation::Horizontal)
-                                    .spacing(tokens::spacing::SM)
-                                    .children((
-                                        m3::filled(palette)
-                                            .is_enabled(!self.submitting())
-                                            .on_click(context.message(Message::Chat(
-                                                ChatMsg::ApprovalRequested(request.clone(), true),
-                                            )))
-                                            .content(m3::label("Approve")),
-                                        m3::outlined(palette)
-                                            .is_enabled(!self.submitting())
-                                            .on_click(context.message(Message::Chat(
-                                                ChatMsg::ApprovalRequested(request.clone(), false),
-                                            )))
-                                            .content(m3::label("Deny")),
-                                        m3::text_button(palette)
-                                            .is_enabled(!self.submitting())
-                                            .on_click(context.message(Message::Chat(
-                                                ChatMsg::AnswerRequested(request.clone()),
-                                            )))
-                                            .content(m3::label("Answer")),
-                                    )),
-                            )),
-                        ),
-                )
-            })
-            .collect();
+                                    TextBlock::new()
+                                        .text(request.summary.clone())
+                                        .foreground(on)
+                                        .text_wrapping(TextWrapping::Wrap)
+                                        .is_text_selection_enabled(true),
+                                    answer_box,
+                                    StackPanel::new()
+                                        .orientation(Orientation::Horizontal)
+                                        .spacing(tokens::spacing::SM)
+                                        .keyed_children(actions),
+                                )),
+                            ),
+                    )
+                })
+                .collect();
         StackPanel::new()
             .grid_row(3)
             .spacing(tokens::spacing::SM)
@@ -1796,6 +1876,110 @@ impl DesktopApp {
             .max_width(tokens::layout::READING_WIDTH)
             .horizontal_alignment(HorizontalAlignment::Center)
             .keyed_children(pending_rows)
+    }
+
+    /// Controls keep the universal string-list answer shape. The plugin still
+    /// validates against the retained native offer immediately before writing.
+    fn question_view(
+        &self,
+        request: &str,
+        question: &eliot_core::requests::Question,
+        context: &mut ViewContext<Self>,
+    ) -> View {
+        use eliot_core::requests::QuestionKind;
+        let values = self
+            .chat
+            .answers
+            .get(request)
+            .and_then(|answers| answers.get(&question.id))
+            .map(|answer| answer.answers.clone())
+            .unwrap_or_default();
+        let request = request.to_owned();
+        let id = question.id.clone();
+        let changed = {
+            let request = request.clone();
+            let id = id.clone();
+            move |values| Message::Chat(ChatMsg::AnswerChanged(request.clone(), id.clone(), values))
+        };
+        let omit: View = if values.is_empty() {
+            View::empty()
+        } else {
+            Button::new()
+                .on_click(context.message(Message::Chat(ChatMsg::AnswerChanged(
+                    request.clone(),
+                    id.clone(),
+                    Vec::new(),
+                ))))
+                .content(m3::label("Leave unanswered"))
+        };
+        let control: View = if question.is_secret {
+            m3::label("Answer this confidential question in the Agent's native application.").into()
+        } else {
+            match question.kind {
+            QuestionKind::Resource => m3::label("This step needs action in the native application. You can cancel this request here.").into(),
+            QuestionKind::Number | QuestionKind::Text => {
+                let before = values.first().cloned().unwrap_or_default();
+                m3::field().text(before.clone())
+                    .placeholder_text(if question.kind == QuestionKind::Number { "Enter a number" } else { "Your answer" })
+                    .automation_name(if question.kind == QuestionKind::Number { "Number answer" } else { "Text answer" })
+                    .on_text_changed(context.callback(move |text| if text == before {
+                        Message::Chat(ChatMsg::AnswerUnchanged)
+                    } else { changed(vec![text]) })).into()
+            },
+            QuestionKind::Boolean | QuestionKind::Single => {
+                let options: Vec<(String, String)> = if question.kind == QuestionKind::Boolean {
+                    vec![("true".to_owned(), "Yes".to_owned()), ("false".to_owned(), "No".to_owned())]
+                } else { question.options.iter().map(|option| (option.id.clone(), option.label.clone())).collect() };
+                let ids: Vec<String> = options.iter().map(|(id, _)| id.clone()).collect();
+                let selected = values.first().and_then(|value| ids.iter().position(|id| id == value));
+                let pick = ComboBox::new().items_source(options.into_iter().map(|(_, label)| label).collect::<Vec<_>>())
+                    .selected_index(selected).placeholder_text("Choose an answer")
+                    .automation_name("Choose an answer")
+                    .on_selection_changed(context.callback(move |index: Option<usize>|
+                        index.and_then(|index| ids.get(index).cloned()).map_or(
+                            Message::Chat(ChatMsg::AnswerUnchanged), |id| changed(vec![id]))));
+                if question.free_entry {
+                    let request = request.clone(); let id = id.clone();
+                    let before = if selected.is_none() { values.first().cloned().unwrap_or_default() } else { String::new() };
+                    StackPanel::new().spacing(tokens::spacing::SM).children((pick,
+                        m3::field().text(before.clone())
+                            .placeholder_text("Or enter another answer")
+                            .automation_name("Other answer")
+                            .on_text_changed(context.callback(move |text| if text == before {
+                                Message::Chat(ChatMsg::AnswerUnchanged)
+                            } else { Message::Chat(ChatMsg::AnswerChanged(request.clone(), id.clone(), vec![text])) }))))
+                } else { pick.into() }
+            }
+            QuestionKind::Multiple => {
+                let mut controls: Vec<KeyedView> = question.options.iter().map(|option| {
+                    let request = request.clone(); let id = id.clone(); let option_id = option.id.clone();
+                    KeyedView::new(option.id.clone(), CheckBox::new()
+                        .is_checked(values.contains(&option.id)).automation_name(option.label.clone())
+                        .on_is_checked_changed(context.callback(move |on| Message::Chat(ChatMsg::AnswerOptionChanged(request.clone(), id.clone(), option_id.clone(), on)))).content(m3::label(&option.label)))
+                }).collect();
+                if question.free_entry {
+                    let selected: Vec<String> = values.iter().filter(|value| question.options.iter().any(|option| &option.id == *value)).cloned().collect();
+                    let other = values.iter().filter(|value| !selected.contains(value)).cloned().collect::<Vec<_>>().join("\n");
+                    controls.push(KeyedView::new("free", m3::field().text(other.clone()).accepts_return(true)
+                        .placeholder_text("Other answers, one per line").automation_name("Other answers")
+                        .on_text_changed(context.callback(move |text: String| {
+                            if text == other { return Message::Chat(ChatMsg::AnswerUnchanged); }
+                            let mut values = selected.clone(); values.extend(text.lines().map(str::to_owned)); changed(values)
+                        }))));
+                }
+                StackPanel::new().spacing(tokens::spacing::SM).keyed_children(controls)
+            }
+
+        }
+        };
+        StackPanel::new().spacing(tokens::spacing::SM).children((
+            m3::label(question.title.as_deref().unwrap_or("Your answer")),
+            TextBlock::new()
+                .text(question.prompt.clone().unwrap_or_default())
+                .text_wrapping(TextWrapping::Wrap),
+            control,
+            omit,
+        ))
     }
 
     /// The one composer: the context row (project and profile), the field,
@@ -1980,8 +2164,12 @@ impl DesktopApp {
         let detail = self.chat.detail.as_ref();
         let active_turn = detail.and_then(|detail| detail.active_turn.clone());
         let resumable = detail.is_some_and(|detail| {
-            matches!(detail.state.as_str(), "stopped" | "failed" | "lost")
-                && detail.active_turn.is_none()
+            matches!(
+                detail.state,
+                eliot_core::AgentState::Stopped
+                    | eliot_core::AgentState::Failed
+                    | eliot_core::AgentState::Lost
+            ) && detail.active_turn.is_none()
                 && !detail.observe_only
         });
         let draft_blank = self.composer_text().trim().is_empty();
@@ -1990,7 +2178,7 @@ impl DesktopApp {
             (Some(agent), Some(detail)) if resumable => m3::filled(palette)
                 .is_enabled(enabled)
                 .automation_name(format!(
-                    "{} (generation {})",
+                    "{} (run {})",
                     if draft_blank {
                         "Resume"
                     } else {
@@ -2149,7 +2337,7 @@ impl DesktopApp {
                                     .text_trimming(TextTrimming::CharacterEllipsis),
                                 m3::text(
                                     format!(
-                                        "Ends Agent {} (generation {}) at once instead of a clean stop; an active turn is cut off.",
+                                        "Ends Agent {} (run {}) at once instead of a clean stop; an active turn is cut off.",
                                         bound.agent, bound.generation
                                     ),
                                     tokens::text::SECONDARY,
@@ -2172,7 +2360,7 @@ impl DesktopApp {
                                 m3::destructive(palette)
                                     .is_enabled(!self.submitting())
                                     .automation_name(format!(
-                                        "Force stop {} generation {}",
+                                        "Force stop {} run {}",
                                         bound.agent, bound.generation
                                     ))
                                     .on_click(context.message(Message::Chat(
@@ -2246,6 +2434,69 @@ fn starting_view(text: &str, label: &str, column: Option<f64>, palette: Palette)
 #[cfg(test)]
 mod tests {
     use super::enter_send_text;
+
+    #[test]
+    fn answer_requires_edits_to_that_request() {
+        let request = super::UiPending {
+            binding: crate::state::BoundAction::request_control("a2", 1, "r1"),
+            kind: "question".to_owned(),
+            summary: "Choose".to_owned(),
+            questions: vec![
+                serde_json::from_value(serde_json::json!({"id":"q1", "kind":"text"})).unwrap(),
+            ],
+        };
+        let mut answers = std::collections::HashMap::new();
+        assert!(!super::can_answer(&request, &answers));
+        answers.insert("r1".to_owned(), eliot_core::requests::Answers::new());
+        assert!(!super::can_answer(&request, &answers));
+        let edited = eliot_core::requests::Answers::from([(
+            "q1".to_owned(),
+            eliot_core::requests::Answer {
+                answers: vec!["yes".to_owned()],
+            },
+        )]);
+        answers.insert("r2".to_owned(), edited.clone());
+        assert!(!super::can_answer(&request, &answers));
+        answers.insert("r1".to_owned(), edited);
+        assert!(super::can_answer(&request, &answers));
+        answers.get_mut("r1").unwrap().clear();
+        assert!(!super::can_answer(&request, &answers));
+    }
+
+    #[test]
+    fn translated_send_failure_retains_the_same_mutation_id() {
+        assert!(super::settles(&Ok::<_, super::SendFailure>(())));
+        for code in ["unknown", "unavailable"] {
+            let mut ledger = crate::state::MutationLedger::default();
+            let action = super::DraftAction::Send {
+                agent: "a2".to_owned(),
+            };
+            let key = action.key(7);
+            let id = ledger.id_for(&key);
+            let failure = super::SendFailure::new(
+                &eliot_core::Error::new(code, "transport: reply missing"),
+                &id,
+                "hello",
+                7,
+                &action,
+            );
+            let result: Result<(), _> = Err(failure);
+            if super::settles(&result) {
+                ledger.complete(&key);
+            }
+            assert_eq!(ledger.id_for(&key), id);
+        }
+        let refused = super::SendFailure::new(
+            &eliot_core::Error::new("invalid", "unknown: quoted model prose"),
+            "id",
+            "hello",
+            7,
+            &super::DraftAction::Send {
+                agent: "a2".to_owned(),
+            },
+        );
+        assert!(super::settles(&Err::<(), _>(refused)));
+    }
 
     #[test]
     fn only_a_single_inserted_line_break_reads_as_enter() {

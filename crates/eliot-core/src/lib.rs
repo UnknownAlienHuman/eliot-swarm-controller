@@ -22,6 +22,7 @@ mod mcp_policy;
 mod native_child;
 mod native_store;
 mod observe;
+mod presentation;
 mod remote_call;
 mod routing;
 mod secrets;
@@ -64,6 +65,7 @@ pub use observe::{
     merge_heavy_episodes, normalize_harness_version, resolve_heavy_category, split_unix_cmdline,
     split_windows_command_line, unwrap_shell_command, verified_harness,
 };
+pub use presentation::{origin_words, reason_message, reason_words};
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
     CapacityScope, ProviderHold, ProviderHoldState, ProviderRestriction, ProviderRestrictionKind,

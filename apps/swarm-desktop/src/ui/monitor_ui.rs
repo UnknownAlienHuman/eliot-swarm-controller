@@ -23,7 +23,7 @@ pub(super) enum MonitorMsg {
     /// Show only the Needs attention section, or everything again.
     AttentionToggled,
     ReparentRequested(reparent::MoveBinding),
-    ReparentSettled(reparent::MoveBinding, Fallible<ReparentResponse>),
+    ReparentSettled(reparent::MoveBinding, eliot_core::Result<ReparentResponse>),
 }
 
 /// The panel's refresh chain and the Agent whose details it reads.
@@ -73,7 +73,7 @@ impl DesktopApp {
                                 id: row.id.clone(),
                                 generation: row.generation,
                                 harness: row.harness.clone(),
-                                state: monitor::state_name(row.state).to_owned(),
+                                state: row.state,
                                 project: String::new(),
                                 parent: row.parent.clone(),
                                 updated_at: 0,
@@ -125,21 +125,20 @@ impl DesktopApp {
                     format!("Moving {} ({mutation_id})…", binding.describe());
                 let request = binding.request(mutation_id);
                 let _task = context.spawn_background(move |_| {
-                    let result = client::block_on(client::reparent(&data_dir, &request))
-                        .map_err(|error| error.to_string());
+                    let result = client::block_on(client::reparent(&data_dir, &request));
                     Message::Monitor(MonitorMsg::ReparentSettled(binding, result))
                 });
             }
             MonitorMsg::ReparentSettled(binding, result) => {
-                let uncertain = result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| crate::state::uncertain(error));
+                let uncertain = result.as_ref().err().is_some_and(crate::state::uncertain);
                 self.settle_mutation(!uncertain);
                 self.monitor.reparent_status = match result {
                     Ok(reply) => reparent::result_lines(&binding, &reply).join("\n"),
                     Err(error) if uncertain => {
-                        format!("Move not confirmed (the same click reuses its id): {error}")
+                        format!(
+                            "Move not confirmed (the same click reuses its id): {}",
+                            error.user_message()
+                        )
                     }
                     Err(error) => reparent::refusal_line(&binding, &error),
                 };
@@ -487,7 +486,7 @@ impl DesktopApp {
         match (detail, read) {
             (Some(detail), _) => {
                 let harness = crate::picker::harness_label(&detail.harness);
-                agent_lines.push(format!("{harness} · {}", state_label(&detail.state)));
+                agent_lines.push(format!("{harness} · {}", state_label(detail.state)));
                 agent_lines.extend(detail.settings.lines());
                 agent_lines.push(format!(
                     "Access: {}",
@@ -522,7 +521,7 @@ impl DesktopApp {
         // full causal chain lives behind `swarm why`.
         if let Some(line) = read
             .and_then(|read| read.diagnosis.as_ref().ok())
-            .and_then(|summary| monitor::diagnosis_line(summary))
+            .and_then(monitor::diagnosis_line)
         {
             sections.push(KeyedView::new(
                 "diagnosis",
@@ -676,16 +675,16 @@ impl DesktopApp {
 }
 
 /// An Agent state code in words.
-fn state_label(state: &str) -> &'static str {
+fn state_label(state: eliot_core::AgentState) -> &'static str {
     match state {
-        "created" | "starting" => "Starting",
-        "idle" => "Ready",
-        "busy" | "running" => "Working",
-        "waiting" => "Waiting for you",
-        "stopped" => "Stopped",
-        "failed" => "Failed",
-        "lost" => "Lost",
-        _ => "State not confirmed",
+        eliot_core::AgentState::Created | eliot_core::AgentState::Starting => "Starting",
+        eliot_core::AgentState::Idle => "Ready",
+        eliot_core::AgentState::Busy => "Working",
+        eliot_core::AgentState::Waiting => "Waiting for you",
+        eliot_core::AgentState::Stopped => "Stopped",
+        eliot_core::AgentState::Failed => "Failed",
+        eliot_core::AgentState::Lost => "Lost",
+        eliot_core::AgentState::Unknown => "State not confirmed",
     }
 }
 

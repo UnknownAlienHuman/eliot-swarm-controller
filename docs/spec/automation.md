@@ -1220,35 +1220,9 @@ observations never prove no progress.
 
 ## Durable tables
 
-Add these in L4, not L1:
-
-```sql
-CREATE TABLE rule_state (
-  principal TEXT NOT NULL, rule TEXT NOT NULL, revision INTEGER NOT NULL,
-  current_definition TEXT NOT NULL, current_cursor INTEGER NOT NULL,
-  retiring_revision INTEGER, retiring_definition TEXT, retiring_cursor INTEGER,
-  retire_through INTEGER, enabled INTEGER NOT NULL, paused_reason TEXT,
-  updated_at INTEGER NOT NULL, PRIMARY KEY(principal,rule)
-);
-CREATE TABLE timers (
-  principal TEXT NOT NULL, rule TEXT NOT NULL, schedule_revision INTEGER NOT NULL,
-  trigger TEXT NOT NULL, anchor INTEGER NOT NULL, last_key INTEGER, next_due_at INTEGER,
-  PRIMARY KEY(principal,rule)
-);
-CREATE TABLE goals (
-  agent INTEGER NOT NULL, mode TEXT NOT NULL, generation INTEGER NOT NULL,
-  revision INTEGER NOT NULL, definition TEXT NOT NULL, state TEXT NOT NULL,
-  last_round_key TEXT, updated_at INTEGER NOT NULL, PRIMARY KEY(agent,mode)
-);
-CREATE TABLE goal_markers (
-  agent INTEGER NOT NULL, mode TEXT NOT NULL, generation INTEGER NOT NULL,
-  revision INTEGER NOT NULL, round_key INTEGER NOT NULL,
-  round_key_kind TEXT NOT NULL CHECK(round_key_kind IN ('idle','slot')),
-  holder TEXT NOT NULL,
-  state TEXT NOT NULL, updated_at INTEGER NOT NULL,
-  PRIMARY KEY(agent,mode,generation,revision,round_key)
-);
-```
+The [Store migrations](../../crates/eliot-store/src/schema.rs) own the
+`rule_state`, `timers`, `goals` and `goal_markers` schemas. They persist
+revision-bound rule traversal, scheduling and Goal round reservations.
 
 `goal_markers` holds one row per unresolved round: `running` while its check
 runs, `unknown` once the round ended without a commit. The final commit
