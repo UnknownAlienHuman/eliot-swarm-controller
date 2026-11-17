@@ -251,6 +251,7 @@ impl Router {
                     }
                     entries.push(eliot_core::api::HarnessModelEntry {
                         id,
+                        display_name: None,
                         default: model
                             .get("default")
                             .and_then(Value::as_bool)
@@ -968,7 +969,8 @@ pub(crate) fn models_key(scope: &str, cmd: &str, version: Option<&str>) -> Optio
 }
 
 /// Build one unified `models.catalog` entry from a harness catalogue
-/// entry: provider and display name derive from the id, availability comes
+/// entry: the provider derives from the id, the label uses the native display
+/// name when available, and availability comes
 /// from holds/quota (`unknown` without affirmative evidence), and the entry
 /// `source` marker is copied verbatim.
 pub(crate) fn catalog_entry(
@@ -978,11 +980,11 @@ pub(crate) fn catalog_entry(
     quota: Option<&HarnessQuotaResponse>,
     now: i64,
 ) -> eliot_core::api::ModelsCatalogEntry {
-    use eliot_core::api::{catalog_display_name, catalog_provider};
+    use eliot_core::api::catalog_provider;
     eliot_core::api::ModelsCatalogEntry {
         harness: harness.to_owned(),
         id: model.id.clone(),
-        display_name: catalog_display_name(&model.id),
+        display_name: model.display_name().to_owned(),
         provider: catalog_provider(harness, &model.id),
         efforts: model.efforts,
         default_effort: model.default_effort,
@@ -1245,6 +1247,7 @@ mod tests {
         use eliot_core::api::harness::{CATALOG_HELD, CATALOG_UNKNOWN};
         let entry = HarnessModelEntry {
             id: "haiku".to_owned(),
+            display_name: None,
             default: false,
             efforts: Some(vec!["low".to_owned()]),
             default_effort: None,
@@ -1272,6 +1275,7 @@ mod tests {
         assert_eq!(built.availability, CATALOG_UNKNOWN);
         assert_eq!(built.source.as_deref(), Some("documented_alias"));
         assert_eq!(built.provider, "anthropic");
+        assert_eq!(built.display_name, "haiku");
         assert_eq!(built.efforts, entry.efforts);
         let held = catalog_entry("claude", entry, Some(true), None, 1_000);
         assert_eq!(held.availability, CATALOG_HELD);
