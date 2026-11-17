@@ -1954,7 +1954,8 @@ mod tests {
         use std::sync::Arc;
         // File-backed Store so a second connection can break command reads
         // the way a wedged SQLite file breaks production dispatch.
-        let dir = std::env::temp_dir().join("eliot-k94-dispatch-read");
+        let dir =
+            std::env::temp_dir().join(format!("eliot-k94-dispatch-read-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("dispatch read fixture dir");
         let db = dir.join("state.sqlite");

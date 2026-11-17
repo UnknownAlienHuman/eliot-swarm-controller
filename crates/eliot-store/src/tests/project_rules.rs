@@ -1482,7 +1482,10 @@ fn project_event_launch_requires_both_grants_and_only_linked_send_uses_next_gene
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64") + 1_000;
     let project = "project-launch-contract";
     let rule_id = "project-launch-contract-rule";
-    let checkout_path = std::env::temp_dir().join("eliot-store-project-launch-contract");
+    let checkout_path = std::env::temp_dir().join(format!(
+        "eliot-store-project-launch-contract-{}",
+        std::process::id()
+    ));
     let checkout = checkout_path.display().to_string();
     let mut registration = ProjectRegistrationInput {
         id: project.to_owned(),
