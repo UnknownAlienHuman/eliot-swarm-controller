@@ -111,10 +111,19 @@ identity (also used by inference clients) does not change. Canonical aliases of 
 directory keep the binding. In-memory Stores retain their own independent binding.
 
 Start dispatch commits the current namespace on the exact Agent generation before any
-plugin process is created. Restart checks and force-stop use that recorded namespace,
-including after a directory move or copy; they never substitute the current namespace.
-Migration preserves findable legacy names before binding a new namespace. A legacy
-generation without a recorded/findable name keeps custody unknown.
+plugin process is created. Read-only restart checks use that recorded namespace even
+after a directory move or copy. Force-stop may terminate that named Job only when the
+recorded namespace equals the Store's current `custody_namespace()`. Otherwise it
+returns `process_custody_foreign`, leaves the Job untouched and settles unknown without
+replaying the command. Agent Jobs are kill-on-close and only their owning daemon holds
+custody, so a live Job under an older namespace belongs to another running daemon.
+
+The first v52 open always mints a new current namespace, including on the original
+production directory: a v51 backup cannot be distinguished from the original. Migration
+first records findable existing generations' legacy namespace (the stable Store identity),
+preserving their names for read-only restart probing. This re-mint does not alter their
+recorded namespace or their live Jobs. A legacy generation without a recorded/findable
+name keeps custody unknown.
 
 A Job creation conflict (`process_custody_conflict`), validation, environment or directory
 preparation error before OS spawn is a definite failed start with origin `swarm`, its
@@ -124,7 +133,9 @@ generation before failing it, closing unstarted sources and releasing its reserv
 in the same transaction. Errors after a child may have been created retain their
 ordinary uncertainty until owned process exit and reader drain are proven. A conflicting
 existing Job is never adopted or terminated by this failed start.
-The no-spawn settlement clears that generation's recorded custody name, so it cannot
+If Store rejects the no-spawn proof, ordinary plugin-error settlement records unknown
+and retains capacity; a concurrent authoritative terminal settlement is preserved.
+A successful no-spawn settlement clears that generation's recorded custody name, so it cannot
 authorize a later force-stop of the conflicting Job.
 
 ### States and reducer

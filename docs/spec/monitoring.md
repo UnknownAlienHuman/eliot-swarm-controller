@@ -81,8 +81,11 @@ using that service.
   ([data-directory binding](core.md#process-custody-identity)), so a
   replacement daemon can prove it closed ([restart recovery](configuration.md#accounts-and-configured-capacity));
 - services that must survive daemon restart use separate service custody;
-- force-stop directly terminates the generation's named Job, without waiting for
-  the plugin's cooperative stop, recovery or command queue. Startup and this
+- force-stop requires the generation's recorded namespace to equal the Store's current
+  namespace. A mismatch returns `process_custody_foreign`, leaves the Job untouched and
+  settles unknown without replay. Restart probing of the recorded name remains read-only.
+  With that binding verified, force-stop directly terminates the generation's named Job,
+  without waiting for the plugin's cooperative stop, recovery or command queue. Startup and this
   termination are serialized, including when no live runtime entry remains.
   It waits for the Job to become empty, verifies recorded process identities and
   drains the native source before settling applied and releasing custody. Missing

@@ -1253,6 +1253,17 @@ impl Router {
             }
             (result, store.is_write_faulted())
         };
+        if result.is_err() {
+            // The Store could not validate this proof. The original start
+            // failure no longer establishes that no external effect occurred.
+            let error = if error.code == "native_not_dispatched" {
+                error.with_code("unknown")
+            } else {
+                error
+            };
+            self.settle_plugin_error(id, &error).await;
+            return;
+        }
         self.finish_settlement(id, result, write_faulted, "store_settlement_failed", false)
             .await;
     }
@@ -1482,6 +1493,131 @@ mod start_result_tests {
     use eliot_core::CommandState;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn rejected_pre_spawn_proof_settles_unknown_and_retains_capacity() {
+        use crate::common::now_ms;
+        use eliot_core::{Error, SubmitCommand};
+
+        let router = crate::router::tests::router();
+        let (id, agent) = {
+            let mut store = router.inner.store.lock().await;
+            let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            launch.args = json!({"project":"rejected-proof", "workspace":"synthetic-workspace", "harness":"claude", "profile":"fixture", "profile_snapshot":{}});
+            let admitted = store.submit("owner", launch, now_ms()).unwrap().command;
+            store.dispatch(&admitted.id, now_ms()).unwrap();
+            let agent = admitted.target.unwrap();
+            // A process fact committed concurrently invalidates the no-spawn proof.
+            crate::test_support::install_live_owned_process_source(&mut store, &agent, 1, now_ms());
+            (admitted.id, agent)
+        };
+        router
+            .settle_unspawned_start(
+                &id,
+                &Error::new("process_custody_conflict", "Job already exists"),
+            )
+            .await;
+        let store = router.inner.store.lock().await;
+        let command = store.get_command(&id).unwrap().unwrap();
+        assert_eq!(command.state, CommandState::Unknown);
+        assert_eq!(command.outcome.unwrap()["code"], "process_custody_conflict");
+        assert!(
+            store
+                .generation_custody_namespace(&agent, 1)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store.read_source_state(&agent, 1, "os").unwrap()["state"],
+            "open"
+        );
+        assert!(!store.is_write_faulted());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn copied_store_force_stop_leaves_the_original_named_job_alive() {
+        use crate::common::now_ms;
+        use crate::platform::{
+            custody::{OwnedChild, agent_custody_name},
+            windows::named_job_closed,
+        };
+        use eliot_core::SubmitCommand;
+        use std::{process::Stdio, time::Duration};
+
+        let root = std::env::temp_dir().join(format!("eliot-foreign-force-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let mut original = eliot_store::Store::open(&a.join("eliot.db")).unwrap();
+        let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        launch.args = json!({"project":"foreign-force", "workspace":a, "harness":"claude", "profile":"fixture", "profile_snapshot":{}});
+        let admitted = original.submit("owner", launch, now_ms()).unwrap().command;
+        original.dispatch(&admitted.id, now_ms()).unwrap();
+        let agent = original
+            .get_agent(admitted.target.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        let namespace = original.custody_namespace().unwrap();
+        let name = agent_custody_name(&namespace, &agent.id, agent.generation);
+        let mut sleeper = tokio::process::Command::new("ping.exe");
+        sleeper
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child =
+            OwnedChild::spawn_agent(sleeper, &namespace, &agent.id, agent.generation).unwrap();
+        assert!(!named_job_closed(&name).unwrap());
+        rusqlite::Connection::open(a.join("eliot.db"))
+            .unwrap()
+            .execute("VACUUM INTO ?1", [b.join("eliot.db").to_str().unwrap()])
+            .unwrap();
+        let router = crate::router::tests::router_with_data_root(b.clone());
+        let (agent, stop) = {
+            let mut store = router.inner.store.lock().await;
+            *store = eliot_store::Store::open(&b.join("eliot.db")).unwrap();
+            assert_ne!(store.custody_namespace().unwrap(), namespace);
+            store.recover_on_restart(now_ms()).unwrap();
+            assert_eq!(
+                store.generation_custody_namespace(&agent.id, 1).unwrap(),
+                Some(namespace)
+            );
+            let mut stop = SubmitCommand::new(ulid::Ulid::new().to_string(), "stop");
+            stop.target = Some(agent.id.clone());
+            stop.expected_generation = Some(1);
+            stop.args = json!({"force":true});
+            let admitted = store.submit("owner", stop, now_ms()).unwrap().command;
+            store.dispatch(&admitted.id, now_ms()).unwrap();
+            (
+                store.get_agent(&agent.id).unwrap().unwrap(),
+                store.get_command(&admitted.id).unwrap().unwrap(),
+            )
+        };
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            router.execute_stop_command(&stop.id, &agent, stop.clone()),
+        )
+        .await
+        .ok();
+        let alive = !named_job_closed(&name).unwrap();
+        child.terminate().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            alive,
+            "force-stop on the backup terminated the original Job"
+        );
+        let store = router.inner.store.lock().await;
+        let retained = store.get_command(&stop.id).unwrap().unwrap();
+        assert_eq!(retained.state, CommandState::Unknown);
+        assert_eq!(retained.outcome.unwrap()["code"], "process_custody_foreign");
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn pre_spawn_job_conflict_fails_the_command_and_agent_with_swarm_origin() {
@@ -1493,6 +1629,8 @@ mod start_result_tests {
         let _temp = crate::test_support::TempDir::own(root.clone());
         std::fs::create_dir_all(&root).unwrap();
         let router = crate::router::tests::router_with_data_root(root.clone());
+        *router.inner.store.lock().await =
+            eliot_store::Store::open(&root.join("eliot.db")).unwrap();
         let (agent, dispatched, namespace) = {
             let mut store = router.inner.store.lock().await;
             let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
@@ -1528,7 +1666,24 @@ mod start_result_tests {
             store.get_agent(&agent.id).unwrap().unwrap().state,
             AgentState::Failed
         );
-        assert!(store.restart_retained_generations(None).unwrap().is_empty());
+        let capacity: Option<i64> = rusqlite::Connection::open_with_flags(
+            root.join("eliot.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap()
+        .query_row(
+            "SELECT capacity_generation FROM agents WHERE id=?1",
+            [agent.id[1..].parse::<i64>().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+        assert_eq!(capacity, None);
+        assert_eq!(
+            store
+                .read_source_state(&agent.id, agent.generation, "os")
+                .unwrap()["state"],
+            "closed"
+        );
         assert_eq!(
             store
                 .generation_custody_namespace(&agent.id, agent.generation)

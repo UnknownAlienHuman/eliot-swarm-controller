@@ -1363,6 +1363,12 @@ impl PluginHost {
                 .ok_or_else(|| {
                     Error::new("unknown", "generation custody namespace was not recorded")
                 })?;
+            if namespace != store.custody_namespace()? {
+                return Err(Error::new(
+                    "process_custody_foreign",
+                    "generation custody belongs to another data-directory binding; its Job was left untouched",
+                ));
+            }
             let guard = ForceStopGuard::new(&self.state, key)?;
             (namespace, guard)
         };
