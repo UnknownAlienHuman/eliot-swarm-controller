@@ -32,6 +32,102 @@ pub struct TimerSlotAdmission {
     pub blocked: bool,
 }
 
+impl<'a> RuleFiringKey<'a> {
+    fn timer(
+        principal: &'a str,
+        state: &'a core::api::RuleStateView,
+        schedule_revision: i64,
+        slot_ms: i64,
+    ) -> Result<Self> {
+        let parent_id =
+            derived_timer_id("parent", principal, &state.id, schedule_revision, slot_ms)?;
+        let child_id =
+            derived_timer_id("action-0", principal, &state.id, schedule_revision, slot_ms)?;
+        let mut args = json!({
+            "rule": state.id,
+            "schedule_revision": schedule_revision,
+            "scheduled_at_ms": slot_ms,
+        });
+        if let Some(project) = &state.project {
+            args["project"] = json!(project);
+        }
+        Ok(Self {
+            principal,
+            state,
+            trigger_cause: None,
+            identity: RuleFiringIdentity::Timer {
+                schedule_revision,
+                slot_ms,
+            },
+            verb: "rule",
+            args,
+            script_context: None,
+            parent_digest: None,
+            parent_id,
+            child_id,
+        })
+    }
+
+    fn manual(
+        principal: &'a str,
+        state: &'a core::api::RuleStateView,
+        parent_id: &'a str,
+        parent_digest: Vec<u8>,
+    ) -> Result<Self> {
+        let mut args = json!({"rule": state.id});
+        if let Some(project) = &state.project {
+            args["project"] = json!(project);
+        }
+        Ok(Self {
+            principal,
+            state,
+            trigger_cause: None,
+            identity: RuleFiringIdentity::Manual,
+            verb: "timer.run",
+            args,
+            script_context: None,
+            parent_digest: Some(parent_digest),
+            parent_id: parent_id.to_owned(),
+            child_id: derived_manual_timer_id(principal, &state.id, parent_id)?,
+        })
+    }
+}
+
+fn derived_timer_id(
+    purpose: &str,
+    principal: &str,
+    rule: &str,
+    schedule_revision: i64,
+    slot_ms: i64,
+) -> Result<String> {
+    let digest = canonical::digest(&json!({
+        "domain": RULE_COMMAND_ID_DOMAIN,
+        "purpose": purpose,
+        "principal": principal,
+        "rule": rule,
+        "schedule_revision": schedule_revision,
+        "scheduled_at_ms": slot_ms,
+    }))?;
+    let bytes: [u8; 16] = digest[..16]
+        .try_into()
+        .map_err(|_| Error::new("internal", "timer command digest is too short"))?;
+    Ok(Ulid::from_bytes(bytes).to_string())
+}
+
+fn derived_manual_timer_id(principal: &str, rule: &str, mutation_id: &str) -> Result<String> {
+    let digest = canonical::digest(&json!({
+        "domain": RULE_COMMAND_ID_DOMAIN,
+        "purpose": "action-0",
+        "principal": principal,
+        "rule": rule,
+        "mutation_id": mutation_id,
+    }))?;
+    let bytes: [u8; 16] = digest[..16]
+        .try_into()
+        .map_err(|_| Error::new("internal", "manual timer digest is too short"))?;
+    Ok(Ulid::from_bytes(bytes).to_string())
+}
+
 impl Store {
     /// Persist a timer's immutable schedule beside its owning rule state. The
     /// daemon supplies calculations; Store captures an omitted interval anchor
