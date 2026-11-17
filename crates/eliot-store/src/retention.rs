@@ -4,7 +4,8 @@
 //!
 //! Owning contract: docs/spec/core.md#retention. Deletion is silent (no events
 //! are emitted) and never replays an effect: event pruning stays below every
-//! live rule/Git cursor and advances `rule_history_coverage.pruned_through` in
+//! live rule cursor and before Agent-local source pins, advancing
+//! `rule_history_coverage.pruned_through` in
 //! the same transaction, while command/write pruning keeps open work, the
 //! retry window, and every row a live projection still references. Mail
 //! pruning deletes only acknowledged rows older than the mail window; unread
@@ -401,9 +402,9 @@ fn event_prune_end_tx(
     cutoff: i64,
 ) -> Result<Option<i64>> {
     // Enabled current/retiring cursors pin the events they still need; this is
-    // the Store backlog pin model (disabled rules pin nothing). Live Git hint
-    // cursors pin the same prefix: hint scans read (cursor, high-water] and
-    // must never skip unconsumed history silently.
+    // the Store backlog pin model (disabled rules pin nothing). A live Git
+    // cursor protects only unconsumed native file hints from its own Agent
+    // generation. A source with no established cursor has no cursor pin.
     let floor: Option<i64> = tx
         .query_row(
             "SELECT MIN(pin) FROM (
@@ -413,9 +414,18 @@ fn event_prune_end_tx(
                  WHERE enabled = 1
                    AND retiring_cursor IS NOT NULL AND retire_through IS NOT NULL
                  UNION ALL
-                 SELECT COALESCE(CAST(s.cursor AS INTEGER), 0) FROM source_state s
+                 SELECT MIN(e.seq) - 1 FROM source_state s
                  JOIN agents a ON a.id = s.agent
+                 JOIN events e ON e.agent = s.agent AND e.generation = s.generation
                  WHERE s.source = 'git' AND s.state = 'open' AND s.generation = a.generation
+                   AND s.cursor IS NOT NULL AND e.seq > CAST(s.cursor AS INTEGER)
+                   AND e.family = 'tool' AND e.kind = 'tool.completed'
+                   AND e.native_id IS NOT NULL AND e.source NOT IN ('git', 'os', 'daemon')
+                   AND json_extract(e.data, '$.tool') = 'fileChange'
+                   AND json_extract(e.data, '$.status') = 'completed'
+                   AND (json_array_length(e.data, '$.changed_paths') > 0
+                        OR json_extract(e.data, '$.changed_paths_truncated') = 1
+                        OR json_extract(e.data, '$.redacted') = 1)
              )",
             [],
             |row| row.get(0),
@@ -878,6 +888,12 @@ mod tests {
             insert_event(&mut store, old);
         }
         let agent = insert_agent(&mut store, 1);
+        store.connection.execute(
+            r#"UPDATE events SET agent=?1,generation=1,source='stream',family='tool',
+             kind='tool.completed',native_id='hint',
+             data='{"tool":"fileChange","status":"completed","changed_paths":["file.rs"]}' WHERE seq=3"#,
+            [agent],
+        ).unwrap();
         store
             .connection
             .execute(
@@ -904,6 +920,41 @@ mod tests {
         assert_eq!(report.events_deleted, 2);
         assert_eq!(report.pruned_through, 4);
         assert_eq!(event_count(&store), 0);
+    }
+
+    #[test]
+    fn prune_events_git_cursor_protects_only_its_own_generation_hints() {
+        for cursor in [None, Some("2")] {
+            let mut store = store();
+            let old = NOW - 31 * DAY_MS;
+            for _ in 0..6 {
+                insert_event(&mut store, old);
+            }
+            let agent = insert_agent(&mut store, 2);
+            // Foreign and old-generation hints below the unread current hint
+            // must not extend this source's pin back to its numeric cursor.
+            store
+                .connection
+                .execute(
+                    r#"UPDATE events SET agent=?1,generation=CASE WHEN seq=4 THEN 1 ELSE 2 END,
+                   source='stream',family='tool',kind='tool.completed',native_id='hint'||seq,
+                   data='{"tool":"fileChange","status":"completed","changed_paths":["file.rs"]}'
+                   WHERE seq IN (3,4,5)"#,
+                    [agent],
+                )
+                .unwrap();
+            store
+                .connection
+                .execute("UPDATE events SET agent=NULL WHERE seq=3", [])
+                .unwrap();
+            store.connection.execute(
+                "INSERT INTO source_state(agent,generation,source,cursor,state,health,updated_at)
+                 VALUES (?1,2,'git',?2,'open','ok',?3)",params![agent,cursor,NOW],
+            ).unwrap();
+            let report = store.prune_retention(Some(30), None, None, NOW).unwrap();
+            assert_eq!(report.events_deleted, if cursor.is_some() { 4 } else { 6 });
+            assert_eq!(event_exists(&store, 5), cursor.is_some());
+        }
     }
 
     #[test]

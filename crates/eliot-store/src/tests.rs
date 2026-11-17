@@ -159,6 +159,123 @@ fn stop_resume_stop_delete_removes_processes_of_every_generation() {
 }
 
 #[test]
+fn delete_ignores_other_agents_sources_with_or_without_cursors() {
+    for source in ["git", "stream"] {
+        for cursor in [None, Some("0"), Some("1")] {
+            let mut store = Store::open(Path::new(":memory:")).unwrap();
+            let now = Ulid::new().timestamp_ms() as i64;
+            store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('','codex','p','stopped',1,?1,?1),('','codex','p','idle',1,?1,?1)",[now]).unwrap();
+            store.connection.execute("INSERT INTO source_state(agent,generation,source,cursor,state,health,updated_at) VALUES (2,1,?1,?2,'open','error',?3)",rusqlite::params![source,cursor,now]).unwrap();
+            store.connection.execute("INSERT INTO events(ts,kind,agent,generation,source,data) VALUES (?1,'session.ended',1,1,'stream','{}'),(?1,'session.ready',2,1,'stream','{}'),(?1,'agent.stopped',1,1,'daemon','{}')",[now]).unwrap();
+            let delete_id = Ulid::new().to_string();
+            let reply = store
+                .change_agent_tree(&delete_id, "a1", None, now)
+                .unwrap();
+            assert_eq!(reply["deleted"], true);
+            assert!(store.get_agent("a1").unwrap().is_none());
+            assert_eq!(
+                store.get_agent("a2").unwrap().unwrap().state,
+                AgentState::Idle
+            );
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("SELECT COUNT(*) FROM events WHERE agent=2", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                store
+                    .change_agent_tree(&delete_id, "a1", None, now)
+                    .unwrap(),
+                reply
+            );
+        }
+    }
+}
+
+#[test]
+fn delete_retains_enabled_current_and_retiring_rule_history_pins() {
+    for retiring in [false, true] {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = Ulid::new().timestamp_ms() as i64;
+        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('','codex','p','stopped',1,?1,?1)",[now]).unwrap();
+        let definition = json!({"id":"delete-pin","enabled":true});
+        store
+            .ensure_rule_state(
+                "owner",
+                &RuleDefinitionInput {
+                    id: "delete-pin".to_owned(),
+                    canonical_definition: definition.to_string(),
+                    definition_digest: eliot_core::canonical_json_sha256(&definition).unwrap(),
+                    enabled: true,
+                },
+                now,
+            )
+            .unwrap();
+        store.connection.execute("INSERT INTO events(ts,kind,agent,generation,source,data) VALUES (?1,'agent.stopped',1,1,'daemon','{}')",[now]).unwrap();
+        if retiring {
+            store.connection.execute("UPDATE rule_state SET current_cursor=1,retiring_revision=1,retiring_definition='{}',retiring_cursor=0,retire_through=1",[]).unwrap();
+        }
+        let delete_id = Ulid::new().to_string();
+        let error = store
+            .change_agent_tree(&delete_id, "a1", None, now)
+            .unwrap_err();
+        assert_eq!(error.code, "busy");
+        assert_eq!(
+            error.message.as_str(),
+            "retained history is pinned by a live rule cursor"
+        );
+        assert!(store.get_agent("a1").unwrap().is_some());
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT pruned_through FROM rule_history_coverage",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        // Both ordinary advancement and disabling release the protection.
+        if retiring {
+            store
+                .connection
+                .execute("UPDATE rule_state SET retiring_cursor=1", [])
+                .unwrap();
+        } else {
+            store
+                .connection
+                .execute("UPDATE rule_state SET enabled=0", [])
+                .unwrap();
+        }
+        store
+            .change_agent_tree(&delete_id, "a1", None, now)
+            .unwrap();
+    }
+}
+
+#[test]
+fn delete_refuses_its_own_live_git_source_even_without_a_cursor() {
+    for state in ["idle", "stopped"] {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = Ulid::new().timestamp_ms() as i64;
+        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('','codex','p',?1,1,?2,?2)",rusqlite::params![state,now]).unwrap();
+        store.connection.execute("INSERT INTO source_state(agent,generation,source,state,health,updated_at) VALUES (1,1,'git','open','error',?1)",[now]).unwrap();
+        assert_eq!(
+            store
+                .change_agent_tree(&Ulid::new().to_string(), "a1", None, now)
+                .unwrap_err()
+                .code,
+            "busy"
+        );
+        assert!(store.get_agent("a1").unwrap().is_some());
+    }
+}
+
+#[test]
 fn delete_refuses_unconsumed_cleanup_and_preserves_consumed_replay() {
     use eliot_core::api::{
         ArtifactKind, ArtifactView, CleanupApplyRequest, CleanupCandidate, CleanupPlan,

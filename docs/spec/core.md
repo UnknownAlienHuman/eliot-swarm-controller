@@ -758,9 +758,16 @@ is implemented by daemon maintenance through the existing Store writer. The foll
 is its contract; bounded read pages alone do not bound stored history.
 
 Cleanup uses bounded batches through the existing Store writer. Delete only an expired,
-contiguous event prefix below every enabled current/retiring rule cursor. Open
-current-generation Git hint cursors pin the same prefix, so hint scans never skip
-unconsumed history silently. Only the latest batch of a source can be re-delivered
+contiguous event prefix below every enabled current/retiring rule cursor. Rules
+traverse the global event log; their cursors protect unconsumed history until
+advancement or the ordinary backlog skip/pause transition. Per-Agent sources
+(including Git and stream) protect only their own Agent/generation's history,
+never another Agent's rows. An open current-generation Git source with an
+established cursor protects its unconsumed native file-change hints after that
+cursor. A source with no established cursor holds no cursor pin: failed probes
+and non-Git workspaces cannot pin history. Prefix pruning stops before the first
+protected row; it does not treat a per-Agent cursor as a global history floor.
+Only the latest batch of a source can be re-delivered
 idempotently: a new batch replaces only its last-batch acknowledgement, and an
 older batch is rejected with `source_integrity`. So for an open source, only
 events with `seq >= source_state.last_batch_first_seq` (and anything after that)
@@ -827,7 +834,9 @@ Deletion requires every descendant stopped and drained, and shares retention's l
 row cleanup. Store removes dependent records in one transaction and retains
 mutation replies plus deleted command identities through the retry window. It
 advances the conservative retained-history floor before removing event rows,
-refusing a live rule/Git cursor pin or an applicable unconsumed cleanup plan.
+refusing a live rule cursor pin or an applicable unconsumed cleanup plan. Other
+Agents' Git/stream sources cannot pin the selected tree's events. Live sources
+inside the selected tree already prevent deletion under the drained-custody guard.
 Process records are removed across every generation; consumed cleanup-plan replay
 remains retained. No uncertain native effect is replayed.
 Neither operation touches native stores, workspaces or branches; artifact cleanup

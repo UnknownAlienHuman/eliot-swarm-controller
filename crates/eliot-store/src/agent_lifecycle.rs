@@ -159,11 +159,14 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
         ));
     }
     let latest: i64=tx.query_row("SELECT COALESCE(MAX(seq),0) FROM events WHERE agent IN (SELECT id FROM deleted_agents)",[],|r|r.get(0)).map_err(sql_error)?;
-    let pinned: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM rule_state WHERE enabled=1 AND (current_cursor<?1 OR retiring_cursor<?1)) OR EXISTS(SELECT 1 FROM source_state WHERE source='git' AND state='open' AND agent NOT IN (SELECT id FROM deleted_agents) AND COALESCE(CAST(cursor AS INTEGER),0)<?1)",[latest],|r|r.get(0)).map_err(sql_error)?;
+    // Rules traverse the global log. Per-Agent sources consume only their own
+    // generation's history; the stopped-and-drained guard already excludes
+    // every live source in the selected tree.
+    let pinned: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM rule_state WHERE enabled=1 AND (current_cursor<?1 OR retiring_cursor<?1))",[latest],|r|r.get(0)).map_err(sql_error)?;
     if pinned {
         return Err(Error::new(
             "busy",
-            "retained history is pinned by a live rule or Git cursor",
+            "retained history is pinned by a live rule cursor",
         ));
     }
     let ids: Vec<String> = tx.prepare("WITH RECURSIVE tree(id,depth) AS (SELECT id,0 FROM commands WHERE target IN (SELECT id FROM deleted_agents) AND parent_command IS NULL UNION ALL SELECT c.id,t.depth+1 FROM commands c JOIN tree t ON c.parent_command=t.id WHERE t.depth<1000) SELECT id FROM tree ORDER BY depth DESC").map_err(sql_error)?.query_map([],|r|r.get(0)).map_err(sql_error)?.collect::<rusqlite::Result<_>>().map_err(sql_error)?;
