@@ -395,6 +395,37 @@ pub fn desktop_section(
         ),
     );
     map.insert("last_access".to_owned(), json!(preferences.last_access));
+    map.insert(
+        "model_visibility".to_owned(),
+        json!(
+            preferences
+                .visibility
+                .iter()
+                .take(crate::settings::MAX_VISIBILITY)
+                .collect::<Vec<_>>()
+        ),
+    );
+    map.insert(
+        "collapsed_model_groups".to_owned(),
+        json!(
+            preferences
+                .collapsed_groups
+                .iter()
+                .filter(|key| !key.trim().is_empty() && key.len() <= MAX_COLLAPSED_KEY)
+                .take(MAX_COLLAPSED)
+                .collect::<Vec<_>>()
+        ),
+    );
+    map.insert(
+        "display_names".to_owned(),
+        json!(
+            preferences
+                .names
+                .iter()
+                .take(crate::settings::MAX_DISPLAY_NAMES)
+                .collect::<Vec<_>>()
+        ),
+    );
     if let Some((width, height)) = window {
         map.insert(
             "window".to_owned(),
@@ -713,6 +744,17 @@ mod tests {
             recents: Vec::new(),
             collapsed: vec!["repo:c:/a/.git".to_owned(), "x".repeat(300)],
             last_access: Some(Access::Full),
+            visibility: vec![crate::settings::Visibility {
+                harness: "opencode".to_owned(),
+                model: None,
+                provider: Some("openrouter".to_owned()),
+                visible: false,
+            }],
+            collapsed_groups: vec!["opencode/openrouter".to_owned()],
+            names: vec![crate::settings::DisplayName {
+                key: "agent:a3".to_owned(),
+                name: "Fix login".to_owned(),
+            }],
         };
         assert_eq!(
             desktop_section(Some(&current), &preferences, None),
@@ -724,7 +766,10 @@ mod tests {
                 "recent_models": [],
                 // A key longer than `[desktop]` accepts is not written.
                 "collapsed_projects": ["repo:c:/a/.git"],
-                "last_access": "full"
+                "last_access": "full",
+                "model_visibility": [{"harness": "opencode", "provider": "openrouter", "visible": false}],
+                "collapsed_model_groups": ["opencode/openrouter"],
+                "display_names": [{"key": "agent:a3", "name": "Fix login"}]
             })
         );
     }

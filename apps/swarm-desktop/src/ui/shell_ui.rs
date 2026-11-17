@@ -5,6 +5,7 @@
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 
+use super::menu_ui::{Target, with_menu};
 use super::*;
 use crate::nav::{Branch, Checkout, Fleet, Row, Section, Shown};
 use crate::settings::{Startup, ThemeChoice};
@@ -161,6 +162,9 @@ pub(super) struct ShellState {
     pub(super) tree_epoch: u64,
     pub(super) agents_next: Option<String>,
     pub(super) agents_total: usize,
+    /// Archived Agents the list leaves out (the fleet line counts the
+    /// live ones); empty while Show archived lists them.
+    pub(super) archived: nav::Archived,
     pub(super) agents_loading: bool,
     /// Tags agent-list loads; a reply for an older request is dropped.
     pub(super) list_epoch: u64,
@@ -170,6 +174,8 @@ pub(super) struct ShellState {
     pub(super) collapsed: HashSet<String>,
     /// Section keys whose older stopped tasks are unfolded.
     pub(super) unfolded: HashSet<String>,
+    /// List archived Agents too (`agent.list` `archived: include`, k92).
+    pub(super) show_archived: bool,
     /// The list shows only the Agents that need attention.
     pub(super) attention_only: bool,
     pub(super) search: Search,
@@ -282,6 +288,11 @@ impl DesktopApp {
                 Err(error) => self.alert(format!("Projects not read: {error}")),
             },
             ShellMsg::AgentsLoaded(list_epoch, append, page) => {
+                // The composer's usage indicator reads every harness's quota
+                // once the daemon answers (Usage's Refresh reads again).
+                if self.settings.quotas.is_empty() {
+                    self.load_quotas(context);
+                }
                 if list_epoch != self.nav.list_epoch {
                     return;
                 }
@@ -295,6 +306,9 @@ impl DesktopApp {
                         }
                         self.nav.agents_next = page.next;
                         self.nav.agents_total = page.total;
+                        if !append {
+                            self.nav.archived = page.archived;
+                        }
                         // A just-launched Agent may not be on this page yet;
                         // its id is already the selection.
                         if let Some(wanted) = self.nav.pending_select.take()
@@ -313,7 +327,14 @@ impl DesktopApp {
                         self.open_startup_conversation(context);
                         self.refresh_search();
                     }
-                    Err(error) => self.alert(format!("Agents not read: {error}")),
+                    Err(error) => {
+                        // A daemon without the archived filter: the toggle
+                        // goes back off, so the refresh does not repeat it.
+                        if self.nav.show_archived && error.contains("(k92)") {
+                            self.nav.show_archived = false;
+                        }
+                        self.alert(format!("Agents not read: {error}"));
+                    }
                 }
             }
             ShellMsg::AgentOpened(agent) => {
@@ -385,6 +406,8 @@ impl DesktopApp {
             ShellMsg::SettingsPage(page) => self.open_settings(Some(page), context),
             ShellMsg::SettingsSearch(text) => self.settings.query = text,
             ShellMsg::SettingsClosed => {
+                // A preset's picker does not follow the owner out.
+                self.close_popover();
                 if self.main != Main::Conversation {
                     self.main = Main::Conversation;
                     self.reprime_fields(context);
@@ -528,7 +551,15 @@ impl DesktopApp {
                             self.launch_update(LaunchMsg::Toggle(launch_ui::Pop::Model), context);
                         }
                     }
+                    Shortcut::Popover(key) if self.menu.open.is_some() => {
+                        if key == crate::shortcuts::PopoverKey::Escape {
+                            self.close_menu();
+                        }
+                    }
                     Shortcut::Popover(key) => self.launch_update(LaunchMsg::Key(key), context),
+                    Shortcut::Enter(_) if self.menu.renaming.is_some() => {
+                        self.menu_update(MenuMsg::RenameCommitted, context);
+                    }
                     Shortcut::Enter(epoch) => {
                         // Enter on a suggestion reached with the arrows, with
                         // no other input since and the box still showing it.
@@ -639,7 +670,6 @@ impl DesktopApp {
         self.chat.live = LiveStatus::Idle;
         self.chat.items = Rc::new(Vec::new());
         self.chat.items_revision = 0;
-        self.chat.unseen = 0;
         if self.panel == Panel::Details {
             self.close_panel();
         }
@@ -658,6 +688,7 @@ impl DesktopApp {
             .cloned();
         self.launch.workspace = checkout.to_owned();
         self.launch.custom_workspace = false;
+        self.launch.chat = false;
         match registered {
             Some(project) => {
                 self.launch.profiles = project.profiles.clone();
@@ -669,6 +700,15 @@ impl DesktopApp {
             }
         }
         self.launch.reconcile_choice();
+    }
+
+    /// What the owner reads for a registered project: the display name they
+    /// gave its sidebar project (`[desktop] display_names`), else its name.
+    pub(super) fn project_label(&self, project: &UiProject) -> String {
+        let key = format!("project:repo:{}", nav::path_key(&project.common_dir));
+        self.prefs
+            .display_name(&key)
+            .map_or_else(|| project.name.clone(), str::to_owned)
     }
 
     /// Open the most recently active Agent's conversation once at start,
@@ -715,6 +755,9 @@ impl DesktopApp {
     /// The title of `agent` as its summary gave it, else the monitor's,
     /// else its id (an Agent on no page read yet).
     pub(super) fn agent_title(&self, agent: &str) -> String {
+        if let Some(name) = self.prefs.display_name(&format!("agent:{agent}")) {
+            return name.to_owned();
+        }
         if let Some(found) = self.find_agent(agent) {
             return found.title.clone();
         }
@@ -962,7 +1005,7 @@ impl DesktopApp {
         };
         let (epoch, id) = (self.nav.tree_epoch, id.to_owned());
         let _task = context.spawn_background(move |_| {
-            let page = load_agents_blocking(&data_dir, &request);
+            let page = load_agents_blocking(&data_dir, &request, None);
             Message::Shell(ShellMsg::BranchLoaded(epoch, id, page))
         });
     }
@@ -984,11 +1027,12 @@ impl DesktopApp {
             ..Default::default()
         };
         self.nav.agents_loading = true;
+        let archived = self.nav.show_archived.then_some("include");
         let _task = context.spawn_background(move |_| {
             Message::Shell(ShellMsg::AgentsLoaded(
                 list_epoch,
                 append,
-                load_agents_blocking(&data_dir, &request),
+                load_agents_blocking(&data_dir, &request, archived),
             ))
         });
     }
@@ -1040,7 +1084,7 @@ impl DesktopApp {
             Main::Settings if !self.startup_error => self.settings_nav(context, palette),
             _ => self.sidebar_view(context, palette),
         };
-        let window = Grid::new()
+        let columns_grid = Grid::new()
             .background(palette.surface())
             .columns(columns)
             .children((
@@ -1051,6 +1095,9 @@ impl DesktopApp {
                 Border::new().grid_column(1).content(main),
                 panel,
             ));
+        // One cell: the window, and over it the right-click menu or the
+        // confirmation dialog.
+        let window = Grid::new().children((columns_grid, self.menu_overlay(context, palette)));
         // Reactor updates a Button's resource overrides in place, but WinUI
         // resolves a template's ThemeResource values only when the template
         // is applied or the theme changes, and the theme change arrives before
@@ -1197,12 +1244,43 @@ impl DesktopApp {
                     )),
             ));
         }
-        let new_task_selected = self.main == Main::Conversation && self.chat.convo.is_none();
+        let new_task_selected =
+            self.main == Main::Conversation && self.chat.convo.is_none() && !self.launch.chat;
         for section in &sections {
             let selected = new_task_selected && section.holds(&self.launch.workspace);
+            let name_key = format!("project:{}", section.key);
+            let renaming = self
+                .menu
+                .renaming
+                .as_ref()
+                .filter(|(target, _)| matches!(target, Target::Project { key, .. } if *key == section.key))
+                .map(|(_, typed)| typed.clone());
+            let name = self
+                .prefs
+                .display_name(&name_key)
+                .map_or_else(|| section.name.clone(), str::to_owned);
+            let row = match renaming {
+                Some(typed) => self.rename_row(&typed, 0.0, context, palette),
+                None => with_menu(
+                    self.project_row(section, &name, selected, filtered, context, palette),
+                    Target::Project {
+                        key: section.key.clone(),
+                        name: name.clone(),
+                        checkout: section.checkout.clone(),
+                        checkouts: section.checkouts.clone(),
+                        collapsed: section.collapsed,
+                    },
+                    context,
+                ),
+            };
             items.push(KeyedView::new(
-                format!("project:{}:{selected}:{}", section.key, section.collapsed),
-                self.project_row(section, selected, filtered, context, palette),
+                format!(
+                    "project:{}:{selected}:{}:{name}:{}",
+                    section.key,
+                    section.collapsed,
+                    self.menu.renaming.is_some()
+                ),
+                row,
             ));
             if section.collapsed {
                 continue;
@@ -1217,12 +1295,7 @@ impl DesktopApp {
                 ));
             }
             for row in &section.rows {
-                let selected = self.main == Main::Conversation
-                    && self.nav.selection.agent.as_deref() == Some(row.agent.id.as_str());
-                items.push(KeyedView::new(
-                    format!("agent:{}:{selected}:{}", row.agent.id, row.expanded),
-                    self.agent_row(row, selected, context, palette),
-                ));
+                items.push(self.task_item(row, context, palette));
             }
             if section.older > 0 {
                 let label = if section.older_shown {
@@ -1261,16 +1334,90 @@ impl DesktopApp {
                     ))),
             ));
         }
+        // Chats without a project (`launch {chat: true}`), as tasks are
+        // under their project: the open one selected, children nested.
+        let chats: Vec<&UiAgent> = nav::chats(&self.nav.agents)
+            .into_iter()
+            .filter(|agent| keep(agent))
+            .collect();
+        if !chats.is_empty() || (self.launch.chat && !filtered) {
+            items.push(KeyedView::new("chats-caption", section_label("Chats")));
+            if chats.is_empty() {
+                items.push(KeyedView::new(
+                    "chats-empty",
+                    quiet_row("No chats yet: Send starts one", tokens::layout::TREE_INDENT),
+                ));
+            }
+            for agent in chats {
+                let row = Row {
+                    agent: agent.clone(),
+                    depth: 0,
+                    children: self
+                        .nav
+                        .agents
+                        .iter()
+                        .filter(|child| child.parent.as_deref() == Some(agent.id.as_str()))
+                        .count(),
+                    expanded: self.nav.expanded.contains(&agent.id),
+                    note: None,
+                    place: None,
+                };
+                items.push(self.task_item(&row, context, palette));
+                if row.expanded {
+                    for child in self
+                        .nav
+                        .agents
+                        .iter()
+                        .filter(|child| child.parent.as_deref() == Some(agent.id.as_str()))
+                    {
+                        let child_row = Row {
+                            agent: child.clone(),
+                            depth: 1,
+                            children: 0,
+                            expanded: false,
+                            note: None,
+                            place: None,
+                        };
+                        items.push(self.task_item(&child_row, context, palette));
+                    }
+                }
+            }
+        }
         let recents = nav::recents(&self.nav.agents, RECENTS);
         if !filtered && !recents.is_empty() {
             items.push(KeyedView::new("recents-caption", section_label("Recents")));
             for agent in recents {
                 items.push(KeyedView::new(
-                    format!("recent:{}", agent.id),
-                    self.recent_row(agent, context, palette),
+                    format!("recent:{}:{}", agent.id, self.agent_label(agent)),
+                    with_menu(
+                        self.recent_row(agent, context, palette),
+                        Target::Agent(agent.clone()),
+                        context,
+                    ),
                 ));
             }
         }
+        items.push(KeyedView::new(
+            format!("archived:{}", self.nav.show_archived),
+            m3::sub_row(palette, self.nav.show_archived)
+                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                .automation_name(if self.nav.show_archived {
+                    "Hide archived (showing archived)"
+                } else {
+                    "Show archived"
+                })
+                .on_click(context.message(Message::Menu(MenuMsg::ArchivedToggled)))
+                .content(m3::row_content(
+                    Some(m3::glyph::ARCHIVE),
+                    if self.nav.show_archived {
+                        "Hide archived"
+                    } else {
+                        "Show archived"
+                    },
+                    "",
+                    View::empty(),
+                )),
+        ));
         let list = ScrollViewer::new()
             .grid_row(4)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
@@ -1347,6 +1494,7 @@ impl DesktopApp {
     fn project_row(
         &self,
         section: &Section,
+        name: &str,
         selected: bool,
         filtered: bool,
         context: &mut ViewContext<Self>,
@@ -1372,12 +1520,12 @@ impl DesktopApp {
         } else {
             (m3::glyph::CHEVRON_DOWN, "expanded")
         };
-        let mut name = format!("{}, project, {state}", section.name);
+        let mut label = format!("{name}, project, {state}");
         if section.collapsed && section.running > 0 {
-            name.push_str(&format!(", {} running", section.running));
+            label.push_str(&format!(", {} running", section.running));
         }
         let toggle = m3::row(palette, selected)
-            .automation_name(name)
+            .automation_name(label)
             .is_enabled(!filtered)
             .on_click(context.message(Message::Shell(ShellMsg::ProjectToggled(
                 section.key.clone(),
@@ -1390,7 +1538,7 @@ impl DesktopApp {
                         m3::icon(chevron),
                         Border::new().grid_column(1).content(m3::row_content(
                             Some(m3::glyph::FOLDER),
-                            &section.name,
+                            name,
                             "",
                             badge,
                         )),
@@ -1400,7 +1548,7 @@ impl DesktopApp {
             .grid_column(1)
             .width(tokens::height::CONTROL)
             .height(tokens::height::CONTROL)
-            .automation_name(format!("New task in {}", section.name))
+            .automation_name(format!("New task in {name}"))
             .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
                 section.checkout.clone(),
             ))))
@@ -1423,7 +1571,8 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let agent = &row.agent;
-        let title = agent.title.as_str();
+        let label = self.agent_label(agent);
+        let title = label.as_str();
         let indent = tokens::layout::TREE_INDENT;
         let chevron: View = if row.expandable() {
             let (glyph, name) = if row.expanded {
@@ -1485,11 +1634,53 @@ impl DesktopApp {
                     .content(m3::row_content(
                         None,
                         title,
-                        row.place.as_deref().unwrap_or(""),
+                        if agent.archived {
+                            "archived"
+                        } else {
+                            row.place.as_deref().unwrap_or("")
+                        },
                         task_dot(palette, agent),
                     )),
                 note,
             ))
+    }
+
+    /// One task or chat row: its right-click menu, or the rename editor.
+    fn task_item(&self, row: &Row, context: &mut ViewContext<Self>, palette: Palette) -> KeyedView {
+        let selected = self.main == Main::Conversation
+            && self.nav.selection.agent.as_deref() == Some(row.agent.id.as_str());
+        let renaming = self
+            .menu
+            .renaming
+            .as_ref()
+            .filter(
+                |(target, _)| matches!(target, Target::Agent(agent) if agent.id == row.agent.id),
+            )
+            .map(|(_, typed)| typed.clone());
+        let label = self.agent_label(&row.agent);
+        let view = match renaming {
+            Some(typed) => self.rename_row(
+                &typed,
+                (row.depth as f64 + 1.0) * tokens::layout::TREE_INDENT,
+                context,
+                palette,
+            ),
+            None => with_menu(
+                self.agent_row(row, selected, context, palette),
+                Target::Agent(row.agent.clone()),
+                context,
+            ),
+        };
+        KeyedView::new(
+            format!(
+                "agent:{}:{selected}:{}:{label}:{}:{}",
+                row.agent.id,
+                row.expanded,
+                row.agent.archived,
+                self.menu.renaming.is_some()
+            ),
+            view,
+        )
     }
 
     /// A Recents row: the title and its dot, no tree.
@@ -1499,21 +1690,17 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
+        let label = self.agent_label(agent);
         m3::sub_row(palette, false)
-            .automation_name(format!("Recent: {}, {}", agent.title, agent.state))
+            .automation_name(format!("Recent: {label}, {}", agent.state))
             .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
-            .content(m3::row_content(
-                None,
-                &agent.title,
-                "",
-                task_dot(palette, agent),
-            ))
+            .content(m3::row_content(None, &label, "", task_dot(palette, agent)))
     }
 
     /// The fleet in one calm row ("6 running", "All quiet · 40 Agents");
     /// it opens the monitor.
     fn fleet_row(&self, fleet: Fleet, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let summary = fleet.summary(self.nav.agents_total);
+        let summary = fleet.summary(self.nav.agents_total, self.nav.archived);
         let dot = if fleet.running > 0 {
             palette
                 .dot(StatusTone::Active)

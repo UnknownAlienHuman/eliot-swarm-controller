@@ -11,14 +11,15 @@
 use std::path::{Path, PathBuf};
 
 use eliot_core::api::{
-    AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentResultRequest,
-    AgentResultResponse, CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest,
-    CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
-    CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest,
-    DiagnoseResponse, EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest,
-    EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest,
-    HandoffResponse, HarnessModelsRequest, HarnessModelsResponse, ReparentRequest,
-    ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
+    AgentArchiveRequest, AgentDeleteRequest, AgentGetRequest, AgentGetResponse, AgentListRequest,
+    AgentListResponse, AgentResultRequest, AgentResultResponse, AgentTreeResponse, ArchivedFilter,
+    CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest, CommandChildrenResponse,
+    CommandGetRequest, CommandResolution, CommandResolveRequest, CommandResolveResponse,
+    CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest, DiagnoseResponse,
+    EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
+    EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest, HandoffResponse,
+    HarnessModelsRequest, HarnessModelsResponse, ReparentRequest, ReparentResponse, SwitchRequest,
+    SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -78,6 +79,85 @@ pub async fn list_agents(data_dir: &Path, params: &AgentListRequest) -> Result<A
         eliot_daemon::client_call_typed(data_dir, "agent.list", params).await?;
     params.validate_response(&reply)?;
     Ok(reply)
+}
+
+/// Per-row chat and archived flags of one `agent.list` page.
+pub type ListFlags = std::collections::HashMap<String, (bool, bool)>;
+
+/// One validated `agent.list` page plus each row's `chat` and `archived`
+/// flags, under the `archived` filter (`exclude` default, `include`, `only`).
+pub async fn list_agents_flagged(
+    data_dir: &Path,
+    params: &AgentListRequest,
+    archived: Option<&str>,
+) -> Result<(AgentListResponse, ListFlags)> {
+    let mut params = params.clone();
+    params.archived = match archived {
+        Some("only") => ArchivedFilter::Only,
+        Some("include") => ArchivedFilter::Include,
+        _ => ArchivedFilter::Exclude,
+    };
+    let reply = list_agents(data_dir, &params).await?;
+    let flags = reply
+        .agents
+        .iter()
+        .map(|row| {
+            (
+                row.summary.id.clone(),
+                (row.summary.chat, row.summary.archived),
+            )
+        })
+        .collect();
+    Ok((reply, flags))
+}
+
+/// The `agent.list` error, worded for the sidebar's Show archived toggle.
+pub fn archived_filter_error(error: &Error) -> String {
+    error.to_string()
+}
+
+/// `agent.archive` (Owner only): hide or show a stopped or idle Agent tree
+/// in the default list; durable, idempotent by mutation id. Returns the
+/// number of Agents it changed.
+pub async fn archive_agent(
+    data_dir: &Path,
+    mutation_id: String,
+    agent: &str,
+    archived: bool,
+) -> Result<usize> {
+    let request = AgentArchiveRequest {
+        id: mutation_id,
+        agent: agent.to_owned(),
+        archived,
+    };
+    request.validate()?;
+    let reply: AgentTreeResponse = typed_call(data_dir, "agent.archive", &request).await?;
+    Ok(reply.affected)
+}
+
+/// `agent.delete` (Owner only, stopped trees only): removes the tree's
+/// records from the Store; never the workspace, native store files or
+/// branches.
+pub async fn delete_agent(data_dir: &Path, mutation_id: String, agent: &str) -> Result<usize> {
+    let request = AgentDeleteRequest {
+        id: mutation_id,
+        agent: agent.to_owned(),
+    };
+    request.validate()?;
+    let reply: AgentTreeResponse = typed_call(data_dir, "agent.delete", &request).await?;
+    Ok(reply.affected)
+}
+
+async fn typed_call<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+    data_dir: &Path,
+    method: &str,
+    request: &Req,
+) -> Result<Resp> {
+    let params = serde_json::to_value(request)
+        .map_err(|_| Error::new("internal", format!("{method} request could not be encoded")))?;
+    let raw = eliot_daemon::client_call(data_dir, method, params).await?;
+    serde_json::from_value(raw)
+        .map_err(|_| Error::new("unknown", format!("{method} returned a malformed result")))
 }
 
 /// Full readback for one Agent: generation, active turn, pending requests,
@@ -299,6 +379,15 @@ pub enum LaunchTarget {
     },
 }
 
+/// Where a new task runs: a project checkout or folder, or a chat without a
+/// project (`chat: true` and no workspace: the daemon creates the chat's
+/// private directory under `chats_root`, per the k92 launch contract).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchPlace {
+    Workspace(String),
+    Chat,
+}
+
 /// First prompt as one submission: nonblank text rides the launch admission
 /// and the linked `<id>/send` command must appear in the reply. Overrides
 /// exist only on the ad-hoc path, which the daemon validates; a profile
@@ -307,13 +396,16 @@ pub async fn submit_launch(
     data_dir: &Path,
     mutation_id: String,
     target: LaunchTarget,
-    workspace: &str,
+    place: &LaunchPlace,
     text: Option<String>,
 ) -> Result<CommandSubmitResponse> {
     if let Some(text) = text.as_deref() {
         check_text(text)?;
     }
-    let mut args = serde_json::json!({ "workspace": workspace });
+    let mut args = match place {
+        LaunchPlace::Workspace(workspace) => serde_json::json!({ "workspace": workspace }),
+        LaunchPlace::Chat => serde_json::json!({ "chat": true }),
+    };
     match target {
         LaunchTarget::Routed => {}
         LaunchTarget::Profile(profile) if !profile.trim().is_empty() => {

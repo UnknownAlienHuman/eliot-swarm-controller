@@ -43,6 +43,11 @@ pub struct UiAgent {
     pub native_child: bool,
     /// Tokens the Agent's summary reports ([`AgentSummary::fleet_usage`]).
     pub tokens: Option<i64>,
+    /// A chat without a project (`launch {chat: true}`, k92): listed under
+    /// Chats, not under a project.
+    pub chat: bool,
+    /// Archived (`agent.archive`, k92): listed only with Show archived.
+    pub archived: bool,
 }
 
 impl UiAgent {
@@ -60,6 +65,8 @@ impl UiAgent {
             // children.
             native_child: summary.activity.is_some(),
             tokens: summary.fleet_usage().map(|(tokens, _)| tokens),
+            chat: false,
+            archived: false,
         }
     }
 
@@ -69,6 +76,11 @@ impl UiAgent {
             self.state.as_str(),
             "busy" | "running" | "created" | "starting"
         )
+    }
+
+    /// Its process may still exist: neither stopped, failed nor lost.
+    pub fn live(&self) -> bool {
+        !matches!(self.state.as_str(), "stopped" | "failed" | "lost")
     }
 
     /// The owner has something to do: answer a pending request
@@ -360,7 +372,8 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
 
     let listed_ids: HashSet<&str> = listed.iter().map(|agent| agent.id.as_str()).collect();
     let mut counted = HashSet::new();
-    for agent in listed {
+    // Chats list under Chats, not under a project.
+    for agent in listed.iter().filter(|agent| !agent.chat) {
         let key = project_key(&agent.project, checkouts);
         let index = match groups.iter().position(|group| group.section.key == key) {
             Some(index) => index,
@@ -378,12 +391,17 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
         if counted.insert(agent.id.as_str()) && agent.running() {
             group.section.running += 1;
         }
+        // A native observed child shows only nested under its parent
+        // conversation (collapsed), never as a task of its own.
         let shows = match shown.only {
-            Some(keep) => keep(agent),
-            None => agent
-                .parent
-                .as_deref()
-                .is_none_or(|parent| !listed_ids.contains(parent)),
+            Some(keep) => keep(agent) && !agent.native_child,
+            None => {
+                !agent.native_child
+                    && agent
+                        .parent
+                        .as_deref()
+                        .is_none_or(|parent| !listed_ids.contains(parent))
+            }
         };
         if shows {
             group.top.push(agent);
@@ -498,16 +516,60 @@ pub fn search(listed: &[UiAgent], checkouts: &[Checkout], query: &str) -> Vec<(S
         .collect()
 }
 
-/// The most recently changed Agents, newest first (ties by id), at most
-/// `limit`.
+/// The most recently changed conversations, newest first (ties by id), at
+/// most `limit`: no native observed child (it lives under its parent) and
+/// nothing archived.
 pub fn recents(agents: &[UiAgent], limit: usize) -> Vec<&UiAgent> {
-    let mut recent: Vec<&UiAgent> = agents.iter().collect();
+    let mut recent: Vec<&UiAgent> = agents
+        .iter()
+        .filter(|agent| !agent.native_child && !agent.archived)
+        .collect();
     recent.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
     // An id read on two pages shows once, at its newest time.
     let mut seen = HashSet::new();
     recent.retain(|agent| seen.insert(agent.id.as_str()));
     recent.truncate(limit);
     recent
+}
+
+/// The chats without a project (`chat: true`), newest first; a chat's own
+/// children nest under it like a task's.
+pub fn chats(agents: &[UiAgent]) -> Vec<&UiAgent> {
+    let mut seen = HashSet::new();
+    let mut chats: Vec<&UiAgent> = agents
+        .iter()
+        .filter(|agent| agent.chat && agent.parent.is_none() && seen.insert(agent.id.as_str()))
+        .collect();
+    chats.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
+    chats
+}
+
+/// Archived Agents the default list leaves out: those still live (not
+/// stopped, failed or lost), those running, and every archived record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Archived {
+    pub live: usize,
+    pub running: usize,
+    pub total: usize,
+}
+
+impl Archived {
+    /// Counts over one `agent.list {archived: only}` page and its total.
+    pub fn of(agents: &[UiAgent], total: usize) -> Self {
+        let mut seen = HashSet::new();
+        let mut archived = Self {
+            total,
+            ..Self::default()
+        };
+        for agent in agents {
+            if !seen.insert(agent.id.as_str()) {
+                continue;
+            }
+            archived.live += usize::from(agent.live());
+            archived.running += usize::from(agent.running());
+        }
+        archived
+    }
 }
 
 /// The fleet line's counts over the listed Agents.
@@ -532,16 +594,34 @@ impl Fleet {
         fleet
     }
 
-    /// The line itself: live work, or how quiet the fleet is.
-    pub fn summary(&self, total: usize) -> String {
-        if self.running > 0 {
-            format!("{} running", self.running)
+    /// The line itself: live work, or how quiet the fleet is. `total`
+    /// counts the listed Agents; a live archived Agent still counts, said
+    /// as archived (k98: "No Agents yet" while one was live).
+    pub fn summary(&self, total: usize, archived: Archived) -> String {
+        let running = self.running + archived.running;
+        let agents = |count: usize| if count == 1 { "Agent" } else { "Agents" };
+        if running > 0 {
+            format!("{running} running")
+        } else if total == 0 && archived.live == 0 {
+            if archived.total == 0 {
+                "No Agents yet".to_owned()
+            } else {
+                format!("All quiet · {} archived", archived.total)
+            }
+        } else if archived.live == 0 {
+            format!("All quiet · {total} {}", agents(total))
         } else if total == 0 {
-            "No Agents yet".to_owned()
-        } else {
             format!(
-                "All quiet · {total} {}",
-                if total == 1 { "Agent" } else { "Agents" }
+                "All quiet · {} {} (archived)",
+                archived.live,
+                agents(archived.live)
+            )
+        } else {
+            let all = total + archived.live;
+            format!(
+                "All quiet · {all} {} ({} archived)",
+                agents(all),
+                archived.live
             )
         }
     }
@@ -561,7 +641,8 @@ const TITLE_CHARS: usize = 60;
 
 /// The title of a listed Agent from Swarm's retained data: the first line
 /// of its first input ([`title`] of `preview`), else its name, else
-/// `<harness> · <profile>` (a native child reads `<harness> subagent`).
+/// `<harness> · <profile>`; a native observed child reads `Codex subagent`
+/// (it inherits its parent's internal profile name, which says nothing).
 /// The id appears only when the daemon reported no profile.
 pub fn summary_title(summary: &AgentSummary) -> String {
     if let Some(title) = summary.preview.as_deref().and_then(title) {
@@ -570,13 +651,15 @@ pub fn summary_title(summary: &AgentSummary) -> String {
     if let Some(name) = summary.name.as_deref().and_then(title) {
         return name;
     }
-    let kind = if summary.activity.is_some() {
-        format!("{} subagent", summary.harness)
-    } else {
-        summary.harness.clone()
-    };
+    if summary.activity.is_some() {
+        return format!(
+            "{} subagent",
+            crate::picker::harness_label(&summary.harness)
+        );
+    }
     format!(
-        "{kind} · {}",
+        "{} · {}",
+        summary.harness,
         summary.profile.as_deref().unwrap_or(&summary.id)
     )
 }
@@ -787,6 +870,8 @@ mod tests {
             title: id.to_owned(),
             native_child: false,
             tokens: None,
+            chat: false,
+            archived: false,
         }
     }
 
@@ -1148,13 +1233,37 @@ mod tests {
     #[test]
     fn the_fleet_line_reports_work_calmly() {
         let quiet = Fleet::default();
-        assert_eq!(quiet.summary(0), "No Agents yet");
-        assert_eq!(quiet.summary(1), "All quiet · 1 Agent");
+        let none = Archived::default();
+        assert_eq!(quiet.summary(0, none), "No Agents yet");
+        assert_eq!(quiet.summary(1, none), "All quiet · 1 Agent");
+        // k98: an archived Agent that is still live is counted.
+        let idle = with(agent("a1", "/p", None), "idle", 1);
+        let stopped = with(agent("a2", "/p", None), "stopped", 1);
+        let archived = Archived::of(&[idle.clone(), stopped], 2);
+        assert_eq!(
+            archived,
+            Archived {
+                live: 1,
+                running: 0,
+                total: 2
+            }
+        );
+        assert_eq!(quiet.summary(0, archived), "All quiet · 1 Agent (archived)");
+        assert_eq!(
+            quiet.summary(3, archived),
+            "All quiet · 4 Agents (1 archived)"
+        );
+        assert_eq!(
+            quiet.summary(0, Archived::of(&[], 2)),
+            "All quiet · 2 archived"
+        );
+        let busy_archived = Archived::of(&[with(idle, "busy", 1)], 1);
+        assert_eq!(quiet.summary(0, busy_archived), "1 running");
         let busy = Fleet {
             running: 6,
             attention: 1,
         };
-        assert_eq!(busy.summary(40), "6 running");
+        assert_eq!(busy.summary(40, none), "6 running");
         assert_eq!(busy.attention_label(), "1 needs attention");
         assert_eq!(
             Fleet {
@@ -1191,6 +1300,30 @@ mod tests {
             .map(|agent| agent.id.as_str())
             .collect();
         assert_eq!(ids, ["a2", "a3", "a1"]);
+    }
+
+    #[test]
+    fn native_children_nest_only_and_stay_out_of_recents_and_chats_leave_projects() {
+        let parent = with(agent("a1", "/w", None), "idle", 10);
+        let mut child = with(agent("a2", "/w", Some("a1")), "unknown", 50);
+        child.native_child = true;
+        child.title = "codex subagent · adhoc-codex".to_owned();
+        let mut orphan = with(agent("a3", "/w", Some("a9")), "running", 40);
+        orphan.native_child = true;
+        let mut chat = with(agent("a4", "/home/Eliot/chats/a4", None), "idle", 30);
+        chat.chat = true;
+        let listed = vec![parent, child, orphan, chat];
+        let recent: Vec<&str> = recents(&listed, 8).iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(recent, ["a4", "a1"]);
+        let sections = View::default().sections(&listed, &[]);
+        assert_eq!(sections.len(), 1, "the chat makes no project of its own");
+        assert_eq!(ids(&sections[0]), [("a1", 0)]);
+        assert_eq!(
+            sections[0].rows[0].children, 1,
+            "the native child nests under a1"
+        );
+        let chat_ids: Vec<&str> = chats(&listed).iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(chat_ids, ["a4"]);
     }
 
     #[test]

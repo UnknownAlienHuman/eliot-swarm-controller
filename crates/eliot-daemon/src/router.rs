@@ -3355,6 +3355,9 @@ impl Router {
                     );
                 }
             }
+            // A local reader-capacity refusal says nothing about the provider:
+            // return it uncached so the next read tries again.
+            Err(error) if error.code == "busy" => return Err(error),
             Err(error) => {
                 catalog::quota_read_error(&mut response, error);
             }
@@ -3373,7 +3376,7 @@ impl Router {
     /// optional query filters case-insensitively over model id, display
     /// name, provider and harness. The response is bounded and paginated.
     async fn models_catalog(&self, params: &Value, principal: &Principal) -> Result<Value> {
-        use eliot_core::api::{ModelsCatalogEntry, ModelsCatalogRequest};
+        use eliot_core::api::{ModelsCatalogEntry, ModelsCatalogFailure, ModelsCatalogRequest};
         require_owner(principal)?;
         let request: ModelsCatalogRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
@@ -3398,16 +3401,17 @@ impl Router {
         let harnesses = harnesses_response.harnesses;
         let key = catalog::aggregate_key(&harnesses);
         let now = now_ms();
-        if let Some(hit) = self
-            .inner
-            .catalog_cache
-            .lock_recover()
-            .get_aggregate(&key, now)
+        if let Some(hit) =
+            self.inner
+                .catalog_cache
+                .lock_recover()
+                .get_aggregate(&key, now, after.is_some())
         {
             return Self::catalog_page(
                 &request,
                 &hit.harnesses,
                 &hit.models,
+                &hit.failures,
                 &query,
                 limit,
                 after.as_deref(),
@@ -3441,6 +3445,7 @@ impl Router {
             }
         };
         let mut models: Vec<ModelsCatalogEntry> = Vec::new();
+        let mut failures: Vec<ModelsCatalogFailure> = Vec::new();
         for entry in &harnesses {
             let harness = entry.harness.as_str();
             if !entry.installed {
@@ -3454,7 +3459,18 @@ impl Router {
             let params = json!({"harness": harness});
             let response_value = match self.harness_models(&params, principal).await {
                 Ok(value) => value,
-                Err(_) => continue,
+                Err(error) => {
+                    // The aggregate names the failed harness with its typed
+                    // error instead of silently listing no models for it.
+                    crate::logging::record(
+                        &self.secret_policy_snapshot(),
+                        "catalog.harness_failed",
+                        &[("source", harness), ("method", "harness.models")],
+                        Some(&error),
+                    );
+                    failures.push(ModelsCatalogFailure::from_error(harness, &error));
+                    continue;
+                }
             };
             let response: eliot_core::api::HarnessModelsResponse =
                 serde_json::from_value(response_value)
@@ -3482,6 +3498,15 @@ impl Router {
                 .cmp(&(right.harness.as_str(), right.id.as_str()))
         });
         let fetched_at_ms = now_ms();
+        // A partial aggregate is never kept for the full TTL: it serves only
+        // the rest of this listing's pages, and the next listing reads the
+        // failed harness again (the others come from their per-scope
+        // `harness.models` cache).
+        let ttl_ms = if failures.is_empty() {
+            catalog::CATALOG_TTL_MS
+        } else {
+            catalog::PARTIAL_AGGREGATE_TTL_MS
+        };
         self.inner
             .catalog_cache
             .lock_recover()
@@ -3489,18 +3514,20 @@ impl Router {
                 key: key.clone(),
                 harnesses: harnesses.clone(),
                 models: models.clone(),
+                failures: failures.clone(),
                 fetched_at_ms,
-                ttl_ms: catalog::CATALOG_TTL_MS,
+                ttl_ms,
             });
         Self::catalog_page(
             &request,
             &harnesses,
             &models,
+            &failures,
             &query,
             limit,
             after.as_deref(),
             fetched_at_ms,
-            catalog::CATALOG_TTL_MS,
+            ttl_ms,
         )
     }
 
@@ -3509,6 +3536,7 @@ impl Router {
         request: &eliot_core::api::ModelsCatalogRequest,
         harnesses: &[eliot_core::api::HarnessEntry],
         models: &[eliot_core::api::ModelsCatalogEntry],
+        failures: &[eliot_core::api::ModelsCatalogFailure],
         query: &str,
         limit: usize,
         after: Option<&str>,
@@ -3547,6 +3575,7 @@ impl Router {
             next,
             fetched_at_ms,
             ttl_ms,
+            failures: failures.to_owned(),
         };
         request.validate_response(&response)?;
         serde_json::to_value(response)

@@ -351,6 +351,11 @@ pub mod winui {
             self.role(|s| s.error, ThemeBrush::SystemCritical)
         }
 
+        /// The M3 scrim behind a dialog: black at 32 %.
+        pub fn scrim(self) -> Brush {
+            Brush::Solid(Color::argb(82, 0, 0, 0))
+        }
+
         /// A destructive confirmation's surface (the Force stop banner).
         pub fn error_container(self) -> Brush {
             self.role(|s| s.error_container, ThemeBrush::SystemCriticalBackground)
@@ -486,6 +491,19 @@ pub mod winui {
         }
 
         /// An assist chip: outlined in outline-variant.
+        /// A field that opens a list (the preset Model field): the
+        /// outlined text field's outline and on-surface text, like the
+        /// form's dropdowns.
+        pub fn field_button(self) -> ResourceOverrides {
+            self.with(|s| {
+                Family {
+                    outline: Some(s.outline),
+                    ..Family::new(None, s.on_surface)
+                }
+                .overrides(s)
+            })
+        }
+
         pub fn chip(self) -> ResourceOverrides {
             self.with(|s| {
                 Family {
@@ -515,8 +533,15 @@ pub mod winui {
 
         /// One segment of a segmented button: secondary-container when
         /// selected, on-surface otherwise, on the filled track.
+        /// A segment: the selected one filled with primary, so it stands
+        /// out on a highlighted picker row (whose fill is the selection's
+        /// secondary-container).
         pub fn segment(self, selected: bool) -> ResourceOverrides {
-            self.row(selected)
+            if selected {
+                self.with(|s| Family::new(Some(s.primary), s.on_primary).overrides(s))
+            } else {
+                self.row(false)
+            }
         }
 
         fn with(self, build: impl FnOnce(&Scheme) -> ResourceOverrides) -> ResourceOverrides {

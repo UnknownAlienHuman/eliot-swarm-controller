@@ -9,7 +9,7 @@
 
 use eliot_core::api::{
     HARNESS_READ_TTL_MS, HarnessEntry, HarnessModelsResponse, HarnessQuotaResponse,
-    ModelsCatalogEntry,
+    ModelsCatalogEntry, ModelsCatalogFailure,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -20,6 +20,10 @@ const MAX_CACHED_SCOPES: usize = 32;
 /// Serve cached catalogue/quota entries for this long after the native read.
 pub(crate) const CATALOG_TTL_MS: u64 = HARNESS_READ_TTL_MS;
 
+/// A partial aggregate (some harness read failed) serves only the
+/// continuation pages of the listing that built it, for at most this long;
+/// every first page rebuilds it, so the failed harness is read again.
+pub(crate) const PARTIAL_AGGREGATE_TTL_MS: u64 = 30_000;
 pub(super) fn quota_read_error(response: &mut HarnessQuotaResponse, error: eliot_core::Error) {
     if error.code == "unsupported" {
         response.status = "unsupported".to_owned();
@@ -163,6 +167,8 @@ pub(crate) struct CachedAggregate {
     pub(crate) key: String,
     pub(crate) harnesses: Vec<HarnessEntry>,
     pub(crate) models: Vec<ModelsCatalogEntry>,
+    /// Installed harnesses whose read failed; non-empty makes it partial.
+    pub(crate) failures: Vec<ModelsCatalogFailure>,
     pub(crate) fetched_at_ms: i64,
     pub(crate) ttl_ms: u64,
 }
@@ -219,10 +225,18 @@ impl CatalogCache {
         self.quotas.insert(entry.scope.clone(), entry);
     }
 
-    pub(crate) fn get_aggregate(&self, key: &str, now: i64) -> Option<CachedAggregate> {
+    /// The fresh aggregate for `key`. A partial one answers only a
+    /// continuation page (`after` set): a first page rebuilds it.
+    pub(crate) fn get_aggregate(
+        &self,
+        key: &str,
+        now: i64,
+        continuation: bool,
+    ) -> Option<CachedAggregate> {
         self.aggregate
             .as_ref()
             .filter(|entry| entry.key == key && entry.fresh(now))
+            .filter(|entry| continuation || entry.failures.is_empty())
             .cloned()
     }
 
@@ -703,27 +717,28 @@ mod tests {
             key: key.clone(),
             harnesses: harnesses.clone(),
             models: Vec::new(),
+            failures: Vec::new(),
             fetched_at_ms: 1_000,
             ttl_ms: CATALOG_TTL_MS,
         };
         cache.insert_aggregate(entry);
         assert_eq!(cache.aggregate_len(), 1);
         // Concurrent callers share the fresh entry: the same key hits.
-        assert!(cache.get_aggregate(&key, 1_000).is_some());
+        assert!(cache.get_aggregate(&key, 1_000, false).is_some());
         assert!(
             cache
-                .get_aggregate(&key, 1_000 + CATALOG_TTL_MS as i64)
+                .get_aggregate(&key, 1_000 + CATALOG_TTL_MS as i64, false)
                 .is_some()
         );
         assert!(
             cache
-                .get_aggregate(&key, 1_000 + CATALOG_TTL_MS as i64 + 1)
+                .get_aggregate(&key, 1_000 + CATALOG_TTL_MS as i64 + 1, false)
                 .is_none()
         );
         let upgraded = vec![harness_entry("codex", "codex", "1.1")];
         assert!(
             cache
-                .get_aggregate(&aggregate_key(&upgraded), 1_000)
+                .get_aggregate(&aggregate_key(&upgraded), 1_000, false)
                 .is_none()
         );
         // A rebuild replaces the single bounded entry, never grows it.
@@ -731,9 +746,40 @@ mod tests {
             key: aggregate_key(&upgraded),
             harnesses: upgraded,
             models: Vec::new(),
+            failures: Vec::new(),
             fetched_at_ms: 2_000,
             ttl_ms: CATALOG_TTL_MS,
         });
         assert_eq!(cache.aggregate_len(), 1);
+    }
+
+    #[test]
+    fn partial_aggregate_serves_only_continuation_pages() {
+        // k98: a failed Codex read was cached for the whole TTL and Codex
+        // vanished from every picker. A partial aggregate keeps one
+        // listing's pages consistent; every new listing reads again.
+        let mut cache = CatalogCache::default();
+        let harnesses = vec![harness_entry("codex", "codex", "1.0")];
+        let key = aggregate_key(&harnesses);
+        cache.insert_aggregate(CachedAggregate {
+            key: key.clone(),
+            harnesses,
+            models: Vec::new(),
+            failures: vec![ModelsCatalogFailure {
+                harness: "codex".to_owned(),
+                code: "busy".to_owned(),
+                message: "metadata_readers in-flight bound reached (limit=4)".to_owned(),
+                origin: eliot_core::FailureOrigin::Swarm,
+            }],
+            fetched_at_ms: 1_000,
+            ttl_ms: PARTIAL_AGGREGATE_TTL_MS,
+        });
+        assert!(cache.get_aggregate(&key, 1_001, false).is_none());
+        assert!(cache.get_aggregate(&key, 1_001, true).is_some());
+        assert!(
+            cache
+                .get_aggregate(&key, 1_000 + PARTIAL_AGGREGATE_TTL_MS as i64 + 1, true)
+                .is_none()
+        );
     }
 }

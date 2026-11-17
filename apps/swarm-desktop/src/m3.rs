@@ -27,7 +27,6 @@ pub mod glyph {
     pub const SETTINGS: &str = "\u{E713}";
     pub const SEND: &str = "\u{E724}";
     pub const STOP: &str = "\u{E71A}";
-    pub const STEER: &str = "\u{E72A}";
     pub const MORE: &str = "\u{E712}";
     pub const INFO: &str = "\u{E946}";
     pub const CLOSE: &str = "\u{E711}";
@@ -60,6 +59,12 @@ pub mod glyph {
     pub const WORKTREE: &str = "\u{E8F1}";
     pub const CLOUD: &str = "\u{E753}";
     pub const CODE: &str = "\u{E943}";
+    /// Manage models (OpenCode's sliders button): Segoe Fluent Equalizer.
+    pub const SLIDERS: &str = "\u{E9E9}";
+    pub const CHAT: &str = "\u{E8BD}";
+    pub const ARCHIVE: &str = "\u{E7B8}";
+    pub const DELETE: &str = "\u{E74D}";
+    pub const RENAME: &str = "\u{E8AC}";
 }
 
 pub fn weight(style: TypeStyle) -> FontWeight {
@@ -137,16 +142,16 @@ pub fn dot(fill: Brush) -> View {
         .into()
 }
 
-/// An Agent state: its header dot and the state name in secondary text
-/// (no container, so a card holds no extra shape).
-pub fn status(palette: Palette, state: &str) -> View {
+/// An Agent state (its code picks the dot's tone) with its label in
+/// secondary text (no container, so a card holds no extra shape).
+pub fn status(palette: Palette, state: &str, label: &str) -> View {
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(spacing::XS)
         .vertical_alignment(VerticalAlignment::Center)
         .children((
             dot(palette.header_dot(StatusTone::of_state(state))),
-            secondary(state.to_owned()).vertical_alignment(VerticalAlignment::Center),
+            secondary(label.to_owned()).vertical_alignment(VerticalAlignment::Center),
         ))
 }
 
@@ -421,6 +426,33 @@ pub fn form_row(label: &str, control: View, action: Option<View>) -> View {
         .columns(columns)
         .column_spacing(spacing::SM)
         .keyed_children(cells)
+}
+
+/// A form field that opens a list as a popover (the preset Model field):
+/// the dropdowns' width, outline and corner; [`field_button_content`]
+/// puts the value at the left and their chevron at the right.
+pub fn field_button(palette: Palette) -> Button {
+    button(palette.field_button())
+        .width(layout::ENUM_WIDTH)
+        .horizontal_alignment(HorizontalAlignment::Left)
+        .horizontal_content_alignment(HorizontalAlignment::Stretch)
+}
+
+/// A [`field_button`]'s value and chevron.
+pub fn field_button_content(value: &str) -> View {
+    Grid::new()
+        .columns([GridLength::STAR, GridLength::Auto])
+        .column_spacing(spacing::SM)
+        .children((
+            TextBlock::new()
+                .text(value.to_owned())
+                .vertical_alignment(VerticalAlignment::Center)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+            Border::new()
+                .grid_column(1)
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(icon_sized(glyph::CHEVRON_DOWN, icon_size::CHEVRON)),
+        ))
 }
 
 /// A dropdown sized for an enum value.

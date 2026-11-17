@@ -654,6 +654,71 @@ pub struct ModelsCatalogResponse {
     pub fetched_at_ms: i64,
     /// Freshness bound in milliseconds for the aggregate.
     pub ttl_ms: u64,
+    /// Installed harnesses whose catalogue read failed while this aggregate
+    /// was built (repeated on every page). Such an aggregate is partial: it
+    /// is not cached, so the next call reads the failed harness again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<ModelsCatalogFailure>,
+}
+
+/// Maximum `models.catalog` failure message length in bytes.
+pub const MAX_CATALOG_FAILURE_MESSAGE_BYTES: usize = 512;
+
+/// One installed harness whose `models.catalog` read failed: the typed
+/// error of its `harness.models` read.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelsCatalogFailure {
+    /// Harness code: codex|claude|muse|opencode|antigravity.
+    pub harness: String,
+    /// The read's error code (`busy`, `unavailable`, `harness_error`, ...).
+    pub code: String,
+    /// The read's error message, bounded to 512 bytes, without controls.
+    pub message: String,
+    /// Who the failure is attributed to.
+    pub origin: crate::FailureOrigin,
+}
+
+impl ModelsCatalogFailure {
+    /// The failure of one harness's read, with its message bounded.
+    pub fn from_error(harness: &str, error: &Error) -> Self {
+        let mut message: String = error
+            .message
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if message.len() > MAX_CATALOG_FAILURE_MESSAGE_BYTES {
+            let mut end = MAX_CATALOG_FAILURE_MESSAGE_BYTES;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+        }
+        Self {
+            harness: harness.to_owned(),
+            code: error.code.chars().take(64).collect(),
+            message,
+            origin: error.origin_or_unknown(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_harness(&self.harness)?;
+        if self.code.trim().is_empty() || self.code.len() > 64 {
+            return Err(Error::new(
+                "invalid",
+                "catalogue failure code must be non-empty of at most 64 bytes",
+            ));
+        }
+        if self.message.len() > MAX_CATALOG_FAILURE_MESSAGE_BYTES
+            || self.message.chars().any(char::is_control)
+        {
+            return Err(Error::new(
+                "invalid",
+                "catalogue failure message must be at most 512 bytes with no controls",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl ModelsCatalogResponse {
@@ -663,6 +728,15 @@ impl ModelsCatalogResponse {
                 "invalid",
                 "catalogue harness list is empty or oversized",
             ));
+        }
+        if self.failures.len() > self.harnesses.len() {
+            return Err(Error::new(
+                "invalid",
+                "catalogue failures exceed the harness list",
+            ));
+        }
+        for failure in &self.failures {
+            failure.validate()?;
         }
         if self.models.len() > MAX_CATALOG_MODELS {
             return Err(Error::new(
@@ -1120,6 +1194,7 @@ b"
             next: None,
             fetched_at_ms: 1,
             ttl_ms: HARNESS_READ_TTL_MS,
+            failures: Vec::new(),
         };
         ModelsCatalogRequest {
             query: None,
@@ -1136,8 +1211,42 @@ b"
             }
             .validate_response(&ModelsCatalogResponse {
                 models: vec![catalog_entry("codex", "a"), catalog_entry("codex", "b"),],
-                ..page
+                ..page.clone()
             })
+            .unwrap_err()
+            .code,
+            "invalid"
+        );
+        // A failed harness read travels typed and bounded; one per harness.
+        let busy = Error::new("busy", format!("metadata_readers\n{}", "x".repeat(600)))
+            .with_origin(
+                crate::FailureOrigin::Swarm,
+                "discovery readers at their bound",
+            );
+        let failure = ModelsCatalogFailure::from_error("codex", &busy);
+        assert_eq!(failure.code, "busy");
+        assert_eq!(failure.origin, crate::FailureOrigin::Swarm);
+        assert!(failure.message.len() <= MAX_CATALOG_FAILURE_MESSAGE_BYTES);
+        assert!(!failure.message.contains('\n'));
+        let partial = ModelsCatalogResponse {
+            failures: vec![failure.clone()],
+            ..page.clone()
+        };
+        partial.validate().unwrap();
+        let encoded = serde_json::to_value(&partial).unwrap();
+        assert_eq!(encoded["failures"][0]["origin"], "swarm");
+        assert!(
+            serde_json::to_value(&page)
+                .unwrap()
+                .get("failures")
+                .is_none()
+        );
+        assert_eq!(
+            ModelsCatalogResponse {
+                failures: vec![failure.clone(), failure],
+                ..page
+            }
+            .validate()
             .unwrap_err()
             .code,
             "invalid"

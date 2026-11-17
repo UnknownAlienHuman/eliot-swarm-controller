@@ -306,7 +306,7 @@ pub(super) struct SettingsState {
     /// Default access as edited (None: as saved).
     access_draft: Option<Access>,
     /// Quota per harness, as read.
-    quotas: BTreeMap<String, Fallible<HarnessQuotaResponse>>,
+    pub(super) quotas: BTreeMap<String, Fallible<HarnessQuotaResponse>>,
     quotas_loading: usize,
 }
 
@@ -730,7 +730,7 @@ impl DesktopApp {
 
     /// Read the quota of every installed harness (one worker each) and the
     /// catalogue's harness list when it is not read yet.
-    fn load_quotas(&mut self, context: &ComponentContext<Self>) {
+    pub(super) fn load_quotas(&mut self, context: &ComponentContext<Self>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
@@ -1338,41 +1338,37 @@ impl DesktopApp {
                 )],
                 Some(Err(error)) => vec![KeyedView::new(
                     "error",
-                    m3::setting_row("Quota", &format!("Not read: {error}"), View::empty()),
+                    m3::setting_row(
+                        &format!("{label}: quota not read"),
+                        &crate::state::plain_error(error),
+                        View::empty(),
+                    ),
                 )],
                 Some(Ok(reply)) => {
                     let windows = crate::quota::windows(reply);
                     if windows.is_empty() {
-                        let why = reply
-                            .note
-                            .clone()
-                            .unwrap_or_else(|| "the harness reports no quota".to_owned());
                         vec![KeyedView::new(
-                            "unsupported",
+                            "status",
                             m3::setting_row(
-                                "Quota",
-                                &format!("Not supported: {why}."),
+                                &crate::quota::status_line(label, reply),
+                                "",
                                 View::empty(),
                             ),
                         )]
                     } else {
+                        let now = crate::handoff::now_ms();
+                        let observed = crate::quota::observed_note(reply);
                         windows
                             .iter()
-                            .map(|window| {
+                            .enumerate()
+                            .map(|(index, window)| {
+                                let mut line = window.line(now);
+                                if let Some(observed) = &observed {
+                                    line = format!("{line} · {observed}");
+                                }
                                 KeyedView::new(
-                                    format!("{}:{}", window.label, window.remaining),
-                                    m3::setting_row(
-                                        &format!("{} remaining", window.label),
-                                        &window.reset_note(crate::handoff::now_ms()),
-                                        StackPanel::new()
-                                            .orientation(Orientation::Horizontal)
-                                            .spacing(tokens::spacing::SM)
-                                            .children((
-                                                m3::body(format!("{}%", window.remaining))
-                                                    .vertical_alignment(VerticalAlignment::Center),
-                                                m3::ring(window.remaining as f64),
-                                            )),
-                                    ),
+                                    format!("{index}:{line}"),
+                                    m3::setting_row(&line, "", m3::ring(window.remaining as f64)),
                                 )
                             })
                             .collect()

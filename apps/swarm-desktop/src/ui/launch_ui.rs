@@ -31,12 +31,17 @@ use eliot_core::api::ModelsCatalogResponse;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Pop {
     Model,
+    /// The picker's Manage models panel (OpenCode's).
+    Manage,
     Access,
     Project,
 }
 
 /// The project popover's row that shows the folder field.
 pub(super) const OTHER_FOLDER: &str = "other-folder";
+/// The project popover's "No project (chat)" row: a chat launch (`chat:
+/// true`, no workspace; the daemon makes its private chat directory).
+pub(super) const CHAT_PROJECT: &str = "no-project-chat";
 /// Focus attempts for a popover's search field, and the wait between them.
 const FIELD_FOCUS_TRIES: u8 = 5;
 const FIELD_FOCUS_RETRY_MS: u64 = 50;
@@ -53,6 +58,8 @@ pub(super) enum LaunchMsg {
     PreviewLoaded(Box<Fallible<eliot_core::RoutingDecision>>),
     /// `models.catalog`, every page.
     CatalogLoaded(Box<Fallible<ModelsCatalogResponse>>),
+    /// A failed harness's Retry: read the catalogue again.
+    CatalogRetry,
     /// Open a popover, or close it when it is the one open.
     Toggle(Pop),
     /// Close the open popover (a click outside it, Esc).
@@ -74,6 +81,25 @@ pub(super) enum LaunchMsg {
     ProjectQuery(String),
     /// A project row (its checkout) or [`OTHER_FOLDER`].
     ProjectChosen(String),
+    /// The picker's sliders button: open Manage models.
+    ManageOpened,
+    /// Manage models' back arrow: the picker again.
+    ManageClosed,
+    /// Manage models' search field.
+    ManageQuery(String),
+    /// One model's toggle in Manage models.
+    ManageModel {
+        harness: String,
+        provider: String,
+        model: String,
+        visible: bool,
+    },
+    /// A provider group's toggle in Manage models (its key, shown).
+    ManageGroup(String, bool),
+    /// Collapse or expand a picker or Manage models group (its key).
+    GroupToggled(String),
+    /// A preset's Model field: open the picker for that preset and harness.
+    PresetPicker(String, String),
     /// A popover key from the keyboard hook.
     Key(PopoverKey),
     /// After the render that bound the highlighted row: bring it into view.
@@ -92,6 +118,16 @@ pub(super) struct LaunchState {
     pub(super) custom_workspace: bool,
     pub(super) launch_text: String,
     pub(super) launch_rev: u64,
+    /// "No project (chat)": the next task launches as a chat.
+    pub(super) chat: bool,
+    /// The start being submitted: its text and what it says while the
+    /// Agent starts (shown at once, until the conversation opens).
+    pub(super) starting: Option<(String, String)>,
+    /// The picker chooses for this preset (`name`, `harness`) instead of
+    /// the composer: Settings › Models & presets' Model field.
+    pub(super) preset: Option<(String, String)>,
+    /// Manage models' search.
+    pub(super) manage_query: String,
     /// Daemon `profile.list` summaries (the presets).
     pub(super) profile_summaries: Vec<ProfileSummary>,
     pub(super) profile_list: Option<ProfileListResponse>,
@@ -125,6 +161,11 @@ pub(super) struct LaunchState {
 }
 
 impl LaunchState {
+    /// The preset the open picker chooses for, if any.
+    pub(super) fn preset_target(&self) -> Option<&(String, String)> {
+        self.preset.as_ref()
+    }
+
     /// Presets a new task may use: the daemon's summaries, narrowed to the
     /// project's allowlist when it has one.
     pub(super) fn allowed(&self) -> Vec<&ProfileSummary> {
@@ -193,39 +234,68 @@ impl DesktopApp {
     pub(super) fn picker_rows(&self) -> Vec<Row> {
         let presets = self.launch.allowed();
         let auto_detail = self.launch.auto_detail();
+        let preset_current = self.preset_choice();
         picker::rows(&picker::Inputs {
             catalog: self.launch.catalog.as_ref(),
             query: &self.launch.query,
-            favorites: &self.prefs.favorites,
-            recents: &self.prefs.recents,
+            prefs: &self.prefs,
+            only_harness: self
+                .launch
+                .preset_target()
+                .map(|(_, harness)| harness.as_str()),
             presets: &presets,
-            current: &self.launch.choice,
+            current: preset_current.as_ref().unwrap_or(&self.launch.choice),
             auto_detail: &auto_detail,
             efforts: &self.launch.efforts,
             claude_efforts: eliot_daemon::CLAUDE_EFFORT_LEVELS,
         })
     }
 
-    /// The project popover's rows: `(checkout, name, path)`, filtered.
+    /// The preset picker's current choice: the preset's model and effort.
+    fn preset_choice(&self) -> Option<Choice> {
+        let (name, harness) = self.launch.preset_target()?;
+        let field = |key: &str| match profiles::field(&self.editor.draft, name, key) {
+            profiles::Field::Simple(value) => Some(value),
+            _ => None,
+        };
+        Some(Choice::Model(Pick {
+            harness: harness.clone(),
+            model: field("model"),
+            effort: field("effort"),
+        }))
+    }
+
+    /// The project popover's rows: `(checkout, name, path)`, filtered;
+    /// "No project (chat)" first.
     pub(super) fn project_rows(&self) -> Vec<(String, String, String)> {
         let query = self.launch.project_query.trim().to_lowercase();
-        let mut rows: Vec<(String, String, String)> = self
-            .nav
-            .projects
-            .iter()
-            .filter(|project| {
-                query.is_empty()
-                    || project.name.to_lowercase().contains(&query)
-                    || project.workspace.to_lowercase().contains(&query)
-            })
-            .map(|project| {
-                (
-                    project.workspace.clone(),
-                    project.name.clone(),
-                    nav::display_path(&project.workspace).to_owned(),
-                )
-            })
-            .collect();
+        let chat = "no project (chat)";
+        let mut rows: Vec<(String, String, String)> = Vec::new();
+        if query.is_empty() || chat.contains(&query) {
+            rows.push((
+                CHAT_PROJECT.to_owned(),
+                "No project (chat)".to_owned(),
+                "A chat in its own private folder".to_owned(),
+            ));
+        }
+        rows.extend(
+            self.nav
+                .projects
+                .iter()
+                .map(|project| (project, self.project_label(project)))
+                .filter(|(project, label)| {
+                    query.is_empty()
+                        || label.to_lowercase().contains(&query)
+                        || project.workspace.to_lowercase().contains(&query)
+                })
+                .map(|(project, label)| {
+                    (
+                        project.workspace.clone(),
+                        label,
+                        nav::display_path(&project.workspace).to_owned(),
+                    )
+                }),
+        );
         rows.push((
             OTHER_FOLDER.to_owned(),
             "Other folder…".to_owned(),
@@ -239,9 +309,17 @@ impl DesktopApp {
             LaunchMsg::WorkspaceChanged(text) => self.launch.workspace = text,
             LaunchMsg::CatalogLoaded(reply) => {
                 self.launch.catalog_loading = false;
-                self.launch.catalog = Some(*reply);
+                // Stale while revalidating: a failed refresh keeps the last
+                // catalogue it read and says why.
+                match (*reply, self.launch.catalog.as_ref()) {
+                    (Err(error), Some(Ok(_))) => {
+                        self.set_status(format!("Models not refreshed: {error}"));
+                    }
+                    (reply, _) => self.launch.catalog = Some(reply),
+                }
                 self.keep_highlight();
             }
+            LaunchMsg::CatalogRetry => self.load_catalog(context),
             LaunchMsg::Toggle(pop) => {
                 if self.launch.open == Some(pop) {
                     self.close_popover();
@@ -285,13 +363,90 @@ impl DesktopApp {
             }
             LaunchMsg::ProjectChosen(checkout) => {
                 self.close_popover();
-                if checkout == OTHER_FOLDER {
+                self.launch.chat = checkout == CHAT_PROJECT;
+                if self.launch.chat {
+                    self.launch.custom_workspace = false;
+                    self.launch.profiles.clear();
+                    self.nav.selection.project = None;
+                } else if checkout == OTHER_FOLDER {
                     self.launch.custom_workspace = true;
                     self.launch.workspace.clear();
                     self.launch.profiles.clear();
                     self.nav.selection.project = None;
                 } else {
                     self.pick_project(&checkout);
+                }
+            }
+            LaunchMsg::ManageOpened => {
+                self.launch.open = Some(Pop::Manage);
+                self.launch.manage_query.clear();
+                crate::shortcuts::set_popover(HookPopover::Menu);
+                self.load_catalog(context);
+                self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
+            }
+            LaunchMsg::ManageClosed => {
+                self.launch.open = Some(Pop::Model);
+                self.launch.highlight = picker::initial(&self.picker_rows());
+                crate::shortcuts::set_popover(HookPopover::Picker);
+                self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
+            }
+            LaunchMsg::ManageQuery(text) => self.launch.manage_query = text,
+            LaunchMsg::ManageModel {
+                harness,
+                provider,
+                model,
+                visible,
+            } => {
+                if self.prefs.model_visible(&harness, &provider, &model) != visible {
+                    self.prefs
+                        .set_model_visible(&harness, &provider, &model, visible);
+                    self.prefs_rev += 1;
+                    self.save_preferences(context);
+                }
+            }
+            LaunchMsg::ManageGroup(key, visible) => {
+                let Some(Ok(reply)) = self.launch.catalog.as_ref() else {
+                    return;
+                };
+                let Some((harness, provider)) = key.split_once('/') else {
+                    return;
+                };
+                let models: Vec<String> = reply
+                    .models
+                    .iter()
+                    .filter(|model| model.harness == harness && model.provider == provider)
+                    .map(|model| model.id.clone())
+                    .collect();
+                let ids: Vec<&str> = models.iter().map(String::as_str).collect();
+                let already = self.prefs.group_visible(harness, provider)
+                    && ids
+                        .iter()
+                        .all(|id| self.prefs.model_visible(harness, provider, id) == visible);
+                if visible && already {
+                    return;
+                }
+                let (harness, provider) = (harness.to_owned(), provider.to_owned());
+                self.prefs
+                    .set_group_visible(&harness, &provider, &ids, visible);
+                self.prefs_rev += 1;
+                self.save_preferences(context);
+            }
+            LaunchMsg::GroupToggled(key) => {
+                self.prefs.toggle_group(&key);
+                self.prefs_rev += 1;
+                self.save_preferences(context);
+                self.keep_highlight();
+                // The keyboard stays in the search field, so typing filters.
+                self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
+            }
+            LaunchMsg::PresetPicker(name, harness) => {
+                let same = self.launch.preset.as_ref() == Some(&(name.clone(), harness.clone()));
+                if same && self.launch.open == Some(Pop::Model) {
+                    self.close_popover();
+                } else {
+                    self.close_popover();
+                    self.launch.preset = Some((name, harness));
+                    self.open_popover(Pop::Model, context);
                 }
             }
             LaunchMsg::Key(key) => self.popover_key(key, context),
@@ -354,22 +509,28 @@ impl DesktopApp {
     }
 
     fn open_popover(&mut self, pop: Pop, context: &ComponentContext<Self>) {
-        // The composer for a new task only.
-        if self.selected_agent_id().is_some() || self.main != Main::Conversation {
+        // The composer for a new task, or a preset's Model field in Settings.
+        let preset = self.launch.preset.is_some() && self.main == Main::Settings;
+        if !preset && (self.selected_agent_id().is_some() || self.main != Main::Conversation) {
             return;
+        }
+        if !preset {
+            self.launch.preset = None;
         }
         self.launch.open = Some(pop);
         match pop {
             Pop::Model => {
                 self.launch.query.clear();
                 self.launch.highlight = picker::initial(&self.picker_rows());
-                if self.launch.catalog.is_none() || matches!(self.launch.catalog, Some(Err(_))) {
-                    self.load_catalog(context);
-                }
+                // Every open revalidates (the daemon serves a complete
+                // catalogue from its cache and reads a failed harness again);
+                // the rows show the last read meanwhile.
+                self.load_catalog(context);
                 crate::shortcuts::set_popover(HookPopover::Picker);
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
                 self.reveal(context);
             }
+            Pop::Manage => self.launch_update(LaunchMsg::ManageOpened, context),
             Pop::Access => {
                 self.launch.access_highlight = Some(self.launch.access());
                 crate::shortcuts::set_popover(HookPopover::Menu);
@@ -390,14 +551,25 @@ impl DesktopApp {
     pub(super) fn close_popover(&mut self) {
         if self.launch.open.take().is_some() {
             crate::shortcuts::set_popover(HookPopover::None);
-            // Keyboard focus goes back to the composer (no-op while unbound).
-            let _ = self.chat.composer_ref.request_focus();
+            if self.launch.preset.take().is_none() {
+                // Keyboard focus goes back to the composer (no-op while unbound).
+                let _ = self.chat.composer_ref.request_focus();
+            }
         }
     }
 
     /// A choice from the picker: it sets the launch's harness, model and
     /// effort (or Auto, or a preset) and closes the picker.
     fn choose(&mut self, choice: Choice, context: &ComponentContext<Self>) {
+        if let Some((name, _)) = self.launch.preset.clone() {
+            // A preset's Model field: the model (and an effort chosen on the
+            // row) go into the preset's draft; Save writes config.toml.
+            if let Choice::Model(pick) = choice {
+                self.set_preset_model(&name, pick.model.as_deref(), pick.effort.as_deref());
+            }
+            self.close_popover();
+            return;
+        }
         self.nav.selection.profile = match &choice {
             Choice::Preset(name) => Some(name.clone()),
             _ => None,
@@ -453,10 +625,15 @@ impl DesktopApp {
             return;
         };
         if key == PopoverKey::Escape {
-            self.close_popover();
+            if pop == Pop::Manage {
+                self.launch_update(LaunchMsg::ManageClosed, context);
+            } else {
+                self.close_popover();
+            }
             return;
         }
         match pop {
+            Pop::Manage => {}
             Pop::Model => {
                 let rows = self.picker_rows();
                 let highlight = self.launch.highlight.clone();
@@ -577,7 +754,10 @@ impl DesktopApp {
     /// Focus the open popover's search field; a refused or unbound focus
     /// is tried again, `tries` times in all.
     fn focus_field(&mut self, tries: u8, context: &ComponentContext<Self>) {
-        if !matches!(self.launch.open, Some(Pop::Model | Pop::Project)) {
+        if !matches!(
+            self.launch.open,
+            Some(Pop::Model | Pop::Manage | Pop::Project)
+        ) {
             return;
         }
         let Some(left) = tries.checked_sub(1) else {
@@ -630,20 +810,27 @@ impl DesktopApp {
             self.alert("Describe the task first.");
             return;
         }
-        if self.launch.workspace.trim().is_empty() {
-            self.alert("Choose a project or a folder for the task.");
+        if !self.launch.chat && self.launch.workspace.trim().is_empty() {
+            self.alert("Choose a project, a folder, or No project (chat).");
             return;
         }
         self.close_popover();
-        let key = format!(
-            "launch:{target:?}:{}:{}",
-            self.launch.workspace, self.launch.launch_rev
-        );
+        let place = if self.launch.chat {
+            client::LaunchPlace::Chat
+        } else {
+            client::LaunchPlace::Workspace(self.launch.workspace.clone())
+        };
+        let key = format!("launch:{target:?}:{place:?}:{}", self.launch.launch_rev);
         let mutation_id = self.ledger.id_for(&key);
         self.in_flight_key = Some(key);
-        let workspace = self.launch.workspace.clone();
         let launch_rev = self.launch.launch_rev;
         self.alert = None;
+        // Shown at once: the message and what happens now, until the
+        // conversation opens (no empty pause after Send).
+        self.launch.starting = Some((text.clone(), self.starting_label()));
+        // The composer empties at once; the revision stays, so a retry of
+        // an unconfirmed start reuses its mutation id.
+        self.launch.launch_text.clear();
         self.set_status(format!("Launching ({mutation_id})…"));
         let _task = context.spawn_background(move |_| {
             Message::Launch(LaunchMsg::LaunchSubmitted(client::block_on(async {
@@ -651,7 +838,7 @@ impl DesktopApp {
                     &data_dir,
                     mutation_id,
                     target,
-                    &workspace,
+                    &place,
                     Some(text.clone()),
                 )
                 .await
@@ -685,8 +872,10 @@ impl DesktopApp {
                 .err()
                 .is_none_or(|error| !crate::state::uncertain(error)),
         );
+        let starting = self.launch.starting.take();
         match outcome {
             Ok(outcome) => {
+                let label = starting.map(|(_, label)| label);
                 // The first prompt rode the launch admission; it is never
                 // sent again. Clear only the submitted draft.
                 if self.launch.launch_rev == outcome.launch_rev {
@@ -696,6 +885,7 @@ impl DesktopApp {
                     self.chat.pending_local =
                         Some((outcome.agent.clone(), linked, outcome.text.clone()));
                 }
+                self.chat.waiting_label = label;
                 self.set_status(format!(
                     "Launched {} ({}); its first input is {}.",
                     outcome.agent,
@@ -717,12 +907,18 @@ impl DesktopApp {
                     generation: outcome.generation,
                     harness: self.launch.choice.harness().unwrap_or_default().to_owned(),
                     state: "created".to_owned(),
-                    project: self.launch.workspace.clone(),
+                    project: if self.launch.chat {
+                        String::new()
+                    } else {
+                        self.launch.workspace.clone()
+                    },
                     parent: None,
                     updated_at: crate::handoff::now_ms(),
                     title: nav::title(&outcome.text).unwrap_or_else(|| outcome.agent.clone()),
                     native_child: false,
                     tokens: None,
+                    chat: self.launch.chat,
+                    archived: false,
                 });
                 self.nav.selection.select_agent(Some(outcome.agent));
                 self.load_agents(context, None);
@@ -730,12 +926,67 @@ impl DesktopApp {
                 self.load_routing_preview(context);
             }
             Err(error) if crate::state::uncertain(&error) => {
+                self.restore_launch_text(starting);
                 self.alert(format!(
                     "Start not confirmed (sending again reuses its id): {error}"
                 ));
             }
-            Err(error) => self.alert(format!("Start refused: {error}")),
+            Err(error) => {
+                self.restore_launch_text(starting);
+                self.alert(format!("Start refused: {error}"));
+            }
         }
+    }
+
+    /// A start that did not go through gives its text back to the composer
+    /// (with the same draft revision, so a retry reuses the mutation id),
+    /// unless the owner already typed something new.
+    fn restore_launch_text(&mut self, starting: Option<(String, String)>) {
+        if let Some((text, _)) = starting
+            && self.launch.launch_text.is_empty()
+        {
+            self.launch.launch_text = text;
+        }
+    }
+
+    /// What the conversation says while a new task starts: "Starting
+    /// Codex…", or Swarm's pick for Auto and presets.
+    pub(super) fn starting_label(&self) -> String {
+        let harness = match &self.launch.choice {
+            Choice::Model(pick) => Some(pick.harness.clone()),
+            _ => self.launch.profile().map(|profile| profile.harness.clone()),
+        };
+        match harness {
+            Some(harness) => format!("Starting {}…", picker::harness_label(&harness)),
+            None => "Starting…".to_owned(),
+        }
+    }
+
+    /// Write the preset's model (and an effort chosen in the picker) into
+    /// the profiles draft.
+    fn set_preset_model(&mut self, name: &str, model: Option<&str>, effort: Option<&str>) {
+        let mut draft = self.editor.draft.clone();
+        for (key, value) in [("model", model), ("effort", effort)] {
+            let current = match profiles::field(&draft, name, key) {
+                profiles::Field::Simple(value) => Some(value),
+                _ => None,
+            };
+            if key == "effort" && value.is_none() {
+                continue;
+            }
+            if current.as_deref() == value {
+                continue;
+            }
+            match profiles::set_field(&draft, name, key, value) {
+                Ok(next) => draft = next,
+                Err(error) => {
+                    self.editor.status = error;
+                    return;
+                }
+            }
+        }
+        self.editor.view = draft.clone();
+        self.editor.draft = draft;
     }
 
     /// Ask routing what it would pick for a new task now.

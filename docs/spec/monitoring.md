@@ -711,6 +711,6 @@ Three advisory event families name what matters without new native control:
 
 Readbacks: `observe.heavy` (windowed rollup, also `swarm heavy`), `harness.doctor`
 (per-harness installed vs verified, also `swarm doctor`), `heavy`/`session_growth` on
-`agent.stats`, the `OBS` column of `swarm top`, and the Observe section of the
-desktop Details panel. Readbacks degrade to `None`/quiet text rather than failing
-the view.
+`agent.stats`, the `OBS` column of `swarm top`, and the Heavy work section of the
+desktop Details panel (shown only when an episode or growth signal was recorded).
+Readbacks degrade to `None`/quiet text rather than failing the view.

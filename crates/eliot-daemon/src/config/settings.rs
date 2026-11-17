@@ -100,15 +100,7 @@ fn section_json(source: &str, name: &str) -> core::Result<JsonValue> {
     let Some(value) = parsed.get(name) else {
         return Ok(match name {
             "routing" => serde_json::json!({"default": []}),
-            "desktop" => serde_json::json!({
-                "theme": "system",
-                "window": null,
-                "startup": "new_task",
-                "favorite_models": [],
-                "recent_models": [],
-                "collapsed_projects": [],
-                "last_access": null,
-            }),
+            "desktop" => desktop_default(),
             _ => empty_object(),
         });
     };
@@ -118,22 +110,33 @@ fn section_json(source: &str, name: &str) -> core::Result<JsonValue> {
         let object = value.as_object_mut().ok_or_else(|| {
             core::Error::new("source_integrity", "desktop settings are not an object")
         })?;
-        object.entry("window").or_insert(JsonValue::Null);
-        object
-            .entry("startup")
-            .or_insert(serde_json::json!("new_task"));
-        object
-            .entry("favorite_models")
-            .or_insert(JsonValue::Array(Vec::new()));
-        object
-            .entry("recent_models")
-            .or_insert(JsonValue::Array(Vec::new()));
-        object
-            .entry("collapsed_projects")
-            .or_insert(JsonValue::Array(Vec::new()));
-        object.entry("last_access").or_insert(JsonValue::Null);
+        // Every field reads with its default, except `theme`, which an
+        // older file may omit and the reader keeps verbatim.
+        if let JsonValue::Object(defaults) = desktop_default() {
+            for (key, default) in defaults {
+                if key != "theme" {
+                    object.entry(key).or_insert(default);
+                }
+            }
+        }
     }
     Ok(value)
+}
+
+/// The `[desktop]` section a file without one reads as.
+fn desktop_default() -> JsonValue {
+    serde_json::json!({
+        "theme": "system",
+        "window": null,
+        "startup": "new_task",
+        "favorite_models": [],
+        "recent_models": [],
+        "collapsed_projects": [],
+        "last_access": null,
+        "model_visibility": [],
+        "collapsed_model_groups": [],
+        "display_names": [],
+    })
 }
 
 /// One-time daemon-startup settlement of crash-left pending settings history
@@ -520,16 +523,7 @@ fn is_default_section(section: SettingsSection, value: &JsonValue) -> bool {
     match section {
         SettingsSection::Routing => value == &serde_json::json!({"default": []}),
         SettingsSection::Desktop => {
-            value
-                == &serde_json::json!({
-                    "theme": "system",
-                    "window": null,
-                    "startup": "new_task",
-                    "favorite_models": [],
-                    "recent_models": [],
-                    "collapsed_projects": [],
-                    "last_access": null,
-                })
+            value == &desktop_default()
                 || value == &serde_json::json!({"theme": "system", "window": null})
         }
         _ => false,

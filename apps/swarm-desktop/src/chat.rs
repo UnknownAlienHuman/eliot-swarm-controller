@@ -310,59 +310,33 @@ impl Coverage {
     }
 
     /// Human-readable coverage lines; every limit is named, none is hidden.
-    pub fn lines(&self, inputs_missing: usize) -> Vec<String> {
-        let mut lines = Vec::new();
-        let turns = if self.turns_complete() {
-            format!(
-                "Turns: all {} retained turns of generation {}",
-                self.result_returned, self.generation
-            )
-        } else {
-            format!(
-                "Turns: newest {} of generation {}; older turns exist",
-                self.result_returned, self.generation
-            )
-        };
-        lines.push(if self.generation > 1 {
-            format!("{turns}; earlier generations are not shown")
-        } else {
-            turns
-        });
-        let activity = if self.reached_creation {
-            format!(
-                "Activity: complete from creation through event {}",
-                self.cursor
-            )
-        } else if self.activity_pruned() {
-            format!(
-                "Activity: events {}–{}; earlier activity was pruned by retention (floor {})",
-                self.window_from + 1,
-                self.cursor,
-                self.pruned_through
-            )
-        } else {
-            format!(
-                "Activity: events {}–{}; older activity not loaded",
-                self.window_from + 1,
-                self.cursor
-            )
-        };
-        lines.push(activity);
+    /// Only what is unusual about the loaded window, in words: older turns
+    /// or activity not loaded, retention pruning, unreadable inputs,
+    /// evicted turns, a reread in progress. Empty when everything is here.
+    pub fn notes(&self, inputs_missing: usize) -> Vec<String> {
+        let mut notes = Vec::new();
+        if !self.turns_complete() {
+            notes.push("Older turns exist; Load older messages shows them.".to_owned());
+        }
+        if self.generation > 1 {
+            notes.push("Earlier generations are not shown.".to_owned());
+        }
+        if self.activity_pruned() {
+            notes.push("Older activity was removed by retention.".to_owned());
+        }
         if inputs_missing > 0 {
-            lines.push(format!(
-                "{inputs_missing} turn input(s) not linked or unreadable in the loaded window"
-            ));
+            notes.push(format!("{inputs_missing} message(s) could not be read."));
         }
         if self.evicted_turns > 0 {
-            lines.push(format!(
-                "{} older turn(s) evicted from memory by the resident bound",
+            notes.push(format!(
+                "{} older turn(s) left memory to keep the window light.",
                 self.evicted_turns
             ));
         }
-        if let Some(stale) = &self.stale {
-            lines.push(format!("Stale: {stale}; rereading"));
+        if self.stale.is_some() {
+            notes.push("Catching up with new activity.".to_owned());
         }
-        lines
+        notes
     }
 }
 
@@ -453,6 +427,9 @@ pub struct Conversation {
     turns: HashMap<String, TurnEntry>,
     inputs: HashMap<String, InputText>,
     local: Vec<String>,
+    /// What each local input waits for ("Sending…", "Starting Codex…"),
+    /// shown under it until its turn starts.
+    local_notes: HashMap<String, String>,
     applied_seq: i64,
     coverage: Coverage,
     /// Turns evicted by the resident bounds; late events never resurrect them.
@@ -499,10 +476,12 @@ impl Conversation {
     pub fn reset(&mut self, coverage: Coverage, turns: &[Turn], events: &[Event]) -> Invalidation {
         let local = std::mem::take(&mut self.local);
         let inputs = std::mem::take(&mut self.inputs);
+        let notes = std::mem::take(&mut self.local_notes);
         *self = Self::new(&self.agent);
         self.coverage = coverage;
         self.inputs = inputs;
         self.local = local;
+        self.local_notes = notes;
         let cursor = self.coverage.cursor;
         let mut invalidation = self.apply_events(events);
         self.coverage.cursor = cursor.max(self.applied_seq);
@@ -688,6 +667,25 @@ impl Conversation {
         }
     }
 
+    /// What a local input waits for, shown under it until its turn starts.
+    pub fn set_local_note(&mut self, command: &str, note: Option<String>) {
+        match note {
+            Some(note) => {
+                self.local_notes.insert(command.to_owned(), note);
+            }
+            None => {
+                self.local_notes.remove(command);
+            }
+        }
+    }
+
+    /// Drop a local input that was never admitted (a definite refusal).
+    pub fn forget_local(&mut self, command: &str) {
+        self.local.retain(|known| known != command);
+        self.local_notes.remove(command);
+        self.inputs.remove(command);
+    }
+
     /// Commands linked to resident turns whose input text is not loaded.
     pub fn missing_inputs(&self) -> Vec<String> {
         let mut missing: Vec<String> = self
@@ -746,17 +744,29 @@ impl Conversation {
                 Some(InputText::Loaded(text)) => text.clone(),
                 _ => String::new(),
             };
-            let part = Part::new(
+            let mut parts = vec![Part::new(
                 format!("in:{command}"),
                 PartKind::Input,
-                "You · submitted, waiting for its turn".to_owned(),
+                "You".to_owned(),
                 text,
                 Vec::new(),
-            );
+            )];
+            if let Some(note) = self.local_notes.get(command) {
+                parts.push(Part::new(
+                    format!("wait:{command}"),
+                    PartKind::Working,
+                    note.clone(),
+                    note.clone(),
+                    Vec::new(),
+                ));
+            }
+            let revision = parts
+                .iter()
+                .fold(text_hash(command), |hash, part| mix(hash, part.revision));
             items.push(TurnItem {
                 key: format!("local:{command}"),
-                revision: part.revision,
-                parts: vec![part],
+                revision,
+                parts,
             });
         }
         items
@@ -786,7 +796,7 @@ impl Conversation {
                 format!("in:turn:{}", turn.turn_id),
                 PartKind::Notice,
                 "Input".to_owned(),
-                "Input not linked: the turn started outside the loaded activity window.".to_owned(),
+                "The message that started this turn is not in the loaded history.".to_owned(),
                 Vec::new(),
             )),
         }
@@ -1136,9 +1146,7 @@ mod tests {
         chat.apply_turns(&[turn("t1", TurnState::Completed, Some("ok"))]);
         assert_eq!(chat.coverage().generation, 1);
         assert_eq!(chat.coverage().result_returned, 1);
-        assert!(
-            chat.coverage().lines(0)[0].starts_with("Turns: all 1 retained turns of generation 1")
-        );
+        assert!(chat.coverage().notes(0).is_empty(), "everything is loaded");
     }
 
     #[test]
@@ -1150,6 +1158,19 @@ mod tests {
             event(9, "turn.completed", json!({"turn_id": "t1"})),
         ]);
         assert!(invalidation.turns && invalidation.detail);
+    }
+
+    #[test]
+    fn a_local_input_keeps_what_it_waits_for_across_a_snapshot() {
+        let mut chat = Conversation::new("a1");
+        chat.note_local_input("c9", "hello");
+        chat.set_local_note("c9", Some("Starting Codex…".to_owned()));
+        chat.reset(coverage(), &[], &[]);
+        let item = &chat.items()[0];
+        assert_eq!(item.parts.len(), 2);
+        assert_eq!(item.parts[1].label, "Starting Codex…");
+        chat.forget_local("c9");
+        assert!(chat.items().is_empty());
     }
 
     #[test]
@@ -1194,10 +1215,20 @@ mod tests {
         coverage.pruned_through = 50;
         coverage.cursor = 90;
         assert!(coverage.activity_pruned());
-        assert!(coverage.lines(0)[1].contains("pruned by retention"));
+        assert!(
+            coverage
+                .notes(0)
+                .iter()
+                .any(|note| note.contains("removed by retention"))
+        );
         coverage.pruned_through = 10;
         assert!(coverage.activity_more());
-        assert!(coverage.lines(0)[1].contains("older activity not loaded"));
+        assert!(
+            !coverage
+                .notes(0)
+                .iter()
+                .any(|note| note.contains("retention"))
+        );
         coverage.result_returned = TURN_PAGE;
         assert!(!coverage.turns_complete());
         assert!(coverage.can_load_older());

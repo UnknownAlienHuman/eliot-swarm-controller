@@ -51,8 +51,10 @@ The host keeps four interactive metadata-reader slots and an independent 32-slot
 launch-preparation lane. A launch's `profile.store` waits fairly for its own slot
 before opening a reader, rather than refusing a transient full pool.
 Only confirmed reader custody cleanup releases its slot; unknown cleanup retains it.
-Shutdown closes slot admission and wakes waiting launches. Explicit discovery/catalogue
-reads may refuse `busy`, with a message naming `metadata_readers` and its limit.
+Shutdown closes slot admission and wakes waiting launches. Catalogue (`model.list`) and
+quota reads wait up to 8 s for an interactive slot (a desktop asks every harness at once
+when it connects); after that wait, and for other explicit discovery reads at once, they
+refuse `busy` with a message naming `metadata_readers` and its limit.
 
 Maximum encoded frame is 1 MiB including the NDJSON newline. Inline input is at most
 512 KiB; persisted event data/final text 64 KiB; pages at most 1,000 entries and below

@@ -931,7 +931,15 @@ fn admit_launch_tx(
                 "private chat launch is owner-only without a parent or worktree",
             ));
         }
-        let path = std::path::Path::new(&workspace).join(format_agent_id(agent_num));
+        // Agent ids restart at a1 in every data dir while chats_root is a
+        // per-user default shared by every daemon, so the Agent id alone
+        // collides. The admitting command id is unique and replays to the
+        // same path for the same command.
+        let path = std::path::Path::new(&workspace).join(format!(
+            "{}-{}",
+            format_agent_id(agent_num),
+            request.id.to_ascii_lowercase()
+        ));
         db!(tx.execute(
             "UPDATE agents SET chat=1,workspace=?1 WHERE id=?2",
             params![path.to_string_lossy(), agent_num]

@@ -427,9 +427,10 @@ of the explicitly selected release scope.
       stable keys and bounded resident turns and bytes. Live events follow a
       committed `events.bounds` cursor: a limit-1 wake with an explicit `wait_ms`,
       then drains from `next`. A lag or `history_gap` marks the view stale and
-      rereads it; transport failures back off and resnapshot. Jump to latest is
-      explicit. Reactor 0.100.0 has no scroll offset API, so the view does not
-      auto-follow the bottom. (Refs #407)
+      rereads it; transport failures back off and resnapshot. Reactor 0.100.0
+      has no scroll offset or `ViewChanged`, so the view neither auto-follows the
+      bottom nor shows a "N new" jump button it could not hide at the bottom;
+      opening a conversation brings its latest turn into view. (Refs #407)
 - [x] **D3 Swarm monitor.** An openable monitor panel uses one demand-driven
       refresh chain, active only while open. Each refresh reads `agent.list` per
       attention state with observations (with `total` as the exact counter), then
@@ -501,8 +502,9 @@ of the explicitly selected release scope.
       dot, details toggle, a "…" menu for Hand off/Switch, Change manager,
       Resume, Detach, Stop and Force stop); coverage, ids and readback live in
       the details panel. The composer of a conversation carries its project,
-      the model-and-effort and access chips, Send, and Interrupt/Steer only
-      while a turn runs; a new task's composer is D9. Settings replaces the
+      the model-and-effort and access chips, Send (which steers the running
+      turn, D10), and Interrupt only while a turn runs; a new task's composer
+      is D9. Settings replaces the
       sidebar with its own navigation and shows one centred page of at most
       840 DIPs (D9). One component system at Codex density with Material 3
       color roles (owner reviews 2026-11-15 and 2026-11-16), every size from
@@ -567,6 +569,53 @@ of the explicitly selected release scope.
       under the data directory by project with Open; cleanup waits for
       `cleanup.plan` / `cleanup.apply`. Shortcuts: Ctrl+N, Ctrl+K, Ctrl+M,
       Ctrl+,. (Refs #407)
+- [x] **D10 The owner's second pass (2026-11-16).** Picker groups (each
+      harness, and each OpenCode provider) collapse, remembered in `[desktop]
+      collapsed_model_groups`; OpenCode's Manage models (the sliders button at
+      the end of the search row) toggles provider groups and single models into
+      `[desktop] model_visibility` with toggle switches, the picker lists only
+      shown models and a search still finds a hidden one, marked hidden. Every
+      picker open revalidates `models.catalog`; a harness whose read failed
+      shows its typed error with Retry. The selected effort
+      segment is filled, so it reads on a highlighted search row. Settings ›
+      Models & presets picks a preset's model with the same picker filtered to
+      its harness (a field like its dropdowns, the picker over the rows below),
+      and its dropdowns carry that harness's real fields (Codex
+      sandbox and approval policy, Claude Code permission mode, Muse approval
+      and sandbox, Antigravity mode); no text box offers Windows text
+      prediction. Enter sends and Shift+Enter keeps the line break (the window
+      hook marks the line break Enter typed); one Send steers the active turn
+      while one runs and, after a definite `bad_state`/`stale_generation`/
+      `unsupported` refusal, goes as the next message with one line saying so.
+      The message shows at once with "Sending…"/"Starting Codex…" until its
+      turn starts. Right-click menus on projects (New task here, Open folder,
+      Rename, Collapse/Expand, Remove project) and on tasks and chats (Rename,
+      Stop while live, idle included, Archive/Unarchive, Delete after a
+      confirmation naming it, a live one's "Stop and delete" stopping, waiting
+      until stopped, then deleting, with a refused step's typed error, Copy
+      Agent ID, Open folder) are drawn in the window; archiving the open chat
+      returns to a new task with "Archived · Undo", and the fleet line counts
+      live archived Agents; Rename writes `[desktop]
+      display_names`, Remove project the `projects` section. A Chats section
+      and "No project (chat)" launch `chat: true`; Archive/Delete call
+      `agent.archive`/`agent.delete` and Show archived filters `agent.list`:
+      these, and Claude/Antigravity/OpenCode/Muse quota windows (read by shape,
+      one line per window such as "Weekly · 43% left · resets in 5 days", a
+      refusal in plain words, Muse's "Shown after a Muse turn" until observed,
+      then "as of HH:MM", and the composer's usage ring), need the k92
+      daemon contract and say so on an older daemon. Details and monitor speak
+      plain words and hide empty rows (`swarm why`'s origin line stays);
+      observed native children nest under their parent and stay out of
+      Recents. (Refs #407)
+
+- [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider
+      readers, durable archive/delete, settings project removal and private chats.
+      Private Windows Owner proof covers real Codex/Claude desktop launch/send,
+      a private chat, archive/unarchive/delete/replay, directory cleanup and Muse
+      stream-observed quota. OpenCode Go numerical readback remains blocked by
+      provider HTTP 403; Antigravity returned real windows before a later HTTP 401.
+      Native first-token time is not exposed by the consumed completed-message
+      surface. Preserve the unrelated native-archive Unknown fence; do not replay it.
 
 - [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider
       readers, durable archive/delete, settings project removal and private chats.

@@ -24,8 +24,20 @@ pub(super) const MAX_READERS: usize = 4;
 // read-only helpers while admitted commands wait fairly instead of refusing.
 pub(super) const MAX_LAUNCH_READERS: usize = 32;
 const READER_DEADLINE: Duration = Duration::from_secs(25);
+/// How long a catalogue or quota read waits for an interactive reader slot.
+const DISCOVERY_SLOT_WAIT: Duration = Duration::from_secs(8);
 const MAX_CURSOR_BYTES: usize = 16 * 1024;
 const MAX_PAGE_BYTES: usize = 900 * 1024;
+
+/// The interactive readers are at their in-flight bound.
+fn readers_busy() -> Error {
+    Error::new("busy", "metadata_readers in-flight bound reached (limit=4)")
+        .with_where("router.dispatch.discovery_readers")
+        .with_origin(
+            eliot_core::FailureOrigin::Swarm,
+            "discovery readers at their in-flight bound",
+        )
+}
 
 pub(super) struct Reader {
     _slot: OwnedSemaphorePermit,
@@ -231,7 +243,8 @@ impl PluginHost {
             ));
         }
         let environment = Value::Object(build_process_environment(&profile)?);
-        let (id, stop_rx, done_tx) = self.register_metadata_reader()?;
+        let slot = self.discovery_slot().await?;
+        let (id, stop_rx, done_tx) = self.register_metadata_reader_slot(slot)?;
         let host = self.clone();
         let (reply, response) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -269,16 +282,7 @@ impl PluginHost {
             ));
         }
         let environment = Value::Object(build_process_environment(&profile)?);
-        // The Usage page asks all five harnesses together. Keep the four-reader
-        // bound, but let the fifth read wait briefly instead of caching a local
-        // capacity error as provider availability for the entire TTL.
-        let slot = tokio::time::timeout(
-            Duration::from_secs(8),
-            self.state.reader_slots.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| Error::new("busy", "quota reader capacity wait timed out"))?
-        .map_err(|_| Error::new("unavailable", "discovery admission is closed"))?;
+        let slot = self.discovery_slot().await?;
         let (id, stop_rx, done_tx) = self.register_metadata_reader_slot(slot)?;
         let host = self.clone();
         let (reply, response) = tokio::sync::oneshot::channel();
@@ -624,6 +628,25 @@ impl PluginHost {
         }
     }
 
+    /// One interactive reader slot for a catalogue or quota read. The
+    /// desktop asks every harness's quota and the unified catalogue together
+    /// when it connects, so a read waits briefly for a slot within the
+    /// four-reader bound instead of failing a transient full pool (the
+    /// catalogue then lacked whole harnesses). After the wait it refuses
+    /// `busy`, naming `metadata_readers` and its limit.
+    async fn discovery_slot(&self) -> Result<OwnedSemaphorePermit> {
+        match tokio::time::timeout(
+            DISCOVERY_SLOT_WAIT,
+            self.state.reader_slots.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(slot)) => Ok(slot),
+            Ok(Err(_)) => Err(Error::new("unavailable", "discovery admission is closed")),
+            Err(_) => Err(readers_busy()),
+        }
+    }
+
     fn register_metadata_reader(
         &self,
     ) -> Result<(
@@ -640,14 +663,7 @@ impl PluginHost {
                 tokio::sync::TryAcquireError::Closed => {
                     Error::new("unavailable", "discovery admission is closed")
                 }
-                tokio::sync::TryAcquireError::NoPermits => {
-                    Error::new("busy", "metadata_readers in-flight bound reached (limit=4)")
-                        .with_where("router.dispatch.discovery_readers")
-                        .with_origin(
-                            eliot_core::FailureOrigin::Swarm,
-                            "discovery readers at their in-flight bound",
-                        )
-                }
+                tokio::sync::TryAcquireError::NoPermits => readers_busy(),
             })?;
         self.register_metadata_reader_slot(slot)
     }
@@ -1143,6 +1159,40 @@ mod tests {
         .unwrap();
         assert_eq!(count, 50);
         assert_eq!(host.reader_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn catalogue_read_waits_for_a_reader_slot_instead_of_refusing_busy() {
+        // The desktop's five connect-time quota reads hold every slot when the
+        // catalogue asks for Codex: the catalogue read waits for the first
+        // reader to finish instead of failing (k98: Codex vanished).
+        let host = host();
+        let mut held = Vec::new();
+        for _ in 0..MAX_READERS {
+            held.push(
+                host.discovery_slot()
+                    .await
+                    .map(|slot| host.register_metadata_reader_slot(slot).unwrap()),
+            );
+        }
+        let waiting = host.discovery_slot();
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let (id, _, done) = held.pop().unwrap().unwrap();
+        host.finish_metadata_reader(&id, done, ReaderCleanup::Confirmed);
+        let slot = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("a freed slot admits the waiting read")
+            .unwrap();
+        let reader = host.register_metadata_reader_slot(slot).unwrap();
+        assert_eq!(host.reader_count(), MAX_READERS);
+        host.finish_metadata_reader(&reader.0, reader.2, ReaderCleanup::Confirmed);
+        for (id, _, done) in held.into_iter().map(Result::unwrap) {
+            host.finish_metadata_reader(&id, done, ReaderCleanup::Confirmed);
+        }
+        assert_eq!(host.reader_count(), 0);
+        host.close_discovery_admission();
+        assert_eq!(host.discovery_slot().await.unwrap_err().code, "unavailable");
     }
 
     #[tokio::test]

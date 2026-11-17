@@ -88,52 +88,42 @@ impl Settings {
             .or(self.profile_effort.as_deref())
     }
 
-    /// Requested, next-turn and effective values, kept apart: a request is
-    /// not proof of what the harness runs.
+    /// What the Agent runs with, in words. The model and effort the
+    /// harness reports, each marked confirmed only after a turn used it
+    /// (a request is not proof); a change for the next turn when one was
+    /// asked for. Rows with nothing to say are left out.
     pub fn lines(&self) -> Vec<String> {
-        let or_default = |value: Option<&str>| value.unwrap_or("native default").to_owned();
         let mut lines = Vec::new();
-        match &self.config {
-            Some(config) => {
-                lines.push(format!(
-                    "Requested (configure rev {}): model {} · effort {}",
-                    config.revision,
-                    config.requested_model.as_deref().unwrap_or("unchanged"),
-                    config.requested_effort.as_deref().unwrap_or("unchanged"),
-                ));
-                lines.push(format!(
-                    "Next turn carries: model {} · effort {} · applies at {} · revision {} ({}); profile {} had {} / {}",
-                    or_default(config.model.as_deref()),
-                    or_default(config.effort.as_deref()),
-                    config.application.replace('_', " "),
-                    config.revision,
-                    config.provenance.replace('_', " "),
-                    config.profile,
-                    or_default(config.original_model.as_deref()),
-                    or_default(config.original_effort.as_deref()),
-                ));
-            }
-            None => lines.push(format!(
-                "Requested (profile {}): model {} · effort {} · no configure revision",
-                self.profile,
-                or_default(self.profile_model.as_deref()),
-                or_default(self.profile_effort.as_deref()),
-            )),
-        }
         let mark = |verified: bool| {
             if verified {
-                "✓ verified by a turn"
+                "confirmed by a turn"
             } else {
-                "admission readback, not turn-verified"
+                "not verified yet"
             }
         };
-        lines.push(format!(
-            "Effective: model {} ({}) · effort {} ({})",
-            self.effective_model.as_deref().unwrap_or("not read back"),
-            mark(self.model_verified),
-            self.effective_effort.as_deref().unwrap_or("not read back"),
-            mark(self.effort_verified),
-        ));
+        match (&self.effective_model, &self.effective_effort) {
+            (Some(model), Some(effort)) => {
+                lines.push(format!("Model {model} ({})", mark(self.model_verified)));
+                lines.push(format!("Effort {effort} ({})", mark(self.effort_verified)));
+            }
+            (Some(model), None) => {
+                lines.push(format!("Model {model} ({})", mark(self.model_verified)));
+            }
+            _ => match (&self.profile_model, &self.profile_effort) {
+                (Some(model), Some(effort)) => {
+                    lines.push(format!(
+                        "Asked for {model} · {effort} effort (not verified yet)"
+                    ));
+                }
+                (Some(model), None) => lines.push(format!("Asked for {model} (not verified yet)")),
+                _ => lines.push("Uses the harness's default model".to_owned()),
+            },
+        }
+        if let Some(config) = &self.config {
+            let model = config.model.as_deref().unwrap_or("the same model");
+            let effort = config.effort.as_deref().unwrap_or("the same effort");
+            lines.push(format!("Next turn: {model} · {effort}"));
+        }
         lines
     }
 }
@@ -356,16 +346,17 @@ mod tests {
             effective_effort: Some("high".to_owned()),
             ..Settings::default()
         };
-        let effective = settings.lines().pop().unwrap();
-        assert!(effective.contains("high (admission readback, not turn-verified)"));
+        let lines = settings.lines();
+        assert_eq!(lines[0], "Model m1 (not verified yet)");
+        assert_eq!(lines[1], "Effort high (not verified yet)");
         settings.effort_verified = true;
-        let effective = settings.lines().pop().unwrap();
-        assert!(effective.contains("high (✓ verified by a turn)"));
-        assert!(effective.contains("m1 (admission readback"));
+        let lines = settings.lines();
+        assert_eq!(lines[1], "Effort high (confirmed by a turn)");
+        assert_eq!(lines[0], "Model m1 (not verified yet)");
     }
 
     #[test]
-    fn overlay_lines_show_revision_and_application_point() {
+    fn a_requested_change_reads_as_the_next_turn() {
         let settings = Settings {
             profile: "p".to_owned(),
             config: Some(AgentConfigView {
@@ -384,10 +375,8 @@ mod tests {
             ..Settings::default()
         };
         let lines = settings.lines();
-        assert!(lines[0].contains("configure rev 2"));
-        assert!(lines[0].contains("model unchanged · effort high"));
-        assert!(lines[1].contains("applies at next turn · revision 2"));
-        assert!(lines[1].contains("profile p had m1 / low"));
+        assert_eq!(lines[0], "Uses the harness's default model");
+        assert_eq!(lines[1], "Next turn: m1 · high");
         assert_eq!(settings.next_model(), Some("m1"));
     }
 

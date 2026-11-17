@@ -2,14 +2,16 @@
 //! list, the model picker and the access menu (see [`super::launch_ui`]
 //! for their state and keys).
 
-use super::launch_ui::{OTHER_FOLDER, Pop};
+use super::launch_ui::{CHAT_PROJECT, OTHER_FOLDER, Pop};
 use super::*;
-use crate::picker::{Choice, Item, Row};
+use crate::picker::{Choice, Item, ManageGroup, Row};
 use crate::settings::Access;
 use crate::theme::winui::Palette;
 
 /// The picker's key hints (OpenCode's footer).
 const PICKER_HINTS: &str = "↑↓ move   ←→ effort   Enter choose   Ctrl+F favorite   Esc close";
+/// Models a Manage models group lists before it asks for a search.
+const MANAGE_GROUP_ROWS: usize = 150;
 
 impl DesktopApp {
     /// The composer's top row for a new task: the project chip (and the
@@ -19,23 +21,33 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let label = self
-            .selected_project()
-            .map(|project| project.name.clone())
-            .or_else(|| {
-                (!self.launch.workspace.is_empty())
-                    .then(|| nav::project_name(&self.launch.workspace, &[]))
-            })
-            .unwrap_or_else(|| "No project".to_owned());
+        let label = if self.launch.chat {
+            "No project (chat)".to_owned()
+        } else {
+            self.selected_project()
+                .map(|project| self.project_label(project))
+                .or_else(|| {
+                    (!self.launch.workspace.is_empty())
+                        .then(|| nav::project_name(&self.launch.workspace, &[]))
+                })
+                .unwrap_or_else(|| "No project".to_owned())
+        };
         let open = self.launch.open == Some(Pop::Project);
+        let glyph = if self.launch.chat {
+            m3::glyph::CHAT
+        } else {
+            m3::glyph::FOLDER
+        };
         let chip = m3::chip(palette)
             .automation_name(format!(
                 "Project: {label} ({})",
                 if open { "list open" } else { "choose" }
             ))
             .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Project))))
-            .content(chip_content(m3::glyph::FOLDER, &label, None));
-        let folder: View = if self.launch.custom_workspace || self.nav.projects.is_empty() {
+            .content(chip_content(glyph, &label, None));
+        let folder: View = if !self.launch.chat
+            && (self.launch.custom_workspace || self.nav.projects.is_empty())
+        {
             m3::field()
                 .text(self.launch.workspace.clone())
                 .placeholder_text("Folder path")
@@ -118,8 +130,13 @@ impl DesktopApp {
         let Some(pop) = self.launch.open else {
             return View::empty();
         };
+        if self.launch.preset_target().is_some() {
+            // A preset's picker opens in its Settings form.
+            return View::empty();
+        }
         let content = match pop {
             Pop::Model => self.model_popover(context, palette),
+            Pop::Manage => self.manage_popover(context, palette),
             Pop::Access => self.access_popover(context, palette),
             Pop::Project => self.project_popover(context, palette),
         };
@@ -132,23 +149,43 @@ impl DesktopApp {
             .content(content)
     }
 
-    fn model_popover(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    pub(super) fn model_popover(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let rows = self.picker_rows();
         let highlight = self.launch.highlight.as_deref();
         let mut items: Vec<KeyedView> = Vec::new();
         for row in &rows {
             match row {
-                Row::Heading { key, title, note } => {
+                Row::Heading {
+                    key,
+                    title,
+                    note,
+                    group: Some(group),
+                    collapsed,
+                } => items.push(KeyedView::new(
+                    format!("{key}:{collapsed}"),
+                    group_heading(group, title, note, *collapsed, 0.0, context, palette),
+                )),
+                Row::Heading {
+                    key, title, note, ..
+                } => {
                     items.push(KeyedView::new(key.clone(), heading(title, note)));
                 }
-                Row::Provider { key, title } => items.push(KeyedView::new(
-                    key.clone(),
-                    m3::secondary(title.clone()).margin(Thickness::new(
-                        tokens::spacing::INSET + tokens::layout::CHECK_COLUMN,
-                        tokens::spacing::XS,
-                        0.0,
-                        tokens::spacing::XS,
-                    )),
+                Row::Provider {
+                    key,
+                    title,
+                    group,
+                    collapsed,
+                } => items.push(KeyedView::new(
+                    format!("{key}:{collapsed}"),
+                    group_heading(
+                        group,
+                        title,
+                        "",
+                        *collapsed,
+                        tokens::layout::CHECK_COLUMN,
+                        context,
+                        palette,
+                    ),
                 )),
                 Row::Note { key, text } => items.push(KeyedView::new(
                     key.clone(),
@@ -161,16 +198,47 @@ impl DesktopApp {
                             tokens::spacing::XS,
                         )),
                 )),
+                Row::Failure { key, text } => items.push(KeyedView::new(
+                    format!("{key}:{}", self.launch.catalog_loading),
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Auto])
+                        .column_spacing(tokens::spacing::SM)
+                        .margin(Thickness::new(
+                            tokens::spacing::INSET + tokens::layout::CHECK_COLUMN,
+                            tokens::spacing::XS,
+                            tokens::spacing::SM,
+                            tokens::spacing::XS,
+                        ))
+                        .children((
+                            m3::secondary(text.clone())
+                                .foreground(palette.error())
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text_wrapping(TextWrapping::Wrap),
+                            m3::text_button(palette)
+                                .grid_column(1)
+                                .is_enabled(!self.launch.catalog_loading)
+                                .automation_name(format!("Retry: {text}"))
+                                .on_click(context.message(Message::Launch(LaunchMsg::CatalogRetry)))
+                                .content(m3::label(if self.launch.catalog_loading {
+                                    "Reading…"
+                                } else {
+                                    "Retry"
+                                })),
+                        )),
+                )),
                 Row::Choice(item) => {
                     let highlighted = highlight == Some(item.key.as_str());
+                    // Not keyed by the highlight: the highlight is the row's
+                    // fill, and re-creating the row under the pointer as it
+                    // enters would drop the click that follows.
                     items.push(KeyedView::new(
-                        format!("{}:{highlighted}:{}", item.key, item.current),
+                        format!("{}:{}", item.key, item.current),
                         self.picker_row(item, highlighted, context, palette),
                     ));
                 }
             }
         }
-        let search = m3::field()
+        let field = m3::field()
             .element_ref(&self.launch.field_ref)
             .text(self.launch.query.clone())
             .placeholder_text("Search models")
@@ -178,6 +246,19 @@ impl DesktopApp {
             .on_text_changed(
                 context.callback(|text| Message::Launch(LaunchMsg::PickerQuery(text))),
             );
+        // OpenCode's sliders button at the right end of the search row.
+        let manage = m3::icon_button(palette)
+            .grid_column(1)
+            .width(tokens::height::CONTROL)
+            .height(tokens::height::CONTROL)
+            .automation_name("Manage models")
+            .on_click(context.message(Message::Launch(LaunchMsg::ManageOpened)))
+            .content(m3::icon(m3::glyph::SLIDERS))
+            .tooltip("Manage models");
+        let search = Grid::new()
+            .columns([GridLength::STAR, GridLength::Auto])
+            .column_spacing(tokens::spacing::XS)
+            .children((field, manage));
         let list = ScrollViewer::new()
             .max_height(tokens::layout::POPOVER_LIST_HEIGHT)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
@@ -219,6 +300,9 @@ impl DesktopApp {
         if item.default {
             marks.push(KeyedView::new("default", m3::badge(palette, "default")));
         }
+        if item.hidden && !highlighted {
+            marks.push(KeyedView::new("hidden", m3::badge(palette, "hidden")));
+        }
         if item.favorite && !highlighted {
             marks.push(KeyedView::new("star", m3::icon(m3::glyph::STAR_FILLED)));
         }
@@ -242,6 +326,9 @@ impl DesktopApp {
         }
         if item.current {
             name.push_str(", current");
+        }
+        if item.hidden {
+            name.push_str(", hidden in Manage models");
         }
         if let Some(reason) = &item.disabled {
             name.push_str(&format!(", {reason}"));
@@ -293,6 +380,15 @@ impl DesktopApp {
                 // The efforts on their own track, so the chosen one stands
                 // out from the row's highlight.
                 let mut cells: Vec<KeyedView> = Vec::new();
+                if item.hidden {
+                    cells.push(KeyedView::new(
+                        "hidden",
+                        Border::new()
+                            .margin(Thickness::new(0.0, 0.0, tokens::spacing::SM, 0.0))
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .content(m3::badge(palette, "hidden")),
+                    ));
+                }
                 if !segments.is_empty() {
                     cells.push(KeyedView::new("efforts", m3::segmented(palette, segments)));
                 }
@@ -450,12 +546,16 @@ impl DesktopApp {
             .into_iter()
             .map(|(checkout, name, path)| {
                 let highlighted = highlight == Some(checkout.as_str());
-                let selected = current.as_deref() == Some(checkout.as_str())
-                    || (checkout == OTHER_FOLDER && self.launch.custom_workspace);
-                let glyph = if checkout == OTHER_FOLDER {
-                    m3::glyph::OPEN_FOLDER
+                let selected = if self.launch.chat {
+                    checkout == CHAT_PROJECT
                 } else {
-                    m3::glyph::FOLDER
+                    current.as_deref() == Some(checkout.as_str())
+                        || (checkout == OTHER_FOLDER && self.launch.custom_workspace)
+                };
+                let glyph = match checkout.as_str() {
+                    OTHER_FOLDER => m3::glyph::OPEN_FOLDER,
+                    CHAT_PROJECT => m3::glyph::CHAT,
+                    _ => m3::glyph::FOLDER,
                 };
                 KeyedView::new(
                     format!("{checkout}:{highlighted}:{selected}"),
@@ -507,6 +607,235 @@ impl DesktopApp {
                 )),
             )
     }
+}
+
+impl DesktopApp {
+    /// OpenCode's Manage models panel: the title and subtitle, a search
+    /// field, then each provider group (collapsible, with its group toggle)
+    /// and one toggle per model.
+    pub(super) fn manage_popover(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let groups = match self.launch.catalog.as_ref() {
+            Some(Ok(reply)) => {
+                crate::picker::manage_groups(reply, &self.prefs, &self.launch.manage_query)
+            }
+            _ => Vec::new(),
+        };
+        let mut rows: Vec<KeyedView> = Vec::new();
+        match self.launch.catalog.as_ref() {
+            None => rows.push(KeyedView::new(
+                "loading",
+                m3::secondary("Reading the models…"),
+            )),
+            Some(Err(error)) => rows.push(KeyedView::new(
+                "error",
+                m3::secondary(format!("Models not read: {error}"))
+                    .text_wrapping(TextWrapping::Wrap),
+            )),
+            Some(Ok(_)) if groups.is_empty() => rows.push(KeyedView::new(
+                "none",
+                m3::secondary("No models match. Clear the search to see every model.")
+                    .margin(Thickness::xy(tokens::spacing::INSET, tokens::spacing::XS)),
+            )),
+            Some(Ok(_)) => {}
+        }
+        for group in &groups {
+            rows.push(KeyedView::new(
+                format!(
+                    "group:{}:{}:{}:{}",
+                    group.key, group.collapsed, group.visible, group.shown
+                ),
+                manage_group_row(group, context, palette),
+            ));
+            if group.collapsed {
+                continue;
+            }
+            for model in group.models.iter().take(MANAGE_GROUP_ROWS) {
+                let (harness, provider, id) = (
+                    group.harness.clone(),
+                    group.provider.clone(),
+                    model.id.clone(),
+                );
+                rows.push(KeyedView::new(
+                    format!("model:{}:{}:{}", group.key, model.id, model.visible),
+                    Grid::new()
+                        .columns([
+                            GridLength::Pixel(tokens::layout::CHECK_COLUMN),
+                            GridLength::STAR,
+                            GridLength::Auto,
+                        ])
+                        .min_height(tokens::height::SUB_ROW)
+                        .margin(Thickness::new(tokens::spacing::INSET, 0.0, 0.0, 0.0))
+                        .children((
+                            View::empty(),
+                            m3::body(model.title.clone())
+                                .grid_column(1)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .text_trimming(TextTrimming::CharacterEllipsis),
+                            ToggleSwitch::new()
+                                .grid_column(2)
+                                .width(tokens::layout::SWITCH_WIDTH)
+                                .is_on(model.visible)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .automation_name(format!(
+                                    "Show {} in the model selector",
+                                    model.title
+                                ))
+                                .on_toggled(context.callback(move |on: bool| {
+                                    Message::Launch(LaunchMsg::ManageModel {
+                                        harness: harness.clone(),
+                                        provider: provider.clone(),
+                                        model: id.clone(),
+                                        visible: on,
+                                    })
+                                })),
+                        )),
+                ));
+            }
+            if group.models.len() > MANAGE_GROUP_ROWS {
+                rows.push(KeyedView::new(
+                    format!("more:{}", group.key),
+                    m3::secondary(format!(
+                        "{} more: search to find one.",
+                        group.models.len() - MANAGE_GROUP_ROWS
+                    ))
+                    .margin(Thickness::new(
+                        tokens::spacing::INSET + tokens::layout::CHECK_COLUMN,
+                        tokens::spacing::XS,
+                        0.0,
+                        tokens::spacing::XS,
+                    )),
+                ));
+            }
+        }
+        let header = Grid::new()
+            .columns([GridLength::Auto, GridLength::STAR])
+            .column_spacing(tokens::spacing::SM)
+            .children((
+                m3::icon_button(palette)
+                    .width(tokens::height::CONTROL)
+                    .height(tokens::height::CONTROL)
+                    .vertical_alignment(VerticalAlignment::Top)
+                    .automation_name("Back to the model selector")
+                    .on_click(context.message(Message::Launch(LaunchMsg::ManageClosed)))
+                    .content(m3::icon(m3::glyph::BACK)),
+                StackPanel::new().grid_column(1).children((
+                    m3::section_title("Manage models"),
+                    m3::secondary("Customize which models appear in the model selector"),
+                )),
+            ));
+        let search = m3::field()
+            .element_ref(&self.launch.field_ref)
+            .text(self.launch.manage_query.clone())
+            .placeholder_text("Search models")
+            .automation_name("Search models to manage")
+            .on_text_changed(
+                context.callback(|text| Message::Launch(LaunchMsg::ManageQuery(text))),
+            );
+        m3::popover(palette)
+            .width(tokens::layout::PICKER_WIDTH)
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .content(
+                StackPanel::new().spacing(tokens::spacing::SM).children((
+                    header,
+                    search,
+                    ScrollViewer::new()
+                        .max_height(tokens::layout::POPOVER_LIST_HEIGHT)
+                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                        .automation_name("Model groups")
+                        .content(StackPanel::new().keyed_children(rows)),
+                )),
+            )
+    }
+}
+
+/// A Manage models group row: its chevron and title collapse it; the
+/// switch shows or hides the whole group (OpenCode's Manage models).
+fn manage_group_row(
+    group: &ManageGroup,
+    context: &mut ViewContext<DesktopApp>,
+    palette: Palette,
+) -> View {
+    let (glyph, state) = if group.collapsed {
+        (m3::glyph::CHEVRON_RIGHT, "collapsed")
+    } else {
+        (m3::glyph::CHEVRON_DOWN, "expanded")
+    };
+    let count = format!("{} of {} shown", group.shown, group.all.len());
+    let key = group.key.clone();
+    let toggle = m3::row(palette, false)
+        .automation_name(format!("{}, {count}, {state}", group.title))
+        .on_click(context.message(Message::Launch(LaunchMsg::GroupToggled(key.clone()))))
+        .content(
+            Grid::new()
+                .columns([GridLength::Auto, GridLength::STAR])
+                .column_spacing(tokens::spacing::SM)
+                .children((
+                    m3::icon(glyph),
+                    Border::new().grid_column(1).content(m3::row_content(
+                        None,
+                        &group.title,
+                        &count,
+                        View::empty(),
+                    )),
+                )),
+        );
+    let group_key = group.key.clone();
+    let check = ToggleSwitch::new()
+        .grid_column(1)
+        .width(tokens::layout::SWITCH_WIDTH)
+        .is_on(group.visible)
+        .vertical_alignment(VerticalAlignment::Center)
+        .automation_name(format!("Show every {} model", group.title))
+        .on_toggled(context.callback(move |on: bool| {
+            Message::Launch(LaunchMsg::ManageGroup(group_key.clone(), on))
+        }));
+    Grid::new()
+        .columns([GridLength::STAR, GridLength::Auto])
+        .column_spacing(tokens::spacing::SM)
+        .children((toggle, check))
+}
+
+/// A collapsible picker group: the chevron and title collapse or expand it
+/// (remembered in `[desktop] collapsed_model_groups`).
+fn group_heading(
+    group: &str,
+    title: &str,
+    note: &str,
+    collapsed: bool,
+    indent: f64,
+    context: &mut ViewContext<DesktopApp>,
+    palette: Palette,
+) -> View {
+    let (glyph, state) = if collapsed {
+        (m3::glyph::CHEVRON_RIGHT, "collapsed")
+    } else {
+        (m3::glyph::CHEVRON_DOWN, "expanded")
+    };
+    let label: View = if indent > 0.0 {
+        m3::secondary(title.to_owned()).into()
+    } else {
+        m3::section_label(title.to_owned())
+            .font_weight(m3::weight(tokens::text::SECTION_TITLE))
+            .into()
+    };
+    m3::sub_row(palette, false)
+        .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
+        .automation_name(format!("{title} models, {state}"))
+        .on_click(context.message(Message::Launch(LaunchMsg::GroupToggled(group.to_owned()))))
+        .content(
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::SM)
+                .children((
+                    m3::icon(glyph),
+                    label,
+                    if note.is_empty() {
+                        View::empty()
+                    } else {
+                        m3::secondary(note.to_owned()).into()
+                    },
+                )),
+        )
 }
 
 /// A chip's content: its icon, label and the ▾ that says it opens.

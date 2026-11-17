@@ -8,7 +8,7 @@ use windows_reactor::*;
 
 use crate::monitor::{
     self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, bytes_label, cpu_time_label, state_name,
-    tokens_label,
+    state_words, tokens_label,
 };
 use crate::theme;
 use crate::theme::winui::Palette;
@@ -44,8 +44,9 @@ pub fn card(row: &MonitorRow, title: &str, open: Callback<()>, palette: Palette)
     crate::m3::card_button(
         palette,
         format!(
-            "{title}, {state}, {}{under}, {}",
-            row.harness,
+            "{title}, {}, {}{under}, {}",
+            state_words(row.state),
+            crate::picker::harness_label(&row.harness),
             row.operation()
         ),
         open,
@@ -65,19 +66,35 @@ pub fn card(row: &MonitorRow, title: &str, open: Callback<()>, palette: Palette)
                         crate::m3::section_title(title.to_owned())
                             .vertical_alignment(VerticalAlignment::Center)
                             .text_trimming(TextTrimming::CharacterEllipsis),
-                        Border::new()
-                            .grid_column(1)
-                            .content(crate::m3::status(palette, state)),
+                        Border::new().grid_column(1).content(crate::m3::status(
+                            palette,
+                            state,
+                            state_words(row.state),
+                        )),
                     )),
-                crate::m3::body(format!("{} · {}{under}", row.harness, row.operation()))
-                    .opacity(theme::MUTED_OPACITY)
-                    .text_trimming(TextTrimming::CharacterEllipsis),
-                crate::m3::secondary(format!(
-                    "{} · CPU {} · {}",
-                    bytes_label(row.obs.rss_bytes()),
-                    cpu_time_label(row.obs.cpu_time_ns()),
-                    tokens_label(row)
+                crate::m3::body(format!(
+                    "{} · {}{under}",
+                    crate::picker::harness_label(&row.harness),
+                    row.operation()
                 ))
+                .opacity(theme::MUTED_OPACITY)
+                .text_trimming(TextTrimming::CharacterEllipsis),
+                // Only the measures the daemon reported.
+                crate::m3::secondary(
+                    [
+                        row.obs
+                            .rss_bytes()
+                            .map(|_| bytes_label(row.obs.rss_bytes())),
+                        row.obs
+                            .cpu_time_ns()
+                            .map(|_| cpu_time_label(row.obs.cpu_time_ns())),
+                        row.tokens.map(|_| tokens_label(row)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                )
                 .text_trimming(TextTrimming::CharacterEllipsis),
             )),
     )
@@ -209,7 +226,8 @@ fn chart_card(
 }
 
 /// The Agent's identity and settings from the monitor's detail read (when
-/// its conversation is not the open one).
+/// its conversation is not the open one), in words; rows with nothing to
+/// say are left out.
 pub fn identity_lines(read: &DetailRead) -> Vec<String> {
     let agent = &read.agent.agent;
     let effective = agent.effective.as_ref();
@@ -217,107 +235,125 @@ pub fn identity_lines(read: &DetailRead) -> Vec<String> {
         effective
             .and_then(|value| value.get(name))
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("not read back")
-            .to_owned()
+            .map(str::to_owned)
     };
-    vec![
-        format!(
-            "Agent {} · generation {} · {} · {}{}",
-            agent.id,
-            agent.generation,
-            agent.harness,
-            format!("{:?}", agent.state).to_lowercase(),
-            if agent.observe_only {
-                " · observe-only"
-            } else {
-                ""
-            }
-        ),
-        format!(
-            "Profile {} · effective model {} · effort {}",
-            agent.profile,
-            field("model"),
-            field("effort")
-        ),
-        format!(
-            "Active turn {} · pending requests {}",
-            agent.active_turn.as_deref().unwrap_or("none"),
-            agent.pending.len()
-        ),
-    ]
+    let harness = crate::picker::harness_label(&agent.harness).to_owned();
+    let mut lines = vec![format!("{harness} · {}", state_words(agent.state))];
+    match (field("model"), field("effort")) {
+        (Some(model), Some(effort)) => lines.push(format!("{model} · {effort} effort")),
+        (Some(model), None) => lines.push(model),
+        _ => lines.push(format!("Model not reported by {harness} yet")),
+    }
+    if !agent.profile.starts_with("adhoc-") {
+        lines.push(format!("Preset {}", agent.profile));
+    }
+    if agent.observe_only {
+        lines.push(format!(
+            "Watched only: {harness} runs it; Swarm cannot steer or stop it."
+        ));
+    }
+    if agent.active_turn.is_some() {
+        lines.push("Working on a turn".to_owned());
+    }
+    if !agent.pending.is_empty() {
+        lines.push(format!("{} request(s) wait for you", agent.pending.len()));
+    }
+    lines.push(format!("ID {} · generation {}", agent.id, agent.generation));
+    lines
 }
 
-/// Token usage and cost lines of the detail read.
-/// Heavy-work and session-growth readback for the Agent Details panel.
+/// Heavy-work and session-growth readback for the Agent Details panel, in
+/// words; empty when neither was recorded (the section is then hidden).
 /// Only committed rollups render: episode rows show the program basename
 /// recorded at commit time, never full commands or paths.
 pub fn observe_lines(read: &DetailRead) -> Vec<String> {
     let mut lines = Vec::new();
-    match &read.agent.heavy {
-        Some(heavy) => lines.push(format!(
-            "Heavy: {} episode(s), latest {}, {} cpu ms",
+    if let Some(heavy) = &read.agent.heavy
+        && heavy.episodes > 0
+    {
+        let what = heavy
+            .latest_category
+            .as_deref()
+            .map(|category| format!(", latest {}", category.replace('_', " ")))
+            .unwrap_or_default();
+        lines.push(format!(
+            "Heavy work: {} episode(s){what}, {:.1} s of CPU",
             heavy.episodes,
-            heavy.latest_category.as_deref().unwrap_or("-"),
-            heavy.total_cpu_ms,
-        )),
-        None => lines.push("Heavy: no heavy episodes recorded".to_owned()),
+            heavy.total_cpu_ms as f64 / 1000.0
+        ));
     }
-    match &read.agent.session_growth {
-        Some(growth) => lines.push(format!(
-            "Growth{}: {}",
-            growth
-                .basis
-                .as_deref()
-                .map(|basis| format!("[{basis}]"))
-                .unwrap_or_default(),
+    if let Some(growth) = &read.agent.session_growth {
+        lines.push(format!(
+            "The session grows fast: {}",
             growth
                 .message
                 .as_deref()
-                .unwrap_or("session signal crossed its threshold"),
-        )),
-        None => lines.push("Growth: within thresholds".to_owned()),
+                .unwrap_or("its size crossed the warning threshold")
+        ));
     }
     lines
 }
 
+/// Token usage and cost of the detail read, in words; counters that are
+/// zero or unreported are left out.
 pub fn usage_lines(read: &DetailRead) -> Vec<String> {
     let mut lines = Vec::new();
     match &read.usage {
         Ok(usage) => {
-            lines.push(format!(
-                "{} turn(s) counted, {} without usage, {} unknown excluded, {} running excluded; history {} ({}){}",
-                usage.turns.turns_counted,
-                usage.turns.turns_without_usage,
-                usage.turns.turns_unknown_excluded,
-                usage.turns.turns_running_excluded,
-                if usage.history_complete { "complete" } else { "partial" },
-                usage.history_reason,
-                if usage.truncated { "; truncated" } else { "" }
-            ));
-            for scope in usage.turns.by_scope.iter().take(4) {
+            let turns = &usage.turns;
+            let (mut input, mut output, mut total) = (0_i64, 0_i64, 0_i64);
+            for scope in &turns.by_scope {
+                input += scope.totals.input_tokens.unwrap_or(0);
+                output += scope.totals.output_tokens.unwrap_or(0);
+                total += scope.totals.total_tokens.unwrap_or(0);
+            }
+            if total == 0 {
+                total = input + output;
+            }
+            if turns.turns_counted == 0 && total == 0 {
+                lines.push("No token usage reported yet.".to_owned());
+            } else {
                 lines.push(format!(
-                    "{}: {} turn(s) · input {} · output {} · total {} tokens",
-                    scope.scope,
-                    scope.turns_counted,
-                    counter(scope.totals.input_tokens),
-                    counter(scope.totals.output_tokens),
-                    counter(scope.totals.total_tokens),
+                    "{} tokens over {} turn(s)",
+                    group(total),
+                    turns.turns_counted
                 ));
+                if input > 0 || output > 0 {
+                    lines.push(format!("{} in · {} out", group(input), group(output)));
+                }
+            }
+            if turns.turns_without_usage > 0 {
+                lines.push(format!(
+                    "{} turn(s) reported no usage",
+                    turns.turns_without_usage
+                ));
+            }
+            if turns.turns_running_excluded > 0 {
+                lines.push("The running turn counts when it ends.".to_owned());
+            }
+            if !usage.history_complete {
+                lines.push("Older history is not counted.".to_owned());
             }
             for cost in &usage.sessions.cost_by_unit {
-                lines.push(format!(
-                    "Cost [{}]: {} over {} snapshot(s)",
-                    cost.unit, cost.total_amount, cost.snapshots
-                ));
+                lines.push(format!("Cost: {} {}", cost.total_amount, cost.unit));
             }
         }
-        Err(error) => lines.push(format!("Usage unavailable: {error}")),
+        Err(_) => lines.push("Usage not reported for this Agent.".to_owned()),
     }
     lines
 }
 
-fn counter(value: Option<i64>) -> String {
-    value.map_or_else(|| "—".to_owned(), |value| value.to_string())
+/// `1234567` as `1,234,567`.
+fn group(value: i64) -> String {
+    let digits = value.abs().to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    if value < 0 { format!("-{out}") } else { out }
 }
 
 /// The CPU and memory charts of `id`, with the sampling note.
