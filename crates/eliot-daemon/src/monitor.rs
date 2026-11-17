@@ -800,12 +800,28 @@ impl Monitoring {
     async fn run_git(self, mut shutdown: watch::Receiver<bool>) -> Result<()> {
         let mut ticks = interval(SAMPLE_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // A bound Agent's native stream closing makes its binding final:
+        // read it now instead of at the next tick, so a stopped Agent's Git
+        // source closes (and `agent.delete` stops answering busy) promptly.
+        let mut committed = Some(self.inner.bus.subscribe());
         loop {
             if *shutdown.borrow() {
                 break;
             }
             tokio::select! {
                 _ = ticks.tick() => self.sample_git(false).await,
+                event = async { committed.as_mut().expect("guarded receiver").recv().await },
+                    if committed.is_some() =>
+                {
+                    match event {
+                        Ok(event) if self.closes_git_binding(&event) => self.sample_git(false).await,
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            self.sample_git(false).await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => committed = None,
+                    }
+                }
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         break;
@@ -815,6 +831,21 @@ impl Monitoring {
         }
         self.sample_git(true).await;
         Ok(())
+    }
+
+    /// The committed `source.closed` of a Git-bound Agent's native stream.
+    fn closes_git_binding(&self, event: &eliot_core::Event) -> bool {
+        event.kind == "source.closed"
+            && event.data.get("source").and_then(Value::as_str) == Some("stream")
+            && event.agent.as_deref().is_some_and(|agent| {
+                self.inner
+                    .git_bindings
+                    .lock_recover()
+                    .keys()
+                    .any(|(bound, generation)| {
+                        bound == agent && event.generation.is_none_or(|g| g == *generation)
+                    })
+            })
     }
 
     async fn git_inputs(&self) -> Result<HashMap<String, GitGroup>> {
@@ -1097,9 +1128,18 @@ impl Monitoring {
                     cache.last_attempt.map(|at| at + SAMPLE_INTERVAL),
                 )
             };
-            if !final_flush
-                && (Instant::now() < due
-                    || earliest.is_some_and(|earliest| Instant::now() < earliest))
+            // A binding's final read (terminal generation, native stream
+            // closed) is what closes its Git source. Like the shutdown flush
+            // it bypasses error backoff: a workspace that is not a Git
+            // repository (a chat directory) otherwise backs off to 30 s and
+            // holds a stopped Agent's custody for that long.
+            let final_read = final_flush
+                || group
+                    .inputs
+                    .iter()
+                    .any(|input| input.terminal && input.native_closed);
+            if (!final_read && Instant::now() < due)
+                || (!final_flush && earliest.is_some_and(|earliest| Instant::now() < earliest))
             {
                 continue;
             }

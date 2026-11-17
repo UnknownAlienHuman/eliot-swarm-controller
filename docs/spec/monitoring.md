@@ -349,7 +349,11 @@ silently disabling the configured HTTPS/SSH transport itself.
 - monitor never writes index, refs or objects.
 
 The current subset polls local state at least 2 s apart without submodule recursion;
-slow/error probes back off up to 30 s. CLI reads return the cache without forcing a scan.
+slow/error probes back off up to 30 s. A binding's final read (its generation is
+terminal and its native stream closed) bypasses that backoff but keeps the 2 s minimum,
+and the stream's committed `source.closed` wakes the poller, so a stopped Agent's Git
+source closes within one probe interval even when its workspace is not a Git
+repository. CLI reads return the cache without forcing a scan.
 The target requirements above remain binding. `git-status AGENT` / `agent.git` returns
 the current generation's cached view; `edits AGENT` / `agent.edits` pages retained
 attribution, including historical generations for an authorized owner.

@@ -458,6 +458,11 @@ Controlled launch resolves the effective native store through a dedicated read-o
 dispatch, together with the minimal-policy MCP projection from the same config response.
 Read-only readers deliver stdin EOF, then require process reap and complete output
 and notification drainage within their cleanup deadline; unknown cleanup remains fenced.
+An owned stop does the same for the controlled app-server: it drops stdin, and
+`codex app-server` exits on EOF in well under a second (flushing alone left it waiting
+for the 2 s kill grace on every stop). Descendants it leaves behind get a 1 s family
+grace before the generation Job is terminated; a detached `git fsmonitor--daemon`
+that a Git command started never exits on its own and is ended there.
 The controlled app-server pins and verifies that same store before
 `thread/start` or `thread/resume`. Resume reuses the retained binding; a legacy Agent
 without one refuses before native control. This does not change admitted command

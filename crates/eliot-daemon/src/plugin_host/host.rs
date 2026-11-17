@@ -56,6 +56,13 @@ const RPC_DEADLINE: Duration = Duration::from_secs(30);
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 const RPC_GRACE: Duration = Duration::from_secs(2);
 const STOP_GRACE: Duration = Duration::from_secs(5);
+/// After the plugin leader exited on its own, how long the rest of its
+/// family (native descendants) may take to follow before the generation's
+/// Job is terminated. Ordinary children exit with their parent well within
+/// this; a detached daemon a native tool started (`git fsmonitor--daemon`)
+/// never does, and waiting the full `STOP_GRACE` for it held every graceful
+/// stop, and so `agent.delete`, for 5 s.
+const FAMILY_GRACE: Duration = Duration::from_secs(1);
 const MAX_PENDING_SNAPSHOT_READS: usize = 1;
 
 #[derive(Clone, Copy)]
@@ -3742,8 +3749,20 @@ async fn wait_child(
     monitoring: &Monitoring,
     agent: &Agent,
 ) -> bool {
+    wait_child_family(child, duration, duration, monitoring, agent).await
+}
+
+/// Wait `leader` for the plugin process, then `family` for its Job to
+/// empty; false when either does not happen in time.
+async fn wait_child_family(
+    child: &mut OwnedChild,
+    leader: Duration,
+    family: Duration,
+    monitoring: &Monitoring,
+    agent: &Agent,
+) -> bool {
     if !matches!(
-        timeout_at(Instant::now() + duration, child.wait()).await,
+        timeout_at(Instant::now() + leader, child.wait()).await,
         Ok(Ok(_))
     ) {
         return false;
@@ -3751,7 +3770,7 @@ async fn wait_child(
     let _ = monitoring.sample_generation(agent).await;
     #[cfg(windows)]
     {
-        if matches!(child.wait_family_empty(duration).await, Ok(true)) {
+        if matches!(child.wait_family_empty(family).await, Ok(true)) {
             // Consume the OS observer's verified-empty certificate before the
             // owning Job is dropped; exited database rows alone are not proof.
             let _ = monitoring.sample_generation(agent).await;
@@ -3762,6 +3781,7 @@ async fn wait_child(
     }
     #[cfg(not(windows))]
     {
+        let _ = family;
         true
     }
 }
@@ -3839,7 +3859,14 @@ async fn shutdown_and_wait_child(
             .close_input((Instant::now() + STOP_GRACE).min(deadlines.custody_until))
             .await;
     }
-    let graceful = wait_stop_child(child, monitoring, agent, deadlines.custody_until).await;
+    // The harness's own exit gets the full grace; what it leaves behind
+    // gets `FAMILY_GRACE`, then the Job terminate below ends it.
+    let graceful = timeout_at(
+        deadlines.custody_until,
+        wait_child_family(child, STOP_GRACE, FAMILY_GRACE, monitoring, agent),
+    )
+    .await
+    .unwrap_or(false);
     let mut exited = graceful;
     if !exited {
         let _ = child.terminate();
