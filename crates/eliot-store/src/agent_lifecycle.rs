@@ -76,11 +76,68 @@ impl Store {
             } else {
                 matches!(row.state, AgentState::Stopped | AgentState::Failed)
             };
-            let open: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM commands WHERE target=?1 AND state IN ('accepted','queued','dispatched','unknown')) OR EXISTS(SELECT 1 FROM turns WHERE agent=?1 AND state IN ('running','unknown'))",[num],|r|r.get(0)).map_err(sql_error)?;
-            if !allowed || open || row.active_turn.is_some() || !row.pending.is_empty() {
+            if !allowed {
                 return Err(Error::new(
                     "busy",
-                    "Agent tree must be idle or stopped to archive, and stopped or failed to delete",
+                    format!(
+                        "{} is {:?}; {} requires {}",
+                        row.id,
+                        row.state,
+                        method,
+                        if archived.is_some() {
+                            "idle or stopped"
+                        } else {
+                            "stopped or failed"
+                        },
+                    ),
+                ));
+            }
+            if let Some(turn) = row.active_turn.as_deref() {
+                return Err(Error::new(
+                    "busy",
+                    format!(
+                        "{} generation {} has active turn {turn}",
+                        row.id, row.generation
+                    ),
+                ));
+            }
+            if !row.pending.is_empty() {
+                return Err(Error::new(
+                    "busy",
+                    format!(
+                        "{} generation {} has {} pending requests",
+                        row.id,
+                        row.generation,
+                        row.pending.len()
+                    ),
+                ));
+            }
+            let command: Option<(String, String, Option<i64>)> = tx.query_row(
+                "SELECT id,state,generation FROM commands WHERE target=?1 AND state IN ('accepted','queued','dispatched','unknown') ORDER BY created_at,id LIMIT 1",
+                [num], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).optional().map_err(sql_error)?;
+            if let Some((command, state, generation)) = command {
+                let generation =
+                    generation.map_or_else(|| "unassigned".to_owned(), |value| value.to_string());
+                return Err(Error::new(
+                    "busy",
+                    format!(
+                        "{} has {state} command {command} (generation {generation})",
+                        row.id
+                    ),
+                ));
+            }
+            let turn: Option<(String, String, i64)> = tx.query_row(
+                "SELECT turn_id,state,generation FROM turns WHERE agent=?1 AND state IN ('running','unknown') ORDER BY generation,turn_id LIMIT 1",
+                [num], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).optional().map_err(sql_error)?;
+            if let Some((turn, state, generation)) = turn {
+                return Err(Error::new(
+                    "busy",
+                    format!(
+                        "{} generation {generation} has {state} turn {turn}; stopped lifecycle does not resolve an uncertain turn",
+                        row.id
+                    ),
                 ));
             }
             if archived.is_none() {
@@ -241,5 +298,32 @@ impl Store {
             Ok(observation)
         })
         .transpose()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopped_tree_refusal_names_its_historical_unknown_turn() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = ulid::Ulid::new().timestamp_ms() as i64;
+        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('','muse','p','stopped',2,?1,?1)", [now]).unwrap();
+        store.connection.execute("INSERT INTO turns(agent,generation,turn_id,state,started_at,completed_at) VALUES (1,1,'retained-turn','unknown',?1,?1)", [now]).unwrap();
+        for archived in [None, Some(true)] {
+            let before = store.connection.total_changes();
+            let error = store
+                .change_agent_tree(&ulid::Ulid::new().to_string(), "a1", archived, now)
+                .unwrap_err();
+            assert_eq!(error.code, "busy");
+            assert!(
+                error
+                    .message
+                    .contains("a1 generation 1 has unknown turn retained-turn")
+            );
+            assert_eq!(store.connection.total_changes(), before);
+            assert!(store.get_agent("a1").unwrap().is_some());
+        }
     }
 }
