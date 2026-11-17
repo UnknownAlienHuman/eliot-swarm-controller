@@ -251,7 +251,11 @@ impl Router {
                     }
                     entries.push(eliot_core::api::HarnessModelEntry {
                         id,
-                        display_name: None,
+                        display_name: model
+                            .get("display_name")
+                            .and_then(Value::as_str)
+                            .and_then(eliot_core::api::harness::native_model_display_name)
+                            .map(str::to_owned),
                         default: model
                             .get("default")
                             .and_then(Value::as_bool)
@@ -1279,6 +1283,23 @@ mod tests {
         assert_eq!(built.efforts, entry.efforts);
         let held = catalog_entry("claude", entry, Some(true), None, 1_000);
         assert_eq!(held.availability, CATALOG_HELD);
+    }
+
+    #[test]
+    fn catalog_entry_uses_native_name_for_display_and_keeps_id_for_selection() {
+        let entry = eliot_core::api::HarnessModelEntry {
+            id: "openrouter/native-id".to_owned(),
+            display_name: Some("Native Display Name".to_owned()),
+            default: false,
+            efforts: None,
+            default_effort: None,
+            source: None,
+        };
+        let built = catalog_entry("opencode", entry, None, None, 1_000);
+        assert_eq!(built.id, "openrouter/native-id");
+        assert_eq!(built.display_name, "Native Display Name");
+        assert_eq!(built.provider, "openrouter");
+        assert!(eliot_core::api::catalog_matches(&built, "Display Name"));
     }
 
     #[test]

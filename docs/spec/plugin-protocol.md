@@ -57,9 +57,10 @@ when it connects); after that wait, and for other explicit discovery reads at on
 refuse `busy` with a message naming `metadata_readers` and its limit.
 
 Catalogue requests use [`ModelListParams`](../../crates/eliot-plugin/src/protocol.rs).
-OpenCode reads ids and variants in separate reader lifetimes, sharing one admission
+OpenCode reads ids and model metadata (names and variants) in separate reader lifetimes, sharing one admission
 slot and read deadline. Each phase closes its owned family before the next starts
-or a result is returned. Optional variant failures permit ids-only output only after
+or a result is returned. The host joins metadata by exact `provider/model` ID.
+Optional metadata failures permit ids-only output only after
 confirmed cleanup; cancellation or unconfirmed closure never becomes success.
 
 Maximum encoded frame is 1 MiB including the NDJSON newline. Inline input is at most

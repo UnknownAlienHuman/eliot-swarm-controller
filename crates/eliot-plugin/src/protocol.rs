@@ -157,7 +157,7 @@ pub struct ProfileStoreParams {
 }
 
 /// One catalogue phase per owned reader lifetime. OpenCode's native CLI uses
-/// separate commands for ids and variants; the host closes each family before
+/// separate commands for ids and metadata. The host closes each family before
 /// starting the next phase. Other harnesses use the default complete inventory.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -172,6 +172,7 @@ pub struct ModelListParams {
 pub enum ModelListPart {
     #[default]
     Models,
+    /// OpenCode model names and variants for the exact ids on the models phase.
     Variants,
 }
 
