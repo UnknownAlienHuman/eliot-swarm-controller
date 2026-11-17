@@ -59,67 +59,70 @@ impl DesktopApp {
                 ),
             ],
         );
-        let installed: Vec<(String, Option<String>)> = match &self.launch.catalog {
-            Some(Ok(reply)) => reply
-                .harnesses
-                .iter()
-                .filter(|entry| entry.installed)
-                .map(|entry| (entry.harness.clone(), entry.version.clone()))
-                .collect(),
-            _ => crate::picker::HARNESSES
-                .iter()
-                .map(|harness| ((*harness).to_owned(), None))
-                .collect(),
-        };
+        let catalog = self
+            .launch
+            .catalog
+            .as_ref()
+            .and_then(|reply| reply.as_ref().ok());
         let now = crate::handoff::now_ms();
-        let mut cards: Vec<KeyedView> = Vec::new();
-        for (harness, version) in installed {
-            let label = crate::picker::harness_label(&harness);
+        let mut cards = Vec::new();
+        for harness in crate::picker::HARNESSES {
+            let entry = catalog.and_then(|reply| {
+                reply
+                    .harnesses
+                    .iter()
+                    .find(|entry| entry.harness == harness)
+            });
+            let label = crate::picker::harness_label(harness);
             let provider =
-                crate::picker::provider_label(&eliot_core::api::catalog_provider(&harness, ""));
+                crate::picker::provider_label(&eliot_core::api::catalog_provider(harness, ""));
             let title = if provider.eq_ignore_ascii_case(label) || provider.is_empty() {
                 label.to_owned()
             } else {
                 format!("{label} · {provider}")
             };
-            let rows: Vec<KeyedView> = match self.settings.quotas.get(&harness) {
-                None => vec![KeyedView::new(
+            let read = self.settings.quotas.get(harness);
+            let observed = read
+                .and_then(|result| result.as_ref().ok())
+                .and_then(crate::quota::observed_note);
+            let metadata = [
+                entry.and_then(|entry| entry.version.as_deref()),
+                observed.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            let rows = match read {
+                None if self.settings.quotas_loading > 0 => vec![KeyedView::new(
                     "reading",
-                    m3::setting_row("Reading the limits…", "", View::empty()),
+                    m3::setting_row("Reading limits…", "", View::empty()),
                 )],
-                Some(Err(error)) => vec![KeyedView::new(
-                    "error",
-                    m3::setting_row(
-                        "Limits not read",
-                        &crate::state::plain_error(error),
-                        View::empty(),
-                    ),
-                )],
+                None => unknown_limits(""),
+                Some(Err(error)) => unknown_limits(&crate::state::plain_error(error)),
                 Some(Ok(reply)) => {
                     let windows = crate::quota::windows(reply);
                     if windows.is_empty() {
-                        vec![KeyedView::new(
-                            "status",
-                            m3::setting_row(
-                                &crate::quota::status_line(label, reply),
-                                "",
-                                View::empty(),
-                            ),
-                        )]
+                        let status = crate::quota::status_line(label, reply);
+                        let note = status
+                            .strip_prefix(label)
+                            .and_then(|status| status.strip_prefix(": "))
+                            .map_or_else(|| status.clone(), crate::quota::sentence);
+                        unknown_limits(&note)
                     } else {
-                        let observed = crate::quota::observed_note(reply);
                         windows
                             .iter()
                             .enumerate()
                             .map(|(index, window)| {
                                 let title = format!("{} remaining", window.name());
-                                let mut note = crate::quota::sentence(&window.resets_in(now));
-                                if let Some(observed) = &observed {
-                                    note = format!("{note} · {observed}");
-                                }
+                                let note = crate::quota::sentence(&window.resets_in(now));
                                 KeyedView::new(
                                     format!("{index}:{title}:{note}:{}", window.remaining),
-                                    m3::setting_row(&title, &note, limit_value(window.remaining)),
+                                    m3::setting_row(
+                                        &title,
+                                        &note,
+                                        limit_value(palette, window.remaining),
+                                    ),
                                 )
                             })
                             .collect()
@@ -127,7 +130,7 @@ impl DesktopApp {
                 }
             };
             cards.push(KeyedView::new(
-                format!("harness:{harness}"),
+                format!("harness:{harness}:{metadata}"),
                 StackPanel::new().spacing(tokens::spacing::SM).children((
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
@@ -135,8 +138,7 @@ impl DesktopApp {
                         .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
                         .children((
                             m3::section_title(title),
-                            m3::secondary(version.unwrap_or_default())
-                                .vertical_alignment(VerticalAlignment::Center),
+                            m3::secondary(metadata).vertical_alignment(VerticalAlignment::Center),
                         )),
                     m3::settings_card(palette, rows),
                 )),
@@ -185,14 +187,22 @@ fn agents(count: usize) -> String {
     format!("{count} {}", if count == 1 { "Agent" } else { "Agents" })
 }
 
-/// A limit's share left and its ring (Antigravity's rows).
-fn limit_value(remaining: i64) -> View {
+fn unknown_limits(note: &str) -> Vec<KeyedView> {
+    vec![KeyedView::new(
+        format!("unknown:{note}"),
+        m3::setting_row("Quota unknown", note, View::empty()),
+    )]
+}
+
+/// A limit's share left and its status ring.
+fn limit_value(palette: Palette, remaining: i64) -> View {
+    let status = palette.quota_status(remaining);
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::SM)
         .children((
             m3::body(format!("{remaining}%")).vertical_alignment(VerticalAlignment::Center),
-            m3::ring(remaining as f64),
+            m3::status_ring(status),
         ))
 }
 

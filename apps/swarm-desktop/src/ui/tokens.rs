@@ -140,7 +140,7 @@ pub mod layout {
     /// is sized to the pill and ends flush with its row.
     pub const SWITCH_WIDTH: f64 = 40.0;
     /// A quota ring (Models & Usage).
-    pub const RING: f64 = 32.0;
+    pub const RING: f64 = 16.0;
 }
 
 #[cfg(test)]

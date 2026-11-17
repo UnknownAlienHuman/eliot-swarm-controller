@@ -4,9 +4,11 @@
 //! are drawn by the conversation's composer; every popover overlays the
 //! conversation right above the composer.
 
+use std::collections::HashMap;
+
 use super::launch_ui::{CHAT_PROJECT, OTHER_FOLDER, Pop};
 use super::*;
-use crate::picker::{Choice, Item, ManageGroup, Row};
+use crate::picker::{Choice, Item, ItemKind, ManageGroup, Row};
 use crate::settings::Access;
 use crate::theme::winui::Palette;
 
@@ -180,6 +182,23 @@ impl DesktopApp {
 
     pub(super) fn model_popover(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let rows = self.picker_rows();
+        // Titles are presentation only. Conversation rows and their actions
+        // still use the Agent's scoped catalog and exact model ids.
+        let titles: HashMap<_, _> = self
+            .launch
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.as_ref().ok())
+            .into_iter()
+            .flat_map(|catalog| &catalog.models)
+            .filter(|model| !model.display_name.trim().is_empty())
+            .map(|model| {
+                (
+                    (model.harness.as_str(), model.id.as_str()),
+                    model.display_name.as_str(),
+                )
+            })
+            .collect();
         let highlight = self.launch.highlight.as_deref();
         let mut items: Vec<KeyedView> = Vec::new();
         for row in &rows {
@@ -260,7 +279,17 @@ impl DesktopApp {
                     // Not keyed by the highlight: the highlight is the row's
                     // fill, and re-creating the row under the pointer as it
                     // enters would drop the click that follows.
-                    let choice = self.picker_row(item, highlighted, context, palette);
+                    let title = match &item.kind {
+                        ItemKind::Model {
+                            harness,
+                            model: Some(id),
+                        } => titles
+                            .get(&(harness.as_str(), id.as_str()))
+                            .copied()
+                            .unwrap_or(id),
+                        _ => &item.title,
+                    };
+                    let choice = self.picker_row(item, title, highlighted, context, palette);
                     let choice = if item.key == "auto" {
                         Grid::new()
                             .columns([GridLength::STAR, GridLength::Auto])
@@ -279,7 +308,7 @@ impl DesktopApp {
                         choice
                     };
                     items.push(KeyedView::new(
-                        format!("{}:{}", item.key, item.current),
+                        format!("{}:{}:{title}", item.key, item.current),
                         choice,
                     ));
                 }
@@ -327,58 +356,46 @@ impl DesktopApp {
             )))
     }
 
-    /// One picker row: a check on the current choice, the model and its
-    /// provider, badges, and its effort; the highlighted row shows the
-    /// efforts to choose from and the favorite star.
+    /// Model selection, effort choices and the favorite action are siblings
+    /// so every effort pill can be clicked directly.
     fn picker_row(
         &self,
         item: &Item,
+        title: &str,
         highlighted: bool,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
         let enabled = item.disabled.is_none();
-        let check: View = if item.current {
-            m3::icon(m3::glyph::CHECK)
-        } else {
-            View::empty()
-        };
-        let mut marks: Vec<KeyedView> = Vec::new();
-        if item.default {
-            marks.push(KeyedView::new("default", m3::badge(palette, "default")));
-        }
-        if item.hidden && !highlighted {
-            marks.push(KeyedView::new("hidden", m3::badge(palette, "hidden")));
-        }
-        if item.favorite && !highlighted {
-            marks.push(KeyedView::new("star", m3::icon(m3::glyph::STAR_FILLED)));
-        }
-        match (&item.disabled, &item.effort) {
-            (Some(reason), _) => {
-                marks.push(KeyedView::new("reason", m3::secondary(reason.clone())));
+        let detail = item.disabled.as_deref().unwrap_or_else(|| {
+            // OpenCode catalog rows already sit beneath a provider heading.
+            if item.key.starts_with("opencode:") {
+                ""
+            } else {
+                &item.detail
             }
-            (None, Some(effort)) if !highlighted || item.efforts.is_empty() => {
-                marks.push(KeyedView::new("effort", m3::secondary(effort.clone())));
+        });
+        let mut name = title.to_owned();
+        for (show, label) in [
+            (item.current, "current"),
+            (item.default, "default model"),
+            (item.favorite, "favorite"),
+            (item.hidden, "hidden in Manage models"),
+        ] {
+            if show {
+                name.push_str(", ");
+                name.push_str(label);
             }
-            _ => {}
         }
-        let trailing: View = StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::SM)
-            .vertical_alignment(VerticalAlignment::Center)
-            .keyed_children(marks);
-        let mut name = format!("{}, {}", item.title, item.detail);
-        if let Some(effort) = &item.effort {
-            name.push_str(&format!(", effort {effort}"));
-        }
-        if item.current {
-            name.push_str(", current");
-        }
-        if item.hidden {
-            name.push_str(", hidden in Manage models");
-        }
-        if let Some(reason) = &item.disabled {
-            name.push_str(&format!(", {reason}"));
+        for value in [
+            &item.detail[..],
+            item.effort.as_deref().unwrap_or(""),
+            item.disabled.as_deref().unwrap_or(""),
+        ] {
+            if !value.is_empty() {
+                name.push_str(", ");
+                name.push_str(value);
+            }
         }
         let mut button = m3::row(palette, false)
             .is_enabled(enabled)
@@ -387,86 +404,100 @@ impl DesktopApp {
         if highlighted {
             button = button.element_ref(&self.launch.row_ref);
         }
-        let button = button.content(
-            Grid::new()
-                .columns([
-                    GridLength::Pixel(tokens::layout::CHECK_COLUMN),
-                    GridLength::STAR,
-                ])
-                .column_spacing(tokens::spacing::SM)
-                .children((
-                    Border::new()
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .content(check),
-                    Border::new().grid_column(1).content(m3::row_content(
-                        None,
-                        &item.title,
-                        &item.detail,
-                        trailing,
-                    )),
-                )),
-        );
-        let extras: View =
-            if highlighted && enabled {
-                let segments: Vec<KeyedView> = item
-                    .efforts
-                    .iter()
-                    .map(|effort| {
-                        let selected = item.effort.as_deref() == Some(effort.as_str());
-                        KeyedView::new(
-                            format!("effort:{effort}:{selected}"),
-                            m3::segment(palette, selected)
-                                .automation_name(format!("{} with effort {effort}", item.title))
-                                .on_click(context.message(Message::Launch(
-                                    LaunchMsg::PickerEffort(item.key.clone(), effort.clone()),
-                                )))
-                                .content(m3::segment_label(effort)),
-                        )
-                    })
-                    .collect();
-                // The efforts on their own track, so the chosen one stands
-                // out from the row's highlight.
-                let mut cells: Vec<KeyedView> = Vec::new();
-                if item.hidden {
-                    cells.push(KeyedView::new(
-                        "hidden",
+        let check = if item.current {
+            m3::icon(m3::glyph::CHECK)
+        } else {
+            View::empty()
+        };
+        let labels: Vec<_> = [
+            (item.default, "Default"),
+            (item.favorite, "Favorite"),
+            (item.hidden, "Hidden"),
+        ]
+        .into_iter()
+        .filter(|(show, _)| *show)
+        .map(|(_, label)| KeyedView::new(label, m3::badge(palette, label)))
+        .collect();
+        let badges = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(tokens::spacing::XS)
+            .keyed_children(labels);
+        let button = button
+            .content(
+                Grid::new()
+                    .columns([
+                        GridLength::Pixel(tokens::layout::CHECK_COLUMN),
+                        GridLength::STAR,
+                    ])
+                    .column_spacing(tokens::spacing::SM)
+                    .children((
                         Border::new()
-                            .margin(Thickness::new(0.0, 0.0, tokens::spacing::SM, 0.0))
                             .vertical_alignment(VerticalAlignment::Center)
-                            .content(m3::badge(palette, "hidden")),
-                    ));
-                }
-                if !segments.is_empty() {
-                    cells.push(KeyedView::new("efforts", m3::segmented(palette, segments)));
-                }
-                if item.model_ref().is_some() {
-                    let glyph = if item.favorite {
-                        m3::glyph::STAR_FILLED
-                    } else {
-                        m3::glyph::STAR
-                    };
-                    cells.push(KeyedView::new(
-                        format!("star:{}", item.favorite),
-                        m3::icon_button(palette)
-                            .automation_name(if item.favorite {
-                                format!("Remove {} from favorites (Ctrl+F)", item.title)
-                            } else {
-                                format!("Add {} to favorites (Ctrl+F)", item.title)
-                            })
-                            .on_click(context.message(Message::Launch(LaunchMsg::PickerFavorite(
-                                item.key.clone(),
-                            ))))
-                            .content(m3::icon(glyph)),
-                    ));
-                }
-                StackPanel::new()
-                    .grid_column(1)
-                    .orientation(Orientation::Horizontal)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .keyed_children(cells)
+                            .content(check),
+                        Border::new()
+                            .grid_column(1)
+                            .content(m3::row_content(None, title, detail, badges)),
+                    )),
+            )
+            .tooltip(title.to_owned());
+        let mut actions: Vec<_> = item
+            .efforts
+            .iter()
+            .map(|effort| {
+                let selected = item.effort.as_deref() == Some(effort);
+                KeyedView::new(
+                    format!("effort:{effort}:{selected}"),
+                    m3::segment(palette, selected)
+                        .min_width(0.0)
+                        .is_enabled(enabled)
+                        .automation_name(format!("{title} with effort {effort}"))
+                        .on_click(context.message(Message::Launch(LaunchMsg::PickerEffort(
+                            item.key.clone(),
+                            effort.clone(),
+                        ))))
+                        .content(m3::segment_label(effort)),
+                )
+            })
+            .collect();
+        if actions.is_empty() && matches!(item.kind, ItemKind::Model { .. }) {
+            actions.push(KeyedView::new(
+                "effort",
+                m3::badge(palette, item.effort.as_deref().unwrap_or("Default effort")),
+            ));
+        }
+        if enabled && item.model_ref().is_some() {
+            let favorite = if highlighted {
+                let (glyph, action) = if item.favorite {
+                    (
+                        m3::glyph::STAR_FILLED,
+                        format!("Remove {title} from favorites"),
+                    )
+                } else {
+                    (m3::glyph::STAR, format!("Add {title} to favorites"))
+                };
+                m3::icon_button(palette)
+                    .automation_name(action)
+                    .on_click(
+                        context
+                            .message(Message::Launch(LaunchMsg::PickerFavorite(item.key.clone()))),
+                    )
+                    .content(m3::icon(glyph))
             } else {
                 View::empty()
             };
+            actions.push(KeyedView::new(
+                format!("star:{highlighted}:{}", item.favorite),
+                Border::new()
+                    .width(tokens::height::CONTROL)
+                    .content(favorite),
+            ));
+        }
+        let actions = StackPanel::new()
+            .grid_column(1)
+            .orientation(Orientation::Horizontal)
+            .spacing(tokens::spacing::XS)
+            .vertical_alignment(VerticalAlignment::Center)
+            .keyed_children(actions);
         Border::new()
             .corner_radius(tokens::radius::CONTROL)
             .background(if highlighted {
@@ -483,7 +514,7 @@ impl DesktopApp {
             .content(
                 Grid::new()
                     .columns([GridLength::STAR, GridLength::Auto])
-                    .children((button, extras)),
+                    .children((button, actions)),
             )
     }
 
@@ -858,13 +889,8 @@ fn group_heading(
     } else {
         (m3::glyph::CHEVRON_DOWN, "expanded")
     };
-    let label: View = if indent > 0.0 {
-        m3::secondary(title.to_owned()).into()
-    } else {
-        m3::section_label(title.to_owned())
-            .font_weight(m3::weight(tokens::text::SECTION_TITLE))
-            .into()
-    };
+    let label =
+        m3::section_label(title.to_owned()).font_weight(m3::weight(tokens::text::SECTION_TITLE));
     m3::sub_row(palette, false)
         .margin(Thickness::new(indent, 0.0, 0.0, 0.0))
         .automation_name(format!("{title} models, {state}"))
