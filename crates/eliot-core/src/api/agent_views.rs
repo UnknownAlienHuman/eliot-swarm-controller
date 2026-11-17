@@ -1505,6 +1505,9 @@ impl CloudMcpStatus {
 /// `pruned_through` is the retained-event watermark. `size_advisory` is
 /// present only when retention is unbounded and the combined size passes the
 /// documented threshold (see `configuration.md` daemon retention).
+/// `config_error` is the typed code and message when `config.toml` could not
+/// be read: the windows are then unknown, so they read back absent with
+/// `unbounded` false and no advisory, never as an unset (unbounded) policy.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionView {
@@ -1517,6 +1520,9 @@ pub struct RetentionView {
     pub unbounded: bool,
     #[serde(deserialize_with = "nullable")]
     pub size_advisory: Option<String>,
+    /// Trailing field; absent when the configuration was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
 }
 
 impl RetentionView {
@@ -1529,11 +1535,14 @@ impl RetentionView {
         if self.pruned_through < 0 {
             return Err(invalid_response());
         }
-        if self.unbounded
-            != (self.events_days.is_none()
-                && self.commands_days.is_none()
-                && self.mail_days.is_none())
-        {
+        let unset =
+            self.events_days.is_none() && self.commands_days.is_none() && self.mail_days.is_none();
+        let known = match &self.config_error {
+            None => true,
+            Some(error) if !error.trim().is_empty() && error.len() <= 512 && unset => false,
+            Some(_) => return Err(invalid_response()),
+        };
+        if self.unbounded != (known && unset) {
             return Err(invalid_response());
         }
         if let Some(advisory) = &self.size_advisory
@@ -3116,7 +3125,56 @@ mod tests {
             wal_bytes: 0,
             unbounded: true,
             size_advisory: None,
+            config_error: None,
         }
+    }
+
+    #[test]
+    fn unreadable_config_reads_back_unknown_windows_never_unbounded() {
+        let unknown = RetentionView {
+            unbounded: false,
+            config_error: Some("invalid: config.toml could not be parsed".to_owned()),
+            ..retention_view()
+        };
+        unknown.validate().unwrap();
+        let wire = serde_json::to_value(&unknown).unwrap();
+        assert_eq!(
+            wire["config_error"],
+            "invalid: config.toml could not be parsed"
+        );
+        assert_eq!(
+            serde_json::from_value::<RetentionView>(wire).unwrap(),
+            unknown
+        );
+        // A failed read is never presented as an unset (unbounded) policy,
+        // with an advisory, or with windows it could not have read.
+        for bad in [
+            RetentionView {
+                unbounded: true,
+                ..unknown.clone()
+            },
+            RetentionView {
+                size_advisory: Some("growing".to_owned()),
+                ..unknown.clone()
+            },
+            RetentionView {
+                events_days: Some(30),
+                ..unknown.clone()
+            },
+            RetentionView {
+                config_error: Some(" ".to_owned()),
+                ..unknown.clone()
+            },
+        ] {
+            assert!(bad.validate().is_err());
+        }
+        // Readable configuration omits the field on the wire.
+        assert!(
+            serde_json::to_value(retention_view())
+                .unwrap()
+                .get("config_error")
+                .is_none()
+        );
     }
 
     #[test]

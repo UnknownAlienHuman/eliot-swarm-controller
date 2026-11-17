@@ -423,6 +423,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `agent.list/get/result` | scoped, paginated Agent state and exact results |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `agent.git/edits` | current Git snapshot and paginated native-attributed edits |
+| `workspace.list` | owner-only page of the managed worktrees Swarm created |
 | `command.submit/get` | implemented immutable admission and command readback |
 | `turn.get` | implemented running/completed/unknown turn read |
 | `swarm.wait` | bounded wait over a frozen child command/turn set with all/any, timeout and honest per-entry outcomes |
@@ -569,7 +570,10 @@ watermark `pruned_through`. `unbounded` is true only when all three windows
 are unset — the default daemon never prunes. When retention is unbounded and
 the combined store size passes the documented threshold, the view carries a
 bounded `size_advisory` naming the remedy; the hourly maintenance tick logs
-one line for the same condition. See
+one line for the same condition. When `config.toml` cannot be read, status
+stays available but the windows are unknown: the view carries the redacted
+`config_error` (`code: message`), all windows absent, `unbounded:false` and no
+advisory, so a read failure never reads back as an unset policy. See
 [configuration](configuration.md) for the windows and the
 threshold, and [monitoring](monitoring.md#views) for the advisory.
 
@@ -587,6 +591,16 @@ canonical checkout, repository common directory, explicit profile/action allowli
 optional Git fetch approval. They do not create or modify registrations. Their project
 values use Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs),
 whose optional `git` value uses [`ProjectGitView` and `GitCredentialHelper`](../../crates/eliot-core/src/api/agent_views.rs).
+
+`workspace.list {after?, limit?}` is an owner-only page of the managed worktrees
+that `launch --worktree` prepared and that are not yet removed, read from the
+retained workspace preparations (never inferred from Agent project labels), ordered
+by Agent ID. Rows use Core
+[`ManagedWorkspaceView`](../../crates/eliot-core/src/api/workspaces.rs): Agent,
+project, source repository, branch, worktree path, preparation phase and update
+time. Like `agent.list`, the response carries the required `total` ignoring the
+cursor, explicit `truncated`, and `next` at the last row of a nonempty page; `limit`
+defaults to 100 and must be 1–1,000. Settings › Worktrees pages it to the end.
 
 `rule.get` uses `RuleGetRequest`/`RuleStateView`, is owner-only, and reads the selected
 global or project rule's current cursor and any retiring definition's cursor/boundary. An

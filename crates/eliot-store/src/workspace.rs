@@ -831,6 +831,47 @@ impl Store {
         Ok(false)
     }
 
+    /// One page of managed worktrees not yet removed, after the Agent cursor,
+    /// with the matching total ignoring the cursor and whether more rows
+    /// follow the page (`workspace.list`).
+    pub fn list_managed_workspaces(
+        &self,
+        after_agent: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<WorkspacePreparation>, usize, bool)> {
+        validate_limit(limit)?;
+        let after = after_agent.map(parse_agent_id).transpose()?.unwrap_or(0);
+        let total: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE phase <> 'removed'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT {WORKSPACE_COLUMNS} FROM workspaces
+                 WHERE agent > ?1 AND phase <> 'removed' ORDER BY agent LIMIT ?2"
+            ))
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![after, limit as i64 + 1], workspace_from_row)
+            .map_err(sql_error)?;
+        let mut workspaces = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?;
+        let mut more = workspaces.len() > limit;
+        workspaces.truncate(limit);
+        let fetched = workspaces.len();
+        enforce_page_bytes(&mut workspaces)?;
+        more |= workspaces.len() < fetched;
+        let total = usize::try_from(total)
+            .map_err(|_| Error::new("source_integrity", "workspace count is invalid"))?;
+        Ok((workspaces, total, more))
+    }
+
     /// Runtime recovery/cleanup candidates only; settled workspace history stays
     /// durable without allocating an operation slot in the daemon.
     pub fn list_pending_workspace_preparations(
