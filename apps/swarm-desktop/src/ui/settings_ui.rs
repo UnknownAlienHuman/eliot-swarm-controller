@@ -478,7 +478,7 @@ impl SettingsState {
     fn refused(&mut self, page: Page, mut note: Note) {
         if page != Page::Advanced {
             self.discard(page);
-            note.text = format!("{} {SHOWS_SAVED}", note.text);
+            note.text = format!("{}. {SHOWS_SAVED}", note.text.trim_end_matches('.'));
         }
         self.notes.insert(page, note);
     }
@@ -1870,7 +1870,11 @@ mod tests {
         assert_eq!(state.projects, stored);
         assert!(!state.dirty(Page::Projects));
         let note = &state.notes[&Page::Projects];
-        assert!(note.error && note.text.contains("no such folder"));
+        assert!(note.error);
+        assert_eq!(
+            note.text,
+            "Not saved: no such folder. The page shows the saved values."
+        );
         // The settings file's JSON keeps its draft for correction.
         edit_all(
             &mut state,
