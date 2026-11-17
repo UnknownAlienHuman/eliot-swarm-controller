@@ -9237,6 +9237,7 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
                  ON commands(target, generation, request_id, state)
                  WHERE request_id IS NOT NULL;
              CREATE TABLE events(
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  agent INTEGER, generation INTEGER, family TEXT,
                  kind TEXT, source TEXT, data TEXT,
                  ts INTEGER NOT NULL DEFAULT 0,
