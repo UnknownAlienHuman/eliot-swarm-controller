@@ -14,9 +14,9 @@
 //! never changes the item keys; only a new or evicted turn does.
 //!
 //! Coverage is explicit and never inferred: how many turns the result read
-//! returned against its limit, which journal window was scanned, whether the
-//! Agent's creation event was inside it, the retention floor, evictions and
-//! inputs whose text could not be read.
+//! returned against its limit, whether the Agent's creation event is still
+//! retained (its events are read from there), the retention floor, evictions
+//! and inputs whose text could not be read.
 
 use std::collections::{HashMap, HashSet};
 
@@ -274,13 +274,11 @@ pub struct Coverage {
     /// `agent.result` limit used and rows it returned.
     pub result_limit: usize,
     pub result_returned: usize,
-    /// Exclusive lower bound of the scanned journal window.
-    pub window_from: i64,
     /// Committed cursor: events are applied through this sequence.
     pub cursor: i64,
     /// Retention floor from `events.bounds`.
     pub pruned_through: i64,
-    /// The Agent's `agent.created` event was inside the scanned window.
+    /// The Agent's `agent.created` event was read (it is still retained).
     pub reached_creation: bool,
     /// Turns dropped from memory by the resident bounds.
     pub evicted_turns: usize,
@@ -294,25 +292,21 @@ impl Coverage {
         self.result_returned < self.result_limit
     }
 
-    /// The window reached the retention floor before the Agent's creation:
-    /// older activity was pruned and cannot be read.
+    /// The Agent's events are read from the retention floor; without its
+    /// creation event, older activity was pruned and cannot be read.
     pub fn activity_pruned(&self) -> bool {
-        !self.reached_creation && self.window_from <= self.pruned_through && self.pruned_through > 0
+        !self.reached_creation && self.pruned_through > 0
     }
 
-    /// Older retained activity exists beyond the scanned window.
-    pub fn activity_more(&self) -> bool {
-        !self.reached_creation && self.window_from > self.pruned_through
-    }
-
+    /// "Load older" pages turns only: the events already start at creation.
     pub fn can_load_older(&self) -> bool {
-        (!self.turns_complete() && self.result_limit < MAX_RESULT_LIMIT) || self.activity_more()
+        !self.turns_complete() && self.result_limit < MAX_RESULT_LIMIT
     }
 
     /// Human-readable coverage lines; every limit is named, none is hidden.
-    /// Only what is unusual about the loaded window, in words: older turns
-    /// or activity not loaded, retention pruning, unreadable inputs,
-    /// evicted turns, a reread in progress. Empty when everything is here.
+    /// Only what is unusual about the loaded conversation, in words: older
+    /// turns not loaded, retention pruning, unreadable inputs, evicted
+    /// turns, a reread in progress. Empty when everything is here.
     pub fn notes(&self, inputs_missing: usize) -> Vec<String> {
         let mut notes = Vec::new();
         if !self.turns_complete() {
@@ -324,14 +318,17 @@ impl Coverage {
         if self.activity_pruned() {
             notes.push("Older activity was removed by retention.".to_owned());
         }
-        if inputs_missing > 0 {
-            notes.push(format!("{inputs_missing} message(s) could not be read."));
+        match inputs_missing {
+            0 => {}
+            1 => notes.push("1 message could not be read.".to_owned()),
+            count => notes.push(format!("{count} messages could not be read.")),
         }
-        if self.evicted_turns > 0 {
-            notes.push(format!(
-                "{} older turn(s) left memory to keep the window light.",
-                self.evicted_turns
-            ));
+        match self.evicted_turns {
+            0 => {}
+            1 => notes.push("1 older turn left memory to keep the window light.".to_owned()),
+            count => notes.push(format!(
+                "{count} older turns left memory to keep the window light."
+            )),
         }
         if self.stale.is_some() {
             notes.push("Catching up with new activity.".to_owned());
@@ -751,13 +748,17 @@ impl Conversation {
         missing
     }
 
-    /// Resident turns without a linked input or with an unreadable one.
+    /// Resident turns without a linked input or whose input read failed.
+    /// An input still being read is not counted: the note describes what
+    /// is missing now, and clears once the text arrives.
     pub fn inputs_unavailable(&self) -> usize {
         self.turns
             .values()
             .filter(|turn| match turn.command_id.as_deref() {
                 None => true,
-                Some(command) => !matches!(self.inputs.get(command), Some(InputText::Loaded(_))),
+                Some(command) => {
+                    matches!(self.inputs.get(command), Some(InputText::Unavailable(_)))
+                }
             })
             .count()
     }
@@ -1322,7 +1323,6 @@ mod tests {
     #[test]
     fn coverage_names_pruned_and_unloaded_history() {
         let mut coverage = coverage();
-        coverage.window_from = 50;
         coverage.pruned_through = 50;
         coverage.cursor = 90;
         assert!(coverage.activity_pruned());
@@ -1332,17 +1332,17 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("removed by retention"))
         );
-        coverage.pruned_through = 10;
-        assert!(coverage.activity_more());
+        coverage.reached_creation = true;
+        assert!(coverage.notes(0).is_empty());
         assert!(
-            !coverage
-                .notes(0)
-                .iter()
-                .any(|note| note.contains("retention"))
+            !coverage.can_load_older(),
+            "events already start at creation"
         );
         coverage.result_returned = TURN_PAGE;
         assert!(!coverage.turns_complete());
         assert!(coverage.can_load_older());
+        assert_eq!(coverage.notes(1)[1], "1 message could not be read.");
+        assert_eq!(coverage.notes(2)[1], "2 messages could not be read.");
     }
 
     #[test]

@@ -3,11 +3,11 @@
 //! one-shot background workers; no WinUI types, so they build everywhere.
 //!
 //! Snapshot recovery follows the issue's order: capture the committed cursor
-//! first (`events.bounds`), then load the current reads, then scan the
-//! retained window up to that cursor. Live delivery continues strictly after
-//! it, so an event is either inside the snapshot or delivered later, never
-//! both and never neither. Markdown is parsed here, off the UI thread, into
-//! owned blocks keyed by content hash.
+//! first (`events.bounds`), then load the current reads, then read the
+//! Agent's retained events up to that cursor. Live delivery continues
+//! strictly after where that read stopped, so an event is either inside the
+//! snapshot or delivered later, never both and never neither. Markdown is
+//! parsed here, off the UI thread, into owned blocks keyed by content hash.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -22,15 +22,11 @@ use crate::client;
 use crate::live::{COALESCE_MS, DRAIN_LIMIT, DRAIN_PAGES};
 use crate::markdown::{self, Doc};
 
-/// Journal rows scanned by default, back from the cursor (about 1.5 s on
-/// the live journal: the server scans 1,000 rows per read).
-pub const DEFAULT_WINDOW_ROWS: i64 = 40_000;
-/// Journal rows scanned at most, however far back the Agent was created.
-pub const MAX_WINDOW_ROWS: i64 = 200_000;
-/// Rows kept below the located creation point (commit-time skew margin).
-const CREATION_MARGIN_ROWS: i64 = 64;
-/// Milliseconds subtracted from `created_at` before locating it.
-const CREATION_MARGIN_MS: i64 = 2_000;
+/// `events.read` pages one snapshot reads at most. Each page holds at most
+/// 1,000 of the Agent's own matching rows (the daemon reads them through its
+/// agent index), so the work follows the Agent's history, not the journal;
+/// a longer history continues through live delivery from where it stopped.
+const SNAPSHOT_PAGES: usize = 64;
 
 type Fallible<T> = Result<T, String>;
 
@@ -38,30 +34,27 @@ fn text(error: eliot_core::Error) -> String {
     error.to_string()
 }
 
-/// How much retained history a snapshot reads.
+/// How many authoritative turns a snapshot reads; its journal events always
+/// start at the Agent's creation (or the retention floor).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Depth {
     pub result_limit: usize,
-    pub window_rows: i64,
 }
 
 impl Default for Depth {
     fn default() -> Self {
         Self {
             result_limit: crate::chat::TURN_PAGE,
-            window_rows: DEFAULT_WINDOW_ROWS,
         }
     }
 }
 
 impl Depth {
-    /// "Load older": one more page of turns and the window back to the
-    /// Agent's creation, within the bound.
+    /// "Load older": one more page of turns.
     pub fn older(self) -> Self {
         Self {
             result_limit: (self.result_limit + crate::chat::TURN_PAGE)
                 .min(crate::chat::MAX_RESULT_LIMIT),
-            window_rows: MAX_WINDOW_ROWS,
         }
     }
 }
@@ -120,7 +113,7 @@ fn linked_commands(events: &[Event]) -> Vec<String> {
     commands
 }
 
-/// Snapshot one Agent: cursor first, then the reads, then the window.
+/// Snapshot one Agent: cursor first, then the reads, then its events.
 pub fn snapshot(data_dir: &Path, agent: &str, depth: Depth) -> Fallible<Snapshot> {
     client::block_on(async {
         let filter = client::chat_filter(agent);
@@ -131,24 +124,20 @@ pub fn snapshot(data_dir: &Path, agent: &str, depth: Depth) -> Fallible<Snapshot
         let results = client::agent_results(data_dir, agent, depth.result_limit)
             .await
             .map_err(text)?;
-        // Start at the Agent's creation when it is inside the window, so a
-        // recent Agent reads complete and an old one names what it skipped.
-        let created = client::seq_before(
+        // Every retained event of this Agent, from its creation: Agent ids
+        // are never reused, so nothing of it lies below the retention floor
+        // except what retention removed. Live delivery resumes at `next`.
+        let scan = client::scan_events_budgeted(
             data_dir,
-            detail.agent.created_at - CREATION_MARGIN_MS,
             bounds.pruned_through,
             bounds.hi,
+            &filter,
+            SNAPSHOT_PAGES,
+            &|| false,
         )
         .await
         .map_err(text)?;
-        let window_from = bounds
-            .pruned_through
-            .max(bounds.hi.saturating_sub(depth.window_rows))
-            .max(created.saturating_sub(CREATION_MARGIN_ROWS))
-            .max(0);
-        let events = client::scan_events(data_dir, window_from, bounds.hi, &filter)
-            .await
-            .map_err(text)?;
+        let events = scan.events;
         let inputs = client::input_texts(data_dir, linked_commands(&events)).await;
         let docs = parse_docs(Conversation::markdown_texts(&results.turns, &events));
         Ok(Snapshot {
@@ -156,8 +145,7 @@ pub fn snapshot(data_dir: &Path, agent: &str, depth: Depth) -> Fallible<Snapshot
                 generation: results.generation,
                 result_limit: depth.result_limit,
                 result_returned: results.turns.len(),
-                window_from,
-                cursor: bounds.hi,
+                cursor: scan.next,
                 pruned_through: bounds.pruned_through,
                 ..Coverage::default()
             },

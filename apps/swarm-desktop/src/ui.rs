@@ -595,7 +595,6 @@ impl Component for DesktopApp {
                 collapsed: HashSet::new(),
                 unfolded: HashSet::new(),
                 show_archived: false,
-                attention_only: false,
                 search: shell_ui::Search::default(),
                 search_ref: ElementRef::new(),
                 shortcuts: None,

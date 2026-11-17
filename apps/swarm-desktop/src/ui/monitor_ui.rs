@@ -4,17 +4,24 @@
 
 use super::*;
 use crate::monitor::MonitorRow;
+use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
+use crate::ui::chat_ui::DraftAction;
 
 #[derive(Clone, Debug)]
 pub(super) enum MonitorMsg {
     MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
     /// A monitor card: open its conversation and its details.
     CardOpened(String),
+    /// A lost or failed card's Resume, bound to the generation shown: open
+    /// its conversation and resume it there.
+    ResumeRequested(String, i64),
     /// Show or hide the native children of one card.
     ChildrenToggled(String),
     /// Show or hide Recently stopped.
     StoppedToggled,
+    /// Show only the Needs attention section, or everything again.
+    AttentionToggled,
     ReparentRequested(reparent::MoveBinding),
     ReparentSettled(reparent::MoveBinding, Fallible<ReparentResponse>),
 }
@@ -33,6 +40,8 @@ pub(super) struct MonitorState {
     pub(super) expanded: HashSet<String>,
     /// Recently stopped is open (collapsed by default).
     pub(super) stopped_open: bool,
+    /// Only the Needs attention section is listed.
+    pub(super) attention_only: bool,
 }
 
 impl DesktopApp {
@@ -80,12 +89,28 @@ impl DesktopApp {
                     self.show_details(&agent.id, context);
                 }
             }
+            MonitorMsg::ResumeRequested(id, generation) => {
+                if self.submitting() {
+                    return;
+                }
+                self.monitor_update(MonitorMsg::CardOpened(id.clone()), context);
+                self.chat_update(
+                    ChatMsg::DraftRequested(DraftAction::Resume {
+                        agent: id,
+                        generation,
+                    }),
+                    context,
+                );
+            }
             MonitorMsg::ChildrenToggled(id) => {
                 if !self.monitor.expanded.remove(&id) {
                     self.monitor.expanded.insert(id);
                 }
             }
             MonitorMsg::StoppedToggled => self.monitor.stopped_open = !self.monitor.stopped_open,
+            MonitorMsg::AttentionToggled => {
+                self.monitor.attention_only = !self.monitor.attention_only;
+            }
             MonitorMsg::ReparentRequested(binding) => {
                 if self.submitting() {
                     return;
@@ -180,6 +205,7 @@ impl DesktopApp {
             selected: self.monitor.selected.clone(),
             stopped: self.monitor.data.wants_stopped(),
             attention_cursor: self.monitor.data.attention_cursor,
+            losses: self.monitor.data.loss_reads(),
         };
         self.monitor.task = Some(context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
@@ -226,10 +252,23 @@ impl DesktopApp {
         let data = &self.monitor.data;
         let indent = depth as f64 * tokens::layout::TREE_INDENT;
         let title = self.agent_title(&row.id);
-        let attention = data
-            .incident(row)
-            .filter(|_| row.state != eliot_core::AgentState::Stopped)
-            .map(|incident| monitor::attention_words(&incident.reason));
+        // A lost or failed card says why it ended, as its conversation does;
+        // a harness-contact report is only the consequence of that end.
+        let note = if row.resumable() {
+            data.loss_words(row).map(monitor_view::CardNote::Ended)
+        } else {
+            data.incident(row)
+                .filter(|_| row.state != eliot_core::AgentState::Stopped)
+                .map(|incident| {
+                    monitor_view::CardNote::Attention(monitor::attention_words(&incident.reason))
+                })
+        };
+        let resume = row.resumable().then(|| {
+            context.message(Message::Monitor(MonitorMsg::ResumeRequested(
+                row.id.clone(),
+                row.generation,
+            )))
+        });
         cards.push(KeyedView::new(
             format!("card:{}", row.id),
             Border::new()
@@ -237,8 +276,12 @@ impl DesktopApp {
                 .content(monitor_view::card(
                     row,
                     &title,
-                    attention.as_deref(),
-                    context.message(Message::Monitor(MonitorMsg::CardOpened(row.id.clone()))),
+                    note.as_ref(),
+                    monitor_view::CardActions {
+                        open: context
+                            .message(Message::Monitor(MonitorMsg::CardOpened(row.id.clone()))),
+                        resume: resume.map(|resume| (resume, !self.submitting())),
+                    },
                     palette,
                 )),
         ));
@@ -312,7 +355,32 @@ impl DesktopApp {
             ));
         }
         let sections = data.sections(now);
+        let attention_count = sections
+            .iter()
+            .find(|section| section.group == monitor::Group::Attention)
+            .map_or(0, |section| section.rows.len());
+        let attention_only = self.monitor.attention_only && attention_count > 0;
+        if attention_count > 0 {
+            let label = monitor::attention_filter_label(attention_count, attention_only);
+            cards.push(KeyedView::new(
+                format!("attention-filter:{attention_only}"),
+                m3::sub_row(palette, attention_only)
+                    .automation_name(label.clone())
+                    .on_click(context.message(Message::Monitor(MonitorMsg::AttentionToggled)))
+                    .content(m3::row_content(
+                        Some(m3::glyph::FLAG),
+                        &label,
+                        "",
+                        palette
+                            .dot(StatusTone::Attention)
+                            .map_or_else(View::empty, m3::dot),
+                    )),
+            ));
+        }
         for section in &sections {
+            if attention_only && section.group != monitor::Group::Attention {
+                continue;
+            }
             let top = section.rows.len();
             if section.group == monitor::Group::Stopped {
                 if top == 0 {
@@ -540,8 +608,9 @@ impl DesktopApp {
         // Change manager: one row per possible manager, each button bound
         // to that row's generation and the shown source generation.
         let source = read.map(|read| &read.agent.agent);
-        let enabled = !self.submitting() && source.is_some_and(|agent| !agent.observe_only);
-        let rows = reparent::candidates(&self.monitor.data.rows, &id)
+        let movable = source.is_some_and(|agent| !agent.observe_only);
+        let enabled = !self.submitting() && movable;
+        let rows: Vec<monitor_view::MoveRow> = reparent::candidates(&self.monitor.data.rows, &id)
             .into_iter()
             .map(|manager| {
                 let bind = |form| {
@@ -569,16 +638,19 @@ impl DesktopApp {
                 }
             })
             .collect();
-        sections.push(KeyedView::new(
-            "manager",
-            monitor_view::manager_section(
-                &id,
-                rows,
-                &self.monitor.reparent_status,
-                enabled,
-                palette,
-            ),
-        ));
+        // Shown only when a move is possible, or to report the last one.
+        if (movable && !rows.is_empty()) || !self.monitor.reparent_status.is_empty() {
+            sections.push(KeyedView::new(
+                "manager",
+                monitor_view::manager_section(
+                    &id,
+                    if movable { rows } else { Vec::new() },
+                    &self.monitor.reparent_status,
+                    enabled,
+                    palette,
+                ),
+            ));
+        }
 
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])

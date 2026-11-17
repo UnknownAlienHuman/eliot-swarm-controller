@@ -89,16 +89,17 @@ impl Settings {
     }
 
     /// What the Agent runs with, in words. The model and effort the
-    /// harness reports, each marked confirmed only after a turn used it
-    /// (a request is not proof); a change for the next turn when one was
-    /// asked for. Rows with nothing to say are left out.
+    /// harness reports, each marked confirmed only once the harness admitted
+    /// it (its launch readback or a turn that carried it; a request is not
+    /// proof); a change for the next turn when one was asked for. Rows with
+    /// nothing to say are left out.
     pub fn lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         let mark = |verified: bool| {
             if verified {
-                "confirmed by a turn"
+                "confirmed"
             } else {
-                "not verified yet"
+                "not confirmed yet"
             }
         };
         match (&self.effective_model, &self.effective_effort) {
@@ -112,10 +113,10 @@ impl Settings {
             _ => match (&self.profile_model, &self.profile_effort) {
                 (Some(model), Some(effort)) => {
                     lines.push(format!(
-                        "Asked for {model} · {effort} effort (not verified yet)"
+                        "Asked for {model} · {effort} effort (not confirmed yet)"
                     ));
                 }
-                (Some(model), None) => lines.push(format!("Asked for {model} (not verified yet)")),
+                (Some(model), None) => lines.push(format!("Asked for {model} (not confirmed yet)")),
                 _ => lines.push("Uses the harness's default model".to_owned()),
             },
         }
@@ -347,12 +348,12 @@ mod tests {
             ..Settings::default()
         };
         let lines = settings.lines();
-        assert_eq!(lines[0], "Model m1 (not verified yet)");
-        assert_eq!(lines[1], "Effort high (not verified yet)");
+        assert_eq!(lines[0], "Model m1 (not confirmed yet)");
+        assert_eq!(lines[1], "Effort high (not confirmed yet)");
         settings.effort_verified = true;
         let lines = settings.lines();
-        assert_eq!(lines[1], "Effort high (confirmed by a turn)");
-        assert_eq!(lines[0], "Model m1 (not verified yet)");
+        assert_eq!(lines[1], "Effort high (confirmed)");
+        assert_eq!(lines[0], "Model m1 (not confirmed yet)");
     }
 
     #[test]

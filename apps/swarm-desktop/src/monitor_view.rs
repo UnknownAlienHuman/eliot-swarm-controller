@@ -30,14 +30,31 @@ fn small(text: impl Into<String>) -> TextBlock {
         .is_text_selection_enabled(true)
 }
 
+/// The line under a card's measures: why a lost or failed Agent ended (from
+/// its loss origin), or an open attention report.
+pub enum CardNote {
+    Ended(String),
+    Attention(String),
+}
+
+/// Width the last lines of a resumable card leave for its Resume button.
+const RESUME_RESERVE: f64 = 88.0;
+
+/// What a card does: the card itself opens the conversation; a resumable
+/// one also offers Resume (its callback and whether it is enabled).
+pub struct CardActions {
+    pub open: Callback<()>,
+    pub resume: Option<(Callback<()>, bool)>,
+}
+
 /// One monitor card: the title with its status, what it does now, its
-/// resources in one muted line, and the open attention report when there
-/// is one. The whole card opens the conversation.
+/// resources in one muted line, and why it ended or the open attention
+/// report. The whole card opens the conversation; Resume sits on it.
 pub fn card(
     row: &MonitorRow,
     title: &str,
-    attention: Option<&str>,
-    open: Callback<()>,
+    note: Option<&CardNote>,
+    actions: CardActions,
     palette: Palette,
 ) -> View {
     let status = row.status_words();
@@ -48,26 +65,51 @@ pub fn card(
         .filter(|_| !row.native_child)
         .map(|parent| format!(" · under {parent}"))
         .unwrap_or_default();
-    let attention_line: View = match attention {
-        Some(text) => crate::m3::secondary(format!("Attention: {text}"))
-            .foreground(palette.error())
-            .text_trimming(TextTrimming::CharacterEllipsis)
-            .into(),
-        None => View::empty(),
+    let (note_line, note_name): (View, String) = match note {
+        Some(CardNote::Ended(text)) => (
+            crate::m3::body(text.clone())
+                .text_trimming(TextTrimming::CharacterEllipsis)
+                .into(),
+            format!(", {text}"),
+        ),
+        Some(CardNote::Attention(text)) => (
+            crate::m3::secondary(format!("Attention: {text}"))
+                .foreground(palette.error())
+                .text_trimming(TextTrimming::CharacterEllipsis)
+                .into(),
+            format!(", attention: {text}"),
+        ),
+        None => (View::empty(), String::new()),
+    };
+    // Only the measures the daemon reported.
+    let measures = [
+        row.obs
+            .rss_bytes()
+            .map(|_| bytes_label(row.obs.rss_bytes())),
+        row.obs
+            .cpu_time_ns()
+            .map(|_| cpu_time_label(row.obs.cpu_time_ns())),
+        row.tokens.map(|_| tokens_label(row)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+    let reserve = if actions.resume.is_some() {
+        RESUME_RESERVE
+    } else {
+        0.0
     };
     // The button pads its content by the control inset; the content adds
     // the same inset above and below.
-    crate::m3::card_button(
+    let card = crate::m3::card_button(
         palette,
         format!(
-            "{title}, {status}, {}{under}, {}{}",
+            "{title}, {status}, {}{under}, {}{note_name}",
             crate::picker::harness_label(&row.harness),
             row.operation(),
-            attention
-                .map(|text| format!(", attention: {text}"))
-                .unwrap_or_default()
         ),
-        open,
+        actions.open,
         StackPanel::new()
             .spacing(tokens::spacing::XS)
             // The button's 1-DIP border and 12-DIP inset plus this put the
@@ -97,26 +139,36 @@ pub fn card(
                 ))
                 .opacity(theme::MUTED_OPACITY)
                 .text_trimming(TextTrimming::CharacterEllipsis),
-                // Only the measures the daemon reported.
-                crate::m3::secondary(
-                    [
-                        row.obs
-                            .rss_bytes()
-                            .map(|_| bytes_label(row.obs.rss_bytes())),
-                        row.obs
-                            .cpu_time_ns()
-                            .map(|_| cpu_time_label(row.obs.cpu_time_ns())),
-                        row.tokens.map(|_| tokens_label(row)),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" · "),
-                )
-                .text_trimming(TextTrimming::CharacterEllipsis),
-                attention_line,
+                // The last lines leave room for Resume at the right.
+                Border::new()
+                    .margin(Thickness::new(0.0, 0.0, reserve, 0.0))
+                    .content(
+                        crate::m3::secondary(measures)
+                            .text_trimming(TextTrimming::CharacterEllipsis),
+                    ),
+                Border::new()
+                    .margin(Thickness::new(0.0, 0.0, reserve, 0.0))
+                    .content(note_line),
             )),
-    )
+    );
+    let Some((resume, enabled)) = actions.resume else {
+        return card;
+    };
+    // Resume is its own button beside the card button (a button inside a
+    // button would swallow the click): drawn over the card's top-right
+    // status line would hide it, so it sits on the card's bottom-right
+    // corner, level with the last line.
+    Grid::new().children((
+        card,
+        crate::m3::text_button(palette)
+            .horizontal_alignment(HorizontalAlignment::Right)
+            .vertical_alignment(VerticalAlignment::Bottom)
+            .margin(Thickness::xy(tokens::spacing::SM, tokens::spacing::SM))
+            .is_enabled(enabled)
+            .automation_name(format!("Resume {title} (generation {})", row.generation))
+            .on_click(resume)
+            .content(crate::m3::label("Resume")),
+    ))
 }
 
 /// Plot height in DIPs; the bars stretch across the card width.
@@ -378,7 +430,17 @@ fn group(value: i64) -> String {
 /// The CPU and memory charts of `id`, with the sampling note.
 pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<KeyedView> {
     let mut views: Vec<KeyedView> = Vec::new();
-    if let Some(row) = monitor.rows.iter().find(|row| row.id == id) {
+    let row = monitor.row(id);
+    // An Agent that ended with every process exited has nothing to sample:
+    // one line says so.
+    if row.is_some_and(|row| row.ended() && row.obs.live_processes() == 0) {
+        views.push(KeyedView::new(
+            "ended",
+            small("No live process.").opacity(theme::MUTED_OPACITY),
+        ));
+        return views;
+    }
+    if let Some(row) = row {
         views.push(KeyedView::new(
             "fresh",
             small(row.obs.freshness()).opacity(theme::MUTED_OPACITY),
@@ -443,6 +505,8 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
                 .opacity(theme::MUTED_OPACITY),
             ));
         }
+        // The freshness line already says nothing was sampled.
+        _ if row.is_some() => {}
         _ => views.push(KeyedView::new(
             "no-series",
             small("No process samples yet.").opacity(theme::MUTED_OPACITY),
@@ -452,7 +516,8 @@ pub fn resource_views(monitor: &Monitor, id: &str, palette: Palette) -> Vec<Keye
 }
 
 /// "Change manager": move the Agent with its subtree, or only its
-/// children, under another live Agent. Each button is already bound.
+/// children, under another live Agent. Each button is already bound. The
+/// caller leaves it out when there is nothing to move and nothing to report.
 pub fn manager_section(
     id: &str,
     rows: Vec<MoveRow>,
@@ -496,16 +561,17 @@ pub fn manager_section(
             )
         })
         .collect();
-    let note = if moves.is_empty() {
-        "No other live Agent can become the manager.".to_owned()
+    let note: View = if moves.is_empty() {
+        View::empty()
     } else {
-        "The daemon checks cycles, fanout limits, observe-only Agents and both generations."
-            .to_owned()
+        small("The daemon checks cycles, fanout limits, observe-only Agents and both generations.")
+            .opacity(theme::MUTED_OPACITY)
+            .into()
     };
     crate::m3::card_high(palette).content(
         StackPanel::new().spacing(tokens::spacing::SM).children((
             crate::m3::section_title("Change manager"),
-            small(note).opacity(theme::MUTED_OPACITY),
+            note,
             StackPanel::new()
                 .spacing(tokens::spacing::MD)
                 .keyed_children(moves),

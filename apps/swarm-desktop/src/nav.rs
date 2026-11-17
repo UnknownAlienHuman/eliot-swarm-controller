@@ -546,13 +546,18 @@ pub fn search(listed: &[UiAgent], checkouts: &[Checkout], query: &str) -> Vec<(S
         .collect()
 }
 
-/// The most recently changed conversations, newest first (ties by id), at
-/// most `limit`: no native observed child (it lives under its parent) and
-/// nothing archived.
-pub fn recents(agents: &[UiAgent], limit: usize) -> Vec<&UiAgent> {
+/// The most recently changed conversations the sidebar does not list
+/// elsewhere (`listed`), newest first (ties by id), at most `limit`: no
+/// native observed child (it lives under its parent) and nothing archived.
+pub fn recents<'a>(
+    agents: &'a [UiAgent],
+    limit: usize,
+    listed: &HashSet<&str>,
+) -> Vec<&'a UiAgent> {
     let mut recent: Vec<&UiAgent> = agents
         .iter()
         .filter(|agent| !agent.native_child && !agent.archived)
+        .filter(|agent| !listed.contains(agent.id.as_str()))
         .collect();
     recent.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
     // An id read on two pages shows once, at its newest time.
@@ -640,18 +645,6 @@ impl Fleet {
             return "No Agents yet".to_owned();
         }
         crate::monitor::live_words(working, self.attention, idle)
-    }
-
-    /// The attention filter row: an action, since the fleet line above it
-    /// already says how many need attention ("List the 2 that need
-    /// attention"; "Listing …" while the list is filtered).
-    pub fn attention_row_label(&self, listed: bool) -> String {
-        let verb = if listed { "Listing" } else { "List" };
-        if self.attention == 1 {
-            format!("{verb} the 1 that needs attention")
-        } else {
-            format!("{verb} the {} that need attention", self.attention)
-        }
     }
 }
 
@@ -1307,19 +1300,6 @@ mod tests {
             busy.summary(40, none),
             "2 working · 1 needs attention · 3 idle"
         );
-        assert_eq!(
-            busy.attention_row_label(false),
-            "List the 1 that needs attention"
-        );
-        assert_eq!(
-            Fleet {
-                running: 0,
-                attention: 3,
-                idle: 0,
-            }
-            .attention_row_label(true),
-            "Listing the 3 that need attention"
-        );
         // Failed and lost need a decision; a native child never counts.
         let fleet = Fleet::of(&[
             with(agent("a3", "/p", None), "lost", 1),
@@ -1344,7 +1324,8 @@ mod tests {
         listed[0].updated_at = 10;
         listed[1].updated_at = 30;
         listed[2].updated_at = 20;
-        let ids: Vec<&str> = recents(&listed, 2)
+        let none = HashSet::new();
+        let ids: Vec<&str> = recents(&listed, 2, &none)
             .into_iter()
             .map(|agent| agent.id.as_str())
             .collect();
@@ -1354,11 +1335,18 @@ mod tests {
             updated_at: 5,
             ..listed[1].clone()
         });
-        let ids: Vec<&str> = recents(&repeated, 9)
+        let ids: Vec<&str> = recents(&repeated, 9, &none)
             .into_iter()
             .map(|agent| agent.id.as_str())
             .collect();
         assert_eq!(ids, ["a2", "a3", "a1"]);
+        // What the sidebar already lists elsewhere stays out of Recents.
+        let shown: HashSet<&str> = ["a2"].into_iter().collect();
+        let ids: Vec<&str> = recents(&repeated, 9, &shown)
+            .into_iter()
+            .map(|agent| agent.id.as_str())
+            .collect();
+        assert_eq!(ids, ["a3", "a1"]);
     }
 
     #[test]
@@ -1372,7 +1360,10 @@ mod tests {
         let mut chat = with(agent("a4", "/home/Eliot/chats/a4", None), "idle", 30);
         chat.chat = true;
         let listed = vec![parent, child, orphan, chat];
-        let recent: Vec<&str> = recents(&listed, 8).iter().map(|a| a.id.as_str()).collect();
+        let recent: Vec<&str> = recents(&listed, 8, &HashSet::new())
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
         assert_eq!(recent, ["a4", "a1"]);
         let sections = View::default().sections(&listed, &[]);
         assert_eq!(sections.len(), 1, "the chat makes no project of its own");
