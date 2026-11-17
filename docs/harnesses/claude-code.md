@@ -156,6 +156,17 @@ Unix the plugin leads its own process group and the daemon group-kills it
 
 ## Native mapping
 
+The SDK's structured `assistant.error:"billing_error"` on the main assistant
+marks a provider billing/quota refusal. If that remains the last main assistant
+error at a normal terminal, the turn settles as `failure`, origin `provider`,
+with `native_error.code:"quota_exhausted"` and a typed quota restriction (no
+reset is invented). The original terminal reason stays in `native_status`.
+A later normal main-assistant record clears an earlier refusal, so recovered
+turns can succeed. Sidechain records do not change this state; cancelled and
+unknown terminal reasons keep their outcomes. This uses the
+[vendor SDKAssistantMessage error field](https://code.claude.com/docs/en/agent-sdk/typescript#sdkassistantmessage),
+not error prose.
+
 | Eliot verb | Mechanism / limitation |
 | --- | --- |
 | launch/send | stdin `control_request initialize` with the pre-assigned session id, then one stdin `user` record per send; the Eliot-minted `uuid` echoed in `command_lifecycle` is the exact turn association, not local pipe acceptance |

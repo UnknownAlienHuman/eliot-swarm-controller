@@ -239,8 +239,15 @@ fn claude_outcome(reason: &str) -> &'static str {
 /// a configured secret inside the reason must not change its outcome (a
 /// secret `error` redacts `api_error` into `api_[REDACTED]`, i.e. unknown).
 /// Returns the canonical outcome and the sanitized reason.
-fn terminal_outcome_and_status(reason: &str, secrets: &SecretPolicy) -> (&'static str, String) {
-    let outcome = claude_outcome(reason);
+fn terminal_outcome_and_status(
+    reason: &str,
+    secrets: &SecretPolicy,
+    failure: Option<&Error>,
+) -> (&'static str, String) {
+    let mut outcome = claude_outcome(reason);
+    if outcome == "success" && failure.is_some_and(|error| error.code == "quota_exhausted") {
+        outcome = "failure";
+    }
     (outcome, secrets.redact_text(reason))
 }
 
@@ -1745,9 +1752,10 @@ impl EventProcessor {
                 .await;
         };
         if is_main_thread_assistant(record) {
-            if let Some(kind) = record.get("error").and_then(Value::as_str) {
-                self.native_failure = claude_api_failure(kind);
-            }
+            self.native_failure = record
+                .get("error")
+                .and_then(Value::as_str)
+                .and_then(claude_api_failure);
             self.bind_tool_uses(record, &turn_id);
             self.observe_tool_uses(record).await?;
         }
@@ -3219,18 +3227,36 @@ impl EventProcessor {
             return Ok(());
         }
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        let (outcome, terminal_reason) =
-            terminal_outcome_and_status(&parsed.terminal_reason, &secrets);
+        let (outcome, terminal_reason) = terminal_outcome_and_status(
+            &parsed.terminal_reason,
+            &secrets,
+            self.native_failure.as_ref(),
+        );
         let mut data = json!({
             "command_id": command_id.clone(),
             "turn_id": turn_id.clone(),
-            "status": terminal_reason.clone(),
+            "status": if outcome == "failure" { "failed" } else { &terminal_reason },
             "outcome": outcome,
             "native_status": terminal_reason.clone(),
         });
         // Optional native main-loop turn usage: absent/malformed usage never
         if outcome == "failure" {
             let error = self.native_failure.take();
+            if error
+                .as_ref()
+                .is_some_and(|error| error.code == "quota_exhausted")
+            {
+                data["native_error"] =
+                    json!({"code":"quota_exhausted", "message":"provider billing/quota refusal"});
+                eliot_plugin::session::attach_provider_restriction(
+                    &mut data,
+                    eliot_core::ProviderRestriction {
+                        kind: eliot_core::ProviderRestrictionKind::Quota,
+                        retry_after: None,
+                    },
+                    &secrets,
+                );
+            }
             eliot_plugin::session::attach_failure_origin(
                 &mut data,
                 "claude",
@@ -3609,14 +3635,17 @@ fn assistant_prompt_id(record: &Value) -> Option<String> {
 /// reference on 2026-11-16. Free text and generic api_error are not evidence.
 fn claude_api_failure(kind: &str) -> Option<Error> {
     use eliot_core::FailureOrigin;
+    if kind == "billing_error" {
+        return Some(Error::provider(
+            eliot_core::ProviderRestrictionKind::Quota,
+            "plugin.claude.turn",
+            "assistant.error upstream billing/quota refusal",
+        ));
+    }
     let (origin, evidence) = match kind {
         "authentication_failed" | "oauth_org_not_allowed" | "account_on_hold" => (
             FailureOrigin::Provider,
             "assistant.error upstream authentication refusal",
-        ),
-        "billing_error" => (
-            FailureOrigin::Provider,
-            "assistant.error upstream billing/quota refusal",
         ),
         "rate_limit" | "overloaded" => (
             FailureOrigin::Provider,
@@ -3740,12 +3769,12 @@ mod tests {
         // on its own), but the persisted outcome stays `failure` while only
         // sanitized text is stored.
         let secrets = SecretPolicy::new(["error"]);
-        let (outcome, status) = terminal_outcome_and_status("api_error", &secrets);
+        let (outcome, status) = terminal_outcome_and_status("api_error", &secrets, None);
         assert_eq!(outcome, "failure");
         assert_eq!(status, "api_[REDACTED]");
         assert_eq!(claude_outcome(&status), "unknown");
         let plain = SecretPolicy::new(Vec::<String>::new());
-        let (outcome, status) = terminal_outcome_and_status("api_error", &plain);
+        let (outcome, status) = terminal_outcome_and_status("api_error", &plain, None);
         assert_eq!(outcome, "failure");
         assert_eq!(status, "api_error");
     }
@@ -3851,6 +3880,58 @@ mod tests {
     }
 
     #[test]
+    fn structured_billing_refusal_overrides_a_normal_terminal_only() {
+        let assistant = json!({"type":"assistant", "error":"billing_error",
+            "parent_tool_use_id":null, "message":{"content":[{"type":"text","text":"quota refusal"}]}});
+        let failure = claude_api_failure(assistant["error"].as_str().unwrap()).unwrap();
+        let secrets = SecretPolicy::new(Vec::<String>::new());
+        assert_eq!(
+            terminal_outcome_and_status("completed", &secrets, Some(&failure)),
+            ("failure", "completed".into())
+        );
+        assert_eq!(
+            terminal_outcome_and_status("interrupted", &secrets, Some(&failure)).0,
+            "interrupted"
+        );
+        assert_eq!(
+            terminal_outcome_and_status("future_stop", &secrets, Some(&failure)).0,
+            "unknown"
+        );
+        assert_eq!(
+            terminal_outcome_and_status("completed", &secrets, None).0,
+            "success"
+        );
+        assert_eq!(failure.origin, Some(eliot_core::FailureOrigin::Provider));
+    }
+
+    #[tokio::test]
+    async fn a_recovered_main_assistant_clears_a_billing_refusal() {
+        let mut processor = ready_processor();
+        processor.status.active_command_id = Some("command-1".into());
+        processor.status.active_turn_id = Some("turn-1".into());
+        processor
+            .observe_assistant(&json!({"type":"assistant", "error":"billing_error",
+            "parent_tool_use_id":null, "message":{"content":[]}}))
+            .await
+            .unwrap();
+        assert_eq!(
+            processor.native_failure.as_ref().unwrap().code,
+            "quota_exhausted"
+        );
+        processor
+            .observe_assistant(&json!({"type":"assistant",
+            "parent_tool_use_id":null, "message":{"content":[]}}))
+            .await
+            .unwrap();
+        assert!(processor.native_failure.is_none());
+        let secrets = SecretPolicy::new(Vec::<String>::new());
+        assert_eq!(
+            terminal_outcome_and_status("completed", &secrets, processor.native_failure.as_ref()).0,
+            "success"
+        );
+    }
+
+    #[test]
     fn result_terminal_completed_settles_success() {
         // Live 2.1.321 terminal frame (captured from `claude -p
         // --input-format stream-json --output-format stream-json --verbose`;
@@ -3885,7 +3966,7 @@ mod tests {
             serde_json::from_value(record.clone()).expect("2.1.321 result decodes");
         assert_eq!(parsed.terminal_reason, "completed");
         let plain = SecretPolicy::new(Vec::<String>::new());
-        let (outcome, status) = terminal_outcome_and_status(&parsed.terminal_reason, &plain);
+        let (outcome, status) = terminal_outcome_and_status(&parsed.terminal_reason, &plain, None);
         assert_eq!(outcome, "success");
         assert_eq!(status, "completed");
         let usage = result_usage(&record).expect("turn counters map");
