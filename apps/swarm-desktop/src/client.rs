@@ -185,6 +185,70 @@ pub async fn diagnose(data_dir: &Path, target: &str) -> Result<DiagnoseResponse>
     Ok(reply)
 }
 
+/// Why a submitted input did not start, or `None` while its command is
+/// still pending or went through. A rejected, failed or cancelled command
+/// is definite (Retry may submit again); `unknown` is not, and neither is a
+/// pending input of an Agent that has ended. A cancelled input fell with
+/// its Agent's start, so the Agent's `why` explains it.
+pub async fn input_failure(
+    data_dir: &Path,
+    agent: &str,
+    command: &str,
+    agent_ended: bool,
+) -> Result<Option<crate::chat::InputFailure>> {
+    use eliot_core::CommandState;
+    let read = read_command(data_dir, command).await?;
+    let (definite, target) = match read.state {
+        CommandState::Rejected | CommandState::Failed => (true, command),
+        CommandState::Cancelled => (true, agent),
+        CommandState::Unknown => (false, command),
+        CommandState::Accepted | CommandState::Queued if agent_ended => (false, agent),
+        _ => return Ok(None),
+    };
+    let (summary, origin) = match diagnose(data_dir, target).await {
+        Ok(reply) => {
+            let origin = summary_origin(&reply);
+            (reply.summary, origin)
+        }
+        // The command outcome still names what happened.
+        Err(_) => {
+            let outcome = read.outcome.as_ref();
+            let field = |name: &str| {
+                outcome
+                    .and_then(|outcome| outcome.get(name))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            };
+            let state = format!("{:?}", read.state).to_lowercase();
+            let reason = field("reason").or_else(|| field("code")).unwrap_or(state);
+            let summary = match field("message") {
+                Some(message) => format!("{command} {reason}: {message}"),
+                None => format!("{command} {reason}"),
+            };
+            (
+                summary,
+                field("origin").unwrap_or_else(|| "unknown".to_owned()),
+            )
+        }
+    };
+    Ok(Some(crate::chat::InputFailure {
+        summary,
+        origin,
+        definite,
+    }))
+}
+
+/// The origin a `why` summary starts with ("swarm origin: …"), else the
+/// first classified step's.
+fn summary_origin(reply: &DiagnoseResponse) -> String {
+    reply
+        .summary
+        .split_once(" origin:")
+        .map(|(origin, _)| origin.to_owned())
+        .or_else(|| reply.steps.iter().find_map(|step| step.origin.clone()))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 /// Newest `limit` retained turns of the current generation of the Agent.
 /// `agent.result` has no cursor: older pages are a larger limit.
 pub async fn agent_results(

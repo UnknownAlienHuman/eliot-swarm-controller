@@ -48,6 +48,40 @@ pub fn running_timers(rules: &[RuleListEntry], project: Option<&str>, path: &str
         .collect()
 }
 
+/// Timers of the script's namespace whose `run` action names it, and one
+/// line per reason that list may be incomplete: the namespace could not be
+/// read (its error), or only its first page was read. A read failure never
+/// looks like "no timer runs this script".
+pub fn timers_in(
+    namespaces: &[crate::config_view::RuleNamespace],
+    project: Option<&str>,
+    path: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut timers = Vec::new();
+    let mut issues = Vec::new();
+    for namespace in namespaces
+        .iter()
+        .filter(|namespace| namespace.project.as_deref() == project)
+    {
+        match &namespace.rules {
+            Ok(rules) => {
+                timers.extend(running_timers(rules, project, path));
+                if namespace.more {
+                    issues.push(format!(
+                        "Only the first page of {} was read; a timer on a later page may also run this script.",
+                        namespace.label
+                    ));
+                }
+            }
+            Err(error) => issues.push(format!(
+                "{} could not be read ({error}); timers there that run this script are not shown.",
+                namespace.label
+            )),
+        }
+    }
+    (timers, issues)
+}
+
 /// Supported GUI editor executable names. A positive list prevents ordinary
 /// interpreter aliases from turning Open in editor into script execution.
 /// This is user intent validation, not binary authentication or a sandbox.
@@ -286,6 +320,39 @@ mod tests {
             }),
             definition: json!({"on": {"at": "2099-01-01T00:00:00Z"}, "do": [{"action": "run", "cmd": cmd}]}),
         }
+    }
+
+    #[test]
+    fn unreadable_or_partial_namespaces_are_reported_not_hidden() {
+        use crate::config_view::RuleNamespace;
+        let namespaces = vec![
+            RuleNamespace {
+                project: None,
+                label: "Global rules".to_owned(),
+                rules: Ok(vec![timer("g", json!(["pwsh", "check.ps1"]))]),
+                more: true,
+            },
+            RuleNamespace {
+                project: Some("app".to_owned()),
+                label: "Project app".to_owned(),
+                rules: Err("unavailable: rule store busy".to_owned()),
+                more: false,
+            },
+        ];
+        let (timers, issues) = timers_in(&namespaces, None, "check.ps1");
+        assert_eq!(timers, vec!["g".to_owned()]);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("Only the first page of Global rules"));
+        // The project namespace failed: no Run action, but the error shows.
+        let (timers, issues) = timers_in(&namespaces, Some("app"), "check.ps1");
+        assert!(timers.is_empty());
+        assert_eq!(
+            issues,
+            vec![
+                "Project app could not be read (unavailable: rule store busy); timers there that run this script are not shown."
+                    .to_owned()
+            ]
+        );
     }
 
     #[test]

@@ -163,6 +163,8 @@ impl RenderCache {
 #[derive(Clone)]
 pub struct RowCallbacks {
     pub copy_part: Callback<String>,
+    /// Retry a local input that did not start (the failure part's key).
+    pub retry: Callback<String>,
     pub copy_code: Callback<(String, usize)>,
     pub toggle_tools: Callback<(String, bool)>,
 }
@@ -392,6 +394,33 @@ fn part_view(
                 .width(tokens::layout::PROGRESS_WIDTH)
                 .horizontal_alignment(HorizontalAlignment::Left),
         )),
+        // A start that did not happen: why (`swarm why`), its origin, and
+        // Retry when the failure is definite.
+        PartKind::Failed | PartKind::Unconfirmed => {
+            let retry: View = if part.kind == PartKind::Failed {
+                let retry = callbacks.retry.clone();
+                let key = part.key.clone();
+                crate::m3::outlined(palette)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .automation_name("Retry")
+                    .on_click(move || {
+                        let _ = retry.call(key.clone());
+                    })
+                    .content(crate::m3::label("Retry"))
+            } else {
+                View::empty()
+            };
+            StackPanel::new().spacing(tokens::spacing::XS).children((
+                TextBlock::new()
+                    .text(format!("{} · {}", part.label, part.plain))
+                    .font_size(tokens::text::BODY.size)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true)
+                    .foreground(palette.error()),
+                label(&part.detail.join(" · ")),
+                retry,
+            ))
+        }
         PartKind::Notice => TextBlock::new()
             .text(format!("{} · {}", part.label, part.plain))
             .font_size(tokens::text::SECONDARY.size)

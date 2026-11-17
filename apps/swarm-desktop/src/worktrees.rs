@@ -1,53 +1,52 @@
 //! The worktrees Swarm manages, for Settings › Worktrees & cleanup: the
-//! checkouts under `<data>\worktrees` (where `launch --worktree` creates
-//! them) among the registered projects and the listed Agents' workspaces,
-//! grouped by repository. Data only; `cleanup.plan` / `cleanup.apply` are
-//! not in this build, so nothing here deletes.
+//! daemon's `workspace.list` rows (the retained managed-workspace
+//! preparations, every page), grouped by project. Data only; nothing here
+//! deletes.
 
-use crate::nav::{self, Checkout};
+use eliot_core::api::ManagedWorkspaceView;
 
-/// Managed worktree paths under `root`, `(repository, paths)` sorted by
-/// repository then path; each path once. `checkouts` are the registered
-/// `(checkout, git common dir)` pairs; `workspaces` the Agents' workspaces.
-pub fn managed(
-    root: &str,
-    checkouts: &[(String, String)],
-    workspaces: &[String],
-) -> Vec<(String, Vec<String>)> {
-    let root_key = nav::path_key(root);
-    if root_key.is_empty() {
-        return Vec::new();
-    }
-    let registered: Vec<Checkout> = checkouts
-        .iter()
-        .map(|(path, common_dir)| Checkout {
-            path: path.clone(),
-            common_dir: common_dir.clone(),
-        })
-        .collect();
-    let mut seen = std::collections::HashSet::new();
-    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-    for path in checkouts
-        .iter()
-        .map(|(path, _)| path)
-        .chain(workspaces.iter())
-    {
-        let key = nav::path_key(path);
-        let inside = key
-            .strip_prefix(root_key.as_str())
-            .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1);
-        if !inside || !seen.insert(key) {
-            continue;
-        }
-        let project = nav::project_of(path, &registered);
-        let shown = nav::display_path(path).to_owned();
+use crate::nav;
+
+/// One managed worktree as the page shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: String,
+    pub branch: String,
+    pub agent: String,
+    pub phase: String,
+}
+
+/// Managed worktrees grouped by project name, `(project, worktrees)`
+/// sorted by project then path. `registered` are the `(checkout, name)`
+/// pairs that give a project label its name.
+pub fn grouped(
+    rows: &[ManagedWorkspaceView],
+    registered: &[(String, String)],
+) -> Vec<(String, Vec<Worktree>)> {
+    let mut groups: Vec<(String, Vec<Worktree>)> = Vec::new();
+    for row in rows {
+        let label = if row.project.is_empty() {
+            &row.repo_path
+        } else {
+            &row.project
+        };
+        let project = nav::project_name(label, registered);
+        let worktree = Worktree {
+            path: nav::display_path(&row.worktree_path).to_owned(),
+            branch: row.branch.clone(),
+            agent: row.agent.clone(),
+            phase: serde_json::to_value(row.phase)
+                .ok()
+                .and_then(|value| value.as_str().map(|phase| phase.replace('_', " ")))
+                .unwrap_or_default(),
+        };
         match groups.iter_mut().find(|(name, _)| *name == project) {
-            Some((_, paths)) => paths.push(shown),
-            None => groups.push((project, vec![shown])),
+            Some((_, worktrees)) => worktrees.push(worktree),
+            None => groups.push((project, vec![worktree])),
         }
     }
-    for (_, paths) in &mut groups {
-        paths.sort();
+    for (_, worktrees) in &mut groups {
+        worktrees.sort_by(|left, right| left.path.cmp(&right.path));
     }
     groups.sort_by(|left, right| left.0.cmp(&right.0));
     groups
@@ -56,33 +55,50 @@ pub fn managed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_core::WorkspacePhase;
+
+    fn row(agent: &str, project: &str, path: &str, phase: WorkspacePhase) -> ManagedWorkspaceView {
+        ManagedWorkspaceView {
+            agent: agent.to_owned(),
+            project: project.to_owned(),
+            repo_path: r"C:\src\app".to_owned(),
+            branch: format!("fix/{agent}"),
+            worktree_path: path.to_owned(),
+            phase,
+            updated_at: 1,
+        }
+    }
 
     #[test]
-    fn only_paths_under_the_root_once_grouped_by_repository() {
-        let root = r"C:\data\worktrees";
-        let checkouts = vec![
-            (
-                r"C:\data\worktrees\wt-b".to_owned(),
-                r"C:\src\app\.git".to_owned(),
+    fn rows_group_by_project_name_whatever_the_agent_labels_say() {
+        // The worktree paths come from the daemon's preparations, so a
+        // worktree outside any listed Agent page or outside <data>\worktrees
+        // is still shown; Agent project labels play no part.
+        let rows = vec![
+            row(
+                "a9",
+                r"C:\src\app",
+                r"D:\wt\app-b",
+                WorkspacePhase::SetupRunning,
             ),
-            (r"C:\src\app".to_owned(), r"C:\src\app\.git".to_owned()),
+            row("a2", r"C:\src\app", r"D:\wt\app-a", WorkspacePhase::Ready),
+            row("a5", r"C:\src\lib", r"D:\wt\lib-a", WorkspacePhase::Unknown),
         ];
-        let workspaces = vec![
-            r"C:\DATA\worktrees\wt-b".to_owned(),
-            r"C:\data\worktrees\wt-a".to_owned(),
-            r"C:\data\worktrees-other\x".to_owned(),
-        ];
-        let groups = managed(root, &checkouts, &workspaces);
+        let registered = vec![(r"C:\src\app".to_owned(), "app".to_owned())];
+        let groups = grouped(&rows, &registered);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, "app");
         assert_eq!(
-            groups,
-            vec![
-                ("app".to_owned(), vec![r"C:\data\worktrees\wt-b".to_owned()]),
-                (
-                    "wt-a".to_owned(),
-                    vec![r"C:\data\worktrees\wt-a".to_owned()]
-                ),
-            ]
+            groups[0]
+                .1
+                .iter()
+                .map(|worktree| worktree.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![r"D:\wt\app-a", r"D:\wt\app-b"]
         );
-        assert!(managed("", &checkouts, &workspaces).is_empty());
+        assert_eq!(groups[0].1[1].phase, "setup running");
+        assert_eq!(groups[1].0, "lib");
+        assert_eq!(groups[1].1[0].agent, "a5");
+        assert!(grouped(&[], &registered).is_empty());
     }
 }

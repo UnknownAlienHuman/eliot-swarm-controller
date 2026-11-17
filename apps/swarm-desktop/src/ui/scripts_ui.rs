@@ -372,22 +372,18 @@ impl DesktopApp {
         });
     }
 
-    /// Timers whose run action names the selected script.
-    pub(super) fn script_timers(&self) -> Vec<String> {
+    /// Timers whose run action names the selected script, and why that
+    /// list may be incomplete (a namespace that could not be read, or one
+    /// read only in part).
+    pub(super) fn script_timers(&self) -> (Vec<String>, Vec<String>) {
         let Some((project, path)) = self.selected_script() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        self.automation
-            .rules
-            .iter()
-            .filter(|namespace| namespace.project == project)
-            .filter_map(|namespace| namespace.rules.as_ref().ok())
-            .flat_map(|rules| scripts::running_timers(rules, project.as_deref(), &path))
-            .collect()
+        scripts::timers_in(&self.automation.rules, project.as_deref(), &path)
     }
 
     pub(super) fn scripts_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let timers = self.script_timers();
+        let (timers, rule_issues) = self.script_timers();
         let editor = &self.scripts;
         let data = config_view::ScriptsData {
             labels: editor
@@ -409,6 +405,7 @@ impl DesktopApp {
             view: self.primed(&editor.view),
             dirty: editor.draft != editor.base,
             timers: &timers,
+            rule_issues: &rule_issues,
             editor_exe: &editor.editor_exe,
             status: &editor.status,
             run_status: &editor.run_status,

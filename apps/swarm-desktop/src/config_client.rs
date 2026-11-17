@@ -6,19 +6,24 @@
 //! preferences ([`crate::settings`]). The remaining calls are the runtime
 //! reads and file-owned APIs the settings document does not cover:
 //! `profile.list` (launchability), `project.list` (resolved registrations),
-//! `routing.preview`, `rule.list`, `script.list/read/save` and `timer.run`.
+//! `routing.preview`, `rule.list`, `script.list/read/save`, `timer.run`,
+//! `workspace.list` (managed worktrees) and the fleet totals for Usage
+//! (`agent.list` counts and the `daemon.status` retention view).
 //! Each runs the same request/response validators the CLI runs.
 
 use std::path::Path;
 
+use eliot_core::AgentState;
 use eliot_core::api::harness::MAX_CATALOG_LIMIT;
 use eliot_core::api::{
-    HarnessQuotaRequest, HarnessQuotaResponse, ModelsCatalogRequest, ModelsCatalogResponse,
-    ProfileListRequest, ProfileListResponse, ProjectRegistrationView, RoutingPreviewRequest,
-    RoutingPreviewResponse, RuleListEntry, RuleListRequest, RuleListResponse, ScriptListRequest,
-    ScriptListResponse, ScriptReadRequest, ScriptReadResponse, ScriptSaveRequest,
-    ScriptSaveResponse, SettingsReadResponse, SettingsSaveRequest, SettingsSaveResponse,
-    TimerRunRequest, discovery::ProjectListRequest,
+    AgentListRequest, ArchivedFilter, DaemonStatusRequest, DaemonStatusResponse,
+    HarnessQuotaRequest, HarnessQuotaResponse, ManagedWorkspaceView, ModelsCatalogRequest,
+    ModelsCatalogResponse, ProfileListRequest, ProfileListResponse, ProjectRegistrationView,
+    RetentionView, RoutingPreviewRequest, RoutingPreviewResponse, RuleListEntry, RuleListRequest,
+    RuleListResponse, ScriptListRequest, ScriptListResponse, ScriptReadRequest, ScriptReadResponse,
+    ScriptSaveRequest, ScriptSaveResponse, SettingsReadResponse, SettingsSaveRequest,
+    SettingsSaveResponse, TimerRunRequest, WorkspaceListRequest, WorkspaceListResponse,
+    discovery::ProjectListRequest,
 };
 use eliot_core::{Command, Error, Result, RoutingDecision};
 use serde_json::Value;
@@ -88,6 +93,80 @@ pub async fn list_projects(data_dir: &Path) -> Result<Vec<ProjectRegistrationVie
         registration.validate()?;
     }
     Ok(registrations)
+}
+
+/// Pages of `workspace.list` read at most (1,000 rows each).
+const WORKSPACE_PAGES: usize = 10;
+
+/// Every managed worktree, page by page, with the daemon's total; `false`
+/// when the page bound stopped the read before the end.
+pub async fn managed_workspaces(
+    data_dir: &Path,
+) -> Result<(Vec<ManagedWorkspaceView>, usize, bool)> {
+    let mut rows = Vec::new();
+    let mut after: Option<String> = None;
+    let mut total = 0;
+    for _ in 0..WORKSPACE_PAGES {
+        let params = WorkspaceListRequest {
+            after: after.clone(),
+            limit: 1_000,
+        };
+        params.validate()?;
+        let page: WorkspaceListResponse =
+            eliot_daemon::client_call_typed(data_dir, "workspace.list", &params).await?;
+        params.validate_response(&page)?;
+        total = page.total;
+        let done = page.workspaces.is_empty() || !page.truncated;
+        after = page.next.clone();
+        rows.extend(page.workspaces);
+        if done {
+            return Ok((rows, total, true));
+        }
+    }
+    Ok((rows, total, false))
+}
+
+/// Complete fleet totals for Settings › Usage: Agents working now or
+/// starting, all Agents (archived included), and the retention view.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FleetTotals {
+    pub running: usize,
+    pub agents: usize,
+    pub retention: Option<RetentionView>,
+}
+
+/// Exact counts (`agent.list` `total` per state, one row each) and the
+/// `daemon.status` retention view: never a sum over the rows a window
+/// happened to load.
+pub async fn fleet_totals(data_dir: &Path) -> Result<FleetTotals> {
+    let count = |state: Option<AgentState>| {
+        let params = AgentListRequest {
+            archived: ArchivedFilter::Include,
+            limit: 1,
+            state,
+            ..AgentListRequest::default()
+        };
+        async move {
+            crate::client::list_agents(data_dir, &params)
+                .await
+                .map(|page| page.total)
+        }
+    };
+    let mut running = 0;
+    for state in [AgentState::Busy, AgentState::Starting, AgentState::Created] {
+        running += count(Some(state)).await?;
+    }
+    let agents = count(None).await?;
+    let request = DaemonStatusRequest::default();
+    request.validate()?;
+    let status: DaemonStatusResponse =
+        eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
+    request.validate_response(&status)?;
+    Ok(FleetTotals {
+        running,
+        agents,
+        retention: status.retention,
+    })
 }
 
 /// The decision routing would record for the next launch of `role`

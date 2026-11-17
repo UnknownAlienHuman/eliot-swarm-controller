@@ -820,6 +820,14 @@ impl DesktopApp {
         } else {
             client::LaunchPlace::Workspace(self.launch.workspace.clone())
         };
+        // Bound now: the picker stays editable while the launch is in flight.
+        let submitted = Submitted {
+            choice: self.launch.choice.clone(),
+            harness: self.starting_harness(),
+            access: self.launch.access(),
+            chat: self.launch.chat,
+            workspace: self.launch.workspace.clone(),
+        };
         let key = format!("launch:{target:?}:{place:?}:{}", self.launch.launch_rev);
         let mutation_id = self.ledger.id_for(&key);
         self.in_flight_key = Some(key);
@@ -827,7 +835,7 @@ impl DesktopApp {
         self.alert = None;
         // Shown at once: the message and what happens now, until the
         // conversation opens (no empty pause after Send).
-        self.launch.starting = Some((text.clone(), self.starting_label()));
+        self.launch.starting = Some((text.clone(), starting_label(submitted.harness.as_deref())));
         // The composer empties at once; the revision stays, so a retry of
         // an unconfirmed start reuses its mutation id.
         self.launch.launch_text.clear();
@@ -854,6 +862,7 @@ impl DesktopApp {
                     linked_command: reply.linked_command.clone(),
                     text,
                     launch_rev,
+                    submitted,
                 })
             })))
         });
@@ -883,7 +892,10 @@ impl DesktopApp {
                 }
                 if let Some(linked) = outcome.linked_command.clone() {
                     self.chat.pending_local =
-                        Some((outcome.agent.clone(), linked, outcome.text.clone()));
+                        Some((outcome.agent.clone(), linked.clone(), outcome.text.clone()));
+                    self.chat
+                        .launches
+                        .insert(outcome.agent.clone(), (linked, outcome.submitted.clone()));
                 }
                 self.chat.waiting_label = label;
                 self.set_status(format!(
@@ -892,34 +904,16 @@ impl DesktopApp {
                     outcome.command_id,
                     outcome.linked_command.as_deref().unwrap_or("not linked")
                 ));
-                // The model goes first in Recent.
-                if let Choice::Model(pick) = &self.launch.choice
-                    && let Some(model) = pick.model_ref()
-                {
+                // The submitted model goes first in Recent, whatever the
+                // picker shows now.
+                if let Some(model) = outcome.submitted.recent() {
                     self.prefs.remember(model);
                     self.prefs_rev += 1;
                     self.save_preferences(context);
                 }
                 // Until the list reads it back, the title is the first
                 // message, known now.
-                self.nav.pending_select = Some(UiAgent {
-                    id: outcome.agent.clone(),
-                    generation: outcome.generation,
-                    harness: self.launch.choice.harness().unwrap_or_default().to_owned(),
-                    state: "created".to_owned(),
-                    project: if self.launch.chat {
-                        String::new()
-                    } else {
-                        self.launch.workspace.clone()
-                    },
-                    parent: None,
-                    updated_at: crate::handoff::now_ms(),
-                    title: nav::title(&outcome.text).unwrap_or_else(|| outcome.agent.clone()),
-                    native_child: false,
-                    tokens: None,
-                    chat: self.launch.chat,
-                    archived: false,
-                });
+                self.nav.pending_select = Some(outcome.pending_agent(crate::handoff::now_ms()));
                 self.nav.selection.select_agent(Some(outcome.agent));
                 self.load_agents(context, None);
                 // Capacity changed: the next Auto pick may differ.
@@ -949,16 +943,12 @@ impl DesktopApp {
         }
     }
 
-    /// What the conversation says while a new task starts: "Starting
-    /// Codex…", or Swarm's pick for Auto and presets.
-    pub(super) fn starting_label(&self) -> String {
-        let harness = match &self.launch.choice {
+    /// The harness a launch of the current choice starts: the chosen
+    /// model's, or Swarm's pick for Auto and presets.
+    fn starting_harness(&self) -> Option<String> {
+        match &self.launch.choice {
             Choice::Model(pick) => Some(pick.harness.clone()),
             _ => self.launch.profile().map(|profile| profile.harness.clone()),
-        };
-        match harness {
-            Some(harness) => format!("Starting {}…", picker::harness_label(&harness)),
-            None => "Starting…".to_owned(),
         }
     }
 
@@ -1045,6 +1035,49 @@ impl DesktopApp {
     }
 }
 
+impl Submitted {
+    /// The Recent entry a launch records: the submitted model and effort.
+    fn recent(&self) -> Option<crate::settings::ModelRef> {
+        match &self.choice {
+            Choice::Model(pick) => pick.model_ref(),
+            _ => None,
+        }
+    }
+}
+
+impl LaunchOutcome {
+    /// The new Agent's row until the list reads it back: the submitted
+    /// harness and place, titled by the first message.
+    fn pending_agent(&self, now: i64) -> UiAgent {
+        UiAgent {
+            id: self.agent.clone(),
+            generation: self.generation,
+            harness: self.submitted.harness.clone().unwrap_or_default(),
+            state: "created".to_owned(),
+            project: if self.submitted.chat {
+                String::new()
+            } else {
+                self.submitted.workspace.clone()
+            },
+            parent: None,
+            updated_at: now,
+            title: nav::title(&self.text).unwrap_or_else(|| self.agent.clone()),
+            native_child: false,
+            tokens: None,
+            chat: self.submitted.chat,
+            archived: false,
+        }
+    }
+}
+
+/// What the conversation says while a new task starts: "Starting Codex…".
+pub(super) fn starting_label(harness: Option<&str>) -> String {
+    match harness {
+        Some(harness) => format!("Starting {}…", picker::harness_label(harness)),
+        None => "Starting…".to_owned(),
+    }
+}
+
 /// What a conversation's chip says the Agent was launched as: the harness
 /// for an ad-hoc launch (no internal `adhoc-*` name), else the preset and
 /// its harness.
@@ -1076,5 +1109,65 @@ pub(super) fn access_label(permissions: Option<&str>) -> String {
         Some("read-only") => "Read only".to_owned(),
         Some("workspace-write") => "Workspace write".to_owned(),
         Some(other) => other.replace(['-', '_'], " "),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pick(harness: &str, model: &str, effort: &str) -> Choice {
+        Choice::Model(Pick {
+            harness: harness.to_owned(),
+            model: Some(model.to_owned()),
+            effort: Some(effort.to_owned()),
+        })
+    }
+
+    #[test]
+    fn completion_records_the_submitted_choice_not_the_current_picker() {
+        // Submitted Codex · luna · low into a folder; the owner then picked
+        // Claude in a chat before the reply came back. Only the submitted
+        // values may reach Recent and the pending Agent row.
+        let outcome = LaunchOutcome {
+            agent: "a7".to_owned(),
+            generation: 1,
+            command_id: "c".to_owned(),
+            linked_command: Some("c/send".to_owned()),
+            text: "Fix the build".to_owned(),
+            launch_rev: 3,
+            submitted: Submitted {
+                choice: pick("codex", "gpt-luna", "low"),
+                harness: Some("codex".to_owned()),
+                access: Access::Auto,
+                chat: false,
+                workspace: "C:/src/app".to_owned(),
+            },
+        };
+        let _later_picker = pick("claude", "claude-sonnet", "high");
+        let recent = outcome.submitted.recent().expect("a model was submitted");
+        assert_eq!(
+            (
+                recent.harness.as_str(),
+                recent.model.as_str(),
+                recent.effort.as_deref()
+            ),
+            ("codex", "gpt-luna", Some("low"))
+        );
+        let row = outcome.pending_agent(5);
+        assert_eq!(row.harness, "codex");
+        assert_eq!(row.project, "C:/src/app");
+        assert!(!row.chat);
+        assert_eq!(row.title, "Fix the build");
+        assert_eq!(
+            starting_label(outcome.submitted.harness.as_deref()),
+            "Starting Codex…"
+        );
+        // A preset or Auto records no model in Recent.
+        let preset = Submitted {
+            choice: Choice::Preset("muse".to_owned()),
+            ..outcome.submitted.clone()
+        };
+        assert!(preset.recent().is_none());
     }
 }
