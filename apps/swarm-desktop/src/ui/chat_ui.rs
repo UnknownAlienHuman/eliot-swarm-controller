@@ -61,6 +61,21 @@ pub(super) enum ChatMsg {
 /// has ended (bounded: only while one is shown as waiting).
 const INPUT_RECHECK_MS: u64 = 2_000;
 
+fn can_answer(
+    request: &UiPending,
+    answers: &HashMap<String, eliot_core::requests::Answers>,
+) -> bool {
+    request
+        .binding
+        .request
+        .as_ref()
+        .and_then(|id| answers.get(id))
+        .is_some_and(|answer| !answer.is_empty())
+        && request.questions.iter().any(|question| {
+            !question.is_secret && question.kind != eliot_core::requests::QuestionKind::Resource
+        })
+}
+
 /// The Agent and generation a "…" entry acts on: the header shown when the
 /// click is handled.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -637,6 +652,9 @@ impl DesktopApp {
                 });
             }
             ChatMsg::AnswerRequested(request) => {
+                if !can_answer(&request, &self.chat.answers) {
+                    return;
+                }
                 let answer = self
                     .chat
                     .answers
@@ -940,8 +958,7 @@ impl DesktopApp {
             eliot_core::AgentState::Stopped
                 | eliot_core::AgentState::Failed
                 | eliot_core::AgentState::Lost
-        )
-            && detail.active_turn.is_none()
+        ) && detail.active_turn.is_none()
             && !detail.observe_only;
         let action = match (&detail.active_turn, resumable) {
             (_, true) => DraftAction::Resume {
@@ -1218,8 +1235,7 @@ impl DesktopApp {
                 | eliot_core::AgentState::Stopped
                 | eliot_core::AgentState::Lost
         );
-        if detail.active_turn.is_some()
-            || !(ended || detail.state == eliot_core::AgentState::Idle)
+        if detail.active_turn.is_some() || !(ended || detail.state == eliot_core::AgentState::Idle)
         {
             return;
         }
@@ -1560,7 +1576,9 @@ impl DesktopApp {
     ) -> View {
         let title = self.agent_title(agent);
         let detail = self.chat.detail.as_ref();
-        let tone = detail.map_or(StatusTone::Neutral, |detail| StatusTone::of_state(detail.state));
+        let tone = detail.map_or(StatusTone::Neutral, |detail| {
+            StatusTone::of_state(detail.state)
+        });
         let note = match &self.chat.live {
             LiveStatus::Stale(_) => "Catching up…",
             LiveStatus::Reconnecting { .. } => "Reconnecting…",
@@ -1822,12 +1840,7 @@ impl DesktopApp {
                             "answer",
                             m3::text_button(palette)
                                 .is_enabled(
-                                    !self.submitting()
-                                        && request.questions.iter().any(|question| {
-                                            !question.is_secret
-                                                && question.kind
-                                                    != eliot_core::requests::QuestionKind::Resource
-                                        }),
+                                    !self.submitting() && can_answer(request, &self.chat.answers),
                                 )
                                 .on_click(context.message(Message::Chat(ChatMsg::AnswerRequested(
                                     request.clone(),
@@ -2165,8 +2178,7 @@ impl DesktopApp {
                 eliot_core::AgentState::Stopped
                     | eliot_core::AgentState::Failed
                     | eliot_core::AgentState::Lost
-            )
-                && detail.active_turn.is_none()
+            ) && detail.active_turn.is_none()
                 && !detail.observe_only
         });
         let draft_blank = self.composer_text().trim().is_empty();
@@ -2431,6 +2443,34 @@ fn starting_view(text: &str, label: &str, column: Option<f64>, palette: Palette)
 #[cfg(test)]
 mod tests {
     use super::enter_send_text;
+
+    #[test]
+    fn answer_requires_edits_to_that_request() {
+        let request = super::UiPending {
+            binding: crate::state::BoundAction::request_control("a2", 1, "r1"),
+            kind: "question".to_owned(),
+            summary: "Choose".to_owned(),
+            questions: vec![
+                serde_json::from_value(serde_json::json!({"id":"q1", "kind":"text"})).unwrap(),
+            ],
+        };
+        let mut answers = std::collections::HashMap::new();
+        assert!(!super::can_answer(&request, &answers));
+        answers.insert("r1".to_owned(), eliot_core::requests::Answers::new());
+        assert!(!super::can_answer(&request, &answers));
+        let edited = eliot_core::requests::Answers::from([(
+            "q1".to_owned(),
+            eliot_core::requests::Answer {
+                answers: vec!["yes".to_owned()],
+            },
+        )]);
+        answers.insert("r2".to_owned(), edited.clone());
+        assert!(!super::can_answer(&request, &answers));
+        answers.insert("r1".to_owned(), edited);
+        assert!(super::can_answer(&request, &answers));
+        answers.get_mut("r1").unwrap().clear();
+        assert!(!super::can_answer(&request, &answers));
+    }
 
     #[test]
     fn translated_send_failure_retains_the_same_mutation_id() {
