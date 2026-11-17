@@ -181,6 +181,24 @@ If a running turn has no terminal evidence, retain it as `unknown` before cleari
 active-turn pointer; do not erase or fabricate its result. Dispatched/unknown commands
 remain historical and are never reissued.
 
+A graceful stop captures the generation's active turn and first invokes the
+adapter's native interrupt for that exact turn. Give native terminal evidence
+up to `eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT` (five seconds),
+including interrupt dispatch. Commit the observed terminal before session teardown;
+a cancellation terminal settles `interrupted`, while natural completion/failure
+keeps its actual outcome. Then stop the owned session and settle process custody.
+An interrupt acknowledgement alone is not a turn result. If interrupt is unsupported,
+the source is uncertain, or no terminal arrives within the bound, continue session
+stop and retain the unresolved turn as `unknown`. Force stop skips the cooperative
+window. This is one dispatched stop with one interrupt attempt, never a replay or
+a synthesized terminal. `AgentStopParams.turn_id` carries the captured turn; a stale
+turn must never fall back to a newer active turn.
+
+Diagnosis of a stopped, failed or lost Agent names retained unknown commands and
+turns across all generations, including history outside the recent-turn page.
+It points to `swarm cmd resolve` or `swarm turn resolve` with an exact Owner
+assertion; stopped process custody alone does not resolve either unknown.
+
 Stall is a flag only for busy work with a healthy authoritative source. Waiting on a
 request is waiting, not stalled solely through silence. Native progress clears a stall;
 CPU/Git/mail/health noise does not. Stale source means progress unknown.

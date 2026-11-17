@@ -2304,7 +2304,10 @@ impl CodexPlugin {
                     "native_not_dispatched" | "native_rejected" | "frame_too_large" | "busy"
                 ) =>
             {
-                let result = rejected_control("Codex turn/interrupt was not applied");
+                let result = rejected_control(&format!(
+                    "Codex turn/interrupt was not applied: {}",
+                    error.message
+                ));
                 settle_control(
                     session,
                     &params.command_id,
@@ -2613,7 +2616,27 @@ impl CodexPlugin {
                 "Codex stop outcome is unresolved and will not be repeated",
             ));
         }
-        session.stop_command_id = Some(params.command_id);
+        // Latch once before native I/O. An uncertain cancel is never replayed.
+        session.stop_command_id = Some(params.command_id.clone());
+        if let Some(interrupt) = params.interrupt() {
+            let until = Instant::now() + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT;
+            let _ = tokio::time::timeout_at(until, self.interrupt(interrupt)).await;
+            if let Some(session) = self.session.as_ref() {
+                eliot_plugin::native_lifecycle::wait_for_stop_turn(until, || {
+                    let status = session.events.status();
+                    !status.source_unknown
+                        && !status.batch_unknown
+                        && status.last_turn.as_ref().is_some_and(|turn| {
+                            Some(&turn.turn_id) == params.turn_id.as_ref() && turn.terminal
+                        })
+                })
+                .await;
+            }
+        }
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("unknown", "stop lost its retained native session"))?;
         terminate_session(session, params.force).await?;
         Ok(json!({"state": "applied"}))
     }

@@ -2597,6 +2597,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn busy_stop_interrupted_frame_preserves_exact_native_evidence() {
+        let (_native, mut processor, host_task, peer_task) = session_test_processor().await;
+        processor.status.ready = true;
+        processor.status.thread_id = Some("owned".to_owned());
+        processor.status.active_command_id = Some("send-1".to_owned());
+        processor.status.active_turn_id = Some("turn-1".to_owned());
+        let frame = json!({"threadId":"owned", "turn":{
+            "id":"turn-1", "status":"interrupted", "items":[], "error":null
+        }});
+        let mut foreign = frame.clone();
+        foreign["threadId"] = json!("other-thread");
+        assert!(
+            processor
+                .process_notification("turn/completed", foreign)
+                .await
+                .is_err()
+        );
+        assert_eq!(processor.status.active_turn_id.as_deref(), Some("turn-1"));
+        processor
+            .process_notification("turn/completed", frame)
+            .await
+            .unwrap();
+        let terminal = processor.status.last_turn.as_ref().unwrap();
+        assert_eq!(terminal.turn_id, "turn-1");
+        assert_eq!(terminal.command_id, "send-1");
+        assert_eq!(terminal.status.as_deref(), Some("interrupted"));
+        assert!(terminal.terminal);
+        assert!(processor.status.active_turn_id.is_none());
+        assert!(!processor.status.source_unknown);
+        // No native terminal during the next stop: custody proves only exit.
+        processor.status.active_command_id = Some("send-2".to_owned());
+        processor.status.active_turn_id = Some("turn-2".to_owned());
+        processor.finish_stop().await.unwrap();
+        let unknown = processor.status.last_turn.as_ref().unwrap();
+        assert_eq!(unknown.turn_id, "turn-2");
+        assert_eq!(unknown.command_id, "send-2");
+        assert!(!unknown.terminal);
+        assert!(unknown.status.is_none());
+        host_task.abort();
+        peer_task.abort();
+    }
+
+    #[tokio::test]
     async fn token_usage_update_for_other_turn_is_dropped_without_gap() {
         let (_native, mut processor, host_task, peer_task) = session_test_processor().await;
         processor.status.thread_id = Some("owned".to_owned());

@@ -45,6 +45,15 @@ use tokio::{
 };
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn request_deadline(method: &str, received_at: Instant) -> Instant {
+    let interrupt = if method == "agent.stop" {
+        eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT
+    } else {
+        std::time::Duration::ZERO
+    };
+    received_at + RPC_TIMEOUT + interrupt
+}
 const STEER_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn quota_read_error(error: Error) -> Error {
@@ -283,8 +292,8 @@ pub(crate) async fn run() -> Result<()> {
             HostLoopEvent::Request(Some(request)) => {
                 let is_shutdown = request.method == "shutdown";
                 let is_stop = request.method == "agent.stop";
-                let deadline =
-                    carried_stop_deadline.unwrap_or_else(|| Instant::now() + RPC_TIMEOUT);
+                let deadline = carried_stop_deadline
+                    .unwrap_or_else(|| request_deadline(&request.method, Instant::now()));
                 let result = if request.method == "agent.snapshot" {
                     match eliot_plugin::preemptible_snapshot(
                         &mut requests,
@@ -297,7 +306,7 @@ pub(crate) async fn run() -> Result<()> {
                             let stop_deadline = next
                                 .as_ref()
                                 .filter(|next| next.method == "agent.stop")
-                                .map(|_| Instant::now() + RPC_TIMEOUT);
+                                .map(|next| request_deadline(&next.method, Instant::now()));
                             let preempted = client
                                 .respond(
                                     request.id.clone(),
@@ -1925,7 +1934,27 @@ impl MusePlugin {
                 "Muse stop outcome is unresolved and will not be repeated",
             ));
         }
-        session.stop_command_id = Some(params.command_id);
+        // Latch once before native I/O. An uncertain cancel is never replayed.
+        session.stop_command_id = Some(params.command_id.clone());
+        if let Some(interrupt) = params.interrupt() {
+            let until = Instant::now() + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT;
+            let _ = tokio::time::timeout_at(until, self.interrupt_command(interrupt)).await;
+            if let Some(session) = self.session.as_ref() {
+                eliot_plugin::native_lifecycle::wait_for_stop_turn(until, || {
+                    let status = session.events.status();
+                    !status.source_unknown
+                        && !status.batch_unknown
+                        && status.last_turn.as_ref().is_some_and(|turn| {
+                            Some(&turn.turn_id) == params.turn_id.as_ref() && turn.terminal
+                        })
+                })
+                .await;
+            }
+        }
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("unknown", "stop lost its retained native session"))?;
         terminate_session(session, params.force, deadline).await?;
         Ok(json!({"state": "applied"}))
     }
@@ -3090,6 +3119,26 @@ fn muse_serve_args(permissions: &str) -> Vec<OsString> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stop_receipt_budget_includes_interrupt_before_reply_reserves() {
+        use super::*;
+        let received_at = Instant::now();
+        let stop = request_deadline("agent.stop", received_at);
+        assert_eq!(
+            stop,
+            received_at + RPC_TIMEOUT + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT
+        );
+        assert_eq!(
+            request_deadline("agent.snapshot", received_at),
+            received_at + RPC_TIMEOUT
+        );
+        let native_deadline = stop - STOP_RESPONSE_RESERVE - STOP_SETTLEMENT_RESERVE;
+        assert_eq!(
+            native_deadline - eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT,
+            received_at + RPC_TIMEOUT - STOP_RESPONSE_RESERVE - STOP_SETTLEMENT_RESERVE
+        );
+    }
+
     #[test]
     fn steer_readback_requires_the_exact_turn_and_readable_log() {
         let readable = serde_json::json!({

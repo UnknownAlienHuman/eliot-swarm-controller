@@ -45,6 +45,24 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// an empty diagnostic snapshot.
 const SEND_TIMEOUT: Duration = Duration::from_secs(25);
 
+fn admit_cancel(
+    state: &events::State,
+    turn_id: &str,
+    highwater_seq: &mut i64,
+    seq: Option<i64>,
+) -> Result<()> {
+    if state.active_turn() != Some(turn_id) || state.source_unknown || state.batch_unknown {
+        return Err(Error::new(
+            "stale_turn",
+            "cancel does not match a healthy exact native turn",
+        ));
+    }
+    if let Some(seq) = seq {
+        *highwater_seq = seq;
+    }
+    Ok(())
+}
+
 async fn wait_for_association(
     association: oneshot::Receiver<Result<()>>,
     deadline: Instant,
@@ -1158,33 +1176,14 @@ impl Session {
         }
         // Re-check the exact turn under the same lock discipline as send:
         // a turn that ended since the first check was never interrupted.
-        let dispatched = {
-            let mut state = self.state.lock().await;
-            if state.active_turn() != Some(turn_id) {
-                return Err(Error::new(
-                    "stale_turn",
-                    "turn/interrupt does not match the exact active native turn",
-                ));
-            }
-            self.highwater_seq = seq;
-            // Hold the event lock across the write and latch: an ask queued
-            // during session/cancel must observe this exact-turn intent.
-            let dispatched = self
-                .client
-                .notify(
-                    "session/cancel",
-                    Some(json!({"sessionId": self.conversation})),
-                    Instant::now() + TIMEOUT,
-                )
-                .await;
-            if !matches!(&dispatched, Err(error) if native_no_write(&error.code)) {
-                state.latch_cancellation(&params.command_id, Some(turn_id));
-                state
-                    .answer_pending_cancelled(&self.client, &params.command_id, Some(turn_id))
-                    .await;
-            }
-            dispatched
-        };
+        let dispatched = self
+            .cancel_turn(
+                &params.command_id,
+                turn_id,
+                Instant::now() + TIMEOUT,
+                Some(seq),
+            )
+            .await;
         let result = match dispatched {
             Ok(()) => {
                 // Per the ACP cancellation contract, answer every pending
@@ -1227,6 +1226,9 @@ impl Session {
                     )),
                 }
             }
+            // The locked re-check refused before native I/O. Preserve that
+            // refusal and leave private history available for the next command.
+            Err(error) if error.code == "stale_turn" => return Err(error),
             Err(error) if native_no_write(&error.code) => Ok(
                 json!({"state": "rejected", "reason": "Antigravity interrupt was not dispatched"}),
             ),
@@ -1240,6 +1242,33 @@ impl Session {
             outcome: result.clone(),
         });
         result
+    }
+
+    async fn cancel_turn(
+        &mut self,
+        command_id: &str,
+        turn_id: &str,
+        until: Instant,
+        seq: Option<i64>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        admit_cancel(&state, turn_id, &mut self.highwater_seq, seq)?;
+        // Hold the event lock across write and latch so late asks observe intent.
+        let dispatched = self
+            .client
+            .notify(
+                "session/cancel",
+                Some(json!({"sessionId": self.conversation})),
+                until,
+            )
+            .await;
+        if !matches!(&dispatched, Err(error) if native_no_write(&error.code)) {
+            state.latch_cancellation(command_id, Some(turn_id));
+            state
+                .answer_pending_cancelled(&self.client, command_id, Some(turn_id))
+                .await;
+        }
+        dispatched
     }
 
     pub async fn snapshot(&self, params: AgentSnapshotParams) -> Result<Value> {
@@ -1344,6 +1373,32 @@ impl Session {
             params.force,
             Err(Error::new("unknown", "Antigravity stop is unresolved")),
         ));
+        if !params.force
+            && let Some(turn_id) = params.turn_id.as_deref()
+        {
+            let until = Instant::now() + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT;
+            let _ = timeout_at(until, async {
+                let _ = self
+                    .cancel_turn(&params.command_id, turn_id, until, None)
+                    .await;
+                loop {
+                    let terminal = {
+                        let state = self.state.lock().await;
+                        !state.source_unknown
+                            && !state.batch_unknown
+                            && state
+                                .last_turn
+                                .as_ref()
+                                .is_some_and(|turn| turn.turn_id == turn_id && turn.terminal)
+                    };
+                    if terminal {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await;
+        }
         // Answer open permission asks `cancelled` best-effort, then close
         // whatever remains: the native session is ending, so no ask may
         // stay open behind it. Closing is not best-effort: every retained
@@ -1798,6 +1853,44 @@ fn remove_hook_config(config: &OwnedHookConfig) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn cancel_refusal_does_not_consume_dispatch_sequence() {
+        let peer = eliot_plugin::Peer::stdio();
+        let mut state = events::State::new(
+            peer.client(),
+            "credential".into(),
+            "a1".into(),
+            1,
+            eliot_core::SecretPolicy::default(),
+            "session-1".into(),
+        );
+        let mut highwater = 3;
+        // The turn ended between the caller's first check and this locked gate.
+        assert_eq!(
+            admit_cancel(&state, "turn-1", &mut highwater, Some(4))
+                .unwrap_err()
+                .code,
+            "stale_turn"
+        );
+        assert_eq!(highwater, 3);
+        let _association = state.prepare("send-1".into(), "turn-1".into()).unwrap();
+        for (source_unknown, batch_unknown) in [(true, false), (false, true)] {
+            state.source_unknown = source_unknown;
+            state.batch_unknown = batch_unknown;
+            assert_eq!(
+                admit_cancel(&state, "turn-1", &mut highwater, Some(4))
+                    .unwrap_err()
+                    .code,
+                "stale_turn"
+            );
+            assert_eq!(highwater, 3);
+        }
+        state.source_unknown = false;
+        state.batch_unknown = false;
+        admit_cancel(&state, "turn-1", &mut highwater, Some(4)).unwrap();
+        assert_eq!(highwater, 4);
+    }
 
     #[tokio::test]
     async fn send_wait_requires_committed_native_association() {
