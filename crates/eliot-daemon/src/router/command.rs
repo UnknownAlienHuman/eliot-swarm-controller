@@ -1241,6 +1241,22 @@ impl Router {
         }
     }
 
+    pub(super) async fn settle_unspawned_start(&self, id: &str, error: &Error) {
+        let error = self.sanitized_failure(error, "swarm.start.pre_spawn");
+        let mut outcome = self.command_error_outcome(&error, "code");
+        outcome["reason"] = json!(error.code);
+        let (result, write_faulted) = {
+            let mut store = self.inner.store.lock().await;
+            let result = store.settle_unspawned_start(id, outcome, now_ms());
+            if let Ok(change) = &result {
+                self.publish_locked(&change.events);
+            }
+            (result, store.is_write_faulted())
+        };
+        self.finish_settlement(id, result, write_faulted, "store_settlement_failed", false)
+            .await;
+    }
+
     pub(super) async fn settle_plugin_error(&self, id: &str, error: &Error) {
         let current = {
             let store = self.inner.store.lock().await;
@@ -1465,6 +1481,86 @@ mod start_result_tests {
     use super::classify_start_result;
     use eliot_core::CommandState;
     use serde_json::json;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pre_spawn_job_conflict_fails_the_command_and_agent_with_swarm_origin() {
+        use crate::common::now_ms;
+        use crate::platform::{custody::agent_custody_name, windows::Job};
+        use eliot_core::{AgentState, SubmitCommand};
+        let root =
+            std::env::temp_dir().join(format!("eliot-prespawn-conflict-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        std::fs::create_dir_all(&root).unwrap();
+        let router = crate::router::tests::router_with_data_root(root.clone());
+        let (agent, dispatched, namespace) = {
+            let mut store = router.inner.store.lock().await;
+            let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            launch.args = json!({"project":"conflict", "workspace":root, "harness":"claude", "profile":"fixture", "profile_snapshot":{"pass_env":[],"pass_env_values":{"CODEX_HOME":null,"CODEX_SQLITE_HOME":null}}});
+            let admitted = store.submit("owner", launch, now_ms()).unwrap().command;
+            store.dispatch(&admitted.id, now_ms()).unwrap();
+            let dispatched = store.get_command(&admitted.id).unwrap().unwrap();
+            let agent = store
+                .get_agent(dispatched.target.as_deref().unwrap())
+                .unwrap()
+                .unwrap();
+            (agent, dispatched, store.custody_namespace().unwrap())
+        };
+        let name = agent_custody_name(&namespace, &agent.id, agent.generation);
+        let _conflict = Job::new_named_kill_on_close(&name).unwrap();
+        router
+            .execute_start_command(
+                &dispatched.id,
+                agent.clone(),
+                dispatched.clone(),
+                None,
+                None,
+            )
+            .await;
+        let store = router.inner.store.lock().await;
+        let failed = store.get_command(&dispatched.id).unwrap().unwrap();
+        assert_eq!(failed.state, CommandState::Failed);
+        let outcome = failed.outcome.unwrap();
+        assert_eq!(outcome["code"], "process_custody_conflict", "{outcome}");
+        assert_eq!(outcome["origin"], "swarm");
+        assert_eq!(outcome["where"], "swarm.start.pre_spawn");
+        assert_eq!(
+            store.get_agent(&agent.id).unwrap().unwrap().state,
+            AgentState::Failed
+        );
+        assert!(store.restart_retained_generations(None).unwrap().is_empty());
+        assert_eq!(
+            store
+                .generation_custody_namespace(&agent.id, agent.generation)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            Job::new_named_kill_on_close(&name).err().unwrap().code,
+            "process_custody_conflict"
+        );
+        drop(store);
+        let why = router
+            .diagnose(
+                &json!({"target":agent.id}),
+                &crate::router::Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert!(
+            why["summary"]
+                .as_str()
+                .unwrap()
+                .starts_with("swarm origin:")
+        );
+        assert!(
+            why["summary"]
+                .as_str()
+                .unwrap()
+                .contains("process_custody_conflict")
+        );
+        assert!(why["summary"].as_str().unwrap().contains("already exists"));
+    }
 
     #[test]
     fn failed_state_settles_failed_and_everything_else_stays_ready() {

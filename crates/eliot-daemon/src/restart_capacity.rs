@@ -77,7 +77,7 @@ pub(crate) async fn reconcile(
 ) -> Vec<RetainedGeneration> {
     let mut remaining = Vec::new();
     for generation in pending {
-        let custody = restart_custody(&context.namespace, &generation).unwrap_or_else(|error| {
+        let custody = restart_custody(&generation).unwrap_or_else(|error| {
             context.log("daemon.restart_custody_probe_failed", &generation, &error);
             RestartCustody::Retained {
                 missing: "custody_probe_failed",
@@ -153,7 +153,6 @@ pub(crate) struct Reconcile {
     pub bus: Bus,
     pub router: Router,
     pub policy: Arc<SecretPolicy>,
-    pub namespace: String,
 }
 
 impl Reconcile {
@@ -275,11 +274,6 @@ mod bounded_recovery_tests {
         );
 
         let store = Arc::new(Mutex::new(store));
-        let namespace = store
-            .lock()
-            .await
-            .custody_namespace()
-            .expect("read custody namespace");
         let root = std::env::temp_dir().join(format!("eliot-restart-page-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&root).expect("create router root");
         struct RemoveOnDrop(std::path::PathBuf);
@@ -300,7 +294,6 @@ mod bounded_recovery_tests {
             bus: Bus::new(16),
             router,
             policy: Arc::new(SecretPolicy::new(Vec::<String>::new())),
-            namespace,
         };
         let report = reconcile_first_pass(&context)
             .await

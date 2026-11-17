@@ -435,16 +435,12 @@ impl Router {
         linked_id: Option<String>,
     ) {
         if let Err(error) = self.prepare_agent_artifact_root(&agent).await {
-            let mut refused = Error::new("native_not_dispatched", *error.message);
-            refused.failure_where = error.failure_where;
-            refused.origin = error.origin;
-            refused.origin_evidence = error.origin_evidence;
             let refused = super::cleanup::swarm_preparation_failure(
-                refused,
+                error,
                 "router.dispatch.prepare_artifact_root",
                 "Swarm's Agent artifact root preparation refused the start before dispatch",
             );
-            self.settle_plugin_error(id, &refused).await;
+            self.settle_unspawned_start(id, &refused).await;
             return;
         }
         let artifact_agent = agent.id.clone();
@@ -477,7 +473,10 @@ impl Router {
                     }
                 }
             }
-            Err(error) => {
+            Err(crate::plugin_host::StartError::NotSpawned(error)) => {
+                self.settle_unspawned_start(id, &error).await;
+            }
+            Err(crate::plugin_host::StartError::Uncertain(error)) => {
                 self.settle_plugin_error(id, &error).await;
             }
         }

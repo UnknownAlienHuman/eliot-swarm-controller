@@ -1591,7 +1591,8 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "DROP INDEX events_git_hints;
+                    "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+                     DROP INDEX events_git_hints;
                      DROP INDEX processes_live_owner;
                      DROP INDEX events_heavy_agent_generation;
                      DELETE FROM schema_migrations WHERE version >= 49;

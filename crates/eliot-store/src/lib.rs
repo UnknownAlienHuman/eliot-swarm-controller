@@ -370,6 +370,7 @@ impl Store {
             hierarchy_limits: core::api::HierarchyLimits::default(),
         };
         store.migrate()?;
+        store.bind_custody_namespace(path)?;
         on_phase(StoreOpenPhase::Migrated);
         Ok(store)
     }
@@ -824,7 +825,21 @@ impl Store {
                 "a Run is applied only with its atomic fixed child-set commit",
             ));
         }
-        let result = self.settle_inner(id, state, outcome, now);
+        let result = self.settle_inner(id, state, outcome, now, false);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    /// Host-only proof that this dispatched start never created an OS child.
+    /// Commit failure, source retirement and capacity release atomically.
+    pub fn settle_unspawned_start(
+        &mut self,
+        id: &str,
+        outcome: Value,
+        now: i64,
+    ) -> Result<Change<Command>> {
+        self.ensure_writer_healthy()?;
+        let result = self.settle_inner(id, CommandState::Failed, Some(outcome), now, true);
         self.fault_on_persistence_error(&result);
         result
     }

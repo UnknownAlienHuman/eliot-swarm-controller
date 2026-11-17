@@ -115,7 +115,13 @@ fn validate_inference_id_age(tx: &Connection, client: &str, id: &str, now: i64) 
 
 impl Store {
     pub fn inference_controller_id(&self) -> Result<String> {
-        self.custody_namespace()
+        self.connection
+            .query_row(
+                "SELECT id FROM store_identity WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
     }
 
     pub fn inference_token_hash(&self, client: &str, version: i64) -> Result<Option<String>> {

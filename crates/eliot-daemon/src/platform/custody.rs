@@ -31,6 +31,22 @@ pub struct OwnedChild {
     observation: std::sync::Mutex<Option<super::CustodyObserver>>,
 }
 
+/// Whether an unsuccessful spawn ever returned an OS child. A suspended
+/// child's cleanup failure must not be confused with refusal before spawn.
+#[derive(Debug)]
+pub enum AgentSpawnError {
+    NotSpawned(Error),
+    Uncertain(Error),
+}
+
+impl AgentSpawnError {
+    pub fn into_error(self) -> Error {
+        match self {
+            Self::NotSpawned(error) | Self::Uncertain(error) => error,
+        }
+    }
+}
+
 impl OwnedChild {
     /// Capture observation authority while the exact leader identity is owned.
     pub fn observer(&self) -> Result<super::CustodyObserver> {
@@ -164,7 +180,7 @@ impl OwnedChild {
                     "cannot start process with verified leaf restrictions",
                 )
             })?;
-            Self::spawn_in_job(command, job)
+            Self::spawn_in_job(command, job).map_err(AgentSpawnError::into_error)
         }
         #[cfg(unix)]
         {
@@ -194,44 +210,49 @@ impl OwnedChild {
         namespace: &str,
         agent: &str,
         generation: i64,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, AgentSpawnError> {
         #[cfg(windows)]
         {
             let name = agent_custody_name(namespace, agent, generation);
             Self::spawn_in_job(
                 command,
-                super::windows::Job::new_named_kill_on_close(&name)?,
+                super::windows::Job::new_named_kill_on_close(&name)
+                    .map_err(AgentSpawnError::NotSpawned)?,
             )
         }
         #[cfg(not(windows))]
         {
             let _ = (namespace, agent, generation);
-            Self::spawn(command)
+            Self::spawn(command).map_err(AgentSpawnError::NotSpawned)
         }
     }
 
     #[cfg(windows)]
-    fn spawn_in_job(mut command: Command, job: super::windows::Job) -> Result<Self> {
+    fn spawn_in_job(
+        mut command: Command,
+        job: super::windows::Job,
+    ) -> std::result::Result<Self, AgentSpawnError> {
         use std::os::windows::process::CommandExt;
         use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
         command
             .as_std_mut()
             .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW);
-        let mut child = command
-            .spawn()
-            .map_err(|error| io_error("spawn suspended child", error))?;
+        let mut child = command.spawn().map_err(|error| {
+            AgentSpawnError::NotSpawned(io_error("spawn suspended child", error))
+        })?;
         let process = match child.raw_handle() {
             Some(process) => process,
             None => {
                 let _ = child.start_kill();
-                return Err(Error::new(
+                return Err(AgentSpawnError::Uncertain(Error::new(
                     "process_handle_unavailable",
                     "Tokio did not expose the suspended child process handle",
-                ));
+                )));
             }
         };
-        job.assign_then_resume(process)?;
+        job.assign_then_resume(process)
+            .map_err(AgentSpawnError::Uncertain)?;
         Ok(Self {
             job,
             child,
@@ -247,7 +268,7 @@ impl OwnedChild {
             } else {
                 super::windows::Job::new_kill_on_close()?
             };
-            Self::spawn_in_job(command, job)
+            Self::spawn_in_job(command, job).map_err(AgentSpawnError::into_error)
         }
 
         #[cfg(unix)]
@@ -387,10 +408,7 @@ pub(crate) fn agent_custody_name(namespace: &str, agent: &str, generation: i64) 
 }
 
 /// Check the custody of a generation that an earlier daemon started.
-pub fn restart_custody(
-    namespace: &str,
-    generation: &eliot_store::RetainedGeneration,
-) -> Result<RestartCustody> {
+pub fn restart_custody(generation: &eliot_store::RetainedGeneration) -> Result<RestartCustody> {
     if generation.processes_truncated {
         return Ok(RestartCustody::Retained {
             missing: "process_readback_truncated",
@@ -398,11 +416,11 @@ pub fn restart_custody(
     }
     #[cfg(windows)]
     {
-        if !generation.named_custody {
+        let Some(namespace) = generation.custody_namespace.as_deref() else {
             return Ok(RestartCustody::Retained {
                 missing: "named_custody_unrecorded",
             });
-        }
+        };
         let name = agent_custody_name(namespace, &generation.agent, generation.generation);
         if !super::windows::named_job_closed(&name)? {
             return Ok(RestartCustody::Retained {
@@ -432,7 +450,6 @@ pub fn restart_custody(
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = namespace;
         let boot = super::unix::host_boot_id()?;
         let mut leader = None;
         let mut current_boot = false;
@@ -484,7 +501,7 @@ pub fn restart_custody(
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
-        let _ = (namespace, generation);
+        let _ = generation;
         Ok(RestartCustody::Retained {
             missing: "custody_unsupported",
         })
@@ -753,10 +770,10 @@ mod restart_custody_tests {
         command
     }
 
-    async fn eventually_closed(namespace: &str, generation: &RetainedGeneration) -> RestartCustody {
+    async fn eventually_closed(generation: &RetainedGeneration) -> RestartCustody {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let custody = restart_custody(namespace, generation).expect("probe custody");
+            let custody = restart_custody(generation).expect("probe custody");
             if matches!(custody, RestartCustody::Closed { .. })
                 || tokio::time::Instant::now() >= deadline
             {
@@ -787,12 +804,12 @@ mod restart_custody_tests {
         let generation = RetainedGeneration {
             agent: "a1".to_owned(),
             generation: 3,
-            named_custody: true,
+            custody_namespace: Some(namespace.clone()),
             processes: vec![recorded(child.child.id().expect("live plugin pid"))],
             processes_truncated: false,
         };
         assert_eq!(
-            restart_custody(&namespace, &generation).expect("probe live custody"),
+            restart_custody(&generation).expect("probe live custody"),
             RestartCustody::Retained {
                 missing: "windows_job_live"
             }
@@ -800,22 +817,22 @@ mod restart_custody_tests {
         let duplicate = OwnedChild::spawn_agent(long_running(), &namespace, "a1", 3)
             .err()
             .expect("an existing custody name is never adopted");
-        assert_eq!(duplicate.code, "process_custody_conflict");
+        assert_eq!(duplicate.into_error().code, "process_custody_conflict");
 
         drop(child);
         assert_eq!(
-            eventually_closed(&namespace, &generation).await,
+            eventually_closed(&generation).await,
             RestartCustody::Closed {
                 evidence: "windows_job_closed",
                 orphan_possible: false
             }
         );
         let unnamed = RetainedGeneration {
-            named_custody: false,
+            custody_namespace: None,
             ..generation.clone()
         };
         assert_eq!(
-            restart_custody(&namespace, &unnamed).expect("probe unnamed custody"),
+            restart_custody(&unnamed).expect("probe unnamed custody"),
             RestartCustody::Retained {
                 missing: "named_custody_unrecorded"
             }
@@ -830,14 +847,14 @@ mod restart_custody_tests {
             ..generation
         };
         assert_eq!(
-            restart_custody(&namespace, &still_running).expect("probe recorded process"),
+            restart_custody(&still_running).expect("probe recorded process"),
             RestartCustody::Retained {
                 missing: "windows_process_live"
             }
         );
         outside.kill().await.expect("stop recorded process");
         assert_eq!(
-            restart_custody(&namespace, &still_running).expect("probe exited process"),
+            restart_custody(&still_running).expect("probe exited process"),
             RestartCustody::Closed {
                 evidence: "windows_job_closed",
                 orphan_possible: false
@@ -866,12 +883,12 @@ mod restart_custody_tests {
         let generation = RetainedGeneration {
             agent: "a1".to_owned(),
             generation: 3,
-            named_custody: true,
+            custody_namespace: Some("unused".to_owned()),
             processes: vec![leader.clone()],
             processes_truncated: false,
         };
         assert_eq!(
-            restart_custody("unused", &generation).expect("probe live group"),
+            restart_custody(&generation).expect("probe live group"),
             RestartCustody::Retained {
                 missing: "unix_process_live"
             }
@@ -880,7 +897,7 @@ mod restart_custody_tests {
         child.terminate().expect("terminate group");
         child.wait().await.expect("reap leader");
         assert_eq!(
-            eventually_closed("unused", &generation).await,
+            eventually_closed(&generation).await,
             RestartCustody::Closed {
                 evidence: "unix_group_empty",
                 orphan_possible: true
@@ -889,13 +906,10 @@ mod restart_custody_tests {
         let mut earlier_boot = leader;
         earlier_boot.identity.host_boot_id = "earlier-boot".to_owned();
         assert_eq!(
-            restart_custody(
-                "unused",
-                &RetainedGeneration {
-                    processes: vec![earlier_boot],
-                    ..generation
-                }
-            )
+            restart_custody(&RetainedGeneration {
+                processes: vec![earlier_boot],
+                ..generation
+            })
             .expect("probe earlier boot"),
             RestartCustody::Closed {
                 evidence: "host_rebooted",
