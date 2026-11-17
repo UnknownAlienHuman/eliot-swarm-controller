@@ -452,50 +452,72 @@ fn replacements(
                 "settings draft contains a redaction marker",
             ));
         }
-        if value.as_object().is_none() {
-            return Err(core::Error::new(
-                "invalid",
-                "settings sections must be objects",
-            ));
-        }
-        let name = section_name(*section).to_owned();
-        if (is_default_section(*section, value)
-            && (*section != SettingsSection::Desktop || !desktop_present))
-            || value.as_object().is_some_and(JsonMap::is_empty)
-        {
-            result.insert(name, String::new());
-            continue;
-        }
-        let mut normalized = value.clone();
-        if *section == SettingsSection::Desktop
-            && let Some(object) = normalized.as_object_mut()
-        {
-            // TOML has no null: omit null window/last_access like the
-            // pre-existing window handling, so a JSON null round-trips.
-            if object.get("window").is_some_and(JsonValue::is_null) {
-                object.remove("window");
-            }
-            if object.get("last_access").is_some_and(JsonValue::is_null) {
-                object.remove("last_access");
-            }
-        }
-        let section_value = toml::Value::try_from(normalized).map_err(|_| {
-            core::Error::new(
-                "profile_error",
-                "settings section contains a non-TOML value",
-            )
-        })?;
-        let mut root = toml::map::Map::new();
-        root.insert(name.clone(), section_value);
-        let source = toml::to_string(&toml::Value::Table(root)).map_err(|_| {
-            core::Error::new(
-                "profile_error",
-                "settings section could not be encoded as TOML",
-            )
-        })?;
-        result.insert(name, source);
+        result.insert(
+            section_name(*section).to_owned(),
+            section_source(*section, value, desktop_present)?,
+        );
     }
     Ok(result)
+}
+
+/// One section's replacement TOML; empty when the section is removed (an
+/// empty or default section reads as its default).
+fn section_source(
+    section: SettingsSection,
+    value: &JsonValue,
+    desktop_present: bool,
+) -> core::Result<String> {
+    if value.as_object().is_none() {
+        return Err(core::Error::new(
+            "invalid",
+            "settings sections must be objects",
+        ));
+    }
+    if (is_default_section(section, value)
+        && (section != SettingsSection::Desktop || !desktop_present))
+        || value.as_object().is_some_and(JsonMap::is_empty)
+    {
+        return Ok(String::new());
+    }
+    let mut normalized = value.clone();
+    if section == SettingsSection::Desktop
+        && let Some(object) = normalized.as_object_mut()
+    {
+        // TOML has no null: omit null window/last_access like the
+        // pre-existing window handling, so a JSON null round-trips.
+        if object.get("window").is_some_and(JsonValue::is_null) {
+            object.remove("window");
+        }
+        if object.get("last_access").is_some_and(JsonValue::is_null) {
+            object.remove("last_access");
+        }
+    }
+    let section_value = toml::Value::try_from(normalized).map_err(|_| {
+        core::Error::new(
+            "profile_error",
+            "settings section contains a non-TOML value",
+        )
+    })?;
+    let name = section_name(section).to_owned();
+    let mut root = toml::map::Map::new();
+    root.insert(name, section_value);
+    toml::to_string(&toml::Value::Table(root)).map_err(|_| {
+        core::Error::new(
+            "profile_error",
+            "settings section could not be encoded as TOML",
+        )
+    })
+}
+
+/// A section as the settings reader shows it once a save stored `value`
+/// (TOML has no null; an empty or default section reads as its default).
+/// An editor compares a read with this to tell its own save from another
+/// writer's (the stale-revision rule in `docs/spec/configuration.md`).
+/// `None` when `value` cannot be stored. The read also fills the daemon
+/// section's `chats_root`; this does not.
+pub fn stored_section(section: SettingsSection, value: &JsonValue) -> Option<JsonValue> {
+    let source = section_source(section, value, true).ok()?;
+    section_json(&source, section_name(section)).ok()
 }
 
 fn validate_unselected_sections(
@@ -834,6 +856,51 @@ mod tests {
         let _read = read_internal(&root.0, &store, None, &policy).expect("read settings");
         let after = store.list_settings_history(100).expect("history");
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn stored_section_is_what_the_read_shows_after_a_save() {
+        let root = TestRoot::new();
+        let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        let sections = BTreeMap::from([
+            (SettingsSection::Profiles, profile_section("gpt-6-luna")),
+            (
+                SettingsSection::Routing,
+                serde_json::json!({"default": ["codex"]}),
+            ),
+            (
+                SettingsSection::Desktop,
+                serde_json::json!({"theme": "dark", "window": null}),
+            ),
+        ]);
+        let saved = save_internal(
+            &root.0,
+            &mut store,
+            None,
+            &sections,
+            SettingsAuthor::Owner(SettingsClientSource::Desktop),
+            false,
+            &policy,
+        )
+        .expect("save settings");
+        assert!(saved.saved);
+        let read = read_internal(&root.0, &store, None, &policy).expect("read settings");
+        for (section, value) in &sections {
+            assert_eq!(
+                stored_section(*section, value).as_ref(),
+                read.sections.get(section)
+            );
+        }
+        // The desktop section reads with its defaults filled in.
+        assert_ne!(
+            Some(&sections[&SettingsSection::Desktop]),
+            read.sections.get(&SettingsSection::Desktop)
+        );
+        assert_eq!(
+            stored_section(SettingsSection::Routing, &serde_json::json!({})),
+            Some(serde_json::json!({"default": []}))
+        );
     }
 
     #[test]

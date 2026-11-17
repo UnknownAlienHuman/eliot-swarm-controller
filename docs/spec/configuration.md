@@ -1006,8 +1006,11 @@ A stale revision writes nothing. An editor such as the desktop sends only the se
 the owner edited, and it re-applies a change refused as `conflict` automatically only
 when a fresh read shows every edited section still holding the value the edit started
 from. Then only another writer's other sections moved, and they are kept: the merge
-loses nothing. When an edited section itself changed, the change is never re-applied:
-the editor shows the refusal and the stored values. The same rule applies when a read
+loses nothing. An edit made while the editor's own save of that section was in flight,
+or of unknown outcome, started from that save's value: the read must hold exactly what
+that save stored, as the store normalizes it. Having saved the section is not enough.
+When an edited section itself changed, the change is never re-applied: the editor
+shows the refusal and the stored values. The same rule applies when a read
 shows that another writer changed a section with an unsaved edit: the edit is dropped
 with the same refusal, so it can never overwrite that writer's value. A definite
 refusal, such as an invalid value, leaves the revision unchanged. A form then shows the

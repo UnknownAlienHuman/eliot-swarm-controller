@@ -34,6 +34,7 @@ mod workspaces;
 /// desktop picker; Claude Code has no live model catalogue).
 pub use adhoc::CLAUDE_EFFORT_LEVELS;
 pub use config::load_cloud_access_config;
+pub use config::settings::stored_section as stored_settings_section;
 pub use daemon::client_call_with_remote_context;
 pub use daemon::{
     CallTimings, DaemonStartupFailure, MAX_RPC_FRAME_BYTES, client_call, client_call_measured,

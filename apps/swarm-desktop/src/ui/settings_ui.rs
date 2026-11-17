@@ -16,7 +16,7 @@
 //! (the presets' TOML and every section's JSON) keep Save, Validate and
 //! Discard. Revisions and history stay in Advanced.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 mod access;
 mod advanced;
@@ -317,6 +317,21 @@ const SHOWS_SAVED: &str = "The page shows the saved values.";
 /// meanwhile (the stale-revision rule in `docs/spec/configuration.md`).
 const CHANGED_ELSEWHERE: &str = "Not saved: these settings were changed somewhere else meanwhile. The page shows the saved values.";
 
+/// Whether a section as read is a value this desktop's own save sent (sure,
+/// of unknown outcome, or still running), as the store keeps it. Having
+/// sent the section is not enough: another writer may have saved over it
+/// before the read, and that value is never this desktop's.
+fn saved_here<'a>(
+    section: Section,
+    read: &Value,
+    saves: impl IntoIterator<Item = &'a BTreeMap<Section, Value>>,
+) -> bool {
+    saves
+        .into_iter()
+        .filter_map(|sent| sent.get(&section))
+        .any(|sent| eliot_daemon::stored_settings_section(section, sent).as_ref() == Some(read))
+}
+
 /// Whether a section's draft differs from a stored value as a save would
 /// send it (Routing drops its empty roles).
 fn differs(section: Section, draft: &Value, stored: &Value) -> bool {
@@ -394,10 +409,10 @@ pub(super) struct SettingsState {
     /// Sections the last saves wrote, until a read shows them: a draft
     /// equal to one follows the read even when the daemon normalised it.
     sent: BTreeMap<Section, Value>,
-    /// Sections a save of unknown outcome sent, until the next read: if it
-    /// landed, that read shows this desktop's own value, not another
-    /// writer's.
-    unsure: BTreeSet<Section>,
+    /// Sections a save of unknown outcome sent, as sent, until the next
+    /// read: if it landed, that read shows this desktop's own value, not
+    /// another writer's.
+    unsure: BTreeMap<Section, Value>,
     /// Pages whose control changes wait for the running save or read.
     queued: Vec<Page>,
     /// Pages whose save was refused for a stale revision: the next read
@@ -485,15 +500,15 @@ impl SettingsState {
 
     /// Take a fresh read. A draft without unsaved edits follows it. An
     /// edited draft stays while its section is unchanged in the read (or
-    /// changed only by this desktop's own save) and saves on the new
-    /// revision; when another writer changed that section, the edit is
+    /// holds exactly what this desktop's own save stored) and saves on the
+    /// new revision; when another writer changed that section, the edit is
     /// never applied: the stored values show with the refusal.
     fn take(&mut self, read: SettingsReadResponse) {
         let old = std::mem::take(&mut self.base);
         let sent = std::mem::take(&mut self.sent);
-        let mut unsure = std::mem::take(&mut self.unsure);
+        let unsure = std::mem::take(&mut self.unsure);
         // A save still running may already be in this read.
-        unsure.extend(self.sending.iter().flat_map(|sending| sending.keys()));
+        let running = self.sending.as_ref();
         let fresh = !self.loaded;
         let mut refused = Vec::new();
         let mut follow = |draft: &mut Value, section: Section, page: Page| {
@@ -505,8 +520,10 @@ impl SettingsState {
                 .unwrap_or_else(|| json!({}));
             let edited =
                 !fresh && *draft != before && *draft != new && sent.get(&section) != Some(draft);
-            let ours = sent.contains_key(&section) || unsure.contains(&section);
-            if edited && (new == before || ours) {
+            if edited
+                && (new == before
+                    || saved_here(section, &new, [&sent, &unsure].into_iter().chain(running)))
+            {
                 return;
             }
             if edited && differs(section, draft, &before) {
@@ -876,7 +893,7 @@ impl DesktopApp {
                     // own; a read shows whether it landed (and if it did, the
                     // value there is this desktop's own).
                     Err(error) if crate::state::uncertain(error) => {
-                        self.settings.unsure.extend(sent.into_keys());
+                        self.settings.unsure.extend(sent);
                         self.load_settings(context);
                     }
                     // Refused (an invalid value), nothing changed: a form
@@ -1168,8 +1185,10 @@ impl DesktopApp {
 
     /// The profile editor follows a read unless it has unsaved edits; those
     /// follow the rule of [`SettingsState::take`]: they stay while the
-    /// presets are unchanged in the read (or changed by this desktop's own
-    /// save), and when another writer changed them they are never applied.
+    /// presets are unchanged in the read (or hold exactly what this
+    /// desktop's own save stored), and when another writer changed them
+    /// they are never applied. Runs before [`SettingsState::take`] clears
+    /// the saves it compares with.
     fn take_profiles(&mut self, read: &SettingsReadResponse) {
         let section = read
             .sections
@@ -1186,9 +1205,14 @@ impl DesktopApp {
                 let edited = editor.draft != editor.base
                     && editor.draft != text
                     && sent.as_ref() != Some(&editor.draft);
-                let ours = sent.is_some()
-                    || editor.sending.is_some()
-                    || self.settings.unsure.contains(&Section::Profiles);
+                let saves = &self.settings;
+                let ours = saved_here(
+                    Section::Profiles,
+                    &section,
+                    [&saves.sent, &saves.unsure]
+                        .into_iter()
+                        .chain(saves.sending.as_ref()),
+                );
                 let elsewhere = edited && text != editor.base && !ours;
                 if !edited || elsewhere {
                     editor.draft = text.clone();
@@ -1980,7 +2004,9 @@ mod tests {
             ],
         ));
         assert_eq!(state.routing, json!({"default": ["c", "d", "e"]}));
-        state.unsure.insert(Section::Routing);
+        state
+            .unsure
+            .insert(Section::Routing, json!({"default": ["c", "d", "f"]}));
         state.take(read(
             "rev5",
             &[
@@ -2003,5 +2029,68 @@ mod tests {
             ],
         ));
         assert_eq!(state.routing, json!({"default": ["c", "d", "e", "g"]}));
+    }
+
+    #[test]
+    fn a_queued_edit_never_overwrites_another_writers_save() {
+        let b = json!({"default": ["z"]});
+        let mut state = SettingsState::default();
+        state.take(read(
+            "rev1",
+            &[(Section::Routing, json!({"default": ["a"]}))],
+        ));
+        // A1 saves; A2 is queued while the reread runs; another writer
+        // saves B to routing before that read.
+        state.routing = json!({"default": ["a", "b"]});
+        let a1 = state.request_sections(Page::Routing, "").unwrap();
+        state.sent.extend(a1);
+        state.routing = json!({"default": ["a", "b", "c"]});
+        state.take(read("rev3", &[(Section::Routing, b.clone())]));
+        // A2 is refused and B shows: nothing is left to send over it.
+        assert_eq!(state.routing, b);
+        assert!(!state.dirty(Page::Routing));
+        assert_eq!(state.notes[&Page::Routing], Note::error(CHANGED_ELSEWHERE));
+        // The same when A1's outcome was unknown.
+        state.notes.clear();
+        state.routing = json!({"default": ["z", "y", "x"]});
+        state
+            .unsure
+            .insert(Section::Routing, json!({"default": ["z", "y"]}));
+        state.take(read(
+            "rev5",
+            &[(Section::Routing, json!({"default": ["w"]}))],
+        ));
+        assert_eq!(state.routing, json!({"default": ["w"]}));
+        assert!(state.notes[&Page::Routing].error);
+        // A read holding A1 as stored is this desktop's own save: A2 stays
+        // and saves on that revision.
+        let mut state = SettingsState::default();
+        state.take(read("rev1", &[(Section::Projects, json!({}))]));
+        state.projects = json!({"atlas": {"path": "C:/atlas"}});
+        state
+            .sent
+            .extend(state.request_sections(Page::Projects, "").unwrap());
+        let a2 = json!({"atlas": {"path": "C:/atlas"}, "beta": {"path": "C:/beta"}});
+        state.projects = a2.clone();
+        state.take(read(
+            "rev2",
+            &[(Section::Projects, json!({"atlas": {"path": "C:/atlas"}}))],
+        ));
+        assert_eq!(state.projects, a2);
+        assert!(state.dirty(Page::Projects));
+        assert!(!state.notes.contains_key(&Page::Projects));
+        // The presets editor ([`DesktopApp::take_profiles`]) asks the same:
+        // the presets a save sent, as stored, against the read.
+        let sent = model::profiles_from_toml(
+            "[profiles.dev]
+harness = \"codex\"
+model = \"gpt-6\"
+",
+        )
+        .unwrap();
+        let saves = BTreeMap::from([(Section::Profiles, sent.clone())]);
+        assert!(saved_here(Section::Profiles, &sent, [&saves]));
+        let other = json!({"dev": {"harness": "codex", "model": "gpt-7"}});
+        assert!(!saved_here(Section::Profiles, &other, [&saves]));
     }
 }
