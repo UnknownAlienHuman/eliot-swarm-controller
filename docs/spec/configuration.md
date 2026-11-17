@@ -1000,6 +1000,18 @@ without asynchronous Git work between them. A delayed save cannot restore older
 project authority after a newer settings save.
 An uncertain post-replacement failure is `unknown`; read the revision before retrying.
 
+A stale revision writes nothing. An editor such as the desktop sends only the sections
+the owner edited, and it re-applies a change refused as `conflict` automatically only
+when a fresh read shows every edited section still holding the value the edit started
+from. Then only another writer's other sections moved, and they are kept: the merge
+loses nothing. When an edited section itself changed, the change is never re-applied:
+the editor shows the refusal and the stored values. The same rule applies when a read
+shows that another writer changed a section with an unsaved edit: the edit is dropped
+with the same refusal, so it can never overwrite that writer's value. A definite
+refusal, such as an invalid value, leaves the revision unchanged. A form then shows the
+stored values under the error, and a raw TOML or JSON editor keeps its draft for
+correction.
+
 Every actual save records old/new revisions, changed sections, time and authenticated
 author in bounded Store history. Public callers cannot claim `bootstrap` or another
 principal. Owner CLI and desktop identify their client source; Agent/automation
@@ -1076,8 +1088,8 @@ with `swarm settings save request.json` (add `--dry-run` to validate only):
 ```
 
 Each named section is a complete replacement; leave unmodified sections out of the
-request. The desktop Settings screen uses the same read/save contract and reports
-conflicts without discarding the draft.
+request. The desktop Settings screen uses the same read/save contract and follows the
+stale-revision rule of [unified settings](#unified-settings).
 
 ## Legacy profile-only editing (`config.profiles.*`)
 
