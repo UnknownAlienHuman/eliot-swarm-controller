@@ -1,0 +1,387 @@
+use super::*;
+
+impl DesktopApp {
+    /// The cleanup review under its row: the plan by kind (a checkbox per
+    /// group that has something to remove, each item with its size and its
+    /// keep or remove reason), Remove with one inline confirmation, then the
+    /// result: removed, kept with why, and unknown.
+    fn cleanup_review(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let state = &self.settings;
+        // A task title when Swarm knows one (else the item keeps its id).
+        let title = |agent: &str| {
+            let title = self.agent_title(agent);
+            (title != agent).then_some(title)
+        };
+        let mut parts: Vec<KeyedView> = Vec::new();
+        if state.cleanup_busy {
+            parts.push(KeyedView::new(
+                "busy",
+                m3::secondary(if state.cleanup_plan.is_some() {
+                    "Removing the selected items…"
+                } else {
+                    "Reviewing what can be removed…"
+                }),
+            ));
+        }
+        if let Some(error) = &state.cleanup_error {
+            parts.push(KeyedView::new(
+                format!("error:{error}"),
+                m3::body(error.clone())
+                    .foreground(palette.error())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+            ));
+        }
+        if let Some((plan, reply)) = &state.cleanup_result {
+            let lines = crate::worktrees::result_lines(plan, reply, &title);
+            let rows: Vec<KeyedView> = lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    let text = if index == 0 {
+                        m3::text(line.clone(), tokens::text::SECTION_TITLE)
+                    } else {
+                        m3::body(line.clone())
+                    };
+                    KeyedView::new(
+                        format!("result:{index}"),
+                        text.text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true),
+                    )
+                })
+                .collect();
+            parts.push(KeyedView::new(
+                "result",
+                m3::card_high(palette)
+                    .automation_name("Cleanup result")
+                    .content(
+                        StackPanel::new()
+                            .spacing(tokens::spacing::XS)
+                            .keyed_children(rows),
+                    ),
+            ));
+        }
+        if let Some(plan) = &state.cleanup_plan {
+            let groups = crate::worktrees::cleanup_groups(plan);
+            if groups.is_empty() {
+                parts.push(KeyedView::new(
+                    "empty",
+                    m3::secondary("Nothing to clean up: Swarm holds no finished work.")
+                        .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
+            for view in &groups {
+                let group = view.group;
+                let checked = !state.cleanup_unchecked.contains(&group);
+                let kept = view.items.len() - view.removable;
+                let size = if crate::worktrees::sized(group) {
+                    format!(" · {}", crate::worktrees::size_words(view.bytes))
+                } else {
+                    String::new()
+                };
+                let summary = match (view.removable, kept) {
+                    (0, kept) => format!("{kept} kept"),
+                    (removable, 0) => format!("{removable} to remove{size}"),
+                    (removable, kept) => format!("{removable} to remove{size} · {kept} kept"),
+                };
+                let header: View = if view.removable > 0 {
+                    CheckBox::new()
+                        .is_checked(checked)
+                        .is_enabled(!state.cleanup_busy)
+                        .automation_name(format!("Remove {}: {summary}", group.title()))
+                        .on_is_checked_changed(context.callback(move |on: bool| {
+                            Message::Settings(SettingsMsg::CleanupGroupToggled(group, on))
+                        }))
+                        .content(m3::text(
+                            format!("{} · {summary}", group.title()),
+                            tokens::text::SECTION_TITLE,
+                        ))
+                } else {
+                    m3::text(
+                        format!("{} · {summary}", group.title()),
+                        tokens::text::SECTION_TITLE,
+                    )
+                    .into()
+                };
+                let mut rows: Vec<KeyedView> =
+                    vec![KeyedView::new(format!("header:{checked}"), header)];
+                let item_row = |item: &eliot_core::api::CleanupCandidate| {
+                    let (name, line) =
+                        crate::worktrees::item_line(item, title(&item.artifact.agent).as_deref());
+                    KeyedView::new(
+                        item.artifact.id.clone(),
+                        StackPanel::new().children((
+                            m3::body(name).text_trimming(TextTrimming::CharacterEllipsis),
+                            m3::secondary(line)
+                                .text_wrapping(TextWrapping::Wrap)
+                                .is_text_selection_enabled(true),
+                        )),
+                    )
+                };
+                // What Remove takes comes first; the kept items fold under
+                // one "N kept" row.
+                let (removable, kept_items) = view.split();
+                rows.extend(removable.iter().map(|item| item_row(item)));
+                if !kept_items.is_empty() {
+                    let open = state.cleanup_kept_open.contains(&group);
+                    let label = format!("{} kept", kept_items.len());
+                    rows.push(KeyedView::new(
+                        format!("kept:{open}"),
+                        m3::sub_row(palette, false)
+                            .automation_name(format!(
+                                "{label} in {} ({})",
+                                group.title(),
+                                if open { "shown" } else { "hidden" }
+                            ))
+                            .on_click(
+                                context.message(Message::Settings(
+                                    SettingsMsg::CleanupKeptToggled(group),
+                                )),
+                            )
+                            .content(m3::row_content(
+                                Some(if open {
+                                    m3::glyph::CHEVRON_DOWN
+                                } else {
+                                    m3::glyph::CHEVRON_RIGHT
+                                }),
+                                &label,
+                                "",
+                                View::empty(),
+                            )),
+                    ));
+                    if open {
+                        rows.extend(kept_items.iter().map(|item| item_row(item)));
+                    }
+                }
+                parts.push(KeyedView::new(
+                    format!("group:{group:?}"),
+                    m3::card_high(palette).content(
+                        StackPanel::new()
+                            .spacing(tokens::spacing::SM)
+                            .keyed_children(rows),
+                    ),
+                ));
+            }
+            if plan.truncated {
+                parts.push(KeyedView::new(
+                    "truncated",
+                    m3::secondary(
+                        "The review stopped at its bound; review again after this cleanup for the rest.",
+                    )
+                    .text_wrapping(TextWrapping::Wrap),
+                ));
+            }
+            let selected = crate::worktrees::selected_artifacts(plan, &state.cleanup_unchecked);
+            let bytes: u64 = plan
+                .items
+                .iter()
+                .filter(|item| selected.contains(&item.artifact.id))
+                .filter_map(|item| item.bytes)
+                .sum();
+            let what = format!(
+                "{} item(s), {}",
+                selected.len(),
+                crate::worktrees::size_words(bytes)
+            );
+            if state.cleanup_confirm {
+                parts.push(KeyedView::new(
+                    "confirm",
+                    m3::card_high(palette)
+                        .automation_name("Confirm cleanup")
+                        .content(
+                            StackPanel::new().spacing(tokens::spacing::SM).children((
+                                m3::body(format!(
+                                    "Remove {what}? This cannot be undone. Kept items stay; Swarm checks each item again before removing it."
+                                ))
+                                .text_wrapping(TextWrapping::Wrap),
+                                StackPanel::new()
+                                    .orientation(Orientation::Horizontal)
+                                    .spacing(tokens::spacing::SM)
+                                    .children((
+                                        m3::destructive(palette)
+                                            .automation_name(format!("Remove: {what}"))
+                                            .on_click(context.message(Message::Settings(
+                                                SettingsMsg::CleanupConfirmed(true),
+                                            )))
+                                            .content(m3::label("Remove")),
+                                        m3::text_button(palette)
+                                            .automation_name("Cancel cleanup")
+                                            .on_click(context.message(Message::Settings(
+                                                SettingsMsg::CleanupConfirmed(false),
+                                            )))
+                                            .content(m3::label("Cancel")),
+                                    )),
+                            )),
+                        ),
+                ));
+            } else if !groups.is_empty() {
+                parts.push(KeyedView::new(
+                    "apply",
+                    m3::destructive(palette)
+                        .automation_name(format!("Remove selected: {what}"))
+                        .is_enabled(!state.cleanup_busy && !selected.is_empty())
+                        .on_click(context.message(Message::Settings(SettingsMsg::CleanupApply)))
+                        .content(m3::label(&if selected.is_empty() {
+                            "Nothing selected".to_owned()
+                        } else {
+                            format!("Remove {what}")
+                        })),
+                ));
+            }
+        }
+        StackPanel::new()
+            .spacing(tokens::spacing::SM)
+            .keyed_children(parts)
+    }
+
+    /// Worktrees & cleanup (Codex's Worktrees page as the pattern): where
+    /// Swarm creates worktrees, Clean up finished work (`cleanup.plan`
+    /// reviewed by kind, then `cleanup.apply` of the checked groups after
+    /// one confirmation), and the worktrees it manages, by project (the
+    /// daemon's `workspace.list`, every page).
+    pub(super) fn worktrees_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let root = self
+            .data_dir
+            .as_ref()
+            .map(|dir| dir.join("worktrees").to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let settings = m3::settings_card(
+            palette,
+            vec![
+                KeyedView::new(
+                    "root",
+                    m3::setting_row(
+                        "Worktree root",
+                        nav::display_path(&root),
+                        m3::outlined(palette)
+                            .automation_name("Open the worktree root")
+                            .is_enabled(!root.is_empty())
+                            .on_click(
+                                context.message(Message::Settings(SettingsMsg::OpenFolder(
+                                    root.clone(),
+                                ))),
+                            )
+                            .content(m3::icon_label(m3::glyph::OPEN_FOLDER, "Open")),
+                    ),
+                ),
+                KeyedView::new(
+                    "cleanup",
+                    m3::setting_row(
+                        "Clean up finished work",
+                        "Review what Swarm can remove for finished tasks, by kind, with sizes and reasons. Nothing is removed until you confirm.",
+                        m3::outlined(palette)
+                            .automation_name("Review cleanup")
+                            .is_enabled(!self.settings.cleanup_busy)
+                            .on_click(context.message(Message::Settings(SettingsMsg::CleanupPlan)))
+                            .content(m3::label(if self.settings.cleanup_plan.is_some() {
+                                "Review again"
+                            } else {
+                                "Review…"
+                            })),
+                    ),
+                ),
+            ],
+        );
+        let cleanup = self.cleanup_review(context, palette);
+        let mut groups: Vec<KeyedView> = Vec::new();
+        let empty: &[eliot_core::api::ManagedWorkspaceView] = &[];
+        let (rows, total, complete) = match &self.settings.worktrees {
+            Some(Ok((rows, total, complete))) => (&rows[..], *total, *complete),
+            Some(Err(error)) => {
+                groups.push(KeyedView::new(
+                    format!("error:{error}"),
+                    m3::body(format!(
+                        "Managed worktrees could not be read: {}",
+                        crate::state::plain_error(error)
+                    ))
+                    .foreground(palette.error())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+                ));
+                (empty, 0, true)
+            }
+            None => (empty, 0, true),
+        };
+        let managed = crate::worktrees::grouped(rows, &self.registered_projects());
+        let heading = match &self.settings.worktrees {
+            None => "Reading…".to_owned(),
+            Some(Err(_)) => String::new(),
+            Some(Ok(_)) if !complete => format!(
+                "{} of {total} shown (the read stopped at its page bound)",
+                rows.len()
+            ),
+            Some(Ok(_)) => format!("{total} managed worktree(s)"),
+        };
+        if matches!(self.settings.worktrees, Some(Ok(_))) && managed.is_empty() {
+            groups.push(KeyedView::new(
+                "none",
+                m3::secondary(
+                    "No managed worktrees yet. A task started with swarm launch --worktree BRANCH gets one here.",
+                )
+                .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        for (project, worktrees) in managed {
+            let rows: Vec<KeyedView> = worktrees
+                .iter()
+                .map(|worktree| {
+                    let name = std::path::Path::new(&worktree.path)
+                        .file_name()
+                        .map_or_else(
+                            || worktree.path.clone(),
+                            |name| name.to_string_lossy().into_owned(),
+                        );
+                    let detail = format!(
+                        "{} · {} · {} · {}",
+                        worktree.branch, worktree.agent, worktree.phase, worktree.path
+                    );
+                    KeyedView::new(
+                        format!("{}:{detail}", worktree.path),
+                        m3::setting_row(
+                            &name,
+                            &detail,
+                            m3::icon_button(palette)
+                                .automation_name(format!("Open {name} in File Explorer"))
+                                .on_click(context.message(Message::Settings(
+                                    SettingsMsg::OpenFolder(worktree.path.clone()),
+                                )))
+                                .content(m3::icon(m3::glyph::OPEN_FOLDER)),
+                        ),
+                    )
+                })
+                .collect();
+            groups.push(KeyedView::new(
+                format!("project:{project}"),
+                StackPanel::new().spacing(tokens::spacing::SM).children((
+                    m3::section_heading(
+                        &project,
+                        &format!("{} worktree(s)", worktrees.len()),
+                        None,
+                    ),
+                    m3::settings_card(palette, rows),
+                )),
+            ));
+        }
+        StackPanel::new().spacing(tokens::spacing::MD).children((
+            StackPanel::new().spacing(tokens::spacing::SM).children((
+                m3::card_title("Creation and cleanup"),
+                settings,
+                cleanup,
+            )),
+            m3::section_heading(
+                "Managed worktrees",
+                &heading,
+                Some(
+                    m3::text_button(palette)
+                        .is_enabled(!self.settings.worktrees_loading)
+                        .automation_name("Read managed worktrees again")
+                        .on_click(context.message(Message::Settings(SettingsMsg::WorktreesRefresh)))
+                        .content(m3::label("Refresh")),
+                ),
+            ),
+            StackPanel::new()
+                .spacing(tokens::spacing::MD)
+                .keyed_children(groups),
+        ))
+    }
+}
