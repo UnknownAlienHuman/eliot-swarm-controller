@@ -2490,6 +2490,36 @@ impl EventProcessor {
                 }
                 self.complete_turn(params, false).await?;
             }
+            "usage/changed" => {
+                let usage: crate::native::types::NativeSubscriptionUsage =
+                    serde_json::from_value(params).map_err(|_| {
+                        Error::new("native_protocol", "Muse usage/changed schema unavailable")
+                    })?;
+                let observation = eliot_core::api::harness::QuotaObservation {
+                    observed_at_ms: usage.observed_at_ms,
+                    windows: vec![
+                        eliot_core::api::harness::QuotaWindow {
+                            label: "5-hour".to_owned(),
+                            used_percent: usage.window.used_percent as f64,
+                            resets_at_ms: Some(usage.window.resets_at_ms),
+                            window_duration_mins: Some(usage.window.window_duration_mins),
+                        },
+                        eliot_core::api::harness::QuotaWindow {
+                            label: "Weekly".to_owned(),
+                            used_percent: usage.weekly.used_percent as f64,
+                            resets_at_ms: Some(usage.weekly.resets_at_ms),
+                            window_duration_mins: Some(10080),
+                        },
+                    ],
+                };
+                observation.validate()?;
+                self.commit_event(
+                    "quota.observed",
+                    ulid::Ulid::new().to_string(),
+                    json!({"observation":observation}),
+                )
+                .await?;
+            }
             "session/tokenUsage" => {
                 self.observe_session_token_usage(params).await?;
             }

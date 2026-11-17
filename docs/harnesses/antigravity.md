@@ -499,3 +499,16 @@ skip. Implementation:
 [`crates/eliot-daemon/src/adhoc.rs`](../../crates/eliot-daemon/src/adhoc.rs)
 (`apply_adhoc_access`).
 
+
+## Read-only provider quota
+
+`plugins/antigravity/src/quota.rs` follows OpenCodex 2.84.0's Cloud Code Assist
+quota pattern, without copied code. On Windows it reads the installed AGY
+`gemini:antigravity` Credential Manager entry (`token.access_token`) read-only,
+uses `loadCodeAssist` to read the existing quota project, then
+`retrieveUserQuotaSummary` on Google's fixed accounting host. Recognized group
+buckets become model-family 5-hour/weekly windows. Tokens, email and project
+identifiers never leave the plugin. No credential refresh or onboarding is done.
+Other platforms currently report a supported environment error because their
+native keyring reader is unimplemented; provider failures also remain supported
+error states. Queries never start a turn.

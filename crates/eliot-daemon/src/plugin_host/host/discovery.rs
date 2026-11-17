@@ -256,15 +256,30 @@ impl PluginHost {
         if !profile
             .get("harness")
             .and_then(Value::as_str)
-            .is_some_and(|harness| matches!(harness, "codex" | "muse"))
+            .is_some_and(|harness| {
+                matches!(
+                    harness,
+                    "codex" | "muse" | "claude" | "opencode" | "antigravity"
+                )
+            })
         {
             return Err(Error::new(
                 "unsupported",
-                "harness.quota needs a codex or muse profile",
+                "harness.quota needs a supported native profile",
             ));
         }
         let environment = Value::Object(build_process_environment(&profile)?);
-        let (id, stop_rx, done_tx) = self.register_metadata_reader()?;
+        // The Usage page asks all five harnesses together. Keep the four-reader
+        // bound, but let the fifth read wait briefly instead of caching a local
+        // capacity error as provider availability for the entire TTL.
+        let slot = tokio::time::timeout(
+            Duration::from_secs(8),
+            self.state.reader_slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| Error::new("busy", "quota reader capacity wait timed out"))?
+        .map_err(|_| Error::new("unavailable", "discovery admission is closed"))?;
+        let (id, stop_rx, done_tx) = self.register_metadata_reader_slot(slot)?;
         let host = self.clone();
         let (reply, response) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -330,7 +345,11 @@ impl PluginHost {
         let read = async {
             let manifest = reader.initialize(&harness, until).await?;
             require_proxy_capability(&profile, &manifest)?;
-            let request = serde_json::json!({"profile": profile});
+            let request = serde_json::to_value(eliot_plugin::protocol::QuotaReadParams {
+                profile,
+                environment,
+            })
+            .map_err(|_| Error::new("internal", "quota.read params encoding failed"))?;
             let value = reader.client.call("quota.read", request, until).await?;
             if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
                 return Err(Error::new(

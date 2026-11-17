@@ -71,6 +71,8 @@ impl AgentGetRequest {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentListRequest {
+    #[serde(default)]
+    pub archived: super::ArchivedFilter,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -126,6 +128,7 @@ pub struct AgentListRequest {
 impl Default for AgentListRequest {
     fn default() -> Self {
         Self {
+            archived: super::ArchivedFilter::default(),
             after: None,
             limit: super::DEFAULT_LIMIT,
             observations: false,
@@ -194,6 +197,11 @@ impl AgentListRequest {
             row.validate().is_err()
                 || !ids.insert(row.summary.id.clone())
                 || row.observation.is_some() != self.observations
+                || match self.archived {
+                    super::ArchivedFilter::Exclude => row.summary.archived,
+                    super::ArchivedFilter::Only => !row.summary.archived,
+                    super::ArchivedFilter::Include => false,
+                }
                 || self.state.is_some_and(|state| row.summary.state != state)
                 || self
                     .project
@@ -246,6 +254,10 @@ impl AgentListRequest {
 /// none; the same scope that lists the row may already read that command.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentSummary {
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub chat: bool,
     pub id: String,
     #[schemars(range(min = 0))]
     pub generation: i64,
@@ -301,7 +313,13 @@ impl AgentSummary {
         if self.generation < 0 {
             return Err(Error::new("invalid", "Agent summary generation is invalid"));
         }
-        text(&self.project)?;
+        if self.chat {
+            if !self.project.is_empty() {
+                return Err(invalid_response());
+            }
+        } else {
+            text(&self.project)?;
+        }
         text(&self.harness)?;
         for value in [&self.name, &self.profile, &self.preview]
             .into_iter()
@@ -2508,6 +2526,9 @@ mod tests {
 
     fn summary() -> AgentSummary {
         AgentSummary {
+            archived: false,
+            chat: false,
+
             id: "a1".to_owned(),
             generation: 0,
             project: "p".to_owned(),

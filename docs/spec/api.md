@@ -635,6 +635,37 @@ wrong types and out-of-range values are `invalid`. `observations` defaults to fa
 when omitted and must be a boolean when present; explicit null is `invalid`. Absent
 optional members are omitted when requests are serialized.
 
+`agent.archive {id, agent:"aN", archived:bool}` is Owner-only and atomically
+archives or unarchives the selected Agent and all current descendants. Every
+member must be idle or stopped, with no active/uncertain turn, pending request or
+open command; otherwise it returns typed `busy` and stops nothing. The flag is
+durable. Admission of send, resume, steer or inject atomically unarchives its
+target, including selector members, so new activity appears in the default list.
+`agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;
+totals and cursors use the same filter. Summaries and full Agents expose `archived`.
+CLI: `swarm archive aN`, `swarm unarchive aN`, `swarm ls --archived include`.
+
+`agent.delete {id, agent:"aN"}` is Owner-only and removes one stopped Agent tree's
+Store records, using retention's leaf-first command cleanup. Live custody, open
+commands, uncertain turns, applicable unconsumed cleanup plans or a pinned history
+floor return `busy`; oversized operations return `unavailable` atomically. It never stops an Agent or deletes
+workspace files, native stores or Git branches. Run artifact cleanup separately
+before removing its ownership records. Process records for every generation of the
+tree are removed; consumed cleanup plans and their exact apply replay remain retained.
+Deleted command IDs remain bound until the retry window expires, preventing a deleted
+native effect from being readmitted.
+Archive/delete replies are `{agent, affected, archived:bool|null, deleted:bool}`;
+mutation ID, result and changes commit together. Exact retries return the retained
+reply even after deletion; changed payloads return `id_conflict`. MCP mints `id`
+when omitted, as for other durable writes. CLI: `swarm delete aN`.
+
+Removing a project already uses the settings writer: call
+`settings.read {sections:["projects"]}`, remove its key from the returned complete
+projects object, then `settings.save {expected_revision:<read revision>,
+sections:{projects:<remaining object>},client:"desktop",dry_run:false}`. This
+unregisters it without deleting its checkout or chats. No `project.remove` alias
+is needed. A later explicit open/launch in that checkout can discover it again.
+
 `agent.list` returns compact summaries ordered by Agent ID, never full Agent
 records; full records stay available through `agent.get`. Optional `state`,
 `project`, `harness`, `parent` and `root` filters are exact indexed matches:
@@ -879,6 +910,16 @@ the CLI prints its code and message, including through linked-start failure read
 Launch/resume with explicit text creates a start plus linked `<id>/send`. Without
 `--wait`, return session readiness; with it, follow the linked input to its exact terminal
 turn. An input-created native session still reports these distinct outcomes.
+
+An Owner `launch` may set `args.chat:true` and omit `workspace`. It must also
+omit `project`, `parent`, `worktree` and `base`. The daemon freezes the configured
+`[daemon].chats_root`, Store allocates the Agent ID, and the daemon exclusively
+creates `<chats_root>/<agent-id>` as a private directory before native startup.
+The directory identity is registered for artifact cleanup; collisions are refused.
+The Agent and summaries carry `chat:true` and `project:""`; children inherit this
+classification. Ordinary project discovery is skipped. The command retains the
+root input, and same-ID retries use its frozen path even after settings change.
+CLI: `swarm launch --chat --harness codex [PROMPT]` (or `--profile P`).
 
 Worktree creation is opt-in on the same launch command:
 
@@ -1347,25 +1388,42 @@ scope with a freshness timestamp (`fetched_at_ms`, `ttl_ms`) and a nonsecret
 credential identity (a name, never a value); every response carries its
 `scope`, `fetched_at_ms`, `ttl_ms` and `credential`. Native model ids are
 retained verbatim and a failed read never selects another model or account.
-`harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is the separate
-provider-supported account quota readback: timestamp (`fetched_at_ms`,
-`ttl_ms`), `scope` and `credential` as above, plus an explicit `status` of
-`supported`, `unsupported` or `unknown` naming the checked native surface and,
-when `supported`, provider-verbatim quota signals in `details` (an object, at
-most 8192 encoded bytes; never secrets or personal data). Codex reads
-`account/rateLimits/read` plus `account/usage/read` when useful (windows with
-used percent, reset time, credits and plan; `account/read` is never called so
-no email enters the response, logs or Store); Muse reads `usage/read`
-(window and weekly used percent, reset time, tier and arrival stamp; an empty
-`details` object means the host observed nothing and no numbers are
-fabricated). A method-not-found or schema mismatch stays `unsupported` or
-`unknown` naming the checked method. OpenCode/Claude/Antigravity expose no
-read-only quota endpoint, so they report `unsupported`. Support never comes
-from an inference probe or per-Agent polling. Both reads are owner-only,
-read-only, deduplicated per account through the same bounded per-scope cache,
-and start no model turn and no inference
-(`swarm harnesses`, `swarm models --harness H [--profile P]`,
-`swarm quota --harness H [--profile P]`).
+`harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is an Owner-only,
+read-only provider quota query. `harness` and optional `profile` keep their current
+contract. The response retains `harness`, `scope`, `credential` (nonsecret names),
+`fetched_at_ms`, `ttl_ms`, `status`, optional `note` and optional `details` (8192 bytes).
+Codex keeps its `rateLimits` projection from `account/rateLimits/read`.
+Claude uses its CLI OAuth `GET /api/oauth/usage`; Antigravity uses its native
+Windows keyring credential and read-only Cloud Code Assist quota calls;
+OpenCode Go uses the selected native credential export and `GET /zen/go/v1/usage`.
+These provider readers return `details.windows`: at most 32
+[`QuotaWindow`](../../crates/eliot-core/src/api/harness.rs) values
+`{label, usedPercent, resetsAtMs, windowDurationMins}`. Percent is a finite number
+in 0..100; reset time is Unix milliseconds or null when absent. Windows identify
+5-hour, weekly and model-scoped limits when supplied; Eliot never invents limits
+or reset times. `details.state` is `ready` or `error`; `details.origin` is
+`provider` or `environment`. A failed read remains `status:"supported"` with
+`state:"error"`, a sanitized reason and no windows. Unsupported native integration
+sources remain `unsupported` with a concrete reason. Native JSON-RPC method-not-found
+(`-32601`) remains `unsupported`, naming the checked `account/rateLimits/read`
+or `usage/read` method; it is not a supported environment failure. The transport disables
+redirects, bounds each HTTP request to eight seconds and each response to 1 MiB;
+credential reads are bounded to 256 KiB. Quota calls wait at most eight seconds
+for one of the existing four metadata-reader permits, so a five-harness Usage
+refresh can complete without an arbitrary fifth-read rejection. The wait starts
+no process; shutdown/capacity failure remains an environment error. Reads never
+refresh or write credentials.
+
+Muse has no provider endpoint. The plugin projects MSP `usage/changed` as the
+session-family `quota.observed` event; Store retains the typed observation, and
+`harness.quota` selects the latest observation under the exact frozen profile.
+Its `fetched_at_ms` remains the native `observedAtMs`, and `note` says "observed
+during a turn". `usage/read` can also return that last native observation, exposed
+under `details.usage`. With no observation, or no installed MSP method, Muse
+returns `unsupported` and its reason. No quota query starts a turn, performs
+inference or polls Agents. CLI: `swarm quota --harness H [--profile P]`.
+
+
 `profile.list` (`ProfileListRequest`/`ProfileListResponse`, no params) returns the
 current `config.toml` revision, whether it parses, and per profile the name,
 harness, requested model/effort (absent = native default), permissions,

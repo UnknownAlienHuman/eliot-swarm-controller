@@ -235,6 +235,9 @@ impl Plugin {
             "initialize" => self
                 .initialize(&request.params)
                 .map(DispatchOutcome::Immediate),
+            "quota.read" => crate::quota::read(&request.params)
+                .await
+                .map(DispatchOutcome::Immediate),
             "profile.store" => Err(Error::new(
                 "unsupported",
                 "Antigravity exposes no verified metadata-only native-store readback",

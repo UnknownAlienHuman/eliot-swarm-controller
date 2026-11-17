@@ -4,6 +4,20 @@ use super::*;
 use eliot_core::api::*;
 
 impl Store {
+    pub fn known_artifact_path(&self, path: &str) -> Result<Option<ArtifactView>> {
+        let body: Option<String> = self
+            .connection
+            .query_row("SELECT body FROM artifacts WHERE path=?1", [path], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(sql_error)?;
+        body.map(|s| {
+            serde_json::from_str(&s).map_err(|_| Error::new("source_integrity", "invalid artifact"))
+        })
+        .transpose()
+    }
+
     /// Internal, non-deletable custody row committed before the native Agent
     /// receives its new directory. Legacy paths are never adopted as roots.
     pub fn agent_artifact_root(
@@ -583,6 +597,14 @@ impl Store {
         };
         if agent.generation != artifact.generation || !cleanup_terminal(agent.state) {
             return Ok(false);
+        }
+        if artifact.purpose == "Swarm chat directory" {
+            let Some(workspace) = agent.workspace.as_deref() else {
+                return Ok(false);
+            };
+            if !agent.chat || !self.artifact_workspace_exclusive(workspace)? {
+                return Ok(false);
+            }
         }
         let sources: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM source_state WHERE agent=?1 AND state='open' AND source NOT IN ('daemon','os','git','workspace_process'))",[parse_agent_id(&agent.id)?],|r|r.get(0)).map_err(sql_error)?;
         let pending: bool = self.connection.query_row("SELECT EXISTS(SELECT 1 FROM commands WHERE target=?1 AND state IN ('accepted','queued','dispatched','unknown'))",[parse_agent_id(&agent.id)?],|r|r.get(0)).map_err(sql_error)?;

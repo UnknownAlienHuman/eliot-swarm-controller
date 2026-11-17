@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 47;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 48;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1155,6 +1155,17 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 48 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch("ALTER TABLE agents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
+                ALTER TABLE agents ADD COLUMN chat INTEGER NOT NULL DEFAULT 0 CHECK(chat IN (0,1));
+                CREATE INDEX agents_list_archived ON agents(archived,id);
+                INSERT INTO schema_migrations(version) VALUES (48);").map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1169,7 +1180,11 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX writes_principal_method; DELETE FROM schema_migrations WHERE version=47;
+                "DROP INDEX agents_list_archived;
+                 ALTER TABLE agents DROP COLUMN archived;
+                 ALTER TABLE agents DROP COLUMN chat;
+                 DELETE FROM schema_migrations WHERE version=48;
+                 DROP INDEX writes_principal_method; DELETE FROM schema_migrations WHERE version=47;
                 DROP TABLE artifacts; DROP TABLE cleanup_plans; DELETE FROM schema_migrations WHERE version=46;
               DROP INDEX commands_turn_unknown;
               DELETE FROM schema_migrations WHERE version=44;
@@ -1243,7 +1258,11 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX writes_principal_method; DELETE FROM schema_migrations WHERE version=47;
+                "DROP INDEX agents_list_archived;
+                 ALTER TABLE agents DROP COLUMN archived;
+                 ALTER TABLE agents DROP COLUMN chat;
+                 DELETE FROM schema_migrations WHERE version=48;
+                 DROP INDEX writes_principal_method; DELETE FROM schema_migrations WHERE version=47;
                 DROP TABLE artifacts; DROP TABLE cleanup_plans; DELETE FROM schema_migrations WHERE version=46;
               DROP INDEX commands_turn_unknown;
               DELETE FROM schema_migrations WHERE version=44;

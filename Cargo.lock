@@ -579,6 +579,8 @@ dependencies = [
 name = "eliot-plugin"
 version = "0.2.0-dev"
 dependencies = [
+ "chrono",
+ "reqwest",
  "eliot-core",
  "futures-util",
  "libc",

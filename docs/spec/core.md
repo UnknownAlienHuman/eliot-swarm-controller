@@ -816,3 +816,25 @@ so a removed delivery admitted with a skew-bounded write id reads
 `history_gap` through the shared absent-id age rule on its own mailbox's
 read paths; a retried ack over it succeeds as already acked. An unset
 `mail_days` disables mail pruning.
+
+## Explicit Agent tree presentation and removal
+
+`archived` is a durable presentation flag independent of lifecycle state; archiving
+never stops a generation. Archive/unarchive requires idle or stopped descendants,
+no active or unknown turns, pending requests or open commands.
+Send, resume, steer and inject admission atomically clears the target's archive flag.
+Deletion requires every descendant stopped and drained, and shares retention's leaf-first command
+row cleanup. Store removes dependent records in one transaction and retains
+mutation replies plus deleted command identities through the retry window. It
+advances the conservative retained-history floor before removing event rows,
+refusing a live rule/Git cursor pin or an applicable unconsumed cleanup plan.
+Process records are removed across every generation; consumed cleanup-plan replay
+remains retained. No uncertain native effect is replayed.
+Neither operation touches native stores, workspaces or branches; artifact cleanup
+precedes record deletion when wanted. See [API](api.md) for DTOs and bounds.
+
+`chat` identifies an Agent without a project (`project` is the empty string).
+The daemon creates its private workspace from the transaction-allocated ID before
+native I/O. Chat descendants retain that classification. `quota.observed` is a
+session-family, generation-bound watch fact carrying a bounded typed
+`QuotaObservation`; it does not alter turn state or token-spend accounting.

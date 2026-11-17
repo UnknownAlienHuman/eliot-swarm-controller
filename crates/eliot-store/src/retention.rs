@@ -316,30 +316,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let mut deleted = 0_i64;
-        {
-            // Clear open-notice references to the exact doomed commands
-            // first, preserving presentation time; unadmitted reservations
-            // have no command row and can never be in this set.
-            let mut clear = tx
-                .prepare(
-                    "UPDATE mail_notices SET open_notice_command = NULL
-                     WHERE open_notice_command = ?1",
-                )
-                .map_err(sql_error)?;
-            for member in &doomed {
-                db!(clear.execute([&member.id]));
-            }
-        }
-        {
-            let mut delete = tx
-                .prepare("DELETE FROM commands WHERE id = ?1")
-                .map_err(sql_error)?;
-            // Children before parents: foreign keys enforce the order.
-            for member in &doomed {
-                deleted += db!(delete.execute([&member.id])) as i64;
-            }
-        }
+        let deleted = delete_commands_tx(&tx, doomed.iter().map(|member| member.id.as_str()))?;
         let writes = prune_writes_tx(&tx, cutoff)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok((deleted, writes))
@@ -597,6 +574,25 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
         return Ok((members, true));
     }
     Ok((members, false))
+}
+
+/// The shared leaf-first physical command cleanup for retention and explicit Agent deletion.
+pub(super) fn delete_commands_tx<'a>(
+    tx: &Transaction<'_>,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<i64> {
+    let mut clear = tx
+        .prepare("UPDATE mail_notices SET open_notice_command=NULL WHERE open_notice_command=?1")
+        .map_err(sql_error)?;
+    let mut delete = tx
+        .prepare("DELETE FROM commands WHERE id=?1")
+        .map_err(sql_error)?;
+    let mut deleted = 0;
+    for id in ids {
+        db!(clear.execute([id]));
+        deleted += db!(delete.execute([id])) as i64;
+    }
+    Ok(deleted)
 }
 
 fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
