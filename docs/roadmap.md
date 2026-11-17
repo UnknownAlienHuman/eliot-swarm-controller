@@ -532,19 +532,27 @@ of the explicitly selected release scope.
       needs attention", "12 idle", "All quiet" when nothing is; every count
       is its accessible name and the Monitor's legend), a separate "N need attention" row that lists Agents waiting
       on a request, failed or lost ones, and controlled Agents in `unknown`
-      (observe-only native children never count), and Settings. A project is a repository:
-      checkouts registered with the same Git common directory group under the
-      repository's name, and a task row names its worktree only where the
-      project spans several, as a quiet tag before its dot (the title trims
-      first). A task folder the desktop's project list does not hold yet
-      lists under its repository when its Git worktree link (the `.git` file,
-      then `commondir`) names a registered one. A button in the sidebar's
+      (observe-only native children never count), and Settings. A project is a repository
+      and nests one level (k142): Project → Subprojects (its linked worktrees) →
+      Tasks. Checkouts registered with the same Git common directory form one
+      project, named by the owner's display name, else the repository name of
+      its `origin` remote (`project.list`'s read-only `origin`), else its main
+      checkout's folder, never a registration ID or a worktree's folder; a
+      subproject reads as its branch in words (`feat/k141-monitor-charts` is
+      "k141 monitor charts", a detached one its folder). Tasks in the main
+      checkout sit under the project; each row shows how many tasks work in
+      it; a registered folder that is gone says "missing" with a one-click
+      Remove. A task folder the desktop's project list does not hold yet
+      lists under its repository from Git's own files (the `.git` file, then
+      `commondir` and `HEAD`). The picker, Settings › Projects and the Monitor
+      use the same names. A button in the sidebar's
       header hides it to a rail (show sidebar, New task, the Monitor with the
       fleet's dot, Settings) for the session; Settings keeps its navigation. Running tasks stay on top, then newest first;
-      stopped tasks last changed before today fold into "Show N older" (a
-      project whose tasks are all older keeps its newest three in view); a
-      collapsed project shows its running count, and `[desktop]
-      collapsed_projects` keeps the collapse across restarts. Titles come with
+      stopped tasks last changed before today, and subprojects with nothing
+      live and nothing from today, fold into "Show N older" (a project whose
+      tasks are all older keeps its newest three in view), and `[desktop]
+      collapsed_projects` keeps a project's or subproject's collapse across
+      restarts. Titles come with
       each `agent.list` page (the first meaningful line of the summary
       `preview`, Markdown removed, else the name, else `<harness> · <profile>`).
       Reactor 0.100.0 has no key events and no N/K accelerator keys, so the
@@ -670,8 +678,9 @@ of the explicitly selected release scope.
       while one runs and, after a definite `bad_state`/`stale_generation`/
       `unsupported` refusal, goes as the next message with one line saying so.
       The message shows at once with "Sending…"/"Starting Codex…" until its
-      turn starts. Right-click menus on projects (New task here, Open folder,
-      Rename, Collapse/Expand, Remove project) and on tasks and chats (Rename,
+      turn starts. Right-click menus on projects and subprojects (New task
+      here, Open folder, Rename, Collapse/Expand, Archive finished tasks,
+      Delete stopped tasks, Remove project) and on tasks and chats (Rename,
       Stop while live, idle included, Archive/Unarchive, Delete after a
       confirmation naming it, a live one's "Stop and delete" stopping, waiting
       until stopped, then deleting, with a refused step's typed error, Copy
@@ -695,7 +704,19 @@ of the explicitly selected release scope.
       of collapsed projects, one per title; older tasks stay under "Show N
       older" and chats under Chats. Delete
       follows the Store (stopped or failed trees, once drained); a lost task
-      offers Resume or Archive instead. (Refs #407)
+      offers Resume or Archive instead. Bulk actions (k142) ask once, naming
+      the count and what stays and why, then show progress and a result:
+      Settings › Projects checks projects (Select all, Remove selected, Remove
+      unused: no live task, and the folder gone or no task ever there) and
+      removes eligible selections in one revision-checked settings save. The
+      daemon refuses the save if any removed registration is in use. One-click
+      missing removal uses stale-project cleanup. The Projects caption's "…"
+      (everything) and each project's menu archive finished root trees or delete
+      stopped root trees, including archived roots for deletion. Scoped actions
+      use daemon-verified checkout membership. Delete confirms trees and affected
+      tasks. Each `agent.archive`/`agent.delete` tree refusal is reported, and
+      files and native sessions stay. Worktrees & cleanup's "Select all safe" checks every
+      group with something safe to remove before `cleanup.apply`. (Refs #407)
 
 - [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider
       readers, durable archive/delete, settings project removal and private chats.

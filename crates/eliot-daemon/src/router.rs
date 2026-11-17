@@ -169,7 +169,7 @@ enum Principal {
         generation: i64,
     },
     ProjectRule {
-        registration: ProjectRegistrationView,
+        registration: Box<ProjectRegistrationView>,
     },
     Run {
         run_command_id: String,
@@ -1207,6 +1207,7 @@ impl Router {
             Principal::ProjectRule {
                 registration: saved,
             } => {
+                let saved = saved.as_ref();
                 if definition.repository != saved.id {
                     return Err(Error::new(
                         "not_allowed",
@@ -1377,7 +1378,7 @@ impl Router {
         registration.validate()?;
         crate::automation::verify_project_registration(&self.inner.data_root, registration).await?;
         let principal = Principal::ProjectRule {
-            registration: registration.clone(),
+            registration: Box::new(registration.clone()),
         };
         let mut prepared = Vec::with_capacity(requests.len());
         for request in requests {
@@ -1414,7 +1415,7 @@ impl Router {
         registration.validate()?;
         crate::automation::verify_project_registration(&self.inner.data_root, registration).await?;
         let principal = Principal::ProjectRule {
-            registration: registration.clone(),
+            registration: Box::new(registration.clone()),
         };
         for request in requests {
             let mut authorized = request.clone();
@@ -1432,7 +1433,7 @@ impl Router {
     ) -> Result<PreparedSubmission> {
         if request.verb == "git.fetch" {
             let principal = Principal::ProjectRule {
-                registration: registration.clone(),
+                registration: Box::new(registration.clone()),
             };
             return self
                 .prepare_git_fetch_submission(request, &principal, Some(registration))
@@ -1441,7 +1442,7 @@ impl Router {
         validate_rule_launch_action(&request, Some(registration))?;
         validate_rule_resume_action(&request, Some(registration))?;
         let principal = Principal::ProjectRule {
-            registration: registration.clone(),
+            registration: Box::new(registration.clone()),
         };
         let prepared = self
             .prepare_submission_after_authorization(request, &principal, true, false)
@@ -2269,6 +2270,10 @@ impl Router {
             .await
             .get_project_registration("owner", &request.id)?
             .ok_or_else(|| Error::new("not_found", "project registration was not found"))?;
+        // Git reads run after the Store lock is released.
+        let mut registrations = [registration];
+        crate::workspace_git::WorkspaceGit::fill_project_readbacks(&mut registrations).await;
+        let [registration] = registrations;
         registration.validate()?;
         serde_json::to_value(registration)
             .map_err(|_| Error::new("internal", "project registration could not be encoded"))
@@ -2277,12 +2282,14 @@ impl Router {
     async fn project_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
         let _: ProjectListRequest = eliot_core::api::discovery::decode_params(params.clone())?;
-        let registrations = self
+        let mut registrations = self
             .inner
             .store
             .lock()
             .await
             .list_project_registrations("owner", None, PAGE_MAX)?;
+        // Git reads run after the Store lock is released.
+        crate::workspace_git::WorkspaceGit::fill_project_readbacks(&mut registrations).await;
         for registration in &registrations {
             registration.validate()?;
         }
@@ -10973,6 +10980,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             run_env: Vec::new(),
             git: None,
             revision: 1,
+            origin: None,
+            checkouts: Vec::new(),
         };
         let mut request = SubmitCommand::new(String::new(), "resume");
         request.target = Some("a7".to_owned());
@@ -10981,7 +10990,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let mut authorized = request.clone();
         authorize_command(
             &Principal::ProjectRule {
-                registration: registration.clone(),
+                registration: Box::new(registration.clone()),
             },
             &mut authorized,
         )
@@ -11010,7 +11019,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(
             authorize_command(
                 &Principal::ProjectRule {
-                    registration: without_resume,
+                    registration: Box::new(without_resume),
                 },
                 &mut request.clone(),
             )
@@ -11098,6 +11107,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             run_env: Vec::new(),
             git: None,
             revision: 1,
+            origin: None,
+            checkouts: Vec::new(),
         };
         let mut request = SubmitCommand::new(String::new(), "launch");
         request.expected_generation = Some(0);
@@ -11162,6 +11173,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             run_env: Vec::new(),
             git: None,
             revision: 1,
+            origin: None,
+            checkouts: Vec::new(),
         };
         let command = Command {
             id: "launch-command".to_owned(),
@@ -12956,6 +12969,8 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
             run_env: Vec::new(),
             git: None,
             revision: 1,
+            origin: None,
+            checkouts: Vec::new(),
         };
         let foreign = Principal::Agent {
             id: "a9999".to_owned(),
@@ -12964,7 +12979,9 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
         let run = Principal::Run {
             run_command_id: "run-1".to_owned(),
         };
-        let project = Principal::ProjectRule { registration };
+        let project = Principal::ProjectRule {
+            registration: Box::new(registration),
+        };
         for principal in [&own, &foreign, &run, &project] {
             for id in [&young, &aged, &pruned] {
                 let error = router
@@ -13579,7 +13596,7 @@ mod run_authorization_tests {
                 run_command_id: "cmd-1".to_owned(),
             },
             Principal::ProjectRule {
-                registration: ProjectRegistrationView {
+                registration: Box::new(ProjectRegistrationView {
                     id: "project-1".to_owned(),
                     checkout: String::new(),
                     repo_common_dir: String::new(),
@@ -13589,7 +13606,9 @@ mod run_authorization_tests {
                     run_env: vec![],
                     git: None,
                     revision: 0,
-                },
+                    origin: None,
+                    checkouts: Vec::new(),
+                }),
             },
         ] {
             let error = router

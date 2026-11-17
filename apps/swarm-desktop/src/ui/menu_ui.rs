@@ -1,6 +1,7 @@
 //! The sidebar's right-click menus (owner review 2026-11-16): a project's
-//! New task here, Open folder, Rename, Collapse or Expand and Remove
-//! project; a chat's or task's Rename, Stop (while it is live, idle
+//! or subproject's New task here, Open folder, Rename, Collapse or Expand,
+//! Archive finished tasks, Delete stopped tasks and Remove project (k142,
+//! through [`super::bulk_ui`]); a chat's or task's Rename, Stop (while it is live, idle
 //! included), Move under another task (k113, [`super::move_ui`]), Resume
 //! (a lost one), Archive or Unarchive, Delete, Copy Agent ID and Open
 //! folder.
@@ -70,6 +71,10 @@ pub(super) enum Action {
     Rename,
     ToggleCollapse,
     RemoveProject,
+    /// Archive every finished task of the project or subproject.
+    ArchiveFinished,
+    /// Delete every stopped task of the project or subproject.
+    DeleteStopped,
     Stop,
     /// "Move under another task…": open the picker.
     MoveUnder,
@@ -638,8 +643,44 @@ impl DesktopApp {
                 self.menu.renaming = Some((target, current));
                 self.focus_rename(5, context);
             }
-            (Action::RemoveProject | Action::Delete, _) => {
+            (Action::Delete, _) => {
                 self.menu.confirm = Some((target, action));
+            }
+            (
+                Action::ArchiveFinished | Action::DeleteStopped,
+                Target::Project { key, name, .. },
+            ) => {
+                let op = if action == Action::ArchiveFinished {
+                    super::bulk_ui::BulkOp::ArchiveFinished
+                } else {
+                    super::bulk_ui::BulkOp::DeleteStopped
+                };
+                self.start_bulk(
+                    op,
+                    super::bulk_ui::Pick::Tasks(Some(key.clone())),
+                    name.clone(),
+                    context,
+                );
+            }
+            (
+                Action::RemoveProject,
+                Target::Project {
+                    checkouts, name, ..
+                },
+            ) => {
+                let ids = self.registrations_in(checkouts);
+                if ids.is_empty() {
+                    self.alert(format!("{name} is not a registered project."));
+                    return;
+                }
+                // One confirmation naming what stays; a project with a
+                // live task is kept, never forced.
+                self.start_bulk(
+                    super::bulk_ui::BulkOp::RemoveProjects,
+                    super::bulk_ui::Pick::Selected(ids),
+                    name.clone(),
+                    context,
+                );
             }
             (Action::CopyId, Target::Agent(agent)) => match crate::clipboard::set_text(&agent.id) {
                 Ok(()) => self.set_status(format!("Copied {}.", agent.id)),
@@ -705,40 +746,22 @@ impl DesktopApp {
                         .map(|count| format!("{count} record tree(s) removed"))
                 });
             }
-            (
-                Action::RemoveProject,
-                Target::Project {
-                    checkouts, name, ..
-                },
-            ) => {
-                let ids: Vec<String> = self
-                    .nav
-                    .projects
-                    .iter()
-                    .filter(|project| {
-                        checkouts
-                            .iter()
-                            .any(|path| nav::path_key(path) == nav::path_key(&project.workspace))
-                    })
-                    .map(|project| project.id.clone())
-                    .collect();
-                if ids.is_empty() {
-                    self.alert(format!("{name} is not a registered project."));
-                    return;
-                }
-                let Ok(data_dir) = self.data_dir.clone() else {
-                    return;
-                };
-                let _task = context.spawn_background(move |_| {
-                    Message::Menu(MenuMsg::Done(
-                        format!("Remove project {name}"),
-                        client::block_on(config_client::remove_projects(&data_dir, &ids))
-                            .map(|_| "unregistered; its folder and tasks stay".to_owned()),
-                    ))
-                });
-            }
             _ => {}
         }
+    }
+
+    /// The registration IDs whose checkout is one of `checkouts`.
+    pub(super) fn registrations_in(&self, checkouts: &[String]) -> Vec<String> {
+        self.nav
+            .projects
+            .iter()
+            .filter(|project| {
+                checkouts
+                    .iter()
+                    .any(|path| nav::path_key(path) == nav::path_key(&project.workspace))
+            })
+            .map(|project| project.id.clone())
+            .collect()
     }
 
     /// One Agent lifecycle call with a ledger-held mutation id.
@@ -781,42 +804,70 @@ impl DesktopApp {
         target: &Target,
     ) -> Vec<(Action, String, &'static str, bool)> {
         match target {
-            Target::Project { collapsed, .. } => vec![
-                (
-                    Action::NewTaskHere,
-                    "New task here".to_owned(),
-                    m3::glyph::NEW_TASK,
-                    false,
-                ),
-                (
-                    Action::OpenFolder,
-                    "Open folder".to_owned(),
-                    m3::glyph::OPEN_FOLDER,
-                    false,
-                ),
-                (
-                    Action::Rename,
-                    "Rename".to_owned(),
-                    m3::glyph::RENAME,
-                    false,
-                ),
-                (
-                    Action::ToggleCollapse,
-                    if *collapsed { "Expand" } else { "Collapse" }.to_owned(),
-                    if *collapsed {
-                        m3::glyph::CHEVRON_DOWN
-                    } else {
-                        m3::glyph::CHEVRON_RIGHT
-                    },
-                    false,
-                ),
-                (
-                    Action::RemoveProject,
-                    "Remove project".to_owned(),
-                    m3::glyph::DELETE,
-                    true,
-                ),
-            ],
+            Target::Project {
+                collapsed,
+                checkouts,
+                checkout,
+                ..
+            } => {
+                let mut entries = vec![
+                    (
+                        Action::OpenFolder,
+                        "Open folder".to_owned(),
+                        m3::glyph::OPEN_FOLDER,
+                        false,
+                    ),
+                    (
+                        Action::Rename,
+                        "Rename".to_owned(),
+                        m3::glyph::RENAME,
+                        false,
+                    ),
+                    (
+                        Action::ToggleCollapse,
+                        if *collapsed { "Expand" } else { "Collapse" }.to_owned(),
+                        if *collapsed {
+                            m3::glyph::CHEVRON_DOWN
+                        } else {
+                            m3::glyph::CHEVRON_RIGHT
+                        },
+                        false,
+                    ),
+                    (
+                        Action::ArchiveFinished,
+                        "Archive finished tasks…".to_owned(),
+                        m3::glyph::ARCHIVE,
+                        false,
+                    ),
+                    (
+                        Action::DeleteStopped,
+                        "Delete stopped tasks…".to_owned(),
+                        m3::glyph::DELETE,
+                        true,
+                    ),
+                ];
+                if self.can_launch_here(checkout) {
+                    entries.insert(
+                        0,
+                        (
+                            Action::NewTaskHere,
+                            "New task here".to_owned(),
+                            m3::glyph::NEW_TASK,
+                            false,
+                        ),
+                    );
+                }
+                // Only a registered checkout can be forgotten.
+                if !self.registrations_in(checkouts).is_empty() {
+                    entries.push((
+                        Action::RemoveProject,
+                        "Remove project…".to_owned(),
+                        m3::glyph::DELETE,
+                        true,
+                    ));
+                }
+                entries
+            }
             Target::Agent(agent) => {
                 if self.menu.more && self.menu.open.is_some() {
                     return std::iter::once((

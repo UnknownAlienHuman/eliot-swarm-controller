@@ -180,6 +180,7 @@ impl Store {
             id,
             generation: record.generation,
             project: record.project,
+            workspace: record.workspace,
             harness: record.harness,
             name: record.name.filter(|name| !name.trim().is_empty()),
             profile: Some(record.profile).filter(|profile| !profile.trim().is_empty()),

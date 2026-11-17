@@ -1369,6 +1369,7 @@ mod tests {
             id: "a1".to_owned(),
             generation: 0,
             project: "p".to_owned(),
+            workspace: None,
             harness: "muse".to_owned(),
             name: None,
             profile: None,

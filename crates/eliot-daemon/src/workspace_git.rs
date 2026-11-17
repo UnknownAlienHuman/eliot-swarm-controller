@@ -20,7 +20,12 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+mod readback;
+pub(crate) use readback::registration_linked_paths;
+
 const READ_TIME: Duration = Duration::from_secs(15);
+/// Shared Git command budget for a project readback.
+const ORIGIN_READ_TIME: Duration = Duration::from_secs(3);
 const METADATA_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Debug)]
@@ -72,6 +77,39 @@ impl WorkspaceGit {
             path_text(&repository.root)?,
             path_text(&repository.common_dir)?,
         ))
+    }
+
+    /// The repository name of `common_dir`'s `origin` remote
+    /// ([`eliot_core::api::repository_name_from_url`]): one bounded
+    /// `git config --get remote.origin.url` run in the common directory with
+    /// the probe's sanitized environment (no inherited `GIT_*`). `None`
+    /// without an origin, for a missing directory, or when Git cannot read
+    /// it. The URL itself, which may embed credentials, never leaves here.
+    async fn origin_name(&self, common_dir: &str, deadline: Instant) -> Option<String> {
+        let root = canonical_root(common_dir).ok()?;
+        let output = self
+            .git
+            .workspace_command_bound(
+                &root,
+                &[
+                    "config",
+                    "--local",
+                    "--no-includes",
+                    "--get",
+                    "remote.origin.url",
+                ],
+                GitBinding {
+                    git_dir: &root,
+                    common_dir: &root,
+                },
+                deadline,
+            )
+            .await
+            .ok()?;
+        if output.code != 0 {
+            return None;
+        }
+        eliot_core::api::repository_name_from_url(std::str::from_utf8(&output.stdout).ok()?)
     }
 
     /// Discover the canonical checkout containing an Owner-opened directory.
@@ -1062,6 +1100,12 @@ fn destination_path(path: &str) -> Result<PathBuf> {
 
 fn metadata_line(path: &Path) -> Result<String> {
     reject_links(path)?;
+    if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return Err(problem(
+            "unavailable",
+            "workspace Git metadata is not a regular file",
+        ));
+    }
     let mut bytes = Vec::new();
     fs::File::open(path)
         .and_then(|file| file.take(METADATA_BYTES + 1).read_to_end(&mut bytes))
@@ -1266,5 +1310,147 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code, "unavailable");
+    }
+
+    #[tokio::test]
+    async fn origin_names_come_from_the_common_directory_without_credentials() {
+        let root = TestRoot::new("origin");
+        init_repo(&root.0);
+        let common = path_text(&root.0.join(".git")).expect("fixture path is UTF-8");
+        let registration = |id: &str| eliot_core::api::ProjectRegistrationView {
+            id: id.to_owned(),
+            checkout: path_text(&root.0).expect("fixture path is UTF-8"),
+            repo_common_dir: common.clone(),
+            profiles: Vec::new(),
+            actions: Vec::new(),
+            interpreters: Default::default(),
+            run_env: Vec::new(),
+            git: None,
+            revision: 1,
+            origin: Some("stale".to_owned()),
+            checkouts: Vec::new(),
+        };
+        let missing = {
+            let mut gone = registration("gone");
+            gone.repo_common_dir =
+                path_text(&root.0.join("missing").join(".git")).expect("fixture path is UTF-8");
+            gone
+        };
+        // No origin remote: nothing to name it by.
+        let mut registrations = vec![registration("a"), missing.clone()];
+        WorkspaceGit::fill_project_readbacks(&mut registrations).await;
+        assert_eq!(registrations[0].origin, None);
+        assert_eq!(registrations[1].origin, None);
+
+        git(
+            &root.0,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://user:secret@example.com/acme/atlas-web.git",
+            ],
+        );
+        let mut registrations = vec![registration("a"), registration("b"), missing];
+        WorkspaceGit::fill_project_readbacks(&mut registrations).await;
+        let origins: Vec<Option<&str>> = registrations
+            .iter()
+            .map(|registration| registration.origin.as_deref())
+            .collect();
+        assert_eq!(origins, [Some("atlas-web"), Some("atlas-web"), None]);
+        for registration in &registrations {
+            registration.validate().expect("filled view stays valid");
+        }
+    }
+
+    #[tokio::test]
+    async fn project_checkout_readback_names_reftable_packed_and_separate_git_dir() {
+        for layout in ["reftable", "packed", "separate"] {
+            let root = TestRoot::new(layout);
+            let main = root.0.join("checkout");
+            fs::create_dir(&main).unwrap();
+            let common = if layout == "separate" {
+                let admin = root.0.join("metadata");
+                git(
+                    &main,
+                    &[
+                        "init",
+                        "--initial-branch=main",
+                        "--separate-git-dir",
+                        admin.to_str().unwrap(),
+                    ],
+                );
+                admin
+            } else {
+                let format = if layout == "reftable" {
+                    "--ref-format=reftable"
+                } else {
+                    "--ref-format=files"
+                };
+                git(&main, &["init", "--initial-branch=main", format]);
+                main.join(".git")
+            };
+            git(
+                &main,
+                &[
+                    "-c",
+                    "user.name=EliotTest",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "root",
+                ],
+            );
+            let linked = root.0.join("linked");
+            git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feat/readback-name",
+                    linked.to_str().unwrap(),
+                ],
+            );
+            if layout == "packed" {
+                git(&main, &["pack-refs", "--all"]);
+            }
+            let mut registrations = [eliot_core::api::ProjectRegistrationView {
+                id: "project".to_owned(),
+                checkout: path_text(&fs::canonicalize(&main).unwrap()).unwrap(),
+                repo_common_dir: path_text(&fs::canonicalize(&common).unwrap()).unwrap(),
+                profiles: Vec::new(),
+                actions: Vec::new(),
+                interpreters: Default::default(),
+                run_env: Vec::new(),
+                git: None,
+                revision: 1,
+                origin: None,
+                checkouts: Vec::new(),
+            }];
+            WorkspaceGit::fill_project_readbacks(&mut registrations).await;
+            let registration = &registrations[0];
+            assert_eq!(
+                registration.checkouts.len(),
+                2,
+                "{layout}: {registration:?}"
+            );
+            let main = registration.checkouts.iter().find(|row| row.main).unwrap();
+            assert_eq!(main.path, registration.checkout);
+            assert_eq!(main.branch.as_deref(), Some("main"));
+            let worktree = registration.checkouts.iter().find(|row| !row.main).unwrap();
+            assert_eq!(worktree.branch.as_deref(), Some("feat/readback-name"));
+
+            // A one-way .git pointer cannot make an unrelated checkout a member.
+            let unrelated = root.0.join("unrelated");
+            fs::create_dir(&unrelated).unwrap();
+            fs::copy(linked.join(".git"), unrelated.join(".git")).unwrap();
+            assert!(
+                !registration_linked_paths(&registration.repo_common_dir)
+                    .contains(&path_text(&unrelated).unwrap())
+            );
+        }
     }
 }

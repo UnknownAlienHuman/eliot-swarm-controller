@@ -178,6 +178,8 @@ mod tests {
                 run_env: Vec::new(),
                 git: None,
                 revision: 4,
+                origin: None,
+                checkouts: Vec::new(),
             }),
         }
     }

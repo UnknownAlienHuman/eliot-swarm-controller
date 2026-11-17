@@ -52,6 +52,9 @@ pub struct AgentSummary {
     #[schemars(range(min = 0))]
     pub generation: i64,
     pub project: String,
+    /// The retained execution directory, independently of the project label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     pub harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -611,6 +614,118 @@ pub struct ProjectRegistrationView {
     #[serde(default)]
     pub git: Option<ProjectGitView>,
     pub revision: i64,
+    /// The repository's name from its `origin` remote URL (the last path
+    /// segment without `.git`), read live from Git by `project.list` and
+    /// `project.get`. Read-only: never stored or settable, never the URL
+    /// itself (which may embed credentials); absent without an `origin`
+    /// remote or when Git cannot read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Live checkout identities verified against this registration's common directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkouts: Vec<ProjectCheckoutView>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectCheckoutView {
+    pub path: String,
+    pub main: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// A bare repository name as [`ProjectRegistrationView::origin`] carries
+/// it: nonempty, at most 255 characters, no path, user or port separators,
+/// whitespace or control characters.
+fn is_repository_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '/' | '\\' | ':' | '@' | '?' | '#')
+        })
+}
+
+/// The repository name of a Git remote URL: its last path segment without
+/// a trailing `.git` (`https://host/org/atlas.git`, `git@host:org/atlas`,
+/// a Windows path ending in `atlas.git` and `/srv/atlas/` all read `atlas`). Only the name
+/// leaves: user info, host, query and fragment are dropped, so a URL that
+/// embeds credentials never reaches a readback. `None` when no valid name
+/// remains.
+pub fn repository_name_from_url(url: &str) -> Option<String> {
+    let url = url.strip_suffix('\n').unwrap_or(url);
+    let url = url.strip_suffix('\r').unwrap_or(url);
+    if url.chars().any(char::is_control) {
+        return None;
+    }
+    let path = if let Some((scheme, after_scheme)) = url.split_once("://") {
+        let end = after_scheme.find(['/', '?', '#'])?;
+        let (authority, tail) = after_scheme.split_at(end);
+        if !tail.starts_with('/')
+            || (authority.is_empty() && !scheme.eq_ignore_ascii_case("file"))
+            || authority.matches('@').count() > 1
+            || tail.contains('@')
+            || url.contains('\\')
+            || url.chars().any(char::is_whitespace)
+        {
+            return None;
+        }
+        let parsed = url::Url::parse(url).ok()?;
+        if parsed.cannot_be_a_base()
+            || (parsed.host().is_none() && !scheme.eq_ignore_ascii_case("file"))
+        {
+            return None;
+        }
+        tail.split(['?', '#']).next()?
+    } else {
+        if url.contains(['?', '#']) {
+            return None;
+        }
+        // A drive path is local. Otherwise a colon before any slash is the
+        // SCP host separator (including a bracketed IPv6 host).
+        let drive = url.as_bytes().get(1) == Some(&b':') && url.as_bytes()[0].is_ascii_alphabetic();
+        let host_start = url.rsplit_once('@').map_or(url, |(_, host)| host);
+        let colon = if host_start.starts_with('[') {
+            host_start
+                .find("]:")
+                .map(|end| url.len() - host_start.len() + end + 1)
+        } else {
+            url.find(':')
+        };
+        match colon {
+            _ if drive => &url[2..],
+            Some(end) if !url[..end].contains(['/', '\\']) => {
+                let (host, path) = (&url[..end], &url[end + 1..]);
+                if host.is_empty()
+                    || ["http", "https", "file", "ssh", "git", "ftp", "ftps"]
+                        .iter()
+                        .any(|scheme| host.eq_ignore_ascii_case(scheme))
+                    || host.matches('@').count() > 1
+                    || host.chars().any(char::is_whitespace)
+                    || path.contains(['@', ':', '\\'])
+                    || url::Url::parse(&format!("ssh://{host}/"))
+                        .ok()?
+                        .host()
+                        .is_none()
+                {
+                    return None;
+                }
+                path
+            }
+            _ if url.contains('@') => return None,
+            _ => url,
+        }
+    };
+    let last = path
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    (is_repository_name(name) && !name.contains('%')).then(|| name.to_owned())
 }
 
 /// Result of project discovery; `None` means the path is not a Git checkout.
@@ -639,6 +754,31 @@ impl ProjectRegistrationView {
         validate_project_run_env(&self.run_env)?;
         if let Some(git) = &self.git {
             git.validate()?;
+        }
+        if let Some(origin) = &self.origin
+            && !is_repository_name(origin)
+        {
+            return Err(Error::new(
+                "invalid",
+                "project origin must be a bare repository name",
+            ));
+        }
+        let mut paths = BTreeSet::new();
+        if self.checkouts.len() > 1000
+            || self.checkouts.iter().filter(|entry| entry.main).count() > 1
+        {
+            return Err(invalid_response());
+        }
+        for checkout in &self.checkouts {
+            text(&checkout.path)?;
+            if checkout.path.len() > 4096
+                || !paths.insert(&checkout.path)
+                || checkout.branch.as_ref().is_some_and(|branch| {
+                    branch.is_empty() || branch.len() > 1024 || branch.chars().any(char::is_control)
+                })
+            {
+                return Err(invalid_response());
+            }
         }
         for (reference, interpreter) in &self.interpreters {
             if reference.is_empty()

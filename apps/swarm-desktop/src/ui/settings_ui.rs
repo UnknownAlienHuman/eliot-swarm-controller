@@ -238,6 +238,9 @@ pub(super) enum SettingsMsg {
     CleanupPlanned(Fallible<(eliot_core::api::CleanupPlan, HashMap<String, String>)>),
     /// Check (true) or uncheck one group of the plan.
     CleanupGroupToggled(crate::worktrees::CleanupGroup, bool),
+    /// Check every group that has something safe to remove (opt-in
+    /// groups included).
+    CleanupSelectAll,
     /// Show or hide one group's kept items.
     CleanupKeptToggled(crate::worktrees::CleanupGroup),
     CleanupExpanded(crate::worktrees::CleanupGroup),
@@ -270,6 +273,10 @@ pub(super) enum SettingsMsg {
     ProjectProfile(String, String, bool),
     ProjectActions(String, String),
     ProjectRemoved(String),
+    /// Check (true) or uncheck one project for a bulk removal.
+    ProjectSelected(String, bool),
+    /// Check every project (true) or none.
+    ProjectsSelectAll(bool),
     ProjectBrowse,
     AssignmentText(String, AssignmentField, String),
     AssignmentBusy(String, Option<f64>),
@@ -444,6 +451,8 @@ pub(super) struct SettingsState {
     all_from: BTreeMap<Section, Value>,
     new_role: String,
     project_open: Option<String>,
+    /// Projects checked for Remove selected (registration IDs).
+    pub(super) project_selected: std::collections::BTreeSet<String>,
     new_assignment: String,
     history_open: bool,
     /// The navigation's search text.
@@ -761,6 +770,9 @@ impl DesktopApp {
                     s.cleanup_open.insert(group);
                 }
             }
+            SettingsMsg::CleanupSelectAll => {
+                s.cleanup_unchecked.clear();
+            }
             SettingsMsg::CleanupGroupToggled(group, on) => {
                 if s.cleanup_busy {
                     return;
@@ -1027,7 +1039,23 @@ impl DesktopApp {
             SettingsMsg::ProjectRemoved(id) => {
                 model::remove_entry(&mut s.projects, &id);
                 s.project_open = None;
+                s.project_selected.remove(&id);
                 self.autosave(Page::Projects, context);
+            }
+            SettingsMsg::ProjectSelected(id, on) => {
+                // A check box may report the value it already shows.
+                if on {
+                    s.project_selected.insert(id);
+                } else {
+                    s.project_selected.remove(&id);
+                }
+            }
+            SettingsMsg::ProjectsSelectAll(on) => {
+                s.project_selected = if on {
+                    model::project_ids(&s.projects).into_iter().collect()
+                } else {
+                    Default::default()
+                };
             }
             SettingsMsg::ProjectBrowse => match folder::pick() {
                 Ok(Some(path)) => {

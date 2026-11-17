@@ -176,25 +176,13 @@ impl DesktopApp {
             .orientation(Orientation::Horizontal)
             .spacing(tokens::spacing::MD)
             .children((
-                m3::meta(
-                    m3::glyph::FOLDER,
-                    &nav::project_name(&detail.project, &self.registered_projects()),
-                ),
+                m3::meta(m3::glyph::FOLDER, &self.place_title(&detail.project)),
                 m3::meta(
                     m3::glyph::PROFILE,
                     &launch_ui::launched_as(&detail.settings.profile, &detail.harness),
                 ),
                 access,
             ))
-    }
-
-    /// Registered (checkout, id) pairs for project names.
-    pub(in crate::ui) fn registered_projects(&self) -> Vec<(String, String)> {
-        self.nav
-            .projects
-            .iter()
-            .map(|project| (project.workspace.clone(), self.project_label(project)))
-            .collect()
     }
 
     /// The open Agent's model-and-effort chip: the next turn's values; it

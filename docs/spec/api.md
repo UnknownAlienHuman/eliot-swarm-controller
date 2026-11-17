@@ -588,6 +588,16 @@ canonical checkout, repository common directory, explicit profile/action allowli
 optional Git fetch approval. They do not create or modify registrations. Their project
 values use Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs),
 whose optional `git` value uses [`ProjectGitView` and `GitCredentialHelper`](../../crates/eliot-core/src/api/agent_views.rs).
+The read-only `origin` is the validated basename of the local `origin` remote's path,
+with `.git` stripped. Malformed and pathless remotes produce no name. The daemon
+reads each common directory in the Git probe's sanitized environment after releasing
+the Store lock. The readback carries only the name.
+The bounded `checkouts` inventory carries live verified paths, main-checkout identity,
+and a branch when a bound `symbolic-ref HEAD` supplies one. A linked entry requires a
+reciprocal Git registration in the pinned common directory. A list can carry the
+inventory on one registration per repository even when multiple registrations share
+it. Omitted entries give no live checkout proof. The desktop joins that inventory to
+the exact retained Agent `workspace` for project and subproject bulk operations.
 
 `workspace.list {after?, limit?}` is an owner-only page of the managed worktrees
 that `launch --worktree` prepared and that are not yet removed, read from the
@@ -690,8 +700,9 @@ sections:{projects:<remaining object>},client:"desktop",dry_run:false}`. This
 unregisters it without deleting its checkout or chats. No `project.remove` alias
 is needed. A later explicit open/launch in that checkout can discover it again.
 
-`agent.list` returns compact summaries ordered by Agent ID, never full Agent
-records; full records stay available through `agent.get`. Optional `state`,
+`agent.list` returns compact summaries ordered by Agent ID. Each summary can carry
+the retained execution directory in `workspace`; full records stay available through
+`agent.get`. Optional `state`,
 `project`, `harness`, `parent` and `root` filters are exact indexed matches:
 wrong types and unknown state names are `invalid`, and a filter never matches
 silently. The selective structural/scope index (`parent`/`root`/`project`)

@@ -34,6 +34,7 @@ impl DesktopApp {
                         harness: detail.harness.clone(),
                         state: detail.state,
                         project: detail.project.clone(),
+                        workspace: None,
                         parent: None,
                         updated_at: 0,
                         title: self.agent_title(&binding.agent),

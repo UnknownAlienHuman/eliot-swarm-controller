@@ -63,6 +63,8 @@ impl DesktopApp {
             4
         } else if self.settings.cleanup_confirm {
             5
+        } else if self.bulk.is_some() {
+            6
         } else {
             0
         }
@@ -148,6 +150,14 @@ impl DesktopApp {
             }
             4 => self.move_update(MoveMsg::Closed, context),
             5 => self.settings_update(SettingsMsg::CleanupConfirmed(false), context),
+            6 => {
+                let message = match self.bulk.as_ref().map(|dialog| dialog.phase) {
+                    Some(bulk_ui::Phase::Running { .. }) => BulkMsg::Stop,
+                    Some(bulk_ui::Phase::Done) => BulkMsg::Closed,
+                    _ => BulkMsg::Confirmed(false),
+                };
+                self.bulk_update(message, context);
+            }
             _ => {}
         }
     }

@@ -2343,6 +2343,8 @@ mod tests {
                     credential_helper: None,
                 }),
                 revision: 1,
+                origin: None,
+                checkouts: Vec::new(),
             };
             registration.validate().unwrap();
             Self {
@@ -2789,6 +2791,8 @@ mod tests {
                     credential_helper: None,
                 }),
                 revision: 1,
+                origin: None,
+                checkouts: Vec::new(),
             };
             let data_root = env::temp_dir().join(format!("missing-git-fetch-data-{}", Ulid::new()));
             let error = prepare_fetch(

@@ -61,7 +61,12 @@ impl DesktopApp {
                     Ok(list) => {
                         let previous = self.selected_script();
                         // A project by its name, not its registration id.
-                        let projects = &self.nav.projects;
+                        let projects: Vec<(String, String)> = self
+                            .nav
+                            .projects
+                            .iter()
+                            .map(|project| (project.id.clone(), self.project_label(project)))
+                            .collect();
                         let unavailable = list
                             .roots
                             .iter()
@@ -71,10 +76,8 @@ impl DesktopApp {
                                         None => "global scripts",
                                         Some(id) => projects
                                             .iter()
-                                            .find(|project| project.id == id)
-                                            .map_or("a removed project", |project| {
-                                                project.name.as_str()
-                                            }),
+                                            .find(|(project, _)| project == id)
+                                            .map_or("a removed project", |(_, name)| name.as_str()),
                                     };
                                     format!("{place}: {reason}")
                                 })
