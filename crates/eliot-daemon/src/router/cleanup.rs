@@ -1898,6 +1898,7 @@ impl Router {
             id: ulid::Ulid::new().to_string(),
             plan_id: plan.plan_id.clone(),
             delete_remote: false,
+            artifacts: None,
         };
         let (_, mut response, is_new) =
             match self

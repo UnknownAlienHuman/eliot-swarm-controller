@@ -48,9 +48,13 @@ HEAD symref; a cached remote HEAD never substitutes for a failed discovery
 deletes branches. A present `daemon.lock` with a live owner keeps a data
 directory; only a provably dead owner releases it.
 
-`cleanup.apply {id,plan_id}` consumes only the plan's safe candidates, rechecks
+`cleanup.apply {id,plan_id,artifacts?}` consumes only the plan's safe candidates, rechecks
 authority, generation, Git cleanliness, opened identities and busy/link refusal,
-then records each outcome as `removed`, `skipped` with reason, or `unknown`.
+then records each outcome as `removed`, `skipped` with reason, or `unknown`. An
+optional `artifacts` list (at most 64 unique ids, each a safe candidate of that
+plan) attempts only those; the plan's other safe candidates settle
+`skipped(not_selected)` without an attempt fence, so a later plan offers them again.
+The selection is part of the request binding.
 The Store commits an unknown attempt before effects and settles results before
 acknowledgement. Exact same-ID replay returns the retained response. Another ID
 cannot consume the plan; another pre-existing plan cannot retry an attempted
@@ -89,8 +93,12 @@ plans, 10,000 filesystem entries, depth 64 and five seconds per tree scan.
 Exceeding a bound refuses the tree before deletion. Ledger exhaustion rejects new
 admission. Removed identities remain tombstones; unknown identities are never
 automatically retried. The CLI exposes `artifact register`, `cleanup plan` and
-`cleanup apply`; Desktop Settings > Advanced reviews a plan and applies its safe
-items through the same Router. A folder assignment opts in with
+`cleanup apply`. Desktop Settings › Worktrees & cleanup (Clean up finished work)
+reviews an Owner `all` plan grouped by kind with each item's size and reason,
+applies the safe items of the checked groups through the same Router after one
+confirmation (local deletions only, one mutation id per plan and selection until a
+definite reply), and shows removed, kept-with-reason and unknown outcomes. The plan
+has no Owner per-Agent scope, so there is no per-task cleanup entry. A folder assignment opts in with
 `cleanup_on_retire`: after an applied stop retires its Agent, the existing
 stop worker runs the same plan/apply for that Agent's build, temp and
 worktree artifacts with Owner authority and retained receipts. It is off by

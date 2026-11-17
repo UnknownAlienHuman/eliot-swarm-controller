@@ -45,6 +45,7 @@ pub(crate) async fn run_cleanup(
                 id: mutation_id(id)?,
                 plan_id,
                 delete_remote,
+                artifacts: None,
             };
             request
                 .validate()

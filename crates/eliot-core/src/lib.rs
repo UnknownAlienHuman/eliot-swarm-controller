@@ -1224,6 +1224,17 @@ impl FailureOrigin {
     }
 }
 
+/// The loss reason of a daemon restart: Swarm fences every live generation.
+pub const DAEMON_RESTART_REASON: &str = "daemon_restart";
+
+/// The typed origin and `where` of a loss Swarm caused itself, from the
+/// loss event's typed `reason` code: a daemon restart is `swarm` at
+/// `daemon.restart`. Every other loss keeps the evidence its producer
+/// recorded (`None`).
+pub fn swarm_loss_location(reason: &str) -> Option<(FailureOrigin, &'static str)> {
+    (reason == DAEMON_RESTART_REASON).then_some((FailureOrigin::Swarm, "daemon.restart"))
+}
+
 /// Truncate to a character boundary; never splits UTF-8 mid-codepoint.
 pub fn bound_chars(text: &str, limit: usize) -> String {
     if text.len() <= limit {

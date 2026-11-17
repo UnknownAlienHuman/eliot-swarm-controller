@@ -1368,6 +1368,10 @@ pub(super) fn transition_lost_tx(
         params![now, agent_num, generation],
     ));
     let mut data = json!({"agent_id": agent.id, "reason": reason});
+    if let Some((origin, location)) = eliot_core::swarm_loss_location(reason) {
+        data["origin"] = json!(origin.as_str());
+        data["where"] = json!(location);
+    }
     if let Some(exit) = exit.filter(|exit| !exit.is_empty()) {
         if let Some(exit_code) = exit.exit_code {
             data["exit_code"] = json!(exit_code);
@@ -1388,7 +1392,12 @@ pub(super) fn transition_lost_tx(
         Some(generation),
         data,
     )?);
-    Ok(())
+    super::native_children::end_native_children_with_parent_tx(
+        tx,
+        Some((agent_num, generation)),
+        now,
+        events,
+    )
 }
 
 fn mark_lost_turn_unknown_tx(
@@ -1429,13 +1438,18 @@ fn mark_lost_turn_unknown_tx(
             )?;
         }
         let cause = command_cause_for_turn_tx(tx, agent_num, generation, turn_id)?;
+        let mut data = json!({"turn_id": turn_id, "reason": reason});
+        if let Some((origin, location)) = eliot_core::swarm_loss_location(reason) {
+            data["origin"] = json!(origin.as_str());
+            data["where"] = json!(location);
+        }
         let event = DaemonEventInput::new(
             now,
             "turn.unknown",
             "turn",
             Some(agent_num),
             Some(generation),
-            json!({"turn_id": turn_id, "reason": reason}),
+            data,
         );
         let event = match cause {
             Some(cause) => event.with_cause(cause),
@@ -1616,5 +1630,10 @@ fn stop_agent_tx(
             json!({"agent_id": agent.id, "command_id": command_id}),
         ),
     )?);
-    Ok(())
+    super::native_children::end_native_children_with_parent_tx(
+        tx,
+        Some((agent_num, generation)),
+        now,
+        events,
+    )
 }

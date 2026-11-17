@@ -395,18 +395,28 @@ fn loss_steps(
     Ok(steps)
 }
 
+/// One loss/failure event as a step. Its recorded `origin`/`where` come
+/// first; a retained loss written before they were recorded classifies only
+/// from its typed `reason` code (a daemon restart is Swarm's own), never
+/// from text.
 fn loss_step(event: &Event, at: Option<i64>) -> DiagnoseStep {
+    let reason = event.data.get("reason").and_then(Value::as_str);
+    let typed = reason.and_then(eliot_core::swarm_loss_location);
+    let text = |key: &str, limit: usize| {
+        event
+            .data
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|value| bound_chars(value, limit))
+    };
     DiagnoseStep {
         kind: "process".to_owned(),
         code: Some(bound_chars(&event.kind, 128)),
-        message: event
-            .data
-            .get("reason")
-            .and_then(Value::as_str)
-            .map(|reason| bound_chars(reason, 1024)),
-        failure_where: None,
-        origin: None,
-        origin_evidence: None,
+        message: reason.map(|reason| bound_chars(reason, 1024)),
+        failure_where: text("where", 128)
+            .or_else(|| typed.map(|(_, location)| location.to_owned())),
+        origin: text("origin", 32).or_else(|| typed.map(|(origin, _)| origin.as_str().to_owned())),
+        origin_evidence: text("origin_evidence", 512),
         exit_code: event.data.get("exit_code").and_then(Value::as_i64),
         ntstatus: event
             .data
@@ -769,5 +779,106 @@ mod tests {
             response.summary
         );
         assert!(response.summary.contains("failure"), "{}", response.summary);
+    }
+
+    #[tokio::test]
+    async fn a_loss_to_a_daemon_restart_is_swarm_origin_at_daemon_restart() {
+        let router = test_router().await;
+        let now = now_ms();
+        let agent = {
+            let mut store = router.inner.store.lock().await;
+            let launch_id = ulid::Ulid::new().to_string();
+            let agent = store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: launch_id.clone(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args: json!({"project":"why-restart", "workspace":"synthetic-workspace", "harness":"codex", "profile":"codex-fixture", "profile_snapshot":{}}),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now,
+                )
+                .expect("admit launch")
+                .command
+                .target
+                .expect("launch target");
+            store.dispatch(&launch_id, now).expect("dispatch launch");
+            let plan = ["session", "turn", "message", "tool", "request"]
+                .into_iter()
+                .map(|family| (family.to_owned(), "stream".to_owned()))
+                .collect();
+            store
+                .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
+                .expect("install sources");
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: "ready".to_owned(),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: "ready".to_owned(),
+                            data: json!({"command_id":launch_id}),
+                        }],
+                        cursor: None,
+                    },
+                    now,
+                )
+                .expect("commit ready");
+            store
+                .settle(&launch_id, CommandState::Applied, None, now)
+                .expect("settle start");
+            store.recover_on_restart(now + 1).expect("restart");
+            agent
+        };
+        let value = router
+            .diagnose(&json!({"target": agent}), &Principal::Owner)
+            .await
+            .expect("diagnose lost agent");
+        let response: DiagnoseResponse = serde_json::from_value(value).expect("typed reply");
+        assert!(
+            response.summary.starts_with("swarm origin:"),
+            "{}",
+            response.summary
+        );
+        assert!(
+            response.summary.contains("daemon.restart"),
+            "{}",
+            response.summary
+        );
+        let loss = response
+            .steps
+            .iter()
+            .find(|step| step.kind == "process")
+            .expect("loss step");
+        assert_eq!(loss.origin.as_deref(), Some("swarm"));
+        assert_eq!(loss.failure_where.as_deref(), Some("daemon.restart"));
+    }
+
+    #[test]
+    fn a_retained_restart_loss_without_recorded_origin_classifies_from_its_reason() {
+        let event: Event = serde_json::from_value(json!({
+            "seq": 7, "ts": 1, "kind": "agent.lost", "family": "agent", "agent": "a2",
+            "generation": 1, "source": "daemon",
+            "data": {"agent_id": "a2", "reason": "daemon_restart"}
+        }))
+        .expect("retained event");
+        let step = loss_step(&event, Some(1));
+        assert_eq!(step.origin.as_deref(), Some("swarm"));
+        assert_eq!(step.failure_where.as_deref(), Some("daemon.restart"));
+        let mut other = event.clone();
+        other.data = json!({"agent_id": "a2", "reason": "native_exit"});
+        let step = loss_step(&other, Some(1));
+        assert_eq!(step.origin, None);
+        assert_eq!(step.failure_where, None);
     }
 }

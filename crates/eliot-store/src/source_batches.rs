@@ -732,6 +732,14 @@ impl Store {
             )?);
         }
         committed_events.extend(provider_events);
+        if !observed && projection.is_terminal() {
+            native_children::end_native_children_with_parent_tx(
+                &tx,
+                Some((agent_num, batch.generation)),
+                now,
+                &mut committed_events,
+            )?;
+        }
         committed_events.sort_by_key(|event| event.seq);
         let source_state = if projection.is_terminal() {
             "closed"
