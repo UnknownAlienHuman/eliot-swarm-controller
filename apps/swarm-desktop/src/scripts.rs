@@ -52,6 +52,7 @@ pub fn running_timers(rules: &[RuleListEntry], project: Option<&str>, path: &str
 /// line per reason that list may be incomplete: the namespace could not be
 /// read (its error), or only its first page was read. A read failure never
 /// looks like "no timer runs this script".
+#[cfg(windows)]
 pub fn timers_in(
     namespaces: &[crate::config_view::RuleNamespace],
     project: Option<&str>,
@@ -322,6 +323,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn unreadable_or_partial_namespaces_are_reported_not_hidden() {
         use crate::config_view::RuleNamespace;
