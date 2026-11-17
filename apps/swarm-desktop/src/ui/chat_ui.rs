@@ -22,10 +22,10 @@ use crate::theme::winui::Palette;
 pub(super) enum ChatMsg {
     ComposerChanged(String),
     AnswerChanged(String, String),
-    SnapshotLoaded(u64, Fallible<Box<Snapshot>>),
-    Delivered(u64, Fallible<Option<Box<Delivery>>>),
+    SnapshotLoaded(u64, eliot_core::Result<Box<Snapshot>>),
+    Delivered(u64, eliot_core::Result<Option<Box<Delivery>>>),
     BackoffDone(u64, bool),
-    RereadLoaded(u64, Result<Box<Reread>, (String, Invalidation)>),
+    RereadLoaded(u64, Result<Box<Reread>, (eliot_core::Error, Invalidation)>),
     RereadRetry(u64),
     LoadOlderRequested,
     /// Bring the latest turn into view once it is realized (epoch, tries).
@@ -312,9 +312,8 @@ impl DesktopApp {
                         self.queue_reread(Invalidation::default(), context);
                     }
                     Err(error) => {
-                        let (code, text) = live::split_error(&error);
-                        let next = live::after_error(code, text, self.chat.failures);
-                        self.set_status(format!("History read failed: {error}"));
+                        let next = live::after_error(&error, self.chat.failures);
+                        self.set_status(format!("History read failed: {}", error.user_message()));
                         match next {
                             // A snapshot that cannot read its own window retries later.
                             Next::Resnapshot { reason } => self.follow_next(
@@ -365,8 +364,7 @@ impl DesktopApp {
                         self.follow_next(next, context);
                     }
                     Err(error) => {
-                        let (code, text) = live::split_error(&error);
-                        let next = live::after_error(code, text, self.chat.failures);
+                        let next = live::after_error(&error, self.chat.failures);
                         self.follow_next(next, context);
                     }
                 }

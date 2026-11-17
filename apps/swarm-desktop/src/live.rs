@@ -120,7 +120,9 @@ pub fn after_page(after: i64, next: i64, truncated: bool, lagged: bool) -> Next 
 }
 
 /// Decide after a failed read; `attempt` counts consecutive failures.
-pub fn after_error(code: &str, message: &str, attempt: u32) -> Next {
+pub fn after_error(error: &eliot_core::Error, attempt: u32) -> Next {
+    let code = error.code.as_str();
+    let message = error.message.as_str();
     match classify(code) {
         ErrorClass::HistoryGap => Next::Resnapshot {
             reason: "cursor fell below the retention floor".to_owned(),
@@ -133,14 +135,6 @@ pub fn after_error(code: &str, message: &str, attempt: u32) -> Next {
         ErrorClass::Fatal => Next::Stop {
             reason: eliot_core::reason_message(code, message),
         },
-    }
-}
-
-/// Split `"code: message"` as produced by `eliot_core::Error`'s Display.
-pub fn split_error(error: &str) -> (&str, &str) {
-    match error.split_once(": ") {
-        Some((code, message)) if !code.contains(' ') => (code, message),
-        _ => ("unknown", error),
     }
 }
 
@@ -166,21 +160,24 @@ mod tests {
     #[test]
     fn history_gap_resnapshots_and_auth_stops() {
         assert!(matches!(
-            after_error("history_gap", "x", 0),
+            after_error(&eliot_core::Error::new("history_gap", "x"), 0),
             Next::Resnapshot { .. }
         ));
         assert!(matches!(
-            after_error("not_allowed", "x", 0),
+            after_error(&eliot_core::Error::new("not_allowed", "x"), 0),
             Next::Stop { .. }
         ));
-        assert!(matches!(after_error("invalid", "x", 3), Next::Stop { .. }));
+        assert!(matches!(
+            after_error(&eliot_core::Error::new("invalid", "x"), 3),
+            Next::Stop { .. }
+        ));
     }
 
     #[test]
     fn transport_failures_back_off_with_a_cap() {
         let Next::Backoff {
             delay_ms, attempt, ..
-        } = after_error("unavailable", "down", 0)
+        } = after_error(&eliot_core::Error::new("unavailable", "down"), 0)
         else {
             panic!("backoff expected");
         };
@@ -189,14 +186,9 @@ mod tests {
     }
 
     #[test]
-    fn error_text_splits_into_code_and_message() {
-        assert_eq!(
-            split_error("unavailable: daemon is not running"),
-            ("unavailable", "daemon is not running")
-        );
-        assert_eq!(
-            split_error("plain words: here"),
-            ("unknown", "plain words: here")
-        );
+    fn message_colons_never_change_the_typed_error_class() {
+        let error = eliot_core::Error::new("invalid", "unknown: origin: provider");
+        assert!(matches!(after_error(&error, 0), Next::Stop { .. }));
+        assert_eq!(error.user_message(), "Check the supplied values");
     }
 }
