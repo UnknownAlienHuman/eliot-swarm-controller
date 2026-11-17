@@ -23,7 +23,7 @@ pub(super) enum MonitorMsg {
     /// Show only the Needs attention section, or everything again.
     AttentionToggled,
     ReparentRequested(reparent::MoveBinding),
-    ReparentSettled(reparent::MoveBinding, Fallible<ReparentResponse>),
+    ReparentSettled(reparent::MoveBinding, eliot_core::Result<ReparentResponse>),
 }
 
 /// The panel's refresh chain and the Agent whose details it reads.
@@ -125,8 +125,7 @@ impl DesktopApp {
                     format!("Moving {} ({mutation_id})…", binding.describe());
                 let request = binding.request(mutation_id);
                 let _task = context.spawn_background(move |_| {
-                    let result = client::block_on(client::reparent(&data_dir, &request))
-                        .map_err(|error| error.to_string());
+                    let result = client::block_on(client::reparent(&data_dir, &request));
                     Message::Monitor(MonitorMsg::ReparentSettled(binding, result))
                 });
             }
@@ -134,12 +133,15 @@ impl DesktopApp {
                 let uncertain = result
                     .as_ref()
                     .err()
-                    .is_some_and(|error| crate::state::uncertain(error));
+                    .is_some_and(|error| matches!(error.code.as_str(), "unknown" | "unavailable"));
                 self.settle_mutation(!uncertain);
                 self.monitor.reparent_status = match result {
                     Ok(reply) => reparent::result_lines(&binding, &reply).join("\n"),
                     Err(error) if uncertain => {
-                        format!("Move not confirmed (the same click reuses its id): {error}")
+                        format!(
+                            "Move not confirmed (the same click reuses its id): {}",
+                            error.user_message()
+                        )
                     }
                     Err(error) => reparent::refusal_line(&binding, &error),
                 };

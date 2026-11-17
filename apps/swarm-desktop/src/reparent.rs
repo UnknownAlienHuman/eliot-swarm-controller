@@ -116,31 +116,12 @@ pub fn result_lines(binding: &MoveBinding, reply: &ReparentResponse) -> Vec<Stri
 }
 
 /// The daemon's refusal with what its code means for a manager change.
-pub fn refusal_line(binding: &MoveBinding, error: &str) -> String {
-    let code = error.split(':').next().unwrap_or_default().trim();
-    let meaning = match code {
-        "invalid" => "a cycle (the new manager is inside the moving subtree) or a bad source form",
-        "fanout_limit" => "the new manager's direct-child or tree limit would be exceeded",
-        "not_allowed" => {
-            "one of these Agents is managed by its native application, or belongs to another project"
-        }
-        "stale_generation" => {
-            "an Agent started a new run; wait for the monitor to refresh and choose again"
-        }
-        "bad_state" => "choose an Agent Swarm controls whose current run is confirmed and still active",
-        "not_found" => "an Agent no longer exists",
-        "frame_too_large" => "the result would exceed the reply bound",
-        "id_conflict" => "this mutation id was already used for a different move",
-        _ => "",
-    };
-    if meaning.is_empty() {
-        format!("Not moved: {} — {error}", binding.describe())
-    } else {
-        format!(
-            "Not moved: {} — {meaning}. Daemon: {error}",
-            binding.describe()
-        )
-    }
+pub fn refusal_line(binding: &MoveBinding, error: &eliot_core::Error) -> String {
+    format!(
+        "Not moved: {} — {}",
+        binding.describe(),
+        error.user_message()
+    )
 }
 
 #[cfg(test)]
@@ -206,13 +187,9 @@ mod tests {
         assert!(result_lines(&binding(MoveForm::Children), &empty)[1].contains("no children"));
         let line = refusal_line(
             &binding(MoveForm::Agent),
-            "invalid: reparent would create a cycle",
+            &eliot_core::Error::new("stale_generation", "internal generation details"),
         );
-        assert!(
-            line.contains("a cycle")
-                && line.ends_with("Daemon: invalid: reparent would create a cycle")
-        );
-        let line = refusal_line(&binding(MoveForm::Agent), "weird: thing");
-        assert!(line.ends_with("— weird: thing"));
+        assert!(line.ends_with("The Agent started a new run; refresh and try again"));
+        assert!(!line.contains("stale_generation"));
     }
 }

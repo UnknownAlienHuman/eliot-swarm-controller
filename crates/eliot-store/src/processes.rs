@@ -1,5 +1,5 @@
-use eliot_core::api::process_state_name;
 use super::*;
+use eliot_core::api::process_state_name;
 
 impl Store {
     pub(super) fn observe_processes_inner(
