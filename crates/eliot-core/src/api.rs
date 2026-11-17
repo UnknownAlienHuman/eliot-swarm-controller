@@ -95,8 +95,8 @@ pub use harness::{
     HarnessModelEntry, HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest,
     HarnessQuotaResponse, MAX_HARNESS_CREDENTIAL_BYTES, MAX_HARNESS_PROFILE_BYTES,
     MAX_HARNESS_QUOTA_NOTE_BYTES, MAX_HARNESS_SCOPE_BYTES, ModelsCatalogEntry,
-    ModelsCatalogRequest, ModelsCatalogResponse, catalog_cursor, catalog_display_name,
-    catalog_matches, catalog_provider,
+    ModelsCatalogFailure, ModelsCatalogRequest, ModelsCatalogResponse, catalog_cursor,
+    catalog_display_name, catalog_matches, catalog_provider,
 };
 pub use hierarchy::{
     DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,

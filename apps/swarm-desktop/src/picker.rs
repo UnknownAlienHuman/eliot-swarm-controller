@@ -983,6 +983,7 @@ mod tests {
             next: None,
             fetched_at_ms: 1,
             ttl_ms: HARNESS_READ_TTL_MS,
+            failures: Vec::new(),
         })
     }
 

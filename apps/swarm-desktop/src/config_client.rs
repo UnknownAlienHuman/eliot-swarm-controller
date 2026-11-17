@@ -122,7 +122,11 @@ pub async fn models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
         request.validate_response(&page)?;
         let next = page.next.clone();
         match whole.as_mut() {
-            Some(whole) => whole.models.extend(page.models),
+            Some(whole) => {
+                whole.models.extend(page.models);
+                // Every page repeats the aggregate's failed harnesses.
+                whole.failures = page.failures;
+            }
             None => whole = Some(page),
         }
         match next {
