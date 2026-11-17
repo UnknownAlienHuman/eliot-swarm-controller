@@ -517,8 +517,10 @@ impl Plugin {
         let hook_config =
             crate::session::stage_hook_config(&instance_dir, &workspace_path, &helper, &data_dir)
                 .map_err(|error| error.with_code("native_not_dispatched"))?;
-        let plan =
+        let mut plan =
             crate::profile::Plan::new(&params, &credential, hooks.token(), hook_config.root())?;
+        let mcp_config = crate::mcp::prepare(&mut plan, &params, &instance_dir)
+            .map_err(|error| error.with_code("native_not_dispatched"))?;
         // Latch before creating a native conversation. Any failure after spawn
         // is retained; this generation never starts a second process on retry.
         self.start = Some((
@@ -528,8 +530,16 @@ impl Plugin {
                 "Antigravity start is unresolved; it will not be replayed",
             )),
         ));
-        let result = match Session::spawn(&params, &plan, peer, &credential, hook_config, hooks)
-            .await
+        let result = match Session::spawn(
+            &params,
+            &plan,
+            peer,
+            &credential,
+            hook_config,
+            hooks,
+            mcp_config,
+        )
+        .await
         {
             Ok(session) => {
                 self.session = Some(session);

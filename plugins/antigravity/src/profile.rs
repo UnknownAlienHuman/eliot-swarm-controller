@@ -33,6 +33,9 @@ pub(crate) struct Plan {
     pub resume: Option<String>,
     pub hook_discovery: PathBuf,
     pub swarm_mcp: SwarmMcp,
+    pub mcp_policy: eliot_core::McpPolicy,
+    pub mcp_allow: Vec<String>,
+    pub mcp_root: Option<PathBuf>,
     mode: Option<String>,
     skip_permissions: bool,
 }
@@ -214,6 +217,11 @@ impl Plan {
             ));
         }
         let model = optional_profile_text(profile, "model", "Antigravity")?;
+        let mcp_policy = eliot_core::McpPolicy::parse_snapshot(profile)?;
+        let mcp_allow = eliot_core::parse_snapshot_allow_list(profile)?;
+        if mcp_policy != eliot_core::McpPolicy::Minimal && !mcp_allow.is_empty() {
+            return Err(Error::new("profile_error", "mcp_allow requires minimal"));
+        }
         let program = optional_profile_text(profile, "cmd", "Antigravity")?.ok_or_else(|| {
             Error::new(
                 "profile_error",
@@ -267,7 +275,40 @@ impl Plan {
         let mut secrets = environment.secrets;
         secrets.push(credential.to_owned());
         secrets.push(hook_token.to_owned());
-        let scope = config_scope(&environment.variables)?;
+        let mcp_root = if mcp_policy == eliot_core::McpPolicy::Minimal {
+            if !params
+                .agent_id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "Antigravity Agent id cannot name a config directory",
+                ));
+            }
+            Some(
+                hook_discovery_dir
+                    .parent()
+                    .ok_or_else(|| {
+                        Error::new("invalid", "Antigravity config parent is unavailable")
+                    })?
+                    .join(format!("{}-agy", params.agent_id)),
+            )
+        } else {
+            None
+        };
+        let mut scope = config_scope(&environment.variables)?;
+        if let Some(root) = &mcp_root {
+            let root = root.to_string_lossy();
+            scope.push_str(&format!(
+                ":isolated-gemini:{}",
+                if cfg!(windows) {
+                    root.to_lowercase()
+                } else {
+                    root.into_owned()
+                }
+            ));
+        }
         let resume = params
             .resume_from
             .as_ref()
@@ -356,6 +397,9 @@ impl Plan {
             resume,
             hook_discovery: hook_discovery_dir.to_owned(),
             swarm_mcp,
+            mcp_policy,
+            mcp_allow,
+            mcp_root,
             mode,
             skip_permissions,
         })
@@ -483,6 +527,9 @@ impl Plan {
             "mode": session.modes.as_ref().map(|modes| modes.current_mode_id.clone()),
             "mcp_servers": null,
             "mcp_servers_verified": false,
+            "mcp": self.mcp_policy.as_str(),
+            "mcp_allow": self.mcp_allow,
+            "mcp_config_root": self.mcp_root,
         }))
     }
 
@@ -525,6 +572,8 @@ impl Plan {
     pub fn requested(&self) -> Value {
         json!({"model": self.model, "cwd": self.launch.cwd, "mode": self.mode,
             "dangerously_skip_permissions": self.skip_permissions, "transport": "acp",
+            "mcp": self.mcp_policy.as_str(), "mcp_allow": self.mcp_allow,
+            "mcp_config_root": self.mcp_root,
             "native_roots": self.native_roots()})
     }
 

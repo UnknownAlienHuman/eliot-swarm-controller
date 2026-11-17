@@ -2546,8 +2546,8 @@ fn antigravity_snapshot_from_entry(
         source,
         McpHarnessSupport {
             harness: "Antigravity",
-            minimal: false,
-            allow: false,
+            minimal: true,
+            allow: true,
         },
     )?;
     insert_control(
@@ -2873,10 +2873,10 @@ struct McpHarnessSupport<'a> {
 
 /// Validate the worker MCP inheritance policy and freeze it with the profile
 /// snapshot. `minimal`/`allow` name whether the harness plugin implements an
-/// isolation mechanism for `minimal` (Codex, Claude, OpenCode) and selective
-/// inclusion of named native servers (Codex only: Claude and OpenCode
+/// isolation mechanism for `minimal` and selective
+/// inclusion of named native servers (Codex and Antigravity: Claude and OpenCode
 /// minimal are the Eliot-only server surface with no allow mapping, so a
-/// non-empty allow list would be silently dropped); Muse and Antigravity
+/// non-empty allow list would be silently dropped); Muse
 /// keep `inherit` only and reject `minimal` as unsupported.
 /// A non-empty allow list always requires `minimal`, so an allowed set
 /// cannot silently ride on the default.
@@ -2892,7 +2892,7 @@ fn freeze_mcp_policy(
     let supports_minimal = support.minimal;
     let supports_allow = support.allow;
     // An unset `mcp` takes the default `minimal` only where the harness maps
-    // it; Muse and Antigravity have no minimal mapping, so their profiles
+    // it; Muse has no minimal mapping, so its profiles
     // keep loading as `inherit` instead of failing after the default change.
     let policy = match entry.mcp.as_deref() {
         None if !supports_minimal => core::McpPolicy::Inherit,
@@ -4195,6 +4195,10 @@ permissions = "workspace-write"
         let snapshot = resolve_text_profile(minimal, "minimal").unwrap();
         assert_eq!(snapshot["mcp"], "minimal");
         assert_eq!(snapshot["mcp_allow"], json!(["owner-search"]));
+        let agy = "[profiles.agy]\nharness='antigravity'\ncmd='C:/Tools/Agy/agy.exe'\nmcp='minimal'\nmcp_allow=['owner-search']\n";
+        let snapshot = resolve_text_profile(agy, "agy").unwrap();
+        assert_eq!(snapshot["mcp"], "minimal");
+        assert_eq!(snapshot["mcp_allow"], json!(["owner-search"]));
 
         // Unknown policies and malformed names fail at load; an explicit
         // `inherit` still freezes verbatim for every harness.
@@ -4215,7 +4219,7 @@ permissions = "workspace-write"
 
         // Claude and OpenCode implement minimal without selective inclusion,
         // so a non-empty allow list is unsupported there; only Codex maps
-        // it. Muse and Antigravity keep inherit only: no harness isolation
+        // it alongside Antigravity. Muse keeps inherit only: no harness isolation
         // mechanism is verified, so an omitted `mcp` resolves to `inherit`
         // there (existing profiles keep loading); explicit `minimal` fails.
         let claude_cmd = if cfg!(windows) {
@@ -4278,7 +4282,7 @@ permissions = "workspace-write"
             (
                 "agy",
                 "[profiles.agy]\nharness='antigravity'\nmodel='test-model'\ncmd='C:/Tools/Agy/agy.exe'\nmcp='minimal'\n",
-                "unsupported",
+                "minimal",
             ),
             (
                 "muse",
@@ -4288,7 +4292,7 @@ permissions = "workspace-write"
             (
                 "agy",
                 "[profiles.agy]\nharness='antigravity'\nmodel='test-model'\ncmd='C:/Tools/Agy/agy.exe'\n",
-                "ok",
+                "minimal",
             ),
             (
                 "muse",
@@ -4296,6 +4300,11 @@ permissions = "workspace-write"
                 "ok",
             ),
         ] {
+            if code == "minimal" {
+                let snapshot = resolve_text_profile(source, name).unwrap();
+                assert_eq!(snapshot["mcp"], "minimal");
+                continue;
+            }
             if code == "ok" {
                 let snapshot = resolve_text_profile(source, name).unwrap();
                 assert_eq!(snapshot["mcp"], "inherit");

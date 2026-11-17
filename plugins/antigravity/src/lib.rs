@@ -3,6 +3,7 @@
 mod events;
 mod hooks;
 mod host;
+mod mcp;
 mod native;
 mod profile;
 mod quota;
