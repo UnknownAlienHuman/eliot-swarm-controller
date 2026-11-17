@@ -3,6 +3,7 @@
 
 mod agent_lifecycle;
 pub use agent_lifecycle::*;
+mod agent_requests;
 mod agent_views;
 mod cleanup;
 pub use cleanup::*;
@@ -36,20 +37,22 @@ mod usage;
 mod waits;
 mod workspaces;
 
+pub use agent_requests::{
+    AgentEditsRequest, AgentGetRequest, AgentGitRequest, AgentListRequest, AgentProcessesRequest,
+    AgentStatsRequest, DaemonPanicTestRequest, DaemonStatusRequest, DiagnoseRequest,
+    ProjectDiscoverRequest,
+};
 pub use agent_views::{
-    AGENT_PREVIEW_CHARS, AgentConfigView, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
-    AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentListRequest, AgentListResponse,
-    AgentListRow, AgentProcessesRequest, AgentProcessesResponse, AgentStatsRequest,
-    AgentStatsResponse, AgentSummary, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus, CrashMarker,
-    DaemonPanicTestRequest, DaemonPanicTestResponse, DaemonStatusRequest, DaemonStatusResponse,
-    DiagnoseRequest, DiagnoseResponse, DiagnoseStep, DrainReport, GitCredentialHelper,
+    AGENT_PREVIEW_CHARS, AgentConfigView, AgentEditsResponse, AgentGetResponse, AgentGitResponse,
+    AgentListResponse, AgentListRow, AgentProcessesResponse, AgentStatsResponse, AgentSummary,
+    CloudMcpCustody, CloudMcpHealth, CloudMcpStatus, CrashMarker, DaemonPanicTestResponse,
+    DaemonStatusResponse, DiagnoseResponse, DiagnoseStep, DrainReport, GitCredentialHelper,
     MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS, MAX_DIAGNOSE_SUMMARY_CHARS, OwnedProcessKind,
-    OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectDiscoverRequest,
-    ProjectDiscoverResponse, ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary,
-    RetentionView, RunningTurnSummary, SourceOwner, SourceState, StatusBlocker,
-    UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
-    activity_state_name, agent_state_name, diagnosis_reason, process_state_name,
-    stats_coverage_name,
+    OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES, ProcessPageCursor, ProjectDiscoverResponse,
+    ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary, RetentionView,
+    RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
+    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView, activity_state_name,
+    agent_state_name, diagnosis_reason, process_state_name, stats_coverage_name,
 };
 pub use config_views::{
     CONFIG_REVISION_HEX_LEN, MAX_LISTED_PROFILES, MAX_PROFILES_SOURCE_BYTES, ProfileListRequest,
