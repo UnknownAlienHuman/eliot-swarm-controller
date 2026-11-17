@@ -1478,6 +1478,10 @@ fn resolve_opencode_default(model: Option<&str>, ids: &[String]) -> core::Result
     }
 }
 
+#[cfg(all(test, windows))]
+#[path = "adhoc/family_tests.rs"]
+mod family_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

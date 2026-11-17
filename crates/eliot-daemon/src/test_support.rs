@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use eliot_core::{ProcessIdentity, ProcessRecord, ProcessState};
 use eliot_store::Store;
 
+#[cfg(windows)]
+pub(crate) mod windows_family;
+
 /// Install the fixture native source plan after dispatch, before any native
 /// batch. Fixture counterpart of the PluginHost manifest validation
 /// (`install_plugin_sources` after manifest check, before `agent.start`);

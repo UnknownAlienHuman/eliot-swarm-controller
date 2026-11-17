@@ -353,7 +353,17 @@ model's installed `Model.Variant` ids overlaid as `efforts` from the
 read-only `opencode api model.list --standalone` operation (`model.list`, the same
 `GET /api/model` inventory the per-session path reads). Both use the installed
 2.2.7 private-server flag (CLI help checked 2026-11-17), so their server descendants
-stay in the daemon-owned reader Job rather than starting or using a shared service.
+inherit the daemon-owned kill-on-close reader Job without breakaway. Each command
+runs in a separate reader lifetime: the host reaps the plugin, drains its reader
+and waits for its Job family to empty (terminating a remaining server tail within
+the bounded close budget) before starting the next command or returning a catalogue.
+Unconfirmed family closure returns `unknown`, including for the optional variants
+read; a failed variants read degrades to ids only after confirmed cleanup.
+Both catalogue commands intentionally inherit the reader's environment and canonical
+native configuration/auth stores, without the per-Agent XDG redirect used by
+`server.rs` and `auth.rs`: discovery must see the owner's authenticated providers.
+They create no session and import or modify no credentials. Process custody and
+private standalone execution do not imply an isolated credential store.
 A launch resolves
 the full provider/model pair, an omitted model leaves the configured native
 default, read back from the session echo. A stored profile may also carry

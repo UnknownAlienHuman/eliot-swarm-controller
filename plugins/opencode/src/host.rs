@@ -11,6 +11,7 @@ use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Resu
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
+    protocol::{ModelListParams, ModelListPart},
     session::{
         ResumeSubject, TargetEnvironment, decode, known_command, native_no_write, not_initialized,
         optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
@@ -630,14 +631,9 @@ impl OpenCodePlugin {
         error
     }
 
-    /// Read-only model list for `harness.models`: the native `opencode
-    /// models` catalogue (`provider/model` ids verbatim) with the
-    /// selectable `Model.Variant` ids overlaid as `efforts` from the
-    /// installed `api model.list` operation (`GET /api/model`). No
-    /// session, no model turn and no inference. A failed variant read
-    /// degrades to the ids-only catalogue; an omitted model still leaves
-    /// the configured native default, read back from the session at
-    /// launch.
+    /// One read-only `harness.models` phase: `models --standalone` ids or
+    /// `api model.list --standalone` variants. The daemon gives each phase
+    /// its own reader Job and proves family closure before overlaying results.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
         if self.session.is_some() || self.failed_start.is_some() {
             return Err(Error::new(
@@ -645,8 +641,8 @@ impl OpenCodePlugin {
                 "OpenCode model.list requires a dedicated reader plugin instance",
             ));
         }
-        let profile: Value = decode(raw, "OpenCode model.list params are invalid")?;
-        let snapshot = profile.get("profile").unwrap_or(&profile);
+        let params: ModelListParams = decode(raw, "OpenCode model.list params are invalid")?;
+        let snapshot = &params.profile;
         if snapshot.get("harness").and_then(Value::as_str) != Some("opencode") {
             return Err(Error::new(
                 "profile_error",
@@ -663,36 +659,19 @@ impl OpenCodePlugin {
                     "OpenCode model.list requires a discovered native cmd",
                 )
             })?;
-        let ids = run_models(std::ffi::OsStr::new(program), Instant::now() + RPC_TIMEOUT).await?;
-        let variants =
-            run_model_variants(std::ffi::OsStr::new(program), Instant::now() + RPC_TIMEOUT)
-                .await
-                .ok();
-        let models: Vec<Value> = ids
-            .into_iter()
-            .map(|id| {
-                let mut entry = serde_json::Map::from_iter([
-                    ("id".to_owned(), Value::String(id.clone())),
-                    ("default".to_owned(), Value::Bool(false)),
-                ]);
-                if let Some(overlay) = variants
-                    .as_ref()
-                    .and_then(|overlay| overlay.iter().find(|candidate| candidate.id == id))
-                {
-                    entry.insert(
-                        "efforts".to_owned(),
-                        Value::Array(
-                            overlay
-                                .variants
-                                .iter()
-                                .map(|variant| Value::String(variant.clone()))
-                                .collect(),
-                        ),
-                    );
-                }
-                Value::Object(entry)
-            })
-            .collect();
+        let until = Instant::now() + RPC_TIMEOUT;
+        let models: Vec<Value> = match params.part {
+            ModelListPart::Models => run_models(std::ffi::OsStr::new(program), until)
+                .await?
+                .into_iter()
+                .map(|id| json!({"id": id, "default": false}))
+                .collect(),
+            ModelListPart::Variants => run_model_variants(std::ffi::OsStr::new(program), until)
+                .await?
+                .into_iter()
+                .map(|entry| json!({"id": entry.id, "default": false, "efforts": entry.variants}))
+                .collect(),
+        };
         Ok(json!({"models": models, "default": Value::Null}))
     }
 

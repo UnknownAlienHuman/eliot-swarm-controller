@@ -56,6 +56,12 @@ quota reads wait up to 8 s for an interactive slot (a desktop asks every harness
 when it connects); after that wait, and for other explicit discovery reads at once, they
 refuse `busy` with a message naming `metadata_readers` and its limit.
 
+Catalogue requests use [`ModelListParams`](../../crates/eliot-plugin/src/protocol.rs).
+OpenCode reads ids and variants in separate reader lifetimes, sharing one admission
+slot and read deadline. Each phase closes its owned family before the next starts
+or a result is returned. Optional variant failures permit ids-only output only after
+confirmed cleanup; cancellation or unconfirmed closure never becomes success.
+
 Maximum encoded frame is 1 MiB including the NDJSON newline. Inline input is at most
 512 KiB; persisted event data/final text 64 KiB; pages at most 1,000 entries and below
 900 KiB. Both semantic and encoded limits apply, including JSON escaping. Reject

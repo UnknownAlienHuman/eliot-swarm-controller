@@ -156,6 +156,25 @@ pub struct ProfileStoreParams {
     pub workspace: String,
 }
 
+/// One catalogue phase per owned reader lifetime. OpenCode's native CLI uses
+/// separate commands for ids and variants; the host closes each family before
+/// starting the next phase. Other harnesses use the default complete inventory.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelListParams {
+    pub profile: Value,
+    #[serde(default)]
+    pub part: ModelListPart,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelListPart {
+    #[default]
+    Models,
+    Variants,
+}
+
 /// One launch's verified native-store selection and optional plugin-owned
 /// startup metadata from the same read. The daemon freezes both at dispatch.
 #[derive(Clone, Debug, Serialize, Deserialize)]

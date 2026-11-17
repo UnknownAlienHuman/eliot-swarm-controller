@@ -361,3 +361,7 @@ mod tests {
         assert!(matches!(opened.result, Err(error) if error.code == "platform_io"));
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "reader/family_tests.rs"]
+mod family_tests;
