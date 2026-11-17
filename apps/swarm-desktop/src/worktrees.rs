@@ -230,7 +230,7 @@ pub fn reason_words(reason: &str) -> String {
             "the registered path is gone and no live Agent uses it".to_owned()
         }
         "project_path_unverified" => "the registered path could not be checked".to_owned(),
-        "project_in_use" => "an Agent still uses the registration".to_owned(),
+        "project_in_use" => "an Agent or unsettled command still uses the registration".to_owned(),
         "branch_checked_out" => "the branch is checked out".to_owned(),
         "no_default_branch" => "the upstream default branch couldn't be found".to_owned(),
         "removed" => "already removed".to_owned(),

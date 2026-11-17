@@ -181,7 +181,7 @@ fn check_stale_project(store: &Store, id: &str, path: &str) -> Result<()> {
     if store.cleanup_project_in_use(id, path)? {
         return Err(Error::new(
             "project_in_use",
-            "an Agent still uses the registration",
+            "an Agent or unsettled command still uses the registration",
         ));
     }
     Ok(())

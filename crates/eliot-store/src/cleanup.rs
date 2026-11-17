@@ -261,6 +261,18 @@ impl Store {
     /// terminal Agent with unsettled activity. The Store holds the complete
     /// fleet here, including rows outside an inventory page.
     pub fn cleanup_project_in_use(&self, id: &str, path: &str) -> Result<bool> {
+        let pending = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE principal=?1
+             AND state IN ('accepted','queued','dispatched','unknown'))",
+                [format!("project:{id}")],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?;
+        if pending {
+            return Ok(true);
+        }
         let path = cleanup_path(path);
         let mut query = self.connection.prepare(
             "SELECT a.project, a.workspace, w.repo_path, w.worktree_path
@@ -781,23 +793,22 @@ fn prior_project_cleanup(
     artifact: &ArtifactView,
 ) -> Result<bool> {
     // The receipt fences the exact project/settings revision even across
-    // plans and restart. A retained consumed plan with a pruned receipt is
-    // inconclusive, so only a newer settings revision can supersede it.
+    // plans and restart. Retention pins unresolved project cleanup receipts.
     tx.query_row(
         "SELECT EXISTS(
            SELECT 1 FROM cleanup_plans p
              JOIN json_each(p.body, '$.items') i
-             LEFT JOIN writes w ON w.id=p.apply_id
+             JOIN writes w ON w.id=p.apply_id
             WHERE p.principal='owner' AND p.apply_id <> ?3
               AND json_extract(i.value, '$.verdict')='safe'
               AND json_extract(i.value, '$.artifact.kind')='project_registration'
               AND json_extract(i.value, '$.artifact.project')=?1
               AND json_extract(i.value, '$.artifact.identity')=?2
-              AND (w.id IS NULL OR EXISTS(
+              AND EXISTS(
                   SELECT 1 FROM json_each(w.result, '$.items') r
                    WHERE json_extract(r.value, '$.artifact_id')=json_extract(i.value, '$.artifact.id')
                      AND json_extract(r.value, '$.outcome')='unknown'
-              ))
+              )
          )",
         params![artifact.project, artifact.identity, apply_id], |row| row.get(0),
     ).map_err(sql_error)
@@ -872,6 +883,23 @@ mod tests {
     }
 
     #[test]
+    fn unsettled_targetless_project_command_keeps_registration() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store.connection.execute(
+            "INSERT INTO commands(id,principal,method,payload_digest,verb,args,state,created_at,updated_at)
+             VALUES (?1,'project:demo','command.submit',x'00','run','{}','dispatched',1,1)",
+            [Ulid::new().to_string()],
+        ).unwrap();
+        assert!(store.cleanup_project_in_use("demo", "/gone").unwrap());
+        assert!(!store.cleanup_project_in_use("other", "/gone").unwrap());
+        store
+            .connection
+            .execute("UPDATE commands SET state='applied'", [])
+            .unwrap();
+        assert!(!store.cleanup_project_in_use("demo", "/gone").unwrap());
+    }
+
+    #[test]
     fn uncertain_project_cleanup_fences_another_plan_for_the_same_revision() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
@@ -913,6 +941,10 @@ mod tests {
             let (_, replay, fresh) = store.begin_cleanup_apply("owner", &request, now).unwrap();
             assert!(!fresh);
             assert_eq!(replay.items[0].outcome, expected);
+            let trimmed = store
+                .prune_retention(None, Some(1), None, now + 2 * 86_400_000)
+                .unwrap();
+            assert_eq!(trimmed.writes_deleted, i64::from(expected == "skipped"));
         }
     }
 

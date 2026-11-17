@@ -91,12 +91,14 @@ pub(crate) async fn discover_project(
         ));
     }
     let project = match matching {
-        Some((definition, registered_checkout)) => Some(upsert_discovered_project(
-            &mut store,
-            definition,
-            &registered_checkout,
-            &common_dir,
-        )?),
+        Some((definition, registered_checkout, registered_common)) => {
+            Some(upsert_discovered_project(
+                &mut store,
+                definition,
+                &registered_checkout,
+                &registered_common,
+            )?)
+        }
         None => register_project(
             data_root,
             &mut store,
@@ -114,7 +116,7 @@ async fn matching_project(
     checkout: &str,
     common_dir: &str,
     linked: bool,
-) -> Result<Option<(crate::config::ProjectRegistrationConfig, String)>> {
+) -> Result<Option<(crate::config::ProjectRegistrationConfig, String, String)>> {
     if projects.is_empty() {
         return Ok(None);
     }
@@ -132,17 +134,16 @@ async fn matching_project(
         if !same_git_path(&registered_common, common_dir) {
             continue;
         }
-        let candidate_rank = if same_git_path(&registered_checkout, checkout) {
-            3
-        } else if linked && !registered_linked {
+        let candidate_rank = if linked && !registered_linked {
+            // A legacy worktree entry cannot supersede the repository grant.
             2
-        } else if linked {
+        } else if linked || same_git_path(&registered_checkout, checkout) {
             1
         } else {
             continue;
         };
         if candidate_rank > rank {
-            best = Some((project, registered_checkout));
+            best = Some((project, registered_checkout, registered_common));
             rank = candidate_rank;
             ambiguous = false;
         } else if candidate_rank == rank {
@@ -521,7 +522,10 @@ mod tests {
             &root, &mut store, None,
             &BTreeMap::from([
                 (Profiles, json!({"chosen": {"harness": "codex"}, "other": {"harness": "codex"}})),
-                (Projects, json!({"repo": {"path": checkout, "profiles": ["chosen"], "actions": ["send"]}})),
+                (Projects, json!({
+                    "repo": {"path": checkout, "profiles": ["chosen"], "actions": ["send"]},
+                    "legacy": {"path": linked, "profiles": ["chosen", "other"], "actions": ["send", "launch"]}
+                })),
             ]),
             SettingsAuthor::Owner(SettingsClientSource::Cli), false, &policy,
         ).unwrap().revision;
