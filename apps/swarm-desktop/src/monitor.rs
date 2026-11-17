@@ -500,16 +500,27 @@ impl MonitorRow {
     /// What the Agent does, in words: the turn it works on, or how its
     /// last turn ended.
     pub fn operation(&self) -> String {
-        match (&self.active_turn, &self.last_outcome) {
-            (Some(_), _) => match self.progress_age_ms {
+        // A native child's turn is its observed activity, not a controlled
+        // active turn.
+        let working = self.active_turn.is_some()
+            || (self.activity.as_deref() == Some("running") && self.state != AgentState::Stopped);
+        let ended = matches!(
+            self.state,
+            AgentState::Stopped | AgentState::Failed | AgentState::Lost
+        );
+        match (working, &self.last_outcome) {
+            (true, _) => match self.progress_age_ms {
                 Some(age) => format!("Working · last output {} ago", seconds(age)),
                 None => "Working · no output yet".to_owned(),
             },
-            (None, Some(outcome)) => format!("Last turn {}", outcome_words(outcome)),
-            (None, None) if self.activity.is_some() => {
-                "Activity not reported by the harness".to_owned()
+            (false, Some(outcome)) => format!("Last turn {}", outcome_words(outcome)),
+            // An open turn cut off by the end has no result; nothing is
+            // invented for it.
+            (false, None) if ended && self.activity.as_deref() == Some("lost") => {
+                "Its open turn has no result".to_owned()
             }
-            (None, None) => "No turns yet".to_owned(),
+            (false, None) if ended || self.activity.is_some() => "No finished turn".to_owned(),
+            (false, None) => "No turns yet".to_owned(),
         }
     }
 }
@@ -751,6 +762,9 @@ pub struct Monitor {
     pub incidents: HashMap<(String, i64), Incident>,
     /// The attention read's cursor (`None` until the first read).
     pub attention_cursor: Option<i64>,
+    /// A live row left the live states: read the stopped rows next, so a
+    /// just-stopped Agent does not vanish until the periodic read.
+    pub stopped_due: bool,
     pub detail: Option<Result<DetailRead, String>>,
     pub read_at_ms: Option<i64>,
     pub errors: Vec<String>,
@@ -760,7 +774,7 @@ pub struct Monitor {
 impl Monitor {
     /// Whether the next refresh reads the stopped rows.
     pub fn wants_stopped(&self) -> bool {
-        self.refreshes.is_multiple_of(STOPPED_EVERY) || self.stopped.is_empty()
+        self.stopped_due || self.refreshes.is_multiple_of(STOPPED_EVERY) || self.stopped.is_empty()
     }
 
     /// The open attention report of a row's current generation.
@@ -916,6 +930,7 @@ impl Monitor {
         match snapshot.stopped {
             Some(Ok(page)) => {
                 self.stopped = page.agents.iter().map(MonitorRow::from_list).collect();
+                self.stopped_due = false;
             }
             Some(Err(error)) => self.errors.push(format!("stopped: {error}")),
             None => {}
@@ -990,6 +1005,10 @@ impl Monitor {
         if self.errors.is_empty() {
             let present: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
             self.series.retain(|id, _| present.contains(id.as_str()));
+        }
+        let live: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        if self.errors.is_empty() && self.rows.iter().any(|row| !live.contains(row.id.as_str())) {
+            self.stopped_due = true;
         }
         self.rows = rows;
         self.counts = counts;
@@ -1620,11 +1639,24 @@ mod tests {
             "Ended with parent"
         );
         assert_eq!(monitor.children("a3")[0].status_words(), "Idle");
+        assert_eq!(monitor.children("a1")[0].operation(), "No finished turn");
         assert_eq!(
             monitor.live_line(2_000),
             "1 working · 2 need attention · 1 idle"
         );
         assert_eq!(monitor.attention_cursor, Some(9));
+        // A row that leaves the live states makes the next refresh read the
+        // stopped rows.
+        assert!(!monitor.stopped_due);
+        monitor.apply(MonitorSnapshot {
+            groups: vec![(AgentState::Busy, page(Vec::new()))],
+            counts: Vec::new(),
+            stopped: None,
+            attention: None,
+            detail: None,
+            read_at_ms: 2_100,
+        });
+        assert!(monitor.stopped_due && monitor.wants_stopped());
         // A recovery closes the incident; a day later the stopped rows age out.
         monitor.take_attention(AttentionRead {
             reports: vec![AttentionReport {
