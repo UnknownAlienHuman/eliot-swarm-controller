@@ -189,6 +189,9 @@ mod tests {
     fn message_colons_never_change_the_typed_error_class() {
         let error = eliot_core::Error::new("invalid", "unknown: origin: provider");
         assert!(matches!(after_error(&error, 0), Next::Stop { .. }));
-        assert_eq!(error.user_message(), "Check the supplied values");
+        assert_eq!(
+            error.user_message(),
+            "Check the supplied values: unknown: origin: provider"
+        );
     }
 }

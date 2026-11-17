@@ -1059,6 +1059,11 @@ unknown outcomes. A terminal's typed `native_error.code` (for example
 At most 16 steps;
 no new store, only existing event and record readbacks.
 
+Human CLI and desktop explanations lead with shared words for the typed code,
+followed by the daemon's complete message when nonempty. Specific refusal reasons
+(including reparent cycles, observe-only Agents and non-live managers) remain
+visible; a generic code alone must not hide the reason or imply a temporary outage.
+
 For every failed terminal turn, with or without a structured provider restriction, status
 and exact command/turn binding remain authoritative when final text exceeds the event
 budget. The event omits oversized final text rather than exposing a truncated string as

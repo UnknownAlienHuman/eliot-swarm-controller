@@ -189,7 +189,22 @@ mod tests {
             &binding(MoveForm::Agent),
             &eliot_core::Error::new("stale_generation", "internal generation details"),
         );
-        assert!(line.ends_with("The Agent started a new run; refresh and try again"));
+        assert!(line.ends_with(
+            "The Agent started a new run; refresh and try again: internal generation details"
+        ));
         assert!(!line.contains("stale_generation"));
+        for (code, message) in [
+            ("invalid", "reparent would create a cycle"),
+            ("not_allowed", "observe-only Agent cannot be reparented"),
+            ("bad_state", "new parent is not a live manager"),
+        ] {
+            assert!(
+                refusal_line(
+                    &binding(MoveForm::Agent),
+                    &eliot_core::Error::new(code, message)
+                )
+                .ends_with(message)
+            );
+        }
     }
 }

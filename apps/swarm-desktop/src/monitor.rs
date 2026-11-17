@@ -1601,7 +1601,7 @@ mod tests {
                 None
             ))
             .as_deref(),
-            Some("Model service: origin: free usage: limit")
+            Some("Model service: The Agent could not finish: origin: free usage: limit")
         );
         assert_eq!(
             diagnosis_line(&diagnosis("unknown", "idle", None, None)),

@@ -13,7 +13,7 @@ pub fn reason_words(code: &str) -> &'static str {
         "stale_generation" => "The Agent started a new run; refresh and try again",
         "unsupported" => "This action is not supported",
         "unknown" => "The result could not be confirmed",
-        "unavailable" => "Swarm is temporarily unavailable",
+        "unavailable" => "This action is unavailable",
         "not_allowed" => "This action is not permitted here",
         "invalid" => "Check the supplied values",
         "not_found" => "The requested item no longer exists",
@@ -49,33 +49,13 @@ pub fn origin_words(origin: &str) -> &'static str {
     }
 }
 
-/// Internal admission/transport explanations use the shared words. Native
-/// failure prose stays intact, including colons or the text `origin:`.
+/// Shared words lead, followed by the daemon's specific explanation intact,
+/// including colons or the text `origin:`.
 pub fn reason_message(code: &str, message: &str) -> String {
-    if message.trim().is_empty()
-        || matches!(
-            code,
-            "bad_state"
-                | "stale_generation"
-                | "unsupported"
-                | "unknown"
-                | "unavailable"
-                | "not_allowed"
-                | "invalid"
-                | "not_found"
-                | "busy"
-                | "timeout"
-                | "internal"
-                | "frame_too_large"
-                | "history_gap"
-                | "fanout_limit"
-                | "id_conflict"
-                | "daemon_restart"
-        )
-    {
+    if message.trim().is_empty() {
         reason_words(code).to_owned()
     } else {
-        message.to_owned()
+        format!("{}: {message}", reason_words(code))
     }
 }
 
@@ -98,5 +78,27 @@ impl crate::api::DiagnoseStep {
             self.code.as_deref().unwrap_or("unknown"),
             self.message.as_deref().unwrap_or_default(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_words_preserve_the_daemons_specific_message() {
+        for (code, message) in [
+            ("invalid", "reparent would create a cycle"),
+            ("not_allowed", "observe-only Agent cannot be reparented"),
+            ("bad_state", "new parent is not a live manager"),
+            ("unavailable", "artifact ledger is full"),
+            ("failure", "origin: request: refused"),
+        ] {
+            let shown = reason_message(code, message);
+            assert!(shown.starts_with(reason_words(code)), "{shown}");
+            assert!(shown.ends_with(message), "{shown}");
+        }
+        assert_eq!(reason_message("invalid", " \n"), reason_words("invalid"));
+        assert!(!reason_message("unavailable", "artifact ledger is full").contains("temporarily"));
     }
 }

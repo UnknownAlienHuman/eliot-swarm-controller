@@ -816,7 +816,10 @@ impl Conversation {
                     kind,
                     label.to_owned(),
                     eliot_core::reason_message(&failure.code, &failure.message),
-                    vec![eliot_core::origin_words(&failure.origin).to_owned()],
+                    vec![format!(
+                        "Origin: {}",
+                        eliot_core::origin_words(&failure.origin)
+                    )],
                 ));
             } else if let Some(note) = self.local_notes.get(command) {
                 parts.push(Part::new(
@@ -1260,8 +1263,11 @@ mod tests {
         let parts = &chat.items()[0].parts;
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[1].kind, PartKind::Failed);
-        assert_eq!(parts[1].text, "chat directory already exists");
-        assert_eq!(parts[1].detail, vec!["Swarm".to_owned()]);
+        assert_eq!(
+            parts[1].text,
+            "The request was declined: chat directory already exists"
+        );
+        assert_eq!(parts[1].detail, vec!["Origin: Swarm".to_owned()]);
         assert!(!parts.iter().any(|part| part.kind == PartKind::Working));
         assert!(chat.waiting_locals().is_empty());
         assert_eq!(chat.local_text("c9/send").as_deref(), Some("hello"));

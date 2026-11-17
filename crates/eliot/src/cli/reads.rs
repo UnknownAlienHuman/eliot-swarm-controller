@@ -1249,7 +1249,7 @@ mod tests {
                 "provider",
                 Some("origin: request: refused")
             )),
-            "Model service: origin: request: refused"
+            "Model service: The Agent could not finish: origin: request: refused"
         );
     }
 
