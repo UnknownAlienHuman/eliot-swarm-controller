@@ -4,7 +4,7 @@
 //! turn outcomes and their `preceded_by` links, process exits with codes,
 //! the last stderr lines, and a previous-run crash marker when the terminal
 //! failure has no classified origin. The one-line summary always starts
-//! with the failure origin.
+//! with the failure origin when a failure was observed.
 
 use super::{Principal, Router, require_owner};
 use eliot_core::{
@@ -203,7 +203,8 @@ impl Router {
                 steps.push(command_step(&command));
             }
         }
-        if let Ok(turns) = store.list_turns(agent, generation, 32) {
+        {
+            let turns = store.list_turns(agent, generation, 32)?;
             for turn in turns {
                 if steps.len() > MAX_TURNS_PER_DIAGNOSIS {
                     break;
@@ -253,9 +254,13 @@ impl Router {
         Ok(DiagnoseResponse {
             target: target.to_owned(),
             summary: summary_for(target, &steps, "agent"),
+            previous_crash: if healthy_agent(&steps) {
+                None
+            } else {
+                crash_if_unexplained(&origin, previous_crash)
+            },
             steps: bounded_steps(steps),
             preceded_by,
-            previous_crash: crash_if_unexplained(&origin, previous_crash),
         })
     }
 }
@@ -335,14 +340,32 @@ fn outcome_code(outcome: &Value) -> Option<String> {
 }
 
 fn turn_step(turn: &Turn, terminal: Option<&Event>) -> DiagnoseStep {
-    let message = terminal
+    let mut message = terminal
         .and_then(|event| event.data.get("native_error")?.get("message")?.as_str())
         .or(turn.native_status.as_deref())
         .or(turn.status.as_deref())
         .map(|message| bound_chars(message, 1024));
+    if let Some(reset) = terminal.and_then(|event| {
+        event
+            .data
+            .get("provider_restriction")?
+            .get("retry_after")?
+            .as_i64()
+    }) {
+        message = Some(bound_chars(
+            &format!(
+                "{}; reset at {reset} (Unix ms)",
+                message.as_deref().unwrap_or("provider restriction")
+            ),
+            1024,
+        ));
+    }
     DiagnoseStep {
         kind: "turn".to_owned(),
-        code: turn.outcome.map(|outcome| outcome.as_str().to_owned()),
+        code: terminal
+            .and_then(|event| event.data.get("native_error")?.get("code")?.as_str())
+            .map(|code| bound_chars(code, 128))
+            .or_else(|| turn.outcome.map(|outcome| outcome.as_str().to_owned())),
         message,
         failure_where: terminal
             .and_then(|event| event.data.get("where")?.as_str())
@@ -431,6 +454,15 @@ fn loss_step(event: &Event, at: Option<i64>) -> DiagnoseStep {
 /// informative step (command outcome, else turn outcome, else loss reason,
 /// else agent state) rendered as origin, target, what, where and message.
 fn summary_for(target: &str, steps: &[DiagnoseStep], fallback_what: &str) -> String {
+    if healthy_agent(steps) {
+        return bound_chars(
+            &format!(
+                "{target} is {}; nothing has failed in recent retained history",
+                steps[0].code.as_deref().unwrap_or("idle")
+            ),
+            MAX_DIAGNOSE_SUMMARY_CHARS,
+        );
+    }
     let step = steps
         .iter()
         .find(|step| {
@@ -474,6 +506,15 @@ fn summary_for(target: &str, steps: &[DiagnoseStep], fallback_what: &str) -> Str
         summary.push_str(message.trim());
     }
     bound_chars(&summary, MAX_DIAGNOSE_SUMMARY_CHARS)
+}
+
+fn healthy_agent(steps: &[DiagnoseStep]) -> bool {
+    steps.len() == 1
+        && steps[0].kind == "agent"
+        && matches!(
+            steps[0].code.as_deref(),
+            Some("idle" | "busy" | "waiting" | "stopped")
+        )
 }
 
 /// Hard cap: the command step plus bounded turn, loss and agent evidence

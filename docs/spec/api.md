@@ -1055,8 +1055,14 @@ exit data; the related turn outcomes with `preceded_by`; process steps from the
 NTSTATUS and the redacted stderr tail (a loss to a daemon restart is `swarm` at
 `daemon.restart`, see [core](core.md#failure-location-and-origin)); and the
 previous-run crash marker when the terminal failure is
-unclassified. The one-line `summary` always starts with the failure origin
-(`provider origin: <target> <code> at <where>: <message>`). At most 16 steps;
+unclassified. When a failure exists, the one-line `summary` starts with its origin
+(`provider origin: <target> <code> at <where>: <message>`). A healthy idle, busy,
+waiting or stopped Agent with no failure in the bounded recent generation read
+says that nothing has failed in that recent history; it carries no unrelated
+previous-crash marker. Unknown origin remains for unexplained failures or
+unknown outcomes. A terminal's typed `native_error.code` (for example
+`quota_exhausted`) and native quota reset hint are included in its turn step.
+At most 16 steps;
 no new store, only existing event and record readbacks.
 
 For every failed terminal turn, with or without a structured provider restriction, status
@@ -1410,7 +1416,11 @@ contract. The response retains `harness`, `scope`, `credential` (nonsecret names
 `fetched_at_ms`, `ttl_ms`, `status`, optional `note` and optional `details` (8192 bytes).
 Codex keeps its `rateLimits` projection from `account/rateLimits/read`.
 Claude uses its CLI OAuth `GET /api/oauth/usage`; Antigravity uses its native
-Windows keyring credential and read-only Cloud Code Assist quota calls;
+Windows keyring credential and read-only Cloud Code Assist quota calls using
+the installed CLI client fingerprint. Its native `retrieveUserQuotaSummary`
+groups keep separate Gemini, Gemini 4 Argon and Claude/GPT model-family
+5-hour/weekly buckets where supplied; missing groups are never filled from
+legacy model-availability percentages (see [Antigravity](../harnesses/antigravity.md#read-only-provider-quota));
 OpenCode Go uses the selected native credential export and `GET /zen/go/v1/usage`.
 These provider readers return `details.windows`: at most 32
 [`QuotaWindow`](../../crates/eliot-core/src/api/harness.rs) values
