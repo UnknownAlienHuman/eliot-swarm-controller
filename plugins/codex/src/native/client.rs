@@ -97,6 +97,26 @@ pub(crate) use eliot_plugin::native_stdio::{NativeFrame, NativeLaunch, StreamSta
 mod tests {
     use super::*;
     #[test]
+    fn recorded_interrupt_no_active_turn_is_a_definite_refusal() {
+        // Installed codex-cli 0.167.1, captured 2026-11-17 from an idle
+        // ephemeral thread's turn/interrupt response. Request id redacted.
+        let frame = serde_json::json!({"id":3,"error":{
+            "code":-32600,"message":"no active turn to interrupt"
+        }});
+        let error = CodexStdioConfig::map_response_error(
+            serde_json::from_value(frame["error"].clone()).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "native_rejected");
+        assert_eq!(error.message.as_str(), "no active turn to interrupt");
+        assert_eq!(error.origin, Some(eliot_core::FailureOrigin::Harness));
+        assert_eq!(
+            error.failure_where.as_deref(),
+            Some("plugin.codex.native.response")
+        );
+    }
+
+    #[test]
     fn method_not_found_retains_classification_and_non_admission() {
         for code in [-32601, -32602] {
             let error = CodexStdioConfig::map_response_error(NativeJsonRpcErrorBody {

@@ -2626,6 +2626,15 @@ mod tests {
         assert!(terminal.terminal);
         assert!(processor.status.active_turn_id.is_none());
         assert!(!processor.status.source_unknown);
+        // No native terminal during the next stop: custody proves only exit.
+        processor.status.active_command_id = Some("send-2".to_owned());
+        processor.status.active_turn_id = Some("turn-2".to_owned());
+        processor.finish_stop().await.unwrap();
+        let unknown = processor.status.last_turn.as_ref().unwrap();
+        assert_eq!(unknown.turn_id, "turn-2");
+        assert_eq!(unknown.command_id, "send-2");
+        assert!(!unknown.terminal);
+        assert!(unknown.status.is_none());
         host_task.abort();
         peer_task.abort();
     }

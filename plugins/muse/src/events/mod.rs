@@ -4546,6 +4546,73 @@ mod tests {
     use super::*;
     use eliot_plugin::protocol::MAX_COMMAND_ID_BYTES;
 
+    #[tokio::test]
+    async fn busy_stop_without_native_terminal_keeps_exact_turn_unknown() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (host_io, plugin_io) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(plugin_io);
+        let mut peer = eliot_plugin::Peer::from_io(read, write);
+        let client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let mut native = crate::native::NativeProcess::spawn(
+            crate::native::NativeLaunch {
+                program: std::env::current_exe().unwrap().into_os_string(),
+                args: vec!["--list".into()],
+                cwd: std::env::current_dir().unwrap(),
+                environment: Vec::new(),
+            },
+            SecretPolicy::default(),
+        )
+        .await
+        .unwrap();
+        let mut processor = EventProcessor::new(
+            native.client(),
+            client,
+            EventConfig {
+                credential: "test-credential".into(),
+                agent_id: "a1".into(),
+                generation: 1,
+                secrets: Vec::new(),
+            },
+        );
+        processor.status.ready = true;
+        processor.status.session_id = Some("session-1".into());
+        processor.status.active_command_id = Some("send-1".into());
+        processor.status.active_turn_id = Some("turn-1".into());
+        eliot_plugin::native_lifecycle::wait_for_stop_turn(Instant::now(), || {
+            processor
+                .status
+                .last_turn
+                .as_ref()
+                .is_some_and(|turn| turn.turn_id == "turn-1" && turn.terminal)
+        })
+        .await;
+        let (read, mut write) = tokio::io::split(host_io);
+        let (result, ()) = tokio::join!(processor.finish_stop(), async {
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            let request: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, "events.put");
+            assert_eq!(request.params["events"][0]["kind"], "session.ended");
+            let reply = json!({"jsonrpc":"2.0", "id":request.id, "result":{"first_seq":1,"last_seq":1,"cursor":null}});
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        result.unwrap();
+        let turn = processor.status.last_turn.as_ref().unwrap();
+        assert_eq!(turn.turn_id, "turn-1");
+        assert_eq!(turn.command_id, "send-1");
+        assert!(!turn.terminal);
+        assert!(turn.status.is_none());
+        native
+            .terminate(true, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        peer_task.abort();
+    }
+
     #[test]
     fn native_request_gap_reason_keeps_only_bounded_metadata() {
         let session_marker = "SESSION_VALUE_MUST_NOT_BE_RECORDED";

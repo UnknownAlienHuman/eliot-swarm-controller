@@ -2178,6 +2178,21 @@ mod tests {
                     break;
                 }
                 let request: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+                if matches!(request.method.as_str(), "source.gap" | "source.health") {
+                    let result = if request.method == "source.gap" {
+                        json!({"gap_id":request.params["gap_id"], "seq":1})
+                    } else {
+                        let mut health = request.params.clone();
+                        health.as_object_mut().unwrap().remove("credential");
+                        health
+                    };
+                    let response = json!({"jsonrpc":"2.0", "id":request.id, "result":result});
+                    write
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    continue;
+                }
                 assert_eq!(request.method, "events.put");
                 let event = request.params["events"][0].clone();
                 let (ack, acknowledged) = oneshot::channel();
@@ -2209,6 +2224,42 @@ mod tests {
             task.abort();
             let _ = task.await;
         }
+    }
+
+    #[tokio::test]
+    async fn busy_stop_without_native_terminal_keeps_exact_turn_unknown() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let _association = state.prepare("send-1".into(), "turn-1".into()).unwrap();
+        let (started, ()) = tokio::join!(state.associate(), async {
+            next_commit(&mut commits, "turn.started")
+                .await
+                .1
+                .send(())
+                .unwrap();
+        });
+        started.unwrap();
+        state.stopping = true;
+        state.latch_cancellation("stop-1", Some("turn-1"));
+        eliot_plugin::native_lifecycle::wait_for_stop_turn(Instant::now(), || {
+            state
+                .last_turn
+                .as_ref()
+                .is_some_and(|turn| turn.turn_id == "turn-1" && turn.terminal)
+        })
+        .await;
+        assert!(state.last_turn.is_none());
+        let (ended, ()) = tokio::join!(state.ended(), async {
+            next_commit(&mut commits, "session.ended")
+                .await
+                .1
+                .send(())
+                .unwrap();
+        });
+        ended.unwrap();
+        assert_eq!(state.settlement_for("turn-1"), Some("unknown"));
+        assert!(state.last_turn.is_none());
+        assert!(state.stopped);
+        finish(tasks).await;
     }
 
     fn request_data() -> Value {
