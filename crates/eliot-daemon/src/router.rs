@@ -3356,24 +3356,7 @@ impl Router {
                 }
             }
             Err(error) => {
-                if harness == "muse" && error.code == "unsupported" {
-                    response.status = "unsupported".to_owned();
-                    response.note=Some("Installed Muse MSP exposes neither usage/read nor a retained subscription observation".to_owned());
-                } else {
-                    let origin = if error.origin == Some(eliot_core::FailureOrigin::Provider) {
-                        "provider"
-                    } else {
-                        "environment"
-                    };
-                    response.details = Some(
-                        json!({"state":"error","origin":origin,"error":"quota read failed; no values available"}),
-                    );
-                    response.note = Some(if error.code == "quota_unavailable" {
-                        error.message.chars().take(512).collect()
-                    } else {
-                        "Read-only native/provider quota unavailable; no inference or credential refresh attempted".to_owned()
-                    });
-                }
+                catalog::quota_read_error(&mut response, error);
             }
         }
         request.validate_response(&response)?;

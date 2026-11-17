@@ -400,6 +400,35 @@ pub(crate) async fn list_models(
     probe_result
 }
 
+fn quota_read_error(error: Error) -> Error {
+    if error.failure_where.as_deref() == Some("plugin.codex.native.response.method_not_found") {
+        error.with_code("unsupported").with_message(
+            "Codex account/rateLimits/read is not supported by the installed app-server",
+        )
+    } else {
+        contextual_error(
+            error,
+            "native_readback",
+            "Codex account/rateLimits/read did not return quota",
+        )
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn quota_read_keeps_method_not_found_classification() {
+    let error = quota_read_error(
+        Error::new("native_rejected", "method not found")
+            .with_where("plugin.codex.native.response.method_not_found"),
+    );
+    assert_eq!(error.code, "unsupported");
+    assert!(error.message.contains("account/rateLimits/read"));
+    assert_eq!(
+        quota_read_error(Error::new("unknown", "lost reply")).code,
+        "unknown"
+    );
+}
+
 /// Read-only native account quota: a short-lived metadata reader calls
 /// `account/rateLimits/read`, plus `account/usage/read` when useful, then
 /// closes. It never starts a thread, sends input, or performs inference.
@@ -418,13 +447,7 @@ pub(crate) async fn read_quota(
         let rates = client
             .call("account/rateLimits/read", json!({}), deadline)
             .await
-            .map_err(|error| {
-                contextual_error(
-                    error,
-                    "native_readback",
-                    "Codex account/rateLimits/read did not return quota",
-                )
-            })?;
+            .map_err(quota_read_error)?;
         reject_secrets(&rates, metadata_secrets)?;
         let mut details = project_rate_limits(&rates)?;
         // Best-effort enrichment: token activity when the native surface

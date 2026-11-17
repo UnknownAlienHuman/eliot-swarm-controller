@@ -639,17 +639,21 @@ optional members are omitted when requests are serialized.
 archives or unarchives the selected Agent and all current descendants. Every
 member must be idle or stopped, with no active/uncertain turn, pending request or
 open command; otherwise it returns typed `busy` and stops nothing. The flag is
-durable. `agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;
+durable. Admission of send, resume, steer or inject atomically unarchives its
+target, including selector members, so new activity appears in the default list.
+`agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;
 totals and cursors use the same filter. Summaries and full Agents expose `archived`.
 CLI: `swarm archive aN`, `swarm unarchive aN`, `swarm ls --archived include`.
 
 `agent.delete {id, agent:"aN"}` is Owner-only and removes one stopped Agent tree's
 Store records, using retention's leaf-first command cleanup. Live custody, open
-commands, uncertain turns or a pinned history floor return `busy`; oversized
-operations return `unavailable` atomically. It never stops an Agent or deletes
+commands, uncertain turns, applicable unconsumed cleanup plans or a pinned history
+floor return `busy`; oversized operations return `unavailable` atomically. It never stops an Agent or deletes
 workspace files, native stores or Git branches. Run artifact cleanup separately
-before removing its ownership records. Deleted command IDs remain bound until
-the retry window expires, preventing a deleted native effect from being readmitted.
+before removing its ownership records. Process records for every generation of the
+tree are removed; consumed cleanup plans and their exact apply replay remain retained.
+Deleted command IDs remain bound until the retry window expires, preventing a deleted
+native effect from being readmitted.
 Archive/delete replies are `{agent, affected, archived:bool|null, deleted:bool}`;
 mutation ID, result and changes commit together. Exact retries return the retained
 reply even after deletion; changed payloads return `id_conflict`. MCP mints `id`
@@ -1400,7 +1404,9 @@ in 0..100; reset time is Unix milliseconds or null when absent. Windows identify
 or reset times. `details.state` is `ready` or `error`; `details.origin` is
 `provider` or `environment`. A failed read remains `status:"supported"` with
 `state:"error"`, a sanitized reason and no windows. Unsupported native integration
-sources remain `unsupported` with a concrete reason. The transport disables
+sources remain `unsupported` with a concrete reason. Native JSON-RPC method-not-found
+(`-32601`) remains `unsupported`, naming the checked `account/rateLimits/read`
+or `usage/read` method; it is not a supported environment failure. The transport disables
 redirects, bounds each HTTP request to eight seconds and each response to 1 MiB;
 credential reads are bounded to 256 KiB. Quota calls wait at most eight seconds
 for one of the existing four metadata-reader permits, so a five-harness Usage
