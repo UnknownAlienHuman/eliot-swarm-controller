@@ -3221,7 +3221,8 @@ mod tests {
         agent.profile_snapshot = json!({
             "pass_env_values": {"CODEX_HOME": null, "CODEX_SQLITE_HOME": null},
         });
-        let data_root = std::env::temp_dir().join("eliot-q20-spawn-test");
+        let data_root =
+            std::env::temp_dir().join(format!("eliot-q20-spawn-test-{}", std::process::id()));
         let environment = build_target_environment(&data_root, &agent, "agent-token")
             .expect("target environment");
         let data_dir = environment

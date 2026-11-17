@@ -2138,7 +2138,8 @@ mod tests {
     fn agent_scope_comparison_ignores_spelling_variants() {
         let complete = [Some("a1"), Some("7"), Some("agent-token")];
         let none: [Option<&str>; 2] = [None, None];
-        let base = std::env::temp_dir().join("eliot-q20-scope-test");
+        let base =
+            std::env::temp_dir().join(format!("eliot-q20-scope-test-{}", std::process::id()));
         let issuing = base.to_str().expect("temp dir is UTF-8").to_owned();
 
         let mut varied = base.clone();
