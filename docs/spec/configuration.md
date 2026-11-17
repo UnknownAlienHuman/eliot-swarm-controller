@@ -714,7 +714,13 @@ Owner-global `[projects.ID]` entries register projects. On an Owner open or laun
 an unregistered Git checkout, S2 creates an entry through the settings writer,
 recorded as a machine change. Its profile allowlist is the existing profiles;
 its action allowlist grants ordinary launch/send only, without script/interpreter,
-Git fetch or additional automation authority. Existing registrations are preserved.
+Git fetch or additional automation authority. Discovery honors an explicit
+registration for the opened checkout. For an unregistered linked worktree, the
+canonical Git common directory identifies its repository registration. Discovery
+prefers the registered primary checkout, or reuses a sole registration for that
+common directory. Ambiguous matches refuse discovery. Reuse returns the registered
+checkout and its exact allowlists, preserves the Agent's workspace, and adds no
+settings entry. Workspace inventory is read-only.
 Daemon startup performs no project discovery: a removed project stays removed
 across restarts, and no checkout is ever registered implicitly. Registration
 runs only through an explicit Owner open (`project.discover`), an Owner

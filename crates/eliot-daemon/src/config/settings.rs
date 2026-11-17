@@ -358,7 +358,20 @@ pub(crate) fn project_configs(source: &str) -> core::Result<Vec<ProjectRegistrat
     project_registrations_in(&parse_config(source)?, source)
 }
 
-fn current_revision(data_root: &Path) -> core::Result<Option<String>> {
+/// Read a single settings source for Git resolution and its later CAS.
+pub(crate) fn project_configs_snapshot(
+    data_root: &Path,
+) -> core::Result<(Option<String>, Vec<ProjectRegistrationConfig>)> {
+    match read_config_source(data_root)? {
+        Some(source) => Ok((
+            Some(profiles_edit::revision_of(&source)),
+            project_configs(&source)?,
+        )),
+        None => Ok((None, Vec::new())),
+    }
+}
+
+pub(crate) fn current_revision(data_root: &Path) -> core::Result<Option<String>> {
     Ok(read_config_source(data_root)?
         .as_deref()
         .map(profiles_edit::revision_of))
