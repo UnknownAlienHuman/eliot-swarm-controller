@@ -1,3 +1,4 @@
+use eliot_core::api::process_state_name;
 use super::*;
 
 impl Store {
@@ -183,14 +184,6 @@ fn merge_process_record(
         }
     }
     Ok(())
-}
-
-fn process_state_name(state: ProcessState) -> &'static str {
-    match state {
-        ProcessState::Running => "running",
-        ProcessState::Exited => "exited",
-        ProcessState::Unknown => "unknown",
-    }
 }
 
 fn insert_process_event(

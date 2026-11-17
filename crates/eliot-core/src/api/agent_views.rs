@@ -1,10 +1,10 @@
 //! Public Agent/daemon read grammar and pure reply binding checks.
 //! Store authorization and the exact workspace target remain Router decisions.
 
-use super::{GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView};
+use super::{GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView, StatsCoverage};
 use crate::{
     Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
-    NativeChildActivityState, ProcessIdentity, ProcessRecord, Result, SessionUsage, StderrSnapshot,
+    NativeChildActivityState, ProcessIdentity, ProcessRecord, ProcessState, Result, SessionUsage, StderrSnapshot,
     TurnOutcome, TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -473,6 +473,25 @@ pub fn activity_state_name(state: NativeChildActivityState) -> &'static str {
         NativeChildActivityState::Interrupted => "interrupted",
         NativeChildActivityState::Lost => "lost",
         NativeChildActivityState::Unknown => "unknown",
+    }
+}
+
+/// Process state spelling shared by persisted observations and readbacks.
+pub fn process_state_name(state: ProcessState) -> &'static str {
+    match state {
+        ProcessState::Running => "running",
+        ProcessState::Exited => "exited",
+        ProcessState::Unknown => "unknown",
+    }
+}
+
+/// OS sample coverage spelling shared by observation readbacks.
+pub fn stats_coverage_name(coverage: StatsCoverage) -> &'static str {
+    match coverage {
+        StatsCoverage::Unknown => "unknown",
+        StatsCoverage::Stale => "stale",
+        StatsCoverage::Complete => "complete",
+        StatsCoverage::Partial => "partial",
     }
 }
 

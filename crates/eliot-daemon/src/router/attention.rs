@@ -3,7 +3,7 @@
 
 use super::{Principal, Router};
 use crate::common::now_ms;
-use eliot_core::api::{agent_state_name, 
+use eliot_core::api::{agent_state_name, process_state_name, stats_coverage_name, 
     EmitDefinitionArgs, MailMode, MailSendRequest, ObservationView, SourceState,
 };
 use eliot_core::{Agent, AgentState, CommandState, Error, ProcessState, Result};
@@ -2293,23 +2293,6 @@ impl ProcessObservation {
             records: Vec::new(),
             error_code: Some(error_code.chars().take(64).collect()),
         }
-    }
-}
-
-fn stats_coverage_name(coverage: eliot_core::api::StatsCoverage) -> &'static str {
-    match coverage {
-        eliot_core::api::StatsCoverage::Unknown => "unknown",
-        eliot_core::api::StatsCoverage::Stale => "stale",
-        eliot_core::api::StatsCoverage::Complete => "complete",
-        eliot_core::api::StatsCoverage::Partial => "partial",
-    }
-}
-
-fn process_state_name(state: ProcessState) -> &'static str {
-    match state {
-        ProcessState::Running => "running",
-        ProcessState::Exited => "exited",
-        ProcessState::Unknown => "unknown",
     }
 }
 
