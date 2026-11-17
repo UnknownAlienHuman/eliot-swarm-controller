@@ -125,7 +125,7 @@ pub fn card_high(palette: Palette) -> Border {
 
 /// The status dot of an Agent state in a list; empty for states that need
 /// no mark.
-pub fn list_dot(palette: Palette, state: &str) -> View {
+pub fn list_dot(palette: Palette, state: eliot_core::AgentState) -> View {
     match palette.dot(StatusTone::of_state(state)) {
         Some(fill) => dot(fill),
         None => View::empty(),
@@ -150,7 +150,7 @@ pub fn status(palette: Palette, state: &str, label: &str) -> View {
         .spacing(spacing::XS)
         .vertical_alignment(VerticalAlignment::Center)
         .children((
-            dot(palette.header_dot(StatusTone::of_state(state))),
+            dot(palette.header_dot(StatusTone::of_activity_state(state))),
             secondary(label.to_owned()).vertical_alignment(VerticalAlignment::Center),
         ))
 }

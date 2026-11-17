@@ -493,8 +493,11 @@ impl DesktopApp {
             })
             .filter(|agent| {
                 !matches!(
-                    agent.state.as_str(),
-                    "stopped" | "failed" | "lost" | "unknown"
+                    agent.state,
+                    eliot_core::AgentState::Stopped
+                        | eliot_core::AgentState::Failed
+                        | eliot_core::AgentState::Lost
+                        | eliot_core::AgentState::Unknown
                 )
             })
             .collect()
@@ -796,7 +799,12 @@ impl DesktopApp {
                 push(
                     &format!("existing-{}", agent.id),
                     destination(
-                        format!("{} · {} · {}", agent.id, agent.state, agent.harness),
+                        format!(
+                            "{} · {} · {}",
+                            agent.id,
+                            eliot_core::api::agent_state_name(agent.state),
+                            agent.harness
+                        ),
                         &choice,
                         state.choice.as_ref(),
                         can_act,

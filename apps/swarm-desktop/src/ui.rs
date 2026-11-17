@@ -140,7 +140,7 @@ struct UiDetail {
     pending: Vec<UiPending>,
     harness: String,
     settings: configure::Settings,
-    state: String,
+    state: eliot_core::AgentState,
     /// Observe-only Agents reject native control verbs.
     observe_only: bool,
     /// The project label (its checkout).
@@ -454,7 +454,7 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         pending,
         harness: reply.agent.harness.clone(),
         settings: configure::Settings::from_reply(reply),
-        state: eliot_core::api::agent_state_name(reply.agent.state).to_owned(),
+        state: reply.agent.state,
         observe_only: reply.agent.observe_only,
         project: reply.agent.project.clone(),
         routing: reply.agent.profile_choice.clone(),

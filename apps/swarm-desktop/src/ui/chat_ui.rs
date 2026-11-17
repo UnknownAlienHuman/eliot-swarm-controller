@@ -935,7 +935,12 @@ impl DesktopApp {
             return Some(Message::Launch(LaunchMsg::LaunchRequested));
         };
         let detail = self.chat.detail.as_ref()?;
-        let resumable = matches!(detail.state.as_str(), "stopped" | "failed" | "lost")
+        let resumable = matches!(
+            detail.state,
+            eliot_core::AgentState::Stopped
+                | eliot_core::AgentState::Failed
+                | eliot_core::AgentState::Lost
+        )
             && detail.active_turn.is_none()
             && !detail.observe_only;
         let action = match (&detail.active_turn, resumable) {
@@ -1207,8 +1212,15 @@ impl DesktopApp {
         ) else {
             return;
         };
-        let ended = matches!(detail.state.as_str(), "failed" | "stopped" | "lost");
-        if detail.active_turn.is_some() || !(ended || detail.state == "idle") {
+        let ended = matches!(
+            detail.state,
+            eliot_core::AgentState::Failed
+                | eliot_core::AgentState::Stopped
+                | eliot_core::AgentState::Lost
+        );
+        if detail.active_turn.is_some()
+            || !(ended || detail.state == eliot_core::AgentState::Idle)
+        {
             return;
         }
         let waiting = convo.waiting_locals();
@@ -1243,7 +1255,7 @@ impl DesktopApp {
         ) else {
             return;
         };
-        if detail.state != "lost" || detail.observe_only {
+        if detail.state != eliot_core::AgentState::Lost || detail.observe_only {
             self.chat.loss = None;
             return;
         }
@@ -1276,7 +1288,10 @@ impl DesktopApp {
         let agent = self.selected_agent_id()?;
         let (read, generation, words) = self.chat.loss.as_ref()?;
         let words = words.as_deref()?;
-        if *read != agent || *generation != detail.generation || detail.state != "lost" {
+        if *read != agent
+            || *generation != detail.generation
+            || detail.state != eliot_core::AgentState::Lost
+        {
             return None;
         }
         Some(
@@ -1545,8 +1560,7 @@ impl DesktopApp {
     ) -> View {
         let title = self.agent_title(agent);
         let detail = self.chat.detail.as_ref();
-        let state = detail.map_or("reading", |detail| detail.state.as_str());
-        let tone = StatusTone::of_state(state);
+        let tone = detail.map_or(StatusTone::Neutral, |detail| StatusTone::of_state(detail.state));
         let note = match &self.chat.live {
             LiveStatus::Stale(_) => "Catching up…",
             LiveStatus::Reconnecting { .. } => "Reconnecting…",
@@ -1555,7 +1569,12 @@ impl DesktopApp {
         };
         let menu: View = match detail {
             Some(detail) => {
-                let ended = matches!(detail.state.as_str(), "stopped" | "failed" | "lost");
+                let ended = matches!(
+                    detail.state,
+                    eliot_core::AgentState::Stopped
+                        | eliot_core::AgentState::Failed
+                        | eliot_core::AgentState::Lost
+                );
                 let controllable = !detail.observe_only;
                 let mut items = vec![
                     MenuItem::item("details", MENU_DETAILS),
@@ -1627,7 +1646,12 @@ impl DesktopApp {
                 Border::new()
                     .grid_column(1)
                     .vertical_alignment(VerticalAlignment::Center)
-                    .automation_name(format!("State: {state}"))
+                    .automation_name(format!(
+                        "State: {}",
+                        eliot_core::api::agent_state_name(
+                            detail.map_or(eliot_core::AgentState::Unknown, |detail| detail.state)
+                        )
+                    ))
                     .content(m3::dot(palette.header_dot(tone))),
                 m3::secondary(note)
                     .grid_column(2)
@@ -2136,7 +2160,12 @@ impl DesktopApp {
         let detail = self.chat.detail.as_ref();
         let active_turn = detail.and_then(|detail| detail.active_turn.clone());
         let resumable = detail.is_some_and(|detail| {
-            matches!(detail.state.as_str(), "stopped" | "failed" | "lost")
+            matches!(
+                detail.state,
+                eliot_core::AgentState::Stopped
+                    | eliot_core::AgentState::Failed
+                    | eliot_core::AgentState::Lost
+            )
                 && detail.active_turn.is_none()
                 && !detail.observe_only
         });

@@ -874,14 +874,14 @@ impl DesktopApp {
         let (Some(id), Some(detail)) = (self.selected_agent_id(), self.chat.detail.as_ref()) else {
             return;
         };
-        let state = detail.state.clone();
+        let state = detail.state;
         for agent in self.nav.agents.iter_mut().filter(|agent| agent.id == id) {
-            agent.state = state.clone();
+            agent.state = state;
         }
         for branch in self.nav.branches.values_mut() {
             if let Branch::Loaded { children, .. } = branch {
                 for agent in children.iter_mut().filter(|agent| agent.id == id) {
-                    agent.state = state.clone();
+                    agent.state = state;
                 }
             }
         }
@@ -1591,7 +1591,11 @@ impl DesktopApp {
         } else {
             View::empty()
         };
-        let mut name = format!("{title}, {}, Agent {}", agent.state, agent.id);
+        let mut name = format!(
+            "{title}, {}, Agent {}",
+            eliot_core::api::agent_state_name(agent.state),
+            agent.id
+        );
         if let Some(place) = &row.place {
             name.push_str(&format!(", in {place}"));
         }
@@ -1685,7 +1689,10 @@ impl DesktopApp {
     ) -> View {
         let label = self.agent_label(agent);
         m3::sub_row(palette, false)
-            .automation_name(format!("Recent: {label}, {}", agent.state))
+            .automation_name(format!(
+                "Recent: {label}, {}",
+                eliot_core::api::agent_state_name(agent.state)
+            ))
             .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
             .content(m3::row_content(None, &label, "", task_dot(palette, agent)))
     }
@@ -1829,7 +1836,7 @@ fn quiet_row(text: &str, indent: f64) -> View {
 /// list carries no marks.
 fn task_dot(palette: Palette, agent: &UiAgent) -> View {
     if agent.running() || agent.needs_attention() {
-        m3::list_dot(palette, &agent.state)
+        m3::list_dot(palette, agent.state)
     } else {
         View::empty()
     }

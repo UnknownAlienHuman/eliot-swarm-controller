@@ -73,7 +73,7 @@ impl DesktopApp {
                                 id: row.id.clone(),
                                 generation: row.generation,
                                 harness: row.harness.clone(),
-                                state: eliot_core::api::agent_state_name(row.state).to_owned(),
+                                state: row.state,
                                 project: String::new(),
                                 parent: row.parent.clone(),
                                 updated_at: 0,
@@ -489,7 +489,10 @@ impl DesktopApp {
         match (detail, read) {
             (Some(detail), _) => {
                 let harness = crate::picker::harness_label(&detail.harness);
-                agent_lines.push(format!("{harness} · {}", state_label(&detail.state)));
+                agent_lines.push(format!(
+                    "{harness} · {}",
+                    state_label(detail.state)
+                ));
                 agent_lines.extend(detail.settings.lines());
                 agent_lines.push(format!(
                     "Access: {}",
@@ -678,16 +681,16 @@ impl DesktopApp {
 }
 
 /// An Agent state code in words.
-fn state_label(state: &str) -> &'static str {
+fn state_label(state: eliot_core::AgentState) -> &'static str {
     match state {
-        "created" | "starting" => "Starting",
-        "idle" => "Ready",
-        "busy" | "running" => "Working",
-        "waiting" => "Waiting for you",
-        "stopped" => "Stopped",
-        "failed" => "Failed",
-        "lost" => "Lost",
-        _ => "State not confirmed",
+        eliot_core::AgentState::Created | eliot_core::AgentState::Starting => "Starting",
+        eliot_core::AgentState::Idle => "Ready",
+        eliot_core::AgentState::Busy => "Working",
+        eliot_core::AgentState::Waiting => "Waiting for you",
+        eliot_core::AgentState::Stopped => "Stopped",
+        eliot_core::AgentState::Failed => "Failed",
+        eliot_core::AgentState::Lost => "Lost",
+        eliot_core::AgentState::Unknown => "State not confirmed",
     }
 }
 

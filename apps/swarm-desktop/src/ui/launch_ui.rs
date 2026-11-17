@@ -1053,7 +1053,7 @@ impl LaunchOutcome {
             id: self.agent.clone(),
             generation: self.generation,
             harness: self.submitted.harness.clone().unwrap_or_default(),
-            state: "created".to_owned(),
+            state: eliot_core::AgentState::Created,
             project: if self.submitted.chat {
                 String::new()
             } else {

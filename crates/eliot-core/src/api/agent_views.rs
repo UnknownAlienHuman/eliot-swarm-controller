@@ -440,7 +440,7 @@ impl AgentSummary {
         }
     }
 
-    /// Fleet counting bucket for one summary. Per core.md, a lost observed
+    /// Fleet counting bucket for one summary. Per docs/spec/api.md:722-727, a lost observed
     /// activity counts as unknown; its display label still describes the loss.
     pub fn fleet_bucket(&self) -> &'static str {
         match &self.activity {

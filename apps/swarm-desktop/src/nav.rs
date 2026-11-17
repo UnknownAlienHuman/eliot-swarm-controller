@@ -30,7 +30,7 @@ pub struct UiAgent {
     pub id: String,
     pub generation: i64,
     pub harness: String,
-    pub state: String,
+    pub state: eliot_core::AgentState,
     /// The Agent's project label: its workspace path, as listed.
     pub project: String,
     /// The current manager, if any.
@@ -56,7 +56,7 @@ impl UiAgent {
             id: summary.id.clone(),
             generation: summary.generation,
             harness: summary.harness.clone(),
-            state: eliot_core::api::agent_state_name(summary.state).to_owned(),
+            state: summary.state,
             project: summary.project.clone(),
             parent: summary.parent.clone(),
             updated_at: summary.updated_at,
@@ -73,14 +73,21 @@ impl UiAgent {
     /// Working now or on its way.
     pub fn running(&self) -> bool {
         matches!(
-            self.state.as_str(),
-            "busy" | "running" | "created" | "starting"
+            self.state,
+            eliot_core::AgentState::Busy
+                | eliot_core::AgentState::Created
+                | eliot_core::AgentState::Starting
         )
     }
 
     /// Its process may still exist: neither stopped, failed nor lost.
     pub fn live(&self) -> bool {
-        !matches!(self.state.as_str(), "stopped" | "failed" | "lost")
+        !matches!(
+            self.state,
+            eliot_core::AgentState::Stopped
+                | eliot_core::AgentState::Failed
+                | eliot_core::AgentState::Lost
+        )
     }
 
     /// The owner has something to do: answer a pending request
@@ -91,19 +98,27 @@ impl UiAgent {
     pub fn needs_attention(&self) -> bool {
         !self.native_child
             && matches!(
-                self.state.as_str(),
-                "waiting" | "failed" | "lost" | "unknown"
+                self.state,
+                eliot_core::AgentState::Waiting
+                    | eliot_core::AgentState::Failed
+                    | eliot_core::AgentState::Lost
+                    | eliot_core::AgentState::Unknown
             )
     }
 
     /// Ready for the next message: idle and controlled.
     pub fn idle(&self) -> bool {
-        self.state == "idle" && !self.native_child
+        self.state == eliot_core::AgentState::Idle && !self.native_child
     }
 
     /// Ended: stopped, failed or lost.
     fn ended(&self) -> bool {
-        matches!(self.state.as_str(), "stopped" | "failed" | "lost")
+        matches!(
+            self.state,
+            eliot_core::AgentState::Stopped
+                | eliot_core::AgentState::Failed
+                | eliot_core::AgentState::Lost
+        )
     }
 }
 
@@ -875,7 +890,7 @@ mod tests {
             id: id.to_owned(),
             generation: 1,
             harness: "muse".to_owned(),
-            state: "idle".to_owned(),
+            state: AgentState::Idle,
             project: project.to_owned(),
             parent: parent.map(str::to_owned),
             updated_at: 0,
@@ -888,7 +903,18 @@ mod tests {
     }
 
     fn with(mut agent: UiAgent, state: &str, updated_at: i64) -> UiAgent {
-        agent.state = state.to_owned();
+        agent.state = match state {
+            "created" => AgentState::Created,
+            "starting" => AgentState::Starting,
+            "idle" => AgentState::Idle,
+            "busy" | "running" => AgentState::Busy,
+            "waiting" => AgentState::Waiting,
+            "stopped" => AgentState::Stopped,
+            "failed" => AgentState::Failed,
+            "lost" => AgentState::Lost,
+            "unknown" => AgentState::Unknown,
+            _ => unreachable!("unknown test state {state}"),
+        };
         agent.updated_at = updated_at;
         agent
     }
@@ -1472,11 +1498,25 @@ mod tests {
         assert_eq!(
             (
                 agent.title.as_str(),
-                agent.state.as_str(),
+                agent.state,
                 agent.native_child
             ),
-            ("k75: titles", "idle", false)
+            ("k75: titles", AgentState::Idle, false)
         );
+    }
+
+    #[test]
+    fn agent_lifecycle_is_carried_as_the_typed_state() {
+        let ready = with(agent("a1", "/p", None), "idle", 0);
+        assert_eq!(ready.state, AgentState::Idle);
+        assert!(ready.idle());
+        assert!(ready.live());
+        assert!(!ready.ended());
+
+        let failed = with(agent("a2", "/p", None), "failed", 0);
+        assert!(failed.needs_attention());
+        assert!(failed.ended());
+        assert!(!failed.live());
     }
 
     #[test]
