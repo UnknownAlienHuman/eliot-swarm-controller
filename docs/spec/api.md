@@ -391,14 +391,8 @@ After a request is written, local response read/integrity failures are `unknown`
 (mutation exit 4), never proof of non-execution. Pre-send validation and a valid,
 matching daemon domain rejection retain their own codes; no automatic retry occurs.
 
-Commands store the binding directly; other writes use:
-
-```sql
-CREATE TABLE writes (
-  id TEXT PRIMARY KEY, principal TEXT NOT NULL, method TEXT NOT NULL,
-  payload_digest BLOB NOT NULL, result TEXT NOT NULL, created_at INTEGER NOT NULL
-);
-```
+Commands store the binding directly; other writes use the durable `writes`
+receipt defined by the [Store migrations](../../crates/eliot-store/src/schema.rs).
 
 The writer checks both command/write namespaces. Later linked inputs, selectors and
 rule actions have bounded derived ids. No general receipt/floor framework.
