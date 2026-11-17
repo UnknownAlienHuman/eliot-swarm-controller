@@ -1,4 +1,5 @@
 use super::{Store, TurnInactiveProof};
+use crate::tests::{native_batch, ready_agent, send_request};
 use eliot_core::{
     AgentState, CommandState, NativeEvent, SourceBatch, SourceHandoff, SourceHandoffGap,
     SubmitCommand, TurnState,
@@ -22,76 +23,6 @@ fn now_ms() -> i64 {
 
 fn store() -> Store {
     Store::open(Path::new(":memory:")).unwrap()
-}
-
-fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
-    let launch_id = Ulid::new().to_string();
-    let admission = store
-        .submit(
-            "owner",
-            SubmitCommand {
-                id: launch_id.clone(),
-                target: None,
-                selector: None,
-                verb: "launch".to_owned(),
-                args: json!({"project":project, "workspace":"synthetic-workspace", "harness":"codex", "profile":"fake", "profile_snapshot":{}}),
-                expected_generation: Some(0),
-                expected_turn_id: None,
-                request_id: None,
-                probe: false,
-            },
-            now,
-        )
-        .expect("admit launch");
-    let agent = admission.command.target.expect("launch target");
-    store.dispatch(&launch_id, now).expect("dispatch launch");
-    crate::tests::install_fixture_sources(store, &agent, &launch_id, 1, now);
-    store
-        .put_batch(
-            SourceBatch {
-                batch_id: format!("{project}:ready"),
-                agent_id: agent.clone(),
-                generation: 1,
-                source: "stream".to_owned(),
-                events: vec![NativeEvent {
-                    ts: None,
-                    kind: "session.ready".to_owned(),
-                    native_id: format!("{project}:ready"),
-                    data: json!({"command_id":launch_id}),
-                }],
-                cursor: None,
-            },
-            now,
-        )
-        .expect("commit session ready");
-    store
-        .settle(&launch_id, CommandState::Applied, None, now)
-        .expect("settle launch");
-    agent
-}
-
-fn send_request(agent: &str, text: &str) -> SubmitCommand {
-    let mut request = SubmitCommand::new(Ulid::new().to_string(), "send");
-    request.target = Some(agent.to_owned());
-    request.expected_generation = Some(1);
-    request.args = json!({"text": text});
-    request
-}
-
-fn native_batch(agent: &str, generation: i64, kind: &str, data: Value) -> SourceBatch {
-    SourceBatch {
-        batch_id: Ulid::new().to_string(),
-        agent_id: agent.to_owned(),
-        generation,
-        source: "stream".to_owned(),
-        events: vec![NativeEvent {
-            ts: None,
-            kind: kind.to_owned(),
-            native_id: Ulid::new().to_string(),
-            data,
-        }],
-        cursor: None,
-    }
 }
 
 fn resolve_command_request(
@@ -206,7 +137,7 @@ fn resolve_unknown_send_to_failed_releases_only_its_input_gate() {
     let first_agent = ready_agent(&mut store, "resolve-first", now);
     let second_agent = ready_agent(&mut store, "resolve-second", now);
 
-    let first_send = send_request(&first_agent, "uncertain first input");
+    let first_send = send_request(&first_agent, 1, "uncertain first input");
     let first_id = first_send.id.clone();
     store
         .submit("owner", first_send, now)
@@ -216,7 +147,7 @@ fn resolve_unknown_send_to_failed_releases_only_its_input_gate() {
         .settle(&first_id, CommandState::Unknown, None, now)
         .expect("retain unknown first send");
 
-    let second_send = send_request(&second_agent, "uncertain second input");
+    let second_send = send_request(&second_agent, 1, "uncertain second input");
     let second_id = second_send.id.clone();
     store
         .submit("owner", second_send, now)
@@ -229,13 +160,13 @@ fn resolve_unknown_send_to_failed_releases_only_its_input_gate() {
         .expect("retain unknown second send");
 
     // A later send queues behind each unknown gate.
-    let first_next = send_request(&first_agent, "later first input");
+    let first_next = send_request(&first_agent, 1, "later first input");
     let first_next_id = first_next.id.clone();
     let admitted = store
         .submit("owner", first_next, now)
         .expect("admit later send");
     assert_eq!(admitted.command.state, CommandState::Queued);
-    let second_next = send_request(&second_agent, "later second input");
+    let second_next = send_request(&second_agent, 1, "later second input");
     let second_next_id = second_next.id.clone();
     store
         .submit("owner", second_next, now)
@@ -303,7 +234,7 @@ fn resolve_unknown_interrupt_to_applied_keeps_turn_binding_and_turn_gate() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-applied", now);
 
-    let send = send_request(&agent, "associated input");
+    let send = send_request(&agent, 1, "associated input");
     let send_id = send.id.clone();
     store.submit("owner", send, now).expect("admit send");
     store.dispatch(&send_id, now).expect("dispatch send");
@@ -359,7 +290,7 @@ fn resolve_unknown_interrupt_to_applied_keeps_turn_binding_and_turn_gate() {
     assert_eq!(turn_resolution_source(&store, &agent, 1, "turn-1"), None);
     let agent_row = store.get_agent(&agent).unwrap().unwrap();
     assert_eq!(agent_row.active_turn.as_deref(), Some("turn-1"));
-    let next = send_request(&agent, "later input");
+    let next = send_request(&agent, 1, "later input");
     let next_id = next.id.clone();
     let admitted = store.submit("owner", next, now).expect("admit later send");
     assert_eq!(admitted.command.state, CommandState::Queued);
@@ -385,7 +316,7 @@ fn unknown_turn_on_live_generation_blocks_next_send_until_owner_resolves() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "unknown-turn-gate", now);
 
-    let first = send_request(&agent, "first input");
+    let first = send_request(&agent, 1, "first input");
     let first_id = first.id.clone();
     store.submit("owner", first, now).expect("admit first send");
     store.dispatch(&first_id, now).expect("dispatch first send");
@@ -421,7 +352,7 @@ fn unknown_turn_on_live_generation_blocks_next_send_until_owner_resolves() {
 
     // The uncertain turn must not be overtaken: the next send queues at
     // admission and stays queued at dispatch (core.md turn/input gates).
-    let next = send_request(&agent, "later input");
+    let next = send_request(&agent, 1, "later input");
     let next_id = next.id.clone();
     let admitted = store.submit("owner", next, now).expect("admit later send");
     assert_eq!(admitted.command.state, CommandState::Queued);
@@ -454,7 +385,7 @@ fn resolve_send_with_lost_turn_association_invents_nothing() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-lost", now);
 
-    let send = send_request(&agent, "input whose turn never committed");
+    let send = send_request(&agent, 1, "input whose turn never committed");
     let send_id = send.id.clone();
     store.submit("owner", send, now).expect("admit send");
     store.dispatch(&send_id, now).expect("dispatch send");
@@ -553,7 +484,7 @@ fn resolve_command_refusals_keep_unknown_work_fenced() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-refusals", now);
 
-    let applied_send = send_request(&agent, "applied input");
+    let applied_send = send_request(&agent, 1, "applied input");
     let applied_id = applied_send.id.clone();
     store
         .submit("owner", applied_send, now)
@@ -590,14 +521,14 @@ fn resolve_command_refusals_keep_unknown_work_fenced() {
         )
         .expect("settle native applied send");
 
-    let dispatched_send = send_request(&agent, "dispatched input");
+    let dispatched_send = send_request(&agent, 1, "dispatched input");
     let dispatched_id = dispatched_send.id.clone();
     store
         .submit("owner", dispatched_send, now)
         .expect("admit send");
     store.dispatch(&dispatched_id, now).expect("dispatch send");
 
-    let queued_send = send_request(&agent, "queued input");
+    let queued_send = send_request(&agent, 1, "queued input");
     let queued_id = queued_send.id.clone();
     let queued = store.submit("owner", queued_send, now).expect("admit send");
     assert_eq!(queued.command.state, CommandState::Queued);
@@ -670,7 +601,7 @@ fn resolve_command_write_ids_replay_or_conflict() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-replay", now);
 
-    let send = send_request(&agent, "uncertain input");
+    let send = send_request(&agent, 1, "uncertain input");
     let send_id = send.id.clone();
     store.submit("owner", send, now).expect("admit send");
     store.dispatch(&send_id, now).expect("dispatch send");
@@ -751,7 +682,7 @@ fn owner_command_assertion_is_distinguishable_from_native_receipt() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-provenance", now);
 
-    let native_send = send_request(&agent, "native input");
+    let native_send = send_request(&agent, 1, "native input");
     let native_id = native_send.id.clone();
     store.submit("owner", native_send, now).expect("admit send");
     store.dispatch(&native_id, now).expect("dispatch send");
@@ -787,7 +718,7 @@ fn owner_command_assertion_is_distinguishable_from_native_receipt() {
         )
         .expect("settle native applied send");
 
-    let uncertain_send = send_request(&agent, "uncertain input");
+    let uncertain_send = send_request(&agent, 1, "uncertain input");
     let uncertain_id = uncertain_send.id.clone();
     store
         .submit("owner", uncertain_send, now)
@@ -837,7 +768,7 @@ fn resolve_unknown_turn_after_stop_completes_with_asserted_status() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-turn", now);
 
-    let send = send_request(&agent, "held input");
+    let send = send_request(&agent, 1, "held input");
     let send_id = send.id.clone();
     store.submit("owner", send, now).expect("admit send");
     store.dispatch(&send_id, now).expect("dispatch send");
@@ -929,7 +860,7 @@ fn resolve_turn_refusals_keep_active_and_terminal_turns_fenced() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-turn-refusals", now);
 
-    let send = send_request(&agent, "held input");
+    let send = send_request(&agent, 1, "held input");
     let send_id = send.id.clone();
     store.submit("owner", send, now).expect("admit send");
     store.dispatch(&send_id, now).expect("dispatch send");
@@ -1060,7 +991,7 @@ fn resolve_turn_write_ids_replay_or_conflict() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-turn-replay", now);
 
-    let send = send_request(&agent, "held input");
+    let send = send_request(&agent, 1, "held input");
     let send_id = send.id.clone();
     store.submit("owner", send, now).expect("admit send");
     store.dispatch(&send_id, now).expect("dispatch send");
@@ -1155,7 +1086,7 @@ fn stored_turn_resolution_replays_without_resolving() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-turn-precheck", now);
 
-    let send = send_request(&agent, "held input");
+    let send = send_request(&agent, 1, "held input");
     let send_id = send.id.clone();
     store.submit("owner", send, now).expect("admit send");
     store.dispatch(&send_id, now).expect("dispatch send");
@@ -1237,7 +1168,7 @@ fn resolve_turn_leaves_sibling_unknown_turn_untouched() {
     let second_agent = ready_agent(&mut store, "resolve-turn-second", now);
 
     for (agent, project) in [(&first_agent, "first"), (&second_agent, "second")] {
-        let send = send_request(agent, &format!("{project} held input"));
+        let send = send_request(agent, 1, &format!("{project} held input"));
         let send_id = send.id.clone();
         store.submit("owner", send, now).expect("admit send");
         store.dispatch(&send_id, now).expect("dispatch send");
@@ -1288,7 +1219,7 @@ fn owner_turn_assertion_is_distinguishable_from_native_completion() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-turn-provenance", now);
 
-    let native_send = send_request(&agent, "native input");
+    let native_send = send_request(&agent, 1, "native input");
     let native_id = native_send.id.clone();
     store.submit("owner", native_send, now).expect("admit send");
     store.dispatch(&native_id, now).expect("dispatch send");
@@ -1315,7 +1246,7 @@ fn owner_turn_assertion_is_distinguishable_from_native_completion() {
         )
         .expect("commit native turn completion");
 
-    let uncertain_send = send_request(&agent, "uncertain input");
+    let uncertain_send = send_request(&agent, 1, "uncertain input");
     let uncertain_id = uncertain_send.id.clone();
     store
         .submit("owner", uncertain_send, now)
@@ -1566,7 +1497,7 @@ fn resolve_turn_needs_a_terminal_generation_or_a_native_proof() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-live-proof", now);
 
-    let send = send_request(&agent, "held input");
+    let send = send_request(&agent, 1, "held input");
     let send_id = send.id.clone();
     store.submit("owner", send, now).expect("admit send");
     store.dispatch(&send_id, now).expect("dispatch send");
@@ -1781,7 +1712,7 @@ fn turn_readback_command_finds_the_latest_bound_send() {
     let now = now_ms();
     let agent = ready_agent(&mut store, "resolve-readback", now);
 
-    let send = send_request(&agent, "held input");
+    let send = send_request(&agent, 1, "held input");
     let send_id = send.id.clone();
     store.submit("owner", send, now).expect("admit send");
     store.dispatch(&send_id, now).expect("dispatch send");

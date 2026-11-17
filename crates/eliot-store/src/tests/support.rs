@@ -1,6 +1,16 @@
 use super::*;
+use serde_json::Value;
 
-pub(super) fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
+pub(crate) fn ready_agent(store: &mut Store, project: &str, now: i64) -> String {
+    ready_agent_with_native_identity(store, project, now, None)
+}
+
+pub(crate) fn ready_agent_with_native_identity(
+    store: &mut Store,
+    project: &str,
+    now: i64,
+    native_identity: Option<(&str, &str)>,
+) -> String {
     let launch_id = Ulid::new().to_string();
     let admission = store
         .submit(
@@ -22,6 +32,14 @@ pub(super) fn ready_agent(store: &mut Store, project: &str, now: i64) -> String 
     let agent = admission.command.target.expect("launch target");
     store.dispatch(&launch_id, now).expect("dispatch launch");
     install_fixture_sources(store, &agent, &launch_id, 1, now);
+    let data = match native_identity {
+        Some((scope, reference)) => json!({
+            "command_id": launch_id,
+            "native_scope": scope,
+            "native_ref": reference,
+        }),
+        None => json!({"command_id": launch_id}),
+    };
     store
         .put_batch(
             SourceBatch {
@@ -33,7 +51,7 @@ pub(super) fn ready_agent(store: &mut Store, project: &str, now: i64) -> String 
                     ts: None,
                     kind: "session.ready".to_owned(),
                     native_id: format!("{project}:ready"),
-                    data: json!({"command_id":launch_id}),
+                    data,
                 }],
                 cursor: None,
             },
@@ -148,6 +166,22 @@ pub(crate) fn send_request(agent: &str, generation: i64, text: &str) -> SubmitCo
     request.args = json!({"text":text});
     request.expected_generation = Some(generation);
     request
+}
+
+pub(crate) fn native_batch(agent: &str, generation: i64, kind: &str, data: Value) -> SourceBatch {
+    SourceBatch {
+        batch_id: Ulid::new().to_string(),
+        agent_id: agent.to_owned(),
+        generation,
+        source: "stream".to_owned(),
+        events: vec![NativeEvent {
+            ts: None,
+            kind: kind.to_owned(),
+            native_id: Ulid::new().to_string(),
+            data,
+        }],
+        cursor: None,
+    }
 }
 
 pub(super) fn start_fake_turn(store: &mut Store, agent: &str, now: i64) -> String {

@@ -409,6 +409,29 @@ struct GoalRow {
     updated_at: i64,
 }
 
+fn update_goal_state_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    mode: &str,
+    revision: i64,
+    state: &GoalStatePersist,
+    now: i64,
+) -> Result<()> {
+    db!(tx.execute(
+        "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
+         WHERE agent = ?4 AND mode = ?5 AND revision = ?6",
+        params![
+            revision + 1,
+            encode_json(state)?,
+            now,
+            agent_num,
+            mode,
+            revision
+        ],
+    ));
+    Ok(())
+}
+
 /// Keep definition/counters, clear A, and install B paused with a fresh turn baseline.
 pub(super) fn transfer_goal_tx(
     tx: &Transaction<'_>,
@@ -431,7 +454,7 @@ pub(super) fn transfer_goal_tx(
             ));
         }
     }
-    let Some(mut source) = load_goal_row_tx(tx, from_num, "eliot")? else {
+    let Some(mut source) = load_goal_row(tx, from_num, "eliot")? else {
         return Ok(None);
     };
     if matches!(
@@ -446,7 +469,7 @@ pub(super) fn transfer_goal_tx(
             "blocked source Goal requires an explicit set or clear before handoff",
         ));
     }
-    let destination = load_goal_row_tx(tx, to_num, "eliot")?;
+    let destination = load_goal_row(tx, to_num, "eliot")?;
     if destination
         .as_ref()
         .is_some_and(|row| row.state.status != GoalStatus::Cleared)
@@ -991,7 +1014,7 @@ impl Store {
             ));
         }
         let turn_count = count_turns(&tx, agent_num, agent_row.generation)?;
-        if let Some(row) = load_goal_row_tx(&tx, agent_num, mode)? {
+        if let Some(row) = load_goal_row(&tx, agent_num, mode)? {
             if row.generation == agent_row.generation
                 && row.state.status == GoalStatus::Active
                 && encode_json(&row.definition)? == encoded
@@ -1029,7 +1052,7 @@ impl Store {
                     mode,
                 ],
             ));
-            let updated = load_goal_row_tx(&tx, agent_num, mode)?
+            let updated = load_goal_row(&tx, agent_num, mode)?
                 .ok_or_else(|| Error::new("internal", "goal disappeared after set"))?;
             let view = goal_view_on(&tx, &goal_holder, updated)?;
             retain_goal_result(&tx, id, principal, "goal.set", &payload_digest, &view, now)?;
@@ -1062,7 +1085,7 @@ impl Store {
                 now,
             ],
         ));
-        let inserted = load_goal_row_tx(&tx, agent_num, mode)?
+        let inserted = load_goal_row(&tx, agent_num, mode)?
             .ok_or_else(|| Error::new("internal", "goal disappeared after set"))?;
         let view = goal_view_on(&tx, &goal_holder, inserted)?;
         retain_goal_result(&tx, id, principal, "goal.set", &payload_digest, &view, now)?;
@@ -1104,7 +1127,7 @@ impl Store {
         }
         validate_id_age(id, now)?;
         let agent_num = parse_agent_id(agent)?;
-        let Some(row) = load_goal_row_tx(&tx, agent_num, mode)? else {
+        let Some(row) = load_goal_row(&tx, agent_num, mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };
         if row.state.status != GoalStatus::Paused && row.state.status != GoalStatus::Active {
@@ -1119,19 +1142,8 @@ impl Store {
             let mut state = row.state;
             state.status = GoalStatus::Paused;
             state.paused_reason = reason.map(ToOwned::to_owned);
-            db!(tx.execute(
-                "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
-                 WHERE agent = ?4 AND mode = ?5 AND revision = ?6",
-                params![
-                    row.revision + 1,
-                    encode_json(&state)?,
-                    now,
-                    agent_num,
-                    mode,
-                    row.revision,
-                ],
-            ));
-            let updated = load_goal_row_tx(&tx, agent_num, mode)?
+            update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
+            let updated = load_goal_row(&tx, agent_num, mode)?
                 .ok_or_else(|| Error::new("internal", "goal disappeared after pause"))?;
             goal_view_on(&tx, &goal_holder, updated)?
         };
@@ -1172,7 +1184,7 @@ impl Store {
         }
         validate_id_age(id, now)?;
         let agent_num = parse_agent_id(agent)?;
-        let Some(row) = load_goal_row_tx(&tx, agent_num, mode)? else {
+        let Some(row) = load_goal_row(&tx, agent_num, mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };
         let view = if row.state.status == GoalStatus::Cleared {
@@ -1188,19 +1200,8 @@ impl Store {
                 last_committed_slot: row.state.last_committed_slot,
                 last_continuation_command_id: None,
             };
-            db!(tx.execute(
-                "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
-             WHERE agent = ?4 AND mode = ?5 AND revision = ?6",
-                params![
-                    row.revision + 1,
-                    encode_json(&state)?,
-                    now,
-                    agent_num,
-                    mode,
-                    row.revision,
-                ],
-            ));
-            let updated = load_goal_row_tx(&tx, agent_num, mode)?
+            update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
+            let updated = load_goal_row(&tx, agent_num, mode)?
                 .ok_or_else(|| Error::new("internal", "goal disappeared after clear"))?;
             goal_view_on(&tx, &goal_holder, updated)?
         };
@@ -1241,7 +1242,7 @@ impl Store {
         }
         validate_id_age(id, now)?;
         let agent_num = parse_agent_id(agent)?;
-        let Some(row) = load_goal_row_tx(&tx, agent_num, mode)? else {
+        let Some(row) = load_goal_row(&tx, agent_num, mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };
         let view = if row.state.status == GoalStatus::Active {
@@ -1273,19 +1274,8 @@ impl Store {
             let mut state = row.state;
             state.status = GoalStatus::Active;
             state.paused_reason = None;
-            db!(tx.execute(
-                "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
-             WHERE agent = ?4 AND mode = ?5 AND revision = ?6",
-                params![
-                    row.revision + 1,
-                    encode_json(&state)?,
-                    now,
-                    agent_num,
-                    mode,
-                    row.revision,
-                ],
-            ));
-            let updated = load_goal_row_tx(&tx, agent_num, mode)?
+            update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
+            let updated = load_goal_row(&tx, agent_num, mode)?
                 .ok_or_else(|| Error::new("internal", "goal disappeared after resume"))?;
             goal_view_on(&tx, &goal_holder, updated)?
         };
@@ -1323,19 +1313,7 @@ impl Store {
             last_committed_slot: row.state.last_committed_slot,
             last_continuation_command_id: row.state.last_continuation_command_id.clone(),
         };
-        let state_text = encode_json(&state)?;
-        db!(tx.execute(
-            "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
-             WHERE agent = ?4 AND mode = ?5 AND revision = ?6",
-            params![
-                row.revision + 1,
-                state_text,
-                now,
-                agent_num,
-                row.mode,
-                row.revision,
-            ],
-        ));
+        update_goal_state_tx(&tx, agent_num, &row.mode, row.revision, &state, now)?;
         commit_transaction(tx, &self.write_faulted)?;
         let row = load_goal_row(&self.connection, agent_num, &row.mode)?
             .ok_or_else(|| Error::new("internal", "goal disappeared after pause"))?;
@@ -1375,7 +1353,7 @@ impl Store {
                 "observe-only Agents take no Goal rounds",
             ));
         }
-        let Some(row) = load_goal_row_tx(&tx, agent_num, mode)? else {
+        let Some(row) = load_goal_row(&tx, agent_num, mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };
         if row.generation != agent_row.generation {
@@ -1390,18 +1368,7 @@ impl Store {
                     last_committed_slot: row.state.last_committed_slot,
                     last_continuation_command_id: row.state.last_continuation_command_id.clone(),
                 };
-                db!(tx.execute(
-                    "UPDATE goals SET revision = ?1, state = ?2, updated_at = ?3
-                     WHERE agent = ?4 AND mode = ?5 AND revision = ?6",
-                    params![
-                        row.revision + 1,
-                        encode_json(&state)?,
-                        now,
-                        agent_num,
-                        mode,
-                        row.revision,
-                    ],
-                ));
+                update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
                 commit_transaction(tx, &self.write_faulted)?;
             }
             return Err(Error::new(
@@ -1431,7 +1398,7 @@ impl Store {
              WHERE agent = ?2 AND mode = ?3 AND state = 'running' AND holder <> ?4",
             params![now, agent_num, mode, self.goal_holder],
         ));
-        let markers = load_goal_markers_tx(&tx, agent_num, mode)?;
+        let markers = load_goal_markers(&tx, agent_num, mode)?;
         if markers
             .iter()
             .any(|marker| marker.is_live(&self.goal_holder))
@@ -1488,7 +1455,7 @@ impl Store {
             row.state.counters.turns_at_set,
             row.state.counters.turns_used,
             row.state.last_continuation_command_id.as_deref(),
-            count_turns_tx(&tx, agent_num, row.generation)?
+            count_turns(&tx, agent_num, row.generation)?
                 .saturating_add(row.state.transferred_turns),
         )?;
         if live_spent != expected_spent {
@@ -1497,7 +1464,7 @@ impl Store {
                 "goal turn budget state changed since the probe",
             ));
         }
-        let claim_seq = max_agent_seq_tx(&tx, agent_num, row.generation)?;
+        let claim_seq = max_agent_seq(&tx, agent_num, row.generation)?;
         match key {
             GoalRoundKey::Idle(idle_seq) => {
                 if !round_key_names_generation_event(&tx, agent_num, row.generation, idle_seq)? {
@@ -1665,7 +1632,7 @@ impl Store {
                 "goal round commit does not match its reservation",
             ));
         }
-        let Some(row) = load_goal_row_tx(&tx, agent_num, &commit.mode)? else {
+        let Some(row) = load_goal_row(&tx, agent_num, &commit.mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };
         if row.state.status != GoalStatus::Active {
@@ -1714,7 +1681,7 @@ impl Store {
                         "round key does not name an idle event of this Agent generation",
                     ));
                 }
-                if max_agent_seq_tx(&tx, agent_num, row.generation)? != idle_seq {
+                if max_agent_seq(&tx, agent_num, row.generation)? != idle_seq {
                     return Err(Error::new(
                         "stale_round",
                         "Agent events advanced past the round key",
@@ -1723,7 +1690,7 @@ impl Store {
             }
             GoalRoundKey::Slot(slot) => {
                 require_slot_due(&row, slot, now)?;
-                if max_agent_seq_tx(&tx, agent_num, row.generation)? != commit.claim_seq {
+                if max_agent_seq(&tx, agent_num, row.generation)? != commit.claim_seq {
                     return Err(Error::new(
                         "stale_round",
                         "Agent events advanced during the round",
@@ -1760,7 +1727,7 @@ impl Store {
                 "a request opened during the round",
             ));
         }
-        let turn_count = count_turns_tx(&tx, agent_num, row.generation)?;
+        let turn_count = count_turns(&tx, agent_num, row.generation)?;
         let mut counters = row.state.counters.clone();
         counters.turns_used = counters.turns_used.max(
             row.state
@@ -1913,7 +1880,7 @@ impl Store {
                 row.revision,
             ],
         ));
-        let row = load_goal_row_tx(&tx, agent_num, &commit.mode)?
+        let row = load_goal_row(&tx, agent_num, &commit.mode)?
             .ok_or_else(|| Error::new("internal", "goal disappeared after round"))?;
         let view = goal_view_on(&tx, &self.goal_holder, row)?;
         let (wire_outcome, reason, command_id) = match &outcome {
@@ -2280,32 +2247,6 @@ fn load_goal_markers(
         .map_err(sql_error)
 }
 
-fn load_goal_markers_tx(
-    tx: &Transaction<'_>,
-    agent_num: i64,
-    mode: &str,
-) -> Result<Vec<GoalMarkerRow>> {
-    let mut statement = tx
-        .prepare(
-            "SELECT generation, round_key, round_key_kind, holder, state
-             FROM goal_markers WHERE agent = ?1 AND mode = ?2",
-        )
-        .map_err(sql_error)?;
-    statement
-        .query_map(params![agent_num, mode], |row| {
-            Ok(GoalMarkerRow {
-                generation: row.get(0)?,
-                round_key: row.get(1)?,
-                kind: row.get(2)?,
-                holder: row.get(3)?,
-                state: row.get(4)?,
-            })
-        })
-        .map_err(sql_error)?
-        .collect::<rusqlite::Result<Vec<GoalMarkerRow>>>()
-        .map_err(sql_error)
-}
-
 fn load_goal_marker_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
@@ -2520,49 +2461,6 @@ fn load_goal_row(connection: &Connection, agent_num: i64, mode: &str) -> Result<
         .transpose()
 }
 
-fn load_goal_row_tx(tx: &Transaction<'_>, agent_num: i64, mode: &str) -> Result<Option<GoalRow>> {
-    tx.query_row(
-        "SELECT agent, mode, generation, revision, definition, state,
-                last_round_key, updated_at
-         FROM goals WHERE agent = ?1 AND mode = ?2",
-        params![agent_num, mode],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, i64>(7)?,
-            ))
-        },
-    )
-    .optional()
-    .map_err(sql_error)?
-    .map(
-        |(agent, mode, generation, revision, definition, state, last_round_key, updated_at)| {
-            let definition: GoalDefinition = serde_json::from_str(&definition)
-                .map_err(|error| Error::new("internal", format!("invalid stored goal: {error}")))?;
-            let state: GoalStatePersist = serde_json::from_str(&state).map_err(|error| {
-                Error::new("internal", format!("invalid stored goal state: {error}"))
-            })?;
-            Ok(GoalRow {
-                agent_num: agent,
-                mode,
-                generation,
-                revision,
-                definition,
-                state,
-                last_round_key,
-                updated_at,
-            })
-        },
-    )
-    .transpose()
-}
-
 fn count_turns(connection: &Connection, agent_num: i64, generation: i64) -> Result<i64> {
     connection
         .query_row(
@@ -2573,15 +2471,6 @@ fn count_turns(connection: &Connection, agent_num: i64, generation: i64) -> Resu
         .map_err(sql_error)
 }
 
-fn count_turns_tx(tx: &Transaction<'_>, agent_num: i64, generation: i64) -> Result<i64> {
-    tx.query_row(
-        "SELECT COUNT(*) FROM turns WHERE agent = ?1 AND generation = ?2",
-        params![agent_num, generation],
-        |row| row.get(0),
-    )
-    .map_err(sql_error)
-}
-
 fn max_agent_seq(connection: &Connection, agent_num: i64, generation: i64) -> Result<i64> {
     connection
         .query_row(
@@ -2590,15 +2479,6 @@ fn max_agent_seq(connection: &Connection, agent_num: i64, generation: i64) -> Re
             |row| row.get(0),
         )
         .map_err(sql_error)
-}
-
-fn max_agent_seq_tx(tx: &Transaction<'_>, agent_num: i64, generation: i64) -> Result<i64> {
-    tx.query_row(
-        "SELECT COALESCE(MAX(seq), 0) FROM events WHERE agent = ?1 AND generation = ?2",
-        params![agent_num, generation],
-        |row| row.get(0),
-    )
-    .map_err(sql_error)
 }
 
 fn unhealthy_open_sources(

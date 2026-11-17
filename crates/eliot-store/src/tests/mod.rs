@@ -41,12 +41,12 @@ mod workspaces;
 
 use support::{
     capacity_generation, capacity_launch_request, capacity_store_path, insert_process,
-    native_store_binding, native_store_request, ready_agent, ready_attention_agent,
-    ready_capacity_agent, ready_managed_codex_agent, ready_muse_agent, ready_steer_agent,
-    remove_capacity_store_files, rule_input_with_limit, simulated_plugin_identity, start_fake_turn,
+    native_store_binding, native_store_request, ready_attention_agent, ready_capacity_agent,
+    ready_managed_codex_agent, ready_muse_agent, ready_steer_agent, remove_capacity_store_files,
+    rule_input_with_limit, simulated_plugin_identity, start_fake_turn,
     targetless_rule_launch_request,
 };
 pub(crate) use support::{
-    install_fixture_sources, install_live_custody_observations, send_request,
-    simulate_normal_stop_proof,
+    install_fixture_sources, install_live_custody_observations, native_batch, ready_agent,
+    ready_agent_with_native_identity, send_request, simulate_normal_stop_proof,
 };
