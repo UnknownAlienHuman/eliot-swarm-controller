@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 48;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 50;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1166,6 +1166,32 @@ impl Store {
                 INSERT INTO schema_migrations(version) VALUES (48);").map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 49 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX events_heavy_agent_generation
+                     ON events(agent, generation, seq) WHERE kind = 'activity.heavy';
+                 INSERT INTO schema_migrations(version) VALUES (49);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 50 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX processes_live_owner ON processes(owner)
+                     WHERE state IN ('running','unknown');
+                 INSERT INTO schema_migrations(version) VALUES (50);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1175,12 +1201,109 @@ mod continuity_tests {
     use super::*;
 
     #[test]
+    fn v49_upgrade_indexes_only_live_process_owners() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX processes_live_owner;
+             DELETE FROM schema_migrations WHERE version=50;
+             INSERT INTO processes(host_boot_id,pid,start_time,owner,role,state,updated_at) VALUES
+                 ('boot',1,1,'agent:a1#1','plugin','exited',1),
+                 ('boot',2,2,'agent:a2#1','plugin','running',1),
+                 ('boot',3,3,'agent:a2#1','child','unknown',1),
+                 ('boot',4,4,'workspace:a3#1','setup','unknown',1);",
+            )
+            .unwrap();
+        store.migrate().unwrap();
+        let (owners, total) = store.live_process_owners(1).unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(total, 2);
+        // The exited `agent:a1#1` sorts first; a page that dropped the state
+        // filter would return it here.
+        assert_eq!(
+            (
+                owners[0].agent.as_str(),
+                owners[0].generation,
+                owners[0].workspace
+            ),
+            ("a2", 1, false)
+        );
+        for sql in [
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM (SELECT DISTINCT owner FROM processes INDEXED BY processes_live_owner WHERE state IN ('running','unknown'))",
+            "EXPLAIN QUERY PLAN SELECT DISTINCT owner FROM processes INDEXED BY processes_live_owner WHERE state IN ('running','unknown') ORDER BY owner LIMIT 1",
+        ] {
+            let plans: Vec<String> = store
+                .connection
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get(3))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert!(
+                plans
+                    .iter()
+                    .any(|plan| plan.contains("USING INDEX processes_live_owner")),
+                "{plans:?}"
+            );
+            assert!(
+                plans.iter().all(|plan| !plan.contains("TEMP B-TREE")),
+                "{plans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v48_upgrade_indexes_heavy_rollups_by_exact_generation() {
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP INDEX processes_live_owner;
+                 DELETE FROM schema_migrations WHERE version=50;
+                 DROP INDEX events_heavy_agent_generation;
+             DELETE FROM schema_migrations WHERE version=49;",
+            )
+            .unwrap();
+        store.migrate().unwrap();
+        for sql in [
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM events WHERE kind='activity.heavy' AND agent=?1 AND generation=?2",
+            "EXPLAIN QUERY PLAN SELECT data FROM events WHERE kind='activity.heavy' AND agent=?1 AND generation=?2 ORDER BY seq DESC LIMIT 201",
+        ] {
+            let plans: Vec<String> = store
+                .connection
+                .prepare(sql)
+                .unwrap()
+                .query_map(params![1, 2], |row| row.get(3))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap();
+            assert!(
+                plans
+                    .iter()
+                    .any(|plan| plan.contains("events_heavy_agent_generation")
+                        && plan.contains("agent=? AND generation=?")),
+                "{plans:?}"
+            );
+            assert!(
+                plans.iter().all(|plan| !plan.contains("TEMP B-TREE")),
+                "{plans:?}"
+            );
+        }
+    }
+
+    #[test]
     fn v39_upgrade_recovers_expiry_from_retention_without_losing_replay() {
         let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
         store
             .connection
             .execute_batch(
-                "DROP INDEX agents_list_archived;
+                "DROP INDEX processes_live_owner;
+                 DELETE FROM schema_migrations WHERE version=50;
+                 DROP INDEX events_heavy_agent_generation;
+                 DELETE FROM schema_migrations WHERE version=49;
+                 DROP INDEX agents_list_archived;
                  ALTER TABLE agents DROP COLUMN archived;
                  ALTER TABLE agents DROP COLUMN chat;
                  DELETE FROM schema_migrations WHERE version=48;
@@ -1258,7 +1381,11 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX agents_list_archived;
+                "DROP INDEX processes_live_owner;
+                 DELETE FROM schema_migrations WHERE version=50;
+                 DROP INDEX events_heavy_agent_generation;
+                 DELETE FROM schema_migrations WHERE version=49;
+                 DROP INDEX agents_list_archived;
                  ALTER TABLE agents DROP COLUMN archived;
                  ALTER TABLE agents DROP COLUMN chat;
                  DELETE FROM schema_migrations WHERE version=48;
