@@ -430,7 +430,7 @@ impl DesktopApp {
             LaunchMsg::ManageOpened => {
                 self.launch.open = Some(Pop::Manage);
                 self.launch.manage_query.clear();
-                crate::shortcuts::set_popover(HookPopover::Menu);
+                crate::shortcuts::set_popover(HookPopover::Panel);
                 self.load_catalog(context);
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
             }

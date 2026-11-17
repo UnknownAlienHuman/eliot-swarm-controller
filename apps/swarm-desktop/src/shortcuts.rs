@@ -77,13 +77,15 @@ pub enum Shortcut {
     ComposerPressed,
 }
 
-/// Which popover is open: none, the model picker (all popover keys), or a
-/// menu (no ←/→ or Ctrl+F).
+/// Which popover is open: none, the model picker (all popover keys), a
+/// menu (no ←/→ or Ctrl+F), or a panel of focusable controls (Manage
+/// models), whose Tab stays native so it reaches the panel's switches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Popover {
     None = 0,
     Picker = 1,
     Menu = 2,
+    Panel = 3,
 }
 
 /// How the last input arrived.
@@ -224,7 +226,8 @@ fn popover_key(popover: u8, key: u16, ctrl: bool, shift: bool, alt: bool) -> Opt
         return None;
     }
     if key == VK_TAB && !ctrl {
-        return Some(PopoverKey::Tab);
+        // A panel's own controls take Tab; elsewhere it returns to the composer.
+        return (popover != Popover::Panel as u8).then_some(PopoverKey::Tab);
     }
     if shift {
         return None;
@@ -378,6 +381,15 @@ mod tests {
         }
         assert_eq!(popover_key(0, VK_TAB, false, false, false), None);
         assert_eq!(popover_key(menu, VK_TAB, true, false, false), None);
+        // Manage models' switches are reached by Tab, so a panel keeps it native,
+        // while Escape still closes it.
+        let panel = Popover::Panel as u8;
+        assert_eq!(popover_key(panel, VK_TAB, false, false, false), None);
+        assert_eq!(popover_key(panel, VK_TAB, false, true, false), None);
+        assert_eq!(
+            popover_key(panel, VK_ESCAPE, false, false, false),
+            Some(PopoverKey::Escape)
+        );
         // A press on the message field closes the popover only while one is
         // open and the pointer is over the field.
         assert!(composer_press(menu, 1));
