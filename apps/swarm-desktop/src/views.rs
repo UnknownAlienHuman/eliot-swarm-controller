@@ -37,6 +37,8 @@ pub struct RenderedPart {
     pub plain: String,
     pub blocks: Option<Vec<RenderedBlock>>,
     pub detail: Vec<String>,
+    pub file_paths: Vec<String>,
+    pub detail_paths: Vec<String>,
 }
 
 /// One virtualized turn item.
@@ -115,6 +117,8 @@ fn render_part(part: &Part, docs: &HashMap<u64, Doc>) -> RenderedPart {
         plain: chat::preview(&part.text),
         blocks: doc.map(render_doc),
         detail: part.detail.clone(),
+        file_paths: chat::file_references(&part.text),
+        detail_paths: chat::file_references(&part.detail.join("\n")),
     }
 }
 
@@ -163,6 +167,8 @@ impl RenderCache {
 #[derive(Clone)]
 pub struct RowCallbacks {
     pub copy_part: Callback<String>,
+    pub open_path: Callback<String>,
+    pub workspace: String,
     /// Retry a local input that did not start (the failure part's key).
     pub retry: Callback<String>,
     pub copy_code: Callback<(String, usize)>,
@@ -219,10 +225,11 @@ fn block_views(part: &RenderedPart, callbacks: &RowCallbacks, palette: Palette) 
                     .into(),
                 RenderedBlock::Heading(level, text) => crate::m3::text(
                     text.clone(),
-                    if *level == 1 {
-                        tokens::text::PAGE_TITLE
-                    } else {
-                        tokens::text::SECTION_TITLE
+                    match level {
+                        1 => theme::typography::DISPLAY,
+                        2 => theme::typography::HEADLINE,
+                        3 => tokens::text::PAGE_TITLE,
+                        _ => tokens::text::SECTION_TITLE,
                     },
                 )
                 .text_wrapping(TextWrapping::Wrap)
@@ -318,56 +325,44 @@ fn part_view(
             // A low-emphasis button rather than a ToggleButton: Reactor
             // 0.100.0 themes only Buttons, so a checked toggle would show the
             // system accent. The accessible name carries the state.
-            let header = anchored(
-                Button::new()
-                    .resource_overrides(palette.icon_button())
-                    .height(tokens::height::CONTROL),
-            )
-            .horizontal_alignment(HorizontalAlignment::Left)
-            .margin(Thickness::new(-tokens::spacing::INSET, 0.0, 0.0, 0.0))
-            .automation_name(format!(
-                "Tool operations: {} ({})",
-                part.plain,
-                if expanded { "expanded" } else { "collapsed" }
-            ))
-            .on_click(move || {
-                let _ = toggle.call((key.clone(), !expanded));
-            })
-            .content(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::SM)
-                    .children((
-                        crate::m3::icon(crate::m3::glyph::TOOLS),
-                        crate::m3::body(part.plain.clone())
-                            .vertical_alignment(VerticalAlignment::Center),
-                        crate::m3::icon(if expanded {
-                            crate::m3::glyph::CHEVRON_DOWN
-                        } else {
-                            crate::m3::glyph::CHEVRON_RIGHT
-                        }),
-                    )),
-            );
-            if expanded {
+            let header = anchored(crate::m3::row(palette, false))
+                .automation_name(format!(
+                    "{} ({})",
+                    part.plain,
+                    if expanded { "expanded" } else { "collapsed" }
+                ))
+                .on_click(move || {
+                    let _ = toggle.call((key.clone(), !expanded));
+                })
+                .content(crate::m3::row_content(
+                    Some(crate::m3::glyph::TOOLS),
+                    &part.plain,
+                    "",
+                    crate::m3::icon(if expanded {
+                        crate::m3::glyph::CHEVRON_DOWN
+                    } else {
+                        crate::m3::glyph::CHEVRON_RIGHT
+                    }),
+                ));
+            let detail: View = if expanded {
                 StackPanel::new().spacing(tokens::spacing::XS).children((
-                    header,
-                    Border::new()
-                        .background(palette.card())
-                        .corner_radius(tokens::radius::CONTAINER)
-                        .padding(Thickness::uniform(tokens::spacing::MD))
-                        .content(
-                            TextBlock::new()
-                                .text(part.detail.join("\n"))
-                                .font_size(tokens::text::SECONDARY.size)
-                                .text_wrapping(TextWrapping::Wrap)
-                                .is_text_selection_enabled(true)
-                                .opacity(theme::MUTED_OPACITY),
-                        ),
+                    crate::m3::secondary(part.detail.join("\n"))
+                        .text_wrapping(TextWrapping::Wrap)
+                        .is_text_selection_enabled(true),
+                    path_actions(&part.detail_paths, callbacks, palette),
                 ))
             } else {
-                header
-            }
+                View::empty()
+            };
+            crate::m3::card(palette)
+                .padding(Thickness::uniform(tokens::spacing::XS))
+                .content(
+                    StackPanel::new()
+                        .spacing(tokens::spacing::XS)
+                        .children((header, detail)),
+                )
         }
+
         // The answer: plain text on the surface; a label only when the
         // outcome is not a plain success.
         PartKind::Final => {
@@ -456,13 +451,23 @@ pub fn item_view(
         .map(|(index, part)| {
             KeyedView::new(
                 part.key.clone(),
-                part_view(
-                    part,
-                    expanded.contains(&part.key),
-                    callbacks,
-                    palette,
-                    anchor.filter(|_| anchored == Some(index)),
-                ),
+                StackPanel::new().spacing(tokens::spacing::XS).children((
+                    part_view(
+                        part,
+                        expanded.contains(&part.key),
+                        callbacks,
+                        palette,
+                        anchor.filter(|_| anchored == Some(index)),
+                    ),
+                    if matches!(
+                        part.kind,
+                        PartKind::Input | PartKind::Progress | PartKind::Final
+                    ) {
+                        path_actions(&part.file_paths, callbacks, palette)
+                    } else {
+                        View::empty()
+                    },
+                )),
             )
         })
         .collect();
@@ -482,4 +487,38 @@ pub fn key_revision(items: &[Rc<RenderedItem>]) -> u64 {
     items.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, item| {
         (hash ^ text_hash(&item.key)).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+/// Reactor 0.100.0 hyperlinks only navigate URIs. Native file-reference
+/// buttons use the existing Explorer path instead, preserving prose selection.
+fn path_actions(paths: &[String], callbacks: &RowCallbacks, palette: Palette) -> View {
+    StackPanel::new().keyed_children(
+        paths
+            .iter()
+            .filter_map(|reference| {
+                let path = std::path::Path::new(reference);
+                if path.is_relative() && callbacks.workspace.is_empty() {
+                    return None;
+                }
+                let resolved = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    std::path::Path::new(&callbacks.workspace).join(path)
+                };
+                let resolved = resolved.to_string_lossy().into_owned();
+                let open = callbacks.open_path.clone();
+                Some(KeyedView::new(
+                    reference.clone(),
+                    crate::m3::text_button(palette)
+                        .horizontal_alignment(HorizontalAlignment::Left)
+                        .automation_name(format!("Reveal file {reference}"))
+                        .on_click(move || {
+                            let _ = open.call(resolved.clone());
+                        })
+                        .content(crate::m3::icon_label(crate::m3::glyph::FOLDER, reference))
+                        .tooltip("Reveal in File Explorer"),
+                ))
+            })
+            .collect::<Vec<_>>(),
+    )
 }

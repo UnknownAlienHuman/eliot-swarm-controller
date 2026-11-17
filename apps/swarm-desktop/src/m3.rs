@@ -251,14 +251,6 @@ pub fn row(palette: Palette, selected: bool) -> Button {
         .horizontal_content_alignment(HorizontalAlignment::Stretch)
 }
 
-/// The one tonal row: the sidebar's New task, the main action of the
-/// shell (primary-container, as M3's tonal emphasis).
-pub fn tonal_row(palette: Palette) -> Button {
-    button(palette.tonal_row())
-        .horizontal_alignment(HorizontalAlignment::Stretch)
-        .horizontal_content_alignment(HorizontalAlignment::Stretch)
-}
-
 /// A sidebar sub-row: a task under its project, a Recents entry (its own
 /// minimum height: the button style's is the control height).
 pub fn sub_row(palette: Palette, selected: bool) -> Button {

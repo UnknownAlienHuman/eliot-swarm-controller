@@ -214,7 +214,7 @@ impl DesktopApp {
                 .map_or_else(|| "Default effort".to_owned(), effort_words)
         );
         let open = self.launch.open == Some(Pop::Effort);
-        m3::chip(palette)
+        m3::text_chip(palette)
             .automation_name(format!(
                 "Model and effort: {label} ({})",
                 if open { "open" } else { "change" }
@@ -609,14 +609,26 @@ impl DesktopApp {
                     .orientation(Orientation::Horizontal)
                     .spacing(tokens::spacing::XS)
                     .children((
-                        ProgressRing::new()
-                            .is_indeterminate(false)
-                            .minimum(0.0)
-                            .maximum(100.0)
-                            .value(window.remaining as f64)
-                            .width(16.0)
-                            .height(16.0)
-                            .vertical_alignment(VerticalAlignment::Center),
+                        // A scoped native track stays visible at this small size.
+                        // Reactor 0.100.0 exposes the ring value, but no brush setters.
+                        Border::new()
+                            .width(20.0)
+                            .height(20.0)
+                            .corner_radius(10.0)
+                            .border_thickness(Thickness::uniform(1.5))
+                            .border_brush(palette.quota_track(window.remaining as f64))
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .content(
+                                ProgressRing::new()
+                                    .is_indeterminate(false)
+                                    .minimum(0.0)
+                                    .maximum(100.0)
+                                    .value(window.remaining as f64)
+                                    .width(16.0)
+                                    .height(16.0)
+                                    .horizontal_alignment(HorizontalAlignment::Center)
+                                    .vertical_alignment(VerticalAlignment::Center),
+                            ),
                         m3::secondary(format!("{}%", window.remaining))
                             .vertical_alignment(VerticalAlignment::Center),
                     )),

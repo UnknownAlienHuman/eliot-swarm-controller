@@ -17,6 +17,24 @@ use material_colors::{
     color::Rgb, hct::Hct, palette::TonalPalette, scheme::variant::SchemeTonalSpot,
 };
 
+/// Material 3 type roles in DIPs, shared with the native control resources.
+pub mod typography {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct TypeStyle {
+        pub size: f64,
+        pub weight: u16,
+    }
+    const fn style(size: f64, weight: u16) -> TypeStyle {
+        TypeStyle { size, weight }
+    }
+    pub const DISPLAY: TypeStyle = style(36.0, 400);
+    pub const HEADLINE: TypeStyle = style(28.0, 400);
+    pub const TITLE_LARGE: TypeStyle = style(22.0, 600);
+    pub const TITLE_MEDIUM: TypeStyle = style(16.0, 600);
+    pub const BODY: TypeStyle = style(14.0, 400);
+    pub const LABEL: TypeStyle = style(12.0, 500);
+}
+
 /// M3 state-layer opacities of the content color over a container.
 pub mod state {
     pub const HOVER: f64 = 0.08;
@@ -488,15 +506,6 @@ pub mod winui {
             })
         }
 
-        /// The tonal row (New task): primary-container with
-        /// on-primary-container, distinct from the selection's
-        /// secondary-container.
-        pub fn tonal_row(self) -> ResourceOverrides {
-            self.with(|s| {
-                Family::new(Some(s.primary_container), s.on_primary_container).overrides(s)
-            })
-        }
-
         /// A card that is one button (monitor cards): no fill of its own
         /// (the card's container shows through), on-surface state layers.
         pub fn card_button(self) -> ResourceOverrides {
@@ -515,6 +524,17 @@ pub mod winui {
                 }
                 .overrides(s)
             })
+        }
+
+        /// The composer's visible quota track, including low-quota attention.
+        pub fn quota_track(self, remaining: f64) -> Brush {
+            if remaining < 5.0 {
+                self.error()
+            } else if remaining < 20.0 {
+                self.warning()
+            } else {
+                self.outline_variant()
+            }
         }
 
         pub fn chip(self) -> ResourceOverrides {
