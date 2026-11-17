@@ -418,10 +418,11 @@ of the explicitly selected release scope.
       builds stay WinUI-free. (Refs #407)
 - [x] **D2 Retained activity and long conversations.** The selected Agent's
       retained conversation is rebuilt from existing reads: `agent.result` turns,
-      its journal window (`turn.started` links each input command,
-      `message.completed` progress and `tool.*` activity) and `command.get` input
-      text. The coverage statement covers turns against the limit, the scanned
-      window, whether creation was reached, the retention floor and evictions.
+      its retained events from creation, read through the agent index
+      (`turn.started` links each input command, `message.completed` progress and
+      `tool.*` activity) and `command.get` input text. The coverage statement
+      covers turns against the limit, whether creation is still retained, the
+      retention floor and evictions; "Load older" pages turns only.
       Markdown renders in native `RichTextBlock` controls (http/https links only;
       HTML literal) with Copy message and Copy code. A virtualized turn list keeps
       stable keys and bounded resident turns and bytes. Live events follow a

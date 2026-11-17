@@ -54,6 +54,8 @@ pub const ATTENTION_KIND: &str = "x.user.agent.attention";
 /// `events.read` calls one refresh spends on attention reports (each scans
 /// at most 1,000 journal rows server-side).
 pub const ATTENTION_SCAN_PAGES: usize = 4;
+/// Loss origins (`swarm why`) read per refresh; more continue next time.
+pub const LOSS_READS: usize = 4;
 /// UI-only samples kept per Agent series.
 pub const RING_CAPACITY: usize = 600;
 /// Bars drawn per graph; never more than useful at this width.
@@ -161,6 +163,8 @@ pub enum Obs {
         clock_regressed: bool,
         error: Option<String>,
         processes: usize,
+        /// Processes not known to have exited (running or unknown).
+        live_processes: usize,
         processes_truncated: bool,
     },
 }
@@ -184,6 +188,11 @@ impl Obs {
                     clock_regressed: stats.clock_regressed,
                     error: stats.error.clone(),
                     processes: data.processes.len(),
+                    live_processes: data
+                        .processes
+                        .iter()
+                        .filter(|process| process.state != eliot_core::ProcessState::Exited)
+                        .count(),
                     processes_truncated: data.processes_truncated,
                 }
             }
@@ -226,6 +235,14 @@ impl Obs {
                 }
                 text
             }
+        }
+    }
+
+    /// The Agent's processes not known to have exited (0 when unobserved).
+    pub fn live_processes(&self) -> usize {
+        match self {
+            Self::Data { live_processes, .. } => *live_processes,
+            Self::Unavailable(_) => 0,
         }
     }
 
@@ -277,6 +294,17 @@ pub fn live_words(working: usize, attention: usize, idle: usize) -> String {
         "All quiet".to_owned()
     } else {
         parts.join(" · ")
+    }
+}
+
+/// The Monitor's attention filter, an action beside its live line ("Show
+/// only the 2 that need attention"; "Showing only …" while it filters).
+pub fn attention_filter_label(count: usize, on: bool) -> String {
+    let verb = if on { "Showing only" } else { "Show only" };
+    if count == 1 {
+        format!("{verb} the 1 that needs attention")
+    } else {
+        format!("{verb} the {count} that need attention")
     }
 }
 
@@ -466,6 +494,22 @@ impl MonitorRow {
             (_, Some("lost")) => "Lost",
             _ => state_words(self.state),
         }
+    }
+
+    /// The Agent ended (stopped, failed or lost): it has no live process.
+    pub fn ended(&self) -> bool {
+        matches!(
+            self.state,
+            AgentState::Stopped | AgentState::Failed | AgentState::Lost
+        )
+    }
+
+    /// A lost or failed Agent Swarm controls, with no open turn: Resume
+    /// starts its next generation.
+    pub fn resumable(&self) -> bool {
+        matches!(self.state, AgentState::Lost | AgentState::Failed)
+            && !self.native_child
+            && self.active_turn.is_none()
     }
 
     /// The status code its tone follows ([`crate::m3::status`]).
@@ -741,6 +785,8 @@ pub struct MonitorSnapshot {
     pub stopped: Option<Result<AgentListResponse, String>>,
     pub attention: Option<Result<AttentionRead, String>>,
     pub detail: Option<Result<DetailRead, String>>,
+    /// `swarm why` summaries of the lost or failed generations it read.
+    pub losses: Vec<((String, i64), Result<String, String>)>,
     pub read_at_ms: i64,
 }
 
@@ -763,6 +809,9 @@ pub struct Monitor {
     pub series: HashMap<String, Series>,
     /// Open attention reports by Agent and generation.
     pub incidents: HashMap<(String, i64), Incident>,
+    /// `swarm why` summary of each lost or failed generation shown: read
+    /// once, since the end of a generation does not change.
+    pub losses: HashMap<(String, i64), String>,
     /// The attention read's cursor (`None` until the first read).
     pub attention_cursor: Option<i64>,
     /// A live row left the live states: read the stopped rows next, so a
@@ -783,6 +832,34 @@ impl Monitor {
     /// The open attention report of a row's current generation.
     pub fn incident(&self, row: &MonitorRow) -> Option<&Incident> {
         self.incidents.get(&(row.id.clone(), row.generation))
+    }
+
+    /// The shown row of one Agent, live or recently stopped.
+    pub fn row(&self, id: &str) -> Option<&MonitorRow> {
+        self.all_rows().find(|row| row.id == id)
+    }
+
+    /// The card's words about why a resumable row ended, from its loss
+    /// origin as the conversation words it ("Stopped by a Swarm restart").
+    /// `None` until read, and for rows that did not end that way.
+    pub fn loss_words(&self, row: &MonitorRow) -> Option<String> {
+        if !row.resumable() {
+            return None;
+        }
+        self.losses
+            .get(&(row.id.clone(), row.generation))
+            .and_then(|summary| diagnosis_line(summary))
+    }
+
+    /// Lost or failed generations shown whose loss origin is not read yet,
+    /// at most `LOSS_READS` per refresh.
+    pub fn loss_reads(&self) -> Vec<(String, i64)> {
+        self.all_rows()
+            .filter(|row| row.resumable())
+            .map(|row| (row.id.clone(), row.generation))
+            .filter(|key| !self.losses.contains_key(key))
+            .take(LOSS_READS)
+            .collect()
     }
 
     fn take_attention(&mut self, read: AttentionRead) {
@@ -1018,6 +1095,17 @@ impl Monitor {
         if snapshot.detail.is_some() {
             self.detail = snapshot.detail;
         }
+        // A failed read is retried by a later refresh.
+        for (key, summary) in snapshot.losses {
+            if let Ok(summary) = summary {
+                self.losses.insert(key, summary);
+            }
+        }
+        let shown: HashSet<(String, i64)> = self
+            .all_rows()
+            .map(|row| (row.id.clone(), row.generation))
+            .collect();
+        self.losses.retain(|key, _| shown.contains(key));
         self.read_at_ms = Some(snapshot.read_at_ms);
     }
 }
@@ -1035,6 +1123,7 @@ enum Read {
     Stopped(Result<AgentListResponse, String>),
     Attention(Result<AttentionRead, String>),
     Detail(Box<Result<DetailRead, String>>),
+    Loss((String, i64), Result<String, String>),
     Cancelled,
 }
 
@@ -1104,6 +1193,8 @@ pub struct RefreshPlan {
     pub selected: Option<String>,
     pub stopped: bool,
     pub attention_cursor: Option<i64>,
+    /// Lost or failed generations whose loss origin to read.
+    pub losses: Vec<(String, i64)>,
 }
 
 /// One refresh: the fixed read set, at most `MAX_CONCURRENT_READS` at once.
@@ -1120,6 +1211,7 @@ pub async fn refresh(
         selected,
         stopped,
         attention_cursor,
+        losses,
     } = plan;
     let mut reads: Vec<ReadFuture<'_>> = Vec::new();
     if stopped {
@@ -1195,6 +1287,18 @@ pub async fn refresh(
             Read::Detail(Box::new(detail.await))
         }));
     }
+    for key in losses {
+        reads.push(Box::pin(async move {
+            if cancelled() {
+                return Read::Cancelled;
+            }
+            let summary = client::diagnose(data_dir, &key.0)
+                .await
+                .map(|reply| reply.summary)
+                .map_err(|error| error.to_string());
+            Read::Loss(key, summary)
+        }));
+    }
     let results: Vec<Read> = futures_util::stream::iter(reads)
         .buffer_unordered(MAX_CONCURRENT_READS)
         .collect()
@@ -1205,6 +1309,7 @@ pub async fn refresh(
         stopped: None,
         attention: None,
         detail: None,
+        losses: Vec::new(),
         read_at_ms,
     };
     if cancelled() || results.iter().any(|read| matches!(read, Read::Cancelled)) {
@@ -1217,6 +1322,7 @@ pub async fn refresh(
             Read::Stopped(page) => snapshot.stopped = Some(page),
             Read::Attention(read) => snapshot.attention = Some(read),
             Read::Detail(detail) => snapshot.detail = Some(*detail),
+            Read::Loss(key, summary) => snapshot.losses.push((key, summary)),
             Read::Cancelled => {}
         }
     }
@@ -1391,6 +1497,7 @@ mod tests {
             stopped: None,
             attention: None,
             detail: None,
+            losses: Vec::new(),
             read_at_ms: 0,
         });
         assert_eq!(monitor.rows.len(), 1);
@@ -1513,6 +1620,7 @@ mod tests {
             clock_regressed: false,
             error: None,
             processes: 1,
+            live_processes: 1,
             processes_truncated: false,
         };
         assert!(obs.freshness().starts_with("Out of date"));
@@ -1624,6 +1732,7 @@ mod tests {
                 next: 9,
             })),
             detail: None,
+            losses: Vec::new(),
             read_at_ms: 2_000,
         });
         let sections = monitor.sections(2_000);
@@ -1669,6 +1778,7 @@ mod tests {
             stopped: None,
             attention: None,
             detail: None,
+            losses: Vec::new(),
             read_at_ms: 2_100,
         });
         assert!(monitor.stopped_due && monitor.wants_stopped());
@@ -1702,5 +1812,48 @@ mod tests {
         assert!(restart_loss(summary));
         assert_eq!(diagnosis_line(summary).as_deref(), Some(RESTART_LOSS_WORDS));
         assert!(!restart_loss("unknown origin: a2 lost"));
+    }
+
+    #[test]
+    fn a_lost_card_words_its_loss_origin_once_read_and_offers_resume() {
+        let mut monitor = Monitor::default();
+        let snapshot = |losses| MonitorSnapshot {
+            groups: vec![
+                (
+                    AgentState::Lost,
+                    page(vec![summary("a2", AgentState::Lost, None, false)]),
+                ),
+                (
+                    AgentState::Idle,
+                    page(vec![summary("a3", AgentState::Idle, None, false)]),
+                ),
+            ],
+            counts: Vec::new(),
+            stopped: None,
+            attention: None,
+            detail: None,
+            losses,
+            read_at_ms: 1_000,
+        };
+        monitor.apply(snapshot(Vec::new()));
+        let lost = monitor.row("a2").unwrap().clone();
+        assert!(lost.resumable() && !monitor.row("a3").unwrap().resumable());
+        assert_eq!(monitor.loss_reads(), [("a2".to_owned(), 1)]);
+        assert_eq!(monitor.loss_words(&lost), None);
+        let why = "swarm origin: a2 agent.lost at daemon.restart: daemon_restart";
+        monitor.apply(snapshot(vec![(("a2".to_owned(), 1), Ok(why.to_owned()))]));
+        assert_eq!(
+            monitor.loss_words(&lost).as_deref(),
+            Some(RESTART_LOSS_WORDS)
+        );
+        assert!(monitor.loss_reads().is_empty(), "read once per generation");
+        assert_eq!(
+            attention_filter_label(1, false),
+            "Show only the 1 that needs attention"
+        );
+        assert_eq!(
+            attention_filter_label(3, true),
+            "Showing only the 3 that need attention"
+        );
     }
 }

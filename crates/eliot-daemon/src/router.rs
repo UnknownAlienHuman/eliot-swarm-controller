@@ -4069,7 +4069,50 @@ impl Router {
             let mut events = Vec::new();
             let mut encoded_bytes = 0_usize;
             let mut byte_limited = false;
-            while cursor < high_water && events.len() < limit && scanned < EVENT_SCAN_MAX {
+            if !filter.agents.is_empty() {
+                // Named Agents read through the `(agent, seq)` index, so the
+                // per-call bound counts matched rows and other Agents' traffic
+                // costs nothing. A noncanonical id matches no row.
+                let agents: Vec<i64> = filter
+                    .agents
+                    .iter()
+                    .filter_map(|agent| eliot_core::parse_agent_id(agent).ok())
+                    .collect();
+                let kinds: Vec<&str> = filter.kinds.iter().map(String::as_str).collect();
+                let sources: Vec<&str> = filter.sources.iter().map(String::as_str).collect();
+                while cursor < high_water && events.len() < limit {
+                    let page = store.read_agent_events(
+                        &agents,
+                        &kinds,
+                        &sources,
+                        cursor,
+                        high_water,
+                        limit - events.len(),
+                    )?;
+                    if page.is_empty() {
+                        cursor = high_water;
+                        break;
+                    }
+                    for event in page {
+                        let cost = encoded_event_cost(&event)?;
+                        if encoded_bytes.saturating_add(cost) > byte_budget {
+                            byte_limited = true;
+                            break;
+                        }
+                        encoded_bytes += cost;
+                        cursor = event.seq;
+                        events.push(event);
+                    }
+                    if byte_limited {
+                        break;
+                    }
+                }
+            }
+            while filter.agents.is_empty()
+                && cursor < high_water
+                && events.len() < limit
+                && scanned < EVENT_SCAN_MAX
+            {
                 let page_limit = (EVENT_SCAN_MAX - scanned).clamp(1, 256);
                 let page = store.read_events(cursor, page_limit, Some(high_water))?;
                 if page.is_empty() {
@@ -13245,6 +13288,62 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
             .unwrap();
         assert_eq!(response["events"].as_array().unwrap().len(), 1);
         assert_eq!(response["lagged"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn agent_filtered_read_finds_rows_behind_unrelated_traffic_in_one_call() {
+        let router = router();
+        let mut store = router.inner.store.lock().await;
+        let mut unrelated = 0;
+        while unrelated <= 1_000 {
+            unrelated += admit(&mut store).len();
+        }
+        let mine = admit(&mut store);
+        for _ in 0..5 {
+            admit(&mut store);
+        }
+        drop(store);
+        let agent = mine[0].agent.clone().unwrap();
+        let read = |params: Value| {
+            let router = router.clone();
+            async move {
+                router
+                    .events_read(&params, &Principal::Owner)
+                    .await
+                    .unwrap()
+            }
+        };
+        let events = |response: &Value| -> Vec<Event> {
+            serde_json::from_value(response["events"].clone()).unwrap()
+        };
+
+        // The old 1,000-row scan returned nothing here; the index finds all.
+        let all = read(json!({"limit":1000, "filter":{"agents":[agent]}})).await;
+        assert_eq!(events(&all), mine);
+        assert_eq!(all["next"], all["high_water"]);
+        assert_eq!(all["truncated"], json!(false));
+
+        // A full page ends at its last matched row and reports more.
+        let first = read(json!({"limit":1, "filter":{"agents":[agent]}})).await;
+        assert_eq!(events(&first), mine[..1]);
+        assert_eq!(first["next"], json!(mine[0].seq));
+        assert_eq!(first["truncated"], json!(true));
+        let rest = read(json!({"after":first["next"], "filter":{"agents":[agent]}})).await;
+        assert_eq!(events(&rest), mine[1..]);
+        assert_eq!(rest["next"], all["high_water"]);
+        assert_eq!(rest["truncated"], json!(false));
+
+        // Kind and source filters apply inside the same indexed read.
+        let kind = mine[0].kind.clone();
+        let filter = json!({"agents":[agent], "kinds":[kind], "sources":[mine[0].source]});
+        let narrowed = read(json!({"filter":filter})).await;
+        let expected: Vec<Event> = mine
+            .iter()
+            .filter(|event| event.kind == kind && event.source == mine[0].source)
+            .cloned()
+            .collect();
+        assert_eq!(events(&narrowed), expected);
+        assert_eq!(narrowed["truncated"], json!(false));
     }
 
     #[test]

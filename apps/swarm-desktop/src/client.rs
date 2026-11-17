@@ -326,10 +326,10 @@ pub async fn events_wake(
     Ok(reply)
 }
 
-/// Scan the journal window `(from, through]` for the filter. Events above
-/// `through` are dropped: live delivery continues from `through` and will
-/// carry them, so nothing is applied twice or skipped. The caller bounds the
-/// window itself (the chat feed's `window_rows`).
+/// Read `(from, through]` for the filter to the end. Events above `through`
+/// are dropped: live delivery continues from `through` and will carry them,
+/// so nothing is applied twice or skipped. An agent filter keeps the work to
+/// that Agent's own rows (the daemon reads them through its agent index).
 pub async fn scan_events(
     data_dir: &Path,
     from: i64,
@@ -353,7 +353,7 @@ pub struct EventScan {
 }
 
 /// Scan `(from, through]` with at most `max_pages` `events.read` calls
-/// (each scans at most `EVENT_SCAN_ROWS` server-side), checking `cancelled`
+/// (each returns at most `EVENT_SCAN_ROWS` rows), checking `cancelled`
 /// before every call. A scan that runs out of budget or is cancelled stops
 /// at the last page read; the caller resumes from `next`.
 pub async fn scan_events_budgeted(

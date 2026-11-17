@@ -1604,7 +1604,15 @@ Subscribe before reading the persisted high-water mark, replay through that mark
 release buffered persisted events above it in order. `next` is the exclusive replay
 cursor; `high_water` reports the persisted high-water observed by the read. A buffer lag
 sets `lagged` and triggers persisted replay from the current cursor. `truncated` reports
-page count/encoded-size limits. Ephemeral delivery is best effort; pruned history returns
+page count/encoded-size limits.
+
+Both methods bound one call's work. Without an agent filter, a call scans at most 1,000
+journal rows after the cursor and applies the kind/source filter to them, so a sparse
+match can return an empty truncated page whose `next` still advances. With a nonempty
+agent filter, the read goes through the `(agent, seq)` index with the kind/source filter
+applied in the same query: `limit` and the encoded-size bound count matched rows only,
+other Agents' traffic costs nothing, and `next` is the last returned row's sequence
+(`truncated`) or `high_water` once the named Agents have no further row through it. Ephemeral delivery is best effort; pruned history returns
 `history_gap`, never silent skipping. Committed event sequence values are never reused.
 
 For these known methods, malformed params, wrong types and unknown fields return

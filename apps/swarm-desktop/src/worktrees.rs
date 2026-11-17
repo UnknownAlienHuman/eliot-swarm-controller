@@ -79,6 +79,20 @@ impl CleanupGroup {
         Self::Other,
     ];
 
+    /// Whether a fresh review checks the group. Native session archives
+    /// change the owner's harness stores, so they start unchecked.
+    pub fn checked_by_default(self) -> bool {
+        self != Self::Sessions
+    }
+
+    /// The groups a fresh review leaves unchecked.
+    pub fn unchecked_by_default() -> std::collections::HashSet<Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|group| !group.checked_by_default())
+            .collect()
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Self::Branches => "Merged branches",
@@ -108,8 +122,8 @@ impl CleanupGroup {
     }
 }
 
-/// One group of the review: its items in plan order, what it would remove
-/// and how much.
+/// One group of the review: its items, those to remove first (each part in
+/// plan order), what it would remove and how much.
 #[derive(Clone, Debug)]
 pub struct CleanupGroupView<'a> {
     pub group: CleanupGroup,
@@ -118,16 +132,25 @@ pub struct CleanupGroupView<'a> {
     pub bytes: u64,
 }
 
+impl CleanupGroupView<'_> {
+    /// The items Remove would take, then the kept ones.
+    pub fn split(&self) -> (&[&CleanupCandidate], &[&CleanupCandidate]) {
+        self.items.split_at(self.removable)
+    }
+}
+
 /// The plan by group, groups without items left out.
 pub fn cleanup_groups(plan: &CleanupPlan) -> Vec<CleanupGroupView<'_>> {
     CleanupGroup::ALL
         .into_iter()
         .filter_map(|group| {
-            let items: Vec<&CleanupCandidate> = plan
+            let mut items: Vec<&CleanupCandidate> = plan
                 .items
                 .iter()
                 .filter(|item| CleanupGroup::of(item) == group)
                 .collect();
+            // Stable: plan order within the removable and the kept items.
+            items.sort_by_key(|item| item.verdict != "safe");
             if items.is_empty() {
                 return None;
             }
@@ -206,8 +229,9 @@ pub fn reason_words(reason: &str) -> String {
 }
 
 /// One item's line: its name, then its size, its keep or remove reason and
-/// where it is.
-pub fn item_line(item: &CleanupCandidate) -> (String, String) {
+/// where it is. A native session or chat folder is named by its task's
+/// `title` when known, its Agent id then leading the second line.
+pub fn item_line(item: &CleanupCandidate, title: Option<&str>) -> (String, String) {
     let path = &item.artifact.path;
     let tail = path
         .rsplit("::")
@@ -220,20 +244,25 @@ pub fn item_line(item: &CleanupCandidate) -> (String, String) {
             |name| name.to_string_lossy().into_owned(),
         )
     };
-    let name = match item.artifact.kind {
-        ArtifactKind::Branch => tail.to_owned(),
-        // A native session is named by its harness and Agent, not its
-        // store reference.
-        ArtifactKind::NativeSession => format!(
-            "{} session of {}",
-            crate::picker::harness_label(&item.artifact.purpose),
-            item.artifact.agent
-        ),
-        ArtifactKind::Worktree => match &item.artifact.git {
+    let harness = crate::picker::harness_label(&item.artifact.purpose);
+    let agent = &item.artifact.agent;
+    let chat = CleanupGroup::of(item) == CleanupGroup::Chats;
+    let name = match (item.artifact.kind, title) {
+        (ArtifactKind::Branch, _) => tail.to_owned(),
+        // A native session is named by its task, not its store reference.
+        (ArtifactKind::NativeSession, Some(title)) => title.to_owned(),
+        (ArtifactKind::NativeSession, None) => format!("{harness} session of {agent}"),
+        (_, Some(title)) if chat => title.to_owned(),
+        (ArtifactKind::Worktree, _) => match &item.artifact.git {
             Some(git) => format!("{} · branch {}", folder(), git.branch),
             None => folder(),
         },
         _ => folder(),
+    };
+    let owner = match (item.artifact.kind, title) {
+        (ArtifactKind::NativeSession, Some(_)) => format!("{harness} session · {agent} · "),
+        (_, Some(_)) if chat => format!("{agent} · "),
+        _ => String::new(),
     };
     let size = match (item.artifact.kind, item.bytes) {
         (ArtifactKind::Branch | ArtifactKind::NativeSession, _) => String::new(),
@@ -251,7 +280,10 @@ pub fn item_line(item: &CleanupCandidate) -> (String, String) {
     };
     (
         name,
-        format!("{size}{verdict}: {}{place}", reason_words(&item.reason)),
+        format!(
+            "{owner}{size}{verdict}: {}{place}",
+            reason_words(&item.reason)
+        ),
     )
 }
 
@@ -263,12 +295,19 @@ pub fn sized(group: CleanupGroup) -> bool {
 
 /// The result of one apply, in words: what was removed, kept (with why) and
 /// left unknown.
-pub fn result_lines(plan: &CleanupPlan, reply: &CleanupApplyResponse) -> Vec<String> {
+pub fn result_lines(
+    plan: &CleanupPlan,
+    reply: &CleanupApplyResponse,
+    title: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
     let name = |id: &str| {
         plan.items
             .iter()
             .find(|item| item.artifact.id == id)
-            .map_or_else(|| id.to_owned(), |item| item_line(item).0)
+            .map_or_else(
+                || id.to_owned(),
+                |item| item_line(item, title(&item.artifact.agent).as_deref()).0,
+            )
     };
     let count = |outcome: &str| {
         reply
@@ -405,18 +444,25 @@ mod tests {
         );
         assert_eq!((groups[0].removable, groups[0].bytes), (1, 3 * 1024 * 1024));
         assert_eq!(groups[1].removable, 0);
-        let (name, line) = item_line(&plan.items[0]);
+        let (name, line) = item_line(&plan.items[0], None);
         assert_eq!(name, "temp");
         assert!(
             line.starts_with("2 KB · Remove: its task finished"),
             "{line}"
         );
-        let (_, kept) = item_line(&plan.items[3]);
+        let (_, kept) = item_line(&plan.items[3], None);
         assert!(kept.contains("Keep: its task is not finished"), "{kept}");
         let session = candidate(ArtifactKind::NativeSession, "codex", "safe", None);
-        let (name, line) = item_line(&session);
+        let (name, line) = item_line(&session, None);
         assert_eq!(name, "Codex session of a1");
         assert_eq!(line, "Remove: its task finished");
+        let (name, line) = item_line(&session, Some("Fix the login bug"));
+        assert_eq!(name, "Fix the login bug");
+        assert_eq!(line, "Codex session · a1 · Remove: its task finished");
+        assert_eq!(
+            CleanupGroup::unchecked_by_default(),
+            [CleanupGroup::Sessions].into_iter().collect()
+        );
         assert!(!sized(CleanupGroup::Branches) && sized(CleanupGroup::Temp));
         let mut unchecked = std::collections::HashSet::new();
         assert_eq!(selected_artifacts(&plan, &unchecked).len(), 2);
@@ -458,7 +504,7 @@ mod tests {
             ],
             bytes_reclaimed: 10,
         };
-        let lines = result_lines(&plan, &reply);
+        let lines = result_lines(&plan, &reply, &|_| None);
         assert_eq!(lines[0], "Removed 1 (10 B) · kept 1 · unknown 1");
         assert_eq!(lines[1], "Removed temp");
         assert!(lines[2].starts_with("Unknown target"), "{}", lines[2]);

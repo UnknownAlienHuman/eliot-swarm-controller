@@ -49,7 +49,6 @@ pub(super) enum ShellMsg {
     /// A project's "Show N older" row: unfold or fold its older tasks.
     OlderToggled(String),
     /// The attention row: list only the Agents that need attention, or all.
-    AttentionToggled,
     /// The search box's text (typed, or a suggestion WinUI wrote into it).
     SearchChanged(String),
     /// A search suggestion chosen (clicked, or reached with the arrows).
@@ -176,8 +175,6 @@ pub(super) struct ShellState {
     pub(super) unfolded: HashSet<String>,
     /// List archived Agents too (`agent.list` `archived: include`, k92).
     pub(super) show_archived: bool,
-    /// The list shows only the Agents that need attention.
-    pub(super) attention_only: bool,
     pub(super) search: Search,
     pub(super) search_ref: ElementRef<AutoSuggestBox>,
     /// Ctrl+N and Ctrl+K from the window's keyboard hook.
@@ -503,7 +500,6 @@ impl DesktopApp {
                     self.nav.unfolded.insert(key);
                 }
             }
-            ShellMsg::AttentionToggled => self.nav.attention_only = !self.nav.attention_only,
             ShellMsg::SearchChanged(text) => {
                 self.nav.search.text = text.clone();
                 // WinUI writes the suggestion reached with the arrows into
@@ -722,7 +718,11 @@ impl DesktopApp {
         if self.prefs.startup != Startup::LastConversation || self.chat.convo.is_some() {
             return;
         }
-        if let Some(agent) = nav::recents(&self.nav.agents, 1).first().cloned().cloned() {
+        if let Some(agent) = nav::recents(&self.nav.agents, 1, &HashSet::new())
+            .first()
+            .cloned()
+            .cloned()
+        {
             self.nav.selection.select_agent(Some(agent.id.clone()));
             self.open_conversation(&agent, context);
         }
@@ -1186,15 +1186,13 @@ impl DesktopApp {
             ]);
 
         let fleet = Fleet::of(&self.nav.agents);
-        let attention = self.nav.attention_only && fleet.attention > 0;
         let query = self.nav.search.query.trim().to_owned();
         let checkouts = self.checkouts();
         let keep = |agent: &UiAgent| {
-            (!attention || agent.needs_attention())
-                && (query.is_empty()
-                    || nav::matches(agent, &nav::project_of(&agent.project, &checkouts), &query))
+            query.is_empty()
+                || nav::matches(agent, &nav::project_of(&agent.project, &checkouts), &query)
         };
-        let filtered = attention || !query.is_empty();
+        let filtered = !query.is_empty();
         let shown = Shown {
             branches: &self.nav.branches,
             expanded: &self.nav.expanded,
@@ -1205,9 +1203,7 @@ impl DesktopApp {
         };
         let sections = nav::sections(&self.nav.agents, &checkouts, &shown);
 
-        let caption = if attention {
-            "Need attention"
-        } else if filtered {
+        let caption = if filtered {
             "Matching tasks"
         } else {
             "Projects"
@@ -1216,15 +1212,6 @@ impl DesktopApp {
             format!("caption:{caption}"),
             section_label(caption),
         )];
-        if attention {
-            items.push(KeyedView::new(
-                "show-all",
-                m3::sub_row(palette, false)
-                    .automation_name("Show all tasks")
-                    .on_click(context.message(Message::Shell(ShellMsg::AttentionToggled)))
-                    .content(m3::row_content(None, "Show all tasks", "", View::empty())),
-            ));
-        }
         if sections.is_empty() {
             let empty = if self.nav.agents_loading {
                 "Loading…"
@@ -1390,7 +1377,26 @@ impl DesktopApp {
                 }
             }
         }
-        let recents = nav::recents(&self.nav.agents, RECENTS);
+        // Recents lists only what the list above does not show now (a
+        // collapsed project's tasks, older ones folded away).
+        let mut listed: HashSet<&str> = sections
+            .iter()
+            .filter(|section| !section.collapsed)
+            .flat_map(|section| section.rows.iter().map(|row| row.agent.id.as_str()))
+            .collect();
+        for chat in nav::chats(&self.nav.agents) {
+            listed.insert(chat.id.as_str());
+            if self.nav.expanded.contains(&chat.id) {
+                listed.extend(
+                    self.nav
+                        .agents
+                        .iter()
+                        .filter(|child| child.parent.as_deref() == Some(chat.id.as_str()))
+                        .map(|child| child.id.as_str()),
+                );
+            }
+        }
+        let recents = nav::recents(&self.nav.agents, RECENTS, &listed);
         if !filtered && !recents.is_empty() {
             items.push(KeyedView::new("recents-caption", section_label("Recents")));
             for agent in recents {
@@ -1451,22 +1457,6 @@ impl DesktopApp {
                 self.fleet_row(fleet, context, palette),
             ),
         ];
-        if fleet.attention > 0 {
-            bottom.push(KeyedView::new(
-                format!("attention:{attention}"),
-                m3::row(palette, attention)
-                    .automation_name(fleet.attention_row_label(attention))
-                    .on_click(context.message(Message::Shell(ShellMsg::AttentionToggled)))
-                    .content(m3::row_content(
-                        Some(m3::glyph::FLAG),
-                        &fleet.attention_row_label(attention),
-                        "",
-                        palette
-                            .dot(StatusTone::Attention)
-                            .map_or_else(View::empty, m3::dot),
-                    )),
-            ));
-        }
         bottom.push(KeyedView::new(
             "settings",
             m3::row(palette, false)
@@ -1704,13 +1694,18 @@ impl DesktopApp {
     /// it opens the monitor.
     fn fleet_row(&self, fleet: Fleet, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let summary = fleet.summary(self.nav.agents_total, self.nav.archived);
-        let dot = if fleet.running > 0 {
-            palette
-                .dot(StatusTone::Active)
-                .map_or_else(View::empty, m3::dot)
+        // One row: it opens the Monitor, whose filter lists only the
+        // Agents that need attention; the dot says the most urgent tone.
+        let tone = if fleet.attention > 0 {
+            Some(StatusTone::Attention)
+        } else if fleet.running > 0 {
+            Some(StatusTone::Active)
         } else {
-            View::empty()
+            None
         };
+        let dot = tone
+            .and_then(|tone| palette.dot(tone))
+            .map_or_else(View::empty, m3::dot);
         let open = self.panel == Panel::Monitor;
         m3::row(palette, open)
             .automation_name(format!(

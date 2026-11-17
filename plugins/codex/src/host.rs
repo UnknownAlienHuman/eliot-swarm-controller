@@ -1447,6 +1447,10 @@ impl CodexPlugin {
                 .reasoning_effort
                 .as_deref()
                 .is_some_and(|effort| Some(effort) == selected_effort.as_deref());
+        // The thread request always names the selected model (the requested
+        // one, or the catalogue default), so its echo proves the native
+        // admission of that model.
+        let model_verified = readback.model == selected_model;
         // Names only from the native inventory; `None` stays null so an
         // unobserved surface is never reported as an observed one.
         let mcp_servers = mcp_readback
@@ -1460,6 +1464,7 @@ impl CodexPlugin {
             "permissions": readback.sandbox.clone(),
             "approval_policy": readback.approval_policy.clone(),
             "effort": readback.reasoning_effort.clone(),
+            "model_verified": model_verified,
             "effort_verified": effort_verified,
             "mcp_policy": mcp_policy.as_str(),
             "mcp_servers": mcp_servers,

@@ -224,6 +224,8 @@ pub(super) enum SettingsMsg {
     CleanupPlanned(Fallible<eliot_core::api::CleanupPlan>),
     /// Check (true) or uncheck one group of the plan.
     CleanupGroupToggled(crate::worktrees::CleanupGroup, bool),
+    /// Show or hide one group's kept items.
+    CleanupKeptToggled(crate::worktrees::CleanupGroup),
     /// Ask for the one confirmation.
     CleanupApply,
     /// The confirmation's answer: true removes the selected items.
@@ -297,8 +299,11 @@ pub(super) struct SettingsState {
     cleanup_busy: bool,
     /// Why the last plan or apply read failed.
     cleanup_error: Option<String>,
-    /// Groups the owner unchecked (every group starts checked).
+    /// Unchecked groups (a fresh review starts with
+    /// [`crate::worktrees::CleanupGroup::unchecked_by_default`]).
     cleanup_unchecked: std::collections::HashSet<crate::worktrees::CleanupGroup>,
+    /// Groups whose kept items are shown (collapsed by default).
+    cleanup_kept_open: std::collections::HashSet<crate::worktrees::CleanupGroup>,
     /// The one confirmation is shown.
     cleanup_confirm: bool,
     /// The ledger key of the apply in flight or uncertain (same id on retry).
@@ -501,10 +506,17 @@ impl DesktopApp {
                 s.cleanup_busy = false;
                 match result {
                     Ok(plan) => {
-                        s.cleanup_unchecked.clear();
+                        s.cleanup_unchecked =
+                            crate::worktrees::CleanupGroup::unchecked_by_default();
+                        s.cleanup_kept_open.clear();
                         s.cleanup_plan = Some(plan);
                     }
                     Err(e) => s.cleanup_error = Some(e),
+                }
+            }
+            SettingsMsg::CleanupKeptToggled(group) => {
+                if !s.cleanup_kept_open.remove(&group) {
+                    s.cleanup_kept_open.insert(group);
                 }
             }
             SettingsMsg::CleanupGroupToggled(group, on) => {
@@ -1588,6 +1600,11 @@ impl DesktopApp {
     /// result: removed, kept with why, and unknown.
     fn cleanup_review(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let state = &self.settings;
+        // A task title when Swarm knows one (else the item keeps its id).
+        let title = |agent: &str| {
+            let title = self.agent_title(agent);
+            (title != agent).then_some(title)
+        };
         let mut parts: Vec<KeyedView> = Vec::new();
         if state.cleanup_busy {
             parts.push(KeyedView::new(
@@ -1609,7 +1626,7 @@ impl DesktopApp {
             ));
         }
         if let Some((plan, reply)) = &state.cleanup_result {
-            let lines = crate::worktrees::result_lines(plan, reply);
+            let lines = crate::worktrees::result_lines(plan, reply, &title);
             let rows: Vec<KeyedView> = lines
                 .iter()
                 .enumerate()
@@ -1681,9 +1698,10 @@ impl DesktopApp {
                 };
                 let mut rows: Vec<KeyedView> =
                     vec![KeyedView::new(format!("header:{checked}"), header)];
-                for item in &view.items {
-                    let (name, line) = crate::worktrees::item_line(item);
-                    rows.push(KeyedView::new(
+                let item_row = |item: &eliot_core::api::CleanupCandidate| {
+                    let (name, line) =
+                        crate::worktrees::item_line(item, title(&item.artifact.agent).as_deref());
+                    KeyedView::new(
                         item.artifact.id.clone(),
                         StackPanel::new().children((
                             m3::body(name).text_trimming(TextTrimming::CharacterEllipsis),
@@ -1691,7 +1709,42 @@ impl DesktopApp {
                                 .text_wrapping(TextWrapping::Wrap)
                                 .is_text_selection_enabled(true),
                         )),
+                    )
+                };
+                // What Remove takes comes first; the kept items fold under
+                // one "N kept" row.
+                let (removable, kept_items) = view.split();
+                rows.extend(removable.iter().map(|item| item_row(item)));
+                if !kept_items.is_empty() {
+                    let open = state.cleanup_kept_open.contains(&group);
+                    let label = format!("{} kept", kept_items.len());
+                    rows.push(KeyedView::new(
+                        format!("kept:{open}"),
+                        m3::sub_row(palette, false)
+                            .automation_name(format!(
+                                "{label} in {} ({})",
+                                group.title(),
+                                if open { "shown" } else { "hidden" }
+                            ))
+                            .on_click(
+                                context.message(Message::Settings(
+                                    SettingsMsg::CleanupKeptToggled(group),
+                                )),
+                            )
+                            .content(m3::row_content(
+                                Some(if open {
+                                    m3::glyph::CHEVRON_DOWN
+                                } else {
+                                    m3::glyph::CHEVRON_RIGHT
+                                }),
+                                &label,
+                                "",
+                                View::empty(),
+                            )),
                     ));
+                    if open {
+                        rows.extend(kept_items.iter().map(|item| item_row(item)));
+                    }
                 }
                 parts.push(KeyedView::new(
                     format!("group:{group:?}"),
