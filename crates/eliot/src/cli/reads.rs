@@ -1166,7 +1166,7 @@ fn print_why_diagnosis(response: &DiagnoseResponse) {
     for step in &response.steps {
         let mut line = format!("  [{}]", step.kind);
         if let Some(code) = step.code.as_deref() {
-            line.push_str(&format!(" {code}"));
+            line.push_str(&format!(" {}", eliot_core::reason_words(code)));
         }
         if let Some(where_) = step.failure_where.as_deref() {
             line.push_str(&format!(" at {where_}"));
@@ -1182,7 +1182,7 @@ fn print_why_diagnosis(response: &DiagnoseResponse) {
         }
         println!("{line}");
         if let Some(origin) = step.origin.as_deref() {
-            println!("    origin: {origin}");
+            println!("    {}", eliot_core::origin_words(origin));
         }
     }
     if let Some(preceded_by) = response.preceded_by.as_deref() {

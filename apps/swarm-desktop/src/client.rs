@@ -113,7 +113,7 @@ pub async fn list_agents_flagged(
 
 /// The `agent.list` error, worded for the sidebar's Show archived toggle.
 pub fn archived_filter_error(error: &Error) -> String {
-    error.to_string()
+    error.user_message()
 }
 
 /// `agent.archive` (Owner only): hide or show a stopped or idle Agent tree

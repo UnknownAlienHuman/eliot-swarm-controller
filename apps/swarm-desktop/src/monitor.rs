@@ -105,18 +105,7 @@ pub struct Incident {
 
 /// An attention reason code in words.
 pub fn attention_words(reason: &str) -> String {
-    match reason {
-        "no_progress" => "No progress for a while".to_owned(),
-        "source_unhealthy" => "Lost contact with its harness".to_owned(),
-        "children_unattended" => "Its subagents are unattended".to_owned(),
-        other => {
-            let text = other.replace('_', " ");
-            let mut chars = text.chars();
-            chars.next().map_or_else(String::new, |first| {
-                first.to_uppercase().chain(chars).collect()
-            })
-        }
-    }
+    eliot_core::reason_words(reason).to_owned()
 }
 
 /// Lower ranks need attention first: pending requests, then unknown

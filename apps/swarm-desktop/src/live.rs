@@ -128,10 +128,10 @@ pub fn after_error(code: &str, message: &str, attempt: u32) -> Next {
         ErrorClass::Transient => Next::Backoff {
             delay_ms: backoff_ms(attempt),
             attempt: attempt + 1,
-            reason: format!("{code}: {message}"),
+            reason: eliot_core::reason_message(code, message),
         },
         ErrorClass::Fatal => Next::Stop {
-            reason: format!("{code}: {message}"),
+            reason: eliot_core::reason_message(code, message),
         },
     }
 }

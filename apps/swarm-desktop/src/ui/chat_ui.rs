@@ -123,6 +123,10 @@ pub(super) struct SendFailure {
 }
 
 impl SendFailure {
+    fn uncertain(&self) -> bool {
+        matches!(self.code.as_str(), "unknown" | "unavailable")
+    }
+
     fn new(
         error: &eliot_core::Error,
         mutation_id: &str,
@@ -131,7 +135,7 @@ impl SendFailure {
         action: &DraftAction,
     ) -> Self {
         Self {
-            error: error.to_string(),
+            error: error.user_message(),
             code: error.code.clone(),
             mutation_id: mutation_id.to_owned(),
             text: text.to_owned(),
@@ -799,7 +803,7 @@ impl DesktopApp {
         let definite = outcome
             .as_ref()
             .err()
-            .is_none_or(|failure| !crate::state::uncertain(&failure.error));
+            .is_none_or(|failure| !failure.uncertain());
         self.settle_mutation(definite);
         match outcome {
             Ok(outcome) => {
@@ -892,7 +896,7 @@ impl DesktopApp {
                     .drafts
                     .restore(&agent, failure.text.clone(), failure.revision);
                 self.rebuild_items();
-                if crate::state::uncertain(&failure.error) {
+                if failure.uncertain() {
                     self.alert(format!(
                         "Not confirmed (sending again reuses the same id): {}",
                         failure.error
@@ -2246,6 +2250,40 @@ fn starting_view(text: &str, label: &str, column: Option<f64>, palette: Palette)
 #[cfg(test)]
 mod tests {
     use super::enter_send_text;
+
+    #[test]
+    fn translated_send_failure_retains_the_same_mutation_id() {
+        for code in ["unknown", "unavailable"] {
+            let mut ledger = crate::state::MutationLedger::default();
+            let action = super::DraftAction::Send {
+                agent: "a2".to_owned(),
+            };
+            let key = action.key(7);
+            let id = ledger.id_for(&key);
+            let failure = super::SendFailure::new(
+                &eliot_core::Error::new(code, "transport: reply missing"),
+                &id,
+                "hello",
+                7,
+                &action,
+            );
+            assert!(!failure.error.starts_with(&format!("{code}:")));
+            if !failure.uncertain() {
+                ledger.complete(&key);
+            }
+            assert_eq!(ledger.id_for(&key), id);
+        }
+        let refused = super::SendFailure::new(
+            &eliot_core::Error::new("invalid", "unknown: quoted model prose"),
+            "id",
+            "hello",
+            7,
+            &super::DraftAction::Send {
+                agent: "a2".to_owned(),
+            },
+        );
+        assert!(!refused.uncertain());
+    }
 
     #[test]
     fn only_a_single_inserted_line_break_reads_as_enter() {
