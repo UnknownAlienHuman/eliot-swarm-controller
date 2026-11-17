@@ -438,16 +438,13 @@ impl AgentSummary {
         }
     }
 
-    /// Fleet counting bucket for one summary.
+    /// Fleet counting bucket for one summary. Per core.md, a lost observed
+    /// activity counts as unknown; its display label still describes the loss.
     pub fn fleet_bucket(&self) -> &'static str {
         match &self.activity {
             Some(_) if self.state == AgentState::Stopped => "stopped",
-            Some(activity) => match activity.state {
-                NativeChildActivityState::Running => "running",
-                NativeChildActivityState::Idle => "idle",
-                NativeChildActivityState::Interrupted => "interrupted",
-                NativeChildActivityState::Unknown | NativeChildActivityState::Lost => "unknown",
-            },
+            Some(activity) if activity.state == NativeChildActivityState::Lost => "unknown",
+            Some(activity) => activity_state_name(activity.state),
             None => agent_state_name(self.state),
         }
     }
@@ -2712,7 +2709,10 @@ mod tests {
             "interrupted"
         );
         assert_eq!(observed(Activity::Unknown).fleet_bucket(), "unknown");
-        assert_eq!(observed(Activity::Lost).fleet_bucket(), "unknown");
+        assert_eq!(
+            (activity_state_name(Activity::Lost), observed(Activity::Lost).fleet_bucket()),
+            ("lost", "unknown")
+        );
         assert_eq!(summary().fleet_bucket(), "idle");
         let mut unknown = summary();
         unknown.state = AgentState::Unknown;
