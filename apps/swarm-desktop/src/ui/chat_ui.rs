@@ -42,7 +42,7 @@ pub(super) enum ChatMsg {
     InterruptRequested(BoundAction),
     ApprovalRequested(UiPending, bool),
     AnswerRequested(UiPending),
-    ControlSubmitted(String, Fallible<String>),
+    ControlSubmitted(String, eliot_core::Result<String>),
     /// A "…" menu entry (its label).
     AgentMenu(String),
     /// The Force stop banner's answer: true confirms the bound action.
@@ -131,8 +131,7 @@ pub(super) fn enter_send_text(previous: &str, text: &str) -> Option<String> {
 /// what was submitted (to give the text back or send it after a steer).
 #[derive(Clone, Debug)]
 pub(super) struct SendFailure {
-    pub(super) error: String,
-    pub(super) code: String,
+    pub(super) error: eliot_core::Error,
     pub(super) mutation_id: String,
     pub(super) text: String,
     pub(super) revision: u64,
@@ -140,10 +139,6 @@ pub(super) struct SendFailure {
 }
 
 impl SendFailure {
-    fn uncertain(&self) -> bool {
-        matches!(self.code.as_str(), "unknown" | "unavailable")
-    }
-
     fn new(
         error: &eliot_core::Error,
         mutation_id: &str,
@@ -152,14 +147,20 @@ impl SendFailure {
         action: &DraftAction,
     ) -> Self {
         Self {
-            error: error.user_message(),
-            code: error.code.clone(),
+            error: error.clone(),
             mutation_id: mutation_id.to_owned(),
             text: text.to_owned(),
             revision,
             action: action.clone(),
         }
     }
+}
+
+fn settles<T>(outcome: &Result<T, SendFailure>) -> bool {
+    outcome
+        .as_ref()
+        .err()
+        .is_none_or(|failure| !crate::state::uncertain(&failure.error))
 }
 
 /// What the composer's draft is submitted as, with the binding captured at
@@ -624,7 +625,6 @@ impl DesktopApp {
                         turn,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             ChatMsg::ApprovalRequested(request, approve) => {
@@ -648,7 +648,6 @@ impl DesktopApp {
                         },
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             ChatMsg::AnswerRequested(request) => {
@@ -681,7 +680,6 @@ impl DesktopApp {
                         answers,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             ChatMsg::ControlSubmitted(what, outcome) => {
@@ -694,9 +692,10 @@ impl DesktopApp {
                 match outcome {
                     Ok(state) => self.set_status(format!("{what} admitted: {state}.")),
                     Err(error) if crate::state::uncertain(&error) => self.alert(format!(
-                        "{what}: not confirmed (trying again reuses its id): {error}"
+                        "{what}: not confirmed (trying again reuses its id): {}",
+                        error.user_message()
                     )),
-                    Err(error) => self.alert(format!("{what} refused: {error}")),
+                    Err(error) => self.alert(format!("{what} refused: {}", error.user_message())),
                 }
                 if self.chat.convo.is_some() {
                     self.queue_reread(
@@ -737,7 +736,6 @@ impl DesktopApp {
                         true,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
         }
@@ -838,11 +836,7 @@ impl DesktopApp {
     ) {
         // Keyboard focus goes back to the composer (no-op while it is unbound).
         let _ = self.chat.composer_ref.request_focus();
-        let definite = outcome
-            .as_ref()
-            .err()
-            .is_none_or(|failure| !failure.uncertain());
-        self.settle_mutation(definite);
+        self.settle_mutation(settles(&outcome));
         match outcome {
             Ok(outcome) => {
                 // Bound to the submitting Agent and draft revision, not
@@ -903,7 +897,7 @@ impl DesktopApp {
                 // a new action (its own ledger key and id), after a definite
                 // refusal only.
                 if let DraftAction::Steer(bound) = &failure.action
-                    && STEER_FALLBACK.contains(&failure.code.as_str())
+                    && STEER_FALLBACK.contains(&failure.error.code.as_str())
                 {
                     let action = DraftAction::Send {
                         agent: bound.agent.clone(),
@@ -934,13 +928,13 @@ impl DesktopApp {
                     .drafts
                     .restore(&agent, failure.text.clone(), failure.revision);
                 self.rebuild_items();
-                if failure.uncertain() {
+                if crate::state::uncertain(&failure.error) {
                     self.alert(format!(
                         "Not confirmed (sending again reuses the same id): {}",
-                        failure.error
+                        failure.error.user_message()
                     ));
                 } else {
-                    self.alert(format!("Not sent: {}", failure.error));
+                    self.alert(format!("Not sent: {}", failure.error.user_message()));
                 }
             }
         }
@@ -996,7 +990,6 @@ impl DesktopApp {
                         None,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             MENU_DETACH => {
@@ -1009,7 +1002,6 @@ impl DesktopApp {
                         bound.generation,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             MENU_STOP => {
@@ -1023,7 +1015,6 @@ impl DesktopApp {
                         false,
                     ))
                     .map(|reply| submit_note(&reply))
-                    .map_err(|error| error.to_string())
                 });
             }
             MENU_FORCE => {
@@ -1417,7 +1408,7 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
         what: &str,
         key: String,
-        work: impl FnOnce(&Path, String) -> Fallible<String> + Send + 'static,
+        work: impl FnOnce(&Path, String) -> eliot_core::Result<String> + Send + 'static,
     ) {
         if self.submitting() {
             return;
@@ -2474,6 +2465,7 @@ mod tests {
 
     #[test]
     fn translated_send_failure_retains_the_same_mutation_id() {
+        assert!(super::settles(&Ok::<_, super::SendFailure>(())));
         for code in ["unknown", "unavailable"] {
             let mut ledger = crate::state::MutationLedger::default();
             let action = super::DraftAction::Send {
@@ -2488,8 +2480,8 @@ mod tests {
                 7,
                 &action,
             );
-            assert!(!failure.error.starts_with(&format!("{code}:")));
-            if !failure.uncertain() {
+            let result: Result<(), _> = Err(failure);
+            if super::settles(&result) {
                 ledger.complete(&key);
             }
             assert_eq!(ledger.id_for(&key), id);
@@ -2503,7 +2495,7 @@ mod tests {
                 agent: "a2".to_owned(),
             },
         );
-        assert!(!refused.uncertain());
+        assert!(super::settles(&Err::<(), _>(refused)));
     }
 
     #[test]

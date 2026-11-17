@@ -13,7 +13,7 @@ pub(super) enum ConfigureMsg {
     Chosen(String),
     /// The configured Agent; outer error: the submission itself; inner: the
     /// settled command read.
-    ConfigureSettled(String, Box<Result<Fallible<Command>, String>>),
+    ConfigureSettled(String, Box<Result<Fallible<Command>, eliot_core::Error>>),
 }
 
 /// The catalogue of the exact Agent generation and the last `configure`
@@ -77,8 +77,7 @@ impl DesktopApp {
                         generation,
                         model,
                         effort,
-                    ))
-                    .map_err(|error| error.to_string());
+                    ));
                     Message::Configure(ConfigureMsg::ConfigureSettled(
                         agent.clone(),
                         Box::new(submitted.map(|reply| {
@@ -89,10 +88,7 @@ impl DesktopApp {
             }
             ConfigureMsg::ConfigureSettled(agent, result) => {
                 let result = *result;
-                let uncertain = result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| crate::state::uncertain(error));
+                let uncertain = result.as_ref().err().is_some_and(crate::state::uncertain);
                 self.settle_mutation(!uncertain);
                 // A reply for an Agent no longer shown changes nothing on screen.
                 if self.selected_agent_id().as_deref() != Some(agent.as_str()) {

@@ -194,6 +194,7 @@ struct Submitted {
 }
 
 type Fallible<T> = Result<T, String>;
+type MutationResult<T> = Result<T, eliot_core::Error>;
 /// One rule namespace read: its rules and whether more remain.
 type RulePage = (Vec<RuleListEntry>, bool);
 

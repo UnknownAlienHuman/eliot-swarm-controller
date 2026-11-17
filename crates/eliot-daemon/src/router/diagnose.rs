@@ -186,7 +186,10 @@ impl Router {
         let generation = row.generation;
         let mut steps = vec![DiagnoseStep {
             kind: "agent".to_owned(),
-            code: Some(bound_chars(eliot_core::api::agent_state_name(row.state), 128)),
+            code: Some(bound_chars(
+                eliot_core::api::agent_state_name(row.state),
+                128,
+            )),
             message: None,
             failure_where: None,
             origin: None,

@@ -52,7 +52,7 @@ const REVEAL_RETRY_MS: u64 = 16;
 pub(super) enum LaunchMsg {
     WorkspaceChanged(String),
     LaunchRequested,
-    LaunchSubmitted(Fallible<LaunchOutcome>),
+    LaunchSubmitted(MutationResult<LaunchOutcome>),
     ProfilesListed(Fallible<ProfileListResponse>),
     /// `routing.preview` for the default role.
     PreviewLoaded(Box<Fallible<eliot_core::RoutingDecision>>),
@@ -849,13 +849,15 @@ impl DesktopApp {
                     &place,
                     Some(text.clone()),
                 )
-                .await
-                .map_err(|error| crate::settings_model::launch_error(&error))?;
+                .await?;
                 Ok(LaunchOutcome {
                     // Admitted without an Agent id: the outcome is
                     // unknown, so the id is kept for a same-id retry.
                     agent: reply.agent.clone().ok_or_else(|| {
-                        "unknown: the launch was admitted without an Agent id".to_owned()
+                        eliot_core::Error::new(
+                            "unknown",
+                            "the launch was admitted without an Agent id",
+                        )
                     })?,
                     generation: reply.generation.unwrap_or_default(),
                     command_id: reply.command_id.clone(),
@@ -870,7 +872,7 @@ impl DesktopApp {
 
     fn launch_submitted(
         &mut self,
-        outcome: Fallible<LaunchOutcome>,
+        outcome: MutationResult<LaunchOutcome>,
         context: &ComponentContext<Self>,
     ) {
         // Keyboard focus goes back to the composer (no-op while it is unbound).
@@ -922,12 +924,16 @@ impl DesktopApp {
             Err(error) if crate::state::uncertain(&error) => {
                 self.restore_launch_text(starting);
                 self.alert(format!(
-                    "Start not confirmed (sending again reuses its id): {error}"
+                    "Start not confirmed (sending again reuses its id): {}",
+                    crate::settings_model::launch_error(&error)
                 ));
             }
             Err(error) => {
                 self.restore_launch_text(starting);
-                self.alert(format!("Start refused: {error}"));
+                self.alert(format!(
+                    "Start refused: {}",
+                    crate::settings_model::launch_error(&error)
+                ));
             }
         }
     }

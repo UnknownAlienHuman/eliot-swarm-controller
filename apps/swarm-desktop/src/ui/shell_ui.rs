@@ -92,7 +92,7 @@ pub(super) enum ShellMsg {
     PreferencesSaved(
         crate::settings::Preferences,
         Option<(u32, u32)>,
-        Fallible<eliot_core::api::SettingsSaveResponse>,
+        MutationResult<eliot_core::api::SettingsSaveResponse>,
     ),
     AlertDismissed,
     /// Re-read the listed Agents (states, Recents order).
@@ -936,8 +936,7 @@ impl DesktopApp {
                 &data_dir,
                 preferences.clone(),
                 window,
-            ))
-            .map_err(|error| error.to_string());
+            ));
             Message::Shell(ShellMsg::PreferencesSaved(preferences, window, saved))
         });
     }

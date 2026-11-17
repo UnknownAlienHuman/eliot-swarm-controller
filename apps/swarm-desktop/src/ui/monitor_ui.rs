@@ -130,10 +130,7 @@ impl DesktopApp {
                 });
             }
             MonitorMsg::ReparentSettled(binding, result) => {
-                let uncertain = result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| matches!(error.code.as_str(), "unknown" | "unavailable"));
+                let uncertain = result.as_ref().err().is_some_and(crate::state::uncertain);
                 self.settle_mutation(!uncertain);
                 self.monitor.reparent_status = match result {
                     Ok(reply) => reparent::result_lines(&binding, &reply).join("\n"),
@@ -489,10 +486,7 @@ impl DesktopApp {
         match (detail, read) {
             (Some(detail), _) => {
                 let harness = crate::picker::harness_label(&detail.harness);
-                agent_lines.push(format!(
-                    "{harness} · {}",
-                    state_label(detail.state)
-                ));
+                agent_lines.push(format!("{harness} · {}", state_label(detail.state)));
                 agent_lines.extend(detail.settings.lines());
                 agent_lines.push(format!(
                     "Access: {}",

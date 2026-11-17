@@ -1496,11 +1496,7 @@ mod tests {
         assert_eq!(summary_title(&unknown), "codex · a7");
         let agent = UiAgent::from_summary(&full);
         assert_eq!(
-            (
-                agent.title.as_str(),
-                agent.state,
-                agent.native_child
-            ),
+            (agent.title.as_str(), agent.state, agent.native_child),
             ("k75: titles", AgentState::Idle, false)
         );
     }
