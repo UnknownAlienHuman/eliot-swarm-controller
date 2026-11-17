@@ -1648,16 +1648,7 @@ impl Store {
         if after < 0 || through.is_some_and(|bound| bound < after) {
             return Err(Error::new("invalid", "invalid event sequence bounds"));
         }
-        // Replay must report pruned history instead of silently omitting it.
-        // Live rule cursors always stay above this floor, so the rule worker
-        // never trips here; client-supplied replay cursors do.
-        let retained = retention::coverage_pruned_through(&self.connection)?;
-        if after < retained {
-            return Err(Error::new(
-                "history_gap",
-                "requested event history is no longer fully retained",
-            ));
-        }
+        self.require_retained(after)?;
         let mut statement = self
             .connection
             .prepare(
@@ -1676,6 +1667,85 @@ impl Store {
         }
         enforce_page_bytes(&mut events)?;
         Ok(events)
+    }
+
+    /// Agent-filtered replay through the `events_agent (agent, seq)` index:
+    /// rows of the named Agents in `(after, through]`, restricted to `kinds`
+    /// and `sources` when those are nonempty, in sequence order, at most
+    /// `limit` rows within the page byte bound. The work is bounded by the
+    /// named Agents' own rows, never by the rest of the journal. No Agent
+    /// matches no row (after the same retention check).
+    pub fn read_agent_events(
+        &self,
+        agents: &[i64],
+        kinds: &[&str],
+        sources: &[&str],
+        after: i64,
+        through: i64,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        validate_limit(limit)?;
+        if after < 0 || through < after {
+            return Err(Error::new("invalid", "invalid event sequence bounds"));
+        }
+        if [agents.len(), kinds.len(), sources.len()]
+            .into_iter()
+            .any(|len| len > MAX_PAGE_ENTRIES)
+        {
+            return Err(Error::new(
+                "invalid",
+                "agent event reads take at most 1,000 Agents, kinds or sources",
+            ));
+        }
+        self.require_retained(after)?;
+        if agents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = |count: usize| vec!["?"; count].join(",");
+        let mut sql = format!(
+            "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
+             FROM events INDEXED BY events_agent
+             WHERE agent IN ({}) AND seq > ? AND seq <= ?",
+            placeholders(agents.len())
+        );
+        if !kinds.is_empty() {
+            sql.push_str(&format!(" AND kind IN ({})", placeholders(kinds.len())));
+        }
+        if !sources.is_empty() {
+            sql.push_str(&format!(" AND source IN ({})", placeholders(sources.len())));
+        }
+        sql.push_str(" ORDER BY seq LIMIT ?");
+        let mut values: Vec<rusqlite::types::Value> =
+            agents.iter().map(|agent| (*agent).into()).collect();
+        values.push(after.into());
+        values.push(through.into());
+        values.extend(kinds.iter().map(|kind| (*kind).to_owned().into()));
+        values.extend(sources.iter().map(|source| (*source).to_owned().into()));
+        values.push((limit as i64).into());
+        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values), event_record_from_row)
+            .map_err(sql_error)?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(event_from_record(row.map_err(sql_error)?)?);
+        }
+        enforce_page_bytes(&mut events)?;
+        Ok(events)
+    }
+
+    /// Replay must report pruned history instead of silently omitting it.
+    /// Live rule cursors always stay above this floor, so the rule worker
+    /// never trips here; client-supplied replay cursors do.
+    fn require_retained(&self, after: i64) -> Result<()> {
+        let retained = retention::coverage_pruned_through(&self.connection)?;
+        if after < retained {
+            return Err(Error::new(
+                "history_gap",
+                "requested event history is no longer fully retained",
+            ));
+        }
+        Ok(())
     }
 
     pub fn event_bounds(&self) -> Result<core::api::EventsBoundsResponse> {
