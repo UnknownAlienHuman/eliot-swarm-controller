@@ -1812,7 +1812,9 @@ mod tests {
         reply.steps[0].kind = "process".to_owned();
         assert_eq!(
             diagnosis_line(&reply).as_deref(),
-            Some("Cause not determined: The Agent could not finish: Stopped by a Swarm restart")
+            Some(
+                "Cause not determined: The Agent could not finish: Interrupted by a Swarm restart"
+            )
         );
         for (code, words) in [
             ("agent.failed", "The Agent could not finish"),
