@@ -1491,39 +1491,9 @@ fn snapshot_from_entry(
             "unsupported",
         ));
     }
-    let pass_env = match entry.pass_env.as_deref() {
-        Some(names) => validate_pass_env(name, names, source, table_offset)?,
-        None => Vec::new(),
-    };
-    let cmd = match entry.cmd.as_deref() {
-        Some(cmd) => Some(validate_cmd(name, cmd, source, table_offset)?),
-        None => None,
-    };
-    crate::setup::validate_entries(&entry.setup).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "setup",
-            &error.message,
-            "profile_error",
-        )
-    })?;
-    let scratch = normalize_scratch(&entry.scratch).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "scratch",
-            &error.message,
-            "profile_error",
-        )
-    })?;
+    let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("codex".to_owned()));
-    if let Some(cmd) = cmd {
-        snapshot.insert("cmd".to_owned(), Value::String(cmd));
-    }
     if let Some(model) = model {
         snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
     }
@@ -1563,28 +1533,14 @@ fn snapshot_from_entry(
         source,
         table_offset,
     )?;
-    snapshot.insert(
-        "pass_env".to_owned(),
-        Value::Array(pass_env.into_iter().map(Value::String).collect()),
-    );
-    snapshot.insert("scratch".to_owned(), json!(scratch));
-    if !entry.setup.is_empty() {
-        snapshot.insert(
-            "setup".to_owned(),
-            serde_json::to_value(&entry.setup)
-                .map_err(|_| core::Error::new("profile_error", "setup could not be encoded"))?,
-        );
-    }
+    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
     Ok(Value::Object(snapshot))
 }
 
-/// Validated profile tail shared by the Muse, OpenCode and Antigravity
-/// slices: an explicit pass_env list, a required explicit native `cmd` (no
-/// script wrapper), and validated setup/scratch. Each harness snapshot
-/// validates its own head (model, effort, ...) then folds this tail in.
+/// Shared profile fields validated after the harness-specific fields.
 struct ProfileTail {
     pass_env: Vec<String>,
-    cmd: String,
+    cmd: Option<String>,
     scratch: Vec<String>,
 }
 
@@ -1598,13 +1554,26 @@ fn validate_profile_tail(
         Some(names) => validate_pass_env(name, names, source, table_offset)?,
         None => Vec::new(),
     };
+    let harness = entry.harness.trim();
     let cmd = match entry.cmd.as_deref() {
-        Some(cmd) => reject_script_wrapper(
-            name,
-            validate_cmd(name, cmd, source, table_offset)?,
-            source,
-            table_offset,
-        )?,
+        Some(cmd) => {
+            let cmd = validate_executable_name(cmd)
+                .map_err(|class| {
+                    profile_field_error(source, table_offset, name, "cmd", class, "profile_error")
+                })?
+                .to_owned();
+            let cmd = if harness == "codex" {
+                cmd
+            } else {
+                reject_script_wrapper(name, cmd, source, table_offset)?
+            };
+            Some(if harness == "claude" {
+                require_native_claude_cmd(name, cmd, source, table_offset)?
+            } else {
+                cmd
+            })
+        }
+        None if harness == "codex" => None,
         None => {
             return Err(profile_field_error(
                 source,
@@ -1643,14 +1612,16 @@ fn validate_profile_tail(
     })
 }
 
-/// Fold the validated tail into the harness snapshot: the required cmd,
-/// pass_env, scratch, and setup (when non-empty).
+/// Fold the validated cmd (when supplied), pass_env, scratch and setup (when
+/// non-empty) into the harness snapshot.
 fn insert_profile_tail(
     snapshot: &mut serde_json::Map<String, Value>,
     tail: ProfileTail,
     setup: &[crate::setup::SetupEntry],
 ) -> core::Result<()> {
-    snapshot.insert("cmd".to_owned(), Value::String(tail.cmd));
+    if let Some(cmd) = tail.cmd {
+        snapshot.insert("cmd".to_owned(), Value::String(cmd));
+    }
     snapshot.insert(
         "pass_env".to_owned(),
         Value::Array(tail.pass_env.into_iter().map(Value::String).collect()),
@@ -1927,56 +1898,9 @@ fn claude_snapshot_from_entry(
             "unsupported",
         ));
     }
-    let pass_env = match entry.pass_env.as_deref() {
-        Some(names) => validate_pass_env(name, names, source, table_offset)?,
-        None => Vec::new(),
-    };
-    let cmd = match entry.cmd.as_deref() {
-        Some(cmd) => require_native_claude_cmd(
-            name,
-            reject_script_wrapper(
-                name,
-                validate_cmd(name, cmd, source, table_offset)?,
-                source,
-                table_offset,
-            )?,
-            source,
-            table_offset,
-        )?,
-        None => {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "cmd",
-                "required explicit cmd is missing",
-                "profile_error",
-            ));
-        }
-    };
-    crate::setup::validate_entries(&entry.setup).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "setup",
-            &error.message,
-            "profile_error",
-        )
-    })?;
-    let scratch = normalize_scratch(&entry.scratch).map_err(|error| {
-        profile_field_error(
-            source,
-            table_offset,
-            name,
-            "scratch",
-            &error.message,
-            "profile_error",
-        )
-    })?;
+    let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("claude".to_owned()));
-    snapshot.insert("cmd".to_owned(), Value::String(cmd));
     if let Some(model) = model {
         snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
     }
@@ -2013,18 +1937,7 @@ fn claude_snapshot_from_entry(
             allow: false,
         },
     )?;
-    snapshot.insert(
-        "pass_env".to_owned(),
-        Value::Array(pass_env.into_iter().map(Value::String).collect()),
-    );
-    snapshot.insert("scratch".to_owned(), json!(scratch));
-    if !entry.setup.is_empty() {
-        snapshot.insert(
-            "setup".to_owned(),
-            serde_json::to_value(&entry.setup)
-                .map_err(|_| core::Error::new("profile_error", "setup could not be encoded"))?,
-        );
-    }
+    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
     Ok(Value::Object(snapshot))
 }
 
@@ -3023,17 +2936,10 @@ fn require_native_claude_cmd(
     Ok(cmd)
 }
 
-fn validate_cmd(profile: &str, cmd: &str, source: &str, offset: usize) -> core::Result<String> {
+pub(crate) fn validate_executable_name(cmd: &str) -> Result<&str, &'static str> {
     let cmd = cmd.trim();
     if cmd.is_empty() || cmd.len() > MAX_CMD_LEN {
-        return Err(profile_field_error(
-            source,
-            offset,
-            profile,
-            "cmd",
-            "must be 1-1024 characters",
-            "profile_error",
-        ));
+        return Err("must be 1-1024 characters");
     }
     const BACKSLASH: char = '\\';
     let file = cmd.rsplit(['/', BACKSLASH]).next().unwrap_or(cmd);
@@ -3055,17 +2961,11 @@ fn validate_cmd(profile: &str, cmd: &str, source: &str, offset: usize) -> core::
             && (!has_path_separator || file.chars().any(char::is_whitespace)))
         || cmd.chars().any(char::is_control)
     {
-        return Err(profile_field_error(
-            source,
-            offset,
-            profile,
-            "cmd",
-            "must name one executable path, not a shell command",
-            "profile_error",
-        ));
+        return Err("must name one executable path, not a shell command");
     }
-    Ok(cmd.to_owned())
+    Ok(cmd)
 }
+
 fn profile_field_error(
     source: &str,
     offset: usize,

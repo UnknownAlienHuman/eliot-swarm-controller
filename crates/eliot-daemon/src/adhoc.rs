@@ -468,20 +468,6 @@ pub(crate) fn adhoc_snapshot(
                 let validated = validate_native_cmd(&profile_name, &cmd)?;
                 snapshot.insert("cmd".to_owned(), Value::String(validated));
             }
-            if let Some(model) = model {
-                snapshot.insert("model".to_owned(), Value::String(model));
-            }
-            if let Some(effort) = effort {
-                snapshot.insert("effort".to_owned(), Value::String(effort));
-            }
-            snapshot.insert(
-                "permissions".to_owned(),
-                Value::String("workspace-write".to_owned()),
-            );
-            snapshot.insert(
-                "approval_policy".to_owned(),
-                Value::String("never".to_owned()),
-            );
         }
         "claude" => {
             let cmd = cmd.ok_or_else(|| {
@@ -492,22 +478,6 @@ pub(crate) fn adhoc_snapshot(
             })?;
             let validated = validate_claude_cmd(&profile_name, &cmd)?;
             snapshot.insert("cmd".to_owned(), Value::String(validated));
-            if let Some(model) = model {
-                snapshot.insert("model".to_owned(), Value::String(model));
-            }
-            // Closed `--effort` vocabulary, validated above; the Claude
-            // plugin pushes it as the CLI `--effort` flag.
-            if let Some(effort) = effort {
-                snapshot.insert("effort".to_owned(), Value::String(effort));
-            }
-            snapshot.insert(
-                "permissions".to_owned(),
-                Value::String("workspace-write".to_owned()),
-            );
-            snapshot.insert(
-                "approval_policy".to_owned(),
-                Value::String("never".to_owned()),
-            );
         }
         "muse" => {
             let cmd = cmd.ok_or_else(|| {
@@ -518,20 +488,6 @@ pub(crate) fn adhoc_snapshot(
             })?;
             let validated = validate_native_cmd(&profile_name, &cmd)?;
             snapshot.insert("cmd".to_owned(), Value::String(validated));
-            if let Some(model) = model {
-                snapshot.insert("model".to_owned(), Value::String(model));
-            }
-            if let Some(effort) = effort {
-                snapshot.insert("effort".to_owned(), Value::String(effort));
-            }
-            snapshot.insert(
-                "permissions".to_owned(),
-                Value::String("workspace-write".to_owned()),
-            );
-            snapshot.insert(
-                "approval_policy".to_owned(),
-                Value::String("never".to_owned()),
-            );
         }
         "opencode" => {
             let cmd = cmd.ok_or_else(|| {
@@ -564,15 +520,6 @@ pub(crate) fn adhoc_snapshot(
                 }),
             };
             snapshot.insert("cmd".to_owned(), Value::String(validated));
-            if let Some(model) = model {
-                snapshot.insert("model".to_owned(), Value::String(model));
-            }
-            // The frozen effort selects the installed variant id on launch
-            // (`Model.Ref.variant`); the plugin gates it against the live
-            // native catalogue before the session exists.
-            if let Some(effort) = effort {
-                snapshot.insert("effort".to_owned(), Value::String(effort));
-            }
             if let Some(selector) = selector {
                 snapshot.insert("auth_integration".to_owned(), Value::String(selector));
             }
@@ -586,9 +533,6 @@ pub(crate) fn adhoc_snapshot(
             })?;
             let validated = validate_native_cmd(&profile_name, &cmd)?;
             snapshot.insert("cmd".to_owned(), Value::String(validated));
-            if let Some(model) = model {
-                snapshot.insert("model".to_owned(), Value::String(model));
-            }
             snapshot.insert(
                 "dangerously_skip_permissions".to_owned(),
                 Value::Bool(false),
@@ -600,6 +544,22 @@ pub(crate) fn adhoc_snapshot(
                 format!("unsupported launch harness {harness}"),
             ));
         }
+    }
+    if let Some(model) = model {
+        snapshot.insert("model".to_owned(), Value::String(model));
+    }
+    if let Some(effort) = effort {
+        snapshot.insert("effort".to_owned(), Value::String(effort));
+    }
+    if matches!(harness.as_str(), "codex" | "claude" | "muse") {
+        snapshot.insert(
+            "permissions".to_owned(),
+            Value::String("workspace-write".to_owned()),
+        );
+        snapshot.insert(
+            "approval_policy".to_owned(),
+            Value::String("never".to_owned()),
+        );
     }
     // Access mapping overwrites the safe defaults above with the exact
     // native permission result for the requested level, freezing both the
@@ -630,40 +590,10 @@ pub(crate) fn adhoc_snapshot(
 }
 
 /// Ad-hoc cmd shape: one explicit executable path, never a shell command.
-/// Mirrors the profile `cmd` rule without a config source for errors.
 fn validate_native_cmd(profile: &str, cmd: &str) -> core::Result<String> {
-    let cmd = cmd.trim();
-    if cmd.is_empty() || cmd.len() > 1024 {
-        return Err(core::Error::new(
-            "profile_error",
-            format!("ad-hoc {profile}: cmd must be 1-1024 characters"),
-        ));
-    }
-    const BACKSLASH: char = '\\';
-    let file = cmd.rsplit(['/', BACKSLASH]).next().unwrap_or(cmd);
-    let lower = file.to_ascii_lowercase();
-    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
-    const SHELLS: &[&str] = &[
-        "sh",
-        "bash",
-        "dash",
-        "zsh",
-        "fish",
-        "cmd",
-        "powershell",
-        "pwsh",
-    ];
-    let has_path_separator = cmd.contains('/') || cmd.contains(BACKSLASH);
-    if SHELLS.contains(&stem)
-        || (cmd.chars().any(char::is_whitespace)
-            && (!has_path_separator || file.chars().any(char::is_whitespace)))
-        || cmd.chars().any(char::is_control)
-    {
-        return Err(core::Error::new(
-            "profile_error",
-            format!("ad-hoc {profile}: cmd must name one executable path, not a shell command"),
-        ));
-    }
+    let cmd = crate::config::validate_executable_name(cmd).map_err(|class| {
+        core::Error::new("profile_error", format!("ad-hoc {profile}: cmd {class}"))
+    })?;
     if is_script_wrapper(cmd) {
         return Err(core::Error::new(
             "profile_error",
