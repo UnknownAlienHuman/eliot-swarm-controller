@@ -11,6 +11,7 @@ use crate::ui::chat_ui::DraftAction;
 
 #[derive(Clone, Debug)]
 pub(super) enum MonitorMsg {
+    RefreshDue(u64),
     MonitorLoaded(u64, Option<Box<MonitorSnapshot>>),
     /// A monitor card: open its conversation and its details.
     CardOpened(String),
@@ -33,7 +34,9 @@ pub(super) struct MonitorState {
     pub(super) data: Monitor,
     /// Tags refreshes; a reply for an older chain is dropped.
     pub(super) epoch: u64,
-    pub(super) task: Option<ComponentTask>,
+    task: Option<ComponentTask>,
+    refresh_gate: Arc<tokio::sync::Mutex<()>>,
+    refreshing: bool,
     /// The Agent whose details (and usage) each refresh reads.
     pub(super) selected: Option<String>,
     /// Cards whose children are shown (collapsed by default).
@@ -48,13 +51,22 @@ pub(super) struct MonitorState {
 impl DesktopApp {
     pub(super) fn monitor_update(&mut self, msg: MonitorMsg, context: &ComponentContext<Self>) {
         match msg {
+            MonitorMsg::RefreshDue(epoch) => {
+                if epoch == self.monitor.epoch && self.panel != Panel::Closed {
+                    self.start_monitor(context);
+                }
+            }
             MonitorMsg::MonitorLoaded(epoch, snapshot) => {
                 if epoch != self.monitor.epoch || self.panel == Panel::Closed {
                     return;
                 }
+                self.monitor.refreshing = false;
                 if let Some(snapshot) = snapshot {
                     self.monitor.data.apply(*snapshot);
-                    self.spawn_monitor(context, monitor::PERIOD_MS);
+                    self.monitor.task = Some(context.spawn_background(move |cancel| {
+                        feed::backoff(monitor::PERIOD_MS, &|| cancel.is_cancelled());
+                        Message::Monitor(MonitorMsg::RefreshDue(epoch))
+                    }));
                 }
             }
             MonitorMsg::CardOpened(id) => {
@@ -129,6 +141,7 @@ impl DesktopApp {
         let changed = self.monitor.selected.as_deref() != Some(agent);
         if changed {
             self.monitor.selected = Some(agent.to_owned());
+            self.monitor.data.detail_errors.clear();
             self.monitor.technical_open = false;
         }
         let was_closed = self.panel == Panel::Closed;
@@ -141,37 +154,27 @@ impl DesktopApp {
     /// Close the panel: no refresh, no render work.
     pub(super) fn close_panel(&mut self) {
         self.panel = Panel::Closed;
+        self.monitor.refreshing = false;
         self.monitor.epoch += 1;
         if let Some(task) = self.monitor.task.take() {
             task.cancel();
         }
     }
 
-    /// (Re)start the refresh chain now; a cancelled chain may still finish
-    /// its last reads, so a running one gets a moment first.
+    /// Read while the panel is open, keeping the last successful data visible.
     pub(super) fn start_monitor(&mut self, context: &ComponentContext<Self>) {
-        let previous_running = self
-            .monitor
-            .task
-            .as_ref()
-            .is_some_and(|task| task.status() == ComponentTaskStatus::Running);
-        self.spawn_monitor(context, if previous_running { 300 } else { 0 });
-    }
-
-    /// Schedule the next refresh: one chain, one refresh in flight, none
-    /// while the panel is closed.
-    pub(super) fn spawn_monitor(&mut self, context: &ComponentContext<Self>, delay_ms: u64) {
         if let Some(task) = self.monitor.task.take() {
             task.cancel();
         }
+        self.monitor.epoch += 1;
         let data_dir = match self.data_dir.clone() {
             Ok(data_dir) => data_dir,
             Err(error) => {
+                self.monitor.refreshing = false;
                 self.monitor.data.errors = vec![format!("no data directory: {error}")];
                 return;
             }
         };
-        self.monitor.epoch += 1;
         let epoch = self.monitor.epoch;
         let plan = monitor::RefreshPlan {
             selected: self.monitor.selected.clone(),
@@ -179,12 +182,18 @@ impl DesktopApp {
             attention_cursor: self.monitor.data.attention_cursor,
             losses: self.monitor.data.loss_reads(),
         };
+        let refresh_gate = self.monitor.refresh_gate.clone();
+        self.monitor.refreshing = true;
         self.monitor.task = Some(context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
-            if delay_ms > 0 && !feed::backoff(delay_ms, &cancelled) {
-                return Message::Monitor(MonitorMsg::MonitorLoaded(epoch, None));
-            }
-            let snapshot = client::block_on(monitor::refresh(&data_dir, plan, &cancelled));
+            let snapshot = client::block_on(async {
+                // A cancelled epoch may still have an IPC read in flight.
+                let _guard = refresh_gate.lock().await;
+                if cancelled() {
+                    return None;
+                }
+                monitor::refresh(&data_dir, plan, &cancelled).await
+            });
             Message::Monitor(MonitorMsg::MonitorLoaded(epoch, snapshot.map(Box::new)))
         }));
     }
@@ -343,9 +352,9 @@ impl DesktopApp {
     /// Recently stopped; workers and subagents under their parent card.
     pub(super) fn monitor_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let data = &self.monitor.data;
-        let now = data.read_at_ms.unwrap_or(0);
+        let now = crate::handoff::now_ms();
         let mut cards: Vec<KeyedView> = Vec::new();
-        if data.read_at_ms.is_none() {
+        if data.read_at_ms.is_none() && self.monitor.refreshing && data.errors.is_empty() {
             cards.push(KeyedView::new(
                 "reading",
                 m3::secondary("Reading the swarm…"),
@@ -453,11 +462,16 @@ impl DesktopApp {
         if data.read_at_ms.is_some() && sections.iter().all(|section| section.rows.is_empty()) {
             cards.push(KeyedView::new("none", m3::secondary("No Agents to show.")));
         }
+        let mut headline = data.live_line(now);
+        if let Some(status) = super::panel_read_status(data.read_at_ms, self.monitor.refreshing) {
+            headline.push_str(" · ");
+            headline.push_str(&status);
+        }
         Grid::new()
             .rows([GridLength::Auto, GridLength::Auto, GridLength::STAR])
             .children((
                 self.panel_header("Monitor", context, palette),
-                m3::secondary(data.live_line(now))
+                m3::secondary(headline)
                     .grid_row(1)
                     .text_wrapping(TextWrapping::Wrap)
                     .margin(Thickness::new(
@@ -494,13 +508,7 @@ impl DesktopApp {
         };
         let mut sections: Vec<KeyedView> = Vec::new();
         let mut technical = vec![format!("ID {id}")];
-        let read = self
-            .monitor
-            .data
-            .detail
-            .as_ref()
-            .and_then(|detail| detail.as_ref().ok())
-            .filter(|read| read.agent.agent.id == id);
+        let data = &self.monitor.data;
 
         // The Agent: identity and settings (from the open conversation's
         // detail when it is this Agent, else the monitor's read).
@@ -510,6 +518,46 @@ impl DesktopApp {
             .detail
             .as_ref()
             .filter(|_| self.selected_agent_id().as_deref() == Some(id.as_str()));
+        let generation = detail
+            .map(|detail| detail.generation)
+            .or_else(|| self.find_agent(&id).map(|agent| agent.generation));
+        let cached = data.detail.as_ref().filter(|cached| {
+            let agent = &cached.read.agent.agent;
+            agent.id == id && generation.is_none_or(|generation| agent.generation == generation)
+        });
+        let read = cached.map(|cached| &cached.read);
+        let previous_generation = data
+            .row(&id)
+            .is_some_and(|row| generation.is_some_and(|generation| row.generation != generation));
+        let resources_at = data
+            .read_at_ms
+            .filter(|_| !previous_generation && data.row(&id).is_some());
+        let read_at = cached
+            .map(monitor::CachedDetail::oldest_read_ms)
+            .into_iter()
+            .chain(resources_at)
+            .min();
+        if let Some(status) = super::panel_read_status(read_at, self.monitor.refreshing) {
+            sections.push(KeyedView::new(
+                "refresh",
+                m3::secondary(status).text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        let errors: Vec<_> = data
+            .detail_errors
+            .iter()
+            .chain(&data.errors)
+            .map(String::as_str)
+            .collect();
+        if !errors.is_empty() {
+            sections.push(KeyedView::new(
+                "read-errors",
+                m3::secondary(format!("Some reads failed: {}", errors.join(" · ")))
+                    .foreground(palette.error())
+                    .text_wrapping(TextWrapping::Wrap),
+            ));
+        }
+        let pending = self.monitor.refreshing && data.detail_errors.is_empty();
         match (detail, read) {
             (Some(detail), _) => {
                 let harness = crate::picker::harness_label(&detail.harness);
@@ -542,7 +590,14 @@ impl DesktopApp {
                     launch_ui::agent_access_label(&settings)
                 ));
             }
-            (None, None) => agent_lines.push("Reading…".to_owned()),
+            (None, None) => agent_lines.push(
+                if pending {
+                    "Reading…"
+                } else {
+                    "Details unavailable."
+                }
+                .to_owned(),
+            ),
         }
         if !self.configure.status.is_empty() && detail.is_some() {
             technical.push(format!("Last configure: {}", self.configure.status));
@@ -607,7 +662,14 @@ impl DesktopApp {
             }
         }
 
-        let resources = monitor_view::resource_views(&self.monitor.data, &id, palette);
+        let resources = if previous_generation {
+            vec![KeyedView::new(
+                "new-session",
+                m3::secondary("No resource sample for this session yet."),
+            )]
+        } else {
+            monitor_view::resource_views(data, &id, palette)
+        };
         sections.push(KeyedView::new(
             "resources",
             m3::card_high(palette).content(
@@ -622,7 +684,8 @@ impl DesktopApp {
 
         let usage = match read {
             Some(read) => monitor_view::usage_lines(read),
-            None => vec!["Reading…".to_owned()],
+            None if pending => vec!["Reading…".to_owned()],
+            None => vec!["Usage unavailable.".to_owned()],
         };
         sections.push(KeyedView::new("usage", section(palette, "Usage", &usage)));
 

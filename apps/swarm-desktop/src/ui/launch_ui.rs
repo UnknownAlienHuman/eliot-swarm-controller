@@ -252,9 +252,11 @@ impl DesktopApp {
     /// The picker's rows for the current state.
     pub(super) fn picker_rows(&self) -> Vec<Row> {
         if let Some(detail) = self.popover_agent() {
-            // The open Agent: only its own route's models, as `configure`
-            // admission checks them, with the next turn's model checked.
-            let catalog = self.agent_catalog().map(|read| {
+            // Preview this harness's launch catalogue until the Agent's
+            // exact route is known. Only the route's choices can apply.
+            let route = self.agent_catalog();
+            let preview = self.agent_launch_catalog(&detail.harness);
+            let catalog = route.map(|read| {
                 read.as_ref()
                     .map(crate::configure::as_catalog)
                     .map_err(Clone::clone)
@@ -264,8 +266,12 @@ impl DesktopApp {
                 model: detail.settings.next_model().map(str::to_owned),
                 effort: detail.settings.next_effort().map(str::to_owned),
             });
-            return picker::rows(&picker::Inputs {
-                catalog: catalog.as_ref(),
+            let effort_locked = matches!(
+                route,
+                Some(Ok(reply)) if reply.configure.effort_refusal.is_some()
+            );
+            let mut rows = picker::rows(&picker::Inputs {
+                catalog: catalog.as_ref().or(preview),
                 query: &self.launch.query,
                 prefs: &self.prefs,
                 only_harness: Some(&detail.harness),
@@ -273,8 +279,22 @@ impl DesktopApp {
                 current: &current,
                 auto_detail: "",
                 efforts: &self.launch.efforts,
-                claude_efforts: eliot_daemon::CLAUDE_EFFORT_LEVELS,
+                claude_efforts: if effort_locked {
+                    &[]
+                } else {
+                    eliot_daemon::CLAUDE_EFFORT_LEVELS
+                },
             });
+            if preview.is_some() {
+                for row in &mut rows {
+                    if let Row::Choice(item) = row {
+                        item.disabled.get_or_insert_with(|| {
+                            "Checking which models this task can use…".to_owned()
+                        });
+                    }
+                }
+            }
+            return rows;
         }
         let presets = self.launch.allowed();
         let auto_detail = self.launch.auto_detail();
@@ -500,6 +520,9 @@ impl DesktopApp {
                 }
             }
             LaunchMsg::EffortChosen(effort) => {
+                if self.submitting() || !self.agent_efforts().contains(&effort) {
+                    return;
+                }
                 self.close_popover();
                 self.configure_update(
                     configure_ui::ConfigureMsg::Chosen {
@@ -581,7 +604,14 @@ impl DesktopApp {
             (true, Pop::Effort | Pop::Usage) => pop,
             // A model the harness keeps opens the effort popover, which
             // says so.
-            (true, Pop::Model) if self.agent_model_allowed() => pop,
+            (true, Pop::Model)
+                if self.agent_model_allowed()
+                    || self.popover_agent().is_some_and(|detail| {
+                        self.agent_launch_catalog(&detail.harness).is_some()
+                    }) =>
+            {
+                pop
+            }
             (true, Pop::Model) => Pop::Effort,
             (true, _) | (false, Pop::Effort) => return,
             (false, _) => pop,
@@ -663,6 +693,9 @@ impl DesktopApp {
         if self.popover_agent().is_some() {
             // The open Agent's picker: the row's model and effort for its
             // next turn.
+            if !self.agent_model_allowed() || self.submitting() {
+                return;
+            }
             self.close_popover();
             if let Choice::Model(pick) = choice {
                 self.configure_update(
@@ -725,7 +758,7 @@ impl DesktopApp {
 
     /// A row the highlight names may be gone (a read, a favorite): keep it
     /// when shown, else the first row.
-    fn keep_highlight(&mut self) {
+    pub(super) fn keep_highlight(&mut self) {
         if self.launch.open != Some(Pop::Model) {
             return;
         }

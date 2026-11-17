@@ -168,7 +168,7 @@ impl DesktopApp {
                     }
                 }
                 if self.panel != Panel::Closed {
-                    self.spawn_monitor(context, 0);
+                    self.start_monitor(context);
                 }
                 // The sidebar's tree follows the new parent.
                 self.shell_update(ShellMsg::RefreshRequested, context);

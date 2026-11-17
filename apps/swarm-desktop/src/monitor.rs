@@ -717,6 +717,21 @@ pub struct DetailRead {
     pub diagnosis: Result<DiagnoseResponse, String>,
 }
 
+/// Last successful reads of the selected Agent and its supplemental data.
+#[derive(Clone, Debug)]
+pub struct CachedDetail {
+    pub read: DetailRead,
+    identity_ms: i64,
+    usage_ms: i64,
+    diagnosis_ms: i64,
+}
+
+impl CachedDetail {
+    pub fn oldest_read_ms(&self) -> i64 {
+        self.identity_ms.min(self.usage_ms).min(self.diagnosis_ms)
+    }
+}
+
 /// One attention report as read: its binding, phase and reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttentionReport {
@@ -955,7 +970,8 @@ pub struct Monitor {
     /// A live row left the live states: read the stopped rows next, so a
     /// just-stopped Agent does not vanish until the periodic read.
     pub stopped_due: bool,
-    pub detail: Option<Result<DetailRead, String>>,
+    pub detail: Option<CachedDetail>,
+    pub detail_errors: Vec<String>,
     pub read_at_ms: Option<i64>,
     pub errors: Vec<String>,
     pub refreshes: u64,
@@ -1132,54 +1148,68 @@ impl Monitor {
             Some(Err(error)) => self.errors.push(format!("attention reports: {error}")),
             None => {}
         }
-        let mut rows = Vec::new();
-        let mut counts = Vec::new();
-        for (state, group) in &snapshot.groups {
-            match group {
-                Ok(page) => {
-                    for row in &page.agents {
-                        let monitor_row = MonitorRow::from_list(row);
-                        if let Some(ObservationView::Data(data)) = row.observation.as_ref() {
-                            self.series
-                                .entry(monitor_row.id.clone())
-                                .or_default()
-                                .observe(&data.stats, &data.processes);
-                        }
-                        rows.push(monitor_row);
-                    }
-                    counts.push(StateCount {
-                        state: *state,
-                        total: Some(page.total),
-                        shown: page.agents.len(),
-                    });
-                }
-                Err(error) => {
-                    self.errors
-                        .push(format!("{}: {error}", agent_state_name(*state)));
-                    counts.push(StateCount {
-                        state: *state,
-                        total: None,
-                        shown: 0,
-                    });
-                }
+        self.take_fleet(&snapshot.groups, &snapshot.counts, snapshot.read_at_ms);
+        if let Some(detail) = snapshot.detail {
+            self.take_detail(detail, snapshot.read_at_ms);
+        }
+        // A failed loss read is retried by a later refresh.
+        for (key, summary) in snapshot.losses {
+            if let Ok(summary) = summary {
+                self.losses.insert(key, summary);
             }
         }
-        for (state, count) in &snapshot.counts {
-            match count {
-                Ok(total) => counts.push(StateCount {
+        let shown: HashSet<(String, i64)> = self
+            .all_rows()
+            .map(|row| (row.id.clone(), row.generation))
+            .collect();
+        self.losses.retain(|key, _| shown.contains(key));
+    }
+
+    fn take_fleet(
+        &mut self,
+        groups: &[(AgentState, Result<AgentListResponse, String>)],
+        totals: &[(AgentState, Result<usize, String>)],
+        read_at_ms: i64,
+    ) {
+        // Rows and counters are projections of one fleet read. Only a
+        // successful page replaces them or advances their freshness.
+        if let Some(error) = groups
+            .iter()
+            .find_map(|(_, page)| page.as_ref().err())
+            .or_else(|| totals.iter().find_map(|(_, count)| count.as_ref().err()))
+        {
+            self.errors.push(format!("fleet: {error}"));
+            return;
+        }
+        let mut rows = Vec::new();
+        let mut counts = Vec::new();
+        for (state, page) in groups
+            .iter()
+            .filter_map(|(state, page)| Some((state, page.as_ref().ok()?)))
+        {
+            for row in &page.agents {
+                let monitor_row = MonitorRow::from_list(row);
+                if let Some(ObservationView::Data(data)) = row.observation.as_ref() {
+                    self.series
+                        .entry(monitor_row.id.clone())
+                        .or_default()
+                        .observe(&data.stats, &data.processes);
+                }
+                rows.push(monitor_row);
+            }
+            counts.push(StateCount {
+                state: *state,
+                total: Some(page.total),
+                shown: page.agents.len(),
+            });
+        }
+        for (state, total) in totals {
+            if let Ok(total) = total {
+                counts.push(StateCount {
                     state: *state,
                     total: Some(*total),
                     shown: 0,
-                }),
-                Err(error) => {
-                    self.errors
-                        .push(format!("{}: {error}", agent_state_name(*state)));
-                    counts.push(StateCount {
-                        state: *state,
-                        total: None,
-                        shown: 0,
-                    });
-                }
+                });
             }
         }
         // Keep overlapping model inputs to one row per Agent, under its
@@ -1206,21 +1236,46 @@ impl Monitor {
         }
         self.rows = rows;
         self.counts = counts;
-        if snapshot.detail.is_some() {
-            self.detail = snapshot.detail;
+        self.read_at_ms = Some(read_at_ms);
+    }
+
+    fn take_detail(&mut self, result: Result<DetailRead, String>, read_at_ms: i64) {
+        self.detail_errors.clear();
+        let mut read = match result {
+            Ok(read) => read,
+            Err(error) => {
+                self.detail_errors.push(error);
+                return;
+            }
+        };
+        if let Err(error) = &read.usage {
+            self.detail_errors.push(format!("usage: {error}"));
         }
-        // A failed read is retried by a later refresh.
-        for (key, summary) in snapshot.losses {
-            if let Ok(summary) = summary {
-                self.losses.insert(key, summary);
+        if let Err(error) = &read.diagnosis {
+            self.detail_errors.push(format!("diagnosis: {error}"));
+        }
+        let identity = &read.agent.agent;
+        let previous = self.detail.take().filter(|last| {
+            last.read.agent.agent.id == identity.id
+                && last.read.agent.agent.generation == identity.generation
+        });
+        let (mut usage_ms, mut diagnosis_ms) = (read_at_ms, read_at_ms);
+        if let Some(last) = previous {
+            if read.usage.is_err() && last.read.usage.is_ok() {
+                read.usage = last.read.usage;
+                usage_ms = last.usage_ms;
+            }
+            if read.diagnosis.is_err() && last.read.diagnosis.is_ok() {
+                read.diagnosis = last.read.diagnosis;
+                diagnosis_ms = last.diagnosis_ms;
             }
         }
-        let shown: HashSet<(String, i64)> = self
-            .all_rows()
-            .map(|row| (row.id.clone(), row.generation))
-            .collect();
-        self.losses.retain(|key, _| shown.contains(key));
-        self.read_at_ms = Some(snapshot.read_at_ms);
+        self.detail = Some(CachedDetail {
+            read,
+            identity_ms: read_at_ms,
+            usage_ms,
+            diagnosis_ms,
+        });
     }
 }
 
@@ -1267,6 +1322,7 @@ async fn read_attention(
             now_ms - ATTENTION_WINDOW_MS,
             bounds.pruned_through,
             bounds.hi,
+            cancelled,
         )
         .await
         .map_err(|error| error.to_string())?,
@@ -1388,10 +1444,7 @@ pub async fn refresh(
     plan: RefreshPlan,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Option<MonitorSnapshot> {
-    let read_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or(0);
+    let read_at_ms = crate::handoff::now_ms();
     let RefreshPlan {
         selected,
         stopped,
@@ -1428,28 +1481,32 @@ pub async fn refresh(
                 .map_err(|error| error.to_string()),
         )
     }));
-    if let Some(agent) = selected.clone() {
+    if let Some(agent) = selected {
         reads.push(Box::pin(async move {
             if cancelled() {
                 return Read::Cancelled;
             }
-            let detail = async {
-                let read = client::get_agent(data_dir, &agent)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let usage = client::usage_summary(data_dir, &agent)
-                    .await
-                    .map_err(|error| error.to_string());
-                let diagnosis = client::diagnose(data_dir, &agent)
-                    .await
-                    .map_err(|error| error.to_string());
-                Ok(DetailRead {
-                    agent: read,
-                    usage,
-                    diagnosis,
-                })
+            let read = match client::get_agent(data_dir, &agent).await {
+                Ok(read) => read,
+                Err(error) => return Read::Detail(Box::new(Err(error.to_string()))),
             };
-            Read::Detail(Box::new(detail.await))
+            if cancelled() {
+                return Read::Cancelled;
+            }
+            let usage = client::usage_summary(data_dir, &agent)
+                .await
+                .map_err(|error| error.to_string());
+            if cancelled() {
+                return Read::Cancelled;
+            }
+            let diagnosis = client::diagnose(data_dir, &agent)
+                .await
+                .map_err(|error| error.to_string());
+            Read::Detail(Box::new(Ok(DetailRead {
+                agent: read,
+                usage,
+                diagnosis,
+            })))
         }));
     }
     for key in losses {
@@ -2010,10 +2067,66 @@ mod tests {
             .unwrap();
         assert_eq!((waiting.shown, waiting.total), (0, Some(1)));
         assert!(!after.errors.iter().any(|error| error.contains("unknown")));
+        let retained = after.counts.clone();
         let mut failed = snapshot();
+        failed.read_at_ms = 4_000;
         take_fleet(&mut failed, Err("unavailable".to_owned()));
         after.apply(failed);
-        assert!(after.counts.iter().all(|count| count.total.is_none()));
+        assert_eq!(after.counts, retained);
+        assert!(after.row("a1").is_some());
+        assert_eq!(after.read_at_ms, Some(2_000));
+        assert_eq!(after.errors, ["fleet: unavailable"]);
+    }
+
+    #[test]
+    fn details_keep_successful_reads_for_the_same_generation() {
+        let detail = |generation, diagnosis| {
+            let mut agent = eliot_core::Agent::new("a1", "repo", "codex", "preset", 0);
+            agent.generation = generation;
+            DetailRead {
+                agent: AgentGetResponse {
+                    agent,
+                    observation: ObservationView::unavailable("no_sample"),
+                    source_states: Vec::new(),
+                    session_usage: None,
+                    config: None,
+                    heavy: None,
+                    session_growth: None,
+                },
+                usage: Err("no usage".to_owned()),
+                diagnosis,
+            }
+        };
+        let diagnosis = DiagnoseResponse {
+            target: "a1".to_owned(),
+            summary: "Stopped".to_owned(),
+            steps: Vec::new(),
+            preceded_by: None,
+            previous_crash: None,
+        };
+        let mut monitor = Monitor::default();
+        monitor.take_detail(Ok(detail(1, Ok(diagnosis.clone()))), 100);
+        monitor.take_detail(Err("Agent read failed".to_owned()), 200);
+        let cached = monitor.detail.as_ref().unwrap();
+        assert_eq!(cached.oldest_read_ms(), 100);
+        assert_eq!(cached.read.diagnosis, Ok(diagnosis.clone()));
+        assert_eq!(monitor.detail_errors, ["Agent read failed"]);
+
+        monitor.take_detail(Ok(detail(1, Err("unavailable".to_owned()))), 300);
+        let cached = monitor.detail.as_ref().unwrap();
+        assert_eq!(cached.oldest_read_ms(), 100);
+        assert_eq!(cached.read.diagnosis, Ok(diagnosis));
+        assert!(
+            monitor
+                .detail_errors
+                .contains(&"diagnosis: unavailable".to_owned())
+        );
+
+        monitor.take_detail(Ok(detail(2, Err("unavailable".to_owned()))), 400);
+        let cached = monitor.detail.unwrap();
+        assert_eq!(cached.oldest_read_ms(), 400);
+        assert_eq!(cached.read.agent.agent.generation, 2);
+        assert_eq!(cached.read.diagnosis, Err("unavailable".to_owned()));
     }
 
     #[test]

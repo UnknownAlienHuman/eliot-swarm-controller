@@ -1,6 +1,6 @@
 use super::*;
 use crate::configure::{effort_words, locked_words};
-use eliot_core::api::HarnessModelsResponse;
+use eliot_core::api::{HarnessModelsResponse, ModelsCatalogResponse};
 use launch_ui::Pop;
 
 /// The usage popover's width (Codex's usage popover).
@@ -262,8 +262,21 @@ impl DesktopApp {
         matches!(self.agent_catalog(), Some(Ok(reply)) if reply.configure.model_refusal.is_none())
     }
 
-    /// The effort steps of the open Agent's next model (none when the
-    /// harness keeps its effort).
+    /// Catalogue choices to preview while the exact route is being read.
+    pub(in crate::ui) fn agent_launch_catalog(
+        &self,
+        harness: &str,
+    ) -> Option<&Fallible<ModelsCatalogResponse>> {
+        if self.agent_catalog().is_some() {
+            return None;
+        }
+        self.launch.catalog.as_ref().filter(|read| {
+            read.as_ref()
+                .is_ok_and(|catalog| catalog.models.iter().any(|model| model.harness == harness))
+        })
+    }
+
+    /// Confirmed effort steps of the open Agent's next model.
     pub(in crate::ui) fn agent_efforts(&self) -> Vec<String> {
         match (self.agent_catalog(), self.chat.detail.as_ref()) {
             (Some(Ok(reply)), Some(detail)) if reply.configure.effort_refusal.is_none() => {
@@ -300,9 +313,18 @@ impl DesktopApp {
             m3::section_title(shown.map_or_else(|| "Default effort".to_owned(), effort_words)),
             m3::secondary(detail.settings.next_model_words()),
         ));
-        let enabled = !self.submitting();
+        let preview = self.agent_launch_catalog(&detail.harness);
+        let efforts = match preview {
+            Some(Ok(catalog)) => {
+                configure::launch_model(catalog, &detail.harness, detail.settings.next_model())
+                    .and_then(|model| model.efforts.clone())
+                    .unwrap_or_default()
+            }
+            _ => self.agent_efforts(),
+        };
+        let ready = matches!(read, Some(Ok(_)));
+        let enabled = ready && !self.submitting();
         let steps: View = match read {
-            None => m3::secondary("Reading the effort levels…").into(),
             Some(Err(error)) => m3::secondary(format!(
                 "Effort levels not read: {}",
                 crate::state::plain_error(error)
@@ -310,9 +332,8 @@ impl DesktopApp {
             .foreground(palette.error())
             .text_wrapping(TextWrapping::Wrap)
             .into(),
-            Some(Ok(_)) if effort_locked => View::empty(),
-            Some(Ok(_)) => {
-                let efforts = self.agent_efforts();
+            _ if effort_locked || (!ready && efforts.is_empty()) => View::empty(),
+            _ => {
                 if efforts.is_empty() {
                     m3::secondary("This model has no effort levels to choose.").into()
                 } else {
@@ -347,13 +368,14 @@ impl DesktopApp {
         let note = match read {
             Some(Ok(_)) => locked_words(harness, model_locked, effort_locked)
                 .unwrap_or_else(|| "Applies from the next turn.".to_owned()),
-            _ => String::new(),
+            None => "Checking what this task can change…".to_owned(),
+            Some(Err(_)) => String::new(),
         };
-        let change_model: View = if matches!(read, Some(Ok(_))) && !model_locked {
+        let change_model: View = if (ready && !model_locked) || preview.is_some() {
             StackPanel::new().spacing(tokens::spacing::XS).children((
                 m3::divider(palette),
                 m3::row(palette, false)
-                    .is_enabled(enabled)
+                    .is_enabled(!self.submitting())
                     .automation_name("Change model")
                     .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Model))))
                     .content(m3::row_content(
@@ -366,7 +388,7 @@ impl DesktopApp {
         } else {
             View::empty()
         };
-        let hints: View = if effort_locked || read.is_none() {
+        let hints: View = if effort_locked || !ready || efforts.is_empty() {
             View::empty()
         } else {
             m3::secondary("←→ effort   Enter apply   Esc close").into()

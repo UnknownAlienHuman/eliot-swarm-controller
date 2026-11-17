@@ -433,9 +433,12 @@ of the explicitly selected release scope.
       bottom nor shows a "N new" jump button it could not hide at the bottom;
       opening a conversation brings its latest turn into view. (Refs #407)
 - [x] **D3 Swarm monitor.** An openable monitor panel uses one demand-driven
-      refresh chain, active only while open. Each refresh reads `agent.list` per
-      attention state with observations (with `total` as the exact counter), then
-      `agent.get` and `usage.summary` for the selected Agent only. At most four
+      refresh chain, active only while open. The last successful fleet and
+      selected-Agent details stay visible on reopen and failed refreshes, with
+      inline read errors and a timestamp when cached data is older than one
+      refresh interval. Each refresh reads `agent.list` once
+      across live states with observations (with `total` as the exact per-state counter),
+      alongside selected-Agent identity, usage and diagnosis. At most four
       reads run concurrently. The panel groups Needs attention (waiting, failed,
       lost, a controlled Agent in `unknown`, or an open `x.user.agent.attention`
       report read incrementally from the journal), Working, Idle and a collapsed
@@ -474,7 +477,9 @@ of the explicitly selected release scope.
       user-selected `.exe` with literal argv and no Eliot credentials. (Refs #407)
 - [x] **D6 Coordination actions.** The composer's model chip configures model and
       effort from `harness.models` read under that Agent's frozen route (`agent`),
-      with the daemon's per-field `configure` refusals; the details show
+      with the daemon's per-field `configure` refusals. While that read is
+      in flight, the launch catalogue previews the harness's choices; editing
+      requires the exact Agent route. The details show
       requested, next-turn (revision, application point) and effective values with
       their turn-proven verified marks. "Move under another task…" (a task's
       "…" and right-click menus, not the details panel) moves an Agent with its
@@ -545,7 +550,9 @@ of the explicitly selected release scope.
       actions. The Details panel has only a close button. (Refs #407)
 - [x] **D8 Settings and routing in the desktop.** Every Settings page reads and
       writes the unified `settings.read/save` (S1) through `config_client`; the
-      desktop has no other store. General writes `[desktop]` theme and
+      desktop has no other store. Settings reopens on its last document
+      with the read time, refreshes in the background and shows errors inline.
+      General writes `[desktop]` theme and
       startup ("reopen the last task" opens the most recently active Agent),
       and Default access `last_access`, each when chosen. Routing edits each role's ordered candidates; Projects edits
       path, allowed profiles and Agent actions; Automations edits assignments

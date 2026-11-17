@@ -399,6 +399,7 @@ pub(super) struct SettingsState {
         eliot_core::api::CleanupApplyResponse,
     )>,
     pub(super) loaded: bool,
+    read_at_ms: Option<i64>,
     pub(super) reading: bool,
     /// A read was asked for while one ran (after a save): read again.
     reread: bool,
@@ -560,6 +561,7 @@ impl SettingsState {
         self.restart_required = read.restart_required;
         self.history = read.history;
         self.loaded = true;
+        self.read_at_ms = Some(crate::handoff::now_ms());
         self.error = None;
     }
 
@@ -852,7 +854,7 @@ impl DesktopApp {
                 if self.settings_page != page {
                     self.settings_page = page;
                     self.reprime_fields(context);
-                    self.settings_entered(context);
+                    self.settings_entered(false, context);
                 }
             }
             SettingsMsg::Loaded(result) => {
@@ -1434,9 +1436,21 @@ impl DesktopApp {
         });
     }
 
-    /// Read what the shown section needs.
-    pub(super) fn settings_entered(&mut self, context: &ComponentContext<Self>) {
-        if !self.settings.loaded {
+    /// The connection already read the document to load preferences.
+    pub(super) fn seed_settings(
+        &mut self,
+        read: SettingsReadResponse,
+        context: &ComponentContext<Self>,
+    ) {
+        if !self.settings.loaded && !self.settings.reading {
+            self.settings_update(SettingsMsg::Loaded(Ok(read)), context);
+        }
+    }
+
+    /// Reopen with the saved document, revalidating it once in the
+    /// background. Changing sections reuses the same document.
+    pub(super) fn settings_entered(&mut self, reopened: bool, context: &ComponentContext<Self>) {
+        if (reopened || !self.settings.loaded) && !self.settings.reading {
             self.load_settings(context);
         }
         match self.settings_page {
@@ -1557,11 +1571,7 @@ impl DesktopApp {
     /// column of at most 840 DIPs with the 24-DIP page padding.
     pub(super) fn settings_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let page = self.settings_page;
-        let body: View = if let Some(error) = &self.settings.error {
-            self.read_error(error, context, palette)
-        } else if !self.settings.loaded {
-            m3::secondary("Reading settings…").into()
-        } else {
+        let body: View = if self.settings.loaded {
             match page {
                 Page::General => self.general_page(context, palette),
                 Page::Shortcuts => shortcuts_page(palette),
@@ -1575,7 +1585,25 @@ impl DesktopApp {
                 Page::CloudMcp => self.cloud_section(context, palette),
                 Page::Advanced => self.advanced_section(context, palette),
             }
+        } else if self.settings.error.is_none() {
+            m3::secondary("Reading settings…").into()
+        } else {
+            View::empty()
         };
+        let freshness = self.settings.read_at_ms.and_then(super::last_read_label);
+        let status = self.settings.error.as_deref().map_or_else(
+            || {
+                freshness.map_or_else(View::empty, |label| {
+                    let text = if self.settings.reading {
+                        format!("Refreshing… · {label}")
+                    } else {
+                        label
+                    };
+                    m3::secondary(text).into()
+                })
+            },
+            |error| self.read_error(error, context, palette),
+        );
         let width = self.settings_column_width();
         // The page's tree is keyed by page, so its editors are new controls
         // (see `reprime_fields`).
@@ -1604,6 +1632,7 @@ impl DesktopApp {
                                     }),
                                 ),
                             ),
+                            KeyedView::new("settings-read-status", status),
                             KeyedView::new(format!("body:{}", page.label()), body),
                         ]),
                 );
@@ -1682,8 +1711,13 @@ impl DesktopApp {
     fn read_error(&self, error: &str, context: &mut ViewContext<Self>, palette: Palette) -> View {
         StackPanel::new().spacing(tokens::spacing::SM).children((
             m3::body(error.to_owned())
+                .foreground(palette.error())
                 .text_wrapping(TextWrapping::Wrap)
                 .is_text_selection_enabled(true),
+            self.settings
+                .read_at_ms
+                .and_then(super::last_read_label)
+                .map_or_else(View::empty, |label| m3::secondary(label).into()),
             m3::outlined(palette)
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .is_enabled(!self.settings.reading)

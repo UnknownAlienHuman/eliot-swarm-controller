@@ -44,6 +44,28 @@ impl DesktopApp {
                     .zip(self.chat.detail.as_ref().map(|detail| detail.generation));
                 if current == Some(loaded) {
                     self.configure.catalog = Some(catalog);
+                    match self.launch.open {
+                        Some(launch_ui::Pop::Model) if self.popover_agent().is_some() => {
+                            if self.agent_model_allowed() {
+                                self.keep_highlight();
+                            } else {
+                                self.launch_update(
+                                    LaunchMsg::Toggle(launch_ui::Pop::Effort),
+                                    context,
+                                );
+                            }
+                        }
+                        Some(launch_ui::Pop::Effort)
+                            if self
+                                .launch
+                                .effort_highlight
+                                .as_ref()
+                                .is_some_and(|effort| !self.agent_efforts().contains(effort)) =>
+                        {
+                            self.launch.effort_highlight = None;
+                        }
+                        _ => {}
+                    }
                 }
             }
             ConfigureMsg::Chosen { model, effort } => {

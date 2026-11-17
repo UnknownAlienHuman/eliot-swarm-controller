@@ -35,7 +35,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 toml.workspace = true
-tokio = { version = "1.53.2", features = ["rt", "net", "time", "macros"] }
+tokio = { version = "1.53.2", features = ["rt", "net", "sync", "time", "macros"] }
 ulid.workspace = true
 url.workspace = true
 
