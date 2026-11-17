@@ -1621,14 +1621,9 @@ impl DesktopApp {
         let freshness = self.settings.read_at_ms.and_then(super::last_read_label);
         let status = self.settings.error.as_deref().map_or_else(
             || {
-                freshness.map_or_else(View::empty, |label| {
-                    let text = if self.settings.reading {
-                        format!("Refreshing… · {label}")
-                    } else {
-                        label
-                    };
-                    m3::secondary(text).into()
-                })
+                // The same text during a background read, so the page never
+                // rewraps or shifts while it refreshes.
+                freshness.map_or_else(View::empty, |label| m3::secondary(label).into())
             },
             |error| self.read_error(error, context, palette),
         );

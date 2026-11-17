@@ -612,7 +612,7 @@ impl DesktopApp {
         if !data.errors.is_empty() {
             notes.push("Some reads failed".to_owned());
         }
-        if let Some(status) = super::panel_read_status(data.read_at_ms, self.monitor.refreshing) {
+        if let Some(status) = super::panel_read_status(data.read_at_ms, crate::handoff::now_ms()) {
             notes.push(status);
         }
         let partial: View = match overview.partial_note() {
@@ -995,7 +995,7 @@ impl DesktopApp {
             .into_iter()
             .chain(resources_at)
             .min();
-        if let Some(status) = super::panel_read_status(read_at, self.monitor.refreshing) {
+        if let Some(status) = super::panel_read_status(read_at, crate::handoff::now_ms()) {
             sections.push(KeyedView::new(
                 "refresh",
                 m3::secondary(status).text_wrapping(TextWrapping::Wrap),
