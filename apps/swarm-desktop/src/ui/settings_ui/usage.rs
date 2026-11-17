@@ -93,14 +93,18 @@ impl DesktopApp {
             .flatten()
             .collect::<Vec<_>>()
             .join(" · ");
-            let rows = match read {
-                None if self.settings.quotas_loading > 0 => vec![KeyedView::new(
+            let rows = match (entry, read) {
+                (Some(entry), _) if !entry.installed => vec![KeyedView::new(
+                    "not-installed",
+                    m3::setting_row("Not installed", "", View::empty()),
+                )],
+                (_, None) if self.settings.quotas_loading > 0 => vec![KeyedView::new(
                     "reading",
                     m3::setting_row("Reading limits…", "", View::empty()),
                 )],
-                None => unknown_limits(""),
-                Some(Err(error)) => unknown_limits(&crate::state::plain_error(error)),
-                Some(Ok(reply)) => {
+                (_, None) => unknown_limits(""),
+                (_, Some(Err(error))) => unknown_limits(&crate::state::plain_error(error)),
+                (_, Some(Ok(reply))) => {
                     let windows = crate::quota::windows(reply);
                     if windows.is_empty() {
                         let status = crate::quota::status_line(label, reply);
