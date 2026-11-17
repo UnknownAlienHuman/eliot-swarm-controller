@@ -85,7 +85,6 @@ struct InterruptedProcess<'a> {
     child: &'a mut OwnedChild,
     observer: Option<&'a CustodyObserver>,
     custody: CustodyGuarantee,
-    stop: StopReason,
     status: Option<ExitStatus>,
     root_exit_observed: bool,
 }
@@ -274,19 +273,15 @@ async fn run_owned_process_inner(
         }
     }
 
+    let interrupted = InterruptedProcess {
+        child: &mut child,
+        observer: observer.as_ref(),
+        custody,
+        status,
+        root_exit_observed,
+    };
     if let Some(stop) = stop {
-        return settle_interrupted(
-            InterruptedProcess {
-                child: &mut child,
-                observer: observer.as_ref(),
-                custody,
-                stop,
-                status,
-                root_exit_observed,
-            },
-            io,
-        )
-        .await;
+        return settle_interrupted(interrupted, stop, io).await;
     }
 
     if !root_exit_observed {
@@ -302,14 +297,8 @@ async fn run_owned_process_inner(
     if !matches!(io.stdin_result.as_ref(), Some(Ok(Ok(())))) || !stdout.complete {
         io.stdout_result = Some(Ok(Ok(stdout)));
         return settle_interrupted(
-            InterruptedProcess {
-                child: &mut child,
-                observer: observer.as_ref(),
-                custody,
-                stop: StopReason::Unknown(ProcessUncertainty::Stdin),
-                status,
-                root_exit_observed,
-            },
+            interrupted,
+            StopReason::Unknown(ProcessUncertainty::Stdin),
             io,
         )
         .await;
@@ -323,7 +312,7 @@ async fn run_owned_process_inner(
         _ = sleep_until(deadline) => {
             Err(StopReason::Failure(ProcessFailure::Timeout))
         }
-        result = wait_for_quiescence(&mut child, observer.as_ref(), deadline) => {
+        result = wait_for_quiescence(interrupted.child, interrupted.observer, deadline) => {
             result.map_err(|_| StopReason::Unknown(ProcessUncertainty::Quiescence))
         }
     };
@@ -332,32 +321,15 @@ async fn run_owned_process_inner(
         Ok(false) => {
             io.stdout_result = Some(Ok(Ok(stdout)));
             return settle_interrupted(
-                InterruptedProcess {
-                    child: &mut child,
-                    observer: observer.as_ref(),
-                    custody,
-                    stop: StopReason::Failure(ProcessFailure::Timeout),
-                    status,
-                    root_exit_observed,
-                },
+                interrupted,
+                StopReason::Failure(ProcessFailure::Timeout),
                 io,
             )
             .await;
         }
         Err(stop) => {
             io.stdout_result = Some(Ok(Ok(stdout)));
-            return settle_interrupted(
-                InterruptedProcess {
-                    child: &mut child,
-                    observer: observer.as_ref(),
-                    custody,
-                    stop,
-                    status,
-                    root_exit_observed,
-                },
-                io,
-            )
-            .await;
+            return settle_interrupted(interrupted, stop, io).await;
         }
     }
 
@@ -365,56 +337,31 @@ async fn run_owned_process_inner(
     {
         if let Some(stop) = pending_interruption(deadline, &cancellation) {
             io.stdout_result = Some(Ok(Ok(stdout)));
-            return settle_interrupted(
-                InterruptedProcess {
-                    child: &mut child,
-                    observer: observer.as_ref(),
-                    custody,
-                    stop,
-                    status,
-                    root_exit_observed,
-                },
-                io,
-            )
-            .await;
+            return settle_interrupted(interrupted, stop, io).await;
         }
 
         // The pre-reap observation is read-only. Reuse the validated owner
         // signal, then rescan while the exact leader still anchors the PGID.
-        let _ = child.terminate();
+        let _ = interrupted.child.terminate();
         let final_quiescent = matches!(
-            child.wait_group_empty_except_leader(CLEANUP_GRACE).await,
+            interrupted
+                .child
+                .wait_group_empty_except_leader(CLEANUP_GRACE)
+                .await,
             Ok(true)
         );
         if !final_quiescent {
             io.stdout_result = Some(Ok(Ok(stdout)));
             return settle_interrupted(
-                InterruptedProcess {
-                    child: &mut child,
-                    observer: observer.as_ref(),
-                    custody,
-                    stop: StopReason::Unknown(ProcessUncertainty::Quiescence),
-                    status,
-                    root_exit_observed,
-                },
+                interrupted,
+                StopReason::Unknown(ProcessUncertainty::Quiescence),
                 io,
             )
             .await;
         }
         if let Some(stop) = pending_interruption(deadline, &cancellation) {
             io.stdout_result = Some(Ok(Ok(stdout)));
-            return settle_interrupted(
-                InterruptedProcess {
-                    child: &mut child,
-                    observer: observer.as_ref(),
-                    custody,
-                    stop,
-                    status,
-                    root_exit_observed,
-                },
-                io,
-            )
-            .await;
+            return settle_interrupted(interrupted, stop, io).await;
         }
     }
 
@@ -564,12 +511,15 @@ where
     }
 }
 
-async fn settle_interrupted(interrupted: InterruptedProcess<'_>, io: ProcessIo) -> ProcessOutcome {
+async fn settle_interrupted(
+    interrupted: InterruptedProcess<'_>,
+    stop: StopReason,
+    io: ProcessIo,
+) -> ProcessOutcome {
     let InterruptedProcess {
         child,
         observer,
         custody,
-        stop,
         mut status,
         root_exit_observed,
     } = interrupted;

@@ -1853,43 +1853,13 @@ async fn run_owned_git(
     }
     let mut child = OwnedChild::spawn(command)?;
     let Some(stdout) = child.take_stdout() else {
-        let (exit_code, quiescent, quiescence_class) = stop_owned_child(&mut child).await;
-        return Ok(ProcessResult {
-            exit_code,
-            stdout: Vec::new(),
-            stderr_len: 0,
-            #[cfg(test)]
-            stderr: Vec::new(),
-            quiescent,
-            quiescence_class,
-            interrupted: true,
-        });
+        return Ok(stop_owned_child(&mut child).await);
     };
     let Some(stderr) = child.take_stderr() else {
-        let (exit_code, quiescent, quiescence_class) = stop_owned_child(&mut child).await;
-        return Ok(ProcessResult {
-            exit_code,
-            stdout: Vec::new(),
-            stderr_len: 0,
-            #[cfg(test)]
-            stderr: Vec::new(),
-            quiescent,
-            quiescence_class,
-            interrupted: true,
-        });
+        return Ok(stop_owned_child(&mut child).await);
     };
     let Some(mut stdin) = child.take_stdin() else {
-        let (exit_code, quiescent, quiescence_class) = stop_owned_child(&mut child).await;
-        return Ok(ProcessResult {
-            exit_code,
-            stdout: Vec::new(),
-            stderr_len: 0,
-            #[cfg(test)]
-            stderr: Vec::new(),
-            quiescent,
-            quiescence_class,
-            interrupted: true,
-        });
+        return Ok(stop_owned_child(&mut child).await);
     };
     let input = input.to_vec();
     let captured = async {
@@ -1936,19 +1906,7 @@ async fn run_owned_git(
                 interrupted: false,
             })
         }
-        Some(Ok(Err(_))) | Some(Err(_)) | None => {
-            let (exit_code, quiescent, quiescence_class) = stop_owned_child(&mut child).await;
-            Ok(ProcessResult {
-                exit_code,
-                stdout: Vec::new(),
-                stderr_len: 0,
-                #[cfg(test)]
-                stderr: Vec::new(),
-                quiescent,
-                quiescence_class,
-                interrupted: true,
-            })
-        }
+        Some(Ok(Err(_))) | Some(Err(_)) | None => Ok(stop_owned_child(&mut child).await),
     }
 }
 
@@ -2017,12 +1975,23 @@ async fn wait_owned_child(
     }
 }
 
-async fn stop_owned_child(child: &mut OwnedChild) -> (Option<i32>, bool, Option<&'static str>) {
+async fn stop_owned_child(child: &mut OwnedChild) -> ProcessResult {
     let _ = child.terminate();
-    match timeout_at(Instant::now() + GIT_CLEANUP_TIME, wait_owned_child(child)).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => (None, false, quiescence_class_for(&Err(error))),
-        Err(_) => (None, false, Some("timeout")),
+    let (exit_code, quiescent, quiescence_class) =
+        match timeout_at(Instant::now() + GIT_CLEANUP_TIME, wait_owned_child(child)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => (None, false, quiescence_class_for(&Err(error))),
+            Err(_) => (None, false, Some("timeout")),
+        };
+    ProcessResult {
+        exit_code,
+        stdout: Vec::new(),
+        stderr_len: 0,
+        #[cfg(test)]
+        stderr: Vec::new(),
+        quiescent,
+        quiescence_class,
+        interrupted: true,
     }
 }
 
