@@ -102,12 +102,49 @@ The optional public `workspace_phase`, `branch`, `base_ref` and `base_oid` are r
 the sole managed workspace row, including when another Agent shares its path. They are
 not duplicated Agent columns. No managed row means these projections are absent.
 
+### Process custody identity
+
+The Store's current custody namespace is minted for its stable Store identity and
+canonical data-directory path. Opening a backup or moved Store at a different canonical
+directory re-mints that namespace before new generations can dispatch. The stable Store
+identity (also used by inference clients) does not change. Canonical aliases of the same
+directory keep the binding. In-memory Stores retain their own independent binding.
+
+Start dispatch commits the current namespace on the exact Agent generation before any
+plugin process is created. Read-only restart checks use that recorded namespace even
+after a directory move or copy. Force-stop may terminate that named Job only when the
+recorded namespace equals the Store's current `custody_namespace()`. Otherwise it
+returns `process_custody_foreign`, leaves the Job untouched and settles unknown without
+replaying the command. Agent Jobs are kill-on-close and only their owning daemon holds
+custody, so a live Job under an older namespace belongs to another running daemon.
+
+The first v52 open always mints a new current namespace, including on the original
+production directory: a v51 backup cannot be distinguished from the original. Migration
+first records findable existing generations' legacy namespace (the stable Store identity),
+preserving their names for read-only restart probing. This re-mint does not alter their
+recorded namespace or their live Jobs. A legacy generation without a recorded/findable
+name keeps custody unknown.
+
+A Job creation conflict (`process_custody_conflict`), validation, environment or directory
+preparation error before OS spawn is a definite failed start with origin `swarm`, its
+original typed reason and a plain explanation in `why`. The host carries the no-spawn
+proof separately from generic errors; Store checks the exact dispatched start and
+generation before failing it, closing unstarted sources and releasing its reservation
+in the same transaction. Errors after a child may have been created retain their
+ordinary uncertainty until owned process exit and reader drain are proven. A conflicting
+existing Job is never adopted or terminated by this failed start.
+If Store rejects the no-spawn proof, ordinary plugin-error settlement records unknown
+and retains capacity; a concurrent authoritative terminal settlement is preserved.
+A successful no-spawn settlement clears that generation's recorded custody name, so it cannot
+authorize a later force-stop of the conflicting Job.
+
 ### States and reducer
 
 | Input | Result |
 | --- | --- |
 | first launch/attach admission | created, generation 0 |
 | controlled start dispatch | target generation, starting |
+| proven refusal before any plugin process is spawned | start command failed, Agent failed; retire unstarted sources and release capacity atomically |
 | exact controlled ready snapshot | reported idle/busy/waiting |
 | observe attach dispatch and exact identity readback | target generation, unknown until current native state is proven |
 | lost start reply without proven endpoint and owner cleanup | starting, start command unknown |
@@ -122,6 +159,7 @@ not duplicated Agent columns. No managed row means these projections are absent.
 An open stop/transition is a command beside the observed state, not another state
 machine. Generation transition blocks ordinary turn work. Terminal settlement cancels
 undispatched work, revokes token/own identity, releases claims and pauses Goals atomically.
+
 The handoff brief gate preserves withheld successor SENDs across automatic native loss
 and restart until Owner resolution or cancellation; explicit lifecycle cancellation
 retains its ordinary no-effect behavior (see [Handoff](coordination.md#handoff)).

@@ -1,5 +1,186 @@
 use super::*;
 
+#[cfg(windows)]
+#[test]
+fn custody_binding_preserves_windows_case_and_junction_aliases() {
+    let root = std::env::temp_dir().join(format!("eliot-custody-alias-{}", Ulid::new()));
+    let dir = root.join("MixedCaseData");
+    fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir.join("eliot.db")).unwrap();
+    let namespace = store.custody_namespace().unwrap();
+    drop(store);
+    let case_alias = PathBuf::from(dir.to_str().unwrap().to_ascii_uppercase());
+    let store = Store::open(&case_alias.join("eliot.db")).unwrap();
+    assert_eq!(store.custody_namespace().unwrap(), namespace);
+    drop(store);
+
+    let junction = root.join("junction");
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&dir)
+        .output()
+        .unwrap();
+    if output.status.success() {
+        let store = Store::open(&junction.join("eliot.db")).unwrap();
+        assert_eq!(store.custody_namespace().unwrap(), namespace);
+        drop(store);
+        fs::remove_dir(&junction).unwrap();
+    } else {
+        eprintln!(
+            "junction alias unavailable on this host: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn custody_binding_preserves_non_utf8_data_directories() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = std::env::temp_dir().join(format!("eliot-custody-bytes-{}", Ulid::new()));
+    let dir = root.join(std::ffi::OsString::from_vec(b"data-\xff".to_vec()));
+    fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir.join("eliot.db")).unwrap();
+    let namespace = store.custody_namespace().unwrap();
+    drop(store);
+    let store = Store::open(&dir.join("eliot.db")).unwrap();
+    assert_eq!(store.custody_namespace().unwrap(), namespace);
+    drop(store);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn backup_at_another_data_dir_has_its_own_namespace_for_the_same_next_generation() {
+    let root = std::env::temp_dir().join(format!("eliot-custody-copy-{}", Ulid::new()));
+    let a = root.join("a");
+    let b = root.join("b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    let mut original = Store::open(&a.join("eliot.db")).unwrap();
+    original
+        .connection
+        .execute("VACUUM INTO ?1", [b.join("eliot.db").to_str().unwrap()])
+        .unwrap();
+    let mut copy = Store::open(&b.join("eliot.db")).unwrap();
+    assert_eq!(
+        original.inference_controller_id().unwrap(),
+        copy.inference_controller_id().unwrap()
+    );
+    assert_ne!(
+        original.custody_namespace().unwrap(),
+        copy.custody_namespace().unwrap()
+    );
+    let now = Ulid::new().timestamp_ms() as i64;
+    let mut generations = Vec::new();
+    for store in [&mut original, &mut copy] {
+        let launch = capacity_launch_request("copy", "copy", json!([]));
+        let id = launch.id.clone();
+        let agent = store
+            .submit("owner", launch, now)
+            .unwrap()
+            .command
+            .target
+            .unwrap();
+        store.dispatch(&id, now).unwrap();
+        generations.push((
+            agent.clone(),
+            store
+                .generation_custody_namespace(&agent, 1)
+                .unwrap()
+                .unwrap(),
+        ));
+    }
+    assert_eq!(generations[0].0, generations[1].0);
+    assert_ne!(generations[0].1, generations[1].1);
+    drop((original, copy));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn retained_namespace_survives_restart_copy_and_pruned_start_event() {
+    let root = std::env::temp_dir().join(format!("eliot-custody-retained-{}", Ulid::new()));
+    let a = root.join("a");
+    let b = root.join("b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    let path = a.join("eliot.db");
+    let mut store = Store::open(&path).unwrap();
+    let namespace = store.custody_namespace().unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let launch = capacity_launch_request("retained-copy", "copy", json!([]));
+    let id = launch.id.clone();
+    let agent = store
+        .submit("owner", launch, now)
+        .unwrap()
+        .command
+        .target
+        .unwrap();
+    store.dispatch(&id, now).unwrap();
+    store.recover_on_restart(now + 1).unwrap();
+    store
+        .connection
+        .execute("DELETE FROM events WHERE kind='agent.starting'", [])
+        .unwrap();
+    store
+        .connection
+        .execute("VACUUM INTO ?1", [b.join("eliot.db").to_str().unwrap()])
+        .unwrap();
+    drop(store);
+    let original = Store::open(&a.join(".").join("eliot.db")).unwrap();
+    assert_eq!(original.custody_namespace().unwrap(), namespace);
+    let copy = Store::open(&b.join("eliot.db")).unwrap();
+    assert_ne!(copy.custody_namespace().unwrap(), namespace);
+    for store in [&original, &copy] {
+        assert_eq!(
+            store.generation_custody_namespace(&agent, 1).unwrap(),
+            Some(namespace.clone())
+        );
+        assert_eq!(
+            store.restart_retained_generations(None).unwrap()[0]
+                .custody_namespace
+                .as_deref(),
+            Some(namespace.as_str())
+        );
+        assert_eq!(store.generation_custody_namespace(&agent, 2).unwrap(), None);
+    }
+    drop((original, copy));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn schema_51_upgrade_records_the_legacy_generation_name_before_reminting() {
+    let path = capacity_store_path();
+    let mut store = Store::open(&path).unwrap();
+    let old_namespace = store.inference_controller_id().unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let launch = capacity_launch_request("legacy-named", "copy", json!([]));
+    let id = launch.id.clone();
+    let agent = store
+        .submit("owner", launch, now)
+        .unwrap()
+        .command
+        .target
+        .unwrap();
+    store.dispatch(&id, now).unwrap();
+    store.connection.execute_batch("DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace; DELETE FROM schema_migrations WHERE version=52;").unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let git_hints_index: bool = store.connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='events_git_hints')", [], |row| row.get(0)).unwrap();
+    assert!(
+        git_hints_index,
+        "schema51 index survives the custody upgrade"
+    );
+    assert_ne!(store.custody_namespace().unwrap(), old_namespace);
+    assert_eq!(
+        store.generation_custody_namespace(&agent, 1).unwrap(),
+        Some(old_namespace)
+    );
+    drop(store);
+    remove_capacity_store_files(&path);
+}
+
 #[test]
 fn configured_capacity_scopes_are_reserved_atomically_and_retries_are_idempotent() {
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
@@ -382,7 +563,7 @@ fn verified_restart_closure_releases_only_the_retained_lost_generation() {
         (retained[0].agent.as_str(), retained[0].generation),
         (agent.as_str(), 1)
     );
-    assert!(retained[0].named_custody);
+    assert!(retained[0].custody_namespace.is_some());
     assert!(retained[0].processes.is_empty());
     assert!(
         store
@@ -466,8 +647,11 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP INDEX events_git_hints;
-             DROP INDEX processes_live_owner;
+            "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+                 DELETE FROM schema_migrations WHERE version=52;
+                 DROP INDEX events_git_hints;
+                 DELETE FROM schema_migrations WHERE version=51;
+                 DROP INDEX processes_live_owner;
              DELETE FROM schema_migrations WHERE version=50;
              DROP INDEX events_heavy_agent_generation;
              DELETE FROM schema_migrations WHERE version=49;
@@ -568,7 +752,7 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         .restart_retained_generations(None)
         .expect("read retained generations");
     assert_eq!(retained.len(), 1);
-    assert!(!retained[0].named_custody);
+    assert!(retained[0].custody_namespace.is_none());
     assert!(!store.custody_namespace().expect("namespace").is_empty());
     drop(store);
     remove_capacity_store_files(&path);

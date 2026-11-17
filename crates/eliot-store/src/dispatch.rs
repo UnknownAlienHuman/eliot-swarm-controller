@@ -95,6 +95,7 @@ fn dispatch_launch_tx(
     let changed = db!(tx.execute(
         "UPDATE agents SET generation = 1, state = 'starting', token = ?1,
                                  updated_at = ?2,
+                                 custody_namespace = (SELECT namespace FROM custody_binding WHERE singleton = 1),
                                  profile_snapshot = COALESCE(?3, profile_snapshot)
              WHERE id = ?4 AND generation = 0 AND state = 'created'",
         params![token, now, snapshot, agent_num],
@@ -233,7 +234,8 @@ fn dispatch_resume_tx(
     let changed = db!(tx.execute(
         "UPDATE agents
          SET generation = ?1, state = 'starting', active_turn = NULL,
-             pending = '[]', token = ?2, updated_at = ?3
+             pending = '[]', token = ?2, updated_at = ?3,
+             custody_namespace = (SELECT namespace FROM custody_binding WHERE singleton = 1)
          WHERE id = ?4 AND generation = ?5
            AND state IN ('stopped', 'failed', 'lost')
            AND active_turn IS NULL AND native_scope = ?6 AND native_ref = ?7",

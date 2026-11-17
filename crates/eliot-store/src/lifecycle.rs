@@ -7,6 +7,7 @@ impl Store {
         state: CommandState,
         outcome: Option<Value>,
         now: i64,
+        start_not_spawned: bool,
     ) -> Result<Change<Command>> {
         validate_settle_outcome(state, &outcome)?;
         let tx = self
@@ -28,6 +29,50 @@ impl Store {
                 "bad_state",
                 "command state transition is not allowed for ordinary settlement",
             ));
+        }
+        if start_not_spawned {
+            let agent_num = record
+                .target
+                .ok_or_else(|| Error::new("bad_state", "unspawned start has no Agent"))?;
+            let generation = record
+                .command
+                .generation
+                .ok_or_else(|| Error::new("bad_state", "unspawned start has no generation"))?;
+            let agent = load_agent_by_num(&tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", "unspawned Agent was not found"))?;
+            let has_processes: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM processes WHERE owner=?1)",
+                    [format!("agent:{}#{generation}", agent.id)],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if state != CommandState::Failed
+                || record.state != CommandState::Dispatched
+                || !matches!(record.command.verb.as_str(), "launch" | "resume")
+                || agent.generation != generation
+                || agent.state != AgentState::Starting
+                || has_processes
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "unspawned start proof does not match the current starting generation",
+                ));
+            }
+            tx.execute(
+                "UPDATE source_state SET state='closed', health='error', updated_at=?1
+                WHERE agent=?2 AND generation=?3 AND source NOT IN ('git','workspace_process')",
+                params![now, agent_num, generation],
+            )
+            .map_err(sql_error)?;
+            // This generation never owned a Job. In particular a conflicting
+            // existing name must not authorize a later force-stop of its owner.
+            tx.execute(
+                "UPDATE agents SET custody_namespace=NULL WHERE id=?1 AND generation=?2",
+                params![agent_num, generation],
+            )
+            .map_err(sql_error)?;
+            capacity::release_unstarted_tx(&tx, agent_num, generation, id)?;
         }
         if state == CommandState::Applied
             && record.command.verb == "send"

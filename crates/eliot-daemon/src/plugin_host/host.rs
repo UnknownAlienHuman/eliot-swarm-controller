@@ -10,6 +10,7 @@ use crate::bus::Bus;
 use crate::common::{now_ms, valid_environment_name};
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
+use crate::platform::custody::AgentSpawnError;
 use actor::run_agent_inner;
 use eliot_core::{
     Agent, Command, ContextItem, Error, InjectArgs, InjectPoint, Result, SecretPolicy, SourceBatch,
@@ -62,6 +63,12 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// stop, and so `agent.delete`, for 5 s.
 const FAMILY_GRACE: Duration = Duration::from_secs(1);
 const MAX_PENDING_SNAPSHOT_READS: usize = 1;
+
+#[derive(Debug)]
+pub(crate) enum StartError {
+    NotSpawned(Error),
+    Uncertain(Error),
+}
 
 #[derive(Clone, Copy)]
 struct StopDeadlines {
@@ -371,7 +378,27 @@ impl PluginHost {
         &self,
         agent: Agent,
         command: Command,
+        source_state: Option<Value>,
+    ) -> std::result::Result<Value, StartError> {
+        let mut may_have_spawned = false;
+        self.start_inner(agent, command, source_state, &mut may_have_spawned).await.map_err(|error| {
+            if may_have_spawned {
+                StartError::Uncertain(error)
+            } else {
+                StartError::NotSpawned(error.with_where("swarm.start.pre_spawn").with_origin(
+                    eliot_core::FailureOrigin::Swarm,
+                    "Swarm refused this generation before creating any OS child; no native effect was dispatched",
+                ))
+            }
+        })
+    }
+
+    async fn start_inner(
+        &self,
+        agent: Agent,
+        command: Command,
         mut source_state: Option<Value>,
+        may_have_spawned: &mut bool,
     ) -> Result<Value> {
         let launch_started = Instant::now();
         if agent.observe_only {
@@ -449,6 +476,7 @@ impl PluginHost {
         {
             let running = self.state.running.lock_recover();
             if running.contains_key(&key) {
+                *may_have_spawned = true;
                 return Err(Error::new(
                     "bad_state",
                     "an owned plugin already exists for this Agent generation",
@@ -497,6 +525,7 @@ impl PluginHost {
         }
         // Another startup may have registered while this one waited for the gate.
         if self.state.running.lock_recover().contains_key(&key) {
+            *may_have_spawned = true;
             return Err(Error::new(
                 "bad_state",
                 "an owned plugin already exists for this Agent generation",
@@ -537,10 +566,19 @@ impl PluginHost {
         let spawn_started = Instant::now();
         let spawned = self.spawn_plugin(&agent, &instance_dir).await;
         let mut child = match spawned {
-            Ok(child) => child,
+            Ok(child) => {
+                *may_have_spawned = true;
+                child
+            }
             Err(error) => {
                 remove_empty_instance_dir(&instance_dir);
-                return Err(error);
+                return Err(match error {
+                    AgentSpawnError::NotSpawned(error) => error,
+                    AgentSpawnError::Uncertain(error) => {
+                        *may_have_spawned = true;
+                        error
+                    }
+                });
             }
         };
         let spawned_at = Instant::now();
@@ -1222,13 +1260,30 @@ impl PluginHost {
         Ok((instance_dir, credential))
     }
 
-    async fn spawn_plugin(&self, agent: &Agent, _instance_dir: &Path) -> Result<OwnedChild> {
-        let workspace = agent
-            .workspace
-            .as_deref()
-            .ok_or_else(|| Error::new("invalid", "Agent launch requires a workspace"))?;
-        let namespace = self.state.store.lock().await.custody_namespace()?;
-        let command = self.plugin_command(&agent.harness, Path::new(workspace))?;
+    async fn spawn_plugin(
+        &self,
+        agent: &Agent,
+        _instance_dir: &Path,
+    ) -> std::result::Result<OwnedChild, AgentSpawnError> {
+        let workspace = agent.workspace.as_deref().ok_or_else(|| {
+            AgentSpawnError::NotSpawned(Error::new("invalid", "Agent launch requires a workspace"))
+        })?;
+        let namespace = self
+            .state
+            .store
+            .lock()
+            .await
+            .generation_custody_namespace(&agent.id, agent.generation)
+            .map_err(AgentSpawnError::NotSpawned)?
+            .ok_or_else(|| {
+                AgentSpawnError::NotSpawned(Error::new(
+                    "process_custody_unrecorded",
+                    "Agent generation has no recorded custody namespace",
+                ))
+            })?;
+        let command = self
+            .plugin_command(&agent.harness, Path::new(workspace))
+            .map_err(AgentSpawnError::NotSpawned)?;
         OwnedChild::spawn_agent(command, &namespace, &agent.id, agent.generation)
     }
 
@@ -1303,7 +1358,17 @@ impl PluginHost {
             // Source EOF can remove routing before the actor finishes draining.
             // Publish planned exit under the same Store lock used by loss
             // settlement so it cannot turn this stop Unknown in that race.
-            let namespace = store.custody_namespace()?;
+            let namespace = store
+                .generation_custody_namespace(&agent.id, agent.generation)?
+                .ok_or_else(|| {
+                    Error::new("unknown", "generation custody namespace was not recorded")
+                })?;
+            if namespace != store.custody_namespace()? {
+                return Err(Error::new(
+                    "process_custody_foreign",
+                    "generation custody belongs to another data-directory binding; its Job was left untouched",
+                ));
+            }
             let guard = ForceStopGuard::new(&self.state, key)?;
             (namespace, guard)
         };
@@ -5489,6 +5554,9 @@ mod tests {
             .start(agent, launch_command_for(&agent_id, 1), None)
             .await
             .unwrap_err();
+        let StartError::NotSpawned(error) = error else {
+            panic!("expected definite pre-spawn failure")
+        };
         assert_eq!(error.code, "bad_state");
         assert!(
             plugin_dir_entries(&data_root).is_empty(),
@@ -5528,6 +5596,9 @@ mod tests {
             .start(agent, launch_command_for(&agent_id, 1), None)
             .await
             .unwrap_err();
+        let StartError::NotSpawned(error) = error else {
+            panic!("expected definite pre-spawn failure")
+        };
         assert_eq!(error.code, "source_integrity");
         assert!(
             error.message.contains("does not match the Agent"),

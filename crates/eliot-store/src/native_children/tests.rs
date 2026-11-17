@@ -1741,7 +1741,7 @@ fn assert_restart_retained_generation(store: &Store, root: &str) {
         (retained[0].agent.as_str(), retained[0].generation),
         (root, 1)
     );
-    assert!(retained[0].named_custody);
+    assert!(retained[0].custody_namespace.is_some());
     assert!(retained[0].processes.is_empty());
 }
 

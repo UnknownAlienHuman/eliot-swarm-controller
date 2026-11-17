@@ -183,13 +183,11 @@ async fn run_owned(
     };
     router.note_events(&recovered);
     logging::record(&policy, "daemon.recovered", &[], None);
-    let namespace = store.lock().await.custody_namespace()?;
     let capacity = restart_capacity::Reconcile {
         store: Arc::clone(&store),
         bus: bus.clone(),
         router: router.clone(),
         policy: Arc::clone(&policy),
-        namespace,
     };
     let report = restart_capacity::reconcile_first_pass(&capacity).await?;
     logging::record(&policy, "daemon.capacity_reconciled", &[], None);

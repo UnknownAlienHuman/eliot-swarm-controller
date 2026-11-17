@@ -1199,10 +1199,14 @@ identities recorded for owner `agent:<id>#<generation>`. It checks custody outsi
 Store lock, then commits the closure and `capacity.released` (or the transfer to an
 admitted resume) in one Store transaction conditional on `capacity_generation` still
 equaling that generation. Generations it cannot settle are rechecked every two seconds;
-no new generation of this daemon is ever among them. The only persisted custody identity
-added for this path is a random per-database namespace (`store_identity`): Windows names
-each Agent generation's kill-on-close Job `Global\eliot-<namespace>-<agent>-<generation>`
-before the suspended plugin starts, and never adopts an existing object of that name.
+no new generation of this daemon is ever among them. A random custody namespace is bound
+to the stable Store identity and canonical data directory (`custody_binding`). A copied
+or moved Store re-mints the current namespace on open. Dispatch records the namespace
+on each Agent generation, so retained generations keep their original names across
+restarts and re-binding. See [custody identity](core.md#process-custody-identity).
+Windows names each generation's kill-on-close Job
+`Global\eliot-<namespace>-<agent>-<generation>` before the suspended plugin starts,
+and never adopts an existing object of that name.
 
 Closure and source coverage are independent. Restart already closes the lost
 generation's native sources as `stale`; a successor's source handoff records any gap for

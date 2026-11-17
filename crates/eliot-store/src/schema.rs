@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 51;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 52;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1212,6 +1212,27 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 52 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE custody_binding (
+                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                     store_id TEXT NOT NULL, data_dir BLOB NOT NULL, namespace TEXT NOT NULL
+                 );
+                 ALTER TABLE agents ADD COLUMN custody_namespace TEXT;
+                 UPDATE agents SET custody_namespace = (SELECT id FROM store_identity WHERE singleton = 1)
+                   WHERE observe_only = 0 AND EXISTS (
+                     SELECT 1 FROM events WHERE events.agent = agents.id
+                       AND events.generation = agents.generation AND kind = 'agent.starting'
+                       AND seq > (SELECT since_seq FROM store_identity WHERE singleton = 1)
+                   );
+                 INSERT INTO schema_migrations(version) VALUES (52);"
+            ).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1226,7 +1247,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
+                "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+                 DELETE FROM schema_migrations WHERE version=52;
+                 DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
                  DROP INDEX processes_live_owner;
              DELETE FROM schema_migrations WHERE version=50;
              INSERT INTO processes(host_boot_id,pid,start_time,owner,role,state,updated_at) VALUES
@@ -1281,7 +1304,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
+                "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+                 DELETE FROM schema_migrations WHERE version=52;
+                 DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
                  DROP INDEX processes_live_owner;
                  DELETE FROM schema_migrations WHERE version=50;
                  DROP INDEX events_heavy_agent_generation;
@@ -1321,7 +1346,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
+                "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+                 DELETE FROM schema_migrations WHERE version=52;
+                 DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
                  DROP INDEX processes_live_owner;
                  DELETE FROM schema_migrations WHERE version=50;
                  DROP INDEX events_heavy_agent_generation;
@@ -1404,7 +1431,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
+                "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+                 DELETE FROM schema_migrations WHERE version=52;
+                 DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
                  DROP INDEX processes_live_owner;
                  DELETE FROM schema_migrations WHERE version=50;
                  DROP INDEX events_heavy_agent_generation;

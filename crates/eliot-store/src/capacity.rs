@@ -12,9 +12,9 @@ const RETAINED_PAGE_SIZE: i64 = 128;
 pub struct RetainedGeneration {
     pub agent: String,
     pub generation: i64,
-    /// The generation started after this Store had a custody namespace, so
-    /// its custody was created under the name derived from it.
-    pub named_custody: bool,
+    /// Namespace committed for this exact generation, independent of the
+    /// current data directory's namespace. None means legacy unnamed custody.
+    pub custody_namespace: Option<String>,
     /// Custody-relevant records only: processes not yet proven exited, plugin
     /// leaders, and one exited witness per boot identity.
     pub processes: Vec<RecordedProcess>,
@@ -31,16 +31,90 @@ pub struct RecordedProcess {
 }
 
 impl Store {
-    /// Random per-database namespace for OS custody names. A later daemon finds
-    /// a previous generation's custody from it without storing another name.
+    /// Current namespace, bound to this Store identity and canonical data dir.
+    /// Existing generations use their separately recorded namespace.
     pub fn custody_namespace(&self) -> Result<String> {
         self.connection
+            .query_row(
+                "SELECT namespace FROM custody_binding WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    pub fn generation_custody_namespace(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT custody_namespace FROM agents WHERE id = ?1 AND generation = ?2",
+                params![parse_agent_id(agent)?, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+            .map(Option::flatten)
+    }
+
+    pub(super) fn bind_custody_namespace(&mut self, path: &Path) -> Result<()> {
+        let data_dir = if path == Path::new(":memory:") {
+            b":memory:".to_vec()
+        } else {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            let canonical = std::fs::canonicalize(parent).map_err(|error| {
+                Error::new(
+                    "platform_io",
+                    format!("canonicalize Store data directory: {error}"),
+                )
+            })?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStrExt;
+                canonical
+                    .as_os_str()
+                    .encode_wide()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>()
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                canonical.as_os_str().as_bytes().to_vec()
+            }
+            #[cfg(not(any(windows, unix)))]
+            {
+                canonical
+                    .to_str()
+                    .ok_or_else(|| Error::new("invalid", "unsupported Store path encoding"))?
+                    .as_bytes()
+                    .to_vec()
+            }
+        };
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let store_id: String = tx
             .query_row(
                 "SELECT id FROM store_identity WHERE singleton = 1",
                 [],
                 |row| row.get(0),
             )
-            .map_err(sql_error)
+            .map_err(sql_error)?;
+        tx.execute(
+            "INSERT INTO custody_binding(singleton, store_id, data_dir, namespace) VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(singleton) DO UPDATE SET store_id=excluded.store_id,
+               data_dir=excluded.data_dir, namespace=excluded.namespace
+             WHERE custody_binding.store_id != excluded.store_id OR custody_binding.data_dir != excluded.data_dir",
+            params![store_id, data_dir, Ulid::new().to_string()],
+        ).map_err(sql_error)?;
+        commit_transaction(tx, &self.write_faulted)
     }
 
     /// Authoritative owned-exit proof: physical exit plus the plugin host's
@@ -61,7 +135,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, generation FROM agents
+                "SELECT id, generation, custody_namespace FROM agents
                  WHERE id > ?1 AND observe_only = 0 AND state IN ('lost', 'stopped')
                    AND capacity_generation = generation
                  ORDER BY id LIMIT ?2",
@@ -69,20 +143,14 @@ impl Store {
             .map_err(sql_error)?;
         let agents = statement
             .query_map(params![after, RETAINED_PAGE_SIZE], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(sql_error)?;
-        let mut named = self
-            .connection
-            .prepare(
-                "SELECT EXISTS(
-                     SELECT 1 FROM events
-                     WHERE agent = ?1 AND generation = ?2 AND kind = 'agent.starting'
-                       AND seq > (SELECT since_seq FROM store_identity WHERE singleton = 1)
-                 )",
-            )
             .map_err(sql_error)?;
         let mut processes = self
             .connection
@@ -107,10 +175,7 @@ impl Store {
             )
             .map_err(sql_error)?;
         let mut retained = Vec::with_capacity(agents.len());
-        for (agent_num, generation) in agents {
-            let named_custody = named
-                .query_row(params![agent_num, generation], |row| row.get(0))
-                .map_err(sql_error)?;
+        for (agent_num, generation, custody_namespace) in agents {
             let agent = format_agent_id(agent_num);
             let owner = format!("agent:{agent}#{generation}");
             let mut rows = processes
@@ -137,7 +202,7 @@ impl Store {
             retained.push(RetainedGeneration {
                 agent,
                 generation,
-                named_custody,
+                custody_namespace,
                 processes: rows,
                 processes_truncated,
             });
