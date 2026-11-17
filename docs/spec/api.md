@@ -654,7 +654,9 @@ process, source or artifact, and stops nothing. Unarchive needs no drain. The fl
 durable. Admission of send, resume, steer or inject atomically unarchives its
 target, including selector members, so new activity appears in the default list.
 `agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;
-totals and cursors use the same filter. Summaries and full Agents expose `archived`.
+totals and cursors use the same filter. The default also lists an archived ended
+(stopped, failed or lost) Agent while its custody is unresolved, as when an archived
+idle Agent is lost with its process left running; `"only"` lists it too. Summaries and full Agents expose `archived`.
 CLI: `swarm archive aN`, `swarm unarchive aN`, `swarm ls --archived include`.
 
 `agent.delete {id, agent:"aN"}` is Owner-only and removes a tree whose Agents are

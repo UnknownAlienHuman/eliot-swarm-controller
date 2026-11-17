@@ -718,6 +718,38 @@ fn list_filters_match_projection_and_report_counts_honestly() {
 }
 
 #[test]
+fn default_list_admits_only_ended_archived_rows() {
+    let row = |state, archived| {
+        let mut summary = summary();
+        summary.state = state;
+        summary.archived = archived;
+        AgentListResponse {
+            agents: vec![AgentListRow {
+                summary,
+                observation: None,
+            }],
+            next: Some("a1".to_owned()),
+            total: 1,
+            truncated: false,
+        }
+    };
+    let default = AgentListRequest::default();
+    // An archived ended Agent with unresolved custody stays in the default
+    // list; an archived live one never does.
+    for state in [AgentState::Lost, AgentState::Failed, AgentState::Stopped] {
+        default.validate_response(&row(state, true)).unwrap();
+    }
+    unknown(default.validate_response(&row(AgentState::Idle, true)));
+    let only = AgentListRequest {
+        archived: crate::api::ArchivedFilter::Only,
+        ..Default::default()
+    };
+    only.validate_response(&row(AgentState::Lost, true))
+        .unwrap();
+    unknown(only.validate_response(&row(AgentState::Lost, false)));
+}
+
+#[test]
 fn list_pagination_requires_cursor_on_every_nonempty_page() {
     let request = AgentListRequest::default();
     let row = || AgentListRow {

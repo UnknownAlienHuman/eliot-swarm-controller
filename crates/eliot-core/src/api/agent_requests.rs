@@ -196,8 +196,12 @@ impl AgentListRequest {
             row.validate().is_err()
                 || !ids.insert(row.summary.id.clone())
                 || row.observation.is_some() != self.observations
+                // The default list keeps an archived ended Agent while its
+                // custody is unresolved (core.md); custody is not on the row.
                 || match self.archived {
-                    super::ArchivedFilter::Exclude => row.summary.archived,
+                    super::ArchivedFilter::Exclude => {
+                        row.summary.archived && !row.summary.state.is_terminal()
+                    }
                     super::ArchivedFilter::Only => !row.summary.archived,
                     super::ArchivedFilter::Include => false,
                 }

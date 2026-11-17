@@ -687,3 +687,64 @@ fn archiving_an_ended_agent_requires_drained_custody_and_names_the_blocker() {
         true
     );
 }
+
+#[test]
+fn an_archived_agent_lost_with_unresolved_custody_stays_in_the_default_list() {
+    use crate::AgentListFilter;
+    use eliot_core::api::ArchivedFilter;
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let list = |store: &Store, archived: ArchivedFilter| {
+        let page = store
+            .list_agent_summaries(
+                &AgentListFilter {
+                    archived,
+                    ..Default::default()
+                },
+                None,
+                20,
+                now,
+                &SessionGrowthThresholds::default(),
+            )
+            .unwrap();
+        let ids: Vec<String> = page.summaries.into_iter().map(|row| row.id).collect();
+        assert_eq!(page.total, ids.len());
+        ids
+    };
+    // An idle Agent keeps its live process when archived and leaves the
+    // default list.
+    let agent = ready_steer_agent(&mut store, "archive-loss", now);
+    insert_process(
+        &store,
+        "archive-boot",
+        4245,
+        1,
+        &format!("agent:{agent}#1"),
+        "running",
+    );
+    store
+        .change_agent_tree(&Ulid::new().to_string(), &agent, Some(true), now)
+        .unwrap();
+    assert!(list(&store, ArchivedFilter::Exclude).is_empty());
+    // A daemon restart loses the generation and leaves the process
+    // unresolved: the lost Agent shows in the default list, still archived.
+    store.recover_on_restart(now + 1).unwrap();
+    let lost = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(lost.state, AgentState::Lost);
+    assert!(lost.archived);
+    assert_eq!(
+        list(&store, ArchivedFilter::Exclude),
+        std::slice::from_ref(&agent)
+    );
+    assert_eq!(
+        list(&store, ArchivedFilter::Only),
+        std::slice::from_ref(&agent)
+    );
+    // Once the process is proven gone the archive hides it again.
+    store
+        .connection
+        .execute("UPDATE processes SET state='exited',exit_code=0", [])
+        .unwrap();
+    assert!(list(&store, ArchivedFilter::Exclude).is_empty());
+    assert_eq!(list(&store, ArchivedFilter::Only), [agent]);
+}

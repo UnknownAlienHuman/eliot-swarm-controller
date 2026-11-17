@@ -192,24 +192,29 @@ impl Store {
     }
 }
 
-/// First unresolved custody of an Agent across its generations, in words: an
+/// Unresolved custody of the Agent whose numeric id is the SQL expression
+/// `agent`, across its generations, one blocker in words per row: an
 /// unexited owned process, an `unknown` artifact or an open non-daemon
-/// source; Eliot's os, git and workspace-process observers count only with
-/// `observers` (delete's drain).
+/// source. Eliot's os, git and workspace-process observers count only where
+/// the SQL boolean `observers` holds (delete's drain). Archive's guard and
+/// the default `agent.list` filter share it.
+pub(crate) fn custody_blockers_sql(agent: &str, observers: &str) -> String {
+    format!(
+        "SELECT state||' '||role||' process '||pid||' ('||owner||')' FROM processes
+             WHERE state IN ('running','unknown')
+               AND (owner GLOB 'agent:a'||{agent}||'#*' OR owner GLOB 'workspace:a'||{agent}||'#*')
+         UNION ALL SELECT 'unknown artifact '||id FROM artifacts WHERE agent={agent} AND json_extract(body,'$.state')='unknown'
+         UNION ALL SELECT 'open '||source||' source (generation '||generation||')' FROM source_state
+             WHERE agent={agent} AND state='open' AND source!='daemon'
+               AND ({observers} OR source NOT IN ('os','git','workspace_process'))"
+    )
+}
+
+/// First unresolved custody of an Agent ([`custody_blockers_sql`]).
 fn custody_blocker_tx(tx: &Transaction<'_>, agent: i64, observers: bool) -> Result<Option<String>> {
-    let id = format_agent_id(agent);
     tx.query_row(
-        "SELECT state||' '||role||' process '||pid||' ('||owner||')' FROM processes WHERE (owner LIKE ?2 OR owner LIKE ?3) AND state!='exited'
-         UNION ALL SELECT 'unknown artifact '||id FROM artifacts WHERE agent=?1 AND json_extract(body,'$.state')='unknown'
-         UNION ALL SELECT 'open '||source||' source (generation '||generation||')' FROM source_state WHERE agent=?1 AND state='open' AND source!='daemon'
-             AND (?4 OR source NOT IN ('os','git','workspace_process'))
-         LIMIT 1",
-        params![
-            agent,
-            format!("agent:{id}#%"),
-            format!("workspace:{id}#%"),
-            observers
-        ],
+        &format!("{} LIMIT 1", custody_blockers_sql("?1", "?2")),
+        params![agent, observers],
         |row| row.get(0),
     )
     .optional()
