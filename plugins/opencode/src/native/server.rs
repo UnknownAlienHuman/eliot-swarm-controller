@@ -431,8 +431,9 @@ impl OwnedServer {
                     isolated_data_home: &data_dir,
                     reuse_existing: auth.reuse_existing,
                 },
-                // The transfer is the known slow pole (three sequential
-                // native CLI children): it shares the whole start envelope
+                // The transfer is the known slow pole (two concurrent
+                // canonical readers followed by the isolated importer):
+                // it shares the whole start envelope
                 // instead of a shorter private budget so loaded cold starts
                 // fail definite, never unknown-by-deadline.
                 envelope,

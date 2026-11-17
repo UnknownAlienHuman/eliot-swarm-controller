@@ -1,7 +1,7 @@
 # OpenCode
 
 L6 adapter for the installed OpenCode 2.2.7. Select one installed HTTP/SSE API
-generation from its OpenAPI document (`GET /doc` where supported); do not mix
+generation from its OpenAPI document (`GET /openapi.json` on installed 2.2.7); do not mix
 generations after a 404. Source:
 [anomalyco/opencode](https://github.com/anomalyco/opencode).
 
@@ -43,7 +43,11 @@ installed selector `openrouter` names ID `openrouter` (display name
 `OpenRouter`). The canonical `auth list` must show precisely one matched
 integration with `connections.len() == 1`; zero matches, several matches, or
 any other connection count refuses without fallback, and never all
-integrations are exported. The selected
+integrations are exported. Canonical list and the explicitly selected export
+run concurrently as independent reads under the same start deadline; both
+reader futures complete, including bounded cleanup attempts on failure,
+before the gate permits any isolated import. There is no cross-launch
+credential cache. The selected
 document moves opaquely, in memory only, from canonical `auth export
 <selector> --standalone` into isolated `auth import --standalone` under the
 exact per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME` roots the server receives
@@ -57,6 +61,21 @@ refuses. If an import outcome cannot be proven, it settles to success only
 after the original child is proven exited and an isolated-list readback proves
 the selected state; otherwise it stays `unknown`, no automatic retry is made,
 and no server is started. A transfer failure before any import write (refused or ambiguous canonical selection, unreadable export, or a missed deadline) is a definite failed start with a typed reason, never `unknown`.
+
+Startup emits metadata-only `opencode.start_step` records through the existing
+plugin debug channel: a static step name, wall-clock start and monotonic elapsed
+microseconds, bound by the host to the Agent generation. These cover frozen
+selector/environment admission, config/skill/hook files, each auth helper,
+port reservation, serve spawn/readiness and session setup. Helper spans can
+overlap; the enclosing transfer span measures the actual critical path.
+Credentials, helper output, environment values and config contents never
+enter these records. Standard logging discards them.
+
+MCP inventory settlement polls the installed `GET /api/mcp` status with a
+50 ms initial delay, doubling to a 1 s maximum for cold starts. Both reads
+and sleeps share the earlier of the 20 s settlement cap and start deadline;
+only a connected readback verifies MCP. A hot connection does not pay a
+fixed one-second delay after its first pending observation.
 
 ## Native identity and process mode
 

@@ -18,7 +18,8 @@
 //! prepares only the owner's explicitly selected integration in that
 //! private store: the canonical list must show the selection exactly once
 //! with exactly one credential for this current path (anything else refuses
-//! without fallback), then export pipes opaquely, in memory only, into
+//! without fallback). List and the selected export are independent reads;
+//! both finish before export pipes opaquely, in memory only, into
 //! import under the exact isolated roots the server will use. On explicit
 //! resume the isolated list is read first and a correctly present
 //! integration is reused without re-import; an unknown import outcome
@@ -190,7 +191,16 @@ pub async fn transfer_selected_integration(
             }
         }
     }
-    match canonical_gate(transfer, deadline).await? {
+    // Both helpers only read the canonical store. Overlap their native
+    // standalone-server startup, but await BOTH even on failure: try_join!
+    // would cancel the other helper before its bounded reap completes.
+    // Import still cannot start until the exact metadata gate and export
+    // have succeeded. Never cache credentials or export without a selector.
+    let (selection, exported) = tokio::join!(
+        canonical_gate(transfer, deadline),
+        export_selected(transfer, deadline),
+    );
+    match selection? {
         Gate::ExactlyOne => {}
         Gate::Absent | Gate::Ambiguous => {
             return Err(Error::new(
@@ -200,7 +210,7 @@ pub async fn transfer_selected_integration(
              .with_origin(eliot_core::FailureOrigin::Environment, "selected external credential is absent or ambiguous"));
         }
     }
-    let secret = export_selected(transfer, deadline).await?;
+    let secret = exported?;
     import_with_reconcile(transfer, &secret, deadline).await
 }
 
