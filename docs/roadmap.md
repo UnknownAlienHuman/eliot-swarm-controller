@@ -708,12 +708,14 @@ of the explicitly selected release scope.
       the count and what stays and why, then show progress and a result:
       Settings › Projects checks projects (Select all, Remove selected, Remove
       unused: no live task, and the folder gone or no task ever there) and
-      removes them in one revision-checked settings save, keeping one with a
-      live task; the Projects caption's "…" (everything) and each project's
-      menu archive every finished task and delete every stopped one through
-      `agent.archive`/`agent.delete` per tree, each refusal (an `unknown`
-      turn, a tree still stopping) reported per task, files and native
-      sessions kept; Worktrees & cleanup's "Select all safe" checks every
+      removes eligible selections in one revision-checked settings save. The
+      daemon refuses the save if any removed registration is in use. One-click
+      missing removal uses stale-project cleanup. The Projects caption's "…"
+      (everything) and each project's menu archive finished root trees or delete
+      stopped root trees, including archived roots for deletion. Scoped actions
+      use daemon-verified checkout membership. Delete confirms trees and affected
+      tasks. Each `agent.archive`/`agent.delete` tree refusal is reported, and
+      files and native sessions stay. Worktrees & cleanup's "Select all safe" checks every
       group with something safe to remove before `cleanup.apply`. (Refs #407)
 
 - [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider

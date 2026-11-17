@@ -343,8 +343,8 @@ impl DesktopApp {
             ));
         }
         // Each project, then its subprojects ("app" < "app › x"), as the
-        // sidebar lists them (registered checkouts and the worktrees tasks
-        // run in); a registered folder that is gone cannot start a task.
+        // sidebar lists them. The list comes from daemon registrations and
+        // verified checkouts, and an absent checkout cannot start a task.
         let checkouts = self.checkouts();
         let mut seen = HashSet::new();
         let mut projects: Vec<(String, String, String)> = checkouts
@@ -1248,6 +1248,7 @@ impl LaunchOutcome {
             } else {
                 self.submitted.workspace.clone()
             },
+            workspace: None,
             parent: None,
             updated_at: now,
             title: nav::title(&self.text).unwrap_or_else(|| self.agent.clone()),

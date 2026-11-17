@@ -807,15 +807,10 @@ impl DesktopApp {
             Target::Project {
                 collapsed,
                 checkouts,
+                checkout,
                 ..
             } => {
                 let mut entries = vec![
-                    (
-                        Action::NewTaskHere,
-                        "New task here".to_owned(),
-                        m3::glyph::NEW_TASK,
-                        false,
-                    ),
                     (
                         Action::OpenFolder,
                         "Open folder".to_owned(),
@@ -851,6 +846,17 @@ impl DesktopApp {
                         true,
                     ),
                 ];
+                if self.can_launch_here(checkout) {
+                    entries.insert(
+                        0,
+                        (
+                            Action::NewTaskHere,
+                            "New task here".to_owned(),
+                            m3::glyph::NEW_TASK,
+                            false,
+                        ),
+                    );
+                }
                 // Only a registered checkout can be forgotten.
                 if !self.registrations_in(checkouts).is_empty() {
                     entries.push((

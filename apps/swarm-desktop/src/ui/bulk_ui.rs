@@ -1,13 +1,14 @@
 //! Bulk actions (owner request 2026-11-17, k142): remove many project
 //! registrations at once, archive every finished task and delete every
-//! stopped task, for one project, one subproject or everything.
+//! stopped task tree, for one project, one subproject or everything.
 //!
 //! Each reads exactly what it would touch first (every `agent.list` page,
 //! `project.list`), then asks once, naming the count and what stays and
 //! why, then shows progress and a result. Projects leave through one
 //! revision-checked settings save (`config_client::remove_projects`, the
 //! settings writer); one with a live task is kept with its reason, never
-//! forced, and the live check runs again just before the save. Tasks go
+//! forced, and the daemon rechecks usage under the Store lock. Missing
+//! registrations go through the stale-project cleanup plan and apply. Tasks go
 //! through `agent.archive` / `agent.delete` one tree at a time, each with
 //! its own ledger-held mutation id, so a refusal (an `unknown` turn cannot
 //! be archived, a tree still stopping) is reported per task and an
@@ -17,6 +18,10 @@
 use super::*;
 use crate::nav::Checkout;
 use crate::theme::winui::Palette;
+use eliot_core::api::{
+    ArtifactKind, CleanupApplyRequest, CleanupApplyResponse, CleanupPlan, CleanupPlanRequest,
+    CleanupScope,
+};
 
 /// What a bulk action does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +63,7 @@ impl BulkOp {
                 eliot_core::count_words(count as u64, "finished task", "finished tasks")
             }
             Self::DeleteStopped => {
-                eliot_core::count_words(count as u64, "stopped task", "stopped tasks")
+                eliot_core::count_words(count as u64, "stopped tree", "stopped trees")
             }
         }
     }
@@ -91,6 +96,14 @@ pub(super) struct BulkItem {
 pub(super) struct BulkPlan {
     pub(super) items: Vec<BulkItem>,
     pub(super) kept: Vec<String>,
+    affected_tasks: usize,
+    missing_cleanup: Option<MissingCleanup>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MissingCleanup {
+    plan_id: String,
+    artifact_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,42 +187,25 @@ fn read_agents(data_dir: &Path, archived: Option<&str>) -> Result<Vec<UiAgent>, 
     Err("there are more tasks than one bulk action reads; try a single project".to_owned())
 }
 
-/// `checkouts` plus each Agent folder they do not hold that Git's files
-/// name as a checkout, so membership and usage are exact for every task.
-fn resolve_folders(mut checkouts: Vec<Checkout>, agents: &[UiAgent]) -> Vec<Checkout> {
-    let mut tried = HashSet::new();
-    for agent in agents {
-        let key = nav::path_key(&agent.project);
-        if agent.chat
-            || agent.project.trim().is_empty()
-            || nav::is_registered(&agent.project, &checkouts)
-            || !tried.insert(key)
-        {
-            continue;
-        }
-        if let Some((common, branch)) = checkout_git(nav::display_path(&agent.project)) {
-            checkouts.push(Checkout {
-                path: agent.project.clone(),
-                common_dir: common,
-                branch,
-                ..Checkout::default()
-            });
-        }
-    }
-    checkouts
-}
-
-/// Whether a task belongs to the scope (a project or subproject key, or
-/// everything).
+/// Scoped mutations use the retained execution directory and an exact
+/// daemon-verified checkout. Folder-only rows have no repository scope.
 fn in_scope(agent: &UiAgent, scope: Option<&str>, checkouts: &[Checkout]) -> bool {
-    match scope {
-        None => true,
-        Some(key) => {
-            !agent.chat
-                && (nav::project_key(&agent.project, checkouts) == key
-                    || nav::subproject_key(&agent.project, checkouts).as_deref() == Some(key))
-        }
-    }
+    let Some(key) = scope else {
+        return true;
+    };
+    let Some(workspace) = agent.workspace.as_deref().filter(|_| !agent.chat) else {
+        return false;
+    };
+    let workspace = nav::path_key(workspace);
+    let mut verified = checkouts
+        .iter()
+        .filter(|checkout| checkout.main.is_some() && nav::path_key(&checkout.path) == workspace);
+    let Some(checkout) = verified.next() else {
+        return false;
+    };
+    verified.next().is_none()
+        && (key == format!("repo:{}", nav::path_key(&checkout.common_dir))
+            || (checkout.main == Some(false) && key == format!("sub:{workspace}")))
 }
 
 /// A kept-count line ("3 live tasks stay: …"), or nothing for zero.
@@ -230,11 +226,27 @@ fn plan_tasks(
     data_dir: &Path,
     op: BulkOp,
     scope: Option<&str>,
-    checkouts: Vec<Checkout>,
-    archived: Option<&'static str>,
+    show_archived: bool,
 ) -> Result<BulkPlan, String> {
-    let agents = read_agents(data_dir, archived)?;
-    let checkouts = resolve_folders(checkouts, &agents);
+    let agents = read_agents(data_dir, archived_filter(op, show_archived))?;
+    let checkouts = if scope.is_some() {
+        project_checkouts(&load_projects_blocking(data_dir)?)
+    } else {
+        Vec::new()
+    };
+    Ok(task_plan(&agents, op, scope, &checkouts))
+}
+
+fn archived_filter(op: BulkOp, show_archived: bool) -> Option<&'static str> {
+    (op == BulkOp::DeleteStopped || show_archived).then_some("include")
+}
+
+fn task_plan(
+    agents: &[UiAgent],
+    op: BulkOp,
+    scope: Option<&str>,
+    checkouts: &[Checkout],
+) -> BulkPlan {
     let mut seen = HashSet::new();
     let roots: Vec<&UiAgent> = agents
         .iter()
@@ -242,7 +254,7 @@ fn plan_tasks(
             agent.parent.is_none()
                 && !agent.native_child
                 && seen.insert(agent.id.as_str())
-                && in_scope(agent, scope, &checkouts)
+                && in_scope(agent, scope, checkouts)
         })
         .collect();
     let mut plan = BulkPlan::default();
@@ -272,6 +284,7 @@ fn plan_tasks(
                 .filter(|agent| agent.state == AgentState::Stopped)
                 .map(item)
                 .collect();
+            plan.affected_tasks = affected_tasks(agents, &plan.items);
             plan.kept.extend(kept_line(
                 count(&|agent| agent.state == AgentState::Failed),
                 "failed task",
@@ -293,7 +306,26 @@ fn plan_tasks(
         }
         BulkOp::RemoveProjects => {}
     }
-    Ok(plan)
+    plan
+}
+
+fn affected_tasks(agents: &[UiAgent], roots: &[BulkItem]) -> usize {
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for agent in agents {
+        if let Some(parent) = agent.parent.as_deref() {
+            children.entry(parent).or_default().push(&agent.id);
+        }
+    }
+    let mut pending: Vec<_> = roots.iter().map(|item| item.id.as_str()).collect();
+    let mut affected = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if affected.insert(id)
+            && let Some(children) = children.get(id)
+        {
+            pending.extend(children);
+        }
+    }
+    affected.len()
 }
 
 /// Each registration's usage, its name and whether its folder is gone.
@@ -302,24 +334,12 @@ struct Registrations {
 }
 
 fn read_registrations(data_dir: &Path) -> Result<Registrations, String> {
-    let registrations = client::block_on(config_client::list_projects(data_dir))
-        .map_err(|error| error.user_message())?;
+    let registrations = load_projects_blocking(data_dir)?;
     let agents = read_agents(data_dir, Some("include"))?;
-    let checkouts: Vec<Checkout> = registrations
-        .iter()
-        .map(|registration| Checkout {
-            path: registration.checkout.clone(),
-            common_dir: registration.repo_common_dir.clone(),
-            branch: checkout_git(nav::display_path(&registration.checkout))
-                .and_then(|(_, branch)| branch),
-            origin: registration.origin.clone(),
-            missing: false,
-        })
-        .collect();
-    let checkouts = resolve_folders(checkouts, &agents);
+    let checkouts = project_checkouts(&registrations);
     let pairs: Vec<(String, String)> = registrations
         .iter()
-        .map(|registration| (registration.id.clone(), registration.checkout.clone()))
+        .map(|registration| (registration.id.clone(), registration.workspace.clone()))
         .collect();
     let usage = nav::registration_use(&pairs, &agents, &checkouts);
     Ok(Registrations {
@@ -328,9 +348,9 @@ fn read_registrations(data_dir: &Path) -> Result<Registrations, String> {
             .map(|registration| {
                 (
                     registration.id.clone(),
-                    nav::place_label(&registration.checkout, &checkouts),
+                    nav::place_label(&registration.workspace, &checkouts),
                     usage.get(&registration.id).copied().unwrap_or_default(),
-                    folder_missing(nav::display_path(&registration.checkout)),
+                    registration.missing,
                 )
             })
             .collect(),
@@ -358,8 +378,8 @@ fn plan_projects(data_dir: &Path, pick: &Pick) -> Result<BulkPlan, String> {
     for (id, name, usage, missing) in registrations.rows {
         let wanted = match pick {
             Pick::Selected(ids) => ids.contains(&id),
-            Pick::Missing(wanted) => *wanted == id,
-            Pick::Unused | Pick::Tasks(_) => true,
+            Pick::Unused => true,
+            Pick::Missing(_) | Pick::Tasks(_) => false,
         };
         if !wanted {
             continue;
@@ -376,6 +396,95 @@ fn plan_projects(data_dir: &Path, pick: &Pick) -> Result<BulkPlan, String> {
         }
     }
     Ok(plan)
+}
+
+fn plan_missing_project(
+    data_dir: &Path,
+    project: &str,
+    name: String,
+    retained: Option<MissingCleanup>,
+) -> Result<BulkPlan, String> {
+    let mut plan = BulkPlan::default();
+    let cleanup = if let Some(retained) = retained {
+        retained
+    } else {
+        let request = CleanupPlanRequest {
+            scope: CleanupScope::Project,
+            project: Some(project.to_owned()),
+            older_than: None,
+        };
+        let reply: CleanupPlan = client::block_on(eliot_daemon::client_call_typed(
+            data_dir,
+            "cleanup.plan",
+            &request,
+        ))
+        .map_err(|error| error.user_message())?;
+        let Some(item) = reply.items.iter().find(|item| {
+            item.artifact.kind == ArtifactKind::ProjectRegistration
+                && item.artifact.project == project
+        }) else {
+            return Err(
+                "The daemon did not return this project registration in the cleanup plan."
+                    .to_owned(),
+            );
+        };
+        if item.verdict != "safe" {
+            plan.kept.push(format!("{name}: {}", item.reason));
+            return Ok(plan);
+        }
+        MissingCleanup {
+            plan_id: reply.plan_id,
+            artifact_id: item.artifact.id.clone(),
+        }
+    };
+    plan.items.push(BulkItem {
+        id: project.to_owned(),
+        name,
+    });
+    plan.missing_cleanup = Some(cleanup);
+    Ok(plan)
+}
+
+fn apply_missing_project(
+    data_dir: &Path,
+    name: &str,
+    cleanup: MissingCleanup,
+    id: String,
+) -> Result<(Vec<String>, Vec<String>), (bool, String)> {
+    let request = CleanupApplyRequest {
+        id,
+        plan_id: cleanup.plan_id,
+        delete_remote: false,
+        artifacts: Some(vec![cleanup.artifact_id.clone()]),
+    };
+    let reply: CleanupApplyResponse = client::block_on(eliot_daemon::client_call_typed(
+        data_dir,
+        "cleanup.apply",
+        &request,
+    ))
+    .map_err(|error| (crate::state::uncertain(&error), error.user_message()))?;
+    let mut matches = reply
+        .items
+        .iter()
+        .filter(|item| item.artifact_id == cleanup.artifact_id);
+    let outcome = matches
+        .next()
+        .filter(|_| reply.plan_id == request.plan_id && matches.next().is_none())
+        .ok_or_else(|| {
+            (
+                true,
+                "The cleanup reply did not identify the selected registration.".to_owned(),
+            )
+        })?;
+    let reason = outcome
+        .reason
+        .as_deref()
+        .unwrap_or("cleanup outcome unavailable");
+    match outcome.outcome.as_str() {
+        "removed" => Ok((vec![name.to_owned()], Vec::new())),
+        "skipped" => Ok((Vec::new(), vec![format!("{name}: {reason}")])),
+        _ => Err((true, reason.to_owned())),
+    }
 }
 
 /// Remove the registrations in one settings save, after checking again
@@ -515,9 +624,24 @@ impl DesktopApp {
                         return;
                     };
                     let items = dialog.plan.items.clone();
-                    let _task = context.spawn_background(move |_| {
-                        Message::Bulk(BulkMsg::Removed(remove_checked(&data_dir, &items)))
-                    });
+                    if let (Pick::Missing(project), Some(cleanup)) =
+                        (&dialog.pick, &dialog.plan.missing_cleanup)
+                    {
+                        let cleanup = cleanup.clone();
+                        self.missing_cleanup
+                            .insert(project.clone(), cleanup.clone());
+                        let id = self.ledger.id_for(&missing_cleanup_key(project));
+                        let name = items[0].name.clone();
+                        let _task = context.spawn_background(move |_| {
+                            Message::Bulk(BulkMsg::Removed(apply_missing_project(
+                                &data_dir, &name, cleanup, id,
+                            )))
+                        });
+                    } else {
+                        let _task = context.spawn_background(move |_| {
+                            Message::Bulk(BulkMsg::Removed(remove_checked(&data_dir, &items)))
+                        });
+                    }
                 } else {
                     self.bulk_step(0, context);
                 }
@@ -534,6 +658,12 @@ impl DesktopApp {
                 let Some(dialog) = self.bulk.as_mut() else {
                     return;
                 };
+                if let Pick::Missing(project) = &dialog.pick
+                    && !matches!(&result, Err((true, _)))
+                {
+                    self.ledger.complete(&missing_cleanup_key(project));
+                    self.missing_cleanup.remove(project);
+                }
                 match result {
                     Ok((removed, kept)) => {
                         dialog
@@ -578,20 +708,22 @@ impl DesktopApp {
         self.bulk = Some(BulkDialog {
             op,
             pick: pick.clone(),
-            scope,
+            scope: scope.clone(),
             phase: Phase::Reading,
             plan: BulkPlan::default(),
             error: None,
             outcomes: Vec::new(),
         });
-        let checkouts = self.checkouts();
-        let archived = self.nav.show_archived.then_some("include");
+        let show_archived = self.nav.show_archived;
+        let retained = match &pick {
+            Pick::Missing(project) => self.missing_cleanup.get(project).cloned(),
+            _ => None,
+        };
         let _task = context.spawn_background(move |_| {
-            let plan = match (&pick, op) {
-                (Pick::Tasks(scope), _) => {
-                    plan_tasks(&data_dir, op, scope.as_deref(), checkouts, archived)
-                }
-                (pick, _) => plan_projects(&data_dir, pick),
+            let plan = match &pick {
+                Pick::Tasks(scope) => plan_tasks(&data_dir, op, scope.as_deref(), show_archived),
+                Pick::Missing(project) => plan_missing_project(&data_dir, project, scope, retained),
+                _ => plan_projects(&data_dir, &pick),
             };
             Message::Bulk(BulkMsg::Planned(plan))
         });
@@ -682,6 +814,11 @@ impl DesktopApp {
             Phase::Confirm if count == 0 => {
                 format!("Nothing to {}{place}", dialog.op.verb().to_lowercase())
             }
+            Phase::Confirm if dialog.op == BulkOp::DeleteStopped => format!(
+                "Delete {}{place} ({} affected)?",
+                dialog.op.noun(count),
+                eliot_core::count_words(dialog.plan.affected_tasks as u64, "task", "tasks"),
+            ),
             Phase::Confirm => format!("{} {}{place}?", dialog.op.verb(), dialog.op.noun(count)),
             Phase::Running { .. } => format!(
                 "{} {} of {}…",
@@ -893,6 +1030,10 @@ impl DesktopApp {
 }
 
 /// The ledger key of one bulk step.
+fn missing_cleanup_key(project: &str) -> String {
+    format!("cleanup.project:{project}")
+}
+
 fn step_key(op: BulkOp, agent: &str) -> String {
     match op {
         BulkOp::ArchiveFinished => format!("archive:{agent}:true"),
@@ -906,5 +1047,70 @@ fn save_words((uncertain, error): (bool, String)) -> String {
         format!("The save was not confirmed: {error}. Review again before removing more.")
     } else {
         format!("Nothing was removed: {error}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eliot_core::AgentState;
+
+    fn stopped(id: &str, parent: Option<&str>, workspace: &str) -> UiAgent {
+        UiAgent {
+            id: id.to_owned(),
+            generation: 1,
+            harness: "codex".to_owned(),
+            state: AgentState::Stopped,
+            project: workspace.to_owned(),
+            workspace: Some(workspace.to_owned()),
+            parent: parent.map(str::to_owned),
+            updated_at: 0,
+            title: id.to_owned(),
+            native_child: false,
+            tokens: None,
+            chat: false,
+            archived: true,
+        }
+    }
+
+    #[test]
+    fn delete_all_includes_archived_roots_and_counts_descendants() {
+        assert_eq!(
+            archived_filter(BulkOp::DeleteStopped, false),
+            Some("include")
+        );
+        let agents = [
+            stopped("a1", None, "/checkout"),
+            stopped("a2", Some("a1"), "/checkout"),
+            stopped("a3", Some("a2"), "/checkout"),
+        ];
+        let plan = task_plan(&agents, BulkOp::DeleteStopped, None, &[]);
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].id, "a1");
+        assert_eq!(plan.affected_tasks, 3);
+    }
+
+    #[test]
+    fn scope_requires_exact_verified_workspace_even_when_labels_match() {
+        let mut verified = Checkout::new("/repo/linked", "/repo/.git");
+        verified.main = Some(false);
+        let mut shadow = stopped("a1", None, "/repo/linked/other-repo");
+        shadow.project = verified.path.clone();
+        let linked = stopped("a2", None, &verified.path);
+        let stale = Checkout::new("/unverified", "/repo/.git");
+        let unverified = stopped("a3", None, &stale.path);
+        let plan = task_plan(
+            &[shadow, linked, unverified],
+            BulkOp::DeleteStopped,
+            Some("repo:/repo/.git"),
+            &[verified, stale],
+        );
+        assert_eq!(
+            plan.items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a2"]
+        );
     }
 }

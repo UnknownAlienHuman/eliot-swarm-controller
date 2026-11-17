@@ -100,10 +100,6 @@ pub(super) enum ShellMsg {
     ListTick,
     /// Hide the sidebar to a rail of icons, or show it again.
     SidebarToggled,
-    /// Unregistered task folders, each with the Git common directory and
-    /// branch Git's files name for it (None: not a Git checkout or not
-    /// readable).
-    WorktreesResolved(Vec<(String, WorktreeGit)>),
 }
 
 /// Reactor 0.100.0 reports the window's Light/Dark scheme only, and a High
@@ -193,16 +189,7 @@ pub(super) struct ShellState {
     pub(super) shortcuts: Option<Arc<Mutex<Receiver<Shortcut>>>>,
     /// The sidebar is hidden to its rail (this session).
     pub(super) sidebar_collapsed: bool,
-    /// Task folders no registered checkout holds, by [`nav::path_key`]:
-    /// the folder as listed and, when it is a Git checkout, its common
-    /// directory and branch ([`checkout_git`]). A linked worktree lists as
-    /// a subproject of its repository, never as a project of its own.
-    pub(super) worktree_repos: std::collections::BTreeMap<String, WorktreeGit>,
-    pub(super) worktrees_resolving: bool,
 }
-
-/// A resolved task folder: as listed, and its common directory and branch.
-pub(super) type WorktreeGit = (String, Option<(String, Option<String>)>);
 
 /// The sidebar search: what the box shows, what was typed and the
 /// suggestions it offers.
@@ -309,7 +296,7 @@ impl DesktopApp {
                         // A new task starts in the first project until one is picked.
                         self.pick_project(&first.workspace);
                     }
-                    self.resolve_worktrees(context);
+                    self.refresh_search();
                 }
                 Err(error) => self.alert(format!("Projects not read: {error}")),
             },
@@ -352,7 +339,6 @@ impl DesktopApp {
                         }
                         self.open_startup_conversation(context);
                         self.refresh_search();
-                        self.resolve_worktrees(context);
                     }
                     Err(error) => {
                         // A daemon without the archived filter: the toggle
@@ -365,15 +351,6 @@ impl DesktopApp {
                 }
             }
             ShellMsg::SidebarToggled => self.nav.sidebar_collapsed = !self.nav.sidebar_collapsed,
-            ShellMsg::WorktreesResolved(found) => {
-                self.nav.worktrees_resolving = false;
-                for (key, resolved) in found {
-                    self.nav.worktree_repos.insert(key, resolved);
-                }
-                self.refresh_search();
-                // Folders listed while this read ran.
-                self.resolve_worktrees(context);
-            }
             ShellMsg::AgentOpened(agent) => {
                 self.close_popover();
                 self.chat.opened_from_search = false;
@@ -389,8 +366,10 @@ impl DesktopApp {
                 }
             }
             ShellMsg::ProjectPicked(checkout) => {
-                self.pick_project(&checkout);
-                self.new_task(context);
+                if self.can_launch_here(&checkout) {
+                    self.pick_project(&checkout);
+                    self.new_task(context);
+                }
             }
             ShellMsg::ExpandToggled(id, expand) => {
                 if expand {
@@ -805,91 +784,33 @@ impl DesktopApp {
         }
     }
 
-    /// Every checkout the sidebar groups by: each registered one (with its
-    /// repository's origin name, branch and whether its folder is gone),
-    /// then each unregistered task folder that is a Git checkout, so a
-    /// linked worktree lists as a subproject of its repository.
+    /// Registered checkouts and daemon-verified worktrees with listed tasks.
     pub(super) fn checkouts(&self) -> Vec<Checkout> {
-        let mut checkouts: Vec<Checkout> = self
+        let visible: HashSet<_> = self
             .nav
             .projects
             .iter()
-            .map(|project| Checkout {
-                path: project.workspace.clone(),
-                common_dir: project.common_dir.clone(),
-                branch: project.branch.clone(),
-                origin: project.origin.clone(),
-                missing: project.missing,
+            .map(|project| nav::path_key(&project.workspace))
+            .chain(
+                self.nav
+                    .agents
+                    .iter()
+                    .map(|agent| nav::path_key(&agent.project)),
+            )
+            .collect();
+        project_checkouts(&self.nav.projects)
+            .into_iter()
+            .filter(|checkout| {
+                checkout.main == Some(true) || visible.contains(&nav::path_key(&checkout.path))
             })
-            .collect();
-        let registered: HashSet<String> = checkouts
-            .iter()
-            .map(|checkout| nav::path_key(&checkout.path))
-            .collect();
-        // Only folders a listed task still runs in (an archived or deleted
-        // task's worktree leaves with it).
-        let listed: HashSet<String> = self
-            .nav
-            .agents
-            .iter()
-            .map(|agent| nav::path_key(&agent.project))
-            .collect();
-        for (key, (folder, git)) in &self.nav.worktree_repos {
-            if let Some((common, branch)) = git
-                && !registered.contains(key)
-                && listed.contains(key)
-            {
-                checkouts.push(Checkout {
-                    path: folder.clone(),
-                    common_dir: common.clone(),
-                    branch: branch.clone(),
-                    ..Checkout::default()
-                });
-            }
-        }
-        checkouts
+            .collect()
     }
 
-    /// Read, once per folder, which Git repository each unregistered task
-    /// folder is a checkout of, and its branch (a file read in the
-    /// background; see [`checkout_git`]).
-    fn resolve_worktrees(&mut self, context: &ComponentContext<Self>) {
-        if self.nav.worktrees_resolving {
-            return;
-        }
-        let registered: Vec<Checkout> = self
-            .nav
-            .projects
+    pub(super) fn can_launch_here(&self, path: &str) -> bool {
+        let key = nav::path_key(path);
+        self.checkouts()
             .iter()
-            .map(|project| Checkout::new(project.workspace.clone(), project.common_dir.clone()))
-            .collect();
-        let mut wanted: Vec<(String, String)> = Vec::new();
-        for agent in &self.nav.agents {
-            let key = nav::path_key(&agent.project);
-            if agent.chat
-                || agent.project.trim().is_empty()
-                || self.nav.worktree_repos.contains_key(&key)
-                || wanted.iter().any(|(known, _)| *known == key)
-                || nav::is_registered(&agent.project, &registered)
-            {
-                continue;
-            }
-            wanted.push((key, agent.project.clone()));
-        }
-        if wanted.is_empty() {
-            return;
-        }
-        self.nav.worktrees_resolving = true;
-        let _task = context.spawn_background(move |_| {
-            let found = wanted
-                .into_iter()
-                .map(|(key, folder)| {
-                    let git = checkout_git(nav::display_path(&folder));
-                    (key, (folder, git))
-                })
-                .collect();
-            Message::Shell(ShellMsg::WorktreesResolved(found))
-        });
+            .any(|checkout| !checkout.missing && nav::path_key(&checkout.path) == key)
     }
 
     /// The listed or fetched Agent with this id.
@@ -1843,6 +1764,7 @@ impl DesktopApp {
                 .grid_column(1)
                 .width(height)
                 .height(height)
+                .is_enabled(self.can_launch_here(place.checkout))
                 .automation_name(format!("New task in {name}"))
                 .on_click(context.message(Message::Shell(ShellMsg::ProjectPicked(
                     place.checkout.to_owned(),

@@ -256,6 +256,7 @@ mod tests {
             harness: "claude".to_owned(),
             state,
             project: "/w".to_owned(),
+            workspace: None,
             parent: parent.map(str::to_owned),
             updated_at,
             title: id.to_owned(),

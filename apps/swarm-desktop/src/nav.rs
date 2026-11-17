@@ -39,6 +39,7 @@ pub struct UiAgent {
     pub state: eliot_core::AgentState,
     /// The Agent's project label: its workspace path, as listed.
     pub project: String,
+    pub workspace: Option<String>,
     /// The current manager, if any.
     pub parent: Option<String>,
     /// Last change of the Agent record (ms since the epoch), for Recents.
@@ -63,7 +64,13 @@ impl UiAgent {
             generation: summary.generation,
             harness: summary.harness.clone(),
             state: summary.state,
-            project: summary.project.clone(),
+            project: summary
+                .workspace
+                .as_ref()
+                .filter(|_| !summary.chat)
+                .unwrap_or(&summary.project)
+                .clone(),
+            workspace: summary.workspace.clone(),
             parent: summary.parent.clone(),
             updated_at: summary.updated_at,
             title: summary_title(summary),
@@ -167,16 +174,17 @@ impl Row {
     }
 }
 
-/// A checkout of a repository: a registered one (`project.list`), or a task
-/// folder the desktop found to be a worktree of one (Git's own files).
+/// A checkout from the daemon's project registration or Git readback.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Checkout {
     pub path: String,
     /// The Git common directory of its repository.
     pub common_dir: String,
-    /// The branch checked out there ([`head_branch`]); `None` for a
+    /// The verified checkout's branch; `None` for a
     /// detached HEAD or when it was not read.
     pub branch: Option<String>,
+    /// Explicit Git identity, absent when only the registration remains.
+    pub main: Option<bool>,
     /// The repository's name from its `origin` remote (`project.list`'s
     /// read-only `origin`), on any checkout of the repository.
     pub origin: Option<String>,
@@ -200,15 +208,6 @@ pub fn folder_name(path: &str) -> &str {
     path.rsplit(['\\', '/'])
         .find(|part| !part.is_empty())
         .unwrap_or(path)
-}
-
-/// The branch a Git `HEAD` file names (`ref: refs/heads/<branch>`,
-/// gitrepository-layout(5)); `None` for a detached HEAD (an object id), a
-/// reftable placeholder (`refs/heads/.invalid`) or anything else.
-pub fn head_branch(head: &str) -> Option<String> {
-    let branch = head.trim().strip_prefix("ref:")?.trim();
-    let branch = branch.strip_prefix("refs/heads/")?;
-    (!branch.is_empty() && branch != ".invalid").then(|| branch.to_owned())
 }
 
 /// Branch prefixes that say what kind of change it is, not what it is
@@ -266,7 +265,10 @@ fn origin_of<'a>(key: &str, checkouts: &'a [Checkout]) -> Option<&'a str> {
 /// its folder without the repository's name in front.
 pub fn subproject_name(checkout: &Checkout) -> Option<String> {
     let (folder, main) = repository(&checkout.common_dir);
-    if main.as_deref().map(path_key) == Some(path_key(&checkout.path)) {
+    if checkout
+        .main
+        .unwrap_or_else(|| main.as_deref().map(path_key) == Some(path_key(&checkout.path)))
+    {
         return None;
     }
     Some(match checkout.branch.as_deref() {
@@ -282,14 +284,30 @@ pub fn subproject_name(checkout: &Checkout) -> Option<String> {
 pub fn place_of(label: &str, checkouts: &[Checkout]) -> (String, Option<String>) {
     match checkout_of(label, checkouts) {
         Some(checkout) => (
-            repository_name(
-                &checkout.common_dir,
-                origin_of(&path_key(&checkout.common_dir), checkouts),
-            ),
+            checkout_repository_name(checkout, checkouts),
             subproject_name(checkout),
         ),
         None => (folder_name(label).to_owned(), None),
     }
+}
+
+fn main_checkout(common_dir: &str, checkouts: &[Checkout]) -> Option<String> {
+    let common = path_key(common_dir);
+    checkouts
+        .iter()
+        .find(|checkout| checkout.main == Some(true) && path_key(&checkout.common_dir) == common)
+        .map(|checkout| checkout.path.clone())
+        .or_else(|| repository(common_dir).1)
+}
+
+fn checkout_repository_name(checkout: &Checkout, checkouts: &[Checkout]) -> String {
+    let origin = origin_of(&path_key(&checkout.common_dir), checkouts);
+    if origin.is_none()
+        && let Some(main) = main_checkout(&checkout.common_dir, checkouts)
+    {
+        return folder_name(&main).to_owned();
+    }
+    repository_name(&checkout.common_dir, origin)
 }
 
 /// [`place_of`] in one line: "atlas-web › search filters", or the
@@ -357,11 +375,6 @@ fn checkout_of<'a>(label: &str, checkouts: &'a [Checkout]) -> Option<&'a Checkou
                     .is_some_and(|rest| rest.starts_with('/'))
         })
         .max_by_key(|checkout| path_key(&checkout.path).len())
-}
-
-/// Whether a registered checkout holds `label` (an Agent's workspace).
-pub fn is_registered(label: &str, checkouts: &[Checkout]) -> bool {
-    checkout_of(label, checkouts).is_some()
 }
 
 /// A worktree folder as a task row names it: without its repository's
@@ -540,8 +553,8 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
                 index
             }
             None => {
-                let name = repository_name(&checkout.common_dir, origin_of(&common, checkouts));
-                let main = repository(&checkout.common_dir).1;
+                let name = checkout_repository_name(checkout, checkouts);
+                let main = main_checkout(&checkout.common_dir, checkouts);
                 groups.push(Group {
                     section: empty(key, name, &checkout.path),
                     main: main.as_deref().map(path_key),
@@ -812,7 +825,9 @@ pub fn registration_use(
             .collect();
         if users.is_empty() {
             let repository = path_key(&checkout.common_dir);
-            let main = repository_of_key(&checkout.common_dir);
+            let main = main_checkout(&checkout.common_dir, checkouts)
+                .as_deref()
+                .map(path_key);
             let same: Vec<&(String, String)> = registrations
                 .iter()
                 .filter(|(_, registered)| {
@@ -837,11 +852,6 @@ pub fn registration_use(
         }
     }
     usage
-}
-
-/// The main checkout's key of a repository, when it has one.
-fn repository_of_key(common_dir: &str) -> Option<String> {
-    repository(common_dir).1.as_deref().map(path_key)
 }
 
 /// Whether `agent` matches a search: every word of `query` appears,
@@ -1289,29 +1299,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn branches_read_by_the_substance_of_their_task() {
-        for (branch, words) in [
-            ("feat/k141-monitor-charts", "k141 monitor charts"),
-            ("fix/k110_provider-quota", "k110 provider quota"),
-            ("refactor/k115-splits", "k115 splits"),
-            ("feature/ui/dark-mode", "ui dark mode"),
-            ("release/1.2", "release 1.2"),
-            ("main", "main"),
-            ("feat", "feat"),
-            ("fix/feat", "feat"),
-        ] {
-            assert_eq!(branch_words(branch), words, "{branch}");
-        }
-        assert_eq!(
-            head_branch("ref: refs/heads/feat/k142-projects\n").as_deref(),
-            Some("feat/k142-projects")
-        );
-        assert_eq!(head_branch(&"ab".repeat(20)), None);
-        assert_eq!(head_branch("ref: refs/heads/.invalid"), None);
-        assert_eq!(head_branch("ref: refs/remotes/origin/main"), None);
-    }
-
     fn agent(id: &str, project: &str, parent: Option<&str>) -> UiAgent {
         UiAgent {
             id: id.to_owned(),
@@ -1319,6 +1306,7 @@ mod tests {
             harness: "muse".to_owned(),
             state: AgentState::Idle,
             project: project.to_owned(),
+            workspace: None,
             parent: parent.map(str::to_owned),
             updated_at: 0,
             title: id.to_owned(),
