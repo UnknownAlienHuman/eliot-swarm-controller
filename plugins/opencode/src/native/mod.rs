@@ -5,6 +5,7 @@ pub(crate) mod models;
 pub(crate) mod requests;
 pub(crate) mod server;
 pub(crate) mod sse;
+pub(crate) mod startup;
 pub(crate) mod types;
 
 pub(crate) use auth::{

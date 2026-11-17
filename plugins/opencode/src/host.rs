@@ -744,6 +744,7 @@ impl OpenCodePlugin {
     }
 
     async fn start(&mut self, raw: &Value, peer: &PeerClient) -> Result<Value> {
+        let _timing = crate::native::startup::Step::new("start_total");
         let parsed = match self.parse_start_request(raw)? {
             StartAdmission::Replay(outcome) => return outcome,
             StartAdmission::New(parsed) => parsed,
@@ -799,6 +800,7 @@ impl OpenCodePlugin {
     /// Start phase 1, admission: decode, replay guards, and frozen-profile
     /// validation. Failures here retain nothing: a corrected start may retry.
     fn parse_start_request(&self, raw: &Value) -> Result<StartAdmission> {
+        let _timing = crate::native::startup::Step::new("frozen_admission");
         let params: AgentStartParams = decode(raw, "OpenCode agent.start params are invalid")?;
         validate_identity(
             &params.agent_id,
@@ -1056,6 +1058,7 @@ impl OpenCodePlugin {
         let http = server.http().clone();
         // Subscribe before session create/input: the stream must observe the
         // session's whole durable sequence starting at `session.created`.
+        let subscribe_timing = crate::native::startup::Step::new("subscribe");
         let (frames, stream) = match http.subscribe(phase_deadline(envelope, RPC_TIMEOUT)).await {
             Ok(subscribed) => subscribed,
             Err(error) => {
@@ -1068,6 +1071,7 @@ impl OpenCodePlugin {
                 });
             }
         };
+        drop(subscribe_timing);
         let events = crate::events::spawn(
             frames,
             stream,
@@ -1118,6 +1122,7 @@ impl OpenCodePlugin {
         mut session: AgentSession,
         envelope: Instant,
     ) -> std::result::Result<AgentSession, PhaseFailure> {
+        let _timing = crate::native::startup::Step::new("process_registration");
         if let Err(error) = register_native_process(
             peer,
             &parsed.credential,
@@ -1166,6 +1171,7 @@ impl OpenCodePlugin {
         mut session: AgentSession,
         envelope: Instant,
     ) -> Result<CreateOutcome> {
+        let _timing = crate::native::startup::Step::new("session_create_verify");
         session.native_scope = opencode_scope(session.server.data_dir());
         // Pre-create verification: no native session or prompt exists yet.
         let local_fragment = if let Some(local) = parsed.local.as_ref() {
@@ -1205,6 +1211,7 @@ impl OpenCodePlugin {
                 .as_ref()
                 .and_then(|model_ref| model_ref.variant.as_deref())
         {
+            let _timing = crate::native::startup::Step::new("model_catalogue");
             let catalogue = match session
                 .http
                 .list_native_models(phase_deadline(envelope, RPC_TIMEOUT))
@@ -1265,6 +1272,7 @@ impl OpenCodePlugin {
             parsed.params.agent_id, parsed.params.generation
         );
         let directory = parsed.workspace.to_string_lossy().into_owned();
+        let create_timing = crate::native::startup::Step::new("session_create");
         let created = match session
             .http
             .create_session(
@@ -1318,6 +1326,7 @@ impl OpenCodePlugin {
                 ));
             }
         };
+        drop(create_timing);
         session.session_id = Some(created.id.clone());
         // Effective readback before readiness: the create response states the
         // exact model and location; on any mismatch no `session.ready` is
@@ -1377,8 +1386,10 @@ impl OpenCodePlugin {
         // the connected verdict for the `eliot-swarm` entry. Observation
         // stays read-only and best-effort; the inventory gate below may
         // still refuse the start on an unexpected or owner-identity server.
+        let mcp_timing = crate::native::startup::Step::new("mcp_inventory");
         let (mcp_servers, mcp_servers_verified, mcp_inventory) =
             observe_mcp_servers(&session.http, phase_deadline(envelope, RPC_TIMEOUT)).await;
+        drop(mcp_timing);
         if let Err(error) =
             gate_mcp_inventory(mcp_inventory.as_deref(), parsed.requested_mcp_policy)
         {
@@ -1394,12 +1405,14 @@ impl OpenCodePlugin {
         effective["mcp_servers"] = mcp_servers;
         effective["mcp_servers_verified"] = json!(mcp_servers_verified);
         effective["mcp_policy"] = json!(parsed.requested_mcp_policy.as_str());
+        let hook_timing = crate::native::startup::Step::new("context_bind");
         let context_bound = bind_context_hooks(
             &session.http,
             &created.id,
             phase_deadline(envelope, RPC_TIMEOUT),
         )
         .await;
+        drop(hook_timing);
         let effective = if context_bound {
             with_context_points(
                 effective,
@@ -2076,6 +2089,7 @@ impl OpenCodePlugin {
         created: SessionInfo,
         effective: Value,
     ) -> Result<Value> {
+        let _timing = crate::native::startup::Step::new("ready_ack");
         if let Err(error) = session
             .events
             .ready(
@@ -3514,7 +3528,8 @@ fn policy_from_snapshot(profile: &serde_json::Map<String, Value>) -> Result<McpP
 /// them and reports an empty surface. Polling is bounded well under one
 /// RPC budget so neither the create nor the resume path can stall on it.
 const MCP_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-const MCP_SETTLE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+const MCP_SETTLE_FIRST_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+const MCP_SETTLE_MAX_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Best-effort Agent-scoped MCP readback for the effective record:
 /// `GET /api/mcp` (`mcp.list`) after the session exists, re-polled until
@@ -3531,11 +3546,14 @@ async fn observe_mcp_servers(
     http: &OpenCodeHttp,
     deadline: Instant,
 ) -> (Value, bool, Option<Vec<McpServerReadback>>) {
-    let cap =
-        Instant::now() + MCP_SETTLE_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+    let cap = (Instant::now() + MCP_SETTLE_TIMEOUT).min(deadline);
+    let mut poll = MCP_SETTLE_FIRST_POLL;
     let mut last: Option<Vec<McpServerReadback>> = None;
     loop {
-        if let Ok(servers) = http.list_mcp_servers(deadline).await {
+        let read_timing = crate::native::startup::Step::new("mcp_inventory_read");
+        let readback = http.list_mcp_servers(cap).await;
+        drop(read_timing);
+        if let Ok(servers) = readback {
             match mcp_settle(&servers) {
                 McpSettle::Connected => return (mcp_names(&servers), true, Some(servers)),
                 // A terminal non-connected status settles the observation
@@ -3549,7 +3567,11 @@ async fn observe_mcp_servers(
         if Instant::now() >= cap {
             break;
         }
-        tokio::time::sleep(MCP_SETTLE_POLL).await;
+        // Hot MCP startup should not pay a whole second after the first
+        // pending observation. Back off for cold starts, clamping both
+        // the native reads and sleeps to the same settle/start deadline.
+        tokio::time::sleep_until((Instant::now() + poll).min(cap)).await;
+        poll = (poll * 2).min(MCP_SETTLE_MAX_POLL);
     }
     match last {
         Some(servers) => (mcp_names(&servers), false, Some(servers)),

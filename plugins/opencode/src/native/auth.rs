@@ -18,7 +18,8 @@
 //! prepares only the owner's explicitly selected integration in that
 //! private store: the canonical list must show the selection exactly once
 //! with exactly one credential for this current path (anything else refuses
-//! without fallback), then export pipes opaquely, in memory only, into
+//! without fallback). List and the selected export are independent reads;
+//! both finish before export pipes opaquely, in memory only, into
 //! import under the exact isolated roots the server will use. On explicit
 //! resume the isolated list is read first and a correctly present
 //! integration is reused without re-import; an unknown import outcome
@@ -166,6 +167,7 @@ pub async fn transfer_selected_integration(
     transfer: &AuthTransfer<'_>,
     deadline: Instant,
 ) -> Result<()> {
+    let _timing = super::startup::Step::new("auth_transfer");
     // An empty XDG root would silently fall back to the canonical store and
     // import into owner state: refuse before spawning. Relative roots stay
     // consistent because every child shares the server's workspace cwd.
@@ -189,7 +191,16 @@ pub async fn transfer_selected_integration(
             }
         }
     }
-    match canonical_gate(transfer, deadline).await? {
+    // Both helpers only read the canonical store. Overlap their native
+    // standalone-server startup, but await BOTH even on failure: try_join!
+    // would cancel the other helper before its bounded reap completes.
+    // Import still cannot start until the exact metadata gate and export
+    // have succeeded. Never cache credentials or export without a selector.
+    let (selection, exported) = tokio::join!(
+        canonical_gate(transfer, deadline),
+        export_selected(transfer, deadline),
+    );
+    match selection? {
         Gate::ExactlyOne => {}
         Gate::Absent | Gate::Ambiguous => {
             return Err(Error::new(
@@ -199,7 +210,7 @@ pub async fn transfer_selected_integration(
              .with_origin(eliot_core::FailureOrigin::Environment, "selected external credential is absent or ambiguous"));
         }
     }
-    let secret = export_selected(transfer, deadline).await?;
+    let secret = exported?;
     import_with_reconcile(transfer, &secret, deadline).await
 }
 
@@ -234,6 +245,7 @@ struct ListEntry {
 /// The canonical gate: the selection must name exactly one integration
 /// entry (by ID or name) holding exactly one connection.
 async fn canonical_gate(transfer: &AuthTransfer<'_>, deadline: Instant) -> Result<Gate> {
+    let _timing = super::startup::Step::new("auth_canonical_list");
     let mut command = canonical_command(transfer);
     command
         .args(list_argv())
@@ -247,6 +259,7 @@ async fn canonical_gate(transfer: &AuthTransfer<'_>, deadline: Instant) -> Resul
 /// The isolated gate: same rule, read under the isolated roots the server
 /// will use, so the read observes exactly the store `serve` will read.
 async fn isolated_gate(transfer: &AuthTransfer<'_>, deadline: Instant) -> Result<Gate> {
+    let _timing = super::startup::Step::new("auth_isolated_list");
     let mut command = isolated_command(transfer);
     command
         .args(list_argv())
@@ -385,6 +398,7 @@ async fn run_list(mut command: Command, deadline: Instant) -> Result<Vec<ListEnt
 /// native error text may echo secrets, so failures surface as static
 /// strings only.
 async fn export_selected(transfer: &AuthTransfer<'_>, deadline: Instant) -> Result<SecretBytes> {
+    let _timing = super::startup::Step::new("auth_export");
     let mut command = canonical_command(transfer);
     command
         .args(export_argv(transfer.selector))
@@ -518,6 +532,7 @@ async fn import_once(
     secret: &SecretBytes,
     deadline: Instant,
 ) -> ImportAttempt {
+    let _timing = super::startup::Step::new("auth_import");
     let mut command = isolated_command(transfer);
     command
         .args(import_argv())

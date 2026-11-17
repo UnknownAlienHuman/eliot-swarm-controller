@@ -243,6 +243,7 @@ impl OwnedServer {
         secrets: &[String],
         envelope: Instant,
     ) -> Result<Self> {
+        let prepare_timing = super::startup::Step::new("config_environment");
         // OpenCode keeps plugin and session contexts per directory. Use the
         // same server-native spelling for cwd, session location, and HTTP
         // directory headers so a Windows verbatim alias cannot split routing.
@@ -383,6 +384,7 @@ impl OwnedServer {
         // empty key refuses before startup, never silently becoming no-auth
         // mode) and the isolated store must hold no credential for the
         // dedicated local provider ID.
+        drop(prepare_timing);
         if let Some(local) = launch.local.as_ref() {
             if let Some(name) = local.api_key_env.as_deref() {
                 let present = launch.environment.iter().any(|(key, value)| {
@@ -429,8 +431,9 @@ impl OwnedServer {
                     isolated_data_home: &data_dir,
                     reuse_existing: auth.reuse_existing,
                 },
-                // The transfer is the known slow pole (three sequential
-                // native CLI children): it shares the whole start envelope
+                // The transfer is the known slow pole (two concurrent
+                // canonical readers followed by the isolated importer):
+                // it shares the whole start envelope
                 // instead of a shorter private budget so loaded cold starts
                 // fail definite, never unknown-by-deadline.
                 envelope,
@@ -463,6 +466,7 @@ impl OwnedServer {
         // bind race resolves as a spawn/readiness failure with no process
         // kept, never as a connection to a foreign listener: readiness
         // requires our password and our config document path.
+        let port_timing = super::startup::Step::new("port_selection");
         let port = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|error| {
@@ -486,6 +490,8 @@ impl OwnedServer {
                 .with_origin(FailureOrigin::Environment, "loopback port readback failed")
             })?
             .port();
+        drop(port_timing);
+        let spawn_timing = super::startup::Step::new("serve_spawn");
         let password = format!("eliot-{}-{}", ulid::Ulid::new(), ulid::Ulid::new());
         // The capture policy covers the host secrets plus the generated
         // password before any pipe is read: a compromised server must not
@@ -524,6 +530,8 @@ impl OwnedServer {
                 "OS could not start the native serve binary",
             )
         })?;
+        drop(spawn_timing);
+        let ready_timing = super::startup::Step::new("serve_readiness");
         let stdout = child.stdout.take().ok_or_else(|| {
             Error::new("native_spawn", "OpenCode serve stdout was not piped")
                 .with_where("plugin.opencode.start.spawn")
@@ -560,6 +568,7 @@ impl OwnedServer {
                 .await;
             return Err(error);
         }
+        drop(ready_timing);
         Ok(server)
     }
 
