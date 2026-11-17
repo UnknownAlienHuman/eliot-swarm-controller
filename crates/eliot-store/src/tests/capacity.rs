@@ -1,5 +1,40 @@
 use super::*;
 
+#[cfg(windows)]
+#[test]
+fn custody_binding_preserves_windows_case_and_junction_aliases() {
+    let root = std::env::temp_dir().join(format!("eliot-custody-alias-{}", Ulid::new()));
+    let dir = root.join("MixedCaseData");
+    fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir.join("eliot.db")).unwrap();
+    let namespace = store.custody_namespace().unwrap();
+    drop(store);
+    let case_alias = PathBuf::from(dir.to_str().unwrap().to_ascii_uppercase());
+    let store = Store::open(&case_alias.join("eliot.db")).unwrap();
+    assert_eq!(store.custody_namespace().unwrap(), namespace);
+    drop(store);
+
+    let junction = root.join("junction");
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&dir)
+        .output()
+        .unwrap();
+    if output.status.success() {
+        let store = Store::open(&junction.join("eliot.db")).unwrap();
+        assert_eq!(store.custody_namespace().unwrap(), namespace);
+        drop(store);
+        fs::remove_dir(&junction).unwrap();
+    } else {
+        eprintln!(
+            "junction alias unavailable on this host: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn custody_binding_preserves_non_utf8_data_directories() {
