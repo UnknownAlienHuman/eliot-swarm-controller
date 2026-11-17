@@ -690,7 +690,27 @@ records; full records stay available through `agent.get`. Optional `state`,
 `project`, `harness`, `parent` and `root` filters are exact indexed matches:
 wrong types and unknown state names are `invalid`, and a filter never matches
 silently. The selective structural/scope index (`parent`/`root`/`project`)
-leads when several filters are present. Each summary carries identity, state,
+leads when several filters are present. `states` optionally selects 1 through
+9 distinct lifecycle states and is mutually exclusive with `state`. It is one
+ordinary ID-ordered page: `limit` remains a **total** row cap (at most 1,000),
+not a per-state allowance; the existing cursor and byte bounds still apply.
+When `states` is supplied, the response also requires `state_totals`, exactly
+one `{state,total}` for each of the nine lifecycle states, including zeroes.
+These counts apply the same caller scope, archived selection and non-state
+filters, ignoring the state set and cursor; the selected states' counts sum
+to the page's `total`. They count persisted lifecycle state, not observed-child
+activity. No totals outside the caller's scope are exposed. Without `states`,
+`state_totals` is absent. Rows and counts are captured under the same Store
+lock; joined observations retain the generation checks below.
+
+The desktop Monitor reads one such page for its eight live states, capped at
+800 total rows, and shows at most 100 rows per state. It groups the rows
+locally using the scoped totals; each group's shown/total count exposes a
+shortfall caused by either row or byte truncation, including a state with no
+rows in the returned prefix. Stopped rows remain a separate, rarer read, and
+attention scanning is unchanged.
+
+Each summary carries identity, state,
 current turn, progress age, the last terminal outcome with its turn and
 retained usage where available, child activity for native observed children,
 and the last controller-observed write time. It also carries what the Agent is

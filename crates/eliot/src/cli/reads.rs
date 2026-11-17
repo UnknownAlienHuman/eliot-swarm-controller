@@ -816,6 +816,7 @@ pub(crate) fn list_params(
         limit,
         observations,
         state,
+        states: None,
         project: filter.project,
         harness: filter.harness,
         parent: filter.parent,

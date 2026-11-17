@@ -1,9 +1,9 @@
 //! Swarm monitor: demand-driven rows, honest counters and UI-only metric
 //! history, as pure logic plus one bounded refresh read.
 //!
-//! One refresh is a fixed set of existing reads: `agent.list` per live state
-//! with `observations=true` (rows), the stopped total (and, every
-//! `STOPPED_EVERY` refreshes, the stopped rows for Recently stopped), the
+//! One refresh reads one bounded multi-state `agent.list` page with joined
+//! observations and scoped state totals (and, every `STOPPED_EVERY`
+//! refreshes, the stopped rows for Recently stopped), the
 //! new `x.user.agent.attention` reports after the last cursor (the first
 //! read starts `ATTENTION_WINDOW_MS` back), and, for the selected Agent
 //! only, `agent.get`, `usage.summary` and `diagnose`. No per-Agent timers,
@@ -40,8 +40,10 @@ use crate::client::{self, MAX_CONCURRENT_READS};
 
 /// Refresh period while the monitor is open.
 pub const PERIOD_MS: u64 = 2_000;
-/// Rows read per live state.
+/// Rows displayed per live state from the bounded fleet page.
 pub const ROWS_PER_STATE: usize = 100;
+/// Total live rows read in one page; per-state counts reveal any shortfall.
+pub const FLEET_ROWS: usize = ROWS_PER_STATE * ROW_STATES.len();
 /// Stopped rows read for Recently stopped (one page).
 pub const STOPPED_ROWS: usize = 1_000;
 /// The stopped rows are read again every this many refreshes (the total
@@ -1160,8 +1162,8 @@ impl Monitor {
                 }
             }
         }
-        // State reads are not one atomic read: an Agent that changed state
-        // between them appears once, under its most urgent state.
+        // Keep overlapping model inputs to one row per Agent, under its
+        // most urgent state. The fleet RPC itself returns distinct rows.
         rows.sort_by(|a, b| {
             a.id.cmp(&b.id)
                 .then_with(|| attention_rank(a.state).cmp(&attention_rank(b.state)))
@@ -1210,8 +1212,7 @@ fn id_order(a: &str, b: &str) -> std::cmp::Ordering {
 type ReadFuture<'a> = Pin<Box<dyn Future<Output = Read> + 'a>>;
 
 enum Read {
-    Group(AgentState, Result<AgentListResponse, String>),
-    Count(AgentState, Result<usize, String>),
+    Fleet(Result<AgentListResponse, String>),
     Stopped(Result<AgentListResponse, String>),
     Attention(Result<AttentionRead, String>),
     Detail(Box<Result<DetailRead, String>>),
@@ -1279,6 +1280,78 @@ fn list_request(state: AgentState, limit: usize, observations: bool) -> AgentLis
     }
 }
 
+fn fleet_request() -> AgentListRequest {
+    AgentListRequest {
+        states: Some(ROW_STATES.to_vec()),
+        limit: FLEET_ROWS,
+        observations: true,
+        ..Default::default()
+    }
+}
+
+/// Adapt one validated fleet page into the existing model input. Totals keep
+/// row/byte truncation visible even when an entire state's rows are outside
+/// the page. Stopped rows and attention retain their independent cadence.
+fn take_fleet(snapshot: &mut MonitorSnapshot, page: Result<AgentListResponse, String>) {
+    let page = page.and_then(|page| {
+        fleet_request()
+            .validate_response(&page)
+            .map_err(|error| error.to_string())?;
+        Ok(page)
+    });
+    match page {
+        Ok(page) => {
+            let totals = page.state_totals.as_ref().expect("validated state totals");
+            for state in ROW_STATES {
+                let agents: Vec<_> = page
+                    .agents
+                    .iter()
+                    .filter(|row| row.summary.state == state)
+                    .take(ROWS_PER_STATE)
+                    .cloned()
+                    .collect();
+                let total = totals
+                    .iter()
+                    .find(|entry| entry.state == state)
+                    .expect("validated state total")
+                    .total;
+                snapshot.groups.push((
+                    state,
+                    Ok(AgentListResponse {
+                        state_totals: None,
+                        next: agents.last().map(|row| row.summary.id.clone()),
+                        truncated: agents.len() < total,
+                        total,
+                        agents,
+                    }),
+                ));
+            }
+            for state in COUNT_STATES {
+                snapshot.counts.push((
+                    state,
+                    Ok(totals
+                        .iter()
+                        .find(|entry| entry.state == state)
+                        .expect("validated state total")
+                        .total),
+                ));
+            }
+        }
+        Err(error) => {
+            snapshot.groups.extend(
+                ROW_STATES
+                    .into_iter()
+                    .map(|state| (state, Err(error.clone()))),
+            );
+            snapshot.counts.extend(
+                COUNT_STATES
+                    .into_iter()
+                    .map(|state| (state, Err(error.clone()))),
+            );
+        }
+    }
+}
+
 /// What one refresh reads besides the fixed live set.
 #[derive(Clone, Debug, Default)]
 pub struct RefreshPlan {
@@ -1325,35 +1398,16 @@ pub async fn refresh(
         }
         Read::Attention(read_attention(data_dir, attention_cursor, read_at_ms, cancelled).await)
     }));
-    for state in ROW_STATES {
-        reads.push(Box::pin(async move {
-            if cancelled() {
-                return Read::Cancelled;
-            }
-            let request = list_request(state, ROWS_PER_STATE, true);
-            Read::Group(
-                state,
-                client::list_agents(data_dir, &request)
-                    .await
-                    .map_err(|error| error.to_string()),
-            )
-        }));
-    }
-    for state in COUNT_STATES {
-        reads.push(Box::pin(async move {
-            if cancelled() {
-                return Read::Cancelled;
-            }
-            let request = list_request(state, 1, false);
-            Read::Count(
-                state,
-                client::list_agents(data_dir, &request)
-                    .await
-                    .map(|page| page.total)
-                    .map_err(|error| error.to_string()),
-            )
-        }));
-    }
+    reads.push(Box::pin(async move {
+        if cancelled() {
+            return Read::Cancelled;
+        }
+        Read::Fleet(
+            client::list_agents(data_dir, &fleet_request())
+                .await
+                .map_err(|error| error.to_string()),
+        )
+    }));
     if let Some(agent) = selected.clone() {
         reads.push(Box::pin(async move {
             if cancelled() {
@@ -1407,8 +1461,7 @@ pub async fn refresh(
     }
     for result in results {
         match result {
-            Read::Group(state, page) => snapshot.groups.push((state, page)),
-            Read::Count(state, total) => snapshot.counts.push((state, total)),
+            Read::Fleet(page) => take_fleet(&mut snapshot, page),
             Read::Stopped(page) => snapshot.stopped = Some(page),
             Read::Attention(read) => snapshot.attention = Some(read),
             Read::Detail(detail) => snapshot.detail = Some(*detail),
@@ -1572,6 +1625,7 @@ mod tests {
             observation: None,
         };
         let page = |state: AgentState| AgentListResponse {
+            state_totals: None,
             agents: vec![row(state)],
             next: Some("a7".to_owned()),
             total: 1,
@@ -1812,11 +1866,132 @@ mod tests {
 
     fn page(rows: Vec<AgentListRow>) -> Result<AgentListResponse, String> {
         Ok(AgentListResponse {
+            state_totals: None,
             next: rows.last().map(|row| row.summary.id.clone()),
             total: rows.len(),
             agents: rows,
             truncated: false,
         })
+    }
+
+    #[test]
+    fn fleet_page_preserves_groups_workers_native_children_and_truncation() {
+        use eliot_core::api::{AGENT_LIST_STATES, AgentStateTotal};
+        let mut rows = vec![
+            summary("a1", AgentState::Busy, None, false),
+            summary("a2", AgentState::Waiting, Some("a1"), false),
+            summary("a3", AgentState::Idle, Some("a1"), false),
+            summary("a4", AgentState::Unknown, Some("a1"), true),
+            summary("a5", AgentState::Busy, None, false),
+            summary("a6", AgentState::Idle, None, false),
+        ];
+        for row in &mut rows {
+            row.observation = Some(ObservationView::unavailable("no_sample"));
+        }
+        let totals: Vec<_> = AGENT_LIST_STATES
+            .into_iter()
+            .map(|state| AgentStateTotal {
+                state,
+                total: if state == AgentState::Stopped {
+                    1
+                } else {
+                    rows.iter().filter(|row| row.summary.state == state).count()
+                },
+            })
+            .collect();
+        let snapshot = || MonitorSnapshot {
+            groups: Vec::new(),
+            counts: Vec::new(),
+            stopped: Some(page(vec![summary("a7", AgentState::Stopped, None, false)])),
+            attention: None,
+            detail: None,
+            losses: Vec::new(),
+            read_at_ms: 2_000,
+        };
+        let mut old = snapshot();
+        for state in ROW_STATES {
+            old.groups.push((
+                state,
+                page(
+                    rows.iter()
+                        .filter(|row| row.summary.state == state)
+                        .cloned()
+                        .collect(),
+                ),
+            ));
+        }
+        old.counts.push((AgentState::Stopped, Ok(1)));
+        let mut new = snapshot();
+        let fleet = AgentListResponse {
+            state_totals: Some(totals),
+            next: Some("a6".to_owned()),
+            total: rows.len(),
+            truncated: false,
+            agents: rows,
+        };
+        take_fleet(&mut new, Ok(fleet.clone()));
+        let mut before = Monitor::default();
+        before.apply(old);
+        let mut after = Monitor::default();
+        after.apply(new);
+        assert!(after.errors.is_empty());
+        assert_eq!(after.counts, before.counts);
+        assert_eq!(after.live_line(2_000), before.live_line(2_000));
+        let tree = after.tree(2_000);
+        let sections: Vec<_> = tree
+            .sections()
+            .into_iter()
+            .map(|section| {
+                (
+                    section.group,
+                    section
+                        .rows
+                        .iter()
+                        .map(|row| row.id.as_str())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sections,
+            vec![
+                (Group::Attention, vec!["a1"]),
+                (Group::Working, vec!["a5"]),
+                (Group::Idle, vec!["a6"]),
+                (Group::Stopped, vec!["a7"])
+            ]
+        );
+        assert_eq!(
+            tree.children("a1")
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a2", "a3", "a4"]
+        );
+        assert_eq!(
+            tree.children_label("a1"),
+            before.tree(2_000).children_label("a1")
+        );
+        // A state beyond the total page cap still has an exact total and
+        // explicit shown/total shortfall rather than appearing quiet.
+        let mut cut = fleet;
+        cut.agents.truncate(1);
+        cut.next = Some("a1".to_owned());
+        cut.truncated = true;
+        let mut truncated = snapshot();
+        take_fleet(&mut truncated, Ok(cut));
+        after.apply(truncated);
+        let waiting = after
+            .counts
+            .iter()
+            .find(|count| count.state == AgentState::Waiting)
+            .unwrap();
+        assert_eq!((waiting.shown, waiting.total), (0, Some(1)));
+        assert!(!after.errors.iter().any(|error| error.contains("unknown")));
+        let mut failed = snapshot();
+        take_fleet(&mut failed, Err("unavailable".to_owned()));
+        after.apply(failed);
+        assert!(after.counts.iter().all(|count| count.total.is_none()));
     }
 
     #[test]

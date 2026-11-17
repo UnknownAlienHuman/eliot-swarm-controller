@@ -92,6 +92,11 @@ pub struct AgentListRequest {
     /// `invalid`; an unknown state name never matches silently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<AgentState>,
+    /// Nonempty distinct state set, mutually exclusive with `state`. `limit`
+    /// remains a total row cap. Requests state totals for all nine states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 9))]
+    pub states: Option<Vec<AgentState>>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -132,6 +137,7 @@ impl Default for AgentListRequest {
             limit: super::DEFAULT_LIMIT,
             observations: false,
             state: None,
+            states: None,
             project: None,
             harness: None,
             parent: None,
@@ -142,6 +148,20 @@ impl Default for AgentListRequest {
 
 impl AgentListRequest {
     pub fn validate(&self) -> Result<()> {
+        if let Some(states) = &self.states
+            && (self.state.is_some()
+                || states.is_empty()
+                || states.len() > 9
+                || states
+                    .iter()
+                    .enumerate()
+                    .any(|(i, state)| states[..i].contains(state)))
+        {
+            return Err(Error::new(
+                "invalid",
+                "states must contain 1 through 9 distinct states and cannot accompany state",
+            ));
+        }
         if let Some(after) = &self.after {
             text(after)?;
         }
@@ -191,6 +211,32 @@ impl AgentListRequest {
         {
             return Err(invalid_response());
         }
+        match (&self.states, &reply.state_totals) {
+            (Some(states), Some(totals)) => {
+                if totals.len() != super::AGENT_LIST_STATES.len()
+                    || super::AGENT_LIST_STATES.iter().any(|state| {
+                        totals.iter().filter(|entry| entry.state == *state).count() != 1
+                    })
+                    || totals
+                        .iter()
+                        .filter(|entry| states.contains(&entry.state))
+                        .try_fold(0usize, |sum, entry| sum.checked_add(entry.total))
+                        != Some(reply.total)
+                    || totals.iter().any(|entry| {
+                        reply
+                            .agents
+                            .iter()
+                            .filter(|row| row.summary.state == entry.state)
+                            .count()
+                            > entry.total
+                    })
+                {
+                    return Err(invalid_response());
+                }
+            }
+            (None, None) => {}
+            _ => return Err(invalid_response()),
+        }
         let mut ids = BTreeSet::new();
         if reply.agents.iter().any(|row| {
             row.validate().is_err()
@@ -206,6 +252,7 @@ impl AgentListRequest {
                     super::ArchivedFilter::Include => false,
                 }
                 || self.state.is_some_and(|state| row.summary.state != state)
+                || self.states.as_ref().is_some_and(|states| !states.contains(&row.summary.state))
                 || self
                     .project
                     .as_ref()
