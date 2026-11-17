@@ -105,7 +105,7 @@ pub struct Incident {
 
 /// An attention reason code in words.
 pub fn attention_words(reason: &str) -> String {
-    eliot_core::reason_words(reason).to_owned()
+    eliot_core::reason_words(reason)
 }
 
 /// Lower ranks need attention first: pending requests, then unknown
@@ -330,7 +330,14 @@ pub fn diagnosis_line(reply: &DiagnoseResponse) -> Option<String> {
         && step.message.is_none()
         && !matches!(
             code,
-            "failure" | "failed" | "lost" | "interrupted" | "refused" | "crashed"
+            "failure"
+                | "failed"
+                | "lost"
+                | "agent.failed"
+                | "agent.lost"
+                | "interrupted"
+                | "refused"
+                | "crashed"
         )
     {
         return None;
@@ -338,7 +345,7 @@ pub fn diagnosis_line(reply: &DiagnoseResponse) -> Option<String> {
     Some(format!(
         "{}: {}",
         eliot_core::origin_words(origin),
-        eliot_core::reason_message(code, step.message.as_deref().unwrap_or_default())
+        step.user_message()
     ))
 }
 
@@ -1611,6 +1618,27 @@ mod tests {
             diagnosis_line(&diagnosis("unknown", "lost", None, None)).as_deref(),
             Some("Cause not determined: Lost contact with the Agent")
         );
+    }
+
+    #[test]
+    fn process_diagnosis_uses_the_shared_reason_words() {
+        let mut reply = diagnosis("unknown", "agent.failed", Some("daemon_restart"), None);
+        reply.steps[0].kind = "process".to_owned();
+        assert_eq!(
+            diagnosis_line(&reply).as_deref(),
+            Some("Cause not determined: The Agent could not finish: Stopped by a Swarm restart")
+        );
+        for (code, words) in [
+            ("agent.failed", "The Agent could not finish"),
+            ("agent.lost", "Lost contact with the Agent"),
+        ] {
+            reply.steps[0].code = Some(code.to_owned());
+            reply.steps[0].message = None;
+            assert_eq!(
+                diagnosis_line(&reply),
+                Some(format!("Cause not determined: {words}"))
+            );
+        }
     }
 
     fn summary(id: &str, state: AgentState, parent: Option<&str>, native: bool) -> AgentListRow {

@@ -2,13 +2,16 @@
 
 use crate::Error;
 
-pub fn reason_words(code: &str) -> &'static str {
-    match code {
+pub fn reason_words(code: &str) -> String {
+    let words = match code {
         "created" | "starting" => "Starting",
         "idle" => "Ready for a message",
         "busy" => "Swarm is busy; try again shortly",
         "waiting" => "Waiting for your answer",
         "stopped" => "Stopped",
+        "accepted" => "Request accepted",
+        "queued" => "Waiting to run",
+        "dispatched" => "Sent to the Agent",
         "bad_state" => "The Agent is not ready for this action",
         "stale_generation" => "The Agent started a new run; refresh and try again",
         "unsupported" => "This action is not supported",
@@ -27,15 +30,16 @@ pub fn reason_words(code: &str) -> &'static str {
         "no_progress" => "No progress for a while",
         "source_unhealthy" => "Lost contact with its harness",
         "children_unattended" => "Its subagents are unattended",
-        "failure" | "failed" => "The Agent could not finish",
-        "lost" => "Lost contact with the Agent",
+        "failure" | "failed" | "agent.failed" => "The Agent could not finish",
+        "lost" | "agent.lost" => "Lost contact with the Agent",
         "interrupted" => "Interrupted",
         "refused" | "rejected" => "The request was declined",
         "cancelled" => "Cancelled",
         "crashed" => "The Agent software stopped unexpectedly",
         "success" | "completed" | "applied" => "Completed",
-        _ => "Could not complete the request",
-    }
+        _ => return code.replace(['_', '.'], " "),
+    };
+    words.to_owned()
 }
 
 pub fn origin_words(origin: &str) -> &'static str {
@@ -53,7 +57,7 @@ pub fn origin_words(origin: &str) -> &'static str {
 /// including colons or the text `origin:`.
 pub fn reason_message(code: &str, message: &str) -> String {
     if message.trim().is_empty() {
-        reason_words(code).to_owned()
+        reason_words(code)
     } else {
         format!("{}: {message}", reason_words(code))
     }
@@ -67,6 +71,17 @@ impl Error {
 
 impl crate::api::DiagnoseStep {
     pub fn user_message(&self) -> String {
+        if self.kind == "process" {
+            let words = reason_words(self.code.as_deref().unwrap_or("unknown"));
+            return match self
+                .message
+                .as_deref()
+                .filter(|reason| !reason.trim().is_empty())
+            {
+                Some(reason) => format!("{words}: {}", reason_words(reason)),
+                None => words,
+            };
+        }
         if self.kind == "agent" && self.message.is_none() {
             match self.code.as_deref() {
                 Some("busy") => return "Working".to_owned(),
@@ -95,10 +110,35 @@ mod tests {
             ("failure", "origin: request: refused"),
         ] {
             let shown = reason_message(code, message);
-            assert!(shown.starts_with(reason_words(code)), "{shown}");
+            assert!(shown.starts_with(&reason_words(code)), "{shown}");
             assert!(shown.ends_with(message), "{shown}");
         }
         assert_eq!(reason_message("invalid", " \n"), reason_words("invalid"));
         assert!(!reason_message("unavailable", "artifact ledger is full").contains("temporarily"));
+    }
+
+    #[test]
+    fn unmapped_codes_are_neutral_and_commands_show_their_progress() {
+        assert_eq!(reason_words("native_exit"), "native exit");
+        assert_eq!(reason_words("agent.custom_state"), "agent custom state");
+        assert_eq!(reason_words("accepted"), "Request accepted");
+        assert_eq!(reason_words("queued"), "Waiting to run");
+        assert_eq!(reason_words("dispatched"), "Sent to the Agent");
+    }
+
+    #[test]
+    fn process_steps_keep_the_terminal_state_and_explain_the_reason() {
+        for (code, words) in [
+            ("agent.lost", "Lost contact with the Agent"),
+            ("agent.failed", "The Agent could not finish"),
+        ] {
+            let step: crate::api::DiagnoseStep = serde_json::from_value(serde_json::json!({
+                "kind": "process", "code": code, "message": "daemon_restart"
+            }))
+            .unwrap();
+            let shown = step.user_message();
+            assert!(shown.starts_with(words), "{shown}");
+            assert!(shown.contains("Stopped by a Swarm restart"), "{shown}");
+        }
     }
 }

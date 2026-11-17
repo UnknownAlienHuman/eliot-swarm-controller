@@ -1163,6 +1163,11 @@ fn why_heading(response: &DiagnoseResponse) -> String {
     let Some(step) = eliot_core::api::diagnosis_reason(&response.steps) else {
         return format!("No failure details are available for {}", response.target);
     };
+    let in_flight = step.kind == "command"
+        && matches!(
+            step.code.as_deref(),
+            Some("accepted" | "queued" | "dispatched")
+        );
     let healthy = step.kind == "agent"
         && step.message.is_none()
         && matches!(
@@ -1173,7 +1178,7 @@ fn why_heading(response: &DiagnoseResponse) -> String {
             .origin
             .as_deref()
             .is_none_or(|origin| origin == "unknown");
-    let label = if healthy {
+    let label = if healthy || in_flight {
         response.target.as_str()
     } else {
         eliot_core::origin_words(step.origin.as_deref().unwrap_or("unknown"))
@@ -1251,6 +1256,26 @@ mod tests {
             )),
             "Model service: The Agent could not finish: origin: request: refused"
         );
+    }
+
+    #[test]
+    fn starting_why_with_an_in_flight_launch_has_no_failure_heading() {
+        for (state, words) in [
+            ("accepted", "Request accepted"),
+            ("queued", "Waiting to run"),
+            ("dispatched", "Sent to the Agent"),
+        ] {
+            let reply =
+                serde_json::from_value::<eliot_core::api::DiagnoseResponse>(serde_json::json!({
+                    "target": "a2", "summary": "unused",
+                    "steps": [
+                        {"kind": "agent", "code": "starting"},
+                        {"kind": "command", "code": state}
+                    ]
+                }))
+                .unwrap();
+            assert_eq!(super::why_heading(&reply), format!("a2: {words}"));
+        }
     }
 
     #[test]

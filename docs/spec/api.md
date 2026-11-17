@@ -1063,6 +1063,9 @@ Human CLI and desktop explanations lead with shared words for the typed code,
 followed by the daemon's complete message when nonempty. Specific refusal reasons
 (including reparent cycles, observe-only Agents and non-live managers) remain
 visible; a generic code alone must not hide the reason or imply a temporary outage.
+Codes without specific words display their readable code name without implying a
+failure. Accepted, queued and dispatched commands describe progress; process steps
+retain whether the Agent was lost or failed and explain their recorded reason.
 
 For every failed terminal turn, with or without a structured provider restriction, status
 and exact command/turn binding remain authoritative when final text exceeds the event
