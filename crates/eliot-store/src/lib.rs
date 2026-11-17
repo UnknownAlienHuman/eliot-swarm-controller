@@ -4171,6 +4171,12 @@ fn admit_command(
     }
     let cause = ordinary_command_cause(command.id);
     insert_command(tx, command, &cause)?;
+    if matches!(command.verb, "send" | "resume" | "steer" | "inject") {
+        db!(tx.execute(
+            "UPDATE agents SET archived=0,updated_at=?1 WHERE id=?2 AND archived=1",
+            params![command.created_at, command.target]
+        ));
+    }
     insert_daemon_event_input(
         tx,
         DaemonEventInput::new(

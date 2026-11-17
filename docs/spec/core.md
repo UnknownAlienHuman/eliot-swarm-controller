@@ -821,12 +821,15 @@ read paths; a retried ack over it succeeds as already acked. An unset
 
 `archived` is a durable presentation flag independent of lifecycle state; archiving
 never stops a generation. Archive/unarchive requires idle or stopped descendants,
-no active or unknown turns, pending requests or open commands. Deletion requires
-every descendant stopped and drained, and shares retention's leaf-first command
+no active or unknown turns, pending requests or open commands.
+Send, resume, steer and inject admission atomically clears the target's archive flag.
+Deletion requires every descendant stopped and drained, and shares retention's leaf-first command
 row cleanup. Store removes dependent records in one transaction and retains
 mutation replies plus deleted command identities through the retry window. It
 advances the conservative retained-history floor before removing event rows,
-refusing a live rule/Git cursor pin. No uncertain native effect is replayed.
+refusing a live rule/Git cursor pin or an applicable unconsumed cleanup plan.
+Process records are removed across every generation; consumed cleanup-plan replay
+remains retained. No uncertain native effect is replayed.
 Neither operation touches native stores, workspaces or branches; artifact cleanup
 precedes record deletion when wanted. See [API](api.md) for DTOs and bounds.
 

@@ -25,6 +25,208 @@ use std::{
 use ulid::Ulid;
 
 #[test]
+fn archived_agent_activity_reappears_in_default_list_atomically() {
+    for verb in ["send", "inject"] {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = Ulid::new().timestamp_ms() as i64;
+        let agent = ready_steer_agent(&mut store, verb, now);
+        if verb == "inject" {
+            store
+                .connection
+                .execute(
+                    "UPDATE agents SET effective=?1 WHERE id=?2",
+                    rusqlite::params![
+                        r#"{"context_points":["next_input"]}"#,
+                        eliot_core::parse_agent_id(&agent).unwrap()
+                    ],
+                )
+                .unwrap();
+        }
+        store
+            .change_agent_tree(&Ulid::new().to_string(), &agent, Some(true), now)
+            .unwrap();
+        let list = |store: &Store| {
+            store
+                .list_agent_summaries(
+                    &super::AgentListFilter::default(),
+                    None,
+                    20,
+                    now,
+                    &SessionGrowthThresholds::default(),
+                )
+                .unwrap()
+        };
+        assert_eq!(list(&store).total, 0);
+        let mut request = send_request(&agent, 1, "read the roadmap");
+        request.verb = verb.to_owned();
+        if verb == "inject" {
+            request.args = json!({"point":"next_input","text":"read the roadmap"});
+        }
+        let mut invalid = request.clone();
+        invalid.id = Ulid::new().to_string();
+        invalid.expected_generation = Some(99);
+        assert!(store.submit("owner", invalid, now).is_err());
+        assert!(store.get_agent(&agent).unwrap().unwrap().archived);
+        store.submit("owner", request.clone(), now).unwrap();
+        assert!(!store.get_agent(&agent).unwrap().unwrap().archived);
+        assert_eq!(list(&store).total, 1);
+        assert_eq!(list(&store).summaries[0].id, agent);
+        assert!(!store.submit("owner", request, now).unwrap().is_new);
+    }
+}
+
+#[test]
+fn stop_resume_stop_delete_removes_processes_of_every_generation() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let agent = ready_steer_agent(&mut store, "delete-generations", now);
+    let initial = store.get_agent(&agent).unwrap().unwrap();
+    for generation in [1, 2] {
+        install_live_custody_observations(&mut store, &agent, generation, now);
+        let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+        stop.target = Some(agent.clone());
+        stop.expected_generation = Some(generation);
+        let stop_id = stop.id.clone();
+        store.submit("owner", stop, now).unwrap();
+        store.dispatch(&stop_id, now).unwrap();
+        store
+            .put_batch(
+                SourceBatch {
+                    batch_id: format!("delete:{generation}:ended"),
+                    agent_id: agent.clone(),
+                    generation,
+                    source: "stream".to_owned(),
+                    cursor: None,
+                    events: vec![NativeEvent {
+                        ts: None,
+                        kind: "session.ended".to_owned(),
+                        native_id: format!("delete:{generation}:ended"),
+                        data: json!({"command_id":stop_id}),
+                    }],
+                },
+                now,
+            )
+            .unwrap();
+        store
+            .settle(&stop_id, CommandState::Applied, None, now)
+            .unwrap();
+        simulate_normal_stop_proof(&mut store, &agent, generation, now);
+        store.connection.execute("INSERT INTO processes(host_boot_id,pid,start_time,owner,role,state,exit_code,updated_at) VALUES ('workspace',?1,0,?2,'setup','exited',0,?3)", rusqlite::params![generation,format!("workspace:{agent}#{generation}"),now]).unwrap();
+        if generation == 1 {
+            store
+                .change_agent_tree(&Ulid::new().to_string(), &agent, Some(true), now)
+                .unwrap();
+            let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+            resume.target = Some(agent.clone());
+            resume.expected_generation = Some(1);
+            let resume_id = resume.id.clone();
+            store.submit("owner", resume, now).unwrap();
+            assert!(!store.get_agent(&agent).unwrap().unwrap().archived);
+            store.dispatch(&resume_id, now).unwrap();
+            install_fixture_sources(&mut store, &agent, &resume_id, 2, now);
+            store.put_batch(SourceBatch {
+                batch_id: "delete:resumed".to_owned(), agent_id: agent.clone(), generation: 2,
+                source: "stream".to_owned(), cursor: None,
+                events: vec![NativeEvent { ts: None, kind: "session.ready".to_owned(),
+                    native_id: "delete:resumed".to_owned(), data: json!({"command_id":resume_id,"native_scope":initial.native_scope,"native_ref":initial.native_ref}) }],
+            }, now).unwrap();
+            store
+                .settle(&resume_id, CommandState::Applied, None, now)
+                .unwrap();
+        }
+    }
+    store.connection.execute("INSERT INTO processes(host_boot_id,pid,start_time,owner,role,state,exit_code,updated_at) VALUES ('other',10,0,'agent:a10#1','plugin','exited',0,?1)", [now]).unwrap();
+    let delete_id = Ulid::new().to_string();
+    let result = store
+        .change_agent_tree(&delete_id, &agent, None, now)
+        .unwrap();
+    assert!(store.get_agent(&agent).unwrap().is_none());
+    let owners: Vec<String> = store
+        .connection
+        .prepare("SELECT owner FROM processes")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(owners, vec!["agent:a10#1"]);
+    assert_eq!(
+        store
+            .change_agent_tree(&delete_id, &agent, None, now)
+            .unwrap(),
+        result
+    );
+}
+
+#[test]
+fn delete_refuses_unconsumed_cleanup_and_preserves_consumed_replay() {
+    use eliot_core::api::{
+        ArtifactKind, ArtifactView, CleanupApplyRequest, CleanupCandidate, CleanupPlan,
+    };
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    for _ in 0..2 {
+        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','stopped',2,?1,?1)",[now]).unwrap();
+    }
+    let artifact = ArtifactView {
+        id: Ulid::new().to_string(),
+        agent: "a1".to_owned(),
+        generation: 1,
+        project: "p".to_owned(),
+        tree: vec!["a1:1".to_owned()],
+        path: "C:/scratch/old".to_owned(),
+        kind: ArtifactKind::Temp,
+        purpose: "old output".to_owned(),
+        identity: "old".to_owned(),
+        created_at: now,
+        state: "registered".to_owned(),
+        git: None,
+    };
+    let plan = CleanupPlan {
+        plan_id: Ulid::new().to_string(),
+        created_at: now,
+        items: vec![CleanupCandidate {
+            artifact,
+            bytes: None,
+            verdict: "keep".to_owned(),
+            reason: "retained".to_owned(),
+        }],
+        truncated: false,
+    };
+    store.retain_cleanup_plan("owner", &plan).unwrap();
+    let mut unrelated = plan.clone();
+    unrelated.plan_id = Ulid::new().to_string();
+    unrelated.items[0].artifact.agent = "a2".to_owned();
+    store.retain_cleanup_plan("owner", &unrelated).unwrap();
+    let delete_id = Ulid::new().to_string();
+    assert_eq!(
+        store
+            .change_agent_tree(&delete_id, "a1", None, now)
+            .unwrap_err()
+            .code,
+        "busy"
+    );
+    assert!(store.get_agent("a1").unwrap().is_some());
+    let request = CleanupApplyRequest {
+        id: Ulid::new().to_string(),
+        plan_id: plan.plan_id.clone(),
+        delete_remote: false,
+    };
+    let (_, first, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
+    assert!(is_new);
+    store
+        .change_agent_tree(&delete_id, "a1", None, now)
+        .unwrap();
+    assert!(store.cleanup_plan("owner", &unrelated.plan_id).is_ok());
+    let (_, replay, is_new) = store.begin_cleanup_apply("owner", &request, now).unwrap();
+    assert!(!is_new);
+    assert_eq!(
+        serde_json::to_value(first).unwrap(),
+        serde_json::to_value(replay).unwrap()
+    );
+}
+
+#[test]
 fn failed_turn_records_its_command_as_preceded_by() {
     // A non-success terminal turn links the command whose terminal event
     // settled it; success links nothing. Legacy rows read back as None.
