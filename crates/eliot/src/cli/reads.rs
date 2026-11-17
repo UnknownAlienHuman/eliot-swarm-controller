@@ -6,8 +6,6 @@ use super::args::{
 };
 use super::support::read_and_print;
 use super::support::{Failure, PAGE_SIZE, print_value, validate_limit};
-#[cfg(test)]
-use eliot_core::NativeChildActivityState;
 use eliot_core::api::{
     AgentEditsRequest, AgentEditsResponse, AgentGetRequest, AgentGetResponse, AgentGitRequest,
     AgentGitResponse, AgentHistoryRequest, AgentListRequest, AgentListResponse,
@@ -1161,13 +1159,33 @@ pub(crate) async fn run_why(
     }
 }
 
+fn why_heading(response: &DiagnoseResponse) -> String {
+    let Some(step) = eliot_core::api::diagnosis_reason(&response.steps) else {
+        return format!("No failure details are available for {}", response.target);
+    };
+    let healthy = step.kind == "agent"
+        && step.message.is_none()
+        && matches!(
+            step.code.as_deref(),
+            Some("created" | "starting" | "idle" | "busy" | "waiting" | "stopped" | "unknown")
+        )
+        && step
+            .origin
+            .as_deref()
+            .is_none_or(|origin| origin == "unknown");
+    let label = if healthy {
+        response.target.as_str()
+    } else {
+        eliot_core::origin_words(step.origin.as_deref().unwrap_or("unknown"))
+    };
+    format!("{label}: {}", step.user_message())
+}
+
 fn print_why_diagnosis(response: &DiagnoseResponse) {
-    println!("{}", response.summary);
+    println!("{}", why_heading(response));
     for step in &response.steps {
         let mut line = format!("  [{}]", step.kind);
-        if let Some(code) = step.code.as_deref() {
-            line.push_str(&format!(" {}", eliot_core::reason_words(code)));
-        }
+        line.push_str(&format!(" {}", step.user_message()));
         if let Some(where_) = step.failure_where.as_deref() {
             line.push_str(&format!(" at {where_}"));
         }
@@ -1176,9 +1194,6 @@ fn print_why_diagnosis(response: &DiagnoseResponse) {
         }
         if let Some(ntstatus) = step.ntstatus.as_deref() {
             line.push_str(&format!(" {ntstatus}"));
-        }
-        if let Some(message) = step.message.as_deref() {
-            line.push_str(&format!(": {message}"));
         }
         println!("{line}");
         if let Some(origin) = step.origin.as_deref() {
@@ -1210,6 +1225,33 @@ mod tests {
     };
     use eliot_core::{AgentState, Error as CoreError, NativeChildActivityState, TurnUsage};
     use std::time::Duration;
+
+    #[test]
+    fn healthy_why_is_a_state_and_failure_prose_is_not_reparsed() {
+        let reply = |code, origin, message| {
+            serde_json::from_value::<eliot_core::api::DiagnoseResponse>(serde_json::json!({
+                "target": "a2", "summary": "not used: origin: provider",
+                "steps": [{"kind": "agent", "code": code, "origin": origin, "message": message}]
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            super::why_heading(&reply("idle", "unknown", None)),
+            "a2: Ready for a message"
+        );
+        assert_eq!(
+            super::why_heading(&reply("busy", "unknown", None)),
+            "a2: Working"
+        );
+        assert_eq!(
+            super::why_heading(&reply(
+                "failure",
+                "provider",
+                Some("origin: request: refused")
+            )),
+            "Model service: origin: request: refused"
+        );
+    }
 
     #[test]
     fn watch_rides_out_transport_timeouts_but_not_domain_rejections() {

@@ -4,6 +4,11 @@ use crate::Error;
 
 pub fn reason_words(code: &str) -> &'static str {
     match code {
+        "created" | "starting" => "Starting",
+        "idle" => "Ready for a message",
+        "busy" => "Swarm is busy; try again shortly",
+        "waiting" => "Waiting for your answer",
+        "stopped" => "Stopped",
         "bad_state" => "The Agent is not ready for this action",
         "stale_generation" => "The Agent started a new run; refresh and try again",
         "unsupported" => "This action is not supported",
@@ -12,7 +17,6 @@ pub fn reason_words(code: &str) -> &'static str {
         "not_allowed" => "This action is not permitted here",
         "invalid" => "Check the supplied values",
         "not_found" => "The requested item no longer exists",
-        "busy" => "Swarm is busy; try again shortly",
         "timeout" => "The request took too long",
         "internal" => "Swarm could not complete the request",
         "frame_too_large" => "The reply is too large to display",
@@ -78,5 +82,21 @@ pub fn reason_message(code: &str, message: &str) -> String {
 impl Error {
     pub fn user_message(&self) -> String {
         reason_message(&self.code, &self.message)
+    }
+}
+
+impl crate::api::DiagnoseStep {
+    pub fn user_message(&self) -> String {
+        if self.kind == "agent" && self.message.is_none() {
+            match self.code.as_deref() {
+                Some("busy") => return "Working".to_owned(),
+                Some("unknown") => return "State not confirmed".to_owned(),
+                _ => {}
+            }
+        }
+        reason_message(
+            self.code.as_deref().unwrap_or("unknown"),
+            self.message.as_deref().unwrap_or_default(),
+        )
     }
 }

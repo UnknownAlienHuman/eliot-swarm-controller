@@ -1722,6 +1722,31 @@ pub struct DiagnoseStep {
     pub at: Option<i64>,
 }
 
+/// The same most-informative reason for every diagnosis presentation. Failure
+/// origin, terminal turn and process evidence take precedence over fallbacks.
+pub fn diagnosis_reason(steps: &[DiagnoseStep]) -> Option<&DiagnoseStep> {
+    steps
+        .iter()
+        .find(|step| {
+            step.origin
+                .as_deref()
+                .is_some_and(|origin| origin != "unknown")
+        })
+        .or_else(|| {
+            steps.iter().find(|step| {
+                step.kind == "turn"
+                    && matches!(
+                        step.code.as_deref(),
+                        Some("failure" | "interrupted" | "unknown")
+                    )
+            })
+        })
+        .or_else(|| steps.iter().find(|step| step.exit_code.is_some()))
+        .or_else(|| steps.iter().find(|step| step.kind == "command"))
+        .or_else(|| steps.iter().find(|step| step.kind == "turn"))
+        .or(steps.first())
+}
+
 impl DiagnoseStep {
     pub fn validate(&self) -> Result<()> {
         if self.kind.chars().count() > 64

@@ -7,7 +7,7 @@ use eliot_core::api::{
     EmitDefinitionArgs, MailMode, MailSendRequest, ObservationView, SourceState, agent_state_name,
     process_state_name, stats_coverage_name,
 };
-use eliot_core::{Agent, AgentState, CommandState, Error, ProcessState, Result};
+use eliot_core::{Agent, AgentState, CommandState, Error, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

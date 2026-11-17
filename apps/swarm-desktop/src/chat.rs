@@ -388,7 +388,8 @@ pub enum PartKind {
 /// origin, and whether the failure is definite (Retry) or uncertain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputFailure {
-    pub summary: String,
+    pub code: String,
+    pub message: String,
     pub origin: String,
     pub definite: bool,
 }
@@ -814,8 +815,8 @@ impl Conversation {
                     format!("fail:{command}"),
                     kind,
                     label.to_owned(),
-                    failure.summary.clone(),
-                    vec![format!("Origin: {}", failure.origin)],
+                    eliot_core::reason_message(&failure.code, &failure.message),
+                    vec![eliot_core::origin_words(&failure.origin).to_owned()],
                 ));
             } else if let Some(note) = self.local_notes.get(command) {
                 parts.push(Part::new(
@@ -1248,7 +1249,8 @@ mod tests {
         chat.set_local_failure(
             "c9/send",
             InputFailure {
-                summary: "swarm origin: a2 rejected at router.dispatch.prepare_chat: chat directory already exists".to_owned(),
+                code: "rejected".to_owned(),
+                message: "chat directory already exists".to_owned(),
                 origin: "swarm".to_owned(),
                 definite: true,
             },
@@ -1258,8 +1260,8 @@ mod tests {
         let parts = &chat.items()[0].parts;
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[1].kind, PartKind::Failed);
-        assert!(parts[1].text.starts_with("swarm origin: a2 rejected"));
-        assert_eq!(parts[1].detail, vec!["Origin: swarm".to_owned()]);
+        assert_eq!(parts[1].text, "chat directory already exists");
+        assert_eq!(parts[1].detail, vec!["Swarm".to_owned()]);
         assert!(!parts.iter().any(|part| part.kind == PartKind::Working));
         assert!(chat.waiting_locals().is_empty());
         assert_eq!(chat.local_text("c9/send").as_deref(), Some("hello"));
@@ -1267,7 +1269,8 @@ mod tests {
         chat.set_local_failure(
             "c9/send",
             InputFailure {
-                summary: "unknown origin: a2 unknown".to_owned(),
+                code: "unknown".to_owned(),
+                message: String::new(),
                 origin: "unknown".to_owned(),
                 definite: false,
             },
@@ -1277,7 +1280,8 @@ mod tests {
         chat.set_local_failure(
             "other",
             InputFailure {
-                summary: "x".to_owned(),
+                code: "failure".to_owned(),
+                message: "x".to_owned(),
                 origin: "swarm".to_owned(),
                 definite: true,
             },

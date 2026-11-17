@@ -28,8 +28,8 @@ use std::path::Path;
 use std::pin::Pin;
 
 use eliot_core::api::{
-    AgentGetResponse, AgentListRequest, AgentListResponse, AgentListRow, ObservationView,
-    ProcessStatsView, UsageSummaryResponse, agent_state_name, stats_coverage_name,
+    AgentGetResponse, AgentListRequest, AgentListResponse, AgentListRow, DiagnoseResponse,
+    ObservationView, ProcessStatsView, UsageSummaryResponse, agent_state_name, stats_coverage_name,
 };
 use eliot_core::{AgentState, NativeChildActivityState};
 use futures_util::StreamExt;
@@ -283,13 +283,14 @@ pub fn attention_filter_label(count: usize, on: bool) -> String {
     }
 }
 
-/// A loss Swarm caused itself, from a `swarm why` summary: a daemon restart
-/// ("swarm origin: a2 agent.lost at daemon.restart: daemon_restart").
-pub fn restart_loss(summary: &str) -> bool {
-    summary.starts_with("swarm origin:") && summary.contains(" at daemon.restart")
+/// A restart loss is identified by structured facts, never summary prose.
+pub fn restart_loss(reply: &DiagnoseResponse) -> bool {
+    eliot_core::api::diagnosis_reason(&reply.steps).is_some_and(|step| {
+        step.origin.as_deref() == Some("swarm")
+            && step.failure_where.as_deref() == Some("daemon.restart")
+    })
 }
 
-/// The words for a loss to a Swarm restart.
 pub const RESTART_LOSS_WORDS: &str = "Stopped by a Swarm restart";
 
 /// A turn outcome in words ("completed", "interrupted", "failed",
@@ -316,52 +317,29 @@ pub fn state_words(state: AgentState) -> &'static str {
     }
 }
 
-/// `swarm why`'s one-line summary ("provider origin: a3 failure: free usage
-/// limit reached") as the details panel's origin line ("Provider: free
-/// usage limit reached"); `None` when there is nothing wrong to report (an
-/// unknown origin on an Agent that did not fail).
-pub fn diagnosis_line(summary: &str) -> Option<String> {
-    if restart_loss(summary) {
+/// The selected structured diagnosis reason, in words; healthy state alone
+/// does not create a failure notice.
+pub fn diagnosis_line(reply: &DiagnoseResponse) -> Option<String> {
+    if restart_loss(reply) {
         return Some(RESTART_LOSS_WORDS.to_owned());
     }
-    let (origin, rest) = summary.split_once(" origin: ")?;
-    let (head, message) = match rest.split_once(": ") {
-        Some((head, message)) => (head, Some(message.trim())),
-        None => (rest, None),
-    };
-    let what = head
-        .split_once(' ')
-        .map_or("", |(_, what)| what)
-        .split(" at ")
-        .next()
-        .unwrap_or("")
-        .trim();
-    // An unknown state alone (an Agent Swarm only watches) is no failure.
-    let failed = matches!(
-        what,
-        "failure" | "failed" | "lost" | "interrupted" | "refused" | "crashed"
-    );
-    if origin == "unknown" && message.is_none() && !failed {
+    let step = eliot_core::api::diagnosis_reason(&reply.steps)?;
+    let code = step.code.as_deref().unwrap_or("unknown");
+    let origin = step.origin.as_deref().unwrap_or("unknown");
+    if origin == "unknown"
+        && step.message.is_none()
+        && !matches!(
+            code,
+            "failure" | "failed" | "lost" | "interrupted" | "refused" | "crashed"
+        )
+    {
         return None;
     }
-    let label = match origin {
-        "provider" => "Provider".to_owned(),
-        "environment" => "Environment".to_owned(),
-        "harness" => "Harness".to_owned(),
-        "swarm" => "Swarm".to_owned(),
-        "user" | "owner" => "You".to_owned(),
-        "unknown" => "Cause not determined".to_owned(),
-        other => {
-            let mut chars = other.chars();
-            chars.next().map_or_else(String::new, |first| {
-                first.to_uppercase().chain(chars).collect()
-            })
-        }
-    };
-    let text = message
-        .filter(|message| !message.is_empty())
-        .map_or_else(|| what.replace('_', " "), str::to_owned);
-    Some(format!("{label}: {text}"))
+    Some(format!(
+        "{}: {}",
+        eliot_core::origin_words(origin),
+        eliot_core::reason_message(code, step.message.as_deref().unwrap_or_default())
+    ))
 }
 
 pub fn bytes_label(bytes: Option<u64>) -> String {
@@ -706,7 +684,7 @@ fn rate(previous: &Sample, current: &Sample) -> (Option<f64>, bool) {
 pub struct DetailRead {
     pub agent: AgentGetResponse,
     pub usage: Result<UsageSummaryResponse, String>,
-    pub diagnosis: Result<String, String>,
+    pub diagnosis: Result<DiagnoseResponse, String>,
 }
 
 /// One attention report as read: its binding, phase and reason.
@@ -759,7 +737,7 @@ pub struct MonitorSnapshot {
     pub attention: Option<Result<AttentionRead, String>>,
     pub detail: Option<Result<DetailRead, String>>,
     /// `swarm why` summaries of the lost or failed generations it read.
-    pub losses: Vec<((String, i64), Result<String, String>)>,
+    pub losses: Vec<((String, i64), Result<DiagnoseResponse, String>)>,
     pub read_at_ms: i64,
 }
 
@@ -784,7 +762,7 @@ pub struct Monitor {
     pub incidents: HashMap<(String, i64), Incident>,
     /// `swarm why` summary of each lost or failed generation shown: read
     /// once, since the end of a generation does not change.
-    pub losses: HashMap<(String, i64), String>,
+    pub losses: HashMap<(String, i64), DiagnoseResponse>,
     /// The attention read's cursor (`None` until the first read).
     pub attention_cursor: Option<i64>,
     /// A live row left the live states: read the stopped rows next, so a
@@ -1098,7 +1076,7 @@ enum Read {
     Stopped(Result<AgentListResponse, String>),
     Attention(Result<AttentionRead, String>),
     Detail(Box<Result<DetailRead, String>>),
-    Loss((String, i64), Result<String, String>),
+    Loss((String, i64), Result<DiagnoseResponse, String>),
     Cancelled,
 }
 
@@ -1251,7 +1229,6 @@ pub async fn refresh(
                     .map_err(|error| error.to_string());
                 let diagnosis = client::diagnose(data_dir, &agent)
                     .await
-                    .map(|reply| reply.summary)
                     .map_err(|error| error.to_string());
                 Ok(DetailRead {
                     agent: read,
@@ -1269,7 +1246,6 @@ pub async fn refresh(
             }
             let summary = client::diagnose(data_dir, &key.0)
                 .await
-                .map(|reply| reply.summary)
                 .map_err(|error| error.to_string());
             Read::Loss(key, summary)
         }));
@@ -1601,22 +1577,40 @@ mod tests {
         assert!(obs.freshness().starts_with("Out of date"));
     }
 
+    fn diagnosis(
+        origin: &str,
+        code: &str,
+        message: Option<&str>,
+        location: Option<&str>,
+    ) -> DiagnoseResponse {
+        serde_json::from_value(serde_json::json!({
+            "target": "a2", "summary": "arbitrary prose: origin: is not a parser input",
+            "steps": [{"kind": "agent", "code": code, "origin": origin,
+                "message": message, "where": location}]
+        }))
+        .unwrap()
+    }
+
     #[test]
-    fn diagnosis_reads_as_its_origin_and_hides_when_nothing_failed() {
+    fn diagnosis_reads_structured_origin_and_keeps_message_colons() {
         assert_eq!(
-            diagnosis_line("provider origin: a3 failure: free usage limit reached").as_deref(),
-            Some("Provider: free usage limit reached")
+            diagnosis_line(&diagnosis(
+                "provider",
+                "failure",
+                Some("origin: free usage: limit"),
+                None
+            ))
+            .as_deref(),
+            Some("Model service: origin: free usage: limit")
         );
-        assert_eq!(diagnosis_line("unknown origin: a1 idle"), None);
         assert_eq!(
-            diagnosis_line("environment origin: a2 failed at plugin start").as_deref(),
-            Some("Environment: failed")
+            diagnosis_line(&diagnosis("unknown", "idle", None, None)),
+            None
         );
         assert_eq!(
-            diagnosis_line("unknown origin: a4 lost").as_deref(),
-            Some("Cause not determined: lost")
+            diagnosis_line(&diagnosis("unknown", "lost", None, None)).as_deref(),
+            Some("Cause not determined: Lost contact with the Agent")
         );
-        assert_eq!(diagnosis_line("unknown origin: a3 unknown"), None);
     }
 
     fn summary(id: &str, state: AgentState, parent: Option<&str>, native: bool) -> AgentListRow {
@@ -1783,10 +1777,13 @@ mod tests {
 
     #[test]
     fn a_restart_loss_reads_as_stopped_by_swarm() {
-        let summary = "swarm origin: a2 agent.lost at daemon.restart: daemon_restart";
-        assert!(restart_loss(summary));
-        assert_eq!(diagnosis_line(summary).as_deref(), Some(RESTART_LOSS_WORDS));
-        assert!(!restart_loss("unknown origin: a2 lost"));
+        let summary = diagnosis("swarm", "daemon_restart", None, Some("daemon.restart"));
+        assert!(restart_loss(&summary));
+        assert_eq!(
+            diagnosis_line(&summary).as_deref(),
+            Some(RESTART_LOSS_WORDS)
+        );
+        assert!(!restart_loss(&diagnosis("unknown", "lost", None, None)));
     }
 
     #[test]
@@ -1815,8 +1812,8 @@ mod tests {
         assert!(lost.resumable() && !monitor.row("a3").unwrap().resumable());
         assert_eq!(monitor.loss_reads(), [("a2".to_owned(), 1)]);
         assert_eq!(monitor.loss_words(&lost), None);
-        let why = "swarm origin: a2 agent.lost at daemon.restart: daemon_restart";
-        monitor.apply(snapshot(vec![(("a2".to_owned(), 1), Ok(why.to_owned()))]));
+        let why = diagnosis("swarm", "daemon_restart", None, Some("daemon.restart"));
+        monitor.apply(snapshot(vec![(("a2".to_owned(), 1), Ok(why))]));
         assert_eq!(
             monitor.loss_words(&lost).as_deref(),
             Some(RESTART_LOSS_WORDS)

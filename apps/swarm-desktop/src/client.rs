@@ -205,48 +205,43 @@ pub async fn input_failure(
         CommandState::Accepted | CommandState::Queued if agent_ended => (false, agent),
         _ => return Ok(None),
     };
-    let (summary, origin) = match diagnose(data_dir, target).await {
-        Ok(reply) => {
-            let origin = summary_origin(&reply);
-            (reply.summary, origin)
-        }
-        // The command outcome still names what happened.
-        Err(_) => {
-            let outcome = read.outcome.as_ref();
-            let field = |name: &str| {
-                outcome
-                    .and_then(|outcome| outcome.get(name))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            };
-            let state = format!("{:?}", read.state).to_lowercase();
-            let reason = field("reason").or_else(|| field("code")).unwrap_or(state);
-            let summary = match field("message") {
-                Some(message) => format!("{command} {reason}: {message}"),
-                None => format!("{command} {reason}"),
-            };
-            (
-                summary,
-                field("origin").unwrap_or_else(|| "unknown".to_owned()),
-            )
-        }
+    let field = |name: &str| {
+        read.outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get(name))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
     };
-    Ok(Some(crate::chat::InputFailure {
-        summary,
-        origin,
+    let mut failure = crate::chat::InputFailure {
+        code: field("reason")
+            .or_else(|| field("code"))
+            .unwrap_or_else(|| {
+                match read.state {
+                    CommandState::Rejected => "rejected",
+                    CommandState::Failed => "failed",
+                    CommandState::Cancelled => "cancelled",
+                    _ => "unknown",
+                }
+                .to_owned()
+            }),
+        message: field("message").unwrap_or_default(),
+        origin: field("origin").unwrap_or_else(|| "unknown".to_owned()),
         definite,
-    }))
-}
-
-/// The origin a `why` summary starts with ("swarm origin: …"), else the
-/// first classified step's.
-fn summary_origin(reply: &DiagnoseResponse) -> String {
-    reply
-        .summary
-        .split_once(" origin:")
-        .map(|(origin, _)| origin.to_owned())
-        .or_else(|| reply.steps.iter().find_map(|step| step.origin.clone()))
-        .unwrap_or_else(|| "unknown".to_owned())
+    };
+    if let Ok(reply) = diagnose(data_dir, target).await
+        && let Some(step) = eliot_core::api::diagnosis_reason(&reply.steps)
+    {
+        if let Some(code) = &step.code {
+            failure.code.clone_from(code);
+        }
+        if let Some(message) = &step.message {
+            failure.message.clone_from(message);
+        }
+        if let Some(origin) = &step.origin {
+            failure.origin.clone_from(origin);
+        }
+    }
+    Ok(Some(failure))
 }
 
 /// Newest `limit` retained turns of the current generation of the Agent.

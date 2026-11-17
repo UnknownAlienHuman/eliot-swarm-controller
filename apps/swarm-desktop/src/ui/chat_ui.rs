@@ -52,7 +52,7 @@ pub(super) enum ChatMsg {
     /// Retry a local input that did not start (its part key).
     RetryInput(String),
     /// The `why` summary of the open lost Agent (Agent, generation).
-    LossRead(String, i64, Fallible<String>),
+    LossRead(String, i64, Fallible<eliot_core::api::DiagnoseResponse>),
 }
 
 /// Between two reads of inputs that still wait while the Agent is idle or
@@ -401,7 +401,10 @@ impl DesktopApp {
                         self.queue_reread(Invalidation::default(), context);
                     }
                     Err((error, work)) => {
-                        self.set_status(format!("Readback failed, retrying: {error}"));
+                        self.set_status(format!(
+                            "Readback failed, retrying: {}",
+                            error.user_message()
+                        ));
                         self.chat.invalidated.merge(work);
                         let delay = live::backoff_ms(self.chat.failures.min(4));
                         let _task = context.spawn_background(move |cancel| {
@@ -1237,7 +1240,6 @@ impl DesktopApp {
         self.chat.loss = Some((agent.clone(), generation, None));
         let _task = context.spawn_background(move |_| {
             let summary = client::block_on(client::diagnose(&data_dir, &agent))
-                .map(|reply| reply.summary)
                 .map_err(|error| error.to_string());
             Message::Chat(ChatMsg::LossRead(agent, generation, summary))
         });
