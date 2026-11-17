@@ -13,6 +13,7 @@
 //! its turn starts.
 
 use super::*;
+use crate::chat::InputFailure;
 use crate::configure::Pick;
 use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
@@ -44,7 +45,17 @@ pub(super) enum ChatMsg {
     AgentMenu(String),
     /// The Force stop banner's answer: true confirms the bound action.
     ForceStopAnswered(bool),
+    /// Outcomes of the inputs still shown as waiting (epoch, per command).
+    InputsChecked(u64, Vec<(String, Fallible<Option<InputFailure>>)>),
+    /// Read the waiting inputs again (epoch).
+    InputsRecheck(u64),
+    /// Retry a local input that did not start (its part key).
+    RetryInput(String),
 }
+
+/// Between two reads of inputs that still wait while the Agent is idle or
+/// has ended (bounded: only while one is shown as waiting).
+const INPUT_RECHECK_MS: u64 = 2_000;
 
 /// The Agent and generation a "…" entry acts on: the header shown when the
 /// click is handled.
@@ -199,6 +210,11 @@ pub(super) struct ChatState {
     /// What the new Agent's first message waits for ("Starting Codex…"),
     /// carried from the launch to its conversation.
     pub(super) waiting_label: Option<String>,
+    /// A read of the waiting inputs' outcomes is running.
+    pub(super) inputs_checking: bool,
+    /// Launches from this window: the Agent, its first input and what was
+    /// submitted, so Retry of a start that did not happen starts it again.
+    pub(super) launches: HashMap<String, (String, Submitted)>,
     /// The open conversation came from a search suggestion: the keyboard
     /// stays in the search box (its arrows, Enter and Esc), so the latest
     /// turn is not followed by moving focus.
@@ -276,6 +292,7 @@ impl DesktopApp {
                             });
                         }
                         self.rebuild_items();
+                        self.check_waiting_inputs(context);
                         if first_load {
                             // Opened at the newest turn, like a chat.
                             self.follow_latest(0, context);
@@ -371,6 +388,7 @@ impl DesktopApp {
                             convo.apply_inputs(reread.inputs);
                         }
                         self.rebuild_items();
+                        self.check_waiting_inputs(context);
                         self.queue_reread(Invalidation::default(), context);
                     }
                     Err((error, work)) => {
@@ -414,6 +432,38 @@ impl DesktopApp {
                 } else {
                     self.chat.expanded.remove(&key);
                 }
+            }
+            ChatMsg::InputsChecked(epoch, results) => {
+                if epoch != self.chat.epoch {
+                    return;
+                }
+                self.chat.inputs_checking = false;
+                let mut pending = false;
+                if let Some(convo) = self.chat.convo.as_mut() {
+                    for (command, result) in results {
+                        match result {
+                            Ok(Some(failure)) => convo.set_local_failure(&command, failure),
+                            Ok(None) | Err(_) => pending = true,
+                        }
+                    }
+                }
+                self.rebuild_items();
+                if pending {
+                    let _task = context.spawn_background(move |cancel| {
+                        let cancelled = || cancel.is_cancelled();
+                        let _ = feed::backoff(INPUT_RECHECK_MS, &cancelled);
+                        Message::Chat(ChatMsg::InputsRecheck(epoch))
+                    });
+                }
+            }
+            ChatMsg::InputsRecheck(epoch) => {
+                if epoch == self.chat.epoch {
+                    self.check_waiting_inputs(context);
+                }
+            }
+            ChatMsg::RetryInput(key) => {
+                let command = key.strip_prefix("fail:").unwrap_or(&key).to_owned();
+                self.retry_input(&command, context);
             }
             ChatMsg::CopyPart(key) => {
                 let text = self
@@ -965,6 +1015,9 @@ impl DesktopApp {
             return;
         };
         self.chat.epoch += 1;
+        // A failed-input check in flight belongs to the old epoch: its reply
+        // is discarded, so the flag must not keep blocking new checks.
+        self.chat.inputs_checking = false;
         if let Some(task) = self.chat.live_task.take() {
             task.cancel();
         }
@@ -1089,6 +1142,79 @@ impl DesktopApp {
             Next::Stop { reason } => {
                 self.chat.live = LiveStatus::Stopped(reason);
                 self.chat.live_task = None;
+            }
+        }
+    }
+
+    /// Inputs shown as waiting while the Agent is idle or has ended may
+    /// never start: read their commands, and show why (`swarm why`, its
+    /// origin and Retry) instead of an indefinite spinner.
+    fn check_waiting_inputs(&mut self, context: &ComponentContext<Self>) {
+        if self.chat.inputs_checking {
+            return;
+        }
+        let (Some(detail), Some(convo), Ok(data_dir)) = (
+            self.chat.detail.as_ref(),
+            self.chat.convo.as_ref(),
+            self.data_dir.clone(),
+        ) else {
+            return;
+        };
+        let ended = matches!(detail.state.as_str(), "failed" | "stopped" | "lost");
+        if detail.active_turn.is_some() || !(ended || detail.state == "idle") {
+            return;
+        }
+        let waiting = convo.waiting_locals();
+        if waiting.is_empty() {
+            return;
+        }
+        let agent = convo.agent().to_owned();
+        let epoch = self.chat.epoch;
+        self.chat.inputs_checking = true;
+        let _task = context.spawn_background(move |_| {
+            let results = waiting
+                .into_iter()
+                .take(4)
+                .map(|command| {
+                    let read =
+                        client::block_on(client::input_failure(&data_dir, &agent, &command, ended))
+                            .map_err(|error| error.to_string());
+                    (command, read)
+                })
+                .collect();
+            Message::Chat(ChatMsg::InputsChecked(epoch, results))
+        });
+    }
+
+    /// Retry a local input that definitely did not start: a launch that
+    /// never ran starts again as submitted (a new task, new mutation id);
+    /// any other input goes back through Send (or Resume) with its text.
+    fn retry_input(&mut self, command: &str, context: &ComponentContext<Self>) {
+        let Some(convo) = self.chat.convo.as_mut() else {
+            return;
+        };
+        let Some(text) = convo.local_text(command) else {
+            return;
+        };
+        let agent = convo.agent().to_owned();
+        convo.forget_local(command);
+        self.rebuild_items();
+        match self.chat.launches.get(&agent).cloned() {
+            Some((first, submitted)) if first == command => {
+                self.new_task(context);
+                self.launch.choice = submitted.choice;
+                self.launch.access = Some(submitted.access);
+                self.launch.chat = submitted.chat;
+                self.launch.workspace = submitted.workspace;
+                self.launch.launch_text = text;
+                self.launch.launch_rev = self.launch.launch_rev.wrapping_add(1);
+                self.update(Message::Launch(LaunchMsg::LaunchRequested), context);
+            }
+            _ => {
+                self.chat.drafts.set(&agent, text);
+                if let Some(primary) = self.primary_action() {
+                    self.update(primary, context);
+                }
             }
         }
     }
@@ -1417,6 +1543,7 @@ impl DesktopApp {
             copy_code: context.callback(|(key, index): (String, usize)| {
                 Message::Chat(ChatMsg::CopyCode(key, index))
             }),
+            retry: context.callback(|key| Message::Chat(ChatMsg::RetryInput(key))),
             toggle_tools: context.callback(|(key, expanded): (String, bool)| {
                 Message::Chat(ChatMsg::ToolsToggled(key, expanded))
             }),

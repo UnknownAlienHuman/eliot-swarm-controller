@@ -232,8 +232,14 @@ impl<C: NativeStdioConfig> StdioProcess<C> {
         self.transport.await_output_drained(deadline).await
     }
 
+    /// End the owned stdio server. A graceful close drops stdin so the
+    /// server sees EOF and exits on its own; flushing alone kept
+    /// `codex app-server` waiting on stdin for the whole kill grace on every
+    /// stop. The kill fires only when that exit cannot be confirmed.
     pub async fn terminate(&mut self, force: bool, deadline: Instant) -> Result<ExitStatus> {
-        self.transport.terminate(force, deadline).await
+        self.transport
+            .terminate_dropping_input(force, deadline)
+            .await
     }
 }
 

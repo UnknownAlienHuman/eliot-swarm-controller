@@ -15205,3 +15205,27 @@ fn observe_events_commit_with_closed_kinds_and_roll_up() {
         .expect("growth view");
     assert!(growth.is_none());
 }
+
+#[test]
+fn managed_workspace_pages_list_every_retained_worktree_with_total_and_cursor() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let (first, first_input) =
+        ready_managed_codex_agent(&mut store, "/synthetic-list", "list-a", now);
+    let (second, second_input) =
+        ready_managed_codex_agent(&mut store, "/synthetic-list", "list-b", now + 1);
+    let (page, total, more) = store.list_managed_workspaces(None, 1).unwrap();
+    assert_eq!((total, more), (2, true));
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].agent, first);
+    assert_eq!(page[0].worktree_path, first_input.worktree_path);
+    let (rest, total, more) = store
+        .list_managed_workspaces(Some(&page[0].agent), 1)
+        .unwrap();
+    assert_eq!((total, more), (2, false));
+    assert_eq!(rest[0].agent, second);
+    assert_eq!(rest[0].worktree_path, second_input.worktree_path);
+    let (after_last, total, more) = store.list_managed_workspaces(Some(&second), 10).unwrap();
+    assert!(after_last.is_empty());
+    assert_eq!((total, more), (2, false));
+}

@@ -184,6 +184,7 @@ const METHODS: &[Method] = &[
     method!("swarm.handoff", HandoffRequest, HandoffResponse, true, true, "Transfer selected undispatched inputs and children to an Agent; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"to":"a2","to_generation":1,"task_command":"retained-task","commands":[]}),
     method!("command.cancel", CommandCancelRequest, CommandCancelResponse, true, true, "Withdraw one undispatched handoff input with no native effect; Owner only.", {"id":EXAMPLE_ID,"command_id":"retained-handoff/send-0"}),
     method!("project.get", ProjectGetRequest, ProjectRegistrationView, true, false, "Read one approved project registration.", {"id":"project-1"}),
+    method!("workspace.list", WorkspaceListRequest, WorkspaceListResponse, true, false, "Page the managed worktrees Swarm created, with total and cursor.", {"limit":100}),
     method!(
         "project.list",
         ProjectListRequest,

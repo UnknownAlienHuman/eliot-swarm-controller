@@ -166,7 +166,9 @@ struct SendOutcome {
     fallback: bool,
 }
 
-/// Admission of one launch-with-text: the new Agent and its linked input.
+/// Admission of one launch-with-text: the new Agent and its linked input,
+/// with the choice that was actually submitted (the picker stays editable
+/// while the launch is in flight, so completion never reads it again).
 #[derive(Clone, Debug)]
 struct LaunchOutcome {
     agent: String,
@@ -175,6 +177,19 @@ struct LaunchOutcome {
     linked_command: Option<String>,
     text: String,
     launch_rev: u64,
+    submitted: Submitted,
+}
+
+/// What one launch submitted: the picker choice (harness, model, effort),
+/// its access level and where it runs.
+#[derive(Clone, Debug, PartialEq)]
+struct Submitted {
+    choice: crate::picker::Choice,
+    /// The harness that starts: the chosen model's, or the preset's.
+    harness: Option<String>,
+    access: crate::settings::Access,
+    chat: bool,
+    workspace: String,
 }
 
 type Fallible<T> = Result<T, String>;
@@ -608,6 +623,8 @@ impl Component for DesktopApp {
                 composer_ref: ElementRef::new(),
                 pending_local: None,
                 waiting_label: None,
+                inputs_checking: false,
+                launches: HashMap::new(),
                 opened_from_search: false,
                 drafts: DraftStore::default(),
                 answers: HashMap::new(),

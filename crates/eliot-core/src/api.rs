@@ -34,6 +34,7 @@ mod switch;
 mod timers;
 mod usage;
 mod waits;
+mod workspaces;
 
 pub use agent_views::{
     AGENT_PREVIEW_CHARS, AgentConfigView, AgentEditsRequest, AgentEditsResponse, AgentGetRequest,
@@ -160,6 +161,7 @@ pub use waits::{
     MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, SwarmWaitRequest, SwarmWaitResponse,
     WaitEntryResult, WaitTurnRef,
 };
+pub use workspaces::{ManagedWorkspaceView, WorkspaceListRequest, WorkspaceListResponse};
 
 use crate::{Error, Event, Result};
 use serde::{Deserialize, Serialize};

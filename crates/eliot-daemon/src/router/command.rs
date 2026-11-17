@@ -1266,8 +1266,16 @@ impl Router {
         linked_id: Option<String>,
     ) {
         if let Err(error) = self.prepare_agent_artifact_root(&agent).await {
-            self.settle_plugin_error(id, &Error::new("native_not_dispatched", *error.message))
-                .await;
+            let mut refused = Error::new("native_not_dispatched", *error.message);
+            refused.failure_where = error.failure_where;
+            refused.origin = error.origin;
+            refused.origin_evidence = error.origin_evidence;
+            let refused = super::cleanup::swarm_preparation_failure(
+                refused,
+                "router.dispatch.prepare_artifact_root",
+                "Swarm's Agent artifact root preparation refused the start before dispatch",
+            );
+            self.settle_plugin_error(id, &refused).await;
             return;
         }
         let artifact_agent = agent.id.clone();

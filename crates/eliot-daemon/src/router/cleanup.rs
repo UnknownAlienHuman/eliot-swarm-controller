@@ -3,6 +3,7 @@ use super::*;
 #[cfg(windows)]
 use crate::platform::script_file::CleanupTree;
 use crate::platform::script_file::directory_identity;
+use eliot_core::FailureOrigin;
 use eliot_core::api::*;
 use std::path::{Component, Path};
 
@@ -20,8 +21,34 @@ pub(super) fn private_chat_root(path: &Path) -> Result<PathBuf> {
         .map_err(|_| Error::new("unavailable", "private chat root unavailable"))
 }
 
+/// A failure of Swarm's own preparation before any native effect (the chat
+/// directory, the Agent artifact root): origin `swarm` at its exact `where`,
+/// unless the producer already classified it (for example an environment
+/// failure of the platform layer).
+pub(super) fn swarm_preparation_failure(mut error: Error, where_: &str, evidence: &str) -> Error {
+    if error.failure_where.is_none() {
+        error = error.with_where(where_);
+    }
+    if error.origin.is_none() {
+        error = error.with_origin(FailureOrigin::Swarm, evidence);
+    }
+    error
+}
+
 impl Router {
     pub(super) async fn prepare_chat_directory(&self, command: &Command) -> Result<()> {
+        self.prepare_chat_directory_once(command)
+            .await
+            .map_err(|error| {
+                swarm_preparation_failure(
+                    error,
+                    "router.dispatch.prepare_chat",
+                    "Swarm's chat directory preparation refused the launch before dispatch",
+                )
+            })
+    }
+
+    async fn prepare_chat_directory_once(&self, command: &Command) -> Result<()> {
         let store = self.inner.store.lock().await;
         let agent = store
             .get_agent(
@@ -1952,6 +1979,63 @@ fn daemon_pid_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
     use std::process::Command as OsCommand;
+
+    #[tokio::test]
+    async fn an_existing_chat_directory_is_a_swarm_refusal_at_prepare_chat() {
+        let root = std::env::temp_dir().join(format!("eliot-chat-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        let chats = root.join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let router = super::super::tests::router_with_data_root(root.clone());
+        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        request.expected_generation = Some(0);
+        request.args = json!({"chat": true, "workspace": chats, "harness": "codex",
+            "profile": "fixture", "profile_snapshot": {}});
+        let (command, chat) = {
+            let mut store = router.inner.store.lock().await;
+            let command = store.submit("owner", request, now_ms()).unwrap().command;
+            let agent = store
+                .get_agent(command.target.as_deref().unwrap())
+                .unwrap()
+                .unwrap();
+            (command, agent.workspace.unwrap())
+        };
+        // Something else already holds the chat's private directory.
+        std::fs::create_dir(&chat).unwrap();
+        let error = router.prepare_chat_directory(&command).await.unwrap_err();
+        assert_eq!(error.code, "conflict");
+        assert_eq!(
+            error.failure_where.as_deref(),
+            Some("router.dispatch.prepare_chat")
+        );
+        assert_eq!(error.origin, Some(FailureOrigin::Swarm));
+        // The settled refusal names Swarm and the exact step, so `why`
+        // never says "unknown origin ... router.dispatch.unknown".
+        router.reject_undispatched_error(&command.id, &error).await;
+        let settled = router
+            .inner
+            .store
+            .lock()
+            .await
+            .get_command(&command.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.state, CommandState::Rejected);
+        let outcome = settled.outcome.expect("refusal outcome");
+        assert_eq!(outcome["where"], "router.dispatch.prepare_chat");
+        assert_eq!(outcome["origin"], "swarm");
+        assert_eq!(outcome["reason"], "conflict");
+        // A producer's own classification is kept.
+        let environment = swarm_preparation_failure(
+            Error::new("unavailable", "disk")
+                .with_where("platform.fs")
+                .with_origin(FailureOrigin::Environment, "disk full"),
+            "router.dispatch.prepare_chat",
+            "unused",
+        );
+        assert_eq!(environment.failure_where.as_deref(), Some("platform.fs"));
+        assert_eq!(environment.origin, Some(FailureOrigin::Environment));
+    }
 
     #[tokio::test]
     async fn artifact_root_is_created_exclusively_and_bound_to_generation() {

@@ -379,6 +379,21 @@ pub enum PartKind {
     Final,
     Working,
     Notice,
+    /// A submitted input that definitely did not go through: the `swarm
+    /// why` summary, its origin, and Retry.
+    Failed,
+    /// A submitted input whose outcome Swarm cannot prove: the summary and
+    /// origin, never Retry (an uncertain effect is not replayed).
+    Unconfirmed,
+}
+
+/// Why a local input did not start: the `swarm why` summary line and its
+/// origin, and whether the failure is definite (Retry) or uncertain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputFailure {
+    pub summary: String,
+    pub origin: String,
+    pub definite: bool,
 }
 
 /// One keyed part of a turn item.
@@ -430,6 +445,8 @@ pub struct Conversation {
     /// What each local input waits for ("Sending…", "Starting Codex…"),
     /// shown under it until its turn starts.
     local_notes: HashMap<String, String>,
+    /// A local input that will not start: shown instead of its note.
+    local_failures: HashMap<String, InputFailure>,
     applied_seq: i64,
     coverage: Coverage,
     /// Turns evicted by the resident bounds; late events never resurrect them.
@@ -477,11 +494,13 @@ impl Conversation {
         let local = std::mem::take(&mut self.local);
         let inputs = std::mem::take(&mut self.inputs);
         let notes = std::mem::take(&mut self.local_notes);
+        let failures = std::mem::take(&mut self.local_failures);
         *self = Self::new(&self.agent);
         self.coverage = coverage;
         self.inputs = inputs;
         self.local = local;
         self.local_notes = notes;
+        self.local_failures = failures;
         let cursor = self.coverage.cursor;
         let mut invalidation = self.apply_events(events);
         self.coverage.cursor = cursor.max(self.applied_seq);
@@ -683,7 +702,40 @@ impl Conversation {
     pub fn forget_local(&mut self, command: &str) {
         self.local.retain(|known| known != command);
         self.local_notes.remove(command);
+        self.local_failures.remove(command);
         self.inputs.remove(command);
+    }
+
+    /// Local inputs still shown as waiting (a note, no failure yet): the
+    /// ones whose command outcome is worth reading.
+    pub fn waiting_locals(&self) -> Vec<String> {
+        self.local
+            .iter()
+            .filter(|command| {
+                self.local_notes.contains_key(*command)
+                    && !self.local_failures.contains_key(*command)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The local input will not start: its failure replaces the waiting
+    /// note, so the conversation never spins on it.
+    pub fn set_local_failure(&mut self, command: &str, failure: InputFailure) {
+        if self.local.iter().any(|known| known == command) {
+            self.local_notes.remove(command);
+            self.local_failures.insert(command.to_owned(), failure);
+        }
+    }
+
+    /// The submitted text of a local input, for Retry.
+    pub fn local_text(&self, command: &str) -> Option<String> {
+        match self.inputs.get(command) {
+            Some(InputText::Loaded(text)) if self.local.iter().any(|known| known == command) => {
+                Some(text.clone())
+            }
+            _ => None,
+        }
     }
 
     /// Commands linked to resident turns whose input text is not loaded.
@@ -751,7 +803,20 @@ impl Conversation {
                 text,
                 Vec::new(),
             )];
-            if let Some(note) = self.local_notes.get(command) {
+            if let Some(failure) = self.local_failures.get(command) {
+                let (kind, label) = if failure.definite {
+                    (PartKind::Failed, "Did not start")
+                } else {
+                    (PartKind::Unconfirmed, "Not confirmed")
+                };
+                parts.push(Part::new(
+                    format!("fail:{command}"),
+                    kind,
+                    label.to_owned(),
+                    failure.summary.clone(),
+                    vec![format!("Origin: {}", failure.origin)],
+                ));
+            } else if let Some(note) = self.local_notes.get(command) {
                 parts.push(Part::new(
                     format!("wait:{command}"),
                     PartKind::Working,
@@ -1171,6 +1236,52 @@ mod tests {
         assert_eq!(item.parts[1].label, "Starting Codex…");
         chat.forget_local("c9");
         assert!(chat.items().is_empty());
+    }
+
+    #[test]
+    fn a_failed_start_replaces_the_spinner_with_why_and_origin() {
+        let mut chat = Conversation::new("a2");
+        chat.note_local_input("c9/send", "hello");
+        chat.set_local_note("c9/send", Some("Starting Codex…".to_owned()));
+        assert_eq!(chat.waiting_locals(), vec!["c9/send".to_owned()]);
+        chat.set_local_failure(
+            "c9/send",
+            InputFailure {
+                summary: "swarm origin: a2 rejected at router.dispatch.prepare_chat: chat directory already exists".to_owned(),
+                origin: "swarm".to_owned(),
+                definite: true,
+            },
+        );
+        // A snapshot keeps the failure; no Working part (spinner) remains.
+        chat.reset(coverage(), &[], &[]);
+        let parts = &chat.items()[0].parts;
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1].kind, PartKind::Failed);
+        assert!(parts[1].text.starts_with("swarm origin: a2 rejected"));
+        assert_eq!(parts[1].detail, vec!["Origin: swarm".to_owned()]);
+        assert!(!parts.iter().any(|part| part.kind == PartKind::Working));
+        assert!(chat.waiting_locals().is_empty());
+        assert_eq!(chat.local_text("c9/send").as_deref(), Some("hello"));
+        // An uncertain outcome shows without Retry.
+        chat.set_local_failure(
+            "c9/send",
+            InputFailure {
+                summary: "unknown origin: a2 unknown".to_owned(),
+                origin: "unknown".to_owned(),
+                definite: false,
+            },
+        );
+        assert_eq!(chat.items()[0].parts[1].kind, PartKind::Unconfirmed);
+        // A failure for an input that is not local is ignored.
+        chat.set_local_failure(
+            "other",
+            InputFailure {
+                summary: "x".to_owned(),
+                origin: "swarm".to_owned(),
+                definite: true,
+            },
+        );
+        assert_eq!(chat.items().len(), 1);
     }
 
     #[test]

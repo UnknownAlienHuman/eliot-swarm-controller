@@ -431,6 +431,7 @@ impl Router {
             "command.cancel" => self.command_cancel(&params, &principal).await,
             "project.get" => self.project_get(&params, &principal).await,
             "project.list" => self.project_list(&params, &principal).await,
+            "workspace.list" => self.workspace_list(&params, &principal).await,
             "project.discover" => self.project_discover(&params, &principal).await,
             "profile.list" => self.profile_list(&params, &principal).await,
             "config.profiles.read" => self.config_profiles_read(&params, &principal).await,
@@ -2289,6 +2290,42 @@ impl Router {
         }
         serde_json::to_value(registrations)
             .map_err(|_| Error::new("internal", "project registrations could not be encoded"))
+    }
+
+    /// Owner page of the worktrees Swarm manages, from the retained
+    /// workspace preparations (not from Agent project labels).
+    async fn workspace_list(&self, params: &Value, principal: &Principal) -> Result<Value> {
+        require_owner(principal)?;
+        let request: eliot_core::api::WorkspaceListRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let (rows, total, truncated) = self
+            .inner
+            .store
+            .lock()
+            .await
+            .list_managed_workspaces(request.after.as_deref(), request.limit)?;
+        let workspaces: Vec<eliot_core::api::ManagedWorkspaceView> = rows
+            .into_iter()
+            .map(|row| eliot_core::api::ManagedWorkspaceView {
+                agent: row.agent,
+                project: row.project,
+                repo_path: row.repo_path,
+                branch: row.requested_branch,
+                worktree_path: row.worktree_path,
+                phase: row.phase,
+                updated_at: row.updated_at,
+            })
+            .collect();
+        let response = eliot_core::api::WorkspaceListResponse {
+            next: workspaces.last().map(|row| row.agent.clone()),
+            truncated: truncated && !workspaces.is_empty(),
+            total,
+            workspaces,
+        };
+        request.validate_response(&response)?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "workspace.list could not be encoded"))
     }
 
     async fn project_discover(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -4856,39 +4893,24 @@ impl Router {
     /// Retention and store-size visibility for `daemon.status`: the configured
     /// windows (or unbounded when all are unset), the retained-event
     /// watermark, the main+WAL file sizes, and the unbounded-growth advisory.
-    /// A config load failure falls back to defaults so status stays available
-    /// as the diagnostic surface; the hourly tick logs the rejection
-    /// separately.
+    /// Status stays available as the diagnostic surface when `config.toml`
+    /// cannot be read, but the windows are then unknown: the view carries the
+    /// typed `config_error` and never reports an unset (unbounded) policy or
+    /// its advisory. The hourly tick logs the rejection separately.
     async fn retention_view(&self) -> Result<RetentionView> {
-        let retention = crate::config::load_daemon_config(&self.inner.data_root)
-            .map(|config| config.retention)
-            .unwrap_or_default();
+        let config = crate::config::load_daemon_config(&self.inner.data_root);
         let pruned_through = {
             let store = self.inner.store.lock().await;
             store.retention_watermark()?
         };
         let (db_bytes, wal_bytes) = crate::maintenance::store_file_sizes(&self.inner.data_root);
-        let unbounded = retention.events_days.is_none()
-            && retention.commands_days.is_none()
-            && retention.mail_days.is_none();
-        let size_advisory = if unbounded
-            && db_bytes.saturating_add(wal_bytes)
-                > crate::config::RETENTION_UNBOUNDED_SIZE_ADVISORY_BYTES
-        {
-            Some("retention is unbounded and the store exceeds 100 MiB; set daemon.retention windows (see configuration.md)".to_owned())
-        } else {
-            None
-        };
-        Ok(RetentionView {
-            events_days: retention.events_days,
-            commands_days: retention.commands_days,
-            mail_days: retention.mail_days,
+        Ok(retention_view_of(
+            config.map(|config| config.retention),
             pruned_through,
             db_bytes,
             wal_bytes,
-            unbounded,
-            size_advisory,
-        })
+            &self.secret_policy_snapshot(),
+        ))
     }
 
     /// Retained unknowns that no longer block drain: stored `unknown`
@@ -7130,6 +7152,56 @@ fn reject_unknown_map_keys(
         ))
     } else {
         Ok(())
+    }
+}
+
+/// The retention view for one configuration read: known windows, or the
+/// typed read failure with unknown windows (never unbounded, no advisory).
+fn retention_view_of(
+    config: Result<crate::config::RetentionConfig>,
+    pruned_through: i64,
+    db_bytes: u64,
+    wal_bytes: u64,
+    policy: &SecretPolicy,
+) -> RetentionView {
+    let (retention, config_error) = match config {
+        Ok(retention) => (retention, None),
+        Err(error) => {
+            let error = error.sanitized(policy);
+            let mut line = format!("{}: {}", error.code, error.message);
+            if line.len() > 512 {
+                let mut end = 509;
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                line.truncate(end);
+                line.push_str("...");
+            }
+            (crate::config::RetentionConfig::default(), Some(line))
+        }
+    };
+    let unbounded = config_error.is_none()
+        && retention.events_days.is_none()
+        && retention.commands_days.is_none()
+        && retention.mail_days.is_none();
+    let size_advisory = if unbounded
+        && db_bytes.saturating_add(wal_bytes)
+            > crate::config::RETENTION_UNBOUNDED_SIZE_ADVISORY_BYTES
+    {
+        Some("retention is unbounded and the store exceeds 100 MiB; set daemon.retention windows (see configuration.md)".to_owned())
+    } else {
+        None
+    };
+    RetentionView {
+        events_days: retention.events_days,
+        commands_days: retention.commands_days,
+        mail_days: retention.mail_days,
+        pruned_through,
+        db_bytes,
+        wal_bytes,
+        unbounded,
+        size_advisory,
+        config_error,
     }
 }
 
@@ -9548,6 +9620,44 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(retention["db_bytes"], json!(0));
         assert_eq!(retention["wal_bytes"], json!(0));
         assert_eq!(retention["size_advisory"], Value::Null);
+        assert!(retention.get("config_error").is_none());
+    }
+
+    #[test]
+    fn unreadable_retention_config_is_reported_never_unbounded() {
+        let policy = SecretPolicy::new(["vendor-secret"]);
+        // Over the advisory size with no readable windows: a failed read
+        // must not turn into "unbounded" or its advisory.
+        let view = retention_view_of(
+            Err(Error::new(
+                "profile_error",
+                "config.toml could not be parsed near vendor-secret",
+            )),
+            3,
+            crate::config::RETENTION_UNBOUNDED_SIZE_ADVISORY_BYTES + 1,
+            0,
+            &policy,
+        );
+        view.validate().unwrap();
+        assert!(!view.unbounded);
+        assert_eq!(view.size_advisory, None);
+        assert_eq!(
+            (view.events_days, view.commands_days, view.mail_days),
+            (None, None, None)
+        );
+        let error = view.config_error.expect("typed config error");
+        assert!(error.starts_with("profile_error: config.toml could not be parsed"));
+        assert!(!error.contains("vendor-secret"));
+        // A readable empty policy is still the documented unbounded case.
+        let unset = retention_view_of(
+            Ok(crate::config::RetentionConfig::default()),
+            3,
+            crate::config::RETENTION_UNBOUNDED_SIZE_ADVISORY_BYTES + 1,
+            0,
+            &policy,
+        );
+        unset.validate().unwrap();
+        assert!(unset.unbounded && unset.size_advisory.is_some() && unset.config_error.is_none());
     }
 
     /// Drive the observer detach-fence race at the Store level: attach, then

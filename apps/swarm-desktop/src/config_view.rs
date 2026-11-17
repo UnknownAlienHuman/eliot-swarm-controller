@@ -799,6 +799,8 @@ pub struct ScriptsData<'a> {
     pub view: &'a str,
     pub dirty: bool,
     pub timers: &'a [String],
+    /// Why `timers` may be incomplete (unreadable or partial rule reads).
+    pub rule_issues: &'a [String],
     pub editor_exe: &'a str,
     pub status: &'a str,
     pub run_status: &'a str,
@@ -937,7 +939,13 @@ pub fn scripts_screen(data: ScriptsData<'_>, actions: ScriptsActions, palette: P
                         .content(crate::m3::label("Discard")),
                 )),
         ));
-        if data.timers.is_empty() {
+        for (index, issue) in data.rule_issues.iter().enumerate() {
+            below.push(KeyedView::new(
+                format!("rule-issue-{index}"),
+                error_note(issue.clone(), palette),
+            ));
+        }
+        if data.timers.is_empty() && data.rule_issues.is_empty() {
             below.push(KeyedView::new(
                 "no-timer",
                 small("To run it, add a timer whose run action names it (rules/*.toml)."),

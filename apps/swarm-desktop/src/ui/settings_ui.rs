@@ -265,7 +265,17 @@ pub(super) enum SettingsMsg {
     /// Read every installed harness's quota again.
     UsageRefresh,
     QuotaLoaded(String, Box<Fallible<HarnessQuotaResponse>>),
+    /// Read the managed worktrees again.
+    WorktreesRefresh,
+    /// Exact fleet totals and retention for Usage.
+    FleetLoaded(Box<Fallible<config_client::FleetTotals>>),
+    /// Every managed worktree (`workspace.list`), the total and whether
+    /// the read reached the end.
+    WorktreesLoaded(Box<Fallible<ManagedWorktrees>>),
 }
+
+/// `workspace.list` read to the end (or to the page bound).
+pub(super) type ManagedWorktrees = (Vec<eliot_core::api::ManagedWorkspaceView>, usize, bool);
 
 /// The read settings, the drafts of the page's sections and the last
 /// save result of each section.
@@ -308,6 +318,12 @@ pub(super) struct SettingsState {
     /// Quota per harness, as read.
     pub(super) quotas: BTreeMap<String, Fallible<HarnessQuotaResponse>>,
     quotas_loading: usize,
+    /// Usage's exact totals; `None` until read.
+    fleet: Option<Fallible<config_client::FleetTotals>>,
+    fleet_loading: bool,
+    /// Worktrees' managed rows; `None` until read.
+    worktrees: Option<Fallible<ManagedWorktrees>>,
+    worktrees_loading: bool,
 }
 
 impl SettingsState {
@@ -720,12 +736,56 @@ impl DesktopApp {
                 }
             }
             SettingsMsg::OpenFolder(path) => open_with_shell(&path),
-            SettingsMsg::UsageRefresh => self.load_quotas(context),
+            SettingsMsg::UsageRefresh => {
+                self.load_quotas(context);
+                self.load_fleet(context);
+            }
             SettingsMsg::QuotaLoaded(harness, reply) => {
                 self.settings.quotas_loading = self.settings.quotas_loading.saturating_sub(1);
                 self.settings.quotas.insert(harness, *reply);
             }
+            SettingsMsg::WorktreesRefresh => self.load_worktrees(context),
+            SettingsMsg::FleetLoaded(reply) => {
+                self.settings.fleet_loading = false;
+                self.settings.fleet = Some(*reply);
+            }
+            SettingsMsg::WorktreesLoaded(reply) => {
+                self.settings.worktrees_loading = false;
+                self.settings.worktrees = Some(*reply);
+            }
         }
+    }
+
+    /// Read Usage's exact fleet totals and the retention view.
+    pub(super) fn load_fleet(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.settings.fleet_loading {
+            return;
+        }
+        self.settings.fleet_loading = true;
+        let _task = context.spawn_background(move |_| {
+            let reply = client::block_on(config_client::fleet_totals(&data_dir))
+                .map_err(|error| error.to_string());
+            Message::Settings(SettingsMsg::FleetLoaded(Box::new(reply)))
+        });
+    }
+
+    /// Read every managed worktree from the daemon.
+    pub(super) fn load_worktrees(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.settings.worktrees_loading {
+            return;
+        }
+        self.settings.worktrees_loading = true;
+        let _task = context.spawn_background(move |_| {
+            let reply = client::block_on(config_client::managed_workspaces(&data_dir))
+                .map_err(|error| error.to_string());
+            Message::Settings(SettingsMsg::WorktreesLoaded(Box::new(reply)))
+        });
     }
 
     /// Read the quota of every installed harness (one worker each) and the
@@ -880,8 +940,11 @@ impl DesktopApp {
                     self.load_scripts(context);
                 }
             }
-            Page::Usage => self.load_quotas(context),
-            Page::Worktrees => self.load_agents(context, None),
+            Page::Usage => {
+                self.load_quotas(context);
+                self.load_fleet(context);
+            }
+            Page::Worktrees => self.load_worktrees(context),
             _ => {}
         }
     }
@@ -1270,13 +1333,8 @@ impl DesktopApp {
     /// harness's remaining provider quota as rings (weekly and 5-hour where
     /// the provider reports them), and what Swarm is running.
     fn usage_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let running = self
-            .nav
-            .agents
-            .iter()
-            .filter(|agent| agent.running())
-            .count();
         let today = today_start_ms();
+        let loaded = self.nav.agents.len();
         let (tokens_today, reporting) = self
             .nav
             .agents
@@ -1286,25 +1344,63 @@ impl DesktopApp {
                 Some(tokens) => (sum + tokens, count + 1),
                 None => (sum, count),
             });
+        let fleet = self.settings.fleet.as_ref();
+        let total = fleet.and_then(|fleet| fleet.as_ref().ok().map(|fleet| fleet.agents));
+        let (running_value, running_note) = match fleet {
+            None => ("…".to_owned(), "Counting…".to_owned()),
+            Some(Ok(fleet)) => (
+                fleet.running.to_string(),
+                format!(
+                    "Working now or starting, of {} Agent(s) in Swarm (exact counts).",
+                    fleet.agents
+                ),
+            ),
+            Some(Err(error)) => (
+                "not counted".to_owned(),
+                format!("Could not count: {}", crate::state::plain_error(error)),
+            ),
+        };
+        let coverage = match total {
+            Some(total) if total > loaded => format!(
+                "Partial: from the {loaded} most recent Agents loaded here, of {total} in Swarm; {reporting} active today report tokens (their totals; Swarm has no per-day usage read)."
+            ),
+            _ => format!(
+                "From all {loaded} Agent(s); {reporting} active today report tokens (their totals; Swarm has no per-day usage read)."
+            ),
+        };
+        let (retention_value, retention_note) = match fleet {
+            None => ("…".to_owned(), "Reading…".to_owned()),
+            Some(Err(_)) => (
+                "not read".to_owned(),
+                "daemon.status could not be read.".to_owned(),
+            ),
+            Some(Ok(fleet)) => retention_lines(fleet.retention.as_ref()),
+        };
         let totals = m3::settings_card(
             palette,
             vec![
                 KeyedView::new(
-                    format!("running:{running}"),
+                    format!("running:{running_value}:{running_note}"),
                     m3::setting_row(
                         "Running Agents",
-                        "Working now or starting.",
-                        m3::body(running.to_string()).into(),
+                        &running_note,
+                        m3::body(running_value).into(),
                     ),
                 ),
                 KeyedView::new(
-                    format!("tokens:{tokens_today}:{reporting}"),
+                    format!("tokens:{tokens_today}:{coverage}"),
                     m3::setting_row(
                         "Tokens today",
-                        &format!(
-                            "Reported by the {reporting} Agent(s) active today (their totals; Swarm has no per-day usage read)."
-                        ),
+                        &coverage,
                         m3::body(group_digits(tokens_today)).into(),
+                    ),
+                ),
+                KeyedView::new(
+                    format!("retention:{retention_value}:{retention_note}"),
+                    m3::setting_row(
+                        "History retention",
+                        &retention_note,
+                        m3::body(retention_value).into(),
                     ),
                 ),
             ],
@@ -1398,7 +1494,9 @@ impl DesktopApp {
                     "",
                     Some(
                         m3::text_button(palette)
-                            .is_enabled(self.settings.quotas_loading == 0)
+                            .is_enabled(
+                                self.settings.quotas_loading == 0 && !self.settings.fleet_loading,
+                            )
                             .automation_name("Read quota again")
                             .on_click(context.message(Message::Settings(SettingsMsg::UsageRefresh)))
                             .content(m3::label("Refresh")),
@@ -1415,29 +1513,13 @@ impl DesktopApp {
     /// Worktrees & cleanup (Codex's Worktrees page as the pattern): where
     /// Swarm creates worktrees, and the ones it manages, by project.
     /// `cleanup.plan` / `cleanup.apply` are not in this build, so there is
-    /// no Delete; the list comes from the registered checkouts and the
-    /// listed Agents' workspaces under `<data>\worktrees`.
+    /// no Delete; the list is the daemon's `workspace.list`, every page.
     fn worktrees_page(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let root = self
             .data_dir
             .as_ref()
             .map(|dir| dir.join("worktrees").to_string_lossy().into_owned())
             .unwrap_or_default();
-        let managed = crate::worktrees::managed(
-            &root,
-            &self
-                .nav
-                .projects
-                .iter()
-                .map(|project| (project.workspace.clone(), project.common_dir.clone()))
-                .collect::<Vec<_>>(),
-            &self
-                .nav
-                .agents
-                .iter()
-                .map(|agent| agent.project.clone())
-                .collect::<Vec<_>>(),
-        );
         let settings = m3::settings_card(
             palette,
             vec![
@@ -1468,7 +1550,35 @@ impl DesktopApp {
             ],
         );
         let mut groups: Vec<KeyedView> = Vec::new();
-        if managed.is_empty() {
+        let empty: &[eliot_core::api::ManagedWorkspaceView] = &[];
+        let (rows, total, complete) = match &self.settings.worktrees {
+            Some(Ok((rows, total, complete))) => (&rows[..], *total, *complete),
+            Some(Err(error)) => {
+                groups.push(KeyedView::new(
+                    format!("error:{error}"),
+                    m3::body(format!(
+                        "Managed worktrees could not be read: {}",
+                        crate::state::plain_error(error)
+                    ))
+                    .foreground(palette.error())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+                ));
+                (empty, 0, true)
+            }
+            None => (empty, 0, true),
+        };
+        let managed = crate::worktrees::grouped(rows, &self.registered_projects());
+        let heading = match &self.settings.worktrees {
+            None => "Reading…".to_owned(),
+            Some(Err(_)) => String::new(),
+            Some(Ok(_)) if !complete => format!(
+                "{} of {total} shown (the read stopped at its page bound)",
+                rows.len()
+            ),
+            Some(Ok(_)) => format!("{total} managed worktree(s)"),
+        };
+        if matches!(self.settings.worktrees, Some(Ok(_))) && managed.is_empty() {
             groups.push(KeyedView::new(
                 "none",
                 m3::secondary(
@@ -1477,22 +1587,29 @@ impl DesktopApp {
                 .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        for (project, paths) in managed {
-            let rows: Vec<KeyedView> = paths
+        for (project, worktrees) in managed {
+            let rows: Vec<KeyedView> = worktrees
                 .iter()
-                .map(|path| {
-                    let name = std::path::Path::new(path)
+                .map(|worktree| {
+                    let name = std::path::Path::new(&worktree.path)
                         .file_name()
-                        .map_or_else(|| path.clone(), |name| name.to_string_lossy().into_owned());
+                        .map_or_else(
+                            || worktree.path.clone(),
+                            |name| name.to_string_lossy().into_owned(),
+                        );
+                    let detail = format!(
+                        "{} · {} · {} · {}",
+                        worktree.branch, worktree.agent, worktree.phase, worktree.path
+                    );
                     KeyedView::new(
-                        path.clone(),
+                        format!("{}:{detail}", worktree.path),
                         m3::setting_row(
                             &name,
-                            nav::display_path(path),
+                            &detail,
                             m3::icon_button(palette)
                                 .automation_name(format!("Open {name} in File Explorer"))
                                 .on_click(context.message(Message::Settings(
-                                    SettingsMsg::OpenFolder(path.clone()),
+                                    SettingsMsg::OpenFolder(worktree.path.clone()),
                                 )))
                                 .content(m3::icon(m3::glyph::OPEN_FOLDER)),
                         ),
@@ -1502,7 +1619,11 @@ impl DesktopApp {
             groups.push(KeyedView::new(
                 format!("project:{project}"),
                 StackPanel::new().spacing(tokens::spacing::SM).children((
-                    m3::section_heading(&project, &format!("{} worktree(s)", paths.len()), None),
+                    m3::section_heading(
+                        &project,
+                        &format!("{} worktree(s)", worktrees.len()),
+                        None,
+                    ),
                     m3::settings_card(palette, rows),
                 )),
             ));
@@ -1511,7 +1632,17 @@ impl DesktopApp {
             StackPanel::new()
                 .spacing(tokens::spacing::SM)
                 .children((m3::card_title("Creation and cleanup"), settings)),
-            m3::card_title("Managed worktrees"),
+            m3::section_heading(
+                "Managed worktrees",
+                &heading,
+                Some(
+                    m3::text_button(palette)
+                        .is_enabled(!self.settings.worktrees_loading)
+                        .automation_name("Read managed worktrees again")
+                        .on_click(context.message(Message::Settings(SettingsMsg::WorktreesRefresh)))
+                        .content(m3::label("Refresh")),
+                ),
+            ),
             StackPanel::new()
                 .spacing(tokens::spacing::MD)
                 .keyed_children(groups),
@@ -2288,6 +2419,49 @@ fn group_digits(value: i64) -> String {
     if value < 0 { format!("-{out}") } else { out }
 }
 
+/// The retention row: the configured windows, or why they are unknown.
+/// An unreadable configuration is never shown as "unbounded".
+fn retention_lines(view: Option<&eliot_core::api::RetentionView>) -> (String, String) {
+    let Some(view) = view else {
+        return (
+            "not reported".to_owned(),
+            "This daemon reports no retention view.".to_owned(),
+        );
+    };
+    let store = format!(
+        "Store {} (database and log).",
+        crate::monitor::bytes_label(Some(view.db_bytes.saturating_add(view.wal_bytes)))
+    );
+    if let Some(error) = &view.config_error {
+        return (
+            "unknown".to_owned(),
+            format!("config.toml could not be read ({error}); the windows are unknown. {store}"),
+        );
+    }
+    if view.unbounded {
+        let advisory = view
+            .size_advisory
+            .as_deref()
+            .map(|advisory| format!(" {advisory}."))
+            .unwrap_or_default();
+        return (
+            "unbounded".to_owned(),
+            format!("No daemon.retention window is set: nothing is pruned. {store}{advisory}"),
+        );
+    }
+    let window =
+        |days: Option<i64>| days.map_or_else(|| "kept".to_owned(), |days| format!("{days} d"));
+    (
+        "bounded".to_owned(),
+        format!(
+            "Events {}, commands {}, mail {}. {store}",
+            window(view.events_days),
+            window(view.commands_days),
+            window(view.mail_days)
+        ),
+    )
+}
+
 /// The start of the local day, in ms since the epoch.
 fn today_start_ms() -> i64 {
     use chrono::{Local, TimeZone};
@@ -2321,6 +2495,39 @@ fn candidate_row(place: usize, name: &str, buttons: View) -> View {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_row_never_shows_unbounded_for_an_unreadable_config() {
+        let view = eliot_core::api::RetentionView {
+            events_days: None,
+            commands_days: None,
+            mail_days: None,
+            pruned_through: 0,
+            db_bytes: 1024,
+            wal_bytes: 0,
+            unbounded: false,
+            size_advisory: None,
+            config_error: Some("profile_error: config.toml: bad".to_owned()),
+        };
+        let (value, note) = retention_lines(Some(&view));
+        assert_eq!(value, "unknown");
+        assert!(note.contains("config.toml could not be read (profile_error: config.toml: bad)"));
+        assert!(!note.contains("nothing is pruned"));
+        let unset = eliot_core::api::RetentionView {
+            unbounded: true,
+            config_error: None,
+            ..view.clone()
+        };
+        assert_eq!(retention_lines(Some(&unset)).0, "unbounded");
+        let bounded = eliot_core::api::RetentionView {
+            events_days: Some(30),
+            config_error: None,
+            ..view
+        };
+        let (value, note) = retention_lines(Some(&bounded));
+        assert_eq!(value, "bounded");
+        assert!(note.starts_with("Events 30 d, commands kept, mail kept."));
+    }
 
     fn read_with(revision: &str, routing: Value, desktop: Value) -> SettingsReadResponse {
         SettingsReadResponse {

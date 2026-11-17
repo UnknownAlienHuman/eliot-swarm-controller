@@ -96,6 +96,8 @@ pub(super) enum MenuMsg {
     RemovalDeleted(Fallible<String>),
     /// Close the Stop and delete dialog after a refused step.
     RemovalClosed,
+    /// Stop and delete: a second passed; the progress line's seconds move.
+    RemovalTick,
     /// `agent.archive` settled (the Agent, archived or not, whether to
     /// reopen its conversation, the outcome).
     Archived(UiAgent, bool, bool, Fallible<usize>),
@@ -132,6 +134,8 @@ pub(super) struct Removal {
     pub(super) command: String,
     pub(super) step: RemovalStep,
     pub(super) error: Option<String>,
+    /// When Stop was clicked: the progress line counts from here.
+    pub(super) started: std::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,11 +146,17 @@ pub(super) enum RemovalStep {
 }
 
 impl RemovalStep {
-    fn progress(self) -> &'static str {
+    /// The dialog's honest progress line: what is happening, whose
+    /// shutdown it waits for, and for how long ("Stopping Codex… 2 s").
+    fn progress(self, harness: &str, elapsed: std::time::Duration) -> String {
+        let harness = crate::picker::harness_label(harness);
+        let seconds = elapsed.as_secs();
         match self {
-            Self::Stopping => "Stopping…",
-            Self::Waiting => "Waiting for it to stop…",
-            Self::Deleting => "Deleting…",
+            Self::Stopping => format!("Stopping {harness}… {seconds} s"),
+            Self::Waiting => {
+                format!("Waiting for {harness} to exit and release its files… {seconds} s")
+            }
+            Self::Deleting => format!("Deleting… {seconds} s"),
         }
     }
 
@@ -260,6 +270,16 @@ impl DesktopApp {
                 }
                 self.shell_update(ShellMsg::RefreshRequested, context);
             }
+            MenuMsg::RemovalTick => {
+                if self
+                    .menu
+                    .removal
+                    .as_ref()
+                    .is_some_and(|removal| removal.error.is_none())
+                {
+                    self.post_removal_tick(context);
+                }
+            }
             MenuMsg::RemovalClosed => {
                 self.menu.removal = None;
                 self.shell_update(ShellMsg::RefreshRequested, context);
@@ -344,7 +364,9 @@ impl DesktopApp {
             command: mutation_id.clone(),
             step: RemovalStep::Stopping,
             error: None,
+            started: std::time::Instant::now(),
         });
+        self.post_removal_tick(context);
         let _task = context.spawn_background(move |_| {
             Message::Menu(MenuMsg::RemovalStopped(
                 client::block_on(client::submit_stop(
@@ -357,6 +379,16 @@ impl DesktopApp {
                 .map(|reply| submit_note(&reply))
                 .map_err(|error| error.to_string()),
             ))
+        });
+    }
+
+    /// Re-render the progress line's seconds once a second while the
+    /// Stop and delete dialog shows progress.
+    fn post_removal_tick(&self, context: &ComponentContext<Self>) {
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let _ = feed::backoff(1_000, &cancelled);
+            Message::Menu(MenuMsg::RemovalTick)
         });
     }
 
@@ -907,8 +939,12 @@ impl DesktopApp {
                         .width(16.0)
                         .height(16.0)
                         .vertical_alignment(VerticalAlignment::Center),
-                    m3::secondary(removal.step.progress())
-                        .vertical_alignment(VerticalAlignment::Center),
+                    m3::secondary(
+                        removal
+                            .step
+                            .progress(&removal.agent.harness, removal.started.elapsed()),
+                    )
+                    .vertical_alignment(VerticalAlignment::Center),
                 )),
         };
         let close: View = if removal.error.is_some() {
@@ -1065,4 +1101,26 @@ fn open_folder(path: &str) {
         return;
     }
     let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_removal_line_names_the_harness_and_the_seconds() {
+        let elapsed = std::time::Duration::from_millis(12_400);
+        assert_eq!(
+            RemovalStep::Stopping.progress("codex", elapsed),
+            "Stopping Codex… 12 s"
+        );
+        assert_eq!(
+            RemovalStep::Waiting.progress("claude", elapsed),
+            "Waiting for Claude Code to exit and release its files… 12 s"
+        );
+        assert_eq!(
+            RemovalStep::Deleting.progress("codex", elapsed),
+            "Deleting… 12 s"
+        );
+    }
 }
