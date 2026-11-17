@@ -373,6 +373,7 @@ impl PluginHost {
         command: Command,
         mut source_state: Option<Value>,
     ) -> Result<Value> {
+        let launch_started = Instant::now();
         if agent.observe_only {
             return Err(Error::new(
                 "not_allowed",
@@ -485,7 +486,9 @@ impl PluginHost {
         // Cleanup closes admission, then waits for this gate before snapshotting
         // running. Cover the first filesystem effect through child ownership
         // handoff, including the awaits before registration; never hold Store.
+        let prepared_at = Instant::now();
         let startup = self.state.startup_gate.lock().await;
+        let gate_acquired_at = Instant::now();
         if self.state.startup_closed.load(Ordering::SeqCst) {
             return Err(Error::new(
                 "native_not_dispatched",
@@ -526,10 +529,12 @@ impl PluginHost {
         // spawn may briefly create a suspended child, but it is terminated
         // before executing and never receives this path. Remove exactly the
         // generated directory, never recursively.
+        let monitoring_started = Instant::now();
         if let Err(error) = self.state.monitoring.prepare_generation(&agent).await {
             remove_empty_instance_dir(&instance_dir);
             return Err(error);
         }
+        let spawn_started = Instant::now();
         let spawned = self.spawn_plugin(&agent, &instance_dir).await;
         let mut child = match spawned {
             Ok(child) => child,
@@ -538,6 +543,7 @@ impl PluginHost {
                 return Err(error);
             }
         };
+        let spawned_at = Instant::now();
         let observer = match child.observer() {
             Ok(observer) => observer,
             Err(error) => {
@@ -589,20 +595,26 @@ impl PluginHost {
 
         let telemetry_policy = Arc::new(SecretPolicy::new(source_credentials.iter()));
         let debug_policy = Arc::clone(&telemetry_policy);
+        let debug_agent = agent.id.clone();
+        let debug_generation = agent.generation as u64;
         let stderr_capture = spawn_plugin_stderr(stderr, telemetry_policy, move |line| {
             if crate::logging::is_debug()
                 && let Some(record) = eliot_plugin::parse_debug_line(line)
             {
-                let ids: Vec<_> = record
+                let mut ids: Vec<_> = record
                     .ids
                     .iter()
                     .map(|(k, v)| (k.as_str(), v.as_str()))
                     .collect();
-                let fields: Vec<_> = record
+                ids.retain(|(key, _)| *key != "agent_id" && *key != "generation");
+                ids.push(("agent_id", debug_agent.as_str()));
+                let mut fields: Vec<_> = record
                     .fields
                     .iter()
                     .map(|(k, v)| (k.as_str(), *v))
                     .collect();
+                fields.retain(|(key, _)| *key != "generation");
+                fields.push(("generation", debug_generation));
                 crate::logging::record_debug(&debug_policy, &record.code, &ids, &fields);
             }
         });
@@ -672,6 +684,7 @@ impl PluginHost {
             .await;
         });
         drop(startup);
+        let registered_at = Instant::now();
 
         let result = match timeout_at(Instant::now() + START_TIMEOUT + RPC_GRACE, started_rx).await
         {
@@ -686,6 +699,23 @@ impl PluginHost {
                 "Agent plugin start exceeded its absolute deadline",
             )),
         };
+        let millis =
+            |duration: std::time::Duration| duration.as_millis().min(u128::from(u64::MAX)) as u64;
+        crate::logging::record_debug(
+            &SecretPolicy::new(source_credentials.iter()),
+            "agent.start_timing",
+            &[("agent_id", &agent.id), ("command_id", &command.id)],
+            &[
+                ("prepare_ms", millis(prepared_at - launch_started)),
+                ("gate_wait_ms", millis(gate_acquired_at - prepared_at)),
+                ("instance_ms", millis(monitoring_started - gate_acquired_at)),
+                ("monitoring_ms", millis(spawn_started - monitoring_started)),
+                ("spawn_ms", millis(spawned_at - spawn_started)),
+                ("register_ms", millis(registered_at - spawned_at)),
+                ("ready_wait_ms", millis(registered_at.elapsed())),
+                ("elapsed_ms", millis(launch_started.elapsed())),
+            ],
+        );
         result.map_err(|error| diagnose_error(error, &stderr_view, &source_credentials))
     }
 

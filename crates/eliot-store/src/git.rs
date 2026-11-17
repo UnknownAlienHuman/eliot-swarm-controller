@@ -45,6 +45,16 @@ impl Store {
         let (expected, metadata_uncovered) =
             collect_expected_git_paths(&scanned.events, &snapshot.workspace);
         let baseline = load_and_check_git_baseline(&tx, snapshot)?;
+        if self
+            .git_observed_at
+            .get(&snapshot.workspace)
+            .is_some_and(|observed_at| *observed_at > snapshot.observed_at)
+        {
+            return Err(Error::new(
+                "bad_state",
+                "Git snapshot predates the latest accepted observation",
+            ));
+        }
         let (covered, attributed) =
             validate_git_hint_batch(&tx, agent_num, generation, snapshot, hints, through, cursor)?;
         if (covered != expected || metadata_uncovered) && !file_gap {
@@ -78,15 +88,29 @@ impl Store {
         )?;
         if snapshot.complete {
             // Only explicit clean proofs clear attribution, including older generations.
-            for path in &snapshot.clean_paths {
-                db!(tx.execute(
-                    "DELETE FROM agent_edits WHERE workspace = ?1 AND path = ?2 AND updated_at <= ?3",
-                    params![snapshot.workspace, path, snapshot.observed_at],
-                ));
+            if !snapshot.clean_paths.is_empty() {
+                let clean_paths = encode_json(&snapshot.clean_paths)?;
+                let stale: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM agent_edits WHERE workspace = ?1
+                         AND path IN (SELECT value FROM json_each(?2)) AND updated_at <= ?3)",
+                        params![snapshot.workspace, clean_paths, snapshot.observed_at],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_error)?;
+                if stale {
+                    db!(tx.execute(
+                        "DELETE FROM agent_edits WHERE workspace = ?1
+                         AND path IN (SELECT value FROM json_each(?2)) AND updated_at <= ?3",
+                        params![snapshot.workspace, clean_paths, snapshot.observed_at],
+                    ));
+                }
             }
-            if baseline.as_ref().is_none_or(|old| {
-                old.head != snapshot.head || old.updated_at != snapshot.observed_at
-            }) {
+            // The baseline moves only on a HEAD transition; unchanged probes write nothing here.
+            if baseline
+                .as_ref()
+                .is_none_or(|old| old.head != snapshot.head)
+            {
                 db!(tx.execute(
                     "INSERT INTO git_workspaces(workspace, head, updated_at) VALUES (?1, ?2, ?3)
                      ON CONFLICT(workspace) DO UPDATE SET head = excluded.head, updated_at = excluded.updated_at",
@@ -94,12 +118,17 @@ impl Store {
                 ));
             }
         }
-        db!(tx.execute(
-            "UPDATE source_state SET cursor = ?1, last_store_seq = COALESCE(?2, last_store_seq), updated_at = ?3
-             WHERE agent = ?4 AND generation = ?5 AND source = 'git'",
-            params![through.to_string(), events.last().map(|event| event.seq), now, agent_num, generation],
-        ));
+        // Irrelevant global events advance `through` but need no durable cursor write.
+        if !scanned.events.is_empty() || !events.is_empty() {
+            db!(tx.execute(
+                "UPDATE source_state SET cursor = ?1, last_store_seq = COALESCE(?2, last_store_seq), updated_at = ?3
+                 WHERE agent = ?4 AND generation = ?5 AND source = 'git'",
+                params![through.to_string(), events.last().map(|event| event.seq), now, agent_num, generation],
+            ));
+        }
         commit_transaction(tx, &self.write_faulted)?;
+        self.git_observed_at
+            .insert(snapshot.workspace.clone(), snapshot.observed_at);
         Ok(events)
     }
 }
@@ -280,16 +309,28 @@ fn compute_git_view(
         "history_complete": snapshot.history_complete, "history_gap": snapshot.history_gap,
         "base_oid": snapshot.base_oid, "committed_paths": committed_paths, "base_complete": snapshot.base_complete,
     });
-    let previous: Option<String> = tx
+    let previous: Option<(String, i64)> = tx
         .query_row(
-            "SELECT data FROM events WHERE agent = ?1 AND generation = ?2
+            "SELECT data,ts FROM events WHERE agent = ?1 AND generation = ?2
              AND source = 'git' AND kind = 'git.changed' ORDER BY seq DESC LIMIT 1",
             params![agent_num, generation],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    let previous = previous.as_deref().map(decode_json).transpose()?;
+    if previous
+        .as_ref()
+        .is_some_and(|(_, observed_at)| *observed_at > snapshot.observed_at)
+    {
+        return Err(Error::new(
+            "bad_state",
+            "Git snapshot predates the committed Git view",
+        ));
+    }
+    let previous = previous
+        .as_ref()
+        .map(|(data, _)| decode_json(data))
+        .transpose()?;
     // Delivery belongs to this binding. A partial view is not a commit receipt.
     let delivered = if previous
         .as_ref()
@@ -584,4 +625,140 @@ fn insert_git_event(
             data,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_git_writes_nothing_and_finds_hints_past_unrelated_events() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        store.connection.execute("INSERT INTO agents(project,harness,profile,workspace,state,generation,created_at,updated_at) VALUES ('','codex','p','workspace','idle',1,100,100)", []).unwrap();
+        store.ensure_git_source("a1", 1, "workspace", 100).unwrap();
+        let mut snapshot = GitSnapshot {
+            workspace: "workspace".to_owned(),
+            head: Some("a".repeat(40)),
+            branch: Some("main".to_owned()),
+            dirty: Vec::new(),
+            commits: Vec::new(),
+            clean_paths: vec!["clean.rs".to_owned()],
+            observed_at: 100,
+            complete: true,
+            history_complete: true,
+            history_gap: false,
+            base_oid: None,
+            committed_paths: Vec::new(),
+            base_complete: false,
+        };
+        store
+            .record_git_observation("a1", 1, &snapshot, &[], 0, 100)
+            .unwrap();
+        // More unrelated events than one page used to starve a frozen idle cursor.
+        store.connection.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1500) INSERT INTO events(ts,kind,agent,generation,source,data) SELECT 101,'tool.completed',1,1,'stream','{\"tool\":\"shell\",\"status\":\"completed\"}' FROM n").unwrap();
+        let page = store
+            .git_hint_page("a1", 1, store.git_cursor("a1", 1).unwrap(), 10)
+            .unwrap();
+        assert!(page.events.is_empty());
+        assert_eq!(page.through, store.high_water().unwrap() as u64);
+        snapshot.observed_at = 200;
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .record_git_observation("a1", 1, &snapshot, &[], page.through, 200)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+
+        // A no-op sample still fences a later regressed clock or delayed sample.
+        snapshot.observed_at = 150;
+        let error = store
+            .record_git_observation("a1", 1, &snapshot, &[], page.through, 201)
+            .unwrap_err();
+        assert_eq!(error.code, "bad_state");
+        assert_eq!(store.connection.total_changes(), before);
+
+        // Typed booleans matter: a numeric 1 was never a native true hint.
+        for data in [
+            json!({"tool":"fileChange","status":"completed","changed_paths_truncated":1}),
+            json!({"tool":"fileChange","status":"completed","redacted":1}),
+            json!({"tool":"fileChange","status":"completed","changed_paths":"not-an-array"}),
+        ] {
+            store.connection.execute("INSERT INTO events(ts,kind,family,agent,generation,source,native_id,data) VALUES (201,'tool.completed','tool',1,1,'stream',?1,?2)", params![ulid::Ulid::new().to_string(), data.to_string()]).unwrap();
+        }
+        assert!(
+            store
+                .git_hint_page("a1", 1, 0, 10)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        assert!(!pending_git_hints(&store.connection, 1, 1, 0).unwrap());
+        store.connection.execute("INSERT INTO events(ts,kind,family,agent,generation,source,native_id,data) VALUES (202,'tool.completed','tool',1,1,'stream','real-file-change','{\"tool\":\"fileChange\",\"status\":\"completed\",\"changed_paths\":[\"changed.rs\"]}')", []).unwrap();
+        let page = store.git_hint_page("a1", 1, 0, 10).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(
+            page.events[0].native_id.as_deref(),
+            Some("real-file-change")
+        );
+        let hint = FileChangeHint {
+            path: "changed.rs".to_owned(),
+            event_seq: page.events[0].seq as u64,
+            ts: 202,
+        };
+        snapshot.observed_at = 202;
+        let events = store
+            .record_git_observation(
+                "a1",
+                1,
+                &snapshot,
+                std::slice::from_ref(&hint),
+                page.through,
+                202,
+            )
+            .unwrap();
+        assert!(events.iter().any(|event| event.kind == "file.changed"));
+        assert_eq!(store.git_cursor("a1", 1).unwrap(), page.through);
+        snapshot.observed_at = 203;
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .record_git_observation(
+                    "a1",
+                    1,
+                    &snapshot,
+                    std::slice::from_ref(&hint),
+                    page.through,
+                    203
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        // Actual HEAD movement still commits a view and the new recovery baseline.
+        snapshot.head = Some("b".repeat(40));
+        snapshot.observed_at = 204;
+        assert!(
+            store
+                .record_git_observation("a1", 1, &snapshot, &[], page.through, 204)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "git.changed")
+        );
+        assert_eq!(
+            store.git_baseline("workspace").unwrap().unwrap().updated_at,
+            204
+        );
+        store.connection.execute("INSERT INTO agents(project,harness,profile,workspace,state,generation,created_at,updated_at) VALUES ('','codex','p','workspace','idle',1,100,100)", []).unwrap();
+        store.ensure_git_source("a2", 1, "workspace", 205).unwrap();
+        store
+            .set_git_source_status("a1", 1, "ok", true, 206)
+            .unwrap();
+        assert!(store.git_observed_at.contains_key("workspace"));
+        store
+            .set_git_source_status("a2", 1, "ok", true, 207)
+            .unwrap();
+        assert!(!store.git_observed_at.contains_key("workspace"));
+    }
 }

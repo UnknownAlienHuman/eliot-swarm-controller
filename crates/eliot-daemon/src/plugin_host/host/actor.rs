@@ -38,6 +38,7 @@ pub(super) async fn run_agent_inner(
     started: oneshot::Sender<Result<Value>>,
     pending_failure: &mut Option<PendingFailure>,
 ) {
+    let initialize_started = Instant::now();
     let source_plan = match initialize_agent(&actor, &client).await {
         Ok(source_plan) => source_plan,
         Err(error) => {
@@ -54,6 +55,7 @@ pub(super) async fn run_agent_inner(
             return;
         }
     };
+    let initialized_at = Instant::now();
     // A resume that inherited a `configure` overlay carries its effective
     // values as the native realignment target: the retained session
     // already runs them, so the plugin must prove them instead of
@@ -86,6 +88,7 @@ pub(super) async fn run_agent_inner(
         effort_override,
         config_revision,
     };
+    let native_started = Instant::now();
     let start = match serde_json::to_value(start_params) {
         // PluginClient validates the exact completed RPC frame, including its
         // allocated request ID and newline, before any bytes reach the writer.
@@ -95,6 +98,35 @@ pub(super) async fn run_agent_inner(
             "agent.start params could not be encoded",
         )),
     };
+    crate::logging::record_debug(
+        &eliot_core::SecretPolicy::new(actor.source_credentials.iter()),
+        "agent.handshake_timing",
+        &[
+            ("agent_id", &actor.agent.id),
+            ("command_id", &actor.start_command.id),
+        ],
+        &[
+            (
+                "initialize_ms",
+                (initialized_at - initialize_started)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+            (
+                "start_prepare_ms",
+                (native_started - initialized_at)
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+            (
+                "native_start_ms",
+                native_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+        ],
+    );
     match start {
         Ok(value) if validate_start_result(&value, &actor.agent, &actor.start_command).is_ok() => {
             if is_failed_start_result(&value) {

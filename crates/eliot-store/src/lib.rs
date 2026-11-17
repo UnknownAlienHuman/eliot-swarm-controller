@@ -262,6 +262,9 @@ pub struct Store {
     /// from another holder is a crashed round: it reads as `unknown`.
     goal_holder: String,
     hierarchy_limits: core::api::HierarchyLimits,
+    /// Live readback watermark, including unchanged probes. This is not a
+    /// durable heartbeat; committed Git views and HEAD transitions fence restart.
+    git_observed_at: BTreeMap<String, i64>,
 }
 
 /// Bounded evidence for tools in one exact, retained turn. Unknown includes
@@ -362,6 +365,7 @@ impl Store {
         let mut store = Self {
             connection,
             write_faulted: Cell::new(false),
+            git_observed_at: BTreeMap::new(),
             goal_holder: Ulid::new().to_string(),
             hierarchy_limits: core::api::HierarchyLimits::default(),
         };
@@ -2594,6 +2598,9 @@ impl Store {
                     "Git source still has unconsumed native file-change hints",
                 ));
             }
+            let closing_workspace = closed
+                .then(|| retained_git_workspace(&tx, agent, generation))
+                .transpose()?;
             let state = if closed {
                 "closed"
             } else {
@@ -2620,7 +2627,24 @@ impl Store {
                     json!({"source": GIT_SOURCE, "state": state, "health": health}),
                 )?);
             }
+            let retire_workspace = if let Some(workspace) = closing_workspace {
+                let shared: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM source_state s JOIN agents a ON a.id=s.agent
+                     WHERE s.source='git' AND s.state='open' AND COALESCE(
+                       (SELECT json_extract(e.data,'$.workspace') FROM events e
+                        WHERE e.agent=s.agent AND e.generation=s.generation AND e.kind='source.opened'
+                          AND json_extract(e.data,'$.source')='git' ORDER BY e.seq DESC LIMIT 1),
+                       CASE WHEN s.generation=a.generation THEN a.workspace END)=?1)",
+                    [&workspace], |row| row.get(0),
+                ).map_err(sql_error)?;
+                (!shared).then_some(workspace)
+            } else {
+                None
+            };
             commit_transaction(tx, &self.write_faulted)?;
+            if let Some(workspace) = retire_workspace {
+                self.git_observed_at.remove(&workspace);
+            }
             Ok(events)
         })();
         self.fault_on_persistence_error(&result);
@@ -2716,9 +2740,10 @@ fn pending_git_hints(
               AND e.source NOT IN ('git', 'os', 'daemon')
               AND json_extract(e.data, '$.tool') = 'fileChange'
               AND json_extract(e.data, '$.status') = 'completed'
-              AND (json_array_length(e.data, '$.changed_paths') > 0
-                   OR json_extract(e.data, '$.changed_paths_truncated') = 1
-                   OR json_extract(e.data, '$.redacted') = 1))",
+              AND (CASE WHEN json_type(e.data, '$.changed_paths') = 'array'
+                        THEN json_array_length(e.data, '$.changed_paths') > 0 ELSE 0 END
+                   OR json_type(e.data, '$.changed_paths_truncated') = 'true'
+                   OR json_type(e.data, '$.redacted') = 'true'))",
             params![agent, generation, git_sequence(cursor)?],
             |row| row.get(0),
         )
@@ -2843,18 +2868,43 @@ fn scan_git_hints(
     let mut statement = connection
         .prepare(
             "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
-         FROM events WHERE seq > ?1 AND seq <= ?2 ORDER BY seq LIMIT ?3",
+         FROM events INDEXED BY events_git_hints WHERE seq > ?1 AND seq <= ?2
+           AND agent = ?4 AND generation = ?5 AND kind = 'tool.completed'
+           AND native_id IS NOT NULL AND source NOT IN ('git', 'os', 'daemon')
+           AND json_extract(data, '$.tool') = 'fileChange'
+           AND json_extract(data, '$.status') = 'completed'
+           AND (CASE WHEN json_type(data, '$.changed_paths') = 'array'
+                     THEN json_array_length(data, '$.changed_paths') > 0 ELSE 0 END
+                OR json_type(data, '$.changed_paths_truncated') = 'true'
+                OR json_type(data, '$.redacted') = 'true')
+         ORDER BY seq LIMIT ?3",
         )
         .map_err(sql_error)?;
     let rows = statement
-        .query_map(params![after, through, limit as i64], event_record_from_row)
+        .query_map(
+            params![
+                after,
+                through,
+                limit as i64,
+                parse_agent_id(agent)?,
+                generation
+            ],
+            event_record_from_row,
+        )
         .map_err(sql_error)?;
     let mut scanned = Vec::new();
     for row in rows {
         scanned.push(event_from_record(row.map_err(sql_error)?)?);
     }
+    let rows_read = scanned.len();
     enforce_page_bytes(&mut scanned)?;
-    let boundary = scanned.last().map_or(through, |event| event.seq);
+    // A short, untrimmed matching page proves the rest of this interval has
+    // no hints. A full or byte-trimmed page advances only through its tail.
+    let boundary = if rows_read < limit && scanned.len() == rows_read {
+        through
+    } else {
+        scanned.last().map_or(after, |event| event.seq)
+    };
     scanned.retain(|event| {
         event.agent.as_deref() == Some(agent)
             && event.generation == Some(generation)

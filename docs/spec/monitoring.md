@@ -357,6 +357,14 @@ silently disabling the configured HTTPS/SSH transport itself.
   `ls-remote` poll;
 - slow status backs off and reports source health;
 - monitor never writes index, refs or objects.
+- an unchanged probe writes no Store rows: with no relevant native hints, Git events or
+  attribution changes, the source cursor stays put (global event high-water is not
+  persisted), and the workspace HEAD baseline changes only on a HEAD transition.
+  Hint pages select that Agent generation's exact completed native file changes before
+  applying their row and byte bounds; unrelated journal traffic cannot starve later hints.
+  A process-local watermark rejects samples older than the last accepted observation,
+  including no-op observations. After restart, retained Git views and HEAD transitions
+  provide the durable lower bounds; an unchanged observation needs no durable heartbeat.
 
 The current subset polls local state at least 2 s apart without submodule recursion;
 slow/error probes back off up to 30 s. A binding's final read (its generation is
