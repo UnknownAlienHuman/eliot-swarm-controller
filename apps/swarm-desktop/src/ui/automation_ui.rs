@@ -11,7 +11,6 @@ pub(super) enum AutomationMsg {
 /// Rules and timers read for the Automation screen.
 pub(super) struct AutomationState {
     pub(super) rules: Vec<RuleNamespace>,
-    pub(super) status: String,
     /// Tags rule loads; an older reply is dropped.
     pub(super) epoch: u64,
 }
@@ -36,16 +35,6 @@ impl DesktopApp {
                         rules: page.map(|(rules, _)| rules),
                     })
                     .collect();
-                let count: usize = self
-                    .automation
-                    .rules
-                    .iter()
-                    .map(|namespace| namespace.rules.as_ref().map_or(0, Vec::len))
-                    .sum();
-                self.automation.status = format!(
-                    "{} read.",
-                    eliot_core::count_words(count as u64, "rule or timer", "rules and timers")
-                );
             }
             AutomationMsg::AutomationRefreshRequested => self.load_rules(context),
         }
@@ -61,7 +50,6 @@ impl DesktopApp {
             .iter()
             .map(|project| project.id.clone())
             .collect();
-        self.automation.status = "Reading rules…".to_owned();
         self.automation.epoch += 1;
         let epoch = self.automation.epoch;
         let _task = context.spawn_background(move |_| {

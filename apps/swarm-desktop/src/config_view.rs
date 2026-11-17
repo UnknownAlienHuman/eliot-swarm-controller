@@ -705,7 +705,6 @@ fn assignment_block(group: &AssignmentRules<'_>) -> View {
 /// assignment generated grouped under that assignment.
 pub fn automation_screen(
     namespaces: &[RuleNamespace],
-    status: &str,
     refresh: Callback<()>,
     palette: Palette,
 ) -> View {
@@ -755,7 +754,9 @@ pub fn automation_screen(
     if cards.is_empty() {
         cards.push(KeyedView::new(
             "none",
-            small(if status.is_empty() || status.starts_with("Reading") {
+            // Decided by whether a read has landed, not by the status text, so
+            // a background re-read never turns an empty list into "Reading…".
+            small(if namespaces.is_empty() {
                 "Reading…"
             } else {
                 "No rules or timers."

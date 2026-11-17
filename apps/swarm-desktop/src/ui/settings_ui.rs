@@ -1618,7 +1618,10 @@ impl DesktopApp {
         } else {
             View::empty()
         };
-        let freshness = self.settings.read_at_ms.and_then(super::last_read_label);
+        let freshness = self
+            .settings
+            .read_at_ms
+            .and_then(crate::monitor::last_read_label);
         let status = self.settings.error.as_deref().map_or_else(
             || {
                 // The same text during a background read, so the page never
@@ -1739,7 +1742,7 @@ impl DesktopApp {
                 .is_text_selection_enabled(true),
             self.settings
                 .read_at_ms
-                .and_then(super::last_read_label)
+                .and_then(crate::monitor::last_read_label)
                 .map_or_else(View::empty, |label| m3::secondary(label).into()),
             m3::outlined(palette)
                 .horizontal_alignment(HorizontalAlignment::Left)

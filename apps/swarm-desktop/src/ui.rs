@@ -425,28 +425,6 @@ fn project_checkouts(projects: &[UiProject]) -> Vec<nav::Checkout> {
     rows
 }
 
-fn last_read_label(at_ms: i64) -> Option<String> {
-    let at = chrono::DateTime::from_timestamp_millis(at_ms)?.with_timezone(&chrono::Local);
-    Some(format!("Last read {}", at.format("%b %-d, %H:%M:%S")))
-}
-
-/// How old cached panel data must be before the panel says when it was
-/// read: several missed refreshes, not the one in flight, so a healthy
-/// panel never shows the line.
-const STALE_AFTER_MS: i64 = 5 * monitor::PERIOD_MS as i64;
-
-/// The read-age line under a cached panel. It appears only when the data
-/// is old, so routine background refreshes never add, remove or rewrap a
-/// line (each one used to shift the whole panel).
-fn panel_read_status(read_at_ms: Option<i64>, now_ms: i64) -> Option<String> {
-    let read = read_at_ms?;
-    if now_ms.saturating_sub(read) > STALE_AFTER_MS {
-        last_read_label(read)
-    } else {
-        None
-    }
-}
-
 /// One validated page of Agent rows on a worker, with chat and archived flags.
 fn load_agents_blocking(
     data_dir: &Path,
@@ -717,7 +695,6 @@ impl Component for DesktopApp {
             monitor: monitor_ui::MonitorState::default(),
             automation: automation_ui::AutomationState {
                 rules: Vec::new(),
-                status: String::new(),
                 epoch: 0,
             },
             menu: menu_ui::MenuState::default(),
@@ -795,26 +772,4 @@ pub fn run(workspace: PathBuf) -> Result<(), String> {
         eprintln!("swarm-desktop: window size not saved: {error}");
     }
     result
-}
-
-#[cfg(test)]
-mod read_status_tests {
-    use super::{STALE_AFTER_MS, panel_read_status};
-
-    #[test]
-    fn fresh_or_in_flight_data_adds_no_line() {
-        let read = 1_794_950_000_000;
-        assert_eq!(panel_read_status(None, read), None);
-        assert_eq!(panel_read_status(Some(read), read), None);
-        // One refresh period plus a slow read is still fresh.
-        assert_eq!(panel_read_status(Some(read), read + 2_500), None);
-        assert_eq!(panel_read_status(Some(read), read + STALE_AFTER_MS), None);
-    }
-
-    #[test]
-    fn old_data_says_when_it_was_read() {
-        let read = 1_794_950_000_000;
-        let line = panel_read_status(Some(read), read + STALE_AFTER_MS + 1).unwrap();
-        assert!(line.starts_with("Last read "), "{line}");
-    }
 }

@@ -612,7 +612,7 @@ impl DesktopApp {
         if !data.errors.is_empty() {
             notes.push("Some reads failed".to_owned());
         }
-        if let Some(status) = super::panel_read_status(data.read_at_ms, crate::handoff::now_ms()) {
+        if let Some(status) = monitor::read_status(data.read_at_ms, crate::handoff::now_ms()) {
             notes.push(status);
         }
         let partial: View = match overview.partial_note() {
@@ -995,7 +995,7 @@ impl DesktopApp {
             .into_iter()
             .chain(resources_at)
             .min();
-        if let Some(status) = super::panel_read_status(read_at, crate::handoff::now_ms()) {
+        if let Some(status) = monitor::read_status(read_at, crate::handoff::now_ms()) {
             sections.push(KeyedView::new(
                 "refresh",
                 m3::secondary(status).text_wrapping(TextWrapping::Wrap),
@@ -1015,7 +1015,9 @@ impl DesktopApp {
                     .text_wrapping(TextWrapping::Wrap),
             ));
         }
-        let pending = self.monitor.refreshing && data.detail_errors.is_empty();
+        // No cached read and no error yet: the first read is still due. This
+        // ignores routine refreshes, so a placeholder never flips each cycle.
+        let pending = data.detail_errors.is_empty();
         match (detail, read) {
             (Some(detail), _) => {
                 let harness = crate::picker::harness_label(&detail.harness);

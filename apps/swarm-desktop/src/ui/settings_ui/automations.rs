@@ -10,7 +10,6 @@ impl DesktopApp {
             self.assignments_view(context, palette),
             config_view::automation_screen(
                 &self.automation.rules,
-                &self.automation.status,
                 context.message(Message::Automation(
                     AutomationMsg::AutomationRefreshRequested,
                 )),
