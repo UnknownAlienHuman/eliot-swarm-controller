@@ -1926,8 +1926,11 @@ mod tests {
             command.args(["-NoProfile", "-NonInteractive", "-Command",
                 "[IO.File]::WriteAllText($env:ELIOT_MUSE_PROBE_WAIT_PID, [string]$PID); Start-Sleep -Seconds 60"])
                 .env("ELIOT_MUSE_PROBE_WAIT_PID", &pid_file);
-            let task = tokio::spawn(probe_muse_command(command, Duration::from_secs(3)));
-            let pid = tokio::time::timeout(Duration::from_secs(2), async {
+            // PowerShell can take several seconds to start under a parallel
+            // test load; the probe bound must outlast that start, and the
+            // PID wait must cover it, or the assertion races process start.
+            let task = tokio::spawn(probe_muse_command(command, Duration::from_secs(12)));
+            let pid = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     if let Ok(text) = std::fs::read_to_string(&pid_file)
                         && let Ok(pid) = text.parse::<u32>()
@@ -1947,7 +1950,7 @@ mod tests {
             } else {
                 assert!(!task.await.unwrap());
             }
-            tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::time::timeout(Duration::from_secs(5), async {
                 while recorded_process_alive(pid, birth).unwrap() {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
