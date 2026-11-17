@@ -101,7 +101,7 @@ fail readiness with location-not-found (observed in the Linux Docker image).
 | detach | explicitly stop controlling/observing as defined, leaving native service/session alive |
 | resume | installed exact native session reattachment: `GET /api/session/{id}` proves the retained session, then the interrupt-quiesce (`POST .../interrupt`, which aborts a running retained execution — refusing would wedge crash-recovery resume) plus the empty `inbox`/`permission`/`form` lists prove it idle (anything still pending refuses the resume); never replays the prompt |
 | approve/deny/answer | installed `POST .../permission/{id}/reply` (`once`/`always`/`reject`; approve must name `once` or `always`, there is no default choice), `POST .../form/{id}/reply` (`answer` map), `DELETE .../form/{id}` for deny; the public request id is the native id, request.opened details are the shared ApprovalRequest/QuestionRequest, answers are the shared AnswerArgs converted to the field-typed native value (string, string array, number, boolean), choices stage against the offered schema (a miss rejects before any write), a lost reply is unknown and never rewritten |
-| configure | mid-run model switch at configure time: the requested `provider/model` must be in the live `GET /api/model` catalogue or the command rejects before any write (the installed server validates nothing and echoes even bogus switches, so the catalogue gate is the honest failure); the switch runs installed `POST /api/session/{id}/model` with a fresh `session.get` effective readback (`model_verified` only from that readback), then the Router stores the overlay — a refused or unproven switch stores nothing and never claims applied. No effort knob exists natively, so `configure --effort` is `unsupported`. Resume-time realign keeps the installed `POST .../model` / `POST .../agent` setters against the retained session with `session.get` effective readback (a refused switch fails the resume as unknown), targeting the inherited overlay revision when a resume carries one |
+| configure | mid-run model and/or effort switch at configure time: the requested `provider/model` must be in the live `GET /api/model` catalogue or the command rejects before any write, and a requested effort must be one of that model's installed `variants` ids (the TUI "Variant" switch; the installed server validates nothing and echoes even bogus switches, so the catalogue gate is the honest failure); the switch runs installed `POST /api/session/{id}/model` with the documented `Model.Ref.variant` and a fresh `session.get` effective readback (`model_verified` and, when an effort was requested, `effort_verified` only from that readback), then the Router stores the overlay — a refused or unproven switch stores nothing and never claims applied. A model switch without an effort runs the server default variant. Resume-time realign keeps the installed `POST .../model` / `POST .../agent` setters against the retained session with `session.get` effective readback (a refused switch fails the resume as unknown), targeting the inherited overlay revision when a resume carries one |
 | fork/background | installed native method and exact resulting identity/state |
 | goal | explicitly selected Eliot Goal; no assumed native Goal |
 
@@ -153,10 +153,14 @@ slash: `opencode/deepseek-v4.1-flash-free` selects provider `opencode` and model
 `deepseek-v4.1-flash-free`, without shortening or substituting it. This follows
 [v2.2.7 `Model.Ref.parse`](https://github.com/anomalyco/opencode/blob/v2.2.7/packages/schema/src/model.ts#L27).
 Empty slash segments, backslash separators, whitespace and control characters reject.
-The native `#variant` suffix is not mapped by this slice and rejects; requests retain
-`variant=None` and the existing exact requested/effective model comparison.
-Effective output reports native `ModelRef.variant` as `model_variant` (null when
-backend omits it); it is readback-only and does not change `model_verified` (provider/id).
+The native `#variant` suffix is not mapped by this slice and rejects; the frozen
+profile `effort` (or ad-hoc `--effort`) selects the documented `Model.Ref.variant`
+instead, gated against the live `GET /api/model` catalogue before the session
+exists. Effective output reports native `ModelRef.variant` as `model_variant` and,
+mirroring that readback, as `effort` with `effort_verified` (an omitted effort
+accepts the server default variant); `model_variant` alone stays readback-only and
+does not change `model_verified` (provider/id), while a requested effort joins the
+ready gate.
 
 L7 verifies two-session isolation when shared mode is selected, adopted-service safety,
 204-vs-execution, lost stream/input, snapshot races, pagination, exact controls and no
@@ -306,7 +310,7 @@ edited by the scan.
 ## Ad-hoc launch
 
 Ad-hoc OpenCode launch (`swarm launch --harness opencode [--model
-PROVIDER/MODEL] [--auth INTEGRATION] [--cmd PATH] --workspace W "prompt"`)
+PROVIDER/MODEL] [--effort VARIANT] [--auth INTEGRATION] [--cmd PATH] --workspace W "prompt"`)
 is Owner-only and freezes a profile-equivalent snapshot from conservative
 defaults (explicit MCP `inherit`, since ad-hoc spans harnesses without a
 minimal mapping) plus flags, with one extra rule: starting the
@@ -317,16 +321,21 @@ selector; an omitted one defaults to the model provider prefix, but only
 when the native `opencode auth list` holds an entry with exactly that id.
 Anything else refuses before spawning with a typed `profile_error` naming
 `--auth` and listing the available integration ids — another provider's
-credential is never picked silently. `--effort` has no mapping and is
-rejected. `cmd` is discovered by following the npm shim to the native
+credential is never picked silently. `--effort` freezes the installed
+per-model variant id verbatim (the live catalogue proves membership at
+launch). `cmd` is discovered by following the npm shim to the native
 `opencode.exe` inside the package (the shim target
 `<shim-dir>/node_modules/@opencode/cli/bin/opencode.exe`, then the known
 package-local paths under every roaming root including the
 `USERPROFILE`-derived default when `APPDATA` is stripped); `--cmd` pins one
 explicit install instead. `swarm models --harness opencode` lists the native
-`opencode models` catalogue (`provider/model` ids verbatim; a launch resolves
+`opencode models` catalogue (`provider/model` ids verbatim) with each
+model's installed `Model.Variant` ids overlaid as `efforts` from the
+read-only `opencode api model.list` operation (`model.list`, the same
+`GET /api/model` inventory the per-session path reads); a launch resolves
 the full provider/model pair, an omitted model leaves the configured native
-default, read back from the session echo).
+default, read back from the session echo. A stored profile may also carry
+`effort`, frozen the same way.
 ## Agent skill delivery (`eliot-swarm`)
 
 At spawn, the plugin copies the daemon-materialized canonical skill files

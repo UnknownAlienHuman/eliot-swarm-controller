@@ -315,25 +315,19 @@ pub struct ConfigureSupport {
 
 impl ConfigureSupport {
     /// Codex carries model and effort per turn; Muse carries effort per
-    /// turn but a model change needs a new native session; OpenCode sets the
-    /// session model natively but has no effort knob; Antigravity sets
-    /// `model` and `thought_level` natively. Anything else has no verified
-    /// mechanism.
+    /// turn but a model change needs a new native session; OpenCode sets
+    /// the session model and its `Model.Ref.variant` natively;
+    /// Antigravity sets `model` and `thought_level` natively. Anything
+    /// else has no verified mechanism.
     pub fn for_harness(harness: &str) -> Self {
         let refuse = |reason: &str| Some(reason.to_owned());
         match harness {
-            "codex" | "antigravity" => Self::default(),
+            "codex" | "antigravity" | "opencode" => Self::default(),
             "muse" => Self {
                 model_refusal: refuse(
                     "Muse model changes require a new native session (restart_required)",
                 ),
                 effort_refusal: None,
-            },
-            "opencode" => Self {
-                model_refusal: None,
-                effort_refusal: refuse(
-                    "configure --effort is not supported for the opencode harness: no native effort knob",
-                ),
             },
             other => {
                 let reason = format!("configure is not supported for the {other} harness");
@@ -858,12 +852,7 @@ mod tests {
         assert!(muse.effort_refusal.is_none());
         let opencode = ConfigureSupport::for_harness("opencode");
         assert!(opencode.model_refusal.is_none());
-        assert!(
-            opencode
-                .effort_refusal
-                .unwrap()
-                .contains("no native effort knob")
-        );
+        assert!(opencode.effort_refusal.is_none());
         let claude = ConfigureSupport::for_harness("claude");
         assert!(claude.model_refusal.is_some() && claude.effort_refusal.is_some());
     }

@@ -13615,30 +13615,17 @@ fn configure_gates_harness_generation_state_and_principal() {
         "unsupported",
         "adapters without a verified mechanism refuse configure"
     );
-    // OpenCode effort stays unsupported: the native API has no effort knob.
-    let opencode_effort = store
-        .submit(
-            "owner",
-            configure_request(&opencode, 1, json!({"effort": "high"})),
-            now + 13,
-        )
-        .unwrap_err();
-    assert_eq!(opencode_effort.code, "unsupported");
-    assert!(
-        opencode_effort.message.contains("no native effort knob"),
-        "OpenCode effort refusal names the missing knob: {}",
-        opencode_effort.message
-    );
-    // OpenCode model and Antigravity model/effort ride their proven native
-    // setters, so admission accepts them; the overlay itself is stored by
-    // the Router only after native proof.
+    // OpenCode model and effort (a native model variant) and Antigravity
+    // model/effort ride their proven native setters, so admission accepts
+    // them; the overlay itself is stored by the Router only after native
+    // proof.
     store
         .submit(
             "owner",
-            configure_request(&opencode, 1, json!({"model": "p/m1"})),
+            configure_request(&opencode, 1, json!({"model": "p/m1", "effort": "high"})),
             now + 14,
         )
-        .expect("admit OpenCode model configure");
+        .expect("admit OpenCode model and effort configure");
     store
         .submit(
             "owner",

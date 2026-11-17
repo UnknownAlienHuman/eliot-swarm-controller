@@ -2874,15 +2874,28 @@ fn opencode_snapshot_from_entry(
             "profile_error",
         ));
     }
+    // A frozen effort selects the installed `Model.Variant` id on launch
+    // (`Model.Ref.variant`); the live native catalogue proves membership.
+    let effort = entry.effort.as_deref().map(str::trim);
+    if effort.is_some_and(|value| {
+        value.is_empty() || value.len() > MAX_EFFORT_LEN || value.chars().any(char::is_control)
+    }) {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "effort",
+            "must be non-empty, at most 128 characters and contain no controls",
+            "profile_error",
+        ));
+    }
     for field in [
-        "effort",
         "approval",
         "collaboration_mode",
         "permissions",
         "approval_policy",
     ] {
         let present = match field {
-            "effort" => entry.effort.as_deref(),
             "approval" => entry.approval.as_deref(),
             "collaboration_mode" => entry.collaboration_mode.as_deref(),
             "permissions" => entry.permissions.as_deref(),
@@ -2931,6 +2944,9 @@ fn opencode_snapshot_from_entry(
     snapshot.insert("harness".to_owned(), Value::String("opencode".to_owned()));
     if let Some(model) = model {
         snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
+    if let Some(effort) = effort {
+        snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
     }
     if has_local_backend_fields(entry) {
         if model.is_none() {
@@ -5463,9 +5479,21 @@ pass_env = ["OPENAI_API_KEY"]
             let error = resolve_text_profile(&source, "oc").expect_err("must reject");
             assert_eq!(error.code, "profile_error", "{source}");
         }
+        // A frozen effort selects the installed variant id on launch.
+        let source = format!("{source}effort = \"high\"\n");
+        let snapshot = resolve_text_profile(&source, "oc").unwrap();
+        assert_eq!(snapshot["effort"], "high");
+        let long = "x".repeat(129);
+        for effort in [String::new(), "   ".to_owned(), long] {
+            let source = format!(
+                "[profiles.oc]\nharness='opencode'\nmodel='opencode/big-pickle'\ncmd='C:/Tools/opencode.exe'\neffort={}\n",
+                serde_json::to_string(&effort).unwrap()
+            );
+            let error = resolve_text_profile(&source, "oc").expect_err("must reject");
+            assert_eq!(error.code, "profile_error", "{source}");
+        }
         // Unconnected presets stay rejected, never silently frozen.
         for field in [
-            "effort='high'",
             "approval='allowAll'",
             "collaboration_mode='plan'",
             "permissions='read-only'",

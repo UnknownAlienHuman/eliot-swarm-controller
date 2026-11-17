@@ -149,7 +149,10 @@ pub(crate) fn claude_documented_models() -> Vec<core::api::HarnessModelEntry> {
 }
 
 fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
-    if !matches!(harness, "codex" | "muse" | "claude") {
+    // OpenCode efforts are the installed per-model `Model.Variant` ids
+    // (the TUI "Variant" switch), so any well-formed value freezes and the
+    // live native catalogue proves membership at launch.
+    if !matches!(harness, "codex" | "muse" | "claude" | "opencode") {
         return Err(core::Error::new(
             "unsupported",
             format!("the {harness} slice has no reasoning-effort mapping"),
@@ -562,6 +565,12 @@ pub(crate) fn adhoc_snapshot(
             snapshot.insert("cmd".to_owned(), Value::String(validated));
             if let Some(model) = model {
                 snapshot.insert("model".to_owned(), Value::String(model));
+            }
+            // The frozen effort selects the installed variant id on launch
+            // (`Model.Ref.variant`); the plugin gates it against the live
+            // native catalogue before the session exists.
+            if let Some(effort) = effort {
+                snapshot.insert("effort".to_owned(), Value::String(effort));
             }
             if let Some(selector) = selector {
                 snapshot.insert("auth_integration".to_owned(), Value::String(selector));
@@ -1552,18 +1561,35 @@ mod tests {
 
     #[test]
     fn adhoc_snapshot_rejects_broader_effort_mappings() {
-        for harness in ["opencode", "antigravity"] {
-            let error = adhoc_snapshot(
-                harness,
-                Some("model"),
-                Some("medium"),
-                Some(r"C:\bin\native.exe".to_owned()),
-                AdhocAuth::Resolve(None),
-                None,
-            )
-            .unwrap_err();
-            assert_eq!(error.code, "unsupported", "{harness}");
-        }
+        let error = adhoc_snapshot(
+            "antigravity",
+            Some("model"),
+            Some("medium"),
+            Some(r"C:\bin\native.exe".to_owned()),
+            AdhocAuth::Resolve(None),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "unsupported");
+    }
+
+    #[test]
+    fn adhoc_opencode_freezes_effort_for_the_native_variant() {
+        let snapshot = adhoc_snapshot(
+            "opencode",
+            Some("opencode/deepseek-v4.1-flash-free"),
+            Some("low"),
+            Some(r"C:\bin\opencode.exe".to_owned()),
+            AdhocAuth::Resolve(Some("opencode-go")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(snapshot["effort"], json!("low"));
+        assert_eq!(
+            snapshot["model"],
+            json!("opencode/deepseek-v4.1-flash-free")
+        );
+        assert_eq!(snapshot["auth_integration"], json!("opencode-go"));
     }
 
     #[test]
