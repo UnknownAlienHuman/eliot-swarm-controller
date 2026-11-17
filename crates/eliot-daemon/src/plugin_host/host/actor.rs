@@ -24,6 +24,7 @@ use eliot_core::{AgentStartParams, Error, Result};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use std::sync::Arc;
+#[cfg(windows)]
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout_at};
