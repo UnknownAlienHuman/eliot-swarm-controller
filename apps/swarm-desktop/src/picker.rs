@@ -1376,6 +1376,24 @@ mod tests {
     }
 
     #[test]
+    fn a_catalogue_row_without_an_effort_launches_none() {
+        // Antigravity reports no efforts: the row shows "Default" and its
+        // choice sends no effort on the wire.
+        let rows = build("", &Choice::Auto, &HashMap::new());
+        let agy = find(&rows, Some("antigravity:gemini-4-hydrogen-high")).unwrap();
+        assert!(agy.efforts.is_empty());
+        assert_eq!(agy.effort, None);
+        assert_eq!(
+            agy.choice(),
+            Choice::Model(Pick {
+                harness: "antigravity".to_owned(),
+                model: Some("gemini-4-hydrogen-high".to_owned()),
+                effort: None,
+            })
+        );
+    }
+
+    #[test]
     fn efforts_are_short_on_screen_and_full_for_screen_readers() {
         let shown: Vec<&str> = ["low", "medium", "high", "xhigh", "max", "ultra"]
             .into_iter()

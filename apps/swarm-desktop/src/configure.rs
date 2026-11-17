@@ -17,7 +17,7 @@ use eliot_core::api::{
 };
 use serde_json::Value;
 
-use crate::picker::effort_label;
+use crate::picker::{effort_label, effort_name};
 
 /// Settings facts of one Agent generation, read from `agent.get`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -113,8 +113,19 @@ impl Settings {
     /// harness reports, plain once the harness admitted it (its launch
     /// readback or a turn that carried it) and "Requested" until then (a
     /// request is not proof); a change for the next turn when one was asked
-    /// for. Rows with nothing to say are left out.
+    /// for. Rows with nothing to say are left out. Efforts read short
+    /// (`med`), as everywhere in the desktop.
     pub fn lines(&self) -> Vec<String> {
+        self.lines_with(|effort| effort_label(effort).to_owned())
+    }
+
+    /// [`Self::lines`] with efforts in full words ("medium"): what a screen
+    /// reader says for them.
+    pub fn spoken_lines(&self) -> Vec<String> {
+        self.lines_with(effort_name)
+    }
+
+    fn lines_with(&self, words: impl Fn(&str) -> String) -> Vec<String> {
         let mut lines = Vec::new();
         let said = |what: &str, value: &str, verified: bool| {
             if verified {
@@ -127,13 +138,13 @@ impl Settings {
             (Some(model), effort) => {
                 lines.push(said("Model", model, self.model_verified));
                 if let Some(effort) = effort {
-                    lines.push(said("Effort", effort_label(effort), self.effort_verified));
+                    lines.push(said("Effort", &words(effort), self.effort_verified));
                 }
             }
             _ => match (&self.profile_model, &self.profile_effort) {
                 (Some(model), Some(effort)) => lines.push(format!(
                     "Requested model {model} · {} effort",
-                    effort_label(effort)
+                    words(effort)
                 )),
                 (Some(model), None) => lines.push(format!("Requested model {model}")),
                 _ => lines.push("Default model".to_owned()),
@@ -144,7 +155,7 @@ impl Settings {
             let effort = config
                 .effort
                 .as_deref()
-                .map_or("the same effort", effort_label);
+                .map_or_else(|| "the same effort".to_owned(), &words);
             lines.push(format!("Next turn: {model} · {effort}"));
         }
         lines
@@ -374,8 +385,14 @@ mod tests {
         settings.effort_verified = true;
         let lines = settings.lines();
         assert_eq!(lines[1], "Effort xhigh");
-        // Details use the desktop's short effort words.
+        // Details use the desktop's short effort words; screen readers
+        // hear the full ones.
         assert_eq!(running("m1", "medium").lines()[1], "Requested effort med");
+        assert_eq!(
+            running("m1", "medium").spoken_lines()[1],
+            "Requested effort medium"
+        );
+        assert_eq!(settings.spoken_lines()[1], "Effort extra high");
         assert_eq!(lines[0], "Requested model m1");
         settings.model_verified = true;
         assert_eq!(settings.lines()[0], "Model m1");

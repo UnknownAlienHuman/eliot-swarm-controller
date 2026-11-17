@@ -14,6 +14,9 @@ use crate::theme::winui::Palette;
 
 /// The picker's key hints (OpenCode's footer).
 const PICKER_HINTS: &str = "↑↓ move   ←→ effort   Enter choose   Ctrl+F favorite   Esc close";
+/// What a model row with no explicit effort launches: the harness's own
+/// default (its accessible name; the chip reads "Default").
+const DEFAULT_EFFORT: &str = "Default effort";
 /// Models a Manage models group lists before it asks for a search.
 const MANAGE_GROUP_ROWS: usize = 150;
 /// The conversation rows a popover overlays: the transcript, pending
@@ -359,8 +362,14 @@ impl DesktopApp {
                 name.push_str(label);
             }
         }
-        // Screen readers hear the effort in full words ("medium").
-        let effort_words = item.effort.as_deref().map(picker::effort_name);
+        // Screen readers hear the effort in full words ("medium"); a model
+        // row without one launches the harness's default effort.
+        let model_row = matches!(item.kind, ItemKind::Model { .. });
+        let effort_words = match item.effort.as_deref() {
+            Some(effort) => Some(picker::effort_name(effort)),
+            None if model_row => Some(DEFAULT_EFFORT.to_lowercase()),
+            None => None,
+        };
         for value in [
             &item.detail[..],
             effort_words.as_deref().unwrap_or(""),
@@ -447,7 +456,10 @@ impl DesktopApp {
                                 .on_click(context.message(Message::Launch(
                                     LaunchMsg::PickerEffort(item.key.clone(), effort.clone()),
                                 )))
-                                .content(chip_text(picker::effort_label(effort))),
+                                .content(chip_text(
+                                    picker::effort_label(effort),
+                                    &picker::effort_name(effort),
+                                )),
                         )
                     })
                     .collect();
@@ -461,13 +473,18 @@ impl DesktopApp {
                         .orientation(Orientation::Horizontal)
                         .keyed_children(segments),
                 )
-        } else if let Some(effort) = item.effort.as_deref() {
+        } else if let Some((label, name)) = match item.effort.as_deref() {
+            Some(effort) => Some((picker::effort_label(effort), picker::effort_name(effort))),
+            // Display only: the row's choice still carries no effort.
+            None if model_row => Some(("Default", DEFAULT_EFFORT.to_owned())),
+            None => None,
+        } {
             Border::new()
                 .height(tokens::height::CHIP)
                 .corner_radius(tokens::radius::CONTROL)
                 .background(palette.well())
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(chip_text(picker::effort_label(effort)).opacity(theme::MUTED_OPACITY))
+                .content(chip_text(label, &name).opacity(theme::MUTED_OPACITY))
         } else {
             View::empty()
         };
@@ -952,9 +969,10 @@ fn chip_content(glyph: &str, label: &str, max_width: Option<f64>) -> View {
 }
 
 /// The label of a picker row's effort chip or segment: the short effort in
-/// the secondary type, inset from the chip's edges.
-fn chip_text(label: &str) -> TextBlock {
+/// the secondary type, inset from the chip's edges, named in full words.
+fn chip_text(label: &str, name: &str) -> TextBlock {
     m3::text(label.to_owned(), tokens::text::SECONDARY)
+        .automation_name(name.to_owned())
         .margin(Thickness::xy(tokens::spacing::SM, 0.0))
         .vertical_alignment(VerticalAlignment::Center)
 }

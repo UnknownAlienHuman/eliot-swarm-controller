@@ -289,8 +289,20 @@ fn chart_card(
 
 /// The Agent's identity and settings from the monitor's detail read (when
 /// its conversation is not the open one), in words; rows with nothing to
-/// say are left out.
+/// say are left out. The effort reads short (`med`).
 pub fn identity_lines(read: &DetailRead) -> Vec<String> {
+    identity_lines_with(read, |effort| {
+        crate::picker::effort_label(effort).to_owned()
+    })
+}
+
+/// [`identity_lines`] with the effort in full words ("medium"): what a
+/// screen reader says for it.
+pub fn identity_spoken_lines(read: &DetailRead) -> Vec<String> {
+    identity_lines_with(read, crate::picker::effort_name)
+}
+
+fn identity_lines_with(read: &DetailRead, words: impl Fn(&str) -> String) -> Vec<String> {
     let agent = &read.agent.agent;
     let effective = agent.effective.as_ref();
     let field = |name: &str| {
@@ -302,10 +314,7 @@ pub fn identity_lines(read: &DetailRead) -> Vec<String> {
     let harness = crate::picker::harness_label(&agent.harness).to_owned();
     let mut lines = vec![format!("{harness} · {}", state_words(agent.state))];
     match (field("model"), field("effort")) {
-        (Some(model), Some(effort)) => lines.push(format!(
-            "{model} · {} effort",
-            crate::picker::effort_label(&effort)
-        )),
+        (Some(model), Some(effort)) => lines.push(format!("{model} · {} effort", words(&effort))),
         (Some(model), None) => lines.push(model),
         _ => lines.push(format!("Model not reported by {harness} yet")),
     }

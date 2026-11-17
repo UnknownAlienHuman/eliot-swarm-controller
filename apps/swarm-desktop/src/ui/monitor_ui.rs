@@ -511,8 +511,11 @@ impl DesktopApp {
         let data = &self.monitor.data;
 
         // The Agent: identity and settings (from the open conversation's
-        // detail when it is this Agent, else the monitor's read).
+        // detail when it is this Agent, else the monitor's read). Effort
+        // words read short; `spoken` holds the same settings lines in full
+        // words and where they start, for the section's accessible name.
         let mut agent_lines: Vec<String> = Vec::new();
+        let mut spoken: Option<(usize, Vec<String>)> = None;
         let detail = self
             .chat
             .detail
@@ -562,6 +565,7 @@ impl DesktopApp {
             (Some(detail), _) => {
                 let harness = crate::picker::harness_label(&detail.harness);
                 agent_lines.push(format!("{harness} · {}", state_label(detail.state)));
+                spoken = Some((agent_lines.len(), detail.settings.spoken_lines()));
                 agent_lines.extend(detail.settings.lines());
                 agent_lines.push(format!(
                     "Access: {}",
@@ -583,6 +587,7 @@ impl DesktopApp {
                 }
             }
             (None, Some(read)) => {
+                spoken = Some((agent_lines.len(), monitor_view::identity_spoken_lines(read)));
                 agent_lines.extend(monitor_view::identity_lines(read));
                 let settings = configure::Settings::from_reply(&read.agent);
                 agent_lines.push(format!(
@@ -602,9 +607,15 @@ impl DesktopApp {
         if !self.configure.status.is_empty() && detail.is_some() {
             technical.push(format!("Last configure: {}", self.configure.status));
         }
+        let mut agent_spoken = agent_lines.clone();
+        if let Some((at, words)) = spoken {
+            for (line, said) in agent_spoken.iter_mut().skip(at).zip(words) {
+                *line = said;
+            }
+        }
         sections.push(KeyedView::new(
             "agent",
-            section(palette, "Summary", &agent_lines),
+            spoken_section(palette, "Summary", &agent_lines, &agent_spoken),
         ));
 
         // The failure diagnosis summary: why and where the Agent last
@@ -765,12 +776,23 @@ fn state_label(state: eliot_core::AgentState) -> &'static str {
 /// A details section: a container-corner card, its title and its lines
 /// in body text.
 fn section(palette: Palette, title: &str, lines: &[String]) -> View {
+    spoken_section(palette, title, lines, lines)
+}
+
+/// [`section`] whose lines a screen reader hears as `spoken` (the efforts
+/// in full words where the text shows them short).
+fn spoken_section(palette: Palette, title: &str, lines: &[String], spoken: &[String]) -> View {
+    let body = m3::body(lines.join("\n"))
+        .text_wrapping(TextWrapping::Wrap)
+        .is_text_selection_enabled(true);
+    let body = if spoken == lines {
+        body
+    } else {
+        body.automation_name(spoken.join("\n"))
+    };
     m3::card_high(palette).content(
-        StackPanel::new().spacing(tokens::spacing::SM).children((
-            m3::section_title(title),
-            m3::body(lines.join("\n"))
-                .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true),
-        )),
+        StackPanel::new()
+            .spacing(tokens::spacing::SM)
+            .children((m3::section_title(title), body)),
     )
 }
