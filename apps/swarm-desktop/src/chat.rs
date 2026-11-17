@@ -114,6 +114,10 @@ struct ToolRow {
     tool: String,
     status: Option<String>,
     done: bool,
+    started_ms: Option<i64>,
+    completed_ms: Option<i64>,
+    paths: Vec<String>,
+    paths_truncated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -181,7 +185,16 @@ impl TurnEntry {
             .iter()
             .map(|entry| match entry {
                 Activity::Message { text, .. } => text.len(),
-                Activity::Tools { rows, .. } => rows.len() * 64,
+                Activity::Tools { rows, .. } => rows
+                    .iter()
+                    .map(|row| {
+                        row.item_id.len()
+                            + row.tool.len()
+                            + row.status.as_ref().map_or(0, String::len)
+                            + row.paths.iter().map(String::len).sum::<usize>()
+                            + 32
+                    })
+                    .sum(),
             })
             .sum();
         activity
@@ -189,7 +202,41 @@ impl TurnEntry {
             + self.event_final.as_ref().map_or(0, String::len)
     }
 
-    fn tool_event(&mut self, item_id: &str, tool: &str, status: Option<String>, done: bool) {
+    fn tool_event(
+        &mut self,
+        item_id: &str,
+        tool: &str,
+        status: Option<String>,
+        done: bool,
+        event: &Event,
+    ) {
+        // Only semantic metadata already retained by the adapter; never raw vendor frames.
+        let paths: Vec<String> = event
+            .data
+            .get("changed_paths")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .take(20)
+            .map(|path| path.chars().take(1_024).collect())
+            .collect();
+        let paths_truncated = event
+            .data
+            .get("changed_paths_truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || event
+                .data
+                .get("changed_paths")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|paths| {
+                    paths.len() > 20
+                        || paths
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .any(|path| path.chars().count() > 1_024)
+                });
         let failed_now = done && status.as_deref().is_some_and(|status| !is_success(status));
         if let Some(&group) = self.item_groups.get(item_id)
             && let Some(Activity::Tools {
@@ -203,9 +250,14 @@ impl TurnEntry {
                 Some(row) => {
                     if done && !row.done {
                         row.done = true;
+                        row.completed_ms = Some(event.ts);
                         *done_count += 1;
                         *failed += usize::from(failed_now);
                     }
+                    if !paths.is_empty() {
+                        row.paths = paths;
+                    }
+                    row.paths_truncated |= paths_truncated;
                     if status.is_some() || done {
                         // A completion without status must not keep "running".
                         row.status = status;
@@ -226,6 +278,10 @@ impl TurnEntry {
             tool: tool.to_owned(),
             status,
             done,
+            started_ms: (!done).then_some(event.ts),
+            completed_ms: done.then_some(event.ts),
+            paths,
+            paths_truncated,
         };
         if !matches!(self.activity.last(), Some(Activity::Tools { .. })) {
             self.activity.push(Activity::Tools {
@@ -618,7 +674,7 @@ impl Conversation {
                         .unwrap_or_else(|| format!("seq:{}", event.seq));
                     let tool = data_str(event, "tool").unwrap_or("tool");
                     let status = data_str(event, "status").map(str::to_owned);
-                    turn.tool_event(&item, tool, status, event.kind == "tool.completed");
+                    turn.tool_event(&item, tool, status, event.kind == "tool.completed", event);
                 }
                 _ => {}
             }
@@ -893,14 +949,14 @@ impl Conversation {
             if Some(index) == echoed {
                 continue;
             }
-            parts.push(match entry {
-                Activity::Message { key, text } => Part::new(
+            match entry {
+                Activity::Message { key, text } => parts.push(Part::new(
                     key.clone(),
                     PartKind::Progress,
                     "Assistant · progress".to_owned(),
                     text.clone(),
                     Vec::new(),
-                ),
+                )),
                 Activity::Tools {
                     key,
                     rows,
@@ -908,35 +964,65 @@ impl Conversation {
                     done,
                     failed,
                 } => {
-                    let summary = tools_summary(*total, *done, *failed);
-                    let mut detail: Vec<String> = Vec::new();
                     if *total > rows.len() {
-                        detail.push(format!(
-                            "… {} not listed",
-                            count(total - rows.len(), "earlier tool", "earlier tools")
+                        parts.push(Part::new(
+                            format!("{key}:omitted"),
+                            PartKind::Notice,
+                            "Tools".to_owned(),
+                            format!(
+                                "{} · {} earlier tools not listed",
+                                tools_summary(*total, *done, *failed),
+                                total - rows.len()
+                            ),
+                            Vec::new(),
                         ));
                     }
-                    detail.extend(rows.iter().map(|row| {
-                        let mark = match (row.done, row.status.as_deref()) {
-                            (false, _) => "…",
-                            (true, Some(status)) if !is_success(status) => "✕",
-                            (true, _) => "✓",
+                    for row in rows {
+                        let name = match row.tool.as_str() {
+                            "commandExecution" => "Run command",
+                            "fileChange" => "Edit files",
+                            other => other,
                         };
-                        match row.status.as_deref() {
-                            Some(status) => format!("{mark} {} ({status})", row.tool),
-                            None => format!("{mark} {}", row.tool),
+                        let status = match (row.done, row.status.as_deref()) {
+                            (false, _) => "Running",
+                            (true, Some(status)) if is_success(status) => "Completed",
+                            (true, Some(status)) => status,
+                            (true, None) => "Finished · result not reported",
+                        };
+                        let elapsed = row
+                            .started_ms
+                            .zip(row.completed_ms)
+                            .and_then(|(start, end)| end.checked_sub(start))
+                            .filter(|ms| *ms >= 0);
+                        let duration = elapsed.map_or_else(
+                            || "duration unavailable".to_owned(),
+                            |ms| format!("~{:.1} s", ms as f64 / 1_000.0),
+                        );
+                        let mut detail = row.paths.clone();
+                        if row.paths_truncated {
+                            detail.push(
+                                "More changed paths were not retained in this card.".to_owned(),
+                            );
                         }
-                    }));
-                    Part::new(
-                        key.clone(),
-                        PartKind::Tools,
-                        "Tools".to_owned(),
-                        summary,
-                        detail,
-                    )
+                        detail.push("Tool output was not retained by the app.".to_owned());
+                        if elapsed.is_some() {
+                            detail.push(
+                                "Duration is measured between the recorded start and finish."
+                                    .to_owned(),
+                            );
+                        }
+                        parts.push(Part::new(
+                            format!("tools:{}", row.item_id),
+                            PartKind::Tools,
+                            "Tool".to_owned(),
+                            format!("{name} · {status} · {duration}"),
+                            detail,
+                        ));
+                    }
                 }
-            });
+            }
         }
+
         if turn.messages_dropped > 0 {
             parts.push(Part::new(
                 format!("dropped:{}", turn.turn_id),
@@ -1052,6 +1138,88 @@ fn tools_summary(total: usize, done: usize, failed: usize) -> String {
         parts.push(format!("{failed} failed"));
     }
     parts.join(" · ")
+}
+
+/// Bounded file references in prose, Markdown destinations, code and tool details.
+/// Resolution and existence checks belong to the click's native I/O boundary.
+pub fn file_references(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    // Only paired backticks/double quotes preserve spaces. Apostrophes in
+    // prose never turn a sentence into a path candidate.
+    let mut quoted = Vec::new();
+    let mut prose = text.to_owned();
+    for delimiter in ['`', '"'] {
+        let mut marks = text.match_indices(delimiter);
+        while let (Some((start, _)), Some((end, _))) = (marks.next(), marks.next()) {
+            let span = &text[start + 1..end];
+            if span.contains(' ') && span.contains(['/', '\\']) {
+                quoted.push(span);
+                // Do not also offer broken pieces of a quoted path with spaces.
+                prose.replace_range(start..end + 1, &" ".repeat(end + 1 - start));
+                if quoted.len() == 24 {
+                    break;
+                }
+            }
+        }
+        if quoted.len() == 24 {
+            break;
+        }
+    }
+    let words = prose.split(|c: char| {
+        c.is_whitespace() || matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>')
+    });
+    for token in quoted.into_iter().chain(words) {
+        let token = token.trim_matches(|c: char| matches!(c, ',' | ';' | '!' | '?' | '*'));
+        let path = token.split('#').next().unwrap_or(token);
+        let mut path = path;
+        while let Some((head, tail)) = path.rsplit_once(':') {
+            if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+                path = head;
+            } else {
+                break;
+            }
+        }
+        let path = path.trim_end_matches(['.', ':']);
+        if path.len() > 2_048
+            || path.contains("://")
+            || path.starts_with(['-', '/', '\\'])
+            || path.contains(['=', '|'])
+        {
+            continue;
+        }
+        let extension = path.rsplit('.').next().unwrap_or_default();
+        let file = path.contains('.')
+            && !extension.is_empty()
+            && extension.len() <= 12
+            && extension.chars().all(char::is_alphanumeric)
+            && extension.chars().any(char::is_alphabetic)
+            && (path.contains(['/', '\\'])
+                || matches!(
+                    extension,
+                    "rs" | "md"
+                        | "toml"
+                        | "txt"
+                        | "json"
+                        | "jsonl"
+                        | "py"
+                        | "ps1"
+                        | "js"
+                        | "ts"
+                        | "tsx"
+                        | "yaml"
+                        | "yml"
+                        | "csv"
+                        | "log"
+                        | "sql"
+                ));
+        if file && path != ".." && !paths.iter().any(|p| p == path) {
+            paths.push(path.to_owned());
+            if paths.len() == 24 {
+                break;
+            }
+        }
+    }
+    paths
 }
 
 #[cfg(test)]
@@ -1485,7 +1653,8 @@ mod tests {
             ),
         ]);
         let tools = &chat.items()[0].parts[1];
-        assert_eq!(tools.detail, vec!["✓ exec".to_owned()]);
+        assert!(tools.text.contains("Finished · result not reported"));
+        assert!(!tools.text.contains("Running"));
     }
 
     #[test]
@@ -1508,10 +1677,41 @@ mod tests {
         }
         chat.apply_events(&events);
         let tools = &chat.items()[0].parts[1];
-        assert_eq!(tools.kind, PartKind::Tools);
-        assert_eq!(tools.text, format!("Ran {} tools", MAX_TOOL_ROWS + 10));
+        assert_eq!(tools.kind, PartKind::Notice);
+        assert_eq!(
+            chat.items()[0]
+                .parts
+                .iter()
+                .filter(|part| part.kind == PartKind::Tools)
+                .count(),
+            MAX_TOOL_ROWS
+        );
+        assert!(tools.text.contains("earlier tools not listed"));
         assert_eq!(tools_summary(1, 1, 0), "Ran 1 tool");
         assert_eq!(tools_summary(3, 2, 1), "3 tools · 1 running · 1 failed");
         assert_eq!(tools_summary(2, 2, 2), "2 tools · 2 failed");
+    }
+}
+
+#[cfg(test)]
+mod file_reference_tests {
+    use super::file_references;
+    #[test]
+    fn prose_and_markdown_paths_are_bounded_and_web_uris_stay_out() {
+        let refs = file_references(
+            r#"Read `docs/vision.md:55`, [code](apps/main.rs#L12), and "C:\My Project\note.txt:1:2". https://example.com/a.rs javascript:alert(1) 1.2.3"#,
+        );
+        assert!(refs.contains(&"docs/vision.md".to_owned()));
+        assert!(refs.contains(&"apps/main.rs".to_owned()));
+        assert!(refs.contains(&r"C:\My Project\note.txt".to_owned()));
+        assert!(
+            !refs
+                .iter()
+                .any(|path| path.contains("https:") || path == "1.2.3")
+        );
+        let many = (0..100)
+            .map(|n| format!("src/f{n}.rs "))
+            .collect::<String>();
+        assert_eq!(file_references(&many).len(), 24);
     }
 }

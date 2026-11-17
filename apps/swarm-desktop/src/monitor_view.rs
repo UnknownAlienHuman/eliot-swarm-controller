@@ -322,7 +322,7 @@ pub fn identity_lines(read: &DetailRead) -> Vec<String> {
         1 => lines.push("1 request waits for you".to_owned()),
         many => lines.push(format!("{many} requests wait for you")),
     }
-    lines.push(format!("ID {}", agent.id));
+
     lines
 }
 
@@ -399,7 +399,24 @@ pub fn usage_lines(read: &DetailRead) -> Vec<String> {
                 lines.push("Older history is not counted.".to_owned());
             }
             for cost in &usage.sessions.cost_by_unit {
-                lines.push(format!("Cost: {} {}", cost.total_amount, cost.unit));
+                let amount = cost.total_amount;
+                let label = if matches!(cost.unit.as_str(), "usd" | "usd_estimate" | "USD") {
+                    if amount > 0.0 && amount < 0.01 {
+                        "<$0.01".to_owned()
+                    } else {
+                        format!("${amount:.2}")
+                    }
+                } else {
+                    format!("{amount:.2} {}", cost.unit)
+                };
+                lines.push(format!(
+                    "Cost: {label}{}",
+                    if cost.unit.ends_with("_estimate") {
+                        " (estimated)"
+                    } else {
+                        ""
+                    }
+                ));
             }
         }
         Err(_) => lines.push("Usage not reported for this Agent.".to_owned()),

@@ -23,6 +23,8 @@ pub(super) enum MonitorMsg {
     StoppedToggled,
     /// Show only the Needs attention section, or everything again.
     AttentionToggled,
+    TechnicalToggled,
+    PanelChosen(Panel),
 }
 
 /// The panel's refresh chain and the Agent whose details it reads.
@@ -40,6 +42,7 @@ pub(super) struct MonitorState {
     pub(super) stopped_open: bool,
     /// Only the Needs attention section is listed.
     pub(super) attention_only: bool,
+    pub(super) technical_open: bool,
 }
 
 impl DesktopApp {
@@ -106,6 +109,15 @@ impl DesktopApp {
                 }
             }
             MonitorMsg::StoppedToggled => self.monitor.stopped_open = !self.monitor.stopped_open,
+            MonitorMsg::TechnicalToggled => {
+                self.monitor.technical_open = !self.monitor.technical_open
+            }
+            MonitorMsg::PanelChosen(panel) => {
+                if let Some(agent) = self.selected_agent_id() {
+                    self.show_details(&agent, context);
+                }
+                self.panel = panel;
+            }
             MonitorMsg::AttentionToggled => {
                 self.monitor.attention_only = !self.monitor.attention_only;
             }
@@ -117,6 +129,7 @@ impl DesktopApp {
         let changed = self.monitor.selected.as_deref() != Some(agent);
         if changed {
             self.monitor.selected = Some(agent.to_owned());
+            self.monitor.technical_open = false;
         }
         let was_closed = self.panel == Panel::Closed;
         self.panel = Panel::Details;
@@ -177,7 +190,12 @@ impl DesktopApp {
     }
 
     /// The panel's header: its title and the one close button.
-    fn panel_header(&self, title: &str, context: &mut ViewContext<Self>, palette: Palette) -> View {
+    fn panel_header(
+        &self,
+        _title: &str,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
         Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
             .margin(Thickness::new(
@@ -187,7 +205,30 @@ impl DesktopApp {
                 tokens::spacing::SM,
             ))
             .children((
-                m3::section_title(title).vertical_alignment(VerticalAlignment::Center),
+                m3::segmented(
+                    palette,
+                    [("Monitor", Panel::Monitor), ("Details", Panel::Details)]
+                        .into_iter()
+                        .map(|(label, panel)| {
+                            KeyedView::new(
+                                label,
+                                m3::segment(palette, self.panel == panel)
+                                    .is_enabled(
+                                        panel != Panel::Details
+                                            || self.monitor.selected.is_some()
+                                            || self.selected_agent_id().is_some(),
+                                    )
+                                    .automation_name(format!("Show {label}"))
+                                    .on_click(
+                                        context.message(Message::Monitor(MonitorMsg::PanelChosen(
+                                            panel,
+                                        ))),
+                                    )
+                                    .content(m3::segment_label(label)),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
                 m3::icon_button(palette)
                     .grid_column(1)
                     .automation_name("Close panel")
@@ -322,6 +363,21 @@ impl DesktopApp {
             ));
         }
         let tree = data.tree(now);
+        let focused = self
+            .selected_agent_id()
+            .or_else(|| self.monitor.selected.clone());
+        if let Some(row) = focused.as_deref().and_then(|id| data.row(id)) {
+            let mut focused = Vec::new();
+            self.monitor_cards(row, 0, &tree, context, palette, &mut focused);
+            cards.push(KeyedView::new(
+                "current-task",
+                StackPanel::new().spacing(tokens::spacing::SM).children((
+                    m3::section_title("Current task"),
+                    StackPanel::new().keyed_children(focused),
+                    m3::divider(palette),
+                )),
+            ));
+        }
         let sections = tree.sections();
         let attention_count = sections
             .iter()
@@ -437,6 +493,7 @@ impl DesktopApp {
             return View::empty();
         };
         let mut sections: Vec<KeyedView> = Vec::new();
+        let mut technical = vec![format!("ID {id}")];
         let read = self
             .monitor
             .data
@@ -473,17 +530,26 @@ impl DesktopApp {
                 if detail.active_turn.is_some() {
                     agent_lines.push("Working on a turn".to_owned());
                 }
-                agent_lines.push(format!("ID {id}"));
+                if read.is_none() {
+                    technical.push(format!("Generation {}", detail.generation));
+                }
             }
-            (None, Some(read)) => agent_lines.extend(monitor_view::identity_lines(read)),
+            (None, Some(read)) => {
+                agent_lines.extend(monitor_view::identity_lines(read));
+                let settings = configure::Settings::from_reply(&read.agent);
+                agent_lines.push(format!(
+                    "Access: {}",
+                    launch_ui::agent_access_label(&settings)
+                ));
+            }
             (None, None) => agent_lines.push("Reading…".to_owned()),
         }
         if !self.configure.status.is_empty() && detail.is_some() {
-            agent_lines.push(format!("Last configure: {}", self.configure.status));
+            technical.push(format!("Last configure: {}", self.configure.status));
         }
         sections.push(KeyedView::new(
             "agent",
-            section(palette, "Agent", &agent_lines),
+            section(palette, "Summary", &agent_lines),
         ));
 
         // The failure diagnosis summary: why and where the Agent last
@@ -522,10 +588,7 @@ impl DesktopApp {
                 }
                 None => vec![format!("You started it on the preset {profile}.")],
             };
-            sections.push(KeyedView::new(
-                "routing",
-                section(palette, "Profile choice", &lines),
-            ));
+            technical.extend(lines);
         }
 
         // The conversation's retained coverage and the feed.
@@ -540,10 +603,7 @@ impl DesktopApp {
                 lines.push(format!("Live updates: {}", self.chat.live.label()));
             }
             if !lines.is_empty() {
-                sections.push(KeyedView::new(
-                    "coverage",
-                    section(palette, "Conversation", &lines),
-                ));
+                technical.extend(lines);
             }
         }
 
@@ -552,7 +612,7 @@ impl DesktopApp {
             "resources",
             m3::card_high(palette).content(
                 StackPanel::new().spacing(tokens::spacing::SM).children((
-                    m3::section_title("Resources"),
+                    m3::section_title("Activity & resources"),
                     StackPanel::new()
                         .spacing(tokens::spacing::MD)
                         .keyed_children(resources),
@@ -566,13 +626,41 @@ impl DesktopApp {
         };
         sections.push(KeyedView::new("usage", section(palette, "Usage", &usage)));
 
-        let observe = read.map(monitor_view::observe_lines).unwrap_or_default();
-        if !observe.is_empty() {
-            sections.push(KeyedView::new(
-                "observe",
-                section(palette, "Heavy work", &observe),
-            ));
+        if let Some(read) = read {
+            technical.push(format!("Generation {}", read.agent.agent.generation));
+            technical.extend(monitor_view::observe_lines(read));
         }
+        let technical_body = if self.monitor.technical_open {
+            section(palette, "Session", &technical)
+        } else {
+            View::empty()
+        };
+        sections.push(KeyedView::new(
+            "technical",
+            StackPanel::new().spacing(tokens::spacing::XS).children((
+                m3::row(palette, false)
+                    .automation_name(format!(
+                        "Technical details ({})",
+                        if self.monitor.technical_open {
+                            "expanded"
+                        } else {
+                            "collapsed"
+                        }
+                    ))
+                    .on_click(context.message(Message::Monitor(MonitorMsg::TechnicalToggled)))
+                    .content(m3::row_content(
+                        Some(if self.monitor.technical_open {
+                            m3::glyph::CHEVRON_DOWN
+                        } else {
+                            m3::glyph::CHEVRON_RIGHT
+                        }),
+                        "Technical details",
+                        "",
+                        View::empty(),
+                    )),
+                technical_body,
+            )),
+        ));
 
         Grid::new()
             .rows([GridLength::Auto, GridLength::STAR])

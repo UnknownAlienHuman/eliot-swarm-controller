@@ -47,26 +47,12 @@ pub mod height {
     pub const TWO_LINE_ROW: f64 = 48.0;
 }
 
-/// The four type styles.
+/// Native aliases of the shared Material 3 type scale.
 pub mod text {
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct TypeStyle {
-        pub size: f64,
-        pub weight: u16,
-    }
-
-    const fn style(size: f64, weight: u16) -> TypeStyle {
-        TypeStyle { size, weight }
-    }
-
-    /// The Settings page title, the empty-state greeting.
-    pub const PAGE_TITLE: TypeStyle = style(20.0, 600);
-    /// Section, card, panel and conversation titles.
-    pub const SECTION_TITLE: TypeStyle = style(14.0, 600);
-    /// Body text, labels, messages and controls (WinUI's control text).
-    pub const BODY: TypeStyle = style(14.0, 400);
-    /// Secondary text: section labels, notes, supporting lines.
-    pub const SECONDARY: TypeStyle = style(12.0, 400);
+    pub use crate::theme::typography::{
+        BODY, LABEL as SECONDARY, TITLE_LARGE as PAGE_TITLE, TITLE_MEDIUM as SECTION_TITLE,
+        TypeStyle,
+    };
 }
 
 /// The 4/8 spacing grid in DIPs.
@@ -176,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn four_type_styles_with_secondary_below_body() {
+    fn title_body_and_label_have_distinct_sizes() {
         let styles = [
             text::PAGE_TITLE,
             text::SECTION_TITLE,
@@ -184,9 +170,8 @@ mod tests {
             text::SECONDARY,
         ];
         let sizes: Vec<f64> = styles.iter().map(|style| style.size).collect();
-        assert_eq!(sizes, [20.0, 14.0, 14.0, 12.0]);
-        // Labels are never larger than the values they name.
-        assert_eq!(text::BODY.size, text::SECTION_TITLE.size);
+        assert_eq!(sizes, [22.0, 16.0, 14.0, 12.0]);
+        const { assert!(text::SECTION_TITLE.size > text::BODY.size) };
         const { assert!(text::SECONDARY.size < text::BODY.size) };
     }
 

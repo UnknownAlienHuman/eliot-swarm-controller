@@ -56,7 +56,15 @@ impl DesktopApp {
         } else {
             View::empty()
         };
+        let workspace = self
+            .chat
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.workspace.clone())
+            .unwrap_or_default();
         let callbacks = RowCallbacks {
+            open_path: context.callback(|path| Message::Chat(ChatMsg::PathOpened(path))),
+            workspace,
             copy_part: context.callback(|value| Message::Chat(ChatMsg::CopyPart(value))),
             copy_code: context.callback(|(key, index): (String, usize)| {
                 Message::Chat(ChatMsg::CopyCode(key, index))
@@ -92,11 +100,18 @@ impl DesktopApp {
             .scheme()
             .map_or(0, |scheme| 1 + u64::from(scheme.dark));
         let width_code = column.map_or(0, |width| width.round() as u64);
+        // A toggle in an older virtualized turn must re-realize its card too.
+        let expansion_code = self
+            .chat
+            .expanded
+            .iter()
+            .fold(0, |code, key| code ^ crate::chat::text_hash(key));
         let source = VirtualSource::new(
             self.chat
                 .items_revision
                 .wrapping_mul(3)
                 .wrapping_add(palette_code)
+                .wrapping_add(expansion_code)
                 .wrapping_add(width_code.wrapping_mul(0x9E37_79B9)),
             earlier,
             move |index| keys[index].key.clone(),

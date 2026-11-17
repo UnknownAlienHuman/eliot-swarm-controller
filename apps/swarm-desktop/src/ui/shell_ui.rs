@@ -1269,19 +1269,26 @@ impl DesktopApp {
             .height(tokens::height::CONTROL)
             .grid_row(2)
             .margin(Thickness::new(pad, tokens::spacing::XS, pad, 0.0));
-        let new_task = m3::tonal_row(palette)
+        let new_task_active = self.main == Main::Conversation && self.chat.convo.is_none();
+        // WinUI's template caches its resource brushes: changing selection
+        // recreates this one row, as with the keyed task rows below.
+        let new_task = StackPanel::new()
             .grid_row(1)
             .margin(Thickness::new(pad, tokens::spacing::XS, pad, 0.0))
-            .automation_name("New task (Ctrl+N)")
-            .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
-            .content(m3::row_content(
-                Some(m3::glyph::NEW_TASK),
-                "New task",
-                "",
-                m3::secondary("Ctrl+N")
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .into(),
-            ));
+            .keyed_children(vec![KeyedView::new(
+                format!("new-task:{new_task_active}"),
+                m3::row(palette, new_task_active)
+                    .automation_name("New task (Ctrl+N)")
+                    .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
+                    .content(m3::row_content(
+                        Some(m3::glyph::NEW_TASK),
+                        "New task",
+                        "",
+                        m3::secondary("Ctrl+N")
+                            .vertical_alignment(VerticalAlignment::Center)
+                            .into(),
+                    )),
+            )]);
         // Then the two destinations, as in Antigravity's sidebar.
         let destination = |page: settings_ui::Page, glyph: &str, label: &str| {
             let shown = self.main == Main::Settings && self.settings_page == page;
