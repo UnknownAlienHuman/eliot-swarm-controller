@@ -1,6 +1,6 @@
 //! Read-only OpenCode model catalogue from the frozen native child.
 //!
-//! The plugin runs its frozen snapshot `cmd` with the exact argv `models`
+//! The plugin runs its frozen snapshot `cmd` with `models --standalone`
 //! (observed `opencode models`, opencode 2.2.7): no session, no turn and no
 //! inference. donor: `plugins/antigravity/src/native/models.rs`
 //! (`run_models`) for the bounded child pattern (exact argv, stdin null,
@@ -21,9 +21,9 @@ use tokio::{
     time::{Instant, timeout, timeout_at},
 };
 
-/// Exact argv for the catalogue child: `models`, nothing else.
-pub(crate) fn models_argv() -> [&'static str; 1] {
-    ["models"]
+/// Keep the private server under the reader Job, never the background service.
+pub(crate) fn models_argv() -> [&'static str; 2] {
+    ["models", "--standalone"]
 }
 
 /// Output cap for the catalogue read: the observed catalogue is tens of KiB
@@ -36,13 +36,13 @@ pub(crate) const MAX_MODELS: usize = 1024;
 /// Maximum model id bytes, mirroring `MAX_HARNESS_MODEL_ID_BYTES` in Core.
 pub(crate) const MAX_MODEL_ID_BYTES: usize = 256;
 
-/// Exact argv for the variant read: `api model.list`, nothing else. The
+/// Exact argv for the variant read: `api model.list --standalone`. The
 /// same read-only native surface as `models` (no server management, no
 /// session, no turn, no inference): it answers the installed `model.list`
-/// operation (`GET /api/model`) against the owner's background service, so
+/// operation (`GET /api/model`) against a private server, so
 /// it sees the same authenticated providers as `models`.
-pub(crate) fn model_list_argv() -> [&'static str; 2] {
-    ["api", "model.list"]
+pub(crate) fn model_list_argv() -> [&'static str; 3] {
+    ["api", "model.list", "--standalone"]
 }
 
 /// Output cap for the variant read: the observed inventory is ~320 KiB

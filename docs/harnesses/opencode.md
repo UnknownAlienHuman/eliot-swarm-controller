@@ -348,10 +348,13 @@ launch). `cmd` is discovered by following the npm shim to the native
 package-local paths under every roaming root including the
 `USERPROFILE`-derived default when `APPDATA` is stripped); `--cmd` pins one
 explicit install instead. `swarm models --harness opencode` lists the native
-`opencode models` catalogue (`provider/model` ids verbatim) with each
+`opencode models --standalone` catalogue (`provider/model` ids verbatim) with each
 model's installed `Model.Variant` ids overlaid as `efforts` from the
-read-only `opencode api model.list` operation (`model.list`, the same
-`GET /api/model` inventory the per-session path reads); a launch resolves
+read-only `opencode api model.list --standalone` operation (`model.list`, the same
+`GET /api/model` inventory the per-session path reads). Both use the installed
+2.2.7 private-server flag (CLI help checked 2026-11-17), so their server descendants
+stay in the daemon-owned reader Job rather than starting or using a shared service.
+A launch resolves
 the full provider/model pair, an omitted model leaves the configured native
 default, read back from the session echo. A stored profile may also carry
 `effort`, frozen the same way.
