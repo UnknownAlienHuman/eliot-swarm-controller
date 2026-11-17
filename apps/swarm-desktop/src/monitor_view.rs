@@ -7,8 +7,8 @@
 use windows_reactor::*;
 
 use crate::monitor::{
-    self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, bytes_label, cpu_time_label, state_words,
-    tokens_label,
+    self, DetailRead, GRAPH_BARS, Monitor, MonitorRow, bytes_label, cpu_time_label, group,
+    state_words, tokens_label,
 };
 use crate::theme;
 use crate::theme::winui::Palette;
@@ -405,19 +405,6 @@ pub fn usage_lines(read: &DetailRead) -> Vec<String> {
         Err(_) => lines.push("Usage not reported for this Agent.".to_owned()),
     }
     lines
-}
-
-/// `1234567` as `1,234,567`.
-pub fn group(value: i64) -> String {
-    let digits = value.abs().to_string();
-    let mut out = String::new();
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-    if value < 0 { format!("-{out}") } else { out }
 }
 
 /// The CPU and memory charts of `id`, with the sampling note.

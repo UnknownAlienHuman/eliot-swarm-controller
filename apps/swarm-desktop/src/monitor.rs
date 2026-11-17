@@ -399,6 +399,19 @@ pub struct MonitorRow {
     pub updated_at: i64,
 }
 
+/// `1234567` as `1,234,567`.
+pub fn group(value: i64) -> String {
+    let digits = value.abs().to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    if value < 0 { format!("-{out}") } else { out }
+}
+
 /// Fleet token label for one monitor row: the grouped count and, in
 /// words, what it covers ("1,234 tokens · last turn", "47,272 tokens ·
 /// whole session"), or an em dash when the summary carries no usage. The
@@ -407,7 +420,7 @@ pub fn tokens_label(row: &MonitorRow) -> String {
     match (row.tokens, row.tokens_scope.as_deref()) {
         (Some(tokens), Some(scope)) => format!(
             "{} tokens · {}",
-            crate::monitor_view::group(tokens),
+            group(tokens),
             if scope == "session" {
                 "whole session"
             } else {
