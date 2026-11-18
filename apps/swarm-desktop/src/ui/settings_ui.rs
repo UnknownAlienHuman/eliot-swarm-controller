@@ -988,8 +988,7 @@ impl DesktopApp {
                             // normalised; the drafts that sent them follow it.
                             self.settings.sent.extend(sent);
                             if page == Page::Models {
-                                self.editor.sent = sent_draft;
-                                self.editor.raw_dirty = false;
+                                self.editor.saved(sent_draft);
                             }
                         }
                         if page == Page::Automations

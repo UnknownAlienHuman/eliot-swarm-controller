@@ -48,6 +48,16 @@ pub(super) struct ProfilesEditor {
 }
 
 impl ProfilesEditor {
+    /// A Models save settled: remember the draft it wrote. The source
+    /// stays dirty when the draft moved on while the save ran, so a late
+    /// acknowledgement never clears a newer edit (#680).
+    pub(super) fn saved(&mut self, sent: Option<String>) {
+        self.sent = sent.clone();
+        if sent.as_ref() == Some(&self.draft) {
+            self.raw_dirty = false;
+        }
+    }
+
     /// Keep the selected preset when the draft still has it, else select
     /// the first one.
     pub(super) fn select_existing(&mut self) {
@@ -349,5 +359,30 @@ impl DesktopApp {
                 .collect(),
         };
         config_view::profiles_screen(data, actions, palette)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_save_ack_keeps_a_newer_source_draft_dirty() {
+        // #680: typing B while save A runs must survive A's
+        // acknowledgement; only an unchanged draft clears.
+        let mut editor = ProfilesEditor {
+            draft: "b".to_owned(),
+            base: String::new(),
+            raw_dirty: true,
+            sending: Some("a".to_owned()),
+            ..ProfilesEditor::default()
+        };
+        let sent = editor.sending.take();
+        editor.saved(sent);
+        assert_eq!(editor.sent.as_deref(), Some("a"));
+        assert!(editor.raw_dirty);
+        editor.draft = "a".to_owned();
+        editor.saved(Some("a".to_owned()));
+        assert!(!editor.raw_dirty);
     }
 }
