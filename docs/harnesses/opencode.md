@@ -199,82 +199,68 @@ L7 verifies two-session isolation when shared mode is selected, adopted-service 
 204-vs-execution, lost stream/input, snapshot races, pagination, exact controls and no
 historical lifecycle duplication. Unsupported API semantics remain explicit.
 
-## Adopted local backends
+## Typed local providers
 
-One documented OpenCode + adopted-backend profile points an owner-run local
-OpenAI-compatible endpoint at the existing isolated per-Agent root. Managed
-startup is deferred: only already-running adopted endpoints are supported,
-never an owned foreground `llama-server`/Strata launcher or a detached `lms`
-command under Agent custody. See [configuration](../spec/configuration.md)
-for the frozen profile shape.
+One documented OpenCode profile points an owner-run OpenAI-compatible endpoint
+at the existing isolated per-Agent root. Managed startup is deferred: only
+already-running endpoints are supported, never an owned foreground server
+launcher or a detached command under Agent custody. See
+[configuration](../spec/configuration.md) for the frozen profile shape.
 
-The frozen model must use the dedicated `eliot-local` provider segment
-(`eliot-local/<api-model-id>`), which has no canonical alias. Three frozen,
-explicit auth choices exist: the existing native `auth_integration` path for
-canonical integrations, an allowed `api_key_env` reference for backends that
-need a key, or no credentials at all (explicit no-auth mode). Local branches
-never import unrelated canonical credentials: `auth_integration` is rejected
-on a local profile, the required key reference must resolve to a non-empty
-runtime value before `serve` starts (a missing or empty key refuses, never
-silently becomes no-auth mode), the isolated store must hold no credential
-for `eliot-local`, and only the `{env:NAME}` reference — or no `apiKey` key
-at all — is rendered. An unresolved `{env:NAME}` would become an empty
-string and select `Auth.none` server-side, so Eliot rejects it first.
+An OpenCode profile with `[profiles.X.local_provider]` selects one declared
+model using `model = "<provider>/<model>"`. The table contains an `id` slug,
+a syntax-validated npm `package`, an absolute HTTP(S) `base_url`, an optional
+`api_key_env`, and a list of models. Each model has an `id` and optional integer
+`context_limit` and `output_limit`. Model IDs may contain slash segments.
+`base_url` rejects userinfo, queries, fragments, and substitutions. Swarm
+rejects unknown fields at freeze and retained admission and validates the typed
+provider before each isolated-config write.
 
-The per-Agent document renders the installed native schema (2.2.7) into
-the existing isolated Agent root: `providers` (plural; the legacy singular
-`provider` stays migrated by the server), `package`
-`@opencode/ai/providers/openai-compatible`, `settings.baseURL` (plus
-`settings.apiKey` only in env-key mode), and one `models` entry carrying
-`tools: true` and the frozen `limit.context/output`. The built-in defaults
-(200,000 context / 32,000 output with tools and image input assumed
-supported) are never relied on: limits are explicit. Title and compaction
-auxiliary requests run on the same selected local model: the generated
-document sets only that model. Managed policy authority is preserved: no
-owner or project file is ever edited.
+Swarm generates the OpenCode `providers.<id>` entry with `settings.baseURL`,
+the configured model limits, and `settings.apiKey = "{env:NAME}"` when a key
+is configured. The variable must be explicitly listed in frozen `pass_env`
+and cannot be reserved for the controller or adapter. Swarm checks the value
+at runtime before writing the config. Local-provider profiles omit
+`auth_integration`.
 
-Effective settings are read back, not assumed. The isolated XDG file is not
-the final authority (workspace-inherited layers load after the isolated global config), so before
-inference the plugin checks the exact provider through bounded native
-`GET /api/provider/:providerID`, selects the exact frozen provider/model pair locally from
-`GET /api/model` (the endpoint answers an object with a `data` array), and reads the backend's
-own passive `GET {base_url}/models` inventory — which never generates text,
-never sends `?reload=1` (that can unload running llama.cpp models), and
-never touches load/switch selectors. This verification runs before
-`POST /api/session` creates any native session: no session or prompt has
-been dispatched yet, so every verification failure — a known mismatch
-(foreign provider/package/endpoint, an absent catalogue pair, divergent
-limits, or an inventory without the frozen id), an unreadable readback, or
-an unreachable backend with no inventory at all — settles the launch as a
-definite failure with a short safe reason (failed-state start result, never
-unknown), and the daemon retires the plugin and releases capacity on proven
-exit instead of pinning an unknown Agent. Unknown is reserved for failures
-after a session or prompt may have been admitted. Project overrides that
-retarget the route are rejected, never adopted. Absent provider observations
-report unavailable honestly instead of failing, and only nonsecret
-observations are retained — never a resolved key or raw configuration. The
-readback is a snapshot, not a guarantee about every request.
+Local-provider sessions run under OpenCode's native project-config disable switch
+(`OPENCODE_CONFIG_PROJECT_DISABLE`, verified against installed v2.2.7
+`packages/cli/src/server-process.ts` and `packages/core/src/config.ts` /
+`config/discovery.ts`): the serve and the model-reader processes skip the
+whole project walk (ancestor and cwd `opencode.json`/`opencode.jsonc`,
+`.opencode/` dirs, project `.agents`/`.claude` dirs) for the session
+lifetime, including native reloads. The project layer otherwise ranks above
+the isolated global config, so the switch — not a file scan — is the
+boundary. Both native paths also strip `OPENCODE_CONFIG`,
+`OPENCODE_CONFIG_CONTENT`, and `OPENCODE_CONFIG_DIR` from their environment.
+Local-provider sessions skip the project MCP file scan and still check the
+effective MCP inventory. Cloud sessions keep the workspace project layers.
 
-Backend presets and metadata mappings are small presets through this same
-provider path, not separate Agent executors. Ollama and vLLM reuse it with
-an explicit local model.
+Effective settings are read back, not assumed. Before inference the plugin
+checks that the generated provider defines the requested model. It then selects the
+exact frozen provider/model pair locally from the live `GET /api/model`
+catalogue (the endpoint answers an object with a `data` array) and carries
+that row's context and output limits into the ready result (omitted values
+stay unknown). This verification runs before `POST /api/session` creates any
+native session: no session or prompt has been dispatched yet, so every
+verification failure - a known mismatch or an unreadable readback - settles
+the launch as a definite failure with a short safe reason (failed-state start
+result, never unknown), and the daemon retires the plugin and releases capacity
+on proven exit instead of pinning an unknown Agent. Unknown is reserved for
+failures after a session or prompt may have been admitted. An unreachable
+custom endpoint is not a start failure: the catalogue still lists the model,
+the start succeeds, and the native turn surfaces the refusal. The readback is
+a snapshot, not a guarantee about every request.
 
-| Backend | Integration boundary |
-| --- | --- |
-| **Strata** | Adopt its selected engine HTTP endpoint. The server also serves unknown requested names, so validate the canonical model/aliases from metadata instead of trusting a successful response. Health separates reachable service (`status`) from loaded model (`loaded`). |
-| **Unsloth Studio** | Use its inference API with an explicit model and a scoped key reference, keeping the client's native function-tool loop. Owner tool/load policies (process-forced tool policy, model auto-switch) are respected and never changed; shared Agents keep one explicit model selector. |
-| **LM Studio** | Use OpenAI-compatible inference plus native model metadata. Prefer one explicitly loaded instance shared by all Agents and read that instance's `config.context_length`, not the model-level maximum. JIT inventory can list unloaded models and auto-evict can unload the previous selection; TTL/load policy stays owner-controlled. |
-| **llama.cpp** | Adopt a fixed-model server first, with the selected model's tool-capable template and function-call path. Keep discovery passive (props reads with `autoload=false`; never `/models?reload=1` for inventory) and configure the effective per-slot context, not pooled context. |
-| **Ollama / vLLM** | Same OpenAI-compatible provider path with an explicit local model. Ollama Responses is stateless; vLLM tool calling depends on model/parser/template. Deployment, clustering and hardware tuning stay outside this increment. |
+Profile-scoped picker rows advertise only the profile's configured selection:
+choosing the row launches the profile as configured. Named-preview failures
+coalesce into one bounded catalogue entry naming the affected profiles, so
+failing previews never invalidate the whole catalogue.
 
-Several Agents may share one adopted server for inference while each keeps
-its own native session, history, tool execution and approvals; stop ends
-only the owned per-Agent server and never unloads a model or touches
-another Agent. Disconnect behavior varies by route, and unloading a model
-or killing its server is not turn cancellation. Codex profiles against
-these backends stay `unsupported`: readiness, catalog/context, history and
-exact tool formats are resolved separately before any Codex route is
-advertised as supported.
+Several Agents may share one endpoint for inference while each keeps its own
+native session, history, tool execution and approvals; stop ends only the owned
+per-Agent server and never unloads a model or touches another Agent. Codex
+profiles against these endpoints stay `unsupported`.
 
 ## Eliot MCP bridge
 
@@ -380,9 +366,8 @@ the bounded close budget) before starting the next command or returning a catalo
 Unconfirmed family closure returns `unknown`, including for the optional variants
 read; a failed variants read degrades to ids only after confirmed cleanup.
 With a named profile, both reads use the same generated provider configuration,
-target environment and selected auth as launch, including the dedicated local
-provider for an adopted backend. Pass `--workspace` to read in the intended launch
-directory. These results are previews, since the prospective launch's workspace
+target environment and selected auth as launch. Pass `--workspace` to read in
+the intended launch directory. These results are previews, since the workspace
 and live provider state can differ. An unscoped read uses the canonical native
 configuration and is also a preview. Each reader's isolated credential store
 lives under its private host-owned instance directory. The host verifies removal

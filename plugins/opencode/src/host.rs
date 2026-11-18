@@ -1,10 +1,10 @@
 use crate::{
     events::{self, EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
     native::{
-        AuthSetup, AuthTransfer, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider,
-        OpenCodeHttp, OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
+        AuthSetup, AuthTransfer, HttpOutcome, IntegrationSelector, OpenCodeHttp, OwnedServer,
+        SWARM_MCP_SERVER_NAME, ServerLaunch,
         models::{MAX_MODEL_ID_BYTES, ReaderContext, run_model_metadata, run_models},
-        server::provider_config,
+        server::{provider_config, validate_local_provider, validate_local_provider_environment},
         transfer_selected_integration,
         types::{
             ConfigEntry, ConfigMcpServer, InboxUser, McpServerReadback, ModelRef, NativeModelEntry,
@@ -12,6 +12,7 @@ use crate::{
         },
     },
 };
+use eliot_core::local_provider::LocalProvider;
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
@@ -26,7 +27,6 @@ use eliot_plugin::{
     },
     start_classification::SettledStartFailure,
 };
-use reqwest::{redirect, retry};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -146,8 +146,8 @@ enum StartPhase {
     Subscribe,
     /// Daemon-side native-process registration, before session create.
     Register,
-    /// Local backend verification, before session create: the adopted
-    /// provider answers for the expected model without creating state.
+    /// Native catalogue verification, before session create: the isolated
+    /// server answers for the expected provider/model without creating state.
     Verify,
     /// Session/create refused or provably never dispatched.
     CreateRefused,
@@ -229,7 +229,7 @@ impl StartPhase {
 fn presession_reason(phase: StartPhase, code: &str) -> String {
     let what = match phase {
         StartPhase::Spawn => "OpenCode serve failed to start",
-        StartPhase::Verify => "OpenCode local backend verification failed",
+        StartPhase::Verify => "OpenCode native catalogue verification failed",
         StartPhase::Subscribe => "OpenCode event subscription failed",
         StartPhase::Register => "OpenCode native-process registration failed",
         StartPhase::CreateRefused => "OpenCode session/create was not admitted",
@@ -318,13 +318,14 @@ struct AgentSession {
     stop_command_id: Option<String>,
     resources_proved_closed: bool,
     stop_end_ack_proved: bool,
+    local_provider: Option<LocalProvider>,
 }
 
 /// A start request that passed admission: decoded params plus the validated
 /// frozen profile, workspace, child environment, selected native auth
-/// integration (cloud path) or adopted local provider (local path), and
-/// redaction secrets. Exactly one of `auth_selector` and `local` is set:
-/// the local path never imports a canonical credential.
+/// integration (cloud path) or typed local provider, and
+/// redaction secrets. Exactly one of `auth_selector` and `local_provider`
+/// is set: local providers use environment-backed authentication.
 struct ParsedStart {
     params: AgentStartParams,
     /// Frozen native-subagent switch (`allow` or `deny`): `deny` stores a
@@ -365,7 +366,7 @@ struct ParsedStart {
     program: OsString,
     environment: Vec<(OsString, OsString)>,
     auth_selector: Option<IntegrationSelector>,
-    local: Option<LocalProvider>,
+    local_provider: Option<LocalProvider>,
     secrets: Vec<String>,
     credential: String,
     instance_dir: String,
@@ -680,17 +681,19 @@ impl OpenCodePlugin {
             .as_object()
             .expect("harness already proved the profile is an object");
         let model = optional_profile_text(profile, "model", "OpenCode")?;
-        let model_ref = model.as_deref().and_then(split_model);
-        let local = start_local_provider(profile, model_ref.as_ref())?;
+        let fragment = start_local_provider(profile)?;
+        if let Some(fragment) = fragment.as_ref() {
+            validate_local_provider_environment(fragment, profile.get("pass_env"), &environment)?;
+        }
         let until = Instant::now() + RPC_TIMEOUT;
         let config_home = base.join("config");
         let data_home = base.join("data");
-        let auth = if local.is_some() || profile.get("auth_integration").is_some() {
-            start_auth_selector(profile, local.is_some())?
+        let auth = if fragment.is_some() || profile.get("auth_integration").is_some() {
+            start_auth_selector(profile, fragment.is_some())?
         } else {
             None
         };
-        let isolated = auth.is_some() || local.is_some();
+        let isolated = auth.is_some() || fragment.is_some();
         if isolated {
             let empty_config = base.join("auth-config");
             let config_dir = config_home.join("opencode");
@@ -704,7 +707,7 @@ impl OpenCodePlugin {
             }
             std::fs::write(
                 config_dir.join("opencode.jsonc"),
-                provider_config(model.as_deref(), local.as_ref()).to_string(),
+                provider_config(model.as_deref(), fragment.as_ref()).to_string(),
             )
             .map_err(|_| {
                 Error::new(
@@ -734,6 +737,7 @@ impl OpenCodePlugin {
             workspace,
             environment: &environment,
             xdg: isolated.then_some((config_home.as_path(), data_home.as_path())),
+            local_provider: fragment.is_some(),
         };
         let models: Vec<Value> = match params.part {
             ModelListPart::Models => run_models(program, until, &context)
@@ -896,21 +900,11 @@ impl OpenCodePlugin {
         // (the effort selects the documented `Model.Ref.variant`).
         let (override_model, override_model_ref, override_effort) = start_config_override(&params)?;
         let requested_agent = optional_profile_text(profile, "agent", "OpenCode")?;
-        if model_ref
-            .as_ref()
-            .is_some_and(|model_ref| model_ref.variant.is_some())
-            && has_local_fields(profile)
-        {
-            return Err(Error::new(
-                "profile_error",
-                "OpenCode effort has no adopted-backend mapping",
-            ));
-        }
-        // A local-backend profile always carries an explicit model (the
-        // eliot-local segment): local fields without a model fail closed
-        // instead of falling back to the native default.
-        let local = start_local_provider(profile, model_ref.as_ref())?;
-        let auth_selector = start_auth_selector(profile, local.is_some())?;
+        // A fragment profile always carries an explicit model: a fragment
+        // without a model fails closed instead of falling back to the native
+        // default.
+        let local_provider = start_local_provider(profile)?;
+        let auth_selector = start_auth_selector(profile, local_provider.is_some())?;
         let (workspace, program) = start_paths(profile, &params)?;
         let TargetEnvironment {
             variables: environment,
@@ -961,7 +955,7 @@ impl OpenCodePlugin {
             program,
             environment,
             auth_selector,
-            local,
+            local_provider,
             secrets,
             credential: initialized.credential.clone(),
             instance_dir: initialized.instance_dir.clone(),
@@ -1055,8 +1049,6 @@ impl OpenCodePlugin {
     /// stream, and assemble the session. The caller retains any error. A
     /// spawn failure carries its provenance: an uncertain auth import (code
     /// `unknown`) settles unknown, definite refusals settle failed.
-    /// The cloud path carries the selected native integration; the local
-    /// path carries the adopted provider and no canonical credential.
     async fn launch_start_session(
         peer: &PeerClient,
         parsed: &ParsedStart,
@@ -1075,7 +1067,13 @@ impl OpenCodePlugin {
                     selector,
                     reuse_existing: parsed.resume.is_some(),
                 }),
-                local: parsed.local.clone(),
+                local_provider: parsed.local_provider.clone(),
+                frozen_pass_env: parsed
+                    .params
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| profile.get("pass_env"))
+                    .cloned(),
                 swarm_executable: parsed.swarm_executable.clone(),
                 swarm_data_dir: parsed.swarm_data_dir.clone(),
                 native_subagents: parsed.native_subagents.clone(),
@@ -1141,6 +1139,7 @@ impl OpenCodePlugin {
             stop_command_id: None,
             resources_proved_closed: false,
             stop_end_ack_proved: false,
+            local_provider: parsed.local_provider.clone(),
         };
 
         Ok(session)
@@ -1192,16 +1191,17 @@ impl OpenCodePlugin {
     /// failure settles only after proving deletion of the created session;
     /// otherwise the exact session and server remain available as unknown.
     ///
-    /// Adopted local path: the provider, catalogue, limits and backend
-    /// inventory verification runs BEFORE `POST /api/session` creates any
-    /// native session — right here at the top, after the owned server is up
-    /// but before the first native write. Nothing has been dispatched at
-    /// that point, so every verification failure (mismatch, unreachable
-    /// backend, or unreadable readback) settles as a definite failed start
-    /// (`ProvenFailed`, retained for a corrected retry), never as an unknown
-    /// that would pin the Agent, keep the plugin alive, and hold capacity.
-    /// Unknown is reserved for failures after a session or prompt may have
-    /// been admitted.
+    /// Fragment path: the native provider and catalogue verification runs
+    /// BEFORE `POST /api/session` creates any native session — right here at
+    /// the top, after the owned server is up but before the first native
+    /// write. Nothing has been dispatched at that point, so every
+    /// verification failure (mismatch or unreadable readback) settles as a
+    /// definite failed start (`ProvenFailed`, retained for a corrected
+    /// retry), never as an unknown that would pin the Agent, keep the plugin
+    /// alive, and hold capacity. Unknown is reserved for failures after a
+    /// session or prompt may have been admitted. An unreachable custom
+    /// endpoint is not a start failure: the catalogue still lists the model,
+    /// the start succeeds, and the native turn surfaces the refusal.
     async fn create_start_session(
         &mut self,
         parsed: &ParsedStart,
@@ -1210,33 +1210,6 @@ impl OpenCodePlugin {
     ) -> Result<CreateOutcome> {
         let _timing = crate::native::startup::Step::new("session_create_verify");
         session.native_scope = opencode_scope(session.server.data_dir());
-        // Pre-create verification: no native session or prompt exists yet.
-        let local_fragment = if let Some(local) = parsed.local.as_ref() {
-            let backend_key = local_key_value(&parsed.environment, local.api_key_env.as_deref());
-            match verify_local_effective(
-                &session.http,
-                local,
-                backend_key,
-                phase_deadline(envelope, RPC_TIMEOUT),
-            )
-            .await
-            {
-                Ok(fragment) => Some(fragment),
-                Err(error) => {
-                    let failure = error.clone();
-                    discard_failed_start(&mut session, error, envelope).await;
-                    return Ok(CreateOutcome::ProvenFailed(
-                        self.retain_proven_no_effect_start(
-                            &parsed.params,
-                            StartPhase::Verify,
-                            failure,
-                        ),
-                    ));
-                }
-            }
-        } else {
-            None
-        };
         // An explicit model must prove membership in the live catalogue
         // before the create below: `Session.create` publishes its input
         // model unchanged and only resolves availability lazily at
@@ -1246,6 +1219,7 @@ impl OpenCodePlugin {
         // catalogue must also prove the variant belongs to that exact
         // model row. A miss or an unreadable catalogue is a definite
         // failed start, never unknown.
+        let mut ready_limits: Option<(Option<i64>, Option<i64>)> = None;
         if let Some(requested) = parsed.requested_model.as_deref() {
             let requested_variant = parsed
                 .model_ref
@@ -1304,16 +1278,24 @@ impl OpenCodePlugin {
                     ));
                 }
             }
+            ready_limits = Some(
+                catalogue_entry(&catalogue, requested)
+                    .and_then(|entry| entry.limit.as_ref())
+                    .map(|limit| (limit.context, limit.output))
+                    .unwrap_or((None, None)),
+            );
         }
         // Workspace-inherited project MCP layers: the owned serve already
         // merged them, so an owner-identity entry there must refuse the start
         // before the native session exists. Every policy, whatever the entry
         // is named.
-        if let Err(error) = refuse_owner_project_mcp(
-            &parsed.workspace,
-            &parsed.swarm_executable,
-            parsed.mcp_cloud_hostname.as_deref(),
-        ) {
+        if parsed.local_provider.is_none()
+            && let Err(error) = refuse_owner_project_mcp(
+                &parsed.workspace,
+                &parsed.swarm_executable,
+                parsed.mcp_cloud_hostname.as_deref(),
+            )
+        {
             let failure = error.clone();
             discard_failed_start(&mut session, error, envelope).await;
             return Ok(CreateOutcome::ProvenFailed(
@@ -1456,19 +1438,26 @@ impl OpenCodePlugin {
             "effort_verified": effort_verified,
             "cwd": created.location.as_ref().map(|location| location.directory.clone()),
         });
+        // Carry the matching catalogue row's context and output limits into
+        // the ready result; omitted values stay unknown (null), never zero.
+        match ready_limits {
+            Some((context, output)) => {
+                effective["context_limit"] = context.map_or(Value::Null, Value::from);
+                effective["output_limit"] = output.map_or(Value::Null, Value::from);
+            }
+            None => {
+                effective["context_limit"] = Value::Null;
+                effective["output_limit"] = Value::Null;
+            }
+        }
         if created.model.is_none()
             && let Some(default) = native_default_model
         {
             effective["native_default_model"] = json!(default);
         }
-        // The adopted provider fragment was proven before the session
-        // existed; merge it into the effective readback here. Post-create
-        // failures below keep their historical settlement: the create may
-        // have admitted native state, so they stay errors (unknown where
-        // ambiguous), never the pre-create failed value.
-        if let Some(fragment) = local_fragment {
-            effective["local"] = fragment;
-        }
+        // Post-create failures below keep their historical settlement: the
+        // create may have admitted native state, so they stay errors (unknown
+        // where ambiguous), never the pre-create failed value.
         // Agent-scoped MCP readback after the session exists: names plus
         // the connected verdict for the `eliot-swarm` entry. Observation
         // stays read-only and polled; the inventory gate below refuses
@@ -1679,11 +1668,13 @@ impl OpenCodePlugin {
         // The resumed serve merges the current project layer again, so the
         // same owner-identity scan runs before the retained session is
         // touched: a project entry added since launch refuses the resume.
-        if let Err(error) = refuse_owner_project_mcp(
-            &parsed.workspace,
-            &parsed.swarm_executable,
-            parsed.mcp_cloud_hostname.as_deref(),
-        ) {
+        if parsed.local_provider.is_none()
+            && let Err(error) = refuse_owner_project_mcp(
+                &parsed.workspace,
+                &parsed.swarm_executable,
+                parsed.mcp_cloud_hostname.as_deref(),
+            )
+        {
             return Err(self.fail_resume(&parsed, session, error, envelope).await);
         }
         let deadline = phase_deadline(envelope, RPC_TIMEOUT);
@@ -1712,18 +1703,20 @@ impl OpenCodePlugin {
         // setter: the quiesce below aborts a running retained execution,
         // so a catalogue miss must fail here with proven no effect
         // instead of aborting that turn and then failing.
-        if let Err(error) =
-            Self::resume_validate_catalogue(&parsed, &session, &retained, deadline).await
-        {
-            discard_unstarted(&mut session, envelope).await;
-            return Ok(self.proven_no_effect_start(
-                &parsed.params,
-                PhaseFailure {
-                    phase: StartPhase::ResumeRefused,
-                    error: Box::new(error),
-                },
-            ));
-        }
+        let resume_limits =
+            match Self::resume_validate_catalogue(&parsed, &session, &retained, deadline).await {
+                Ok(limits) => limits,
+                Err(error) => {
+                    discard_unstarted(&mut session, envelope).await;
+                    return Ok(self.proven_no_effect_start(
+                        &parsed.params,
+                        PhaseFailure {
+                            phase: StartPhase::ResumeRefused,
+                            error: Box::new(error),
+                        },
+                    ));
+                }
+            };
         // Effective MCP proof before the quiesce below can abort a running
         // retained execution: the settled inventory is gated and the
         // winning effective documents must carry no owner transport (plus
@@ -1754,6 +1747,7 @@ impl OpenCodePlugin {
             &retained.id,
             mcp_servers,
             mcp_servers_verified,
+            resume_limits,
             deadline,
         )
         .await
@@ -1949,7 +1943,7 @@ impl OpenCodePlugin {
         session: &AgentSession,
         retained: &SessionInfo,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> Result<Option<(Option<i64>, Option<i64>)>> {
         // The realignment target is the inherited overlay's effective
         // model and effort when a resume carries them (the retained
         // session already runs them), else the frozen request. An omitted
@@ -1967,8 +1961,22 @@ impl OpenCodePlugin {
                 .as_deref()
                 .or(parsed.requested_effort.as_deref())
         };
+        // The fragment membership rule matches the create path before any
+        // write: a catalog-listed model outside the fragment refuses here,
+        // before the quiesce interrupt aborts a running retained turn. No
+        // workspace file scan runs here either: the resumed serve regenerates
+        // under the same native project-config disable switch, so workspace
+        // project layers stay unloaded for the session lifetime.
+        if let (Some(provider), Some(target)) = (parsed.local_provider.as_ref(), target_model)
+            && !local_provider_contains(provider, target)
+        {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode local provider does not declare the retained model",
+            ));
+        }
         if target_model.is_none() && target_variant.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let catalogue = session
             .http
@@ -2036,7 +2044,36 @@ impl OpenCodePlugin {
                 ));
             }
         }
-        Ok(())
+        // Carry the matching catalogue row's limits for the ready result;
+        // omitted values stay unknown (None), never zero.
+        if let Some(target) = target_model
+            && let Some(target_ref) = target_ref
+        {
+            let _ = target;
+            if let Some(entry) =
+                catalogue_entry_for(&catalogue, &target_ref.provider_id, &target_ref.id)
+                && let Some(limit) = entry.limit.as_ref()
+            {
+                return Ok(Some((limit.context, limit.output)));
+            }
+            return Ok(Some((None, None)));
+        }
+        if let Some(variant) = target_variant {
+            let _ = variant;
+            if let Some(validation_ref) = parsed
+                .override_model_ref
+                .as_ref()
+                .or(parsed.model_ref.as_ref())
+                .or(retained.model.as_ref())
+                && let Some(entry) =
+                    catalogue_entry_for(&catalogue, &validation_ref.provider_id, &validation_ref.id)
+                && let Some(limit) = entry.limit.as_ref()
+            {
+                return Ok(Some((limit.context, limit.output)));
+            }
+            return Ok(Some((None, None)));
+        }
+        Ok(None)
     }
 
     /// Resume MCP proof: gate the settled inventory and prove the winning
@@ -2107,6 +2144,7 @@ impl OpenCodePlugin {
         session_id: &str,
         mcp_servers: Value,
         mcp_servers_verified: bool,
+        resume_limits: Option<(Option<i64>, Option<i64>)>,
         deadline: Instant,
     ) -> Result<Value> {
         let current = session
@@ -2350,6 +2388,16 @@ impl OpenCodePlugin {
             "agent_verified": agent_verified,
             "cwd": effective.location.as_ref().map(|location| location.directory.clone()),
         });
+        match resume_limits {
+            Some((context, output)) => {
+                effective_value["context_limit"] = context.map_or(Value::Null, Value::from);
+                effective_value["output_limit"] = output.map_or(Value::Null, Value::from);
+            }
+            None => {
+                effective_value["context_limit"] = Value::Null;
+                effective_value["output_limit"] = Value::Null;
+            }
+        }
         effective_value["native_subagents"] = json!(
             parsed
                 .native_subagents
@@ -2357,17 +2405,17 @@ impl OpenCodePlugin {
                 .unwrap_or_else(|| "allow".to_owned())
         );
         effective_value["native_subagents_verified"] = json!(subagents_verified);
-        // Adopted local path: the regenerated server config must still pin
-        // the frozen provider. A known mismatch fails the resume for a
-        // corrected retry; transport ambiguity stays unknown.
-        if let Some(local) = parsed.local.as_ref() {
-            let backend_key = local_key_value(&parsed.environment, local.api_key_env.as_deref());
-            match verify_local_effective(&session.http, local, backend_key, deadline).await {
-                Ok(fragment) => {
-                    effective_value["local"] = fragment;
-                }
-                Err(error) => return Err(error),
-            }
+        // Fragment path: the regenerated server config must still carry the
+        // frozen provider. The live catalogue proves the retained pair; a
+        // miss fails the resume for a corrected retry.
+        if let Some(provider) = parsed.local_provider.as_ref()
+            && let Some(model) = effective.model.as_ref()
+            && !provider.contains_model(&model.provider_id, &model.id)
+        {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode local provider does not declare the retained model",
+            ));
         }
         // The effective MCP proof ran pre-quiesce (`resume_prove_mcp`): no
         // inventory or effective-config read happens here after the
@@ -2768,6 +2816,18 @@ impl OpenCodePlugin {
             return Ok(json!({
                 "state": "rejected",
                 "reason": format!("OpenCode model {model} is not in the native catalogue"),
+            }));
+        }
+        // The same membership rule as the start and resume paths, before
+        // either one writes: a catalog-listed model outside the frozen
+        // fragment refuses here, never after quiescing or switching.
+        if let (Some(provider), Some(model)) =
+            (session.local_provider.as_ref(), requested.model.as_deref())
+            && !local_provider_contains(provider, model)
+        {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": "OpenCode local provider does not declare the requested model",
             }));
         }
         let current = session
@@ -3738,186 +3798,102 @@ impl OpenCodePlugin {
 /// integration (ID or name) whose canonical credential the pre-serve
 /// transfer prepares. Required on the cloud path and nonsecret; the
 /// capacity-only account field is never consulted for authentication. On
-/// the adopted local path the selector must be absent: no canonical
+/// the fragment path the selector must be absent: no canonical
 /// credential is ever imported there.
 fn start_auth_selector(
     profile: &serde_json::Map<String, Value>,
-    is_local: bool,
+    is_fragment: bool,
 ) -> Result<Option<IntegrationSelector>> {
     let raw = profile
         .get("auth_integration")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty());
-    if is_local {
+    if is_fragment {
         if raw.is_some() {
             return Err(Error::new(
                 "profile_error",
-                "OpenCode local backend profiles must not name a canonical auth_integration",
+                "OpenCode local provider profiles cannot name a canonical auth_integration",
             ));
         }
         return Ok(None);
     }
-    let raw = raw.ok_or_else(|| {
-        Error::new(
+    let Some(raw) = raw else {
+        if let Some(migration) = retained_eliot_local_migration(profile) {
+            return Err(migration);
+        }
+        return Err(Error::new(
             "profile_error",
             "OpenCode profile requires an explicit auth_integration selector",
-        )
-    })?;
+        ));
+    };
     IntegrationSelector::new(raw)
         .map(Some)
         .map_err(|error| error.with_code("profile_error"))
 }
 
-/// Dedicated local provider ID without a canonical alias. The frozen model
-/// on an adopted-backend profile must use this provider segment; the daemon
-/// freezes it, and this check keeps a hand-built snapshot honest.
-const LOCAL_PROVIDER_ID: &str = "eliot-local";
-
-/// Expected native package rendering the adopted OpenAI-compatible route.
-const LOCAL_PROVIDER_PACKAGE: &str = "@opencode/ai/providers/openai-compatible";
-
-/// The frozen adopted local provider: `provider_base_url`, `backend`,
-/// `context_limit` and `output_limit` are all required with an optional
-/// Any adopted-backend field present means the profile intends the local
-/// path, with or without an explicit model; the caller rejects the
-/// model-absent combination as a profile error.
-fn has_local_fields(profile: &serde_json::Map<String, Value>) -> bool {
-    profile.contains_key("provider_base_url")
-        || profile.contains_key("backend")
-        || profile.contains_key("api_key_env")
-        || profile.contains_key("context_limit")
-        || profile.contains_key("output_limit")
-        || profile.contains_key("provider_package")
+/// Older local-provider snapshots need a new profile before they can run.
+fn retained_eliot_local_migration(profile: &serde_json::Map<String, Value>) -> Option<Error> {
+    let has_old_fields = [
+        "provider_base_url",
+        "backend",
+        "api_key_env",
+        "context_limit",
+        "output_limit",
+        "provider_package",
+    ]
+    .iter()
+    .any(|field| profile.contains_key(*field));
+    let is_eliot_local = profile
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| model.split('/').next().unwrap_or("") == "eliot-local");
+    if has_old_fields || is_eliot_local {
+        Some(Error::new(
+            "profile_error",
+            "OpenCode retained provider configuration must migrate to local_provider with model <provider>/<model>",
+        ))
+    } else {
+        None
+    }
 }
 
-/// `api_key_env` reference (absent means explicit no-auth mode). Key values
-/// stay runtime-only; only the env name is frozen. Any local field without
-/// the full set fails closed instead of falling back to another auth mode.
-fn start_local_provider(
-    profile: &serde_json::Map<String, Value>,
-    model_ref: Option<&ModelRef>,
-) -> Result<Option<LocalProvider>> {
-    if let Some(model_ref) = model_ref {
-        return parse_local_provider(profile, model_ref);
-    }
-    if has_local_fields(profile) {
+fn start_local_provider(profile: &serde_json::Map<String, Value>) -> Result<Option<LocalProvider>> {
+    if profile.contains_key("provider") {
         return Err(Error::new(
             "profile_error",
-            "OpenCode local backend requires an explicit model with the dedicated eliot-local provider segment",
+            "OpenCode retained provider configuration must migrate to local_provider",
         ));
     }
-    Ok(None)
-}
-
-fn parse_local_provider(
-    profile: &serde_json::Map<String, Value>,
-    model_ref: &ModelRef,
-) -> Result<Option<LocalProvider>> {
-    if !has_local_fields(profile) {
-        return Ok(None);
-    }
-    if model_ref.provider_id != LOCAL_PROVIDER_ID {
+    let Some(value) = profile.get("local_provider") else {
+        return match retained_eliot_local_migration(profile) {
+            Some(error) => Err(error),
+            None => Ok(None),
+        };
+    };
+    let provider: LocalProvider = serde_json::from_value(value.clone()).map_err(|_| {
+        Error::new(
+            "profile_error",
+            "OpenCode retained local_provider has invalid fields",
+        )
+    })?;
+    validate_local_provider(&provider, profile.get("pass_env"))?;
+    if !profile
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| local_provider_contains(&provider, model))
+    {
         return Err(Error::new(
             "profile_error",
-            "OpenCode local backend profiles must use the dedicated eliot-local provider segment",
+            "OpenCode local provider profile must select one of its declared models",
         ));
     }
     if profile.contains_key("auth_integration") {
         return Err(Error::new(
             "profile_error",
-            "OpenCode local backend profiles must not name a canonical auth_integration",
+            "OpenCode local provider profiles cannot name a canonical auth_integration",
         ));
     }
-    let base_url = profile
-        .get("provider_base_url")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Error::new(
-                "profile_error",
-                "OpenCode local backend requires an explicit provider_base_url",
-            )
-        })?
-        .trim()
-        .to_owned();
-    if base_url.len() > 2048
-        || base_url.chars().any(char::is_control)
-        || (!base_url.starts_with("http://") && !base_url.starts_with("https://"))
-    {
-        return Err(Error::new(
-            "profile_error",
-            "OpenCode local backend provider_base_url must be an absolute http(s) endpoint URL",
-        ));
-    }
-    let backend_raw = profile
-        .get("backend")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Error::new(
-                "profile_error",
-                "OpenCode local backend requires an explicit backend kind",
-            )
-        })?;
-    let backend = BackendKind::parse(backend_raw).ok_or_else(|| {
-        Error::new(
-            "profile_error",
-            "OpenCode local backend kind must be strata, unsloth, lmstudio, llama.cpp, ollama, vllm or generic",
-        )
-    })?;
-    let limit = |key: &str| {
-        profile
-            .get(key)
-            .and_then(Value::as_i64)
-            .filter(|value| *value > 0)
-            .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
-                    format!("OpenCode local backend requires a positive {key}"),
-                )
-            })
-    };
-    let context_limit = limit("context_limit")?;
-    let output_limit = limit("output_limit")?;
-    let api_key_env = match profile.get("api_key_env") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(name)) if !name.trim().is_empty() => Some(name.trim().to_owned()),
-        _ => {
-            return Err(Error::new(
-                "profile_error",
-                "OpenCode local backend api_key_env must be a non-empty environment name",
-            ));
-        }
-    };
-    let package = profile
-        .get("provider_package")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(LOCAL_PROVIDER_PACKAGE)
-        .to_owned();
-    if package != LOCAL_PROVIDER_PACKAGE {
-        return Err(Error::new(
-            "profile_error",
-            "OpenCode local backend provider package contradicts the installed native schema",
-        ));
-    }
-    Ok(Some(LocalProvider {
-        provider_id: model_ref.provider_id.clone(),
-        api_model_id: model_ref.id.clone(),
-        base_url,
-        api_key_env,
-        context_limit,
-        output_limit,
-        backend: backend.as_str().to_owned(),
-        package,
-    }))
-}
-
-/// Compare endpoint spellings after trimming trailing slashes. The frozen
-/// and observed values must name the same route; project overrides that
-/// retarget the base URL are a profile mismatch, never silently adopted.
-fn normalize_endpoint(value: &str) -> String {
-    value.trim().trim_end_matches('/').to_owned()
+    Ok(Some(provider))
 }
 
 /// Read the frozen worker MCP policy back. The owned serve is already
@@ -4027,6 +4003,10 @@ fn refuse_owner_project_mcp(
         ));
     }
     Ok(())
+}
+
+fn local_provider_contains(provider: &LocalProvider, model: &str) -> bool {
+    split_provider_model(model).is_some_and(|(id, model)| provider.contains_model(id, model))
 }
 
 /// Refuse the start when any effective `mcp.servers` entry carries the
@@ -4245,235 +4225,10 @@ fn mcp_names(servers: &[McpServerReadback]) -> Value {
     )
 }
 
-/// Resolve the adopted backend key value (runtime-only) from the launch
-/// environment for the passive inventory read. A missing or empty value
-/// yields `None` so the read runs unauthenticated only when the profile
-/// selected no-auth mode; it never fabricates an empty-string credential.
-fn local_key_value<'a>(
-    environment: &'a [(OsString, OsString)],
-    name: Option<&str>,
-) -> Option<&'a str> {
-    let name = name?;
-    environment
-        .iter()
-        .find_map(|(key, value)| {
-            let matches = if cfg!(windows) {
-                key.to_string_lossy().eq_ignore_ascii_case(name)
-            } else {
-                key.to_string_lossy() == *name
-            };
-            matches.then(|| value.to_str()).flatten()
-        })
-        .filter(|value| !value.trim().is_empty())
-}
-
-/// Passive adopted-backend inventory: one bounded `GET {base_url}/models`
-/// with the scoped key reference only. This never generates text, never
-/// sends `?reload=1` (which can unload running llama.cpp models), and never
-/// touches load/switch selectors. `None` reports unavailable evidence
-/// honestly (listing disabled or unreachable); `Some(ids)` lets the caller
-/// reject a known mismatch against the frozen API model id.
-async fn fetch_backend_inventory(
-    base_url: &str,
-    backend: BackendKind,
-    api_key: Option<&str>,
-    deadline: Instant,
-) -> Option<Vec<String>> {
-    const MAX_INVENTORY_BYTES: usize = 64 * 1024;
-    let url = format!(
-        "{}{}",
-        base_url.trim_end_matches('/'),
-        backend.inventory_path()
-    );
-    if url.len() > 4096 {
-        return None;
-    }
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(redirect::Policy::none())
-        .retry(retry::never())
-        .build()
-        .ok()?;
-    let mut request = client.get(url);
-    if let Some(key) = api_key.filter(|key| !key.trim().is_empty()) {
-        request = request.bearer_auth(key);
-    }
-    let mut response = tokio::time::timeout_at(deadline, request.send())
-        .await
-        .ok()?
-        .ok()?;
-    if response.status() != reqwest::StatusCode::OK {
-        return None;
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_INVENTORY_BYTES as u64)
-    {
-        return None;
-    }
-    let mut body = Vec::new();
-    loop {
-        let chunk = tokio::time::timeout_at(deadline, response.chunk())
-            .await
-            .ok()?
-            .ok()?;
-        match chunk {
-            Some(part) => {
-                if body.len().saturating_add(part.len()) > MAX_INVENTORY_BYTES {
-                    return None;
-                }
-                body.extend_from_slice(&part);
-            }
-            None => break,
-        }
-    }
-    let value: Value = serde_json::from_slice(&body).ok()?;
-    // OpenAI-compatible list shape `{object: "list", data: [{id}]}`;
-    // tolerate a bare array of `{id}` entries too.
-    let items = if let Some(data) = value.get("data").and_then(Value::as_array) {
-        data.clone()
-    } else {
-        value.as_array()?.clone()
-    };
-    Some(
-        items
-            .iter()
-            .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
-            .collect(),
-    )
-}
-
-/// Verify the effective adopted provider before inference: the exact
-/// provider identity, package and base URL from `GET /api/provider`, the
-/// exact frozen provider/model pair selected locally from `GET /api/model`,
-/// and the
-/// frozen limits against observed ones, plus the backend's own passive
-/// inventory. Every failure reason is short and non-secret: reasons are
-/// persisted in the daemon outcome, so they never carry endpoints, ids,
-/// values, or secrets. A known mismatch is `profile_error` (project
-/// overrides must not retarget the route); transport ambiguity is
-/// `unknown`. An unreachable backend is `profile_error`, never a silent
-/// pass: the start cannot infer without it. Absent observed provider fields
-/// report unavailable honestly instead of failing, and only nonsecret
-/// observations enter the fragment — never a resolved key or raw
-/// configuration.
-async fn verify_local_effective(
-    http: &OpenCodeHttp,
-    local: &LocalProvider,
-    backend_key: Option<&str>,
-    deadline: Instant,
-) -> Result<Value> {
-    let provider = http
-        .get_provider(&local.provider_id, deadline)
-        .await
-        .map_err(|_| Error::new("unknown", "adopted provider readback unresolved"))?;
-    if let Some(observed) = provider.id.as_deref()
-        && observed != local.provider_id
-    {
-        return Err(Error::new("profile_error", "effective provider mismatch"));
-    }
-    let mut unavailable = Vec::new();
-    let observed_package = provider.package.clone();
-    if let Some(observed) = observed_package.as_deref() {
-        if observed != local.package {
-            return Err(Error::new(
-                "profile_error",
-                "effective provider package mismatch",
-            ));
-        }
-    } else {
-        unavailable.push("package");
-    }
-    let observed_base = provider
-        .settings
-        .as_ref()
-        .and_then(|settings| settings.base_url.clone());
-    if let Some(observed) = observed_base.as_deref() {
-        if normalize_endpoint(observed) != normalize_endpoint(&local.base_url) {
-            return Err(Error::new(
-                "profile_error",
-                "effective provider endpoint mismatch",
-            ));
-        }
-    } else {
-        unavailable.push("baseURL");
-    }
-    let key_observed = provider
-        .settings
-        .as_ref()
-        .is_some_and(|settings| settings.api_key.is_some());
-    let models = http
-        .list_native_models(deadline)
-        .await
-        .map_err(|_| Error::new("unknown", "adopted provider readback unresolved"))?;
-    // Exact pair: the frozen provider id AND the frozen API model id must
-    // name one catalogue row. Identical model ids under other providers
-    // never satisfy this readback, so an unrelated row cannot conceal an
-    // absent model or the wrong limits.
-    let requested = format!("{}/{}", local.provider_id, local.api_model_id);
-    let entry = catalogue_entry(&models, &requested)
-        .ok_or_else(|| Error::new("profile_error", "effective catalogue mismatch"))?;
-    let mut limits_unavailable = Vec::new();
-    if let Some(limit) = entry.limit.as_ref() {
-        match limit.context {
-            Some(observed) if observed != local.context_limit => {
-                return Err(Error::new(
-                    "profile_error",
-                    "effective context limit mismatch",
-                ));
-            }
-            None => limits_unavailable.push("context"),
-            _ => {}
-        }
-        match limit.output {
-            Some(observed) if observed != local.output_limit => {
-                return Err(Error::new(
-                    "profile_error",
-                    "effective output limit mismatch",
-                ));
-            }
-            None => limits_unavailable.push("output"),
-            _ => {}
-        }
-    } else {
-        limits_unavailable.push("limit");
-    }
-    let backend_kind = BackendKind::parse(&local.backend)
-        .ok_or_else(|| Error::new("profile_error", "effective backend mismatch"))?;
-    let inventory =
-        match fetch_backend_inventory(&local.base_url, backend_kind, backend_key, deadline).await {
-            None => {
-                return Err(Error::new("profile_error", "adopted backend unreachable"));
-            }
-            Some(ids) if ids.iter().any(|id| id == &local.api_model_id) => "matched",
-            Some(_) => {
-                return Err(Error::new(
-                    "profile_error",
-                    "adopted backend inventory mismatch",
-                ));
-            }
-        };
-    Ok(json!({
-        "backend": local.backend,
-        "backend_hint": backend_kind.metadata_hint(),
-        "provider_id": local.provider_id,
-        "provider_package": local.package,
-        "provider_base_url": local.base_url,
-        "api_model_id": local.api_model_id,
-        "context_limit": local.context_limit,
-        "output_limit": local.output_limit,
-        "key_mode": local.api_key_env.as_ref().map(|name| format!("env:{name}")).unwrap_or("none".to_owned()),
-        "observed_package": observed_package,
-        "observed_base_url": observed_base,
-        "key_observed": key_observed,
-        "catalogue_model_present": true,
-        "limits_unavailable": limits_unavailable,
-        "provider_unavailable": unavailable,
-        "readback_complete": unavailable.is_empty() && limits_unavailable.is_empty(),
-        "inventory": inventory,
-    }))
-}
-
+// Native provider fragments never call the custom endpoint directly:
+// readiness is the OpenCode native catalogue (`GET /api/provider`,
+// `GET /api/model`), and an unreachable endpoint surfaces as the native
+// turn error, never as a start failure.
 /// A configure model/effort request: at least one of the two is present.
 /// A requested model switches the session model; a requested effort
 /// selects the documented `Model.Ref.variant` on that switch. Model and
@@ -5096,15 +4851,13 @@ fn opencode_manifest() -> PluginManifest {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendKind, DAEMON_START_TIMEOUT, LocalProvider, McpSettle, OpenCodeHttp, OpenCodePlugin,
-        PhaseFailure, START_CLEANUP_BUDGET, START_ENVELOPE, START_SETTLE_RESERVE,
-        SWARM_MCP_SERVER_NAME, StartAdmission, StartPhase, catalogue_contains, catalogue_entry,
-        catalogue_variants, fetch_backend_inventory, local_key_value, mcp_names, mcp_settle,
-        normalize_endpoint, opencode_manifest, opencode_scope, parse_configure_model,
-        parse_local_provider, phase_budget, phase_deadline, policy_from_snapshot,
-        presession_reason, split_model, start_auth_selector, start_config_override,
-        start_failure_is_proven_no_effect, start_model_ref, verify_local_effective,
-        verify_managed_mcp_transport, winning_managed_mcp_server,
+        DAEMON_START_TIMEOUT, McpSettle, OpenCodePlugin, PhaseFailure, START_CLEANUP_BUDGET,
+        START_ENVELOPE, START_SETTLE_RESERVE, SWARM_MCP_SERVER_NAME, StartAdmission, StartPhase,
+        catalogue_contains, catalogue_entry, catalogue_variants, mcp_names, mcp_settle,
+        opencode_manifest, opencode_scope, parse_configure_model, phase_budget, phase_deadline,
+        policy_from_snapshot, presession_reason, split_model, start_auth_selector,
+        start_config_override, start_failure_is_proven_no_effect, start_local_provider,
+        start_model_ref, verify_managed_mcp_transport, winning_managed_mcp_server,
     };
     use crate::native::server::READINESS_TIMEOUT;
     use crate::native::types::{
@@ -6042,375 +5795,101 @@ mod tests {
         );
     }
 
-    fn local_profile(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    fn fragment_profile(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
         value.as_object().expect("object").clone()
     }
 
-    fn local_model_ref() -> crate::native::types::ModelRef {
-        crate::native::types::ModelRef {
-            id: "qwen3-8b".to_owned(),
-            provider_id: "eliot-local".to_owned(),
-            variant: None,
-        }
+    fn fragment_doc() -> serde_json::Value {
+        serde_json::json!({
+            "id": "k173d-fixture",
+            "package": "@ai-sdk/openai-compatible",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "api_key_env": "K173D_PROOF_KEY",
+            "models": [{"id": "test-model"}],
+        })
     }
 
     #[test]
-    fn local_provider_parses_frozen_fields_with_env_key_or_no_auth() {
-        let profile = local_profile(json!({
-            "model": "eliot-local/qwen3-8b",
-            "provider_base_url": "http://127.0.0.1:1234/v1",
-            "backend": "lmstudio",
-            "context_limit": 131072,
-            "output_limit": 8192,
+    fn retained_local_provider_requires_typed_fields_and_frozen_key_admission() {
+        let profile = fragment_profile(serde_json::json!({
+            "model": "k173d-fixture/test-model",
+            "local_provider": fragment_doc(),
+            "pass_env": ["K173D_PROOF_KEY"],
         }));
-        let local = parse_local_provider(&profile, &local_model_ref())
-            .expect("no-auth local")
+        let fragment = start_local_provider(&profile)
+            .expect("fragment")
             .expect("present");
-        assert_eq!(local.provider_id, "eliot-local");
-        assert_eq!(local.api_model_id, "qwen3-8b");
-        assert_eq!(local.base_url, "http://127.0.0.1:1234/v1");
-        assert_eq!(local.backend, "lmstudio");
-        assert_eq!(local.api_key_env, None);
+        assert_eq!(fragment.id, "k173d-fixture");
+        let mut malformed = profile.clone();
+        malformed.remove("pass_env");
+        assert!(start_local_provider(&malformed).is_err());
+        malformed.insert("pass_env".to_owned(), json!(["K173D_PROOF_KEY", 9]));
+        assert!(start_local_provider(&malformed).is_err());
+        malformed.insert("pass_env".to_owned(), json!(["ELIOT_AGENT_TOKEN"]));
+        malformed.get_mut("local_provider").unwrap()["api_key_env"] = json!("ELIOT_AGENT_TOKEN");
+        assert!(start_local_provider(&malformed).is_err());
+        let mut legacy = profile.clone();
+        legacy.insert("provider".to_owned(), json!({}));
+        assert!(start_local_provider(&legacy).is_err());
 
-        let profile = local_profile(json!({
-            "provider_base_url": "http://127.0.0.1:8080/v1",
-            "backend": "llama.cpp",
-            "api_key_env": "LOCAL_LLM_KEY",
-            "context_limit": 65536,
-            "output_limit": 4096,
-            "provider_package": "@opencode/ai/providers/openai-compatible",
-        }));
-        let local = parse_local_provider(&profile, &local_model_ref())
-            .expect("env-key local")
-            .expect("present");
-        assert_eq!(local.api_key_env.as_deref(), Some("LOCAL_LLM_KEY"));
-
-        // Cloud profiles carry no local provider.
-        let profile =
-            local_profile(json!({"model": "openrouter/m", "auth_integration": "openrouter"}));
-        let cloud_ref = crate::native::types::ModelRef {
-            id: "m".to_owned(),
-            provider_id: "openrouter".to_owned(),
-            variant: None,
-        };
-        assert!(
-            parse_local_provider(&profile, &cloud_ref)
-                .expect("cloud")
-                .is_none()
+        // Cloud profiles carry no fragment.
+        let cloud = fragment_profile(
+            serde_json::json!({ "model": "openrouter/m", "auth_integration": "openrouter" }),
         );
-    }
-
-    #[test]
-    fn local_provider_rejects_mixed_partial_and_wrong_package() {
-        // A canonical credential must never ride the local path.
-        let profile = local_profile(json!({
-            "provider_base_url": "http://127.0.0.1:8080",
-            "backend": "ollama",
-            "context_limit": 32768,
-            "output_limit": 4096,
+        assert!(start_local_provider(&cloud).expect("cloud").is_none());
+        // Mixed auth refuses.
+        let mixed = fragment_profile(serde_json::json!({
+            "model": "k173d-fixture/test-model",
+            "local_provider": fragment_doc(),
             "auth_integration": "openrouter",
+            "pass_env": ["K173D_PROOF_KEY"],
         }));
         assert_eq!(
-            parse_local_provider(&profile, &local_model_ref())
-                .expect_err("mixed auth")
-                .code,
+            start_local_provider(&mixed).expect_err("mixed").code,
             "profile_error"
         );
-        // The dedicated provider segment is required.
-        let foreign = crate::native::types::ModelRef {
-            id: "m".to_owned(),
-            provider_id: "openrouter".to_owned(),
-            variant: None,
-        };
-        let profile = local_profile(json!({
-            "provider_base_url": "http://127.0.0.1:8080",
-            "backend": "ollama",
-            "context_limit": 32768,
-            "output_limit": 4096,
-        }));
+        // Missing model refuses.
+        let no_model = fragment_profile(serde_json::json!({ "local_provider": fragment_doc() }));
         assert_eq!(
-            parse_local_provider(&profile, &foreign)
-                .expect_err("foreign provider")
-                .code,
+            start_local_provider(&no_model).expect_err("no model").code,
             "profile_error"
         );
-        // Partial local fields fail closed, never fall back.
-        for value in [
-            json!({"provider_base_url": "http://127.0.0.1:8080"}),
-            json!({"backend": "ollama"}),
-            json!({"context_limit": 32768}),
-            json!({"output_limit": 4096}),
-            json!({"provider_base_url": "", "backend": "ollama", "context_limit": 1, "output_limit": 1}),
-            json!({"provider_base_url": "ftp://127.0.0.1:8080", "backend": "ollama", "context_limit": 1, "output_limit": 1}),
-            json!({"provider_base_url": "http://127.0.0.1:8080", "backend": "unknown-rt", "context_limit": 1, "output_limit": 1}),
-            json!({"provider_base_url": "http://127.0.0.1:8080", "backend": "ollama", "context_limit": 0, "output_limit": 1}),
-            json!({"provider_base_url": "http://127.0.0.1:8080", "backend": "ollama", "context_limit": 1, "provider_package": "other/package"}),
-        ] {
-            assert!(
-                parse_local_provider(&local_profile(value), &local_model_ref()).is_err(),
-                "partial local must fail"
-            );
-        }
+        // Empty fragment refuses.
+        let empty = fragment_profile(
+            serde_json::json!({ "model": "k173d-fixture/test-model", "local_provider": {} }),
+        );
+        assert_eq!(
+            start_local_provider(&empty).expect_err("empty").code,
+            "profile_error"
+        );
     }
 
     #[test]
-    fn local_auth_selector_is_absent_while_cloud_requires_a_selector() {
-        let cloud = local_profile(json!({"auth_integration": "openrouter"}));
+    fn fragment_auth_selector_is_absent_while_cloud_requires_a_selector() {
+        let cloud = fragment_profile(serde_json::json!({ "auth_integration": "openrouter" }));
         assert!(start_auth_selector(&cloud, false).expect("cloud").is_some());
-        // `err()` (not `expect_err`) because the selector type deliberately
-        // has no `Debug` so a caller bug cannot log whatever was passed in.
         assert_eq!(
-            start_auth_selector(&local_profile(json!({})), false)
+            start_auth_selector(&fragment_profile(serde_json::json!({})), false)
                 .err()
                 .expect("missing cloud selector")
                 .code,
             "profile_error"
         );
-        // Local refuses a canonical selector instead of importing it.
-        let mixed = local_profile(json!({"auth_integration": "openrouter"}));
+        let mixed = fragment_profile(serde_json::json!({ "auth_integration": "openrouter" }));
         assert_eq!(
             start_auth_selector(&mixed, true)
                 .err()
-                .expect("local mixed auth")
+                .expect("fragment mixed auth")
                 .code,
             "profile_error"
         );
         assert!(
-            start_auth_selector(&local_profile(json!({})), true)
-                .expect("local none")
+            start_auth_selector(&fragment_profile(serde_json::json!({})), true)
+                .expect("fragment none")
                 .is_none()
         );
     }
 
-    #[test]
-    fn endpoint_normalization_trims_only_trailing_slashes() {
-        assert_eq!(
-            normalize_endpoint("http://127.0.0.1:1234/v1/"),
-            "http://127.0.0.1:1234/v1"
-        );
-        assert_eq!(
-            normalize_endpoint("http://127.0.0.1:1234/v1"),
-            "http://127.0.0.1:1234/v1"
-        );
-    }
-
-    #[test]
-    fn backend_key_resolves_only_non_empty_runtime_values() {
-        use std::ffi::OsString;
-        let environment = vec![
-            (
-                OsString::from("LOCAL_LLM_KEY"),
-                OsString::from("secret-value"),
-            ),
-            (OsString::from("EMPTY_KEY"), OsString::from("   ")),
-        ];
-        assert_eq!(
-            local_key_value(&environment, Some("LOCAL_LLM_KEY")),
-            Some("secret-value")
-        );
-        assert_eq!(local_key_value(&environment, Some("EMPTY_KEY")), None);
-        assert_eq!(local_key_value(&environment, Some("MISSING")), None);
-        assert_eq!(local_key_value(&environment, None), None);
-    }
-
-    /// A closed loopback port: binds are released before use, so connects
-    /// are refused fast with no listener, no redirect and no leak.
-    async fn closed_loopback_port() -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("closed-port bind");
-        let port = listener.local_addr().expect("closed-port addr").port();
-        drop(listener);
-        port
-    }
-
-    /// A minimal stub of the owned OpenCode server: answers the two
-    /// readback routes the adopted-backend gate needs, nothing else.
-    async fn stub_owned_provider_server(
-        provider_body: String,
-        model_body: String,
-    ) -> (tokio::task::JoinHandle<()>, u16) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("stub bind");
-        let port = listener.local_addr().expect("stub addr").port();
-        let handle = tokio::spawn(async move {
-            for _ in 0..2 {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut head = Vec::new();
-                let mut byte = [0u8; 1];
-                loop {
-                    use tokio::io::AsyncReadExt;
-                    match stream.read(&mut byte).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            head.push(byte[0]);
-                            if head.len() >= 4 && head[head.len() - 4..] == *b"\r\n\r\n" {
-                                break;
-                            }
-                            if head.len() > 8192 {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let body = if head.starts_with(b"GET /api/provider/") {
-                    &provider_body
-                } else {
-                    &model_body
-                };
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                use tokio::io::AsyncWriteExt;
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
-        (handle, port)
-    }
-
-    fn local_fixture(base_url: &str) -> LocalProvider {
-        LocalProvider {
-            provider_id: "eliot-local".to_owned(),
-            api_model_id: "test-model".to_owned(),
-            base_url: base_url.to_owned(),
-            api_key_env: None,
-            context_limit: 1000,
-            output_limit: 100,
-            backend: "generic".to_owned(),
-            package: "@opencode/ai/providers/openai-compatible".to_owned(),
-        }
-    }
-
-    #[tokio::test]
-    async fn backend_inventory_unreachable_reports_none() {
-        let closed = closed_loopback_port().await;
-        let base = format!("http://127.0.0.1:{closed}/v1");
-        let deadline = super::Instant::now() + std::time::Duration::from_secs(10);
-        // No listener: refused fast, with or without a key reference (the
-        // key is never sent when the endpoint is unreachable).
-        assert_eq!(
-            fetch_backend_inventory(&base, BackendKind::Generic, None, deadline).await,
-            None
-        );
-        assert_eq!(
-            fetch_backend_inventory(
-                &base,
-                BackendKind::Generic,
-                Some("LOCAL_TEST_KEY"),
-                deadline
-            )
-            .await,
-            None
-        );
-    }
-
-    /// The live 20261114 finding: with no backend listening, the launch
-    /// used to stash an unknown session (Agent stuck `starting`, plugin and
-    /// children alive, capacity held). The verification gate that runs
-    /// before any native session is created must fail definitely instead.
-    #[tokio::test]
-    async fn unreachable_backend_fails_before_any_native_session() {
-        let closed = closed_loopback_port().await;
-        let (stub, port) = stub_owned_provider_server(
-            format!(
-                "{{\"data\":{{\"id\":\"eliot-local\",\"package\":\"@opencode/ai/providers/openai-compatible\",\"settings\":{{\"baseURL\":\"http://127.0.0.1:{closed}/v1\"}}}}}}"
-            ),
-            "{\"data\":[{\"id\":\"test-model\",\"providerID\":\"eliot-local\",\"limit\":{\"context\":1000,\"output\":100}}]}".to_owned(),
-        )
-        .await;
-        let dir = std::env::temp_dir();
-        let http = OpenCodeHttp::new(port, "test-password".to_owned(), &dir).expect("stub client");
-        let local = local_fixture(&format!("http://127.0.0.1:{closed}/v1"));
-        let error = verify_local_effective(
-            &http,
-            &local,
-            None,
-            super::Instant::now() + std::time::Duration::from_secs(10),
-        )
-        .await
-        .expect_err("unreachable backend must fail the start gate");
-        assert_eq!(error.code, "profile_error");
-        assert_eq!(error.message.as_str(), "adopted backend unreachable");
-        // The short safe reason carries no endpoint, id, value or secret.
-        assert!(!error.message.contains("127.0.0.1"));
-        assert!(!error.message.contains("test-model"));
-        stub.abort();
-    }
-
-    /// The healthy path is unchanged: a listening backend whose inventory
-    /// lists the frozen model passes the gate with the fragment merged.
-    #[tokio::test]
-    async fn reachable_backend_with_matching_inventory_passes() {
-        let backend = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("backend bind");
-        let backend_port = backend.local_addr().expect("backend addr").port();
-        let backend_task = tokio::spawn(async move {
-            let Ok((mut stream, _)) = backend.accept().await else {
-                return;
-            };
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            loop {
-                use tokio::io::AsyncReadExt;
-                match stream.read(&mut byte).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        head.push(byte[0]);
-                        if head.len() >= 4 && head[head.len() - 4..] == *b"\r\n\r\n" {
-                            break;
-                        }
-                        if head.len() > 8192 {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            let body =
-                "{\"object\":\"list\",\"data\":[{\"id\":\"test-model\",\"object\":\"model\"}]}";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            use tokio::io::AsyncWriteExt;
-            let _ = stream.write_all(response.as_bytes()).await;
-        });
-        let (stub, port) = stub_owned_provider_server(
-            format!(
-                "{{\"data\":{{\"id\":\"eliot-local\",\"package\":\"@opencode/ai/providers/openai-compatible\",\"settings\":{{\"baseURL\":\"http://127.0.0.1:{backend_port}/v1\"}}}}}}"
-            ),
-            "{\"data\":[{\"id\":\"test-model\",\"providerID\":\"eliot-local\",\"limit\":{\"context\":1000,\"output\":100}}]}".to_owned(),
-        )
-        .await;
-        let dir = std::env::temp_dir();
-        let http = OpenCodeHttp::new(port, "test-password".to_owned(), &dir).expect("stub client");
-        let local = local_fixture(&format!("http://127.0.0.1:{backend_port}/v1"));
-        let fragment = verify_local_effective(
-            &http,
-            &local,
-            None,
-            super::Instant::now() + std::time::Duration::from_secs(10),
-        )
-        .await
-        .expect("healthy backend passes");
-        assert_eq!(fragment["inventory"], "matched");
-        assert_eq!(
-            fragment["provider_base_url"],
-            format!("http://127.0.0.1:{backend_port}/v1")
-        );
-        stub.abort();
-        backend_task.abort();
-    }
-
-    /// Proven-no-effect failures return the daemon-honored failed-state
-    /// value (never an error): the same start replays the value without new
-    /// native I/O, and any other start is refused.
     #[test]
     fn proven_no_effect_start_returns_failed_state_and_replays() {
         let params = AgentStartParams::new("agent-1", 7, "0199-start-1");
@@ -6418,13 +5897,13 @@ mod tests {
         let value = plugin.retain_proven_no_effect_start(
             &params,
             StartPhase::Verify,
-            eliot_core::Error::new("native_readback", "adopted backend unreachable"),
+            eliot_core::Error::new("native_readback", "native catalogue unreachable"),
         );
         assert_eq!(value["state"], "failed");
         assert_eq!(value["agent_id"], "agent-1");
         assert_eq!(value["generation"], 7);
         assert_eq!(value["command_id"], "0199-start-1");
-        assert_eq!(value["reason"], "adopted backend unreachable");
+        assert_eq!(value["reason"], "native catalogue unreachable");
         match plugin
             .start_replay_admission(&params)
             .expect("admission")
@@ -6686,5 +6165,65 @@ mod tests {
         assert!(eliot_plugin::start_classification::is_proven_no_effect(
             eliot_plugin::start_classification::StartPoint::NativeRefusalBeforeDispatch
         ));
+    }
+
+    #[test]
+    fn fragment_membership_rule_matches_configure_and_resume() {
+        use super::{local_provider_contains, retained_eliot_local_migration};
+        use eliot_core::local_provider::LocalProvider;
+        let fragment: LocalProvider = serde_json::from_value(json!({
+            "id": "k173d-fixture", "package": "@ai-sdk/openai-compatible",
+            "base_url": "http://127.0.0.1:1234", "models": [{"id": "m"}],
+        }))
+        .expect("typed provider");
+        assert!(local_provider_contains(&fragment, "k173d-fixture/m"));
+        assert!(!local_provider_contains(&fragment, "k173d-fixture/other"));
+        // A catalog-listed model outside the fragment refuses on both paths.
+        assert!(!local_provider_contains(&fragment, "openrouter/m"));
+        // Retained eliot-local profiles name the migration, not auth.
+        let retained: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
+            "harness": "opencode",
+            "model": "eliot-local/qwen3-8b",
+        }))
+        .expect("retained snapshot decodes");
+        let migration = retained_eliot_local_migration(&retained).expect("migration error");
+        assert_eq!(migration.code, "profile_error");
+        assert!(migration.message.contains("local_provider"));
+        let old_fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(json!({
+                "harness": "opencode",
+                "model": "k173d-fixture/m",
+                "provider_base_url": "http://127.0.0.1:1234/v1",
+            }))
+            .expect("old snapshot decodes");
+        assert!(retained_eliot_local_migration(&old_fields).is_some());
+        // Ordinary cloud profiles carry no migration.
+        let cloud: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
+            "harness": "opencode",
+            "model": "openrouter/m",
+            "auth_integration": "openrouter",
+        }))
+        .expect("cloud snapshot decodes");
+        assert!(retained_eliot_local_migration(&cloud).is_none());
+    }
+
+    #[test]
+    fn ready_result_carries_catalogue_limits_with_unknown_for_omitted() {
+        // The ready gate copies the matching catalogue row's limits; omitted
+        // values stay unknown (null), never zero.
+        let with_limits: Vec<NativeModelEntry> = serde_json::from_value(json!([
+            {"providerID": "k173d-fixture", "id": "test-model",
+             "limit": {"context": 131072, "output": 8192}},
+            {"providerID": "k173d-fixture", "id": "nolimit"},
+        ]))
+        .expect("catalogue decodes");
+        let entry =
+            super::catalogue_entry(&with_limits, "k173d-fixture/test-model").expect("row present");
+        let limit = entry.limit.as_ref().expect("limits present");
+        assert_eq!(limit.context, Some(131072));
+        assert_eq!(limit.output, Some(8192));
+        let missing =
+            super::catalogue_entry(&with_limits, "k173d-fixture/nolimit").expect("row present");
+        assert!(missing.limit.is_none());
     }
 }

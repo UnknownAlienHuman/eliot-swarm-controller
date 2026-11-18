@@ -312,42 +312,43 @@ permissions stay unknown (`null` / unverified) until a real native tool probe co
 posture. `collaboration_mode` and `approval_policy`
 presets stay rejected. See the [Muse page](../harnesses/muse.md).
 
-An OpenCode adopted-backend profile points one frozen profile at a local
+An OpenCode custom-provider profile points one frozen profile at a local
 OpenAI-compatible endpoint instead of a canonical integration:
 
 ```toml
 [profiles.opencode-local]
 harness = "opencode"
 cmd = "C:/Tools/OpenCode/opencode.exe"
-model = "eliot-local/qwen3-8b"
-provider_base_url = "http://127.0.0.1:1234/v1"
-backend = "lmstudio"
-context_limit = 131072
-output_limit = 8192
-# api_key_env = "LOCAL_LLM_KEY"  # plus a pass_env entry, when the backend needs a key
-# pass_env = ["LOCAL_LLM_KEY"]
+model = "k173d-fixture/test-model"
+pass_env = ["LOCAL_LLM_KEY"]
+
+[profiles.opencode-local.local_provider]
+id = "k173d-fixture"
+package = "@ai-sdk/openai-compatible"
+base_url = "http://127.0.0.1:1234/v1"
+api_key_env = "LOCAL_LLM_KEY"
+models = [{ id = "test-model", context_limit = 32768, output_limit = 4096 }]
 ```
 
-`backend` is one preset through the single OpenCode provider path:
-`strata`, `unsloth`, `lmstudio`, `llama.cpp`, `ollama`, `vllm` or `generic`
-(Ollama and vLLM reuse the same path, not separate executors). `model` must
-use the dedicated `eliot-local` provider segment, which has no canonical
-alias. `api_key_env` names one `pass_env`-allowed environment holding the
-backend key; absent means explicit no-auth mode, and a missing or empty
-required key refuses before startup instead of silently becoming no-auth.
-`auth_integration` must be absent on this path so no unrelated canonical
-credential is imported. `context_limit` and `output_limit` are the explicit
-effective limits; the plugin renders them with the installed
-`@opencode/ai/providers/openai-compatible` package and verifies the
-effective provider, catalogue entry, limits and passive backend inventory
-before any native session is created — every verification failure
-(including an unreachable backend) settles the launch as failed with a
-short safe reason, never unknown — rejecting project overrides that
-retarget the route.
+`model` is the exact `provider/model` string (model IDs may contain slash
+segments). Swarm generates the isolated
+OpenCode provider entry from `local_provider`: `base_url` becomes
+`settings.baseURL`, `api_key_env` becomes a `{env:NAME}` runtime reference,
+and each model record supplies its native model limits. The typed shape is
+validated at freeze, retained admission, and before every write; unknown
+fields, literal credentials, URL userinfo/query/fragment components, and
+substitutions are refused. `api_key_env` must be listed in `pass_env`, and
+`auth_integration` must be absent, so no unrelated canonical credential is
+imported. The adapter sets `OPENCODE_CONFIG_PROJECT_DISABLE` and strips
+`OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, and `OPENCODE_CONFIG_DIR` for the
+server and both preview readers. The plugin checks the exact model pair through the live `GET /api/model`
+catalogue before creating a session. An unreachable endpoint can still be
+listed and reports its failure on the native turn. Each named profile is a
+separate picker preset with its frozen model and effort. OpenCode catalogue
+failures share one bounded entry.
 There is no harness/model/account fallback. Codex profiles against these
-backends stay `unsupported` until readiness, catalog/context, history and
-exact tool formats are resolved separately. See the
-[OpenCode harness page](../harnesses/opencode.md#adopted-local-backends).
+endpoints stay `unsupported`. See the
+[OpenCode harness page](../harnesses/opencode.md#typed-local-providers).
 
 ### Worker MCP policy
 
@@ -418,8 +419,11 @@ servers. By harness:
 - OpenCode serves the isolated per-Agent config (only the Agent-scoped
   server) under isolated `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, but the
   workspace project layer (`opencode.json`/`opencode.jsonc`) still merges
-  natively, so every start scans that layer pre-create (pre-touch on
-  resume) for owner-identity entries and refuses the start on a match.
+  natively on the cloud path, so every start scans that layer pre-create
+  (pre-touch on resume) for owner-identity entries and refuses the start on
+  a match. Fragment sessions additionally run under the native
+  project-config disable switch, so project layers never load there; the
+  file scan still runs as a fail-closed backstop.
   The settled inventory is then gated: `minimal` refuses any serving
   unexpected server, `inherit` refuses reserved Swarm names, and
   `mcp_servers_verified` is reported only after the gate passes with the

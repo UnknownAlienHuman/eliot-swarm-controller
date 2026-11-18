@@ -273,6 +273,7 @@ impl DesktopApp {
                         ItemKind::Model {
                             harness,
                             model: Some(id),
+                            ..
                         } => titles
                             .get(&(harness.as_str(), id.as_str()))
                             .copied()

@@ -30,9 +30,10 @@ pub(crate) async fn read(raw: &Value) -> Result<Value> {
     let params = q::decode(raw)?;
     let profile = &params.profile;
     let selector = profile.get("auth_integration").and_then(Value::as_str);
-    if profile.get("provider_base_url").is_some() || profile.get("backend").is_some() {
+    // A retired provider fragment also has no native quota route.
+    if profile.get("local_provider").is_some() || profile.get("provider").is_some() {
         return Ok(
-            json!({"status":"unsupported","note":"Adopted OpenCode backend has no verified provider quota reader","details":{}}),
+            json!({"status":"unsupported","note":"The local OpenCode provider has no verified quota reader","details":{}}),
         );
     }
     if selector == Some("opencode-go") {
@@ -135,10 +136,12 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn omitted_and_adopted_selectors_do_not_read_go_quota() {
+    async fn local_providers_and_omitted_selectors_do_not_read_go_quota() {
         for profile in [
-            json!({"provider_base_url":"http://127.0.0.1:1234/v1","backend":"lmstudio"}),
-            json!({"provider_base_url":"http://127.0.0.1:1234/v1","auth_integration":"opencode-go"}),
+            json!({"local_provider":{"id":"local","package":"p","base_url":"http://localhost/v1","models":[{"id":"m"}]}}),
+            json!({"local_provider":{"id":"local"},"auth_integration":"opencode-go"}),
+            json!({"provider":{"k173d-fixture":{"package":"p"}}}),
+            json!({"provider":{"k173d-fixture":{"package":"p"}},"auth_integration":"opencode-go"}),
             json!({}),
         ] {
             let raw = json!({"profile":profile,"environment":{}});

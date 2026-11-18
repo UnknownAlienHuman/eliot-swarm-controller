@@ -548,12 +548,13 @@ pub struct ConfigModel {
 // Provider and model readback (adopted local backends)
 // ---------------------------------------------------------------------------
 
-/// `GET /api/provider/:providerID` subset for the adopted-backend check:
-/// the exact provider identity, the native package rendering the route, and
-/// the effective base URL. Unknown fields are ignored; a missing field
-/// reports unavailable, never a fabricated default.
+/// `GET /api/provider/:providerID` subset: the exact provider identity, the
+/// native package rendering the route, and the effective base URL. Unknown
+/// fields are ignored; a missing field reports unavailable, never a
+/// fabricated default.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct ProviderReadback {
     #[serde(default)]
     pub id: Option<String>,
@@ -568,6 +569,7 @@ pub struct ProviderReadback {
 /// resolved key can reach diagnostics, snapshots or logs.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct ProviderSettingsReadback {
     #[serde(default, rename = "baseURL")]
     pub base_url: Option<String>,

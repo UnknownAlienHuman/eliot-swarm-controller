@@ -286,21 +286,26 @@ fn editability(source: &str, policy: &SecretPolicy) -> Option<&'static str> {
             );
         }
     };
-    if has_credentialed_url(&config, source) {
+    if has_unsafe_profile_or_proxy(&config) {
         return Some("the profiles fail the daemon's strict validation; edit config.toml directly");
     }
     None
 }
 
-/// Profiles or adopted proxies whose URL fields carry credentials (userinfo,
-/// query, fragment) must never be handed to the editor as safe source.
-fn has_credentialed_url(config: &super::FileConfig, source: &str) -> bool {
+/// Keep unsafe provider configuration and credential-bearing proxy URLs out
+/// of the profile editor.
+fn has_unsafe_profile_or_proxy(config: &super::FileConfig) -> bool {
     config.profiles.values().any(|entry| {
-        entry
-            .get_ref()
-            .provider_base_url
-            .as_deref()
-            .is_some_and(|raw| super::validate_provider_base_url("", raw, source, 0).is_err())
+        let entry = entry.get_ref();
+        entry.local_provider.as_ref().is_some_and(|provider| {
+            let pass_env: Vec<_> = entry
+                .pass_env
+                .iter()
+                .flatten()
+                .map(|name| name.trim().to_owned())
+                .collect();
+            provider.validate(&pass_env).is_err()
+        })
     }) || config.proxies.iter().any(|(name, entry)| {
         let proxy = entry.get_ref();
         core::RouteBinding {

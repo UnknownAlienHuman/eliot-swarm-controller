@@ -1,5 +1,4 @@
 pub(crate) mod auth;
-pub(crate) mod backends;
 pub(crate) mod client;
 pub(crate) mod models;
 pub(crate) mod requests;
@@ -10,9 +9,63 @@ pub(crate) mod types;
 pub(crate) mod usage;
 
 pub(crate) use auth::{
-    AuthSetup, AuthTransfer, IntegrationSelector, ensure_no_credential_for_provider,
-    transfer_selected_integration,
+    AuthSetup, AuthTransfer, IntegrationSelector, transfer_selected_integration,
 };
-pub(crate) use backends::BackendKind;
 pub(crate) use client::{HttpOutcome, OpenCodeHttp};
-pub(crate) use server::{LocalProvider, OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch};
+pub(crate) use server::{OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch};
+
+/// Use the same isolated config discovery for serve and both model readers.
+pub(crate) fn apply_environment(
+    command: &mut tokio::process::Command,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    local_provider: bool,
+) {
+    if local_provider {
+        const OVERRIDES: &[&str] = &[
+            "OPENCODE_CONFIG",
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_CONFIG_DIR",
+            "OPENCODE_CONFIG_PROJECT_DISABLE",
+        ];
+        command
+            .env_clear()
+            .envs(environment.iter().filter_map(|(name, value)| {
+                let is_override = OVERRIDES.iter().any(|key| name.eq_ignore_ascii_case(key));
+                (!is_override).then_some((name, value))
+            }));
+        command.env("OPENCODE_CONFIG_PROJECT_DISABLE", "1");
+    } else {
+        command.envs(environment.iter().map(|(name, value)| (name, value)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_environment;
+    use std::ffi::OsString;
+
+    #[test]
+    fn local_provider_processes_disable_project_config_and_strip_explicit_overrides() {
+        let environment = [
+            ("OPENCODE_CONFIG", "file"),
+            ("opencode_config_content", "inline"),
+            ("OPENCODE_CONFIG_DIR", "directory"),
+            ("OPENCODE_CONFIG_PROJECT_DISABLE", "0"),
+            ("LOCAL_API_KEY", "sample-value"),
+        ]
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+        let mut command = tokio::process::Command::new("opencode");
+        apply_environment(&mut command, &environment, true);
+        let vars = command.as_std().get_envs().collect::<Vec<_>>();
+        assert_eq!(vars.len(), 2);
+        assert!(vars.contains(&("LOCAL_API_KEY".as_ref(), Some("sample-value".as_ref()))));
+        assert!(vars.contains(&(
+            "OPENCODE_CONFIG_PROJECT_DISABLE".as_ref(),
+            Some("1".as_ref())
+        )));
+
+        let mut cloud = tokio::process::Command::new("opencode");
+        apply_environment(&mut cloud, &environment, false);
+        assert_eq!(cloud.as_std().get_envs().count(), environment.len());
+    }
+}

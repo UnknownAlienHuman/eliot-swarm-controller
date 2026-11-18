@@ -14,6 +14,7 @@
 
 use std::{ffi::OsStr, path::Path, process::Stdio};
 
+use super::apply_environment;
 use eliot_core::api::harness::native_model_display_name;
 use eliot_core::{Error, Result};
 use eliot_plugin::native_lifecycle::kill_and_reap;
@@ -73,14 +74,15 @@ pub(crate) struct ReaderContext<'a> {
     pub workspace: &'a Path,
     pub environment: &'a [(std::ffi::OsString, std::ffi::OsString)],
     pub xdg: Option<(&'a Path, &'a Path)>,
+    /// Typed local-provider reads must not accept native config overrides.
+    pub local_provider: bool,
 }
 
 impl ReaderContext<'_> {
     fn command(&self, program: &OsStr) -> Command {
         let mut command = Command::new(program);
-        command
-            .current_dir(self.workspace)
-            .envs(self.environment.iter().cloned());
+        command.current_dir(self.workspace);
+        apply_environment(&mut command, self.environment, self.local_provider);
         if let Some((config_home, data_home)) = self.xdg {
             command
                 .env("XDG_CONFIG_HOME", config_home)
