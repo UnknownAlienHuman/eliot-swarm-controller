@@ -1408,24 +1408,43 @@ impl OpenCodePlugin {
             .await;
             return Err(self.retain_failed_start(&parsed.params, error));
         }
-        // Same-name transport proof: the inventory gate above only sees the
-        // entry name and status, while any inherited layer can replace the
-        // managed transport under that name. A serving managed entry must
-        // still run the exact generated transport; an unreadable effective
-        // config cannot prove that and fails the start closed with the
-        // created session killed, exactly like the gate above.
-        if mcp_inventory.as_deref().is_some_and(|servers| {
-            servers
-                .iter()
-                .any(|server| server.is_connected(SWARM_MCP_SERVER_NAME))
-        }) {
+        // Effective-configuration proofs: the inventory gate above only sees
+        // entry names and statuses. Managed, system and global layers merge
+        // natively above the project files the pre-create scan sees
+        // (managed settings load last and override everything), so the
+        // winning documents must prove two things. First, no effective
+        // `mcp.servers` entry carries the owner identity under ANY name: a
+        // differently named owner transport in a managed layer escapes both
+        // the file scan and the reserved-name inventory gate under
+        // `inherit`. Second, a serving (`connected` or `pending`) managed
+        // entry must still run the exact generated transport, since any
+        // inherited layer can replace the transport under that name. An
+        // unreadable effective config proves neither and fails the start
+        // closed with the created session killed, exactly like the gate
+        // above.
+        if mcp_inventory.is_some() {
             let expected_command = managed_mcp_command(parsed);
-            let transport = match session
+            let proof = match session
                 .http
                 .get_config(phase_deadline(envelope, RPC_TIMEOUT))
                 .await
             {
-                Ok(documents) => verify_managed_mcp_transport(&documents, &expected_command),
+                Ok(documents) => refuse_effective_owner_mcp(
+                    &documents,
+                    parsed.swarm_executable.to_str(),
+                    parsed.mcp_cloud_hostname.as_deref(),
+                )
+                .and_then(|()| {
+                    if mcp_inventory.as_deref().is_some_and(|servers| {
+                        servers
+                            .iter()
+                            .any(|server| server.is_serving(SWARM_MCP_SERVER_NAME))
+                    }) {
+                        verify_managed_mcp_transport(&documents, &expected_command)
+                    } else {
+                        Ok(())
+                    }
+                }),
                 Err(error) => Err(Error::new(
                     "profile_error",
                     format!(
@@ -1434,7 +1453,7 @@ impl OpenCodePlugin {
                     ),
                 )),
             };
-            if let Err(error) = transport {
+            if let Err(error) = proof {
                 let kill_note = delete_created_session(&mut session, &created.id, envelope).await;
                 let error = discard_failed_start(
                     &mut session,
@@ -2124,15 +2143,14 @@ impl OpenCodePlugin {
         let (mcp_servers, mcp_servers_verified, mcp_inventory) =
             observe_mcp_servers(&session.http, deadline).await;
         gate_mcp_inventory(mcp_inventory.as_deref(), parsed.requested_mcp_policy)?;
-        // Same proof as the create path: a serving managed entry must still
-        // run the exact generated transport. The retained session predates
-        // this generation, so an unreadable readback stays unknown while a
-        // proven transport mismatch fails the resume.
-        if mcp_inventory.as_deref().is_some_and(|servers| {
-            servers
-                .iter()
-                .any(|server| server.is_connected(SWARM_MCP_SERVER_NAME))
-        }) {
+        // Same proofs as the create path: no effective `mcp.servers` entry
+        // carries the owner identity under any name (managed layers merge
+        // above the project files), and a serving (`connected` or
+        // `pending`) managed entry still runs the exact generated
+        // transport. The retained session predates this generation, so an
+        // unreadable readback stays unknown while a proven owner hit or
+        // transport mismatch fails the resume.
+        if mcp_inventory.is_some() {
             let expected_command = managed_mcp_command(parsed);
             let documents = session.http.get_config(deadline).await.map_err(|error| {
                 Error::new(
@@ -2143,7 +2161,18 @@ impl OpenCodePlugin {
                     ),
                 )
             })?;
-            verify_managed_mcp_transport(&documents, &expected_command)?;
+            refuse_effective_owner_mcp(
+                &documents,
+                parsed.swarm_executable.to_str(),
+                parsed.mcp_cloud_hostname.as_deref(),
+            )?;
+            if mcp_inventory.as_deref().is_some_and(|servers| {
+                servers
+                    .iter()
+                    .any(|server| server.is_serving(SWARM_MCP_SERVER_NAME))
+            }) {
+                verify_managed_mcp_transport(&documents, &expected_command)?;
+            }
         }
         effective_value["mcp_servers"] = mcp_servers;
         effective_value["mcp_servers_verified"] = json!(mcp_servers_verified);
@@ -3808,6 +3837,60 @@ fn refuse_owner_project_mcp(
     Ok(())
 }
 
+/// Refuse the start when any effective `mcp.servers` entry carries the
+/// owner Swarm identity under any name. The pre-create file scan only sees
+/// project layers, but managed, system, global and integration layers also
+/// merge natively (managed settings load last and override everything in
+/// `packages/core/src/config.ts`), so a differently named owner transport
+/// there escapes both that scan and the reserved-name inventory gate under
+/// `inherit`. The winning documents prove its absence. The Agent-scoped
+/// entry (`swarm mcp --require-agent`) never matches: it is not the owner
+/// identity.
+fn refuse_effective_owner_mcp(
+    documents: &[ConfigEntry],
+    controller_executable: Option<&str>,
+    cloud_mcp_hostname: Option<&str>,
+) -> Result<()> {
+    for document in documents {
+        let Some(servers) = document
+            .info
+            .as_ref()
+            .and_then(|info| info.mcp.as_ref())
+            .map(|mcp| &mcp.servers)
+        else {
+            continue;
+        };
+        for (name, server) in servers {
+            let owned = match server.command.as_deref() {
+                Some([head, tail @ ..]) => eliot_core::is_owner_swarm_server(
+                    Some(head.as_str()),
+                    Some(tail),
+                    server.url.as_deref(),
+                    controller_executable,
+                    cloud_mcp_hostname,
+                ),
+                _ => eliot_core::is_owner_swarm_server(
+                    None,
+                    None,
+                    server.url.as_deref(),
+                    controller_executable,
+                    cloud_mcp_hostname,
+                ),
+            };
+            if owned {
+                let origin = document.path.as_deref().unwrap_or("effective config");
+                return Err(Error::new(
+                    "profile_error",
+                    format!(
+                        "OpenCode effective MCP layer contributes the owner Swarm MCP server {name:?} from {origin}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Exclusive inventory gate for the worker MCP surface, applied after the
 /// settle observation on both the create and resume paths. An unreadable
 /// inventory reports unverified but never refuses: absence of evidence is
@@ -4830,6 +4913,33 @@ mod tests {
             info: None,
         }];
         assert!(winning_managed_mcp_server(&directory).is_none());
+    }
+
+    #[test]
+    fn effective_owner_transport_refuses_any_name() {
+        // No effective servers: nothing to refuse.
+        assert!(super::refuse_effective_owner_mcp(&[], None, None).is_ok());
+        // The managed Agent-scoped entry is never the owner identity.
+        let managed = vec![config_document(managed_server(managed_command()))];
+        assert!(super::refuse_effective_owner_mcp(&managed, None, None).is_ok());
+        // A differently named owner stdio transport in a managed layer
+        // refuses, even though the inventory gate only sees names.
+        let evil = vec![config_document(
+            json!({"night-bridge": {"type": "local", "command": ["swarm", "mcp"]}}),
+        )];
+        let error = super::refuse_effective_owner_mcp(&evil, None, None).expect_err("owner hit");
+        assert_eq!(error.code, "profile_error");
+        assert!(error.message.contains("night-bridge"));
+        // A swarm-named entry WITHOUT the Agent scope is the owner too.
+        let renamed = vec![config_document(
+            json!({"eliot-swarm": {"type": "local", "command": ["swarm", "mcp"]}}),
+        )];
+        assert!(super::refuse_effective_owner_mcp(&renamed, None, None).is_err());
+        // Unrelated transports pass.
+        let quiet = vec![config_document(
+            json!({"helper": {"type": "local", "command": ["npm", "run", "server"]}}),
+        )];
+        assert!(super::refuse_effective_owner_mcp(&quiet, None, None).is_ok());
     }
     use std::path::PathBuf;
 

@@ -4,12 +4,16 @@
 //! `XDG_DATA_HOME`, so the owner's global config never merges; the
 //! workspace-inherited layers still merge natively (installed 2.2.7): each
 //! ancestor directory's direct `opencode.json` / `opencode.jsonc` files
-//! plus its `.opencode/` project directory. Every start therefore scans
-//! those layers for owner-identity entries before the native session
-//! exists: a stdio entry selecting `swarm mcp` without `--require-agent`,
-//! or an HTTP entry on the configured cloud hostname. A match fails the
-//! start with the entry and layer named, in every policy and regardless of
-//! entry name. No project or user file is ever edited.
+//! plus its `.opencode/` project directory, each read as a native document
+//! (the `mcp.servers` table plus the legacy `mcp.<name>` server spelling).
+//! Every start therefore scans those layers for owner-identity entries
+//! before the native session exists: a stdio entry selecting `swarm mcp`
+//! without `--require-agent`, or an HTTP entry on the configured cloud
+//! hostname. A match fails the start with the entry and layer named, in
+//! every policy and regardless of entry name. Managed, system and global
+//! layers are not files here; the effective configuration proves their
+//! absence after the session exists (see `host.rs`). No project or user
+//! file is ever edited.
 
 use std::path::Path;
 
@@ -61,7 +65,13 @@ pub fn scan_project_mcp(workspace: &Path) -> Result<Vec<ProjectMcpEntry>> {
     let mut depth = 0usize;
     while let Some(dir) = layer {
         if depth > MAX_PROJECT_ANCESTORS {
-            break;
+            // Degenerate depth with ancestors still unscanned: succeeding
+            // silently would bless layers the scan never saw, so the start
+            // fails closed with the bound named.
+            return Err(eliot_core::Error::new(
+                "profile_error",
+                "OpenCode project MCP layer scan exceeds its ancestor bound",
+            ));
         }
         scan_layer(dir, depth, &mut entries)?;
         shared_scan::ensure_total_entries(
@@ -146,20 +156,53 @@ pub fn find_owner_entries<'a>(
         .collect()
 }
 
-/// Project the `mcp.servers` tables of one project document. Absent or
-/// null layers contribute nothing; a non-object layer fails closed.
-/// Non-object entries are skipped: only the documented table shape
-/// (`command` string/array, `url` string) is evaluated.
+/// Project the MCP servers of one project document: the `mcp.servers`
+/// table plus the native legacy spelling, where any other `mcp.<name>`
+/// key is itself a server (`packages/core/src/config/normalize.ts`
+/// `normalizeMcp`: `type: local` with a `command` array, `type: remote`
+/// with a `url`). Absent or null layers contribute nothing; a non-object
+/// layer fails closed. Non-object table entries are skipped; a non-record
+/// legacy value fails closed, since native would still decode it as a
+/// server candidate the scan could not evaluate. Enabled-only legacy
+/// values (`{enabled: bool}` without `type`) are omitted exactly like the
+/// native normalization omits them.
 fn project_entries(document: &Value, file: String) -> Result<Vec<ProjectMcpEntry>> {
     let label = format!("OpenCode project MCP layer in {file}");
-    let Some(servers) = shared_scan::table_object(
-        document.get("mcp").and_then(|mcp| mcp.get("servers")),
-        &label,
-    )?
+    let mcp = document.get("mcp");
+    let mut entries = Vec::new();
+    // A null `mcp` contributes nothing, like an absent one; any other
+    // non-object `mcp` fails closed below.
+    if let Some(mcp) = mcp.filter(|mcp| !mcp.is_null()) {
+        let Some(table) = mcp.as_object() else {
+            return Err(eliot_core::Error::new(
+                "profile_error",
+                format!("{label} `mcp` is not an object"),
+            ));
+        };
+        for (name, value) in table {
+            if name == "servers" || name == "timeout" {
+                continue;
+            }
+            let Some(entry) = legacy_entry(name, value, &file, &label)? else {
+                continue;
+            };
+            entries.push(entry);
+        }
+    }
+    let Some(servers) = shared_scan::table_object(mcp.and_then(|mcp| mcp.get("servers")), &label)?
     else {
-        return Ok(Vec::new());
+        return Ok(entries);
     };
-    let mut entries = Vec::with_capacity(servers.len().min(MAX_PROJECT_SERVERS));
+    if is_direct_legacy_server(&Value::Object(servers.clone())) {
+        // `mcp.servers` is itself one legacy server (`{type, command|url}`),
+        // not a name table: native decodes it under the key `servers`.
+        let value = Value::Object(servers.clone());
+        if let Some(entry) = legacy_entry("servers", &value, &file, &label)? {
+            entries.push(entry);
+        }
+        return Ok(entries);
+    }
+    entries.reserve(servers.len().min(MAX_PROJECT_SERVERS));
     for (name, entry) in servers {
         let Some(table) = entry.as_object() else {
             continue;
@@ -174,6 +217,51 @@ fn project_entries(document: &Value, file: String) -> Result<Vec<ProjectMcpEntry
         });
     }
     Ok(entries)
+}
+
+/// Whether a `mcp.servers` value is itself one legacy server
+/// (`normalizeMcp` `isDirectLegacyMcp`: a record whose `type` is `local`
+/// or `remote`) rather than a name table.
+fn is_direct_legacy_server(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(|table| table.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "local" || kind == "remote")
+}
+
+/// Project one legacy `mcp.<name>` server value. Enabled-only values are
+/// omitted (`None`, like the native diagnostic omits them); non-record
+/// values fail closed with the layer named.
+fn legacy_entry(
+    name: &str,
+    value: &Value,
+    file: &str,
+    label: &str,
+) -> Result<Option<ProjectMcpEntry>> {
+    let Some(table) = value.as_object() else {
+        return Err(eliot_core::Error::new(
+            "profile_error",
+            format!("{label} legacy MCP entry {name:?} is not an object"),
+        ));
+    };
+    if table.get("type").is_none() && table.get("enabled").and_then(Value::as_bool).is_some() {
+        return Ok(None);
+    }
+    // Legacy `type: local` carries `command` as an array; older documents
+    // may split `command` (string) and `args` (array) into two keys.
+    let (command, args) = if matches!(table.get("command"), Some(Value::Array(_))) {
+        project_command(table.get("command"))
+    } else {
+        shared_scan::project_string_command_args(table.get("command"), table.get("args"))
+    };
+    Ok(Some(ProjectMcpEntry {
+        name: name.to_owned(),
+        command,
+        args,
+        url: table.get("url").and_then(Value::as_str).map(str::to_owned),
+        file: file.to_owned(),
+    }))
 }
 
 /// Project one stdio command shape: a string command carries no argument
@@ -434,6 +522,80 @@ mod tests {
         let big = "x".repeat(MAX_PROJECT_CONFIG_BYTES + 1);
         write_project(&dir, "opencode.json", &big);
         let error = scan_project_mcp(&dir).expect_err("oversize project file fails");
+        assert_eq!(error.code, "profile_error");
+    }
+
+    #[test]
+    fn legacy_mcp_spelling_scans_like_a_server() {
+        let scratch = ScratchDir::new();
+        let dir = scratch.path().to_path_buf();
+        write_project(
+            &dir,
+            "opencode.jsonc",
+            r#"{
+              // Native legacy spelling: any mcp.<name> key is a server.
+              "mcp": {
+                "bridge": {"type": "local", "command": ["swarm", "mcp"]},
+                "old-split": {"command": "npm", "args": ["run", "server"]},
+                "far": {"type": "remote", "url": "https://mcp.example.com/mcp"},
+                "quiet": {"enabled": true},
+                "timeout": {"catalog": 1000}
+              }
+            }"#,
+        );
+        let entries = scan_project_mcp(&dir).expect("legacy layer scans");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bridge", "far", "old-split"]
+        );
+        let bridge = entries
+            .iter()
+            .find(|entry| entry.name == "bridge")
+            .expect("bridge");
+        assert_eq!(bridge.command.as_deref(), Some("swarm"));
+        assert_eq!(bridge.args, Some(vec!["mcp".to_owned()]));
+        let split = entries
+            .iter()
+            .find(|entry| entry.name == "old-split")
+            .expect("split");
+        assert_eq!(split.command.as_deref(), Some("npm"));
+        assert_eq!(
+            split.args,
+            Some(vec!["run".to_owned(), "server".to_owned()])
+        );
+        // The legacy owner transport matches regardless of its key.
+        let hits = find_owner_entries(&entries, None, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "bridge");
+    }
+
+    #[test]
+    fn legacy_servers_value_decodes_as_one_server() {
+        let scratch = ScratchDir::new();
+        let dir = scratch.path().to_path_buf();
+        write_project(
+            &dir,
+            "opencode.json",
+            r#"{"mcp": {"servers": {"type": "local", "command": ["swarm", "mcp"]}}}"#,
+        );
+        let entries = scan_project_mcp(&dir).expect("direct legacy scans");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "servers");
+        assert_eq!(entries[0].command.as_deref(), Some("swarm"));
+    }
+
+    #[test]
+    fn non_record_legacy_value_fails_closed() {
+        let scratch = ScratchDir::new();
+        let dir = scratch.path().to_path_buf();
+        write_project(&dir, "opencode.json", r#"{"mcp": {"x": 5}}"#);
+        let error = scan_project_mcp(&dir).expect_err("non-record legacy fails");
+        assert_eq!(error.code, "profile_error");
+        write_project(&dir, "opencode.json", r#"{"mcp": "servers"}"#);
+        let error = scan_project_mcp(&dir).expect_err("non-object mcp fails");
         assert_eq!(error.code, "profile_error");
     }
 }

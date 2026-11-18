@@ -509,6 +509,15 @@ impl McpServerReadback {
     pub fn is_connected(&self, server_name: &str) -> bool {
         self.name == server_name && self.status.status == "connected"
     }
+
+    /// Whether this entry counts as serving for the named Agent-scoped
+    /// server: `connected` or `pending`. The inventory gate treats both
+    /// words as serving, so the managed-transport proof must run for both
+    /// too; otherwise a still-connecting managed entry would skip the
+    /// proof while other pending servers are already refused.
+    pub fn is_serving(&self, server_name: &str) -> bool {
+        self.name == server_name && matches!(self.status.status.as_str(), "connected" | "pending")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1236,6 +1245,21 @@ mod tests {
         assert!(!entries[2].is_connected("eliot-swarm"));
         assert!(!entries[3].is_connected("eliot-swarm"));
         assert!(!entries[4].is_connected("eliot-swarm"));
+        // Serving covers the still-connecting Agent-scoped entry too:
+        // the inventory gate refuses other pending servers, so the
+        // managed proof cannot skip a pending managed entry.
+        assert!(entries[0].is_serving("eliot-swarm"));
+        assert!(!entries[1].is_serving("eliot-swarm"));
+        assert!(!entries[2].is_serving("eliot-swarm"));
+        let pending_swarm = McpServerReadback {
+            name: "eliot-swarm".to_owned(),
+            status: McpStatusReadback {
+                status: "pending".to_owned(),
+                error: None,
+            },
+        };
+        assert!(!pending_swarm.is_connected("eliot-swarm"));
+        assert!(pending_swarm.is_serving("eliot-swarm"));
     }
 
     #[test]
