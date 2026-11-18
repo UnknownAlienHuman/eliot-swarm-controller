@@ -3570,6 +3570,16 @@ impl OpenCodePlugin {
             Ok(request) => request,
             Err(reason) => return unknown_snapshot(&params, reason),
         };
+        let last_turn = match Self::snapshot_turn_facts(
+            &event_status,
+            &params,
+            request.turn_id.as_deref(),
+            &session.start_command_id,
+            session.stop_command_id.as_deref(),
+        ) {
+            Ok(last_turn) => last_turn,
+            Err(reason) => return unknown_snapshot(&params, reason),
+        };
         // The session readback proves the exact owned session is alive; turn
         // facts come from the committed stream fold.
         if !Self::session_readback_proven(&session.http, &request.session_id).await {
@@ -3578,17 +3588,6 @@ impl OpenCodePlugin {
                 "OpenCode session readback did not prove the exact owned session",
             );
         }
-        if request.turn_id.is_none() {
-            return unknown_snapshot(
-                &params,
-                "OpenCode command has no exact native turn association",
-            );
-        }
-        let last_turn =
-            match Self::snapshot_turn_facts(&event_status, &params, request.turn_id.as_deref()) {
-                Ok(last_turn) => last_turn,
-                Err(reason) => return unknown_snapshot(&params, reason),
-            };
         let state = if event_status.active_turn_id.is_some() {
             "busy"
         } else {
@@ -3674,12 +3673,14 @@ impl OpenCodePlugin {
             .is_ok()
     }
 
-    /// Snapshot phase 4, facts: the requested turn from the committed stream
-    /// fold. `Err(reason)` renders as an unknown snapshot with that reason.
+    /// The requested turn from the committed stream fold. Only the native
+    /// session's start and stop commands can request session-level facts.
     fn snapshot_turn_facts(
         event_status: &EventStatus,
         params: &AgentSnapshotParams,
         turn_id: Option<&str>,
+        start_command_id: &str,
+        stop_command_id: Option<&str>,
     ) -> std::result::Result<Option<TurnFacts>, &'static str> {
         match turn_id {
             Some(requested) => {
@@ -3701,7 +3702,12 @@ impl OpenCodePlugin {
                     Err("OpenCode readback did not prove the exact requested turn")
                 }
             }
-            None => Ok(event_status.last_turn.clone()),
+            None if params.command_id == start_command_id
+                || stop_command_id == Some(params.command_id.as_str()) =>
+            {
+                Ok(event_status.last_turn.clone())
+            }
+            None => Err("OpenCode command has no exact native turn association"),
         }
     }
 
@@ -5168,6 +5174,41 @@ mod tests {
         ResumeSubject, optional_profile_text, parse_resume_subject, validate_source_plan,
     };
     use serde_json::json;
+
+    #[test]
+    fn turnless_snapshot_binds_start_and_stop_commands_only() {
+        use super::{AgentSnapshotParams, EventStatus, TurnFacts};
+
+        let status = EventStatus {
+            last_turn: Some(TurnFacts {
+                command_id: "send-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                status: None,
+                final_text: None,
+                terminal: true,
+            }),
+            ..Default::default()
+        };
+        let mut params = AgentSnapshotParams {
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            command_id: "start".to_owned(),
+            turn_id: None,
+        };
+        for command_id in ["start", "stop"] {
+            params.command_id = command_id.to_owned();
+            let turn =
+                OpenCodePlugin::snapshot_turn_facts(&status, &params, None, "start", Some("stop"))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(turn.turn_id, "turn-1");
+        }
+        params.command_id = "send-1".to_owned();
+        assert!(
+            OpenCodePlugin::snapshot_turn_facts(&status, &params, None, "start", Some("stop"))
+                .is_err()
+        );
+    }
 
     fn mcp_fixture(name: &str, status: &str) -> McpServerReadback {
         McpServerReadback {

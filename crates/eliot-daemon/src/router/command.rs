@@ -2026,6 +2026,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_owned_runtime_rejects_before_native_dispatch() {
+        let router = router();
+        let command = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, _) = result_fixture(&mut store);
+            store
+                .submit("owner", steer(&agent), now_ms())
+                .unwrap()
+                .command
+        };
+        router
+            .clone()
+            .process_command_inner(command.id.clone(), None)
+            .await;
+        let settled = router
+            .inner
+            .store
+            .lock()
+            .await
+            .get_command(&command.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.state, CommandState::Rejected);
+        assert_eq!(settled.outcome.unwrap()["code"], "native_not_dispatched");
+    }
+
+    #[tokio::test]
     async fn first_plugin_deliveries_follow_committed_dispatch_sequence() {
         let router = router();
         let (agent, first, configure, second, before) = {

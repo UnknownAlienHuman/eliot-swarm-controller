@@ -142,7 +142,10 @@ enum Control {
     },
     CheckTurn {
         turn_id: String,
-        reply: oneshot::Sender<bool>,
+        reply: oneshot::Sender<Option<bool>>,
+    },
+    MarkInterrupted {
+        turn_id: String,
     },
     ReplyRequest {
         command_id: String,
@@ -155,6 +158,7 @@ enum Control {
     },
     HookResponseReady {
         request_id: String,
+        consumer_id: String,
         result: Result<Vec<ContextItem>>,
     },
     BeginStop {
@@ -294,6 +298,7 @@ struct EventProcessor {
     gap_number: u64,
     pending_turn: Option<PendingTurn>,
     pending_steer: Option<PendingSteer>,
+    interrupted_turn: Option<String>,
     pending_requests: HashMap<String, PendingNativeRequest>,
     cancelled_hook_requests: HashSet<String>,
     tool_use_turns: HashMap<String, ToolUseBinding>,
@@ -517,6 +522,11 @@ impl EventHandle {
     /// Whether `turn_id` is the exact live turn, answered behind any queued
     /// terminal frame so a control never targets a finished turn.
     pub async fn check_turn(&self, turn_id: &str) -> bool {
+        self.turn_interrupt_status(turn_id).await.is_some()
+    }
+
+    /// The exact live turn's interrupt status, or None if the turn ended.
+    pub async fn turn_interrupt_status(&self, turn_id: &str) -> Option<bool> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .control
@@ -527,9 +537,18 @@ impl EventHandle {
             .await
             .is_err()
         {
-            return false;
+            return None;
         }
-        reply_rx.await.unwrap_or(false)
+        reply_rx.await.ok().flatten()
+    }
+
+    pub async fn mark_interrupted(&self, turn_id: &str) {
+        let _ = self
+            .control
+            .send(Control::MarkInterrupted {
+                turn_id: turn_id.to_owned(),
+            })
+            .await;
     }
 
     /// Decide one open `can_use_tool` permission. Runs on the event task,
@@ -737,7 +756,14 @@ async fn dispatch_control(
             let live = processor.status.active_turn_id.as_deref() == Some(turn_id.as_str())
                 && processor.status.failure.is_none()
                 && !processor.status.stopped;
-            let _ = reply.send(live);
+            let _ = reply.send(
+                live.then(|| processor.interrupted_turn.as_deref() == Some(turn_id.as_str())),
+            );
+        }
+        Control::MarkInterrupted { turn_id } => {
+            if processor.status.active_turn_id.as_deref() == Some(turn_id.as_str()) {
+                processor.interrupted_turn = Some(turn_id);
+            }
         }
         Control::ReplyRequest {
             command_id,
@@ -754,8 +780,15 @@ async fn dispatch_control(
             publish(processor, status);
             let _ = reply.send(result);
         }
-        Control::HookResponseReady { request_id, result } => {
-            if let Err(error) = processor.finish_hook_callback(&request_id, result).await {
+        Control::HookResponseReady {
+            request_id,
+            consumer_id,
+            result,
+        } => {
+            if let Err(error) = processor
+                .finish_hook_callback(&request_id, &consumer_id, result)
+                .await
+            {
                 processor.status.source_unknown = true;
                 if processor.status.failure.is_none() {
                     processor.status.failure = Some(*error.message);
@@ -830,6 +863,7 @@ impl EventProcessor {
             gap_number: 0,
             pending_turn: None,
             pending_steer: None,
+            interrupted_turn: None,
             pending_requests: HashMap::new(),
             cancelled_hook_requests: HashSet::new(),
             tool_use_turns: HashMap::new(),
@@ -992,6 +1026,7 @@ impl EventProcessor {
             // turn can ever arrive; dropping the waiter unwedges the session.
             // The caller already answered, so the dropped outcome is unheard.
             self.pending_turn = None;
+            self.cancelled_hook_requests.clear();
         }
     }
 
@@ -1410,6 +1445,7 @@ impl EventProcessor {
                 Ok(())
             }
             "cancelled" => {
+                self.cancelled_hook_requests.clear();
                 settle(
                     outcome,
                     TurnOutcome::Rejected("Claude did not admit the input".to_owned()),
@@ -1417,6 +1453,7 @@ impl EventProcessor {
                 Ok(())
             }
             _ => {
+                self.cancelled_hook_requests.clear();
                 settle(
                     outcome,
                     TurnOutcome::Unknown(
@@ -2029,6 +2066,7 @@ impl EventProcessor {
         }
         let host = self.host.clone();
         let callback_request_id = request_id.to_owned();
+        let callback_consumer_id = consumer_id.clone();
         let callback_deadline = deadline;
         let task = tokio::spawn(async move {
             let result = match host.call("hook.event", params, callback_deadline).await {
@@ -2040,6 +2078,7 @@ impl EventProcessor {
             let _ = control_tx
                 .send(Control::HookResponseReady {
                     request_id: callback_request_id,
+                    consumer_id: callback_consumer_id,
                     result,
                 })
                 .await;
@@ -2063,9 +2102,14 @@ impl EventProcessor {
     async fn finish_hook_callback(
         &mut self,
         request_id: &str,
+        expected_consumer_id: &str,
         result: Result<Vec<ContextItem>>,
     ) -> Result<()> {
-        let Some(pending) = self.pending_hooks.get(request_id) else {
+        let Some(pending) = self
+            .pending_hooks
+            .get(request_id)
+            .filter(|pending| pending.consumer_id == expected_consumer_id)
+        else {
             return Ok(());
         };
         let native = pending.native.clone();
@@ -2477,8 +2521,13 @@ impl EventProcessor {
         if cancel.kind != "control_cancel_request" || cancel.request_id.trim().is_empty() {
             return;
         }
-        self.cancelled_hook_requests
-            .insert(cancel.request_id.clone());
+        if !self.frames_drained
+            && !self.planned_stop
+            && (self.status.active_turn_id.is_some() || self.pending_turn.is_some())
+        {
+            self.cancelled_hook_requests
+                .insert(cancel.request_id.clone());
+        }
         self.remove_buffered_hook_callback(&cancel.request_id);
         if let Some(pending) = self.pending_hooks.remove(&cancel.request_id) {
             pending.task.abort();
@@ -2513,7 +2562,6 @@ impl EventProcessor {
             .map(|(request_id, _)| request_id.clone())
             .collect();
         for request_id in request_ids {
-            self.cancelled_hook_requests.insert(request_id.clone());
             if let Some(pending) = self.pending_hooks.remove(&request_id) {
                 pending.task.abort();
                 self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
@@ -2522,13 +2570,12 @@ impl EventProcessor {
     }
 
     fn cancel_all_hook_callbacks(&mut self) {
-        let pending_hooks: Vec<(String, PendingHookCallback)> =
-            self.pending_hooks.drain().collect();
-        for (request_id, pending) in pending_hooks {
-            self.cancelled_hook_requests.insert(request_id);
+        let pending_hooks = std::mem::take(&mut self.pending_hooks);
+        for pending in pending_hooks.into_values() {
             pending.task.abort();
             self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
         }
+        self.cancelled_hook_requests.clear();
     }
 
     /// One CLI `control_request`: only the `can_use_tool` permission ask is
@@ -2974,7 +3021,6 @@ impl EventProcessor {
         // Unanswered asks die with their turn: close them before the terminal
         // commit, without a command binding.
         self.close_pending_requests(Some(&turn_id)).await?;
-        // Callback fences outlive turn completion while this transport exists.
         if self
             .status
             .last_turn
@@ -3098,7 +3144,9 @@ impl EventProcessor {
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
+        self.interrupted_turn = None;
         self.tool_use_turns.clear();
+        self.cancelled_hook_requests.clear();
         self.clear_tool_tracking();
         self.tool_coverage_gap_reported = false;
         self.tool_use_tracking_fenced = false;
@@ -3244,7 +3292,6 @@ impl EventProcessor {
         // The stopped session consumes no more asks: close every retained one
         // before `session.ended`.
         self.close_pending_requests(None).await?;
-        // Keep generation fences until this drained processor is dropped.
         let native_id = format!(
             "claude:{}:session.ended",
             self.status.session_id.as_deref().unwrap_or("unresolved")
@@ -3290,6 +3337,7 @@ impl EventProcessor {
         self.status.ready = false;
         self.status.active_command_id = None;
         self.status.active_turn_id = None;
+        self.interrupted_turn = None;
         Ok(())
     }
 
@@ -3471,6 +3519,14 @@ mod tests {
             processor.sink = eliot_plugin::CommitSink::new(client, "test-credential".to_owned());
             processor.status.active_command_id = Some("send-1".to_owned());
             processor.status.active_turn_id = Some("turn-1".to_owned());
+            processor.interrupted_turn = Some("turn-1".to_owned());
+            let cancelled = json!({"type":"control_cancel_request","request_id":"hook-1"});
+            processor.cancel_hook_callback(&cancelled);
+            assert!(processor.cancelled_hook_requests.contains("hook-1"));
+            if no_terminal {
+                processor.planned_stop = true;
+                processor.note_frames_drained().await;
+            }
             let frame = serde_json::json!({"type":"command_lifecycle","command_uuid":"turn-1","state":"cancelled"});
             let terminal = async {
                 if no_terminal {
@@ -3508,6 +3564,10 @@ mod tests {
             });
             result.unwrap();
             assert!(processor.status.active_turn_id.is_none());
+            assert!(processor.interrupted_turn.is_none());
+            assert!(processor.cancelled_hook_requests.is_empty());
+            processor.cancel_hook_callback(&cancelled);
+            assert!(processor.cancelled_hook_requests.is_empty());
             let turn = processor.status.last_turn.as_ref().unwrap();
             assert_eq!(turn.turn_id, "turn-1");
             assert_eq!(turn.terminal, !no_terminal);

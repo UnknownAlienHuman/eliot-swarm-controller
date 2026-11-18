@@ -151,10 +151,10 @@ not proof that the completed runtime frame fits.
 
 The router enqueues first `agent.command` deliveries at the Store dispatch boundary.
 It appends to the bounded runtime mailbox under the Store writer lock after commit, so
-deliveries to a plugin follow dispatch sequence order. A full mailbox rejects the
-command with proof that no native write was dispatched. The actor checks the complete
-encoded request, including its actual id, arguments and NDJSON newline, against the
-1 MiB frame bound before writing the plugin RPC.
+deliveries to a plugin follow dispatch sequence order. A missing owned runtime or a
+full mailbox rejects the command with proof that no native write was dispatched.
+The actor checks the complete encoded request, including its actual id, arguments and
+NDJSON newline, against the 1 MiB frame bound before writing the plugin RPC.
 
 Each command ID is delivered through `agent.command` at most once per plugin generation.
 Store answers exact settled retries. An unresolved dispatch can settle from exact
@@ -163,6 +163,11 @@ facts. Without such evidence its outcome remains `unknown` and the router never
 redelivers the write. A plugin retains only native handles bounded by live state, such
 as the current native turn binding. Store owns command identity, history and settlement.
 An initial send linked to launch or resume follows ordinary send dispatch.
+
+A controlled snapshot using the session's start or stop command ID may omit the turn
+ID to request session state. Other command snapshots need an exact turn, supplied by
+the caller or proven by the adapter's current native binding. A read that cannot prove
+the requested binding returns an unknown snapshot.
 
 For SEND, the same `agent.command` effect carries the FIFO `next_input` items claimed
 from existing command rows, plus the effective configuration overlay when one

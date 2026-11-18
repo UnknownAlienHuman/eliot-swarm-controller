@@ -21,7 +21,7 @@ use eliot_plugin::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     ffi::OsString,
     path::{Path, PathBuf},
 };
@@ -185,7 +185,6 @@ struct AgentSession {
     native_client: ClaudeClient,
     events: EventHandle,
     pending_turn: PendingTurn,
-    interrupted_turns: HashSet<String>,
     stop_command_id: Option<String>,
 }
 
@@ -1433,6 +1432,7 @@ impl ClaudePlugin {
         };
         // These are pre-write refusals. Generic `busy`/`unknown` errors after
         // daemon dispatch would incorrectly turn them into uncertain effects.
+        session.pending_turn.reconcile();
         if let Err(error) = check_send_ready(session) {
             return Ok(rejected_control(&error.message));
         }
@@ -1819,13 +1819,13 @@ impl ClaudePlugin {
         }
         // The event task answers behind any queued terminal frame, so an
         // interrupt racing completion refuses instead of writing twice.
-        if !session.events.check_turn(turn_id).await {
+        let Some(already_interrupted) = session.events.turn_interrupt_status(turn_id).await else {
             return Err(Error::new(
                 "stale_turn",
                 "Claude turn is not the active turn",
             ));
-        }
-        if session.interrupted_turns.contains(turn_id) {
+        };
+        if already_interrupted {
             return Ok(json!({
                 "state": "applied",
                 "command_id": command_id,
@@ -1852,7 +1852,7 @@ impl ClaudePlugin {
                 ));
             }
         };
-        session.interrupted_turns.insert(turn_id.to_owned());
+        session.events.mark_interrupted(turn_id).await;
         let mut applied = json!({
             "state": "applied",
             "command_id": command_id,
@@ -1950,8 +1950,7 @@ impl ClaudePlugin {
         }
         let event_status = session.events.status();
         session.pending_turn.reconcile();
-        let turn_id = params.turn_id.clone();
-        live_session_snapshot(session, &params, &event_status, turn_id)
+        live_session_snapshot(session, &params, &event_status)
     }
 
     async fn stop(&mut self, raw: &Value) -> Result<Value> {
@@ -2070,7 +2069,6 @@ fn live_session_snapshot(
     session: &AgentSession,
     params: &AgentSnapshotParams,
     event_status: &EventStatus,
-    turn_id: Option<String>,
 ) -> Result<Value> {
     if session.phase == SessionPhase::Stopped {
         return unknown_snapshot(
@@ -2085,12 +2083,15 @@ fn live_session_snapshot(
     else {
         return unknown_snapshot(params, "Claude session identity was not acknowledged");
     };
-    if turn_id.is_none() {
-        return unknown_snapshot(
-            params,
-            "Claude command has no exact native turn association",
-        );
-    }
+    let last_turn = match snapshot_turn_facts(
+        params,
+        event_status,
+        &session.start_command_id,
+        session.stop_command_id.as_deref(),
+    ) {
+        Ok(last_turn) => last_turn,
+        Err(reason) => return unknown_snapshot(params, reason),
+    };
     let state = if event_status.batch_unknown || event_status.source_unknown {
         "unknown"
     } else if event_status.active_turn_id.is_some() {
@@ -2099,24 +2100,6 @@ fn live_session_snapshot(
         "idle"
     } else {
         "unknown"
-    };
-    let last_turn = match turn_id.as_deref() {
-        Some(turn_id) => {
-            let active = event_status.active_turn_id.as_deref() == Some(turn_id);
-            let retained = event_status
-                .last_turn
-                .as_ref()
-                .filter(|last| last.turn_id == turn_id)
-                .cloned();
-            if !active && retained.is_none() {
-                return unknown_snapshot(
-                    params,
-                    "Claude readback did not prove the exact requested turn",
-                );
-            }
-            retained
-        }
-        None => event_status.last_turn.clone(),
     };
     let result_known = last_turn
         .as_ref()
@@ -2134,6 +2117,31 @@ fn live_session_snapshot(
         "source_unknown": event_status.source_unknown,
         "result_known": result_known,
     }))
+}
+
+fn snapshot_turn_facts<'a>(
+    params: &AgentSnapshotParams,
+    status: &'a EventStatus,
+    start_command_id: &str,
+    stop_command_id: Option<&str>,
+) -> std::result::Result<Option<&'a events::TurnFacts>, &'static str> {
+    let Some(turn_id) = params.turn_id.as_deref() else {
+        return if params.command_id == start_command_id
+            || stop_command_id == Some(params.command_id.as_str())
+        {
+            Ok(status.last_turn.as_ref())
+        } else {
+            Err("Claude command has no exact native turn association")
+        };
+    };
+    let retained = status
+        .last_turn
+        .as_ref()
+        .filter(|last| last.turn_id == turn_id);
+    if status.active_turn_id.as_deref() != Some(turn_id) && retained.is_none() {
+        return Err("Claude readback did not prove the exact requested turn");
+    }
+    Ok(retained)
 }
 
 async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()> {
@@ -2428,7 +2436,6 @@ async fn launch_session(
         native_client,
         events,
         pending_turn: PendingTurn::default(),
-        interrupted_turns: HashSet::new(),
         stop_command_id: None,
     })
 }
@@ -2809,6 +2816,59 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
+
+    #[test]
+    fn delayed_association_releases_the_send_waiter() {
+        use super::{PendingTurn, TurnOutcome, TurnWaiter};
+
+        let (reply, outcome) = tokio::sync::oneshot::channel();
+        let mut pending = PendingTurn {
+            pending: Some(TurnWaiter {
+                turn_id: "timed-out-turn".to_owned(),
+                outcome,
+            }),
+        };
+        pending.reconcile();
+        assert!(pending.pending.is_some());
+        assert!(reply.send(TurnOutcome::Associated).is_ok());
+        pending.reconcile();
+        assert!(pending.pending.is_none());
+    }
+
+    #[test]
+    fn turnless_snapshot_binds_start_and_stop_commands_only() {
+        use super::{AgentSnapshotParams, EventStatus, events::TurnFacts, snapshot_turn_facts};
+
+        let status = EventStatus {
+            ready: true,
+            last_turn: Some(TurnFacts {
+                command_id: "send-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                status: None,
+                final_text: None,
+                final_text_unavailable: None,
+                terminal: true,
+            }),
+            ..Default::default()
+        };
+        let mut params = AgentSnapshotParams {
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            command_id: "start".to_owned(),
+            turn_id: None,
+        };
+        for command_id in ["start", "stop"] {
+            params.command_id = command_id.to_owned();
+            let turn = snapshot_turn_facts(&params, &status, "start", Some("stop"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(turn.turn_id, "turn-1");
+        }
+        params.command_id = "send-1".to_owned();
+        assert!(snapshot_turn_facts(&params, &status, "start", Some("stop")).is_err());
+        params.turn_id = Some("turn-1".to_owned());
+        assert!(snapshot_turn_facts(&params, &status, "start", Some("stop")).is_ok());
+    }
 
     #[test]
     fn exited_start_retires_without_response_delivery_and_keeps_exact_replay() {

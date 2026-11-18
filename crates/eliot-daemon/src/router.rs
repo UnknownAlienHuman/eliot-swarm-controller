@@ -10521,19 +10521,24 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(child.generation, Some(1));
         assert_eq!(child.args, json!({"text":"follow-up"}));
 
-        let mut saw_dispatch = false;
-        loop {
-            let event = committed.recv().await.expect("router event bus stays open");
-            if event.data.get("command_id").and_then(Value::as_str) != Some(child.id.as_str()) {
-                continue;
+        let saw_dispatch = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut saw_dispatch = false;
+            loop {
+                let event = committed.recv().await.expect("router event bus stays open");
+                if event.data.get("command_id").and_then(Value::as_str) != Some(child.id.as_str()) {
+                    continue;
+                }
+                if event.kind == "command.dispatched" {
+                    saw_dispatch = true;
+                }
+                if matches!(event.kind.as_str(), "command.rejected" | "command.unknown") {
+                    assert_eq!(event.kind, "command.rejected");
+                    break saw_dispatch;
+                }
             }
-            if event.kind == "command.dispatched" {
-                saw_dispatch = true;
-            }
-            if event.kind == "command.unknown" {
-                break;
-            }
-        }
+        })
+        .await
+        .expect("rule SEND settles without an owned plugin");
         assert!(saw_dispatch);
         let stored = router
             .inner
@@ -10543,7 +10548,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .get_command(&child.id)
             .unwrap()
             .unwrap();
-        assert_eq!(stored.state, CommandState::Unknown);
+        assert_eq!(stored.state, CommandState::Rejected);
+        assert_eq!(stored.outcome.unwrap()["code"], "native_not_dispatched");
         assert_eq!(stored.verb, "send");
         assert_eq!(stored.args, json!({"text":"follow-up"}));
         assert_eq!(
