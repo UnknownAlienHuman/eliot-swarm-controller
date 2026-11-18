@@ -559,6 +559,15 @@ fn stage_launch(
     }
     launch.args["registered_project"] = json!(from.project);
     launch.args[LAUNCH_ARG] = json!(transfer.id);
+    // The source custody check above proves this generation can release its
+    // reservation. Keep that release even if another holder blocks the launch.
+    events.extend(capacity::release_owned_exit_event_tx(
+        tx,
+        parse_agent_id(&from.id)?,
+        from.generation,
+        "project_transfer",
+        now,
+    )?);
     db!(tx.execute_batch("SAVEPOINT project_transfer_launch"));
     db!(tx.execute(
         "UPDATE project_transfers SET launch_command=?1 WHERE project=?2",
@@ -588,7 +597,7 @@ fn stage_launch(
         Err(error) => return Err(error),
     };
     db!(tx.execute_batch("RELEASE project_transfer_launch"));
-    *events = admission.events;
+    events.extend(admission.events);
     value.launch_command = Some(admission.command.id);
     value.outcome = ProjectTransferOutcome::LaunchAdmitted;
     Ok(())
@@ -654,8 +663,8 @@ fn commit_transfer(
         workspace::transfer_workspace_custody(tx, path, from, to, now, &mut events)?;
     }
     write_next_assignment(tx, &value.assignment, Some((to_num, to.generation)), None)?;
-    capacity::require_assignment_fits(tx, &from.project, capacity_policy)?;
     delete_intent(tx, &from.project)?;
+    capacity::require_assignment_fits(tx, &from.project, capacity_policy)?;
     let assignment = read_assignment(tx, &from.project)?;
     events.push(insert_daemon_event(
         tx, now, "project.transferred", "coordination", Some(parse_agent_id(&to.id)?), Some(to.generation),

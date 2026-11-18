@@ -446,9 +446,10 @@ pub(super) fn reserve_tx(
     set_reservation_generation_tx(tx, id, None, generation)
 }
 
-/// Reservations belonging to the current assignment's root and exact manager
-/// generation. Managed launch and resume can reserve before dispatch installs
-/// the new generation. The candidate row is evaluated by the same predicate.
+/// Reservations belonging to the current assignment, including the staged
+/// successor's slot during transfer. Managed launch and resume can reserve
+/// before dispatch installs the new generation. The candidate is evaluated by
+/// the same predicate as the retained reservations.
 fn assignment_usage(
     conn: &Connection,
     project: &str,
@@ -461,7 +462,10 @@ fn assignment_usage(
                     CASE WHEN a.id = ?2 THEN ?3 ELSE a.capacity_generation END AS reserved
              FROM project_assignments p
              JOIN agents m ON m.id = p.manager AND m.project = p.project
-             JOIN agents a ON a.project = p.project AND a.root = p.manager
+             LEFT JOIN project_transfers transfer ON transfer.project = p.project
+             LEFT JOIN commands successor ON successor.id = transfer.launch_command
+             JOIN agents a ON a.project = p.project
+                 AND (a.root = p.manager OR a.id = successor.target)
              WHERE p.project = ?1 AND (
                  m.generation = p.manager_generation OR
                  (m.generation = 0 AND p.manager_generation = 1 AND p.start_command IS NOT NULL)

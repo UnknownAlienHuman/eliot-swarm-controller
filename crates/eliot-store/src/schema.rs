@@ -1969,6 +1969,12 @@ mod continuity_tests {
     fn v60_assigns_distinct_artifact_seq() {
         use eliot_core::api::{ArtifactKind, ArtifactView};
         let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61;",
+            )
+            .unwrap();
         let version: i64 = store
             .connection
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {

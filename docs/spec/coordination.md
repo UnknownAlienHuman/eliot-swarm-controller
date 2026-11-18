@@ -539,8 +539,9 @@ remain unsupported.
   A has a workspace. Idle alone supplies no writer-exit evidence.
 - **Launch**, if needed, prefers a compatible idle root in A's actual workspace
   on the requested approved profile. A new root uses ordinary launch admission
-  and reservations. A full capacity scope returns a capacity wait after
-  continuation policy and source blockers have been checked.
+  and reservations. The staged replacement holds a slot in the current
+  assignment as well as in the project and fleet. A full capacity scope returns
+  a capacity wait after continuation policy and source blockers have been checked.
   The Owner may authorize provisioning after stop by supplying saved
   continuation context at Begin, with the project launch action permitted.
   The daemon requires owned-process exit, reader drain and closure of A's
