@@ -22,9 +22,21 @@ const MAX_SET_DEPTH: i64 = 1_000;
 /// error: fan-out is legitimate, while the depth bound above trips only on
 /// corruption. Total deleted rows stay bounded by `MAX_PAGE_ENTRIES`.
 const MAX_SET_MEMBERS: usize = MAX_PAGE_ENTRIES;
-/// Prunable roots deleted per pass. Kept roots are excluded by the selection
-/// query itself, so kept sets never starve the pass.
+/// Prunable roots deleted per pass. The candidate sweep skips kept roots in
+/// place and stops here, so kept sets never starve the pass.
 const MAX_PRUNE_ROOTS: i64 = 50;
+/// Expired root candidates, oldest first: the first page and the keyed
+/// continuation past the last examined `(created_at, id)`. Both ride the
+/// `created_at` index and stop at the batch bound, so no pass scans or
+/// materializes the whole expired history to find the next roots.
+const PRUNE_COMMAND_CANDIDATES_FIRST: &str =
+    "SELECT id, created_at FROM commands INDEXED BY commands_prune_roots
+             WHERE parent_command IS NULL AND created_at <= ? ORDER BY created_at, id LIMIT ?";
+const PRUNE_COMMAND_CANDIDATES_AFTER: &str =
+    "SELECT id, created_at FROM commands INDEXED BY commands_prune_roots
+             WHERE parent_command IS NULL AND created_at <= ?
+               AND (created_at > ? OR (created_at = ? AND id > ?))
+             ORDER BY created_at, id LIMIT ?";
 
 /// Outcome of one bounded maintenance pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,98 +229,87 @@ impl Store {
     }
 
     fn prune_commands_and_writes(&mut self, cutoff: i64) -> Result<(i64, i64)> {
-        // The open-child / turn / reference / oversize keep checks live in
-        // the selection itself: only fully prunable roots are returned, so
-        // kept sets never occupy the per-pass root budget and starve pruning.
-        let roots: Vec<String> = self
-            .connection
-            .prepare(
-                "WITH RECURSIVE
-                 old_sets(root, id, depth) AS (
-                     SELECT c.id, c.id, 0 FROM commands c
-                     WHERE c.parent_command IS NULL AND c.created_at <= ?1
-                     UNION ALL
-                     SELECT s.root, ch.id, s.depth + 1 FROM commands ch
-                     JOIN old_sets s ON ch.parent_command = s.id
-                     WHERE s.depth < ?2
-                 ),
-                 kept(root) AS (
-                     SELECT DISTINCT s.root FROM old_sets s
-                     JOIN commands m ON m.id = s.id
-                     WHERE m.state IN ('accepted', 'queued', 'dispatched', 'unknown')
-                        OR m.created_at > ?1
-                        OR s.depth >= ?2
-                        OR EXISTS (
-                            SELECT 1 FROM turns t
-                            WHERE t.agent = m.target AND t.generation = m.generation
-                              AND t.turn_id = m.turn_id
-                              AND t.state IN ('running', 'unknown')
-                        )
-                        OR EXISTS (
-                            SELECT 1 FROM workspaces w WHERE w.start_command_id = m.id
-                        )
-                        OR EXISTS (
-                            SELECT 1 FROM provider_holds h WHERE h.probe_command = m.id
-                        )
-                        OR EXISTS (
-                            SELECT 1 FROM goals g
-                            WHERE g.agent = m.target AND g.mode = 'eliot'
-                              AND g.generation = m.generation
-                              AND json_extract(g.state, '$.status') IN ('active', 'paused')
-                              AND json_extract(g.state, '$.last_continuation_command_id') = m.id
-                        )
-                        OR EXISTS (
-                            SELECT 1 FROM agent_config a WHERE a.command_id = m.id
-                        )
-                 ),
-                 oversize(root) AS (
-                     SELECT s.root FROM old_sets s
-                     GROUP BY s.root HAVING COUNT(*) > ?4
-                 )
-                 SELECT c.id FROM commands c
-                 WHERE c.parent_command IS NULL
-                   AND c.created_at <= ?1
-                   AND NOT EXISTS (SELECT 1 FROM kept k WHERE k.root = c.id)
-                   AND NOT EXISTS (SELECT 1 FROM oversize o WHERE o.root = c.id)
-                 ORDER BY c.created_at, c.id LIMIT ?3",
-            )
-            .map_err(sql_error)?
-            .query_map(
-                params![
-                    cutoff,
-                    MAX_SET_DEPTH,
-                    MAX_PRUNE_ROOTS,
-                    MAX_SET_MEMBERS as i64
-                ],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(sql_error)?;
+        // Bounded candidate sweep through a progressing keyset cursor: page
+        // expired roots oldest-first in bounded batches and walk one bounded
+        // subtree per candidate. Kept or oversize sets are skipped in place
+        // so they never starve later eligible roots, and the pass stops at
+        // the root/row budgets with whole sets still deleting atomically. No
+        // pass materializes every expired command tree: each candidate costs
+        // one indexed subtree walk, and the sweep stops early once the root
+        // budget is doomed.
+        const CANDIDATE_BATCH: i64 = 64;
         let mut doomed: Vec<SubtreeMember> = Vec::new();
-        for root in &roots {
-            let (members, truncated) = subtree_members_tx(&self.connection, root)?;
-            // The selection already excludes oversize sets; this stays as a
-            // backstop so one can never be partly pruned.
-            if truncated {
-                continue;
-            }
-            if members.len() + doomed.len() > MAX_PAGE_ENTRIES && !doomed.is_empty() {
+        let mut doomed_roots: i64 = 0;
+        let mut cursor: Option<(i64, String)> = None;
+        'sweep: loop {
+            let (sql, mut candidate_params): (&str, Vec<rusqlite::types::Value>) = match &cursor {
+                None => (
+                    PRUNE_COMMAND_CANDIDATES_FIRST,
+                    vec![rusqlite::types::Value::from(cutoff)],
+                ),
+                Some((created_at, id)) => (
+                    PRUNE_COMMAND_CANDIDATES_AFTER,
+                    vec![
+                        rusqlite::types::Value::from(cutoff),
+                        rusqlite::types::Value::from(*created_at),
+                        rusqlite::types::Value::from(*created_at),
+                        rusqlite::types::Value::from(id.clone()),
+                    ],
+                ),
+            };
+            candidate_params.push(rusqlite::types::Value::from(CANDIDATE_BATCH));
+            let mut statement = self.connection.prepare(sql).map_err(sql_error)?;
+            let batch: Vec<(String, i64)> = statement
+                .query_map(rusqlite::params_from_iter(candidate_params.iter()), |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(sql_error)?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(sql_error)?;
+            if batch.is_empty() {
                 break;
             }
-            if members.iter().any(|member| {
-                member.is_open()
-                    || member.created_at > cutoff
-                    || member.turn_bound
-                    || member.workspace_ref
-                    || member.probe_ref
-                    || member.goal_ref
-                    || member.config_ref
-            }) {
-                continue;
+            if let Some((id, created_at)) = batch.last() {
+                cursor = Some((*created_at, id.clone()));
             }
-            doomed.extend(members);
-            if doomed.len() >= MAX_PAGE_ENTRIES {
+            for (root, _) in &batch {
+                if doomed_roots >= MAX_PRUNE_ROOTS {
+                    break 'sweep;
+                }
+                let (members, truncated) = match subtree_members_tx(&self.connection, root) {
+                    Err(error) if error.code == "source_integrity" => {
+                        // A set past the traversal bound stays kept, as the
+                        // previous selection kept it, instead of failing the
+                        // pass on corruption-shaped history.
+                        continue;
+                    }
+                    result => result?,
+                };
+                // An oversize set is never partly pruned.
+                if truncated {
+                    continue;
+                }
+                if members.len() + doomed.len() > MAX_PAGE_ENTRIES && !doomed.is_empty() {
+                    break 'sweep;
+                }
+                if members.iter().any(|member| {
+                    member.is_open()
+                        || member.created_at > cutoff
+                        || member.turn_bound
+                        || member.workspace_ref
+                        || member.probe_ref
+                        || member.goal_ref
+                        || member.config_ref
+                }) {
+                    continue;
+                }
+                doomed_roots += 1;
+                doomed.extend(members);
+                if doomed.len() >= MAX_PAGE_ENTRIES {
+                    break 'sweep;
+                }
+            }
+            if batch.len() < CANDIDATE_BATCH as usize {
                 break;
             }
         }
@@ -1570,6 +1571,51 @@ mod tests {
             .unwrap();
         assert_eq!(report.commands_deleted, MAX_PRUNE_ROOTS);
         assert_eq!(command_count(&store), 1200 - MAX_PRUNE_ROOTS);
+    }
+
+    #[test]
+    fn prune_command_candidates_seek_without_materializing_history() {
+        let store = store();
+        for (select, args) in [
+            (
+                PRUNE_COMMAND_CANDIDATES_FIRST,
+                vec![
+                    rusqlite::types::Value::from(NOW),
+                    rusqlite::types::Value::from(64_i64),
+                ],
+            ),
+            (
+                PRUNE_COMMAND_CANDIDATES_AFTER,
+                vec![
+                    rusqlite::types::Value::from(NOW),
+                    rusqlite::types::Value::from(NOW),
+                    rusqlite::types::Value::from(NOW),
+                    rusqlite::types::Value::from("seed".to_owned()),
+                    rusqlite::types::Value::from(64_i64),
+                ],
+            ),
+        ] {
+            let mut statement = store
+                .connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {select}"))
+                .unwrap();
+            let plan = statement
+                .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<String>>>()
+                .unwrap()
+                .join("\n");
+            assert!(
+                !plan.contains("SCAN commands"),
+                "candidate sweep should not scan commands, got:\n{plan}"
+            );
+            assert!(
+                !plan.contains("MATERIALIZE"),
+                "candidate sweep should not materialize history, got:\n{plan}"
+            );
+        }
     }
 
     #[test]

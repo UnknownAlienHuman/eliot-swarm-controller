@@ -1279,6 +1279,15 @@ impl Store {
                  ALTER TABLE commands ADD COLUMN assignment_binding TEXT;
                  ALTER TABLE cleanup_plans ADD COLUMN assignment_binding TEXT;
                  INSERT INTO schema_migrations(version) VALUES (55);",
+        if current < 56 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX commands_prune_roots ON commands(created_at, id)
+                    WHERE parent_command IS NULL;
+                   INSERT INTO schema_migrations(version) VALUES (56);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
@@ -1411,7 +1420,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1481,7 +1490,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1536,7 +1545,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1634,7 +1643,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;

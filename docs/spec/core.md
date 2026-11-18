@@ -899,7 +899,10 @@ gap and handoff ACK even when ordinary event rows expire.
 Retain parent/child command sets while required by open work or the supported history
 window; prune the set transactionally, children before parent, so callers never see a
 partly pruned expansion. Keep any set containing accepted, queued, dispatched or unknown
-work. Retain command bindings/results in `commands` and other mutation bindings/results
+work. Each pass sweeps expired roots oldest-first through a bounded keyset cursor,
+examining one bounded subtree per candidate over the `commands_prune_roots` index and
+skipping kept or oversize sets in place, so no pass materializes the whole expired
+history. Retain command bindings/results in `commands` and other mutation bindings/results
 in `writes` for at least the supported retry window plus the allowed clock-skew
 margin. Cleanup must not make an accepted id look new or replay an external effect.
 An unresolved Running Goal-round reservation remains pinned in `writes` beyond
