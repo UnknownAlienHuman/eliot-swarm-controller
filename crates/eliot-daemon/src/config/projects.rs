@@ -49,7 +49,7 @@ pub(crate) fn default_chats_root(data_root: &Path) -> core::Result<std::path::Pa
     if is_owner_default_data_dir(data_root) {
         return owner_chats_root();
     }
-    let protected = protected_paths(data_root);
+    let protected = protected_paths(data_root)?;
     if let Some(sibling) = sibling_chats_root(data_root)
         && validate_chats_root(&sibling, &protected).is_ok()
     {
@@ -133,20 +133,20 @@ pub(crate) fn validate_chats_location(
         .map(std::path::PathBuf::from)
         .map(Ok)
         .unwrap_or_else(|| default_chats_root(data_root))?;
-    let protected = protected_paths(data_root);
+    let protected = protected_paths(data_root)?;
     validate_chats_root(&root, &protected)
 }
 
 /// Every location a chat root must stay disjoint from: the daemon data
 /// dir, the canonical owner chat tree for non-default data dirs,
 /// credential and configuration homes. Shared by the explicit path and
-/// every automatic default.
-fn protected_paths(data_root: &Path) -> Vec<PathBuf> {
+/// every automatic default. When the owner home cannot be resolved for a
+/// non-default data dir, this fails closed instead of omitting the owner
+/// tree from the protected set.
+fn protected_paths(data_root: &Path) -> core::Result<Vec<PathBuf>> {
     let mut protected = vec![data_root.to_owned()];
-    if !is_owner_default_data_dir(data_root)
-        && let Ok(owner_chats) = owner_chats_root()
-    {
-        protected.push(owner_chats);
+    if !is_owner_default_data_dir(data_root) {
+        protected.push(owner_chats_root()?);
     }
     for name in [
         "CODEX_HOME",
@@ -182,7 +182,7 @@ fn protected_paths(data_root: &Path) -> Vec<PathBuf> {
             protected.push(home.join("AppData"));
         }
     }
-    protected
+    Ok(protected)
 }
 
 fn validate_chats_root(root: &Path, protected: &[PathBuf]) -> core::Result<PathBuf> {

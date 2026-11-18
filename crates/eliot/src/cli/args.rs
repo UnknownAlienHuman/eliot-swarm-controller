@@ -888,6 +888,9 @@ pub(crate) struct ChatOrganizationArgs {
     /// Read back one registered project only; omitted reads every group.
     #[arg(long, value_name = "PROJECT")]
     pub(crate) project: Option<String>,
+    /// Group cursor: the next_after of the previous page.
+    #[arg(long, value_name = "PROJECT")]
+    pub(crate) after: Option<String>,
     /// Include archived rows (default hides them).
     #[arg(long)]
     pub(crate) archived: bool,
@@ -895,7 +898,7 @@ pub(crate) struct ChatOrganizationArgs {
 
 #[derive(Args)]
 pub(crate) struct ChatAttachArgs {
-    /// Chats to place, at most 64 per call.
+    /// Chats to place, at most 16 per call.
     #[arg(value_name = "CHAT")]
     pub(crate) agents: Vec<String>,
     /// Retained project receiving the placement.
@@ -905,14 +908,14 @@ pub(crate) struct ChatAttachArgs {
 
 #[derive(Args)]
 pub(crate) struct ChatDetachArgs {
-    /// Chats to detach, at most 64 per call.
+    /// Chats to detach, at most 16 per call.
     #[arg(value_name = "CHAT")]
     pub(crate) agents: Vec<String>,
 }
 
 #[derive(Args)]
 pub(crate) struct ChatTagArgs {
-    /// Agents or chats to tag, at most 64 per call.
+    /// Agents or chats to tag, at most 16 per call.
     #[arg(value_name = "AGENT")]
     pub(crate) agents: Vec<String>,
     /// Replacement tags, at most 16; omitted clears every tag.

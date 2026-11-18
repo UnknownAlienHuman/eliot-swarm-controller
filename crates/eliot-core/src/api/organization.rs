@@ -17,9 +17,10 @@ use crate::{AgentState, Error, Result, parse_agent_id};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Most Agents one attach/detach/tag call may carry. Mirrors the handoff
-/// selection bound: one call stays one bounded page of rows.
-pub const MAX_ORG_AGENTS: usize = 64;
+/// Most Agents one attach/detach/tag call may carry. Sized so the worst
+/// nominal receipt (every link with a full-length project and a full tag
+/// set) still fits the 64 KiB retained-result bound with JSON overhead.
+pub const MAX_ORG_AGENTS: usize = 16;
 /// Most tags one tag call may set on each Agent.
 pub const MAX_ORG_TAGS: usize = 16;
 /// Most bytes of one tag.
@@ -43,7 +44,7 @@ fn validate_agents(agents: &[String]) -> Result<()> {
     if agents.is_empty() || agents.len() > MAX_ORG_AGENTS {
         return Err(Error::new(
             "invalid",
-            "organization selection carries 1 to 64 Agents",
+            "organization selection carries 1 to 16 Agents",
         ));
     }
     let mut seen = std::collections::HashSet::new();
@@ -166,12 +167,8 @@ impl OrgMemberView {
                 "organization response carries a projectless Agent",
             ));
         }
-        if self.chat && !self.project.is_empty() {
-            return Err(Error::new(
-                "unknown",
-                "organization response carries a project chat",
-            ));
-        }
+        // Chats keep their retained execution label (legacy chats may carry
+        // one); placement comes from the overlay link alone.
         if let Some(link) = &self.project_link {
             validate_project_name(link, "organization response")?;
             if let Some(workspace) = &self.workspace
@@ -292,6 +289,10 @@ pub struct ChatOrganizationRequest {
     /// Read back one registered project only; omitted reads every group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Group cursor: the `next_after` of the previous page. Groups sort by
+    /// project with the unplaced bucket last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
     /// Archived rows stay hidden unless included or selected alone.
     #[serde(default)]
     pub archived: ArchivedFilter,
@@ -301,6 +302,9 @@ impl ChatOrganizationRequest {
     pub fn validate(&self) -> Result<()> {
         if let Some(project) = &self.project {
             validate_project_name(project, "params.project")?;
+        }
+        if let Some(after) = &self.after {
+            validate_project_name(after, "params.after")?;
         }
         Ok(())
     }
@@ -312,7 +316,8 @@ impl ChatOrganizationRequest {
                 .groups
                 .iter()
                 .any(|group| group.project.as_deref() != Some(project))
-                || reply.groups.is_empty())
+                || reply.groups.len() > 1
+                || (reply.groups.is_empty() && self.after.is_none()))
         {
             return Err(Error::new(
                 "unknown",
@@ -338,6 +343,13 @@ pub struct ChatOrganizationResponse {
     pub member_total: usize,
     #[serde(default)]
     pub truncated: bool,
+    /// True when more project groups follow this page; pass `next_after`
+    /// back as `after` to read them.
+    #[serde(default)]
+    pub groups_truncated: bool,
+    /// Last project name of this page; absent unless `groups_truncated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
 }
 
 impl ChatOrganizationResponse {
@@ -374,6 +386,33 @@ impl ChatOrganizationResponse {
                 "unknown",
                 "organization response member bound differs",
             ));
+        }
+        match (&self.groups_truncated, &self.next_after) {
+            (true, Some(after)) => {
+                validate_project_name(after, "organization response")?;
+                let Some(last) = self.groups.last() else {
+                    return Err(Error::new(
+                        "unknown",
+                        "organization group truncation differs",
+                    ));
+                };
+                // Pages are project prefixes with the unplaced bucket last,
+                // so a truncated page ends on a project group whose name is
+                // the cursor for the next page.
+                if last.project.as_deref() != Some(after.as_str()) {
+                    return Err(Error::new(
+                        "unknown",
+                        "organization group truncation differs",
+                    ));
+                }
+            }
+            (true, None) | (false, Some(_)) => {
+                return Err(Error::new(
+                    "unknown",
+                    "organization group truncation differs",
+                ));
+            }
+            (false, None) => {}
         }
         Ok(())
     }
@@ -581,9 +620,50 @@ mod tests {
     }
 
     #[test]
+    fn worst_nominal_mutation_receipt_fits_the_retained_result_bound() {
+        use crate::limits::MAX_EVENT_BYTES;
+        // Every link carries a full-length project and a full tag set, as
+        // preserved by attach/detach and tag responses alike.
+        let links: Vec<OrgLinkView> = (0..MAX_ORG_AGENTS)
+            .map(|index| OrgLinkView {
+                agent: format!("a{}", i64::MAX - index as i64),
+                project_link: Some("p".repeat(1024)),
+                tags: (0..MAX_ORG_TAGS)
+                    .map(|tag| format!("{tag:016}{}", "t".repeat(MAX_ORG_TAG_BYTES - 16)))
+                    .collect(),
+            })
+            .collect();
+        let reply = ChatOrganizationMutationResponse {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            links,
+        };
+        reply.validate().unwrap();
+        let encoded = serde_json::to_vec(&reply).unwrap();
+        assert!(
+            encoded.len() <= MAX_EVENT_BYTES,
+            "worst nominal receipt uses {} of {MAX_EVENT_BYTES} bytes",
+            encoded.len(),
+        );
+    }
+
+    #[test]
+    fn mutation_selection_over_the_advertised_bound_is_rejected() {
+        let agents: Vec<String> = (1..=MAX_ORG_AGENTS as i64 + 1)
+            .map(|num| format!("a{num}"))
+            .collect();
+        let request = ChatAttachRequest {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            agents,
+            project: "app".to_owned(),
+        };
+        assert_eq!(request.validate().unwrap_err().code, "invalid");
+    }
+
+    #[test]
     fn organization_orders_projects_before_the_unplaced_bucket() {
         let request = ChatOrganizationRequest {
             project: None,
+            after: None,
             archived: ArchivedFilter::Exclude,
         };
         request.validate().unwrap();
@@ -618,12 +698,64 @@ mod tests {
             }],
             member_total: 1,
             truncated: false,
+            groups_truncated: false,
+            next_after: None,
         };
         request.validate_response(&reply).unwrap();
         let filtered = ChatOrganizationRequest {
             project: Some("app".to_owned()),
+            after: None,
             archived: ArchivedFilter::Exclude,
         };
         assert!(filtered.validate_response(&reply).is_err());
+    }
+
+    #[test]
+    fn group_cursor_binding_is_explicit() {
+        let bad_cursor = ChatOrganizationRequest {
+            project: None,
+            after: Some(String::new()),
+            archived: ArchivedFilter::Exclude,
+        };
+        assert!(bad_cursor.validate().is_err());
+        let group = || OrgGroupView {
+            project: Some("app".to_owned()),
+            registration: None,
+            assignment: None,
+            needs_assignment: false,
+            conflicting_roots: Vec::new(),
+            manager: None,
+            members: Vec::new(),
+            member_total: 0,
+            members_truncated: false,
+        };
+        let reply = ChatOrganizationResponse {
+            event_watermark: 1,
+            as_of: 1,
+            groups: vec![group()],
+            member_total: 0,
+            truncated: false,
+            groups_truncated: true,
+            next_after: Some("app".to_owned()),
+        };
+        reply.validate().unwrap();
+        for broken in [
+            ChatOrganizationResponse {
+                groups_truncated: true,
+                next_after: None,
+                ..reply.clone()
+            },
+            ChatOrganizationResponse {
+                groups_truncated: false,
+                next_after: Some("app".to_owned()),
+                ..reply.clone()
+            },
+            ChatOrganizationResponse {
+                next_after: Some("other".to_owned()),
+                ..reply.clone()
+            },
+        ] {
+            assert!(broken.validate().is_err());
+        }
     }
 }

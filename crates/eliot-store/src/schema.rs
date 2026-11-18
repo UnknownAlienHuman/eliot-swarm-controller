@@ -1503,8 +1503,7 @@ impl Store {
                 "CREATE TABLE chat_organization (
                      agent INTEGER PRIMARY KEY REFERENCES agents(id),
                      project_link TEXT,
-                     tags TEXT NOT NULL DEFAULT '[]',
-                     updated_at INTEGER NOT NULL
+                     tags TEXT NOT NULL DEFAULT '[]'
                  );
                  CREATE INDEX chat_organization_link ON chat_organization(project_link);
                  WITH RECURSIVE chain(chat_id, num) AS (
@@ -1534,9 +1533,8 @@ impl Store {
                      SELECT chat_id, MIN(project) FROM candidates
                      GROUP BY chat_id HAVING COUNT(DISTINCT project) = 1
                  )
-                 INSERT INTO chat_organization(agent, project_link, tags, updated_at)
-                     SELECT single.chat_id, single.project, '[]',
-                         COALESCE((SELECT MAX(updated_at) FROM agents), 0)
+                 INSERT INTO chat_organization(agent, project_link, tags)
+                     SELECT single.chat_id, single.project, '[]'
                      FROM single;
                 INSERT INTO schema_migrations(version) VALUES (64);",
             )

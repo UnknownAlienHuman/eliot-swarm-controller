@@ -171,11 +171,22 @@ pub(crate) fn read_internal(
     let mut values = BTreeMap::new();
     for section in &sections {
         let mut value = section_json(&source, section_name(*section))?;
-        if *section == SettingsSection::Daemon && value.get("chats_root").is_none() {
-            // Read back the same validated root launch resolves: a
-            // non-default data dir never reads back under the owner tree.
+        if *section == SettingsSection::Daemon {
+            // Explicit and default roots resolve through the same
+            // launch-time validator, so a stored root inside the owner
+            // chat tree is refused at readback too.
+            let configured = match value.get("chats_root") {
+                None => None,
+                Some(JsonValue::String(root)) => Some(root.as_str()),
+                Some(_) => {
+                    return Err(core::Error::new(
+                        "profile_error",
+                        "daemon.chats_root must be a string",
+                    ));
+                }
+            };
             value["chats_root"] = serde_json::json!(
-                super::validate_chats_location(data_root, None)?.to_string_lossy()
+                super::validate_chats_location(data_root, configured)?.to_string_lossy()
             );
         }
         if policy.contains_value(&value) {
@@ -963,6 +974,45 @@ mod tests {
         let _read = read_internal(&root.0, &store, None, &policy).expect("read settings");
         let after = store.list_settings_history(100).expect("history");
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn explicit_chats_root_inside_owner_tree_is_refused_at_readback() {
+        let root = TestRoot::new();
+        let store = Store::open(Path::new(":memory:")).expect("open Store");
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .expect("home is set for the chats_root fixture");
+        let bad = PathBuf::from(home)
+            .join("Eliot")
+            .join("chats")
+            .join("k175d-evil");
+        let source = format!("[daemon]\nchats_root = '{}'\n", bad.to_string_lossy());
+        std::fs::write(root.0.join("config.toml"), source).expect("write bad config");
+        // Launch resolves the same validator; readback must refuse too.
+        let error = read_internal(&root.0, &store, Some(&[SettingsSection::Daemon]), &policy)
+            .expect_err("explicit root inside the owner tree is refused");
+        assert_eq!(error.code, "profile_error");
+    }
+
+    #[test]
+    fn default_chats_root_reads_back_disjoint_from_the_owner_tree() {
+        let root = TestRoot::new();
+        let store = Store::open(Path::new(":memory:")).expect("open Store");
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        std::fs::write(root.0.join("config.toml"), "").expect("write empty config");
+        let read = read_internal(&root.0, &store, Some(&[SettingsSection::Daemon]), &policy)
+            .expect("default root reads back");
+        let value = read.sections[&SettingsSection::Daemon]
+            .get("chats_root")
+            .and_then(JsonValue::as_str)
+            .expect("effective chats_root reads back");
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .expect("home is set for the chats_root fixture");
+        let owner_chats = PathBuf::from(home).join("Eliot").join("chats");
+        let resolved = std::path::absolute(value).unwrap_or_else(|_| PathBuf::from(value));
+        assert_ne!(resolved, owner_chats);
+        assert!(!resolved.starts_with(&owner_chats));
     }
 
     #[test]

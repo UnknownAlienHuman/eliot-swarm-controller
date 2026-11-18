@@ -284,10 +284,13 @@ existing Agent or chat identity (schema v64).
 - `chat.organization` returns the grouped projection: teams by project
   assignment, manager, repository or worktree, and ancestry, with
   event-watermark readback. Clients never repeat Git discovery or grouping.
+  Chats group by their overlay link alone; a legacy chat that still carries
+  an execution project reads in the no-project bucket until attached.
 - `chat.attach` moves chats under a retained project; `chat.detach` returns
   them to the no-project bucket. `chat.tag` replaces tag groups. Each
-  mutation returns the committed per-Agent links; change readback rides the
-  projection's event watermark.
+  mutation returns the committed per-Agent links; each fresh write appends
+  one `organization.changed` event in the same transaction so the
+  projection's event watermark advances.
 - Continuing work in another project stays a separate, authorized execution
   operation through the existing switch/handoff path, not an organization
   mutation: a running Agent cannot change execution scope through an edit.

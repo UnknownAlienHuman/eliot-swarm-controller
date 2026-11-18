@@ -14,9 +14,14 @@ pub(super) async fn run_chat(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
-        ChatCommand::Organization(ChatOrganizationArgs { project, archived }) => {
+        ChatCommand::Organization(ChatOrganizationArgs {
+            project,
+            after,
+            archived,
+        }) => {
             let request = ChatOrganizationRequest {
                 project,
+                after,
                 archived: if archived {
                     ArchivedFilter::Include
                 } else {

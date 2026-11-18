@@ -831,7 +831,7 @@ fn method_scopes(name: &str, principal: &Principal, identity: &IdentityResponse)
 fn method_limits(name: &str) -> &'static str {
     match name {
         "chat.attach" | "chat.detach" | "chat.tag" => {
-            "Owner only. Placement and tags only; execution scope is untouched. At most 64 Agents per call. Retry the same id for the retained readback."
+            "Owner only. Placement and tags only; execution scope is untouched. At most 16 Agents per call. Retry the same id for the retained readback."
         }
         "chat.organization" => {
             "Owner only. Ready grouped projection with event-watermark readback; no client-side Git discovery."

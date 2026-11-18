@@ -33,40 +33,31 @@ impl Router {
         require_owner(principal)?;
         let change = {
             let mut store = self.inner.store.lock().await;
-            match method {
+            let change = match method {
                 "chat.attach" => {
                     let request: ChatAttachRequest =
                         eliot_core::api::discovery::decode_params(params.clone())?;
                     request.validate()?;
-                    let change =
-                        store.attach_chats(&principal_name(principal), &request, now_ms())?;
-                    serde_json::to_value(change.value).map_err(|_| {
-                        Error::new("internal", "organization mutation could not be encoded")
-                    })?
+                    store.attach_chats(&principal_name(principal), &request, now_ms())?
                 }
                 "chat.detach" => {
                     let request: ChatDetachRequest =
                         eliot_core::api::discovery::decode_params(params.clone())?;
                     request.validate()?;
-                    let change =
-                        store.detach_chats(&principal_name(principal), &request, now_ms())?;
-                    serde_json::to_value(change.value).map_err(|_| {
-                        Error::new("internal", "organization mutation could not be encoded")
-                    })?
+                    store.detach_chats(&principal_name(principal), &request, now_ms())?
                 }
                 _ => {
                     let request: ChatTagRequest =
                         eliot_core::api::discovery::decode_params(params.clone())?;
                     request.validate()?;
-                    let change =
-                        store.tag_agents(&principal_name(principal), &request, now_ms())?;
-                    serde_json::to_value(change.value).map_err(|_| {
-                        Error::new("internal", "organization mutation could not be encoded")
-                    })?
+                    store.tag_agents(&principal_name(principal), &request, now_ms())?
                 }
-            }
+            };
+            self.publish_locked(&change.events);
+            change
         };
-        Ok(change)
+        serde_json::to_value(change.value)
+            .map_err(|_| Error::new("internal", "organization mutation could not be encoded"))
     }
 
     pub(super) async fn chat_attach(&self, params: &Value, principal: &Principal) -> Result<Value> {
