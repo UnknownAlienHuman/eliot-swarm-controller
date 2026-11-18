@@ -328,20 +328,50 @@ impl TurnEntry {
             *failed += usize::from(failed_now);
         }
         self.item_groups.insert(item_id.to_owned(), group);
-        if self.item_order.back().is_none_or(|last| last != item_id) {
+        if !self.item_order.iter().any(|known| known == item_id) {
             self.item_order.push_back(item_id.to_owned());
         }
-        // The tool identity index stays bounded: drop the least recently
-        // started identities. Their rows stay (bounded) with exact
-        // counters, and a late completion for a dropped identity opens a
-        // fresh done row instead of updating the old one.
+        // Only settled identities leave: an unfinished tool keeps the
+        // identity its completion settles (settling the row and group
+        // that started it), and a settled entry dedupes redeliveries.
+        // Every retained byte still counts toward the resident budget,
+        // so whole turns leave when tools pile up.
         while self.item_order.len() > MAX_TOOL_IDS_PER_TURN {
-            let Some(old) = self.item_order.pop_front() else {
+            if !self.evict_one_tool_id() {
                 break;
-            };
-            if !self.item_order.contains(&old) {
-                self.item_groups.remove(&old);
             }
+        }
+    }
+
+    /// Drop the oldest settled tool identity. An unfinished tool, or one
+    /// whose row already left the bounded list, keeps its identity: only
+    /// a row that shows done proves the completion was recorded.
+    fn evict_one_tool_id(&mut self) -> bool {
+        let settled = self
+            .item_order
+            .iter()
+            .position(|item_id| self.tool_settled(item_id));
+        match settled.and_then(|position| self.item_order.remove(position)) {
+            Some(item_id) => {
+                self.item_groups.remove(&item_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the tool's completion was recorded on its row.
+    fn tool_settled(&self, item_id: &str) -> bool {
+        match self
+            .item_groups
+            .get(item_id)
+            .and_then(|group| self.activity.get(*group))
+        {
+            Some(Activity::Tools { rows, .. }) => rows
+                .iter()
+                .find(|row| row.item_id == item_id)
+                .is_some_and(|row| row.done),
+            _ => false,
         }
     }
 }
@@ -658,6 +688,14 @@ impl Conversation {
                 continue;
             };
             if self.evicted.contains(turn_id) {
+                continue;
+            }
+            // Only a start creates a turn: late activity for a discarded
+            // turn never resurrects it with a fresh timestamp, and a
+            // completion whose start is below the retention floor does
+            // not fabricate a newest turn (its record still arrives
+            // through `agent.result`).
+            if !self.turns.contains_key(turn_id) && event.kind != "turn.started" {
                 continue;
             }
             let turn = self
@@ -2009,6 +2047,81 @@ mod tests {
     }
 
     #[test]
+    fn an_early_tool_settles_its_original_group_after_newer_starts() {
+        // Finding 3: an early tool completing after 256 newer starts
+        // keeps its identity (it never settled), so its completion
+        // lands on the row and group that started it: no second tool,
+        // exact counters.
+        let mut chat = Conversation::new("a1");
+        chat.apply_events(&[event(1, "turn.started", json!({"turn_id": "t0"}))]);
+        let starts: Vec<Event> = (0..300)
+            .map(|index| {
+                event(
+                    index + 2,
+                    "tool.started",
+                    json!({
+                        "turn_id": "t0",
+                        "item_id": format!("item{index:03}"),
+                        "tool": "run",
+                    }),
+                )
+            })
+            .collect();
+        chat.apply_events(&starts);
+        chat.apply_events(&[event(
+            302,
+            "tool.completed",
+            json!({
+                "turn_id": "t0",
+                "item_id": "item000",
+                "tool": "run",
+                "status": "completed",
+            }),
+        )]);
+        let turn = chat.turns.get("t0").expect("resident turn");
+        assert!(turn.item_groups.contains_key("item000"));
+        let (mut total, mut done) = (0, 0);
+        for entry in &turn.activity {
+            if let Activity::Tools {
+                rows: _,
+                total: group_total,
+                done: group_done,
+                ..
+            } = entry
+            {
+                total += group_total;
+                done += group_done;
+            }
+        }
+        assert_eq!(total, 300);
+        assert_eq!(done, 1);
+    }
+
+    #[test]
+    fn late_activity_never_fabricates_a_turn() {
+        // Finding 3: only a start creates a turn. A completion or a
+        // message for an unknown turn (a discarded turn's late event,
+        // or a start below the retention floor) is dropped instead of
+        // appearing as the newest turn.
+        let mut chat = Conversation::new("a1");
+        chat.apply_events(&[
+            event(
+                10,
+                "tool.completed",
+                json!({"turn_id": "t9", "item_id": "item9", "tool": "run", "status": "ok"}),
+            ),
+            event(
+                11,
+                "message.completed",
+                json!({"turn_id": "t9", "text": "late", "phase": "final"}),
+            ),
+            event(12, "turn.completed", json!({"turn_id": "t9"})),
+        ]);
+        assert!(!chat.turns.contains_key("t9"));
+        assert_eq!(chat.coverage().evicted_turns, 0);
+    }
+
+    #[test]
     fn evicted_turns_are_not_resurrected_by_late_events() {
         let mut chat = Conversation::new("a1");
         chat.reset(coverage(), &[], &[]);
@@ -2033,15 +2146,14 @@ mod tests {
         let mut chat = Conversation::new("a1");
         chat.reset(coverage(), &[], &[]);
         let big = "x".repeat(MAX_TEXT_BYTES - 1);
-        let events: Vec<Event> = (0..60)
-            .map(|index| {
-                event(
-                    index + 1,
-                    "message.completed",
-                    json!({"turn_id": "t1", "phase": "commentary", "text": big}),
-                )
-            })
-            .collect();
+        let mut events = vec![event(1, "turn.started", json!({"turn_id": "t1"}))];
+        events.extend((0..60).map(|index| {
+            event(
+                index + 2,
+                "message.completed",
+                json!({"turn_id": "t1", "phase": "commentary", "text": big}),
+            )
+        }));
         chat.apply_events(&events);
         let items = chat.items();
         assert_eq!(items.len(), 1);
@@ -2062,13 +2174,14 @@ mod tests {
         let mut chat = Conversation::new("a1");
         chat.reset(coverage(), &[], &[]);
         chat.apply_events(&[
+            event(1, "turn.started", json!({"turn_id": "t1"})),
             event(
-                1,
+                2,
                 "tool.started",
                 json!({"turn_id": "t1", "item_id": "i1", "tool": "exec", "status": "inProgress"}),
             ),
             event(
-                2,
+                3,
                 "tool.completed",
                 json!({"turn_id": "t1", "item_id": "i1", "tool": "exec"}),
             ),
@@ -2082,8 +2195,8 @@ mod tests {
     fn tool_counters_stay_exact_past_the_row_bound() {
         let mut chat = Conversation::new("a1");
         chat.reset(coverage(), &[], &[]);
-        let mut events = Vec::new();
-        let mut seq = 1;
+        let mut events = vec![event(1, "turn.started", json!({"turn_id": "t1"}))];
+        let mut seq = 2;
         for index in 0..(MAX_TOOL_ROWS + 10) {
             events.push(event(
                 seq,
