@@ -441,6 +441,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `swarm.handoff`, `command.cancel` | atomic task transfer to an existing Agent; Owner withdrawal of undispatched handoff input |
 | `command.children` | implemented scoped, paged child readback for a retained expansion |
 | `project.list/get` | owner-only read of registered project authority |
+| `project.overview` | Owner or Agent read of one project team or every team with workspaces, queue, capacity and whole-fleet totals; a manager sees its own team in full and aggregates for other projects |
 | `rule.list/get/catch_up` | owner-only paged rule list (state, timer state, canonical definition), one rule read, and finite committed-history catch-up |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
@@ -500,6 +501,15 @@ For ordinary commands, a supplied `args.assignment_epoch` is a precondition when
 the verb accepts it. Admission records the current binding even when it is
 omitted. See [coordination](coordination.md#project-manager-assignment) for
 generation, epoch and dispatch behavior.
+
+`project.overview` takes an optional registered project id and returns the
+team entry (current manager, workers, workspaces, queue depth, `project` and
+`manager_assignment` capacity usages beside their Owner limits) or every
+visible team plus `fleet` totals (`global:swarm` usage, live harnesses by
+harness, active turns, queued work, retained-unknown reservations, separately
+listed native children). Counts are exact `COUNT(*)` reads; list views are
+bounded with truncation flags and `coverage: partial` instead of a total when
+a list does not fit. CLI callers use `swarm project overview [--project ID]`.
 
 ### Authenticated method discovery
 

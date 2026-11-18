@@ -1283,10 +1283,36 @@ limits. An omitted cap (`None`) is unlimited; `0` disables that scope. The snaps
 freezes the scope names and configured values. Cross-harness children reserve
 their own scopes and inherited parent
 account/proxy scopes together, so multiple distinct scopes of one kind are allowed;
-duplicate scope identities reject. A full scope rejects before native
-control with `capacity_unavailable`. That request is not admitted or persisted, so it
+duplicate scope identities reject. The daemon-wide `global:swarm` scope, the per-registered-project
+`project:<id>` scope and the per-project `manager_assignment:<id>` scope join
+the profile, account and proxy scopes. The Owner sets their bounds in the one
+config store:
+
+```toml
+[capacity]
+global_max_live = 3
+
+[capacity.projects.app]
+max_live = 2
+manager_max_live = 2
+```
+
+A missing limit is unlimited, as for every other scope; `0` disables admission
+to that scope. The daemon freezes the current Owner bounds into each launch
+snapshot alongside the profile, account and proxy bounds, so another profile
+name, a second assignment key or a new worker cannot evade a project or global
+cap, and a worker launch counts against its manager's project. The unit is a
+controlled generation or reservation, an idle manager included; observe-only
+Agents never reserve. The Store checks and reserves every applicable scope in
+the same admission transaction as the assignment, workspace and launch.
+
+A full scope rejects before native
+control with `capacity_unavailable`. That refusal names the blocking scope and
+points at the Owner remedy (`config.toml [capacity]`). That request is not admitted or persisted, so it
 creates no command, Agent, event or reservation; the same ID may be submitted again
-after capacity changes. An already admitted command retains its result under its ID, and
+after capacity changes. Lowering a limit stops nothing running: existing
+reservations keep running and only new admissions are refused until usage
+drops. Retained unknown reservations keep occupying their scopes. An already admitted command retains its result under its ID, and
 replay never starts another native generation or reservation. A capacity reservation is
 released only after the owned generation is proven closed: the OS source closed
 with every recorded process of the generation exited (at least one plugin or

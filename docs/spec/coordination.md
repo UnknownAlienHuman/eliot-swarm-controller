@@ -234,6 +234,18 @@ automatically through the existing parent link. They run in the manager's ready
 worktree under the current assignment fence and can reuse a frozen profile with
 setup entries. Workspace setup runs only during preparation of a new worktree.
 
+`project.overview` reads back one project team or every team with its manager,
+workers, workspaces, queue depth and capacity usage, plus whole-fleet totals:
+live harnesses (with per-harness breakdown), active turns, queued work and
+retained-unknown reservations, each counted separately, with observed native
+children listed separately and never counted twice. Totals are exact committed
+counts, never a UI page: the worker, workspace and native-child lists are
+bounded and carry truncation flags, and `coverage` says `partial` when a list
+did not fit instead of giving a total for it. The Owner sees every team in
+full; a manager caller sees its own team in full and aggregates for other
+projects. Queue-depth reporting carries no scheduling promise: fairness and
+queued interactive launch are step 4 and stay unsupported.
+
 The current workspace binding to the assignment is recorded separately from
 the historical creator receipt, so a later transfer can move the binding without
 rewriting history. Cleanup planning, cleanup apply and worktree removal keep
