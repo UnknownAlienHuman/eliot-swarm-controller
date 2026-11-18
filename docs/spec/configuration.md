@@ -933,8 +933,7 @@ or kills a service still used by old snapshots; conflicting endpoint reuse fails
 
 The frozen snapshot above never changes for a generation. `command.submit`
 `verb:\"configure\"` records a separate overlay instead: the requested values,
-the effective values the next native turn carries (each requested value, or
-the frozen original when not requested), a monotonically increasing
+the settings for the next native turn, a monotonically increasing
 `config_revision` for the Agent generation, and `application:\"next_turn\"`.
 Only `model` and `effort` are supported; authority-adjacent fields are
 rejected outright and anything else is `unsupported`. Only the Owner may
@@ -943,10 +942,13 @@ submit it.
 Codex carries both values as per-turn `turn/start` overrides
 (`TurnStartParams.model`/`effort`); Muse carries effort through per-turn
 `reasoningEffort` and switches the live session model at configure time
-(`session/setModel` with `session/read` proof, between turns only), while
-Claude switches the live session model at configure time through the
-stream-json `set_model` control request (between turns only; effort applies
-only at launch and is refused). OpenCode switches the
+(`session/setModel` with `session/read` proof, between turns only). Muse
+keeps the last configured value for omitted fields, with initial values
+from the native session and frozen profile. The frozen profile supplies
+the native resume effort. Claude commits the accepted selector through
+the stream-json `set_model` control request between turns, with a native
+permission-mode check before and after the setter. Effort is launch-only.
+Other omitted fields use the frozen original. OpenCode switches the
 retained session model at configure time (`POST /api/session/{id}/model`
 with a `session.get` proof; the requested model must be in the live model
 catalogue or the command rejects before any write, and effort has no native

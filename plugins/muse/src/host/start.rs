@@ -110,14 +110,8 @@ pub(super) fn prepare_profile(
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_owned)
         });
-    let requested_effort = match params
-        .effort_override
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-    {
-        Some(effort) => Some(effort),
-        None => optional_profile_text(profile, "effort", "Muse")?,
-    };
+    // Overlay effort belongs to turn/start, including after resume.
+    let requested_effort = optional_profile_text(profile, "effort", "Muse")?;
     if let Some(effort) = requested_effort.as_deref()
         && !is_reasoning_effort_tier(effort)
     {

@@ -1533,16 +1533,9 @@ impl ClaudePlugin {
         dispatch_send(session, &params.command_id, native_content, context).await
     }
 
-    /// Switch the live session model through the stream-json `set_model`
-    /// control request, between turns only. The switch runs only when no
-    /// turn is active and no input awaits association, so a mid-turn
-    /// configure refuses before any write with proof of no effect. The
-    /// success reply is the application proof (the same proof the resume
-    /// realign relies on); a native refusal or a provably-undispatched
-    /// write refuses with its reason, and a lost or ambiguous reply
-    /// settles unknown without a replay, storing nothing. The effective
-    /// model is reported from the next native `assistant` record by the
-    /// event task, never assumed here.
+    /// Change the selector only after confirming the owned CLI is idle.
+    /// An applied reply proves selector acceptance and unchanged permission
+    /// mode. The next bound assistant record identifies the serving model.
     async fn configure_command(&mut self, params: AgentCommandParams) -> Result<Value> {
         let session = self
             .session
@@ -1567,20 +1560,11 @@ impl ClaudePlugin {
                 "Claude session identity is unresolved",
             ));
         }
-        if let Some(reason) = session.events.status().failure {
-            return Err(Error::new("unknown", reason));
-        }
-        if session.events.status().active_turn_id.is_some() {
-            return Ok(json!({
-                "state": "rejected",
-                "reason": "Claude already has an active turn; configure the model between turns",
-            }));
-        }
-        if session.sends.pending.is_some() {
-            return Ok(json!({
-                "state": "rejected",
-                "reason": "Claude prior input has no exact native turn association; configure between turns",
-            }));
+        session.sends.reconcile();
+        if let Some(reason) =
+            configure_input_refusal(&session.events.status(), session.sends.pending.is_some())
+        {
+            return Ok(json!({"state": "rejected", "reason": reason}));
         }
         let model = match Self::parse_configure_model(&params.args) {
             Ok(model) => model,
@@ -1591,6 +1575,23 @@ impl ClaudePlugin {
                 }));
             }
         };
+        let before = match read_configure_state(&session.native_client).await {
+            Ok(before) => before,
+            Err(_) => {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": "Claude could not confirm native idle state and permission mode",
+                }));
+            }
+        };
+        if let Err(error) = check_configure_preflight(&before, &model) {
+            return Ok(json!({"state": "rejected", "reason": error.message}));
+        }
+        if let Some(reason) =
+            configure_input_refusal(&session.events.status(), session.sends.pending.is_some())
+        {
+            return Ok(json!({"state": "rejected", "reason": reason}));
+        }
         match session
             .native_client
             .control(
@@ -1600,11 +1601,21 @@ impl ClaudePlugin {
             )
             .await
         {
-            Ok(_) => Ok(json!({
-                "state": "applied",
-                "model": model,
-                "model_verified": true,
-            })),
+            Ok(_) => {
+                let after = read_configure_state(&session.native_client).await.map_err(|error| {
+                    contextual_error(
+                        error,
+                        "unknown",
+                        "Claude accepted the model selector but permission mode could not be verified",
+                    )
+                })?;
+                verify_configure_permission_mode(&before, &after)?;
+                Ok(json!({
+                    "state": "applied",
+                    "accepted_model": model,
+                    "model_verified": false,
+                }))
+            }
             Err(error) if error.code == "native_rejected" => Ok(json!({
                 "state": "rejected",
                 "reason": format!("Claude refused the model switch ({})", error.message),
@@ -2708,6 +2719,80 @@ async fn realign_resumed_settings(
     Ok(effective_mode)
 }
 
+fn configure_input_refusal(
+    status: &crate::events::EventStatus,
+    pending_send: bool,
+) -> Option<&str> {
+    if let Some(reason) = status.failure.as_deref() {
+        return Some(reason);
+    }
+    if status.active_turn_id.is_some() || status.background_continuation {
+        return Some(
+            "Claude already has an active turn or background continuation; configure between turns",
+        );
+    }
+    pending_send.then_some(
+        "Claude prior input has no exact native turn association; configure between turns",
+    )
+}
+
+async fn read_configure_state(client: &ClaudeClient) -> Result<InitializeReadback> {
+    // Repeated initialize without settings preserves the installed hooks and
+    // reports the current native session state and permission mode.
+    let result = client
+        .control("initialize", json!({}), Instant::now() + RPC_TIMEOUT)
+        .await?;
+    serde_json::from_value(result).map_err(|_| {
+        Error::new(
+            "native_readback",
+            "Claude configure readback did not match its envelope",
+        )
+    })
+}
+
+fn check_configure_preflight(readback: &InitializeReadback, model: &str) -> Result<()> {
+    if readback.session_state.as_deref() != Some("idle") {
+        return Err(Error::new(
+            "busy",
+            "Claude native session must be idle to configure the model",
+        ));
+    }
+    match readback.current_permission_mode.as_deref() {
+        Some("auto")
+            if !readback.models.iter().any(|entry| {
+                entry.supports_auto_mode == Some(true)
+                    && (entry.value.as_deref() == Some(model)
+                        || entry.resolved_model.as_deref() == Some(model))
+            }) =>
+        {
+            Err(Error::new(
+                "unsupported",
+                "Claude did not confirm this model supports the current auto permission mode",
+            ))
+        }
+        Some(mode) if !mode.trim().is_empty() => Ok(()),
+        _ => Err(Error::new(
+            "native_readback",
+            "Claude did not report its current permission mode",
+        )),
+    }
+}
+
+fn verify_configure_permission_mode(
+    before: &InitializeReadback,
+    after: &InitializeReadback,
+) -> Result<()> {
+    if after.current_permission_mode.is_none()
+        || after.current_permission_mode != before.current_permission_mode
+    {
+        return Err(Error::new(
+            "unknown",
+            "Claude accepted the model selector but its permission mode was not preserved and verified",
+        ));
+    }
+    Ok(())
+}
+
 fn native_resume_permission_mode(profile_mode: &str) -> &str {
     match profile_mode {
         "manual" => "default",
@@ -3183,6 +3268,33 @@ mod tests {
                 std::ffi::OsString::from("Task"),
             ]
         );
+    }
+
+    #[test]
+    fn configure_requires_auto_model_support_and_unchanged_permission_mode() {
+        use super::{check_configure_preflight, verify_configure_permission_mode};
+        let before = serde_json::from_value(json!({
+            "session_state":"idle", "current_permission_mode":"auto", "models":[
+                {"value":"haiku", "supportsAutoMode":false},
+                {"value":"sonnet", "resolvedModel":"claude-sonnet-5", "supportsAutoMode":true}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            check_configure_preflight(&before, "haiku")
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+        assert!(check_configure_preflight(&before, "claude-sonnet-5").is_ok());
+        let drifted = serde_json::from_value(json!({"current_permission_mode":"default"})).unwrap();
+        assert_eq!(
+            verify_configure_permission_mode(&before, &drifted)
+                .unwrap_err()
+                .code,
+            "unknown"
+        );
+        assert!(verify_configure_permission_mode(&before, &before).is_ok());
     }
 
     #[test]

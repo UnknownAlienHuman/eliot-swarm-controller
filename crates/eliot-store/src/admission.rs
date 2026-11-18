@@ -295,6 +295,15 @@ pub(super) fn resolve_configure(
     if let Some(reason) = refusal {
         return Err(Error::new("unsupported", reason));
     }
+    if harness == "muse"
+        && let Some(effort) = effort.as_deref()
+        && !eliot_core::api::MUSE_REASONING_EFFORT_TIERS.contains(&effort)
+    {
+        return Err(Error::new(
+            "invalid",
+            "Muse effort is not a supported reasoning tier",
+        ));
+    }
     let original_model = snapshot
         .get("model")
         .and_then(Value::as_str)
@@ -1350,6 +1359,20 @@ fn admit_configure_tx(
     // overlay itself is stored by the Router after dispatch, which
     // settles the command applied only once the values are stored.
     let _ = resolve_configure(&request.args, &agent.harness, &agent.profile_snapshot)?;
+    if eliot_core::api::configure_uses_native_session(&agent.harness, &request.args) {
+        if matches!(agent.harness.as_str(), "claude" | "muse") && agent.active_turn.is_some() {
+            return Err(Error::new(
+                "busy",
+                "Agent already has an active turn; configure the model between turns",
+            ));
+        }
+        if has_pending_send_input(tx, agent_num, agent.generation)? {
+            return Err(Error::new(
+                "busy",
+                "native configure requires no pending input; retry between turns",
+            ));
+        }
+    }
     events.push(admit_command(
         tx,
         &CommandInsert::admitted(

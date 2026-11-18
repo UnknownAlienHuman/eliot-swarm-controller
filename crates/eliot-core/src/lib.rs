@@ -1768,23 +1768,17 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 effort,
             });
         }
+        "turn.model_observed" => {
+            require_live_turn(agent, event)?;
+            record_serving_model(&mut next, required_text(event, "model")?);
+        }
         "message.completed" => {
             require_live_turn(agent, event)?;
             let command_id = required_text(event, "command_id")?;
             let turn_id = required_text(event, "turn_id")?;
             let text = required_text(event, "text")?;
             if let Some(model) = optional_observed_model(event)? {
-                match &mut next.effective {
-                    Some(Value::Object(effective)) => {
-                        effective.insert("model".to_owned(), Value::String(model));
-                    }
-                    None => {
-                        let mut effective = serde_json::Map::new();
-                        effective.insert("model".to_owned(), Value::String(model));
-                        next.effective = Some(Value::Object(effective));
-                    }
-                    Some(_) => {}
-                }
+                record_serving_model(&mut next, model);
             }
             effects.push(Effect::MessageCompleted {
                 command_id,
@@ -2037,6 +2031,16 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
 
     next.updated_at = now;
     Ok((next, effects))
+}
+
+fn record_serving_model(agent: &mut Agent, model: String) {
+    if let Value::Object(effective) = agent
+        .effective
+        .get_or_insert_with(|| Value::Object(serde_json::Map::new()))
+    {
+        effective.insert("model".to_owned(), Value::String(model));
+        effective.insert("model_verified".to_owned(), Value::Bool(true));
+    }
 }
 
 fn require_live_turn(agent: &Agent, event: &NativeEvent) -> Result<()> {
@@ -2589,6 +2593,32 @@ mod mcp_readback_tests {
             data: full,
             ts: None,
         }
+    }
+
+    #[test]
+    fn claude_serving_model_is_verified_only_from_the_bound_turn() {
+        let mut agent = busy_agent();
+        agent.harness = "claude".into();
+        agent.effective = Some(json!({"model": null, "permission_mode":"default"}));
+        let turn = agent.active_turn.clone().unwrap();
+        let mut observation = NativeEvent {
+            kind: "turn.model_observed".into(),
+            native_id: "assistant-model".into(),
+            data: json!({"turn_id":"foreign","model":"claude-haiku-4-5"}),
+            ts: None,
+        };
+        assert_eq!(
+            apply(&agent, &observation, 42).unwrap_err().code,
+            "source_integrity"
+        );
+        observation.data["turn_id"] = json!(turn);
+        let (observed, _) = apply(&agent, &observation, 42).unwrap();
+        assert_eq!(
+            observed.effective.unwrap(),
+            json!({
+                "model":"claude-haiku-4-5", "model_verified":true, "permission_mode":"default"
+            })
+        );
     }
 
     #[test]

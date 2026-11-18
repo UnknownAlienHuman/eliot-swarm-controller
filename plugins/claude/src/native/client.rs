@@ -290,6 +290,7 @@ impl ClaudeClient {
                     format!("Claude {subtype} response channel closed"),
                 )
             })?
+            .map_err(|error| classify_control_error(subtype, error))
     }
 
     async fn write_encoded(&self, encoded: String, deadline: Instant) -> Result<()> {
@@ -297,6 +298,32 @@ impl ClaudeClient {
             .send(encoded, deadline)
             .await
             .map_err(|error| self.diagnostic_error(error))
+    }
+}
+
+fn classify_control_error(subtype: &str, error: Error) -> Error {
+    // The installed CLI emits these validation messages before changing its
+    // model. A generic error can follow a partial effect or a pending switch.
+    let message = error.message.as_str();
+    if subtype == "set_model"
+        && error.code == "native_control_error"
+        && (message == "set_model: model must be a string"
+            || message.starts_with("Unable to validate model: ")
+            || message.strip_prefix("Model '").is_some_and(|detail| {
+                detail.ends_with("' not found")
+                    || detail.ends_with("' isn't available for your account")
+            })
+            || error
+                .message
+                .strip_prefix("Model \"")
+                .is_some_and(|message| {
+                    message.contains("\" is not a recognized model id.")
+                        || message.contains("\" is restricted by your organization's settings.")
+                }))
+    {
+        error.with_code("native_rejected")
+    } else {
+        error.with_code("unknown")
     }
 }
 
@@ -315,6 +342,16 @@ fn classify_claude_frame(value: Value) -> PumpAction<ClaudeFrame> {
         };
         let result = match response.response.subtype.as_str() {
             "success" => Ok(response.response.response.unwrap_or(Value::Null)),
+            "error" => Err(Error::new(
+                "native_control_error",
+                response
+                    .response
+                    .error
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or("Claude control refused without an error description"),
+            )),
             _ => Err(Error::new(
                 "unknown",
                 format!(
@@ -336,6 +373,34 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::{ffi::OsString, time::Duration};
+
+    #[test]
+    fn configure_decodes_correlated_model_validation_refusals() {
+        for (message, code) in [
+            (
+                "Model \"missing\" is not a recognized model id. Run /model to see available models.",
+                "native_rejected",
+            ),
+            (
+                "Unable to validate model: OAuth refresh token is no longer valid",
+                "native_rejected",
+            ),
+            ("Model 'missing' not found", "native_rejected"),
+            ("set_model failed", "unknown"),
+            ("This model switch is still pending", "unknown"),
+        ] {
+            let PumpAction::Route { key, result } = classify_claude_frame(serde_json::json!({
+                "type": "control_response",
+                "response": {"subtype": "error", "request_id": "switch", "error": message}
+            })) else {
+                panic!("expected a correlated response");
+            };
+            assert_eq!(key, "switch");
+            let error = classify_control_error("set_model", result.unwrap_err());
+            assert_eq!(error.code, code);
+            assert_eq!(error.message.as_str(), message);
+        }
+    }
 
     #[test]
     fn stderr_fixture_child() {

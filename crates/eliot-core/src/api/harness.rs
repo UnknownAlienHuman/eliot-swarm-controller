@@ -363,6 +363,11 @@ impl ConfigureSupport {
     }
 }
 
+/// Muse stable schema's closed reasoning effort vocabulary.
+pub const MUSE_REASONING_EFFORT_TIERS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
 /// Whether a dispatched `configure` must switch the live native session
 /// through the owned plugin with native proof before the Router stores
 /// anything. Mirrors [`ConfigureSupport`]: OpenCode and Antigravity always

@@ -13,7 +13,6 @@ use crate::{
             NativeSessionReadParams, NativeSessionReadResult,
             NativeSessionReasoningEffortChangedNotification, NativeSessionResumeParams,
             NativeSessionResumeResult, NativeSessionSetModelParams, NativeSessionSetModelResult,
-            NativeSessionSetReasoningEffortParams, NativeSessionSetReasoningEffortResult,
             NativeSessionStartParams, NativeSessionStartResult, NativeTurnCancelParams,
             NativeTurnCancelResult, NativeTurnCompletedNotification, NativeTurnInputPart,
             NativeTurnStartParams, NativeTurnStartResult, NativeTurnStartedNotification,
@@ -1301,63 +1300,6 @@ impl MusePlugin {
                     "reason": format!("Muse effort {effort} is not a variant of model {requested_model}"),
                 }));
             }
-            let effort_command = new_command_id();
-            let effort_response = match session
-                .native_client
-                .call(
-                    "session/setReasoningEffort",
-                    serde_json::to_value(NativeSessionSetReasoningEffortParams {
-                        command_id: effort_command.clone(),
-                        reasoning_effort: effort.to_owned(),
-                        session_id: session_id.clone(),
-                    })
-                    .map_err(|_| {
-                        Error::new(
-                            "internal",
-                            "Muse session/setReasoningEffort params could not be encoded",
-                        )
-                    })?,
-                    deadline,
-                )
-                .await
-            {
-                Ok(value) => value,
-                Err(error) if error.code == "native_rejected" => {
-                    return Ok(json!({
-                        "state": "rejected",
-                        "reason": format!(
-                            "Muse session/setReasoningEffort did not admit the effort ({})",
-                            error.message
-                        ),
-                    }));
-                }
-                Err(error) if native_no_write(&error.code) => {
-                    return Ok(json!({
-                        "state": "rejected",
-                        "reason": "Muse session/setReasoningEffort was not dispatched",
-                    }));
-                }
-                Err(error) => {
-                    return Err(contextual_error(
-                        error,
-                        "unknown",
-                        "Muse session/setReasoningEffort may have changed native state; it will not be repeated",
-                    ));
-                }
-            };
-            let effort_ack: NativeSessionSetReasoningEffortResult =
-                serde_json::from_value(effort_response).map_err(|_| {
-                    Error::new(
-                        "unknown",
-                        "Muse session/setReasoningEffort ack did not match the installed schema",
-                    )
-                })?;
-            if effort_ack.command_id != effort_command || effort_ack.status != "accepted" {
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": "Muse session/setReasoningEffort did not acknowledge the exact submitted command",
-                }));
-            }
         }
         let model_command = new_command_id();
         let model_response = match session
@@ -1405,19 +1347,7 @@ impl MusePlugin {
                 ));
             }
         };
-        let model_ack: NativeSessionSetModelResult = serde_json::from_value(model_response)
-            .map_err(|_| {
-                Error::new(
-                    "unknown",
-                    "Muse session/setModel ack did not match the installed schema",
-                )
-            })?;
-        if model_ack.command_id != model_command || model_ack.status != "accepted" {
-            return Ok(json!({
-                "state": "rejected",
-                "reason": "Muse session/setModel did not acknowledge the exact submitted command",
-            }));
-        }
+        check_configure_model_ack(model_response, &model_command)?;
         // Verify the switch against the owned session before reporting it:
         // the ack admits the selection for subsequent model calls, and the
         // readback proves which model the session now carries.
@@ -1439,38 +1369,11 @@ impl MusePlugin {
             ));
         }
         session.selected_model = Some(requested_model.clone());
-        let mut response = json!({
+        Ok(json!({
             "state": "applied",
             "model": requested_model,
             "model_verified": true,
-        });
-        if let Some(effort) = requested.effort {
-            let effective_effort = read_effective_reasoning_effort(
-                &session.native_client,
-                &session_id,
-            )
-            .await
-            .map_err(|error| {
-                Error::new(
-                    "unknown",
-                    format!(
-                        "Muse reasoning-effort readback did not prove the effort switch ({})",
-                        error.message
-                    ),
-                )
-            })?;
-            if effective_effort.as_deref() != Some(effort.as_str()) {
-                return Err(Error::new(
-                    "unknown",
-                    format!(
-                        "Muse reasoning-effort readback did not prove the effort switch to {effort}"
-                    ),
-                ));
-            }
-            response["effort"] = Value::String(effort);
-            response["effort_verified"] = Value::Bool(true);
-        }
-        Ok(response)
+        }))
     }
 
     async fn send_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -2308,7 +2211,11 @@ impl MusePlugin {
                 "Muse native observation remains unresolved",
             );
         }
-        read_live_snapshot(session, &params, session_id, turn_id).await
+        let snapshot = read_live_snapshot(session, &params, session_id, turn_id).await?;
+        if let Some(model) = snapshot["native_model"].as_str() {
+            session.selected_model = Some(model.to_owned());
+        }
+        Ok(snapshot)
     }
 
     async fn stop(&mut self, raw: &Value, deadline: Instant) -> Result<Value> {
@@ -2939,7 +2846,8 @@ async fn read_live_snapshot(
         "agent_id": params.agent_id, "generation": params.generation,
         "command_id": params.command_id, "state": session_state(&readback.session),
         "native_scope": session.native_scope, "native_ref": session_id,
-        "active_turn": last_turn.as_ref().filter(|turn| !turn.terminal).map(|turn| turn.turn_id.clone()),
+        "native_model": readback.session.model_id,
+        "active_turn": readback.session.active_turn_id,
         "last_turn": last_turn, "native_exit": event_status.native_exit,
         "batch_unknown": event_status.batch_unknown,
         "source_unknown": event_status.source_unknown, "result_known": result_known,
@@ -3016,6 +2924,22 @@ async fn read_backward_page(
             .await?,
     )
     .map_err(|_| Error::new("native_readback", "Muse view/page response was invalid"))
+}
+
+fn check_configure_model_ack(response: Value, command_id: &str) -> Result<()> {
+    let ack: NativeSessionSetModelResult = serde_json::from_value(response).map_err(|_| {
+        Error::new(
+            "unknown",
+            "Muse session/setModel ack did not match the installed schema",
+        )
+    })?;
+    if ack.command_id != command_id || ack.status != "accepted" {
+        return Err(Error::new(
+            "unknown",
+            "Muse session/setModel did not acknowledge the exact submitted command",
+        ));
+    }
+    Ok(())
 }
 
 /// Read back the standing session-default reasoning effort: the newest
@@ -3964,6 +3888,25 @@ mod tests {
             Some("agent-1")
         );
         assert_eq!(value.get("generation").and_then(Value::as_i64), Some(1));
+    }
+
+    #[test]
+    fn configure_model_ack_must_name_the_exact_accepted_command() {
+        use super::check_configure_model_ack;
+        for (id, status) in [("foreign", "accepted"), ("switch", "unrecognized")] {
+            let reply = json!({"commandId": id, "status": status});
+            assert_eq!(
+                check_configure_model_ack(reply, "switch").unwrap_err().code,
+                "unknown"
+            );
+        }
+        assert!(
+            check_configure_model_ack(
+                json!({"commandId": "switch", "status": "accepted"}),
+                "switch"
+            )
+            .is_ok()
+        );
     }
 
     #[test]

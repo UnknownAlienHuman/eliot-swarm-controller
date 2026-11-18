@@ -32,7 +32,7 @@ use eliot_core::{
     },
     parse_agent_id,
 };
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::json;
 
 const RESOLVE_COMMAND_METHOD: &str = "command.resolve";
@@ -48,6 +48,14 @@ pub struct TurnInactiveProof {
     pub turn_id: String,
 }
 
+/// Exact current Muse session model, read through the owned generation's plugin.
+pub struct ConfigureReadback {
+    pub agent: String,
+    pub generation: i64,
+    pub native_ref: String,
+    pub model: String,
+}
+
 impl Store {
     /// Resolve one unknown command to its owner-asserted terminal state. The
     /// mutation id binds the assertion for idempotent retries; the command
@@ -58,16 +66,48 @@ impl Store {
         request: &CommandResolveRequest,
         now: i64,
     ) -> Result<Change<CommandResolveResponse>> {
+        self.resolve_command_with_readback(principal, request, None, now)
+    }
+
+    pub fn resolve_command_with_readback(
+        &mut self,
+        principal: &str,
+        request: &CommandResolveRequest,
+        readback: Option<&ConfigureReadback>,
+        now: i64,
+    ) -> Result<Change<CommandResolveResponse>> {
         self.ensure_writer_healthy()?;
-        let result = self.resolve_command_inner(principal, request, now);
+        let result = self.resolve_command_inner(principal, request, readback, now);
         self.fault_on_persistence_error(&result);
         result
+    }
+
+    pub fn stored_command_resolution(
+        &self,
+        principal: &str,
+        request: &CommandResolveRequest,
+    ) -> Result<Option<CommandResolveResponse>> {
+        request.validate()?;
+        if principal != "owner" {
+            return Err(Error::new(
+                "not_allowed",
+                "command resolution requires the owner principal",
+            ));
+        }
+        ensure_resolution_write_id(&self.connection, &request.id)?;
+        stored_command_resolution(
+            &self.connection,
+            principal,
+            request,
+            &command_resolution_digest(request)?,
+        )
     }
 
     fn resolve_command_inner(
         &mut self,
         principal: &str,
         request: &CommandResolveRequest,
+        readback: Option<&ConfigureReadback>,
         now: i64,
     ) -> Result<Change<CommandResolveResponse>> {
         request.validate()?;
@@ -77,43 +117,14 @@ impl Store {
                 "command resolution requires the owner principal",
             ));
         }
-        let semantic_payload = json!({
-            "command_id": request.command_id,
-            "as": request.resolution.as_str(),
-            "reason": request.reason,
-        });
-        let payload_digest = canonical::digest(&semantic_payload)?;
+        let payload_digest = command_resolution_digest(request)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
 
-        if command_binding(&tx, &request.id)?.is_some() {
-            return Err(Error::new(
-                "id_conflict",
-                "resolution write id is already used by a command",
-            ));
-        }
-        crate::ensure_no_digest_id(
-            &tx,
-            &request.id,
-            "resolution write id is already used by a completion digest",
-        )?;
-        if let Some((old_principal, old_method, old_digest, old_result)) =
-            write_binding(&tx, &request.id)?
-        {
-            if old_principal != principal
-                || old_method != RESOLVE_COMMAND_METHOD
-                || old_digest != payload_digest
-            {
-                return Err(Error::new(
-                    "id_conflict",
-                    "resolution write id is bound to another principal, method, or payload",
-                ));
-            }
-            let value = serde_json::from_value::<CommandResolveResponse>(decode_json(&old_result)?)
-                .map_err(|error| Error::new("internal", error.to_string()))?;
-            request.validate_response(&value)?;
+        ensure_resolution_write_id(&tx, &request.id)?;
+        if let Some(value) = stored_command_resolution(&tx, principal, request, &payload_digest)? {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(Change {
                 value,
@@ -164,6 +175,9 @@ impl Store {
                 "bad_state",
                 "launch/resume resolution must be failed; an applied start needs its Agent transition",
             ));
+        }
+        if record.command.verb == "configure" && request.resolution == CommandResolution::Applied {
+            resolve_configure_overlay(&tx, &record, readback, now)?;
         }
         let event = resolve_command_tx(&tx, &record, request, request.resolution.state(), now)?;
         let value = CommandResolveResponse {
@@ -224,17 +238,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
 
-        if command_binding(&tx, &request.id)?.is_some() {
-            return Err(Error::new(
-                "id_conflict",
-                "resolution write id is already used by a command",
-            ));
-        }
-        crate::ensure_no_digest_id(
-            &tx,
-            &request.id,
-            "resolution write id is already used by a completion digest",
-        )?;
+        ensure_resolution_write_id(&tx, &request.id)?;
         if let Some((old_principal, old_method, old_digest, old_result)) =
             write_binding(&tx, &request.id)?
         {
@@ -351,17 +355,7 @@ impl Store {
                 "turn resolution requires the owner principal",
             ));
         }
-        if command_binding(&self.connection, &request.id)?.is_some() {
-            return Err(Error::new(
-                "id_conflict",
-                "resolution write id is already used by a command",
-            ));
-        }
-        crate::ensure_no_digest_id(
-            &self.connection,
-            &request.id,
-            "resolution write id is already used by a completion digest",
-        )?;
+        ensure_resolution_write_id(&self.connection, &request.id)?;
         if let Some((old_principal, old_method, old_digest, old_result)) =
             write_binding(&self.connection, &request.id)?
         {
@@ -404,6 +398,87 @@ impl Store {
             .optional()
             .map_err(sql_error)
     }
+}
+
+fn command_resolution_digest(request: &CommandResolveRequest) -> Result<Vec<u8>> {
+    canonical::digest(&json!({
+        "command_id": request.command_id,
+        "as": request.resolution.as_str(),
+        "reason": request.reason,
+    }))
+}
+
+fn ensure_resolution_write_id(connection: &Connection, id: &str) -> Result<()> {
+    if command_binding(connection, id)?.is_some() {
+        return Err(Error::new(
+            "id_conflict",
+            "resolution write id is already used by a command",
+        ));
+    }
+    crate::ensure_no_digest_id(
+        connection,
+        id,
+        "resolution write id is already used by a completion digest",
+    )
+}
+
+fn stored_command_resolution(
+    connection: &Connection,
+    principal: &str,
+    request: &CommandResolveRequest,
+    payload_digest: &[u8],
+) -> Result<Option<CommandResolveResponse>> {
+    let Some((old_principal, old_method, old_digest, old_result)) =
+        write_binding(connection, &request.id)?
+    else {
+        return Ok(None);
+    };
+    if old_principal != principal
+        || old_method != RESOLVE_COMMAND_METHOD
+        || old_digest != payload_digest
+    {
+        return Err(Error::new(
+            "id_conflict",
+            "resolution write id is bound to another principal, method, or payload",
+        ));
+    }
+    let value = serde_json::from_value::<CommandResolveResponse>(decode_json(&old_result)?)
+        .map_err(|error| Error::new("internal", error.to_string()))?;
+    request.validate_response(&value)?;
+    Ok(Some(value))
+}
+
+fn resolve_configure_overlay(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    readback: Option<&ConfigureReadback>,
+    now: i64,
+) -> Result<()> {
+    let agent = record
+        .target
+        .map(|target| load_agent_by_num(tx, target))
+        .transpose()?
+        .flatten()
+        .ok_or_else(|| Error::new("bad_state", "configure has no retained Agent"))?;
+    let native = if eliot_core::api::configure_uses_native_session(
+        &agent.harness,
+        &record.command.args,
+    ) {
+        let proof = readback.filter(|proof| {
+            agent.harness == "muse"
+                && agent.state == eliot_core::AgentState::Idle
+                && proof.agent == agent.id
+                && proof.generation == agent.generation
+                && Some(proof.generation) == record.command.generation
+                && agent.native_ref.as_deref() == Some(proof.native_ref.as_str())
+                && record.command.args.get("model").and_then(serde_json::Value::as_str) == Some(proof.model.as_str())
+        }).ok_or_else(|| Error::new("bad_state", "applying an unknown native configure requires exact live configuration readback"))?;
+        Some((Some(proof.model.clone()), None))
+    } else {
+        None
+    };
+    super::config_overlay::apply_agent_config_tx(tx, record, native, now)?;
+    Ok(())
 }
 
 /// Digest of one turn-resolution assertion payload, shared by the

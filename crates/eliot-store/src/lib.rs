@@ -29,7 +29,7 @@ pub use goals::{
 };
 pub use handoff::HandoffAdmission;
 pub use projects::ProjectRegistrationInput;
-pub use resolution::TurnInactiveProof;
+pub use resolution::{ConfigureReadback, TurnInactiveProof};
 pub use retention::RetentionReport;
 pub use rules::{
     RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,
@@ -5193,7 +5193,7 @@ fn install_stream_source_plan(
 fn family_for_kind(kind: &str) -> Result<&'static str> {
     match kind {
         "session.ready" | "session.ended" | "session.usage" | "quota.observed" => Ok("session"),
-        "turn.started" | "turn.completed" | "turn.unknown" => Ok("turn"),
+        "turn.started" | "turn.completed" | "turn.unknown" | "turn.model_observed" => Ok("turn"),
         "message.completed" => Ok("message"),
         "tool.started" | "tool.completed" | "hook.before_tool" => Ok("tool"),
         "hook.before_model" => Ok("turn"),

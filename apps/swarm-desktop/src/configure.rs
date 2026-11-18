@@ -202,9 +202,26 @@ pub fn outcome_words(command: &Command) -> String {
             } else {
                 code.to_owned()
             };
-            eliot_core::reason_message(&code, text("message"))
+            let message = text("message");
+            eliot_core::reason_message(
+                &code,
+                if message.is_empty() {
+                    text("reason")
+                } else {
+                    message
+                },
+            )
         }
     }
+}
+
+pub fn failure_alert(command: &Command, detail: &str) -> String {
+    let prefix = if command.state == eliot_core::CommandState::Unknown {
+        "Model or effort change is uncertain"
+    } else {
+        "Model or effort not changed"
+    };
+    format!("{prefix}: {detail}")
 }
 
 /// What the harness keeps for the whole task, in one plain sentence, or
@@ -482,6 +499,31 @@ mod tests {
         assert_eq!(change(&reply, &settings, Some("m2"), Some("low")), None);
         assert_eq!(change(&reply, &settings, Some("m9"), None), None);
         assert_eq!(change(&reply, &settings, Some("m1"), Some("low")), None);
+    }
+
+    #[test]
+    fn configure_alert_preserves_refusal_reason_and_reports_uncertainty() {
+        let command = serde_json::from_value(serde_json::json!({
+            "id":"configure", "principal":"owner", "method":"command.submit",
+            "verb":"configure", "args":{}, "state":"rejected", "created_at":0, "updated_at":0,
+            "outcome":{"reason":"Claude already has an active turn"}
+        }))
+        .unwrap();
+        assert!(outcome_words(&command).contains("Claude already has an active turn"));
+        let unknown = Command {
+            state: eliot_core::CommandState::Unknown,
+            ..command
+        };
+        assert!(
+            failure_alert(&unknown, &outcome_words(&unknown))
+                .starts_with("Model or effort change is uncertain")
+        );
+        assert!(
+            ConfigureSupport::for_harness("claude")
+                .effort_refusal
+                .unwrap()
+                .contains("launch_only")
+        );
     }
 
     #[test]
