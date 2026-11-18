@@ -23,6 +23,7 @@ fn replay(
     if command_binding(tx, id)?.is_some() {
         return Err(Error::new("id_conflict", "id is bound to a command"));
     }
+    crate::ensure_no_digest_id(tx, id, "id is already used by a completion digest")?;
     if let Some((p, m, digest, result)) = write_binding(tx, id)? {
         if p != principal || m != method || digest != canonical::digest(payload)? {
             return Err(Error::new(
@@ -44,6 +45,7 @@ fn write(
     result: &Value,
     now: i64,
 ) -> Result<()> {
+    crate::ensure_no_digest_id(tx, id, "id is already used by a completion digest")?;
     let sequence = if let Some(client) = principal.strip_prefix("memory_inference:") {
         let last: i64 = tx
             .query_row(

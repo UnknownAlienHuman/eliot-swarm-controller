@@ -295,6 +295,11 @@ pub struct WriteAdmission {
 pub struct Store {
     connection: Connection,
     write_faulted: Cell<bool>,
+    /// Persistent keyset cursor for retention command pruning: the last
+    /// examined expired root `(created_at, id)`, or `None` at the oldest.
+    /// Successive passes resume here instead of restarting at the oldest
+    /// root, so kept roots are not revisited every pass under the Store lock.
+    retention_commands_cursor: Option<(i64, String)>,
     /// Opaque owner of this handle's Goal round markers. A `running` marker
     /// from another holder is a crashed round: it reads as `unknown`.
     goal_holder: String,
@@ -402,6 +407,7 @@ impl Store {
         let mut store = Self {
             connection,
             write_faulted: Cell::new(false),
+            retention_commands_cursor: None,
             git_observed_at: BTreeMap::new(),
             goal_holder: Ulid::new().to_string(),
             hierarchy_limits: core::api::HierarchyLimits::default(),
@@ -741,6 +747,17 @@ impl Store {
             return Err(Error::new(
                 "id_conflict",
                 "mutation id is already used by a command",
+            ));
+        }
+        // Completion-digest registrations reserve the shared mutation-id
+        // namespace: a generic write admitted under a pending digest id
+        // would poison the later digest delivery with a write binding.
+        // Only the exact registered digest-delivery conversion (through
+        // `mail_send_digest_delivery`) may reuse the id.
+        if digest_id_bound(&tx, id)? {
+            return Err(Error::new(
+                "id_conflict",
+                "write id is already used by a completion digest",
             ));
         }
         if let Some((old_principal, old_method, old_digest, old_result)) = write_binding(&tx, id)? {
@@ -3959,6 +3976,20 @@ fn digest_id_bound(connection: &Connection, id: &str) -> Result<bool> {
             |row| row.get(0),
         )
         .map_err(sql_error)
+}
+
+/// Shared digest-ID reservation: no public write path may bind a fresh
+/// pending digest id. Only the exact registered digest-delivery conversion
+/// (through `mail_send_digest_delivery`) may reuse the id.
+pub(crate) fn ensure_no_digest_id(
+    connection: &Connection,
+    id: &str,
+    what: &'static str,
+) -> Result<()> {
+    if digest_id_bound(connection, id)? {
+        return Err(Error::new("id_conflict", what));
+    }
+    Ok(())
 }
 
 fn write_exists(connection: &Connection, id: &str) -> Result<bool> {

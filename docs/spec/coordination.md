@@ -111,8 +111,22 @@ registrations group starts unchecked.
 
 The current limits are 64 candidates, 4,096 retained artifacts, 1,024 retained
 plans, 10,000 filesystem entries, depth 64 and five seconds per tree scan.
-Exceeding a bound refuses the tree before deletion. Ledger exhaustion rejects new
-admission. Removed identities remain tombstones; unknown identities are never
+Exceeding a bound refuses the tree before deletion. A full plan ledger self-heals
+on retain first: it reclaims fully settled consumed plans (no `unknown` item
+outcome), consumed plans whose receipt was pruned while their own settlement
+is terminal and known (none of their item artifacts is still `unknown`), and
+abandoned never-consumed previews older than the write-id retry window,
+oldest first, so ordinary preview/apply cycles never wedge it. Plans with
+an outstanding `unknown` attempt and their receipt fences are never reclaimed,
+and a receipt-less consumed plan with an uncertain outcome is kept, never
+replayed and never given an invented outcome; the full-ledger refusal then
+names those stranded plans as the blocker. Only
+when nothing reclaimable remains does exhaustion reject new admission. Exact
+apply retries check the retained receipt before loading the plan row, so a
+reclaimed settled plan still replays its retained response instead of `not_found`.
+Write retention pins every consumed apply receipt while its plan row exists, so a
+settled receipt can never prune before the ledger reclaims the plan and wedge it
+permanently ineligible. Removed identities remain tombstones; unknown identities are never
 automatically retried. The CLI exposes `artifact register`, `cleanup plan` and
 `cleanup apply`. Desktop Settings › Worktrees & cleanup (Clean up finished work)
 reviews an Owner `all` plan grouped by kind with each item's size and reason,
@@ -334,9 +348,25 @@ the existing mail stable effect identity makes the retry a no-op. The thread is
 `completion-<id-prefix>` (never `attention-*`, never `-advisory`), the body lists
 every frozen entry outcome, and no attention event is emitted: a successful
 completion stays distinct from an attention incident. Registration ids share the
-public write-id namespace: `mail.send` with an id bound to a completion digest
-rejects `id_conflict`, symmetric to the command/write checks at registration;
-only digest delivery itself reuses the id. Delivered digests are pruned under
+public write-id namespace: every public write path (`mail.send`, `mail.ack`,
+`var.set` and groups, commands, generic writes, claims, cleanup, handoff,
+resolution, and all other retained mutations) with an id bound to a completion
+digest rejects `id_conflict`, symmetric to the command/write checks at
+registration. Only the exact registered digest-delivery conversion reuses the
+id: the Store verifies the pending registration and requires the mail to target
+exactly the frozen parent recipient on the frozen `completion-<id-prefix>`
+thread before binding anything, so a mismatched request through the digest
+path (wrong recipient or wrong thread) rejects with `id_conflict` without
+consuming the pending id. That conversion is exempt from the new-write age gate (its age
+is the registration's age), so a digest stays deliverable however long its
+child set takes. Mail and delivered mark commit in one Store transaction, so a
+restart never recomputes a changed body: the registration reads delivered
+immediately, an exact same-body replay returns the retained mail, and a changed
+body under the consumed id conflicts instead of overwriting. A retained receipt
+advances the delivered mark only with evidence it was that digest's conversion:
+the same mail body to the frozen parent recipient on the frozen
+`completion-<id-prefix>` thread; a legacy receipt on another thread leaves the
+digest pending. Delivered digests are pruned under
 the commands retention window (see [core](core.md#retention)), oldest delivery
 first; pending digests are never pruned.
 

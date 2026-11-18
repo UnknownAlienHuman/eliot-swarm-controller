@@ -349,6 +349,11 @@ impl Store {
                 "hook consumer id is already bound to a command",
             ));
         }
+        crate::ensure_no_digest_id(
+            &tx,
+            consumer_id,
+            "hook consumer id is already used by a completion digest",
+        )?;
         if let Some((old_principal, old_method, old_digest, old_result)) =
             write_binding(&tx, consumer_id)?
         {

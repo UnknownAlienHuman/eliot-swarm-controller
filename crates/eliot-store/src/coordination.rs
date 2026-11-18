@@ -24,7 +24,7 @@ use eliot_core::{
         MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDefinitionArgs, MailDelivery,
         MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
         MailReadRequest, MailSendRequest, MailSendResponse, VarDefinitionArgs, VarGetRequest,
-        VarGetResponse, VarScope, VarSetRequest, VarSetResponse, parse_var_scope,
+        VarGetResponse, VarScope, VarSetRequest, VarSetResponse, digest_thread, parse_var_scope,
     },
     parse_agent_id,
 };
@@ -321,14 +321,24 @@ impl Store {
                 "mail write id is already used by a completion digest",
             ));
         }
-        if let Some(retained) = retained_write_binding(
-            &self.connection,
-            principal,
-            &request.id,
-            MAIL_SEND_METHOD,
-            &prepared.payload_digest,
-            "mail write id is bound to another principal, method, or payload",
-        )? {
+        // A digest-bound id never takes the generic retained replay on the
+        // digest path: the digest branch below admits a retained receipt
+        // as the delivery only with evidence it was this digest's
+        // conversion (exact mail payload plus the frozen completion
+        // thread). A legacy receipt whose payload happens to match but
+        // whose delivery thread differs would otherwise replay here and
+        // the driver would advance the delivered mark off it.
+        let digest_bound = allow_digest_id && digest_id_bound(&self.connection, &request.id)?;
+        if !digest_bound
+            && let Some(retained) = retained_write_binding(
+                &self.connection,
+                principal,
+                &request.id,
+                MAIL_SEND_METHOD,
+                &prepared.payload_digest,
+                "mail write id is bound to another principal, method, or payload",
+            )?
+        {
             let value = serde_json::from_value::<MailSendResponse>(decode_json(&retained)?)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
@@ -414,6 +424,11 @@ impl Store {
                 "mail write id is already used by a command",
             ));
         }
+        crate::ensure_no_digest_id(
+            &self.connection,
+            &request.id,
+            "mail write id is already used by a completion digest",
+        )?;
         if let Some(retained) = retained_write_binding(
             &self.connection,
             principal,
@@ -618,6 +633,11 @@ impl Store {
                 "variable write id is already used by a command",
             ));
         }
+        crate::ensure_no_digest_id(
+            &self.connection,
+            &request.id,
+            "variable write id is already used by a completion digest",
+        )?;
         let Some(retained) = retained_write_binding(
             &self.connection,
             principal,
@@ -944,20 +964,134 @@ impl Store {
                 "mail write id is already used by a command",
             ));
         }
-        if !allow_digest_id && digest_id_bound(&tx, &request.id)? {
+        // Digest-path exact conversion gate: a pending digest id may only be
+        // consumed by a mail to exactly the frozen parent recipient on the
+        // frozen `completion-<id-prefix>` thread. Any mismatched digest-path
+        // request rejects with `id_conflict` before binding anything, so it
+        // can never poison the later delivery and the digest stays pending.
+        // A consumed (already delivered) digest id never admits new mail: an
+        // exact replay returns the retained response, anything else rejects.
+        if allow_digest_id && digest_id_bound(&tx, &request.id)? {
+            match Self::pending_digest_recipient(&tx, &request.id)? {
+                Some(parent) => {
+                    let expected_thread = digest_thread(&request.id);
+                    if request.to != [parent.clone()]
+                        || request.thread.as_deref() != Some(expected_thread.as_str())
+                    {
+                        return Err(Error::new(
+                            "id_conflict",
+                            "digest mail must target the registered parent recipient on the frozen completion thread",
+                        ));
+                    }
+                    // Exact pending conversion. A retained mail binding under
+                    // this id is the already-committed delivery only with
+                    // evidence it was this digest's conversion: the exact
+                    // mail payload and the frozen completion thread. A
+                    // legacy receipt (ordinary mail admitted under this id
+                    // before the digest reservation, on another thread or
+                    // with another body) never marks the digest delivered;
+                    // the digest stays pending. Replay it verbatim (even if
+                    // the recomputed body changed across a restart) and
+                    // ensure the delivered mark, all in this transaction.
+                    // A principal/method mismatch is still a conflicting
+                    // rebinding.
+                    if let Some((old_principal, old_method, old_digest, old_result)) =
+                        write_binding(&tx, &request.id)?
+                    {
+                        if old_principal != principal || old_method != MAIL_SEND_METHOD {
+                            return Err(Error::new(
+                                "id_conflict",
+                                "mail write id is bound to another principal, method, or payload",
+                            ));
+                        }
+                        if old_digest != *payload_digest {
+                            return Err(Error::new(
+                                "id_conflict",
+                                "retained mail is not this digest's conversion",
+                            ));
+                        }
+                        let delivery_id = format!("{}/{}", request.id, parent);
+                        let stored_thread: Option<Option<String>> = tx
+                            .query_row(
+                                "SELECT thread FROM messages WHERE delivery_id = ?1",
+                                params![delivery_id],
+                                |row| row.get(0),
+                            )
+                            .optional()
+                            .map_err(sql_error)?;
+                        if stored_thread.flatten().as_deref() != Some(expected_thread.as_str()) {
+                            return Err(Error::new(
+                                "id_conflict",
+                                "retained mail is not this digest's conversion",
+                            ));
+                        }
+                        let value =
+                            serde_json::from_value::<MailSendResponse>(decode_json(&old_result)?)
+                                .map_err(|error| Error::new("internal", error.to_string()))?;
+                        request.validate_response(&value)?;
+                        if let Some(delivery) = value.deliveries.first() {
+                            Self::mark_digest_delivered_in_tx(
+                                &tx,
+                                &request.id,
+                                &delivery.delivery_id,
+                                now,
+                            )?;
+                        }
+                        commit_transaction(tx, &self.write_faulted)?;
+                        return Ok(MailSendResult {
+                            value,
+                            events: Vec::new(),
+                            outcome: MailSendOutcome::Retained,
+                        });
+                    }
+                    // No binding yet: fall through to the age-exempt fresh
+                    // path below, which commits mail and mark atomically.
+                }
+                None => {
+                    // Already delivered: no new mail under this id. Exact
+                    // replays return retained; anything else conflicts without
+                    // consuming.
+                    if let Some(old_result) = retained_write_binding(
+                        &tx,
+                        principal,
+                        &request.id,
+                        MAIL_SEND_METHOD,
+                        payload_digest,
+                        "mail write id is bound to another principal, method, or payload",
+                    )? {
+                        let value =
+                            serde_json::from_value::<MailSendResponse>(decode_json(&old_result)?)
+                                .map_err(|error| Error::new("internal", error.to_string()))?;
+                        request.validate_response(&value)?;
+                        commit_transaction(tx, &self.write_faulted)?;
+                        return Ok(MailSendResult {
+                            value,
+                            events: Vec::new(),
+                            outcome: MailSendOutcome::Retained,
+                        });
+                    }
+                    return Err(Error::new(
+                        "id_conflict",
+                        "mail write id is already used by a completion digest",
+                    ));
+                }
+            }
+        } else if !allow_digest_id && digest_id_bound(&tx, &request.id)? {
             return Err(Error::new(
                 "id_conflict",
                 "mail write id is already used by a completion digest",
             ));
         }
-        if let Some(old_result) = retained_write_binding(
-            &tx,
-            principal,
-            &request.id,
-            MAIL_SEND_METHOD,
-            payload_digest,
-            "mail write id is bound to another principal, method, or payload",
-        )? {
+        if (!allow_digest_id || !digest_id_bound(&tx, &request.id)?)
+            && let Some(old_result) = retained_write_binding(
+                &tx,
+                principal,
+                &request.id,
+                MAIL_SEND_METHOD,
+                payload_digest,
+                "mail write id is bound to another principal, method, or payload",
+            )?
+        {
             let value = serde_json::from_value::<MailSendResponse>(decode_json(&old_result)?)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
@@ -977,7 +1111,21 @@ impl Store {
             .thread
             .as_deref()
             .is_some_and(|thread| thread.starts_with("attention-"));
+        let digest_exempt = allow_digest_id
+            && Self::pending_digest_recipient(&tx, &request.id)?.is_some_and(|parent| {
+                request.to == [parent]
+                    && request.thread.as_deref() == Some(digest_thread(&request.id).as_str())
+            });
         if attention_write {
+            validate_ulid(&request.id)?;
+        } else if digest_exempt {
+            // Authorized digest-delivery conversion: the id is already an
+            // admitted durable digest whose first delivery is still pending,
+            // and the mail targets exactly the frozen parent recipient on
+            // the frozen completion thread, so its age is the registration's
+            // age rather than a new write's.
+            // The format rule still applies; mail and delivered mark commit
+            // atomically below so a restart never recomputes a changed body.
             validate_ulid(&request.id)?;
         } else {
             validate_id_age(&request.id, now)?;
@@ -991,16 +1139,35 @@ impl Store {
         };
         let value = Self::mail_effect_tx(&tx, sender, &definition, limits, &request.id, now)?;
         request.validate_response(&value)?;
-        retain_write_tx(
-            &tx,
-            &request.id,
-            principal,
-            MAIL_SEND_METHOD,
-            payload_digest,
-            &serde_json::to_value(&value)
-                .map_err(|error| Error::new("internal", error.to_string()))?,
-            now,
-        )?;
+        if digest_exempt {
+            retain_write_tx_allow_digest(
+                &tx,
+                &request.id,
+                principal,
+                MAIL_SEND_METHOD,
+                payload_digest,
+                &serde_json::to_value(&value)
+                    .map_err(|error| Error::new("internal", error.to_string()))?,
+                now,
+            )?;
+            let delivery_id = value
+                .deliveries
+                .first()
+                .map(|d| d.delivery_id.clone())
+                .ok_or_else(|| Error::new("internal", "digest mail delivered nothing"))?;
+            Self::mark_digest_delivered_in_tx(&tx, &request.id, &delivery_id, now)?;
+        } else {
+            retain_write_tx(
+                &tx,
+                &request.id,
+                principal,
+                MAIL_SEND_METHOD,
+                payload_digest,
+                &serde_json::to_value(&value)
+                    .map_err(|error| Error::new("internal", error.to_string()))?,
+                now,
+            )?;
+        }
         commit_transaction(tx, &self.write_faulted)?;
         Ok(MailSendResult {
             value,
@@ -1079,6 +1246,11 @@ impl Store {
                 "mail write id is already used by a command",
             ));
         }
+        crate::ensure_no_digest_id(
+            &tx,
+            &request.id,
+            "mail write id is already used by a completion digest",
+        )?;
         if let Some(old_result) = retained_write_binding(
             &tx,
             principal,
@@ -1178,6 +1350,11 @@ impl Store {
                 "variable write id is already used by a command",
             ));
         }
+        crate::ensure_no_digest_id(
+            tx,
+            &request.id,
+            "variable write id is already used by a completion digest",
+        )?;
         if let Some(retained) = retained_write_binding(
             tx,
             principal,
@@ -1754,6 +1931,23 @@ fn absent_delivery_error(delivery_id: &str, mailbox: i64, now: i64) -> Error {
 }
 
 pub(super) fn retain_write_tx(
+    tx: &Transaction<'_>,
+    id: &str,
+    principal: &str,
+    method: &str,
+    payload_digest: &[u8],
+    result: &Value,
+    now: i64,
+) -> Result<()> {
+    crate::ensure_no_digest_id(tx, id, "write id is already used by a completion digest")?;
+    retain_write_tx_allow_digest(tx, id, principal, method, payload_digest, result, now)
+}
+
+/// Digest-delivery write retention: the exact registered conversion reuses
+/// the digest id by design, so it bypasses the shared reservation. Only the
+/// digest delivery path may use this; every other caller uses
+/// [`retain_write_tx`].
+pub(super) fn retain_write_tx_allow_digest(
     tx: &Transaction<'_>,
     id: &str,
     principal: &str,

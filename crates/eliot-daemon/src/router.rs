@@ -146,6 +146,20 @@ struct RouterInner {
     /// (`Unknown { quiescent: false }`). Cleanup and native dispatch stay
     /// fenced for these ids; the fence lifts only on daemon restart.
     inference_unquiescent: Mutex<HashSet<String>>,
+    /// Progressing keyset cursor for the completion-digest sweep: the last
+    /// examined `(created_at, id)`, or `None` at the oldest row. The driver
+    /// advances it past every examined page and wraps when it passes the
+    /// sweep high-water below, so pending or mailbox-blocked registrations
+    /// at the front never starve later eligible ones even while new
+    /// registrations keep arriving. In-memory only: a restart resumes at the
+    /// oldest row, and restart deduplication still holds through the digest
+    /// mail id.
+    digest_poll_cursor: Mutex<Option<(i64, String)>>,
+    /// Sweep high-water: the newest pending `(created_at, id)` observed when
+    /// the current sweep started (`None` before the first sweep). The sweep
+    /// wraps once the cursor passes this bound, so a continuously growing
+    /// tail cannot trap older registrations behind the cursor forever.
+    digest_sweep_end: Mutex<Option<(i64, String)>>,
     /// Bumped by `goal.set`/`goal.resume` when the Goal ends up active and
     /// idle-keyed. The goal driver sweeps the retained idle subjects on
     /// every change; reads never bump it. Startup performs no sweep: the
@@ -280,6 +294,8 @@ impl Router {
                 inference_runner: AsyncMutex::new(()),
                 inference_workers: Mutex::new(HashMap::new()),
                 inference_unquiescent: Mutex::new(HashSet::new()),
+                digest_poll_cursor: Mutex::new(None),
+                digest_sweep_end: Mutex::new(None),
                 goal_reconcile,
             }),
         }

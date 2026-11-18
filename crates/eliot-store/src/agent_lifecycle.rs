@@ -75,6 +75,7 @@ impl Store {
         if command_binding(&tx, id)?.is_some() {
             return Err(Error::new("id_conflict", "id belongs to a command"));
         }
+        crate::ensure_no_digest_id(&tx, id, "id is already used by a completion digest")?;
         if let Some((principal, old_method, old_digest, result)) = write_binding(&tx, id)? {
             if principal != "owner" || old_method != method || old_digest != digest {
                 return Err(Error::new("id_conflict", "id belongs to another mutation"));
@@ -254,6 +255,60 @@ pub(crate) fn custody_blockers_sql(agent: &str, observers: &str) -> String {
              WHERE agent={agent} AND state='open' AND source!='daemon'
                AND ({observers} OR source NOT IN ('os','git','workspace_process'))"
     )
+}
+
+/// Distinct Agent numbers holding unresolved custody for the default
+/// `agent.list` exclusion (the same blockers as [`custody_blockers_sql`]
+/// with observers disabled): an unexited owned process, an `unknown`
+/// artifact, or an open non-daemon, non-observer source. Each leg seeks its
+/// own table instead of scanning archived history per row, so the archived
+/// branch and its counts stay bounded by live custody rather than by the
+/// retained fleet size.
+pub(crate) fn default_list_custody_agents(connection: &Connection) -> Result<Vec<i64>> {
+    use std::collections::BTreeSet;
+    let mut agents = BTreeSet::new();
+    let mut statement = connection
+        .prepare("SELECT DISTINCT owner FROM processes WHERE state IN ('running','unknown')")
+        .map_err(sql_error)?;
+    let owners = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sql_error)?;
+    for owner in owners {
+        let owner = owner.map_err(sql_error)?;
+        let num = owner
+            .strip_prefix("agent:a")
+            .or_else(|| owner.strip_prefix("workspace:a"))
+            .and_then(|rest| rest.split('#').next())
+            .and_then(|num| num.parse::<i64>().ok());
+        if let Some(num) = num {
+            agents.insert(num);
+        }
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT agent FROM artifacts WHERE json_extract(body,'$.state')='unknown'",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(sql_error)?;
+    for row in rows {
+        agents.insert(row.map_err(sql_error)?);
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT DISTINCT agent FROM source_state
+             WHERE state='open' AND source!='daemon'
+               AND source NOT IN ('os','git','workspace_process')",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(sql_error)?;
+    for row in rows {
+        agents.insert(row.map_err(sql_error)?);
+    }
+    Ok(agents.into_iter().collect())
 }
 
 /// First unresolved custody of an Agent ([`custody_blockers_sql`]).

@@ -837,9 +837,17 @@ supply it, grouped by native scope (`turn`, `main_loop_turn`, `message`,
 `turns_counted`, `turns_without_usage`, and per-counter `turns_missing`
 gaps, plus the retained non-terminal turns the sums skip
 (`turns_unknown_excluded`, `turns_running_excluded`): an unknown turn may
-have spent tokens the readback cannot see. Session facts sum cumulative counters only where every included
-snapshot supplies them (otherwise the subtotal and its gap read back), group
-cost by verbatim unit without converting, and never sum context occupancy.
+have spent tokens the readback cannot see. Session facts contribute per-Agent
+resume-chain deltas: generations of one Agent continue the same native subject, so
+each snapshot adds its signed advance past the previous retained cumulative for
+the same normalized provider namespace (the snapshot source up to any event
+suffix, so Muse `session/tokenUsage` and `session/contextUsage` share one
+baseline; a first observation for a session counts from zero, an advance adds
+its delta, and a lower observation in the same session is a correction that
+retracts the over-count by moving the baseline down, contributing no new usage;
+only a genuinely new native subject starts a fresh baseline; coverage still
+reads back where a snapshot is missing), group cost by verbatim unit without
+converting, and never sum context occupancy.
 `history_complete` is false with its reason when the retained-event
 watermark (`rule_history_coverage.pruned_through`) shows history was pruned;
 scope expansion stops at the hierarchy fanout bound with `truncated` set and
@@ -899,7 +907,13 @@ gap and handoff ACK even when ordinary event rows expire.
 Retain parent/child command sets while required by open work or the supported history
 window; prune the set transactionally, children before parent, so callers never see a
 partly pruned expansion. Keep any set containing accepted, queued, dispatched or unknown
-work. Retain command bindings/results in `commands` and other mutation bindings/results
+work. Each pass resumes a persistent keyset cursor past the last examined expired
+root (wrapping only once the eligible set is exhausted) instead of restarting at
+the oldest root, and examines at most a bounded number of candidates per pass;
+each candidate walks one bounded breadth-first subtree over the
+`commands_prune_roots` index with a per-parent limit, skipping kept or oversize
+sets in place, so no pass revisits every kept root, rewinds the root index, or
+materializes an oversize tree into an automatic index before the outer limit. Retain command bindings/results in `commands` and other mutation bindings/results
 in `writes` for at least the supported retry window plus the allowed clock-skew
 margin. Cleanup must not make an accepted id look new or replay an external effect.
 An unresolved Running Goal-round reservation remains pinned in `writes` beyond

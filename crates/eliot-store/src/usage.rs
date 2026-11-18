@@ -5,8 +5,11 @@
 //! scope (`turn`, `main_loop_turn`, `message`, `unknown`) reports its own
 //! subtotals with the turns counted and the per-counter gaps. Session facts
 //! read the latest `session_usage` snapshot per Agent generation in scope;
-//! cumulative counters sum only where every included snapshot supplies them,
-//! and cost sums only within one verbatim unit, never converted. Scope
+//! each generation contributes its signed advance past the previously retained
+//! cumulative for the same source (a new session counts from zero, an advance
+//! adds its delta, and a same-session correction retracts the over-count by
+//! moving the baseline down), and cost sums only within one verbatim unit,
+//! never converted. Scope
 //! expansion reuses the hierarchy fanout bound and reports truncation; the
 //! retained-event watermark names the retention floor instead of implying
 //! full totals.
@@ -19,7 +22,7 @@ use eliot_core::api::{
     UsageSummaryRequest, UsageSummaryResponse,
 };
 use rusqlite::params_from_iter;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// One resolved usage scope: retained (agent, generation) pairs with the
 /// expansion bound already applied.
@@ -339,7 +342,18 @@ impl Store {
             sessions,
         })
     }
+}
 
+/// Baseline namespace for resume-chain deltas: the snapshot source up to any
+/// event suffix (`muse:session/tokenUsage` and `muse:session/contextUsage`
+/// share `muse:session`). Different event kinds from one native subject must
+/// not double-count; different provider namespaces must never subtract.
+fn normalize_baseline_source(source: Option<&str>) -> String {
+    let source = source.unwrap_or_default();
+    source.split('/').next().unwrap_or_default().to_owned()
+}
+
+impl Store {
     fn summarize_sessions(
         &self,
         wanted: &std::collections::HashSet<(i64, i64)>,
@@ -351,6 +365,12 @@ impl Store {
         let mut capacity = 0_usize;
         let mut costs: BTreeMap<String, (f64, usize)> = BTreeMap::new();
         let mut snapshots_without_cost = 0_usize;
+        // Consecutive generations of one Agent continue the same native
+        // subject (resume enforces subject equality at its transaction
+        // boundary), so each snapshot contributes only its advance past the
+        // previously retained cumulative. Collect first, then walk oldest
+        // generation first.
+        let mut chain: Vec<(i64, i64, SessionUsage)> = Vec::new();
         if !wanted.is_empty() {
             let nums: BTreeSet<i64> = wanted.iter().map(|(num, _)| *num).collect();
             let nums: Vec<i64> = nums.into_iter().collect();
@@ -374,55 +394,83 @@ impl Store {
                     continue;
                 }
                 let usage = decode_session_usage(&snapshot)?;
-                snapshots += 1;
-                if usage.context_used_tokens.is_some() {
-                    occupancy += 1;
+                chain.push((agent, generation, usage));
+            }
+        }
+        chain.sort_by_key(|first| (first.0, first.1));
+        // Signed advances past the retained baseline: a first observation for
+        // a session counts from zero, an advance adds its delta, and a lower
+        // observation in the same session is a correction that retracts the
+        // over-count by moving the baseline down (it contributes no new
+        // usage). Only a genuinely new native subject starts a fresh baseline.
+        // Baselines split by normalized provider namespace (the snapshot
+        // source up to any event suffix), so cumulative namespaces from
+        // different provider pipelines never subtract, while different event
+        // kinds from the same native subject (for example Muse
+        // `session/tokenUsage` and `session/contextUsage`, where the latter
+        // carries the former's cumulative forward) share one baseline instead
+        // of double-counting the same subject.
+        let mut token_baseline: HashMap<(i64, String, usize), i64> = HashMap::new();
+        let mut cost_baseline: HashMap<(i64, String, String), f64> = HashMap::new();
+        for (agent, _generation, usage) in &chain {
+            snapshots += 1;
+            if usage.context_used_tokens.is_some() {
+                occupancy += 1;
+            }
+            if usage.context_window_tokens.is_some() {
+                capacity += 1;
+            }
+            let source = normalize_baseline_source(usage.source.as_deref());
+            let counters = [
+                usage
+                    .cumulative_tokens
+                    .as_ref()
+                    .and_then(|cumulative| cumulative.input_tokens),
+                usage
+                    .cumulative_tokens
+                    .as_ref()
+                    .and_then(|cumulative| cumulative.output_tokens),
+                usage
+                    .cumulative_tokens
+                    .as_ref()
+                    .and_then(|cumulative| cumulative.cache_read_tokens),
+                usage
+                    .cumulative_tokens
+                    .as_ref()
+                    .and_then(|cumulative| cumulative.cache_write_tokens),
+            ];
+            for (index, value) in counters.into_iter().enumerate() {
+                if let Some(value) = value {
+                    // Signed advance past the retained baseline: a new session
+                    // counts from zero, an advance adds its delta, and a
+                    // same-session correction retracts the over-count by
+                    // moving the baseline down to the corrected cumulative.
+                    let baseline = token_baseline
+                        .get(&(*agent, source.clone(), index))
+                        .copied()
+                        .unwrap_or(0);
+                    token_baseline.insert((*agent, source.clone(), index), value);
+                    sums[index] += i128::from(value - baseline);
+                    supplied[index] += 1;
                 }
-                if usage.context_window_tokens.is_some() {
-                    capacity += 1;
+            }
+            match usage.cumulative_cost.as_ref() {
+                Some(cost)
+                    if cost.unit.as_ref().is_some_and(|unit| !unit.is_empty())
+                        && cost.amount.is_some() =>
+                {
+                    let unit = cost.unit.clone().expect("cost unit present");
+                    let amount = cost.amount.expect("cost amount present");
+                    let baseline = cost_baseline
+                        .get(&(*agent, source.clone(), unit.clone()))
+                        .copied()
+                        .unwrap_or(0.0);
+                    cost_baseline.insert((*agent, source.clone(), unit.clone()), amount);
+                    let entry = costs.entry(unit).or_insert((0.0, 0));
+                    entry.0 += amount - baseline;
+                    entry.1 += 1;
                 }
-                let counters = [
-                    usage
-                        .cumulative_tokens
-                        .as_ref()
-                        .and_then(|tokens| tokens.input_tokens),
-                    usage
-                        .cumulative_tokens
-                        .as_ref()
-                        .and_then(|tokens| tokens.output_tokens),
-                    usage
-                        .cumulative_tokens
-                        .as_ref()
-                        .and_then(|tokens| tokens.cache_read_tokens),
-                    usage
-                        .cumulative_tokens
-                        .as_ref()
-                        .and_then(|tokens| tokens.cache_write_tokens),
-                ];
-                for (index, value) in counters.into_iter().enumerate() {
-                    if let Some(value) = value {
-                        sums[index] += i128::from(value);
-                        supplied[index] += 1;
-                    }
-                }
-                match usage.cumulative_cost.as_ref() {
-                    Some(cost)
-                        if cost
-                            .amount
-                            .is_some_and(|amount| amount.is_finite() && amount >= 0.0)
-                            && cost
-                                .unit
-                                .as_deref()
-                                .is_some_and(|unit| !unit.trim().is_empty()) =>
-                    {
-                        let entry = costs
-                            .entry(cost.unit.clone().expect("cost unit present"))
-                            .or_insert((0.0, 0));
-                        entry.0 += cost.amount.expect("cost amount present");
-                        entry.1 += 1;
-                    }
-                    _ => snapshots_without_cost += 1,
-                }
+                _ => snapshots_without_cost += 1,
             }
         }
         let subtotal = |index: usize| {
@@ -764,6 +812,216 @@ mod tests {
         assert_eq!(response.sessions.context_occupancy_supplied, 1);
         assert_eq!(response.sessions.context_capacity_supplied, 1);
         let _ = third;
+    }
+
+    #[test]
+    fn resumed_generations_contribute_deltas_not_repeated_cumulatives() {
+        let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+        let now = now_ms();
+        let resumed = launch(&mut store, "usage-resume", now);
+        let reset = launch(&mut store, "usage-resume", now);
+        let other = launch(&mut store, "usage-resume", now);
+        // One native session continued across two generations: each snapshot
+        // repeats the session cumulative, so a plain sum would double-count
+        // it. Only a genuinely new native subject proves a reset and counts
+        // from zero; a lower cumulative in the same session would be a
+        // correction, not a reset.
+        for (generation, input, output, amount) in [(1, 1000, 300, 1.5), (2, 1500, 500, 2.0)] {
+            insert_session(
+                &store,
+                &resumed,
+                generation,
+                json!({
+                    "cumulative_tokens": {"input_tokens": input, "output_tokens": output},
+                    "cumulative_cost": {"amount": amount, "unit": "usd_estimate"},
+                    "source": "codex:thread/tokenUsage/updated",
+                }),
+            );
+        }
+        // A fresh native subject starts its own baseline and counts from zero.
+        insert_session(
+            &store,
+            &reset,
+            1,
+            json!({
+                "cumulative_tokens": {"input_tokens": 200, "output_tokens": 100},
+                "cumulative_cost": {"amount": 0.3, "unit": "usd_estimate"},
+                "source": "codex:thread/tokenUsage/updated",
+            }),
+        );
+        // A different provider pipeline is never subtracted against the
+        // first: incomparable cumulative namespaces contribute in full.
+        insert_session(
+            &store,
+            &other,
+            1,
+            json!({
+                "cumulative_tokens": {"input_tokens": 5000, "output_tokens": 50},
+                "cumulative_cost": {"amount": 7.0, "unit": "credits"},
+                "source": "antigravity:usage_update",
+            }),
+        );
+        let request = UsageSummaryRequest {
+            agent: None,
+            generation: None,
+            project: Some("usage-resume".to_owned()),
+            root: None,
+        };
+        let response = summarize(&store, &request);
+        assert_eq!(response.agents_included, 3);
+        assert_eq!(response.generations_included, 4);
+        assert_eq!(response.sessions.snapshots, 4);
+        assert_eq!(response.sessions.generations_without_snapshot, 0);
+        let tokens = &response.sessions.cumulative_tokens;
+        assert_eq!(tokens.input_tokens.total, Some(1000 + 500 + 200 + 5000));
+        assert_eq!(tokens.input_tokens.supplied, 4);
+        assert_eq!(tokens.input_tokens.missing, 0);
+        assert!(tokens.input_tokens.complete);
+        assert_eq!(tokens.output_tokens.total, Some(300 + 200 + 100 + 50));
+        let usd = response
+            .sessions
+            .cost_by_unit
+            .iter()
+            .find(|cost| cost.unit == "usd_estimate")
+            .expect("usd cost");
+        assert_eq!(usd.total_amount, 2.3);
+        assert_eq!(usd.snapshots, 3);
+        let credits = response
+            .sessions
+            .cost_by_unit
+            .iter()
+            .find(|cost| cost.unit == "credits")
+            .expect("credits cost");
+        assert_eq!(credits.total_amount, 7.0);
+        assert_eq!(response.sessions.snapshots_without_cost, 0);
+    }
+
+    #[test]
+    fn muse_context_and_token_events_share_one_baseline() {
+        let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+        let now = now_ms();
+        let agent = launch(&mut store, "usage-muse", now);
+        // Generation 1 ends on a tokenUsage cumulative of 1000 input.
+        insert_session(
+            &store,
+            &agent,
+            1,
+            json!({
+                "cumulative_tokens": {"input_tokens": 1000, "output_tokens": 100},
+                "cumulative_cost": {"amount": 1.0, "unit": "usd_estimate"},
+                "source": "muse:session/tokenUsage",
+            }),
+        );
+        // The contextUsage update carries the same cumulative forward while
+        // changing the source label: it must not double-count the same
+        // subject. (In production the retained snapshot per generation is
+        // the latest event; this test models the two-event sequence as two
+        // generations to prove the baseline shares across the labels.)
+        insert_session(
+            &store,
+            &agent,
+            2,
+            json!({
+                "cumulative_tokens": {"input_tokens": 1000, "output_tokens": 100},
+                "cumulative_cost": {"amount": 1.0, "unit": "usd_estimate"},
+                "context_used_tokens": 50,
+                "context_window_tokens": 200,
+                "source": "muse:session/contextUsage",
+            }),
+        );
+        // Generation 3 advances the same session to 1500 input.
+        insert_session(
+            &store,
+            &agent,
+            3,
+            json!({
+                "cumulative_tokens": {"input_tokens": 1500, "output_tokens": 150},
+                "cumulative_cost": {"amount": 1.5, "unit": "usd_estimate"},
+                "source": "muse:session/tokenUsage",
+            }),
+        );
+        let response = summarize(
+            &store,
+            &UsageSummaryRequest {
+                agent: None,
+                generation: None,
+                project: Some("usage-muse".to_owned()),
+                root: None,
+            },
+        );
+        // 1000 (gen1) + 0 (gen2 carries forward, no advance) + 500 (gen3
+        // advance past the shared baseline) = 1500, never 1000 + 1000 + 1500.
+        assert_eq!(
+            response.sessions.cumulative_tokens.input_tokens.total,
+            Some(1500)
+        );
+        assert_eq!(
+            response.sessions.cumulative_tokens.output_tokens.total,
+            Some(150)
+        );
+        let usd = response
+            .sessions
+            .cost_by_unit
+            .iter()
+            .find(|cost| cost.unit == "usd_estimate")
+            .expect("usd cost");
+        assert_eq!(usd.total_amount, 1.5);
+    }
+
+    #[test]
+    fn muse_same_session_correction_retracts_overcount() {
+        let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+        let now = now_ms();
+        let agent = launch(&mut store, "usage-correction", now);
+        // Generation 1 over-reports the session cumulative at 1000 input.
+        insert_session(
+            &store,
+            &agent,
+            1,
+            json!({
+                "cumulative_tokens": {"input_tokens": 1000, "output_tokens": 100},
+                "cumulative_cost": {"amount": 1.0, "unit": "usd_estimate"},
+                "source": "muse:session/tokenUsage",
+            }),
+        );
+        // Generation 2 corrects the same session down to 900: the correction
+        // becomes the new baseline with no new usage, retracting the phantom
+        // 100 instead of counting the corrected cumulative in full (which
+        // would report 1,900).
+        insert_session(
+            &store,
+            &agent,
+            2,
+            json!({
+                "cumulative_tokens": {"input_tokens": 900, "output_tokens": 90},
+                "cumulative_cost": {"amount": 0.5, "unit": "usd_estimate"},
+                "source": "muse:session/tokenUsage",
+            }),
+        );
+        let response = summarize(
+            &store,
+            &UsageSummaryRequest {
+                agent: None,
+                generation: None,
+                project: Some("usage-correction".to_owned()),
+                root: None,
+            },
+        );
+        assert_eq!(
+            response.sessions.cumulative_tokens.input_tokens.total,
+            Some(900)
+        );
+        assert_eq!(
+            response.sessions.cumulative_tokens.output_tokens.total,
+            Some(90)
+        );
+        let usd = response
+            .sessions
+            .cost_by_unit
+            .iter()
+            .find(|cost| cost.unit == "usd_estimate")
+            .expect("usd cost");
+        assert_eq!(usd.total_amount, 0.5);
     }
 
     #[test]

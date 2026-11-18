@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 57;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 58;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1283,6 +1283,61 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 58 {
+            // v58 adds the four store performance indexes. Databases
+            // migrated on this branch before the reconciliation
+            // carry the prune index under v55 without the origin/main v55
+            // project-assignment tables (max version 55, no assignments).
+            // Backfill the assignment tables here so the v58 upgrade heals
+            // them; fresh and origin/main databases already have them and
+            // take no extra write.
+            let has_assignments: bool = self
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_assignments')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if !has_assignments {
+                let tx = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sql_error)?;
+                tx.execute_batch(
+                    "CREATE TABLE project_assignments (
+                         project TEXT PRIMARY KEY,
+                         manager INTEGER,
+                         manager_generation INTEGER,
+                         epoch INTEGER NOT NULL CHECK(epoch > 0),
+                         revision INTEGER NOT NULL CHECK(revision > 0),
+                         start_command TEXT,
+                         CHECK((manager IS NULL) = (manager_generation IS NULL))
+                     );
+                     ALTER TABLE commands ADD COLUMN assignment_binding TEXT;
+                     ALTER TABLE cleanup_plans ADD COLUMN assignment_binding TEXT;",
+                )
+                .map_err(sql_error)?;
+                tx.commit().map_err(sql_error)?;
+            }
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS commands_prune_roots ON commands(created_at, id)
+                    WHERE parent_command IS NULL;
+                 CREATE INDEX IF NOT EXISTS completion_digests_pending_cursor
+                    ON completion_digests(delivered_at, created_at, id);
+                 CREATE INDEX IF NOT EXISTS agents_list_archived_state
+                    ON agents(archived, state, id);
+                 CREATE INDEX IF NOT EXISTS workspaces_start_command
+                    ON workspaces(start_command_id);
+                   INSERT INTO schema_migrations(version) VALUES (58);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         if current < 56 {
             let tx = self
                 .connection
@@ -1376,7 +1431,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version = 57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1411,7 +1466,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1481,7 +1536,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1536,7 +1591,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1634,7 +1689,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1742,5 +1797,80 @@ mod continuity_tests {
             .collect::<std::result::Result<_, _>>()
             .unwrap();
         assert_eq!(sequences, vec![1, 2]);
+    }
+
+    #[test]
+    fn v58_upgrade_from_main_v57_recreates_all_indexes() {
+        // Fresh databases open at v58 with all four performance indexes.
+        let fresh = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let version: i64 = fresh
+            .connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 58);
+        for name in [
+            "commands_prune_roots",
+            "completion_digests_pending_cursor",
+            "agents_list_archived_state",
+            "workspaces_start_command",
+        ] {
+            let exists: bool = fresh
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "index {name} exists on fresh open");
+        }
+        // A database at main's v57 (all four v58 indexes dropped, v58
+        // unrecorded) gains exactly those indexes from the v58 upgrade
+        // without touching the assignment tables.
+        let mut main_v57 = Store::open(std::path::Path::new(":memory:")).unwrap();
+        main_v57
+            .connection
+            .execute_batch(
+                "DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58;",
+            )
+            .unwrap();
+        main_v57.migrate().unwrap();
+        let version: i64 = main_v57
+            .connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 58);
+        for name in [
+            "commands_prune_roots",
+            "completion_digests_pending_cursor",
+            "agents_list_archived_state",
+            "workspaces_start_command",
+        ] {
+            let exists: bool = main_v57
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "index {name} recreated by the v58 upgrade");
+        }
+        let assignment_table: bool = main_v57
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_assignments')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            assignment_table,
+            "project assignments survive the v58 upgrade"
+        );
     }
 }

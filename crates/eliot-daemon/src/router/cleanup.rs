@@ -705,7 +705,7 @@ impl Router {
             .store
             .lock()
             .await
-            .retain_cleanup_plan(&name, &plan)?;
+            .retain_cleanup_plan(&name, &plan, now_ms())?;
         encoded(plan)
     }
 
@@ -1930,7 +1930,7 @@ impl Router {
             .store
             .lock()
             .await
-            .retain_cleanup_plan("owner", &plan)
+            .retain_cleanup_plan("owner", &plan, now_ms())
             .is_err()
         {
             return;

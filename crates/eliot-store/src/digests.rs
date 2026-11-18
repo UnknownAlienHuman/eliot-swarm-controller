@@ -13,7 +13,7 @@ use super::{
     sql_error, validate_id_age, write_binding,
 };
 use eliot_core::{Error, Result, api::SwarmDigestRequest, parse_agent_id};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -57,6 +57,14 @@ pub enum DigestRegisterOutcome {
     Retained,
 }
 
+/// One pending digest page plus the cycle high-water read in the same Store
+/// transaction, so the bound and the rows can never disagree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingDigestPage {
+    pub rows: Vec<DigestRow>,
+    pub high_water: Option<(i64, String)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DigestRegistered {
     pub row: DigestRow,
@@ -84,6 +92,57 @@ struct StoredDigestRow {
     delivered_at: Option<i64>,
     payload_digest: Vec<u8>,
     hidden_json: String,
+}
+
+/// One pending page of stored rows after a keyset cursor, oldest first.
+/// Takes the connection (or an open read transaction dereferencing to one) so
+/// the standalone page read and the atomic high-water-plus-page snapshot
+/// share one query shape: seek from the cursor by key, never from the start
+/// of the pending partition.
+fn pending_page_rows(
+    connection: &rusqlite::Connection,
+    after: Option<(i64, &str)>,
+    limit: usize,
+) -> Result<Vec<StoredDigestRow>> {
+    let limit = limit.clamp(1, 256) as i64;
+    let mut sql = String::from(
+        "SELECT id, parent, mode, commands, turns, requester, created_at, delivered_mail_id, delivered_at, payload_digest, hidden
+         FROM completion_digests INDEXED BY completion_digests_pending_cursor WHERE delivered_at IS NULL",
+    );
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some((created_at, id)) = after {
+        sql.push_str(" AND (created_at > ?1 OR (created_at = ?2 AND id > ?3))");
+        params.push(rusqlite::types::Value::from(created_at));
+        params.push(rusqlite::types::Value::from(created_at));
+        params.push(rusqlite::types::Value::from(id.to_owned()));
+        sql.push_str(" ORDER BY created_at ASC, id ASC LIMIT ?4");
+    } else {
+        sql.push_str(" ORDER BY created_at ASC, id ASC LIMIT ?1");
+    }
+    params.push(rusqlite::types::Value::from(limit));
+    let mut stmt = connection.prepare(&sql).map_err(sql_error)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(StoredDigestRow {
+                id: row.get(0)?,
+                parent: row.get(1)?,
+                mode: row.get(2)?,
+                commands_json: row.get(3)?,
+                turns_json: row.get(4)?,
+                requester: row.get(5)?,
+                created_at: row.get(6)?,
+                delivered_mail_id: row.get(7)?,
+                delivered_at: row.get(8)?,
+                payload_digest: row.get(9)?,
+                hidden_json: row.get(10)?,
+            })
+        })
+        .map_err(sql_error)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(sql_error)?);
+    }
+    Ok(out)
 }
 
 fn parse_row(stored: StoredDigestRow) -> Result<DigestRow> {
@@ -267,40 +326,129 @@ impl Store {
         self.digest_row(id)
     }
 
+    /// Frozen parent recipient of a still-pending digest registration, or
+    /// `None` when the id is not a digest or its first delivery already
+    /// committed. The digest driver proves the exact registered conversion
+    /// with this: a pending registration plus the frozen recipient exempt the
+    /// delivery mail from the new-write age gate (its age is the
+    /// registration's age, not a new write's). Delivered or absent ids keep
+    /// the ordinary write-id rules.
+    pub(super) fn pending_digest_recipient(
+        tx: &Transaction<'_>,
+        id: &str,
+    ) -> Result<Option<String>> {
+        let row: Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT parent, delivered_at FROM completion_digests WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        match row {
+            Some((parent, None)) => Ok(Some(format!("a{parent}"))),
+            _ => Ok(None),
+        }
+    }
+
     /// Bounded pending registrations, oldest first.
     pub fn pending_completion_digests(&self, limit: usize) -> Result<Vec<DigestRow>> {
+        self.pending_completion_digests_after(None, limit)
+    }
+
+    /// Bounded pending registrations after a keyset cursor, oldest first.
+    /// `after` is the last examined `(created_at, id)`; `None` starts at the
+    /// oldest row. The driver advances the cursor past every examined row and
+    /// wraps to `None` at the end, so pending or mailbox-blocked rows at the
+    /// front never trap later eligible registrations behind one fixed page.
+    /// High-water of the pending set: the newest `(created_at, id)` still
+    /// awaiting delivery, or `None` when nothing is pending. The driver
+    /// snapshots this at sweep start so the sweep wraps when the cursor
+    /// passes the end of the eligible set observed at that tick, instead of
+    /// chasing newly arriving registrations forever.
+    ///
+    /// The high-water and the page below must be read together with
+    /// [`Self::pending_completion_digests_page`]: separate locks let the
+    /// queue change between the two reads (an empty high-water with rows on
+    /// the page leaves the sweep with no wrap bound, so full pages of new
+    /// registrations prevent wrapping indefinitely).
+    pub fn pending_completion_digests_max(&self) -> Result<Option<(i64, String)>> {
         self.ensure_committed_reads()?;
-        let limit = limit.clamp(1, 256) as i64;
-        let mut stmt = self
+        let row: Option<(i64, String)> = self
             .connection
-            .prepare(
-                "SELECT id, parent, mode, commands, turns, requester, created_at, delivered_mail_id, delivered_at, payload_digest, hidden
-                 FROM completion_digests WHERE delivered_at IS NULL ORDER BY created_at ASC, id ASC LIMIT ?1",
+            .query_row(
+                "SELECT created_at, id FROM completion_digests INDEXED BY completion_digests_pending_cursor
+                 WHERE delivered_at IS NULL
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .optional()
             .map_err(sql_error)?;
-        let rows = stmt
-            .query_map(params![limit], |row| {
-                Ok(StoredDigestRow {
-                    id: row.get(0)?,
-                    parent: row.get(1)?,
-                    mode: row.get(2)?,
-                    commands_json: row.get(3)?,
-                    turns_json: row.get(4)?,
-                    requester: row.get(5)?,
-                    created_at: row.get(6)?,
-                    delivered_mail_id: row.get(7)?,
-                    delivered_at: row.get(8)?,
-                    payload_digest: row.get(9)?,
-                    hidden_json: row.get(10)?,
-                })
-            })
-            .map_err(sql_error)?;
+        Ok(row)
+    }
+
+    pub fn pending_completion_digests_after(
+        &self,
+        after: Option<(i64, &str)>,
+        limit: usize,
+    ) -> Result<Vec<DigestRow>> {
+        self.ensure_committed_reads()?;
         let mut out = Vec::new();
-        for row in rows {
-            let stored = row.map_err(sql_error)?;
+        for stored in pending_page_rows(&self.connection, after, limit)? {
             out.push(parse_row(stored)?);
         }
         Ok(out)
+    }
+
+    /// High-water plus one pending page in a single read transaction. The
+    /// driver snapshots the cycle high-water and reads its first page here,
+    /// and re-reads the head page here when a sweep wraps, so the bound and
+    /// the rows can never disagree: a non-empty page always carries a
+    /// high-water, and an empty queue always reads back empty. Continuation
+    /// ticks within a sweep keep the captured bound and read only the page
+    /// with [`Self::pending_completion_digests_after`].
+    pub fn pending_completion_digests_page(
+        &mut self,
+        after: Option<(i64, &str)>,
+        limit: usize,
+    ) -> Result<PendingDigestPage> {
+        self.ensure_committed_reads()?;
+        let tx = self.connection.transaction().map_err(sql_error)?;
+        let high_water: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT created_at, id FROM completion_digests
+                 WHERE delivered_at IS NULL
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let mut rows = Vec::new();
+        for stored in pending_page_rows(&tx, after, limit)? {
+            rows.push(parse_row(stored)?);
+        }
+        // Read-only snapshot: rolling back releases the shared lock with no
+        // writes to persist.
+        drop(tx);
+        Ok(PendingDigestPage { rows, high_water })
+    }
+
+    /// Mark a pending digest delivered inside the caller's transaction.
+    /// No-op when it was already delivered (restart/retry safe).
+    pub(crate) fn mark_digest_delivered_in_tx(
+        tx: &Transaction<'_>,
+        id: &str,
+        mail_delivery_id: &str,
+        now: i64,
+    ) -> Result<()> {
+        db!(tx.execute(
+            "UPDATE completion_digests SET delivered_mail_id = ?1, delivered_at = ?2
+             WHERE id = ?3 AND delivered_at IS NULL",
+            params![mail_delivery_id, now, id],
+        ));
+        Ok(())
     }
 
     /// Mark a pending digest delivered. Returns false when it was already
@@ -458,11 +606,205 @@ mod tests {
             .mail_send("owner", &mail, MailLimits::default(), now)
             .unwrap_err();
         assert_eq!(err.code, "id_conflict");
-        // The digest delivery path still delivers under the same id.
-        let delivered = store
+        // The digest path without the frozen completion thread also rejects:
+        // a pending digest id is consumed only by the exact conversion.
+        let err = store
             .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // So does the right recipient with the wrong thread.
+        let wrong_thread = MailSendRequest {
+            id: id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "foreign mail reusing a digest id".to_owned(),
+            thread: Some("completion-wrong".to_owned()),
+            reply_to_delivery: None,
+        };
+        let err = store
+            .mail_send_digest_delivery("owner", &wrong_thread, MailLimits::default(), now)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // Neither mismatch consumes the pending id.
+        assert!(
+            store
+                .pending_completion_digests_after(None, 10)
+                .expect("pending digests")
+                .iter()
+                .any(|row| row.id == id),
+            "mismatched-thread mail leaves the digest pending"
+        );
+        // The exact conversion (frozen recipient plus frozen completion
+        // thread) still delivers under the same id.
+        let exact = MailSendRequest {
+            thread: Some(eliot_core::api::digest_thread(&id)),
+            ..mail
+        };
+        let delivered = store
+            .mail_send_digest_delivery("owner", &exact, MailLimits::default(), now)
             .expect("digest delivery");
         assert_eq!(delivered.outcome, crate::MailSendOutcome::Fresh);
+    }
+
+    #[test]
+    fn digest_legacy_receipt_on_another_thread_leaves_digest_pending() {
+        // Simulates a pre-#473 store: a pending digest whose id is also
+        // bound by ordinary mail admitted before the digest reservation
+        // existed. Neither receipt may advance the delivered mark.
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let parent_num: i64 = parent[1..].parse().expect("parent agent number");
+
+        // Case 1: legacy receipt with a different body on another thread.
+        let legacy_id = ulid::Ulid::new().to_string();
+        store
+            .digest_register("owner", &digest_request(&legacy_id, &parent), &[false], now)
+            .expect("register");
+        let legacy_result = json!({"deliveries": [{
+            "delivery_id": format!("{legacy_id}/{parent}"),
+            "recipient": parent,
+            "recipient_generation": 1,
+        }]});
+        store
+            .connection
+            .execute(
+                "INSERT INTO writes(id, principal, method, payload_digest, result, created_at) VALUES (?1, 'owner', 'mail.send', zeroblob(32), ?2, ?3)",
+                params![legacy_id, legacy_result.to_string(), now],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO messages(delivery_id, sender, sender_generation, recipient, recipient_generation, thread, reply_to_delivery, mode, text, content_digest, admitted_at) VALUES (?1, 'owner', NULL, ?2, 1, 'legacy-thread', NULL, 'queue', 'legacy body', x'00', ?3)",
+                params![format!("{legacy_id}/{parent}"), parent_num, now],
+            )
+            .unwrap();
+        let exact = MailSendRequest {
+            id: legacy_id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "digest body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&legacy_id)),
+            reply_to_delivery: None,
+        };
+        let err = store
+            .mail_send_digest_delivery("owner", &exact, MailLimits::default(), now)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        assert!(
+            store
+                .pending_completion_digests_after(None, 10)
+                .expect("pending digests")
+                .iter()
+                .any(|row| row.id == legacy_id),
+            "legacy receipt on another thread leaves the digest pending"
+        );
+
+        // Case 2: retained payload matches the conversion but the stored
+        // delivery thread does not. The thread check still keeps pending.
+        let thread_id = ulid::Ulid::new().to_string();
+        store
+            .digest_register("owner", &digest_request(&thread_id, &parent), &[false], now)
+            .expect("register");
+        let thread = eliot_core::api::digest_thread(&thread_id);
+        let payload = crate::canonical::digest(&json!({
+            "to": [parent.clone()],
+            "mode": "queue",
+            "text": "digest body",
+            "thread": thread,
+            "reply_to_delivery": Option::<String>::None,
+        }))
+        .expect("conversion payload digest");
+        let converted = json!({"deliveries": [{
+            "delivery_id": format!("{thread_id}/{parent}"),
+            "recipient": parent,
+            "recipient_generation": 1,
+        }]});
+        store
+            .connection
+            .execute(
+                "INSERT INTO writes(id, principal, method, payload_digest, result, created_at) VALUES (?1, 'owner', 'mail.send', ?2, ?3, ?4)",
+                params![thread_id, payload, converted.to_string(), now],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO messages(delivery_id, sender, sender_generation, recipient, recipient_generation, thread, reply_to_delivery, mode, text, content_digest, admitted_at) VALUES (?1, 'owner', NULL, ?2, 1, 'other-thread', NULL, 'queue', 'digest body', x'00', ?3)",
+                params![format!("{thread_id}/{parent}"), parent_num, now],
+            )
+            .unwrap();
+        let exact = MailSendRequest {
+            id: thread_id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "digest body".to_owned(),
+            thread: Some(thread),
+            reply_to_delivery: None,
+        };
+        let err = store
+            .mail_send_digest_delivery("owner", &exact, MailLimits::default(), now)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        assert!(
+            store
+                .get_completion_digest(&thread_id)
+                .expect("read digest")
+                .expect("digest present")
+                .delivered_at
+                .is_none(),
+            "thread-mismatched receipt leaves the digest pending"
+        );
+    }
+
+    #[test]
+    fn submit_and_record_write_reject_digest_bound_id() {
+        use eliot_core::SubmitCommand;
+
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let id = ulid::Ulid::new().to_string();
+        let req = digest_request(&id, &parent);
+        store
+            .digest_register("owner", &req, &[false], now)
+            .expect("register");
+        // An ordinary command under a pending digest id would poison the
+        // later delivery with `command_binding`: the shared namespace
+        // reservation rejects it symmetrically to mail/handoff/switch.
+        let mut launch = SubmitCommand::new(id.clone(), "launch");
+        launch.expected_generation = Some(0);
+        launch.args = json!({"project": "p", "workspace": "synthetic-workspace",
+            "harness": "codex", "profile": "fake", "profile_snapshot": {}});
+        let err = store.submit("owner", launch, now).unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // A generic write under the same id would poison delivery with a
+        // write binding instead; it rejects the same way.
+        let err = store
+            .record_write(
+                &id,
+                "owner",
+                "probe.write",
+                &json!({"probe": true}),
+                &json!({"ok": true}),
+                now,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // The digest registration itself survives both rejections and still
+        // delivers through the exact registered conversion.
+        let mail = MailSendRequest {
+            id: id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "digest body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&id)),
+            reply_to_delivery: None,
+        };
+        store
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now)
+            .expect("digest delivery");
     }
 
     #[test]
@@ -475,13 +817,14 @@ mod tests {
         store
             .digest_register("owner", &req, &[false], now)
             .expect("register");
-        // First delivery uses the registration id as the mail id.
+        // First delivery uses the registration id as the mail id, on the
+        // frozen completion thread.
         let mail = MailSendRequest {
             id: id.clone(),
             to: vec![parent.clone()],
             mode: eliot_core::api::MailMode::Queue,
             text: "digest body".to_owned(),
-            thread: Some("completion-test".to_owned()),
+            thread: Some(eliot_core::api::digest_thread(&id)),
             reply_to_delivery: None,
         };
         let first = store
@@ -503,6 +846,366 @@ mod tests {
             .expect("second mail");
         assert_eq!(second.outcome, crate::MailSendOutcome::Retained);
         assert_eq!(first.value, second.value);
+    }
+
+    #[test]
+    fn digest_delivery_survives_the_write_id_age_window() {
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let other = ready_agent(&mut store, "q", now);
+        let id = ulid::Ulid::new().to_string();
+        let req = digest_request(&id, &parent);
+        store
+            .digest_register("owner", &req, &[false], now)
+            .expect("register");
+        // Past the 24-hour new-write window the pending digest is still an
+        // authorized conversion of its durable registration, not a new
+        // write: the first delivery succeeds under the registration id.
+        let late = now + 25 * 60 * 60 * 1000;
+        let mail = MailSendRequest {
+            id: id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "digest body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&id)),
+            reply_to_delivery: None,
+        };
+        let delivered = store
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), late)
+            .expect("late digest delivery");
+        assert_eq!(delivered.outcome, crate::MailSendOutcome::Fresh);
+        // A digest-path mail to anyone but the frozen parent recipient is
+        // not the registered conversion: it rejects with id_conflict before
+        // binding anything, so the mismatched request can never consume the
+        // pending id (even past the age window, where the reservation still
+        // takes precedence over the age rule).
+        let other_id = ulid::Ulid::new().to_string();
+        let other_req = digest_request(&other_id, &parent);
+        store
+            .digest_register("owner", &other_req, &[false], now)
+            .expect("register");
+        let diverted = MailSendRequest {
+            id: other_id.clone(),
+            to: vec![other.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "diverted digest body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&other_id)),
+            reply_to_delivery: None,
+        };
+        let err = store
+            .mail_send_digest_delivery("owner", &diverted, MailLimits::default(), late)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // The diverted late request never consumed the registration: the
+        // exact conversion still delivers afterwards under the frozen parent.
+        let retry = MailSendRequest {
+            id: other_id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "digest body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&other_id)),
+            reply_to_delivery: None,
+        };
+        store
+            .mail_send_digest_delivery("owner", &retry, MailLimits::default(), late)
+            .expect("exact conversion still delivers after diverted attempt");
+    }
+
+    #[test]
+    fn digest_id_reservation_covers_ack_and_var_writes() {
+        use eliot_core::api::{MailAckRequest, VarSetRequest};
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let id = ulid::Ulid::new().to_string();
+        let req = digest_request(&id, &parent);
+        store
+            .digest_register("owner", &req, &[false], now)
+            .expect("register");
+        // mail.ack under a pending digest id must respect the reservation:
+        // it rejects with id_conflict instead of binding the id and
+        // poisoning the later delivery. Seed one real delivery so the ack
+        // request itself validates; the digest reservation still wins.
+        let seed_mail = MailSendRequest {
+            id: ulid::Ulid::new().to_string(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "seed".to_owned(),
+            thread: None,
+            reply_to_delivery: None,
+        };
+        let seed = store
+            .mail_send("owner", &seed_mail, MailLimits::default(), now)
+            .expect("seed mail");
+        let ack = MailAckRequest {
+            id: id.clone(),
+            agent: Some(parent.clone()),
+            deliveries: vec![seed.value.deliveries[0].delivery_id.clone()],
+        };
+        let err = store.mail_ack("owner", &ack, now).unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // var.set under the same id rejects the same way (agent principal,
+        // own project scope, fresh CAS).
+        let agent_principal = format!("agent:{parent}:1");
+        let var = VarSetRequest {
+            id: id.clone(),
+            scope: None,
+            key: "k".to_owned(),
+            value: serde_json::json!("v"),
+            expect_version: Some(0),
+            note: None,
+        };
+        let err = store.var_set(&agent_principal, &var, now).unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // The registration still delivers through the exact conversion.
+        let mail = MailSendRequest {
+            id: id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "digest body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&id)),
+            reply_to_delivery: None,
+        };
+        store
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now)
+            .expect("digest delivery after ack/var rejections");
+    }
+
+    #[test]
+    fn digest_diverted_request_never_consumes_pending_id() {
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let other = ready_agent(&mut store, "q", now);
+        let id = ulid::Ulid::new().to_string();
+        let req = digest_request(&id, &parent);
+        store
+            .digest_register("owner", &req, &[false], now)
+            .expect("register");
+        // A fresh mismatched request through the digest path (wrong
+        // recipient, still inside the write-id window) must reject with
+        // id_conflict before binding anything.
+        let diverted = MailSendRequest {
+            id: id.clone(),
+            to: vec![other.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "diverted body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&id)),
+            reply_to_delivery: None,
+        };
+        let err = store
+            .mail_send_digest_delivery("owner", &diverted, MailLimits::default(), now + 1)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // The exact conversion still delivers afterwards.
+        let mail = MailSendRequest {
+            id: id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "digest body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&id)),
+            reply_to_delivery: None,
+        };
+        let delivered = store
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now + 2)
+            .expect("exact delivery after diverted attempt");
+        assert_eq!(delivered.outcome, crate::MailSendOutcome::Fresh);
+        // Mail and delivered mark commit atomically: the registration reads
+        // delivered immediately without a separate mark step.
+        let row = store
+            .get_completion_digest(&id)
+            .expect("read digest")
+            .expect("digest present");
+        assert!(row.delivered_at.is_some());
+    }
+
+    #[test]
+    fn digest_delivered_id_never_admits_changed_body() {
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let id = ulid::Ulid::new().to_string();
+        let req = digest_request(&id, &parent);
+        store
+            .digest_register("owner", &req, &[false], now)
+            .expect("register");
+        let mail = MailSendRequest {
+            id: id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "first body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&id)),
+            reply_to_delivery: None,
+        };
+        let first = store
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now)
+            .expect("first delivery");
+        assert_eq!(first.outcome, crate::MailSendOutcome::Fresh);
+        // Mail and delivered mark commit atomically, so a restart sees the
+        // registration as delivered and never recomputes a changed body
+        // through the Store: an exact same-body replay returns retained,
+        // while a changed body under the consumed id conflicts instead of
+        // overwriting the committed mail.
+        let same = store
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now + 1)
+            .expect("same-body replay returns retained");
+        assert_eq!(same.outcome, crate::MailSendOutcome::Retained);
+        assert_eq!(same.value, first.value);
+        let recomputed = MailSendRequest {
+            id: id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "changed body after restart".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&id)),
+            reply_to_delivery: None,
+        };
+        let err = store
+            .mail_send_digest_delivery("owner", &recomputed, MailLimits::default(), now + 2)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+    }
+
+    #[test]
+    fn pending_digests_page_past_a_blocked_head_with_wraparound() {
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        // 51 pending registrations: a fixed oldest-50 page would revisit the
+        // same head forever and never examine the 51st.
+        let mut ids = Vec::new();
+        for index in 0..51 {
+            let id = ulid::Ulid::new().to_string();
+            let req = digest_request(&id, &parent);
+            store
+                .digest_register("owner", &req, &[false], now + index)
+                .expect("register");
+            ids.push(id);
+        }
+        let head = store
+            .pending_completion_digests_after(None, 50)
+            .expect("first page");
+        assert_eq!(head.len(), 50);
+        let cursor = head.last().map(|row| (row.created_at, row.id.clone()));
+        // The cursor advances past the blocked head: the next page reaches
+        // the tail the fixed window could never examine.
+        let (created_at, id) = cursor.expect("head cursor");
+        let tail = store
+            .pending_completion_digests_after(Some((created_at, id.as_str())), 50)
+            .expect("second page");
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].id, ids[50]);
+        // Past the newest row the page is empty; wrapping restarts at the
+        // oldest row so the sweep cycles instead of stalling.
+        let drained = store
+            .pending_completion_digests_after(Some((tail[0].created_at, tail[0].id.as_str())), 50)
+            .expect("drained page");
+        assert!(drained.is_empty());
+        let wrapped = store
+            .pending_completion_digests_after(None, 50)
+            .expect("wrapped page");
+        assert_eq!(wrapped.len(), 50);
+        assert_eq!(wrapped[0].id, ids[0]);
+        // The legacy oldest-first entry point keeps its contract.
+        let legacy = store.pending_completion_digests(50).expect("legacy page");
+        assert_eq!(legacy.len(), 50);
+        assert_eq!(legacy[0].id, ids[0]);
+    }
+
+    #[test]
+    fn pending_digests_high_water_bounds_sweep_despite_new_arrivals() {
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        // Snapshot the sweep high-water, then keep arriving: the sweep must
+        // wrap once its cursor passes the observed end instead of chasing the
+        // growing tail forever.
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let id = ulid::Ulid::new().to_string();
+            let req = digest_request(&id, &parent);
+            store
+                .digest_register("owner", &req, &[false], now + index)
+                .expect("register");
+            ids.push(id);
+        }
+        let end = store
+            .pending_completion_digests_max()
+            .expect("high-water")
+            .expect("pending");
+        let first = store
+            .pending_completion_digests_after(None, 2)
+            .expect("first page");
+        assert_eq!(first.len(), 2);
+        // New registrations arrive mid-sweep past the recorded end.
+        for index in 3..6 {
+            let id = ulid::Ulid::new().to_string();
+            let req = digest_request(&id, &parent);
+            store
+                .digest_register("owner", &req, &[false], now + index)
+                .expect("register");
+        }
+        // The continuation seeks past the cursor through the pending keyset
+        // cursor (no full-partition scan): it reaches the row observed at
+        // sweep start, not just the pending partition head.
+        let cursor = first.last().map(|row| (row.created_at, row.id.clone()));
+        let (created_at, id) = cursor.expect("cursor");
+        let second = store
+            .pending_completion_digests_after(Some((created_at, id.as_str())), 10)
+            .expect("second page");
+        assert!(second.iter().any(|row| row.id == end.1));
+        // The high-water still names the sweep-start end, while the live max
+        // has moved past it with the new arrivals.
+        let live_max = store
+            .pending_completion_digests_max()
+            .expect("live max")
+            .expect("pending");
+        assert!(live_max >= end);
+    }
+
+    #[test]
+    fn pending_page_snapshots_high_water_with_first_page_atomically() {
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let id = ulid::Ulid::new().to_string();
+            let req = digest_request(&id, &parent);
+            store
+                .digest_register("owner", &req, &[false], now + index)
+                .expect("register");
+            ids.push(id);
+        }
+        // High-water and first page come from one transaction: the bound
+        // always agrees with the rows, so a non-empty page carries a
+        // high-water and an empty queue reads back empty with none. The
+        // page starts at the oldest row and seeks past the cursor by key.
+        let snapshot = store
+            .pending_completion_digests_page(None, 50)
+            .expect("snapshot page");
+        assert_eq!(snapshot.rows.len(), 3);
+        assert_eq!(snapshot.rows[0].id, ids[0]);
+        let end = snapshot
+            .high_water
+            .expect("non-empty page carries a high-water");
+        assert_eq!(end.1, ids[2]);
+        let cursor = snapshot
+            .rows
+            .last()
+            .map(|row| (row.created_at, row.id.clone()))
+            .expect("cursor");
+        let tail = store
+            .pending_completion_digests_page(Some((cursor.0, cursor.1.as_str())), 50)
+            .expect("tail page");
+        assert!(tail.rows.is_empty());
+        assert_eq!(tail.high_water.map(|end| end.1), Some(ids[2].clone()));
+        let mut empty = Store::open(std::path::Path::new(":memory:")).expect("open Store");
+        let snapshot = empty
+            .pending_completion_digests_page(None, 50)
+            .expect("empty snapshot");
+        assert!(snapshot.rows.is_empty());
+        assert_eq!(snapshot.high_water, None);
     }
 
     #[test]
