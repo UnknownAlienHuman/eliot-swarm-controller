@@ -337,6 +337,60 @@ pub(crate) async fn read_effective_mcp_surface(
     probe_result
 }
 
+pub(crate) const MODEL_PAGE_SIZE: u32 = 100;
+pub(crate) const MAX_MODEL_PAGES: usize = 100;
+
+/// Bounded `model/list` cursor pagination over one live client: the one copy
+/// of the page loop behind both the metadata catalogue (`list_models`) and
+/// the launch probe (`discover_model` in `host.rs`). Page params, cursor
+/// advance and the page bound are identical; only failure classification
+/// differs, so every failure maps through the caller's constructors. Each
+/// page is bounded by `per_page` capped by the caller's overall `deadline`,
+/// so two slow pages fit their individual budgets without exceeding the
+/// reader's overall deadline. Returns the entries plus whether the bound
+/// truncated the catalogue: the metadata read keeps the truncated prefix
+/// (as before), the launch probe reports the bound instead.
+pub(crate) async fn collect_model_pages(
+    client: &NativeClient,
+    per_page: Duration,
+    overall: Instant,
+    encode_error: impl Fn() -> Error,
+    call_error: impl Fn(Error) -> Error,
+    schema_error: impl Fn() -> Error,
+    cursor_error: impl Fn() -> Error,
+) -> Result<(Vec<NativeModelEntry>, bool)> {
+    let mut entries: Vec<NativeModelEntry> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    for _ in 0..MAX_MODEL_PAGES {
+        let deadline = (Instant::now() + per_page).min(overall);
+        let response = client
+            .call(
+                "model/list",
+                serde_json::to_value(NativeModelListParams {
+                    cursor: cursor.clone(),
+                    include_hidden: Some(true),
+                    limit: Some(MODEL_PAGE_SIZE),
+                })
+                .map_err(|_| encode_error())?,
+                deadline,
+            )
+            .await
+            .map_err(&call_error)?;
+        let page: NativeModelListResponse =
+            serde_json::from_value(response).map_err(|_| schema_error())?;
+        entries.extend(page.data);
+        match page.next_cursor {
+            Some(next) if !next.is_empty() && seen_cursors.insert(next.clone()) => {
+                cursor = Some(next);
+            }
+            Some(_) => return Err(cursor_error()),
+            None => return Ok((entries, false)),
+        }
+    }
+    Ok((entries, true))
+}
+
 /// Read-only native model catalogue: a short-lived metadata reader runs
 /// initialize, pages `model/list`, then closes. It never starts a thread,
 /// sends input, or performs inference.
@@ -350,45 +404,27 @@ pub(crate) async fn list_models(
         start_initialized_reader(launch, metadata_secrets, diagnostic_secrets, deadline).await?;
     let probe_result: Result<Vec<NativeModelEntry>> = async {
         let client = probe.client();
-        let mut entries: Vec<NativeModelEntry> = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut seen_cursors = HashSet::new();
-        for _ in 0..100usize {
-            let response = client
-                .call(
-                    "model/list",
-                    serde_json::to_value(NativeModelListParams {
-                        cursor: cursor.clone(),
-                        include_hidden: Some(true),
-                        limit: Some(100),
-                    })
-                    .map_err(|_| invalid_page())?,
-                    deadline,
+        let (entries, _) = collect_model_pages(
+            &client,
+            READ_TIMEOUT,
+            deadline,
+            invalid_page,
+            |error| {
+                contextual_error(
+                    error,
+                    "native_readback",
+                    "Codex model/list did not return a catalogue page",
                 )
-                .await
-                .map_err(|error| {
-                    contextual_error(
-                        error,
-                        "native_readback",
-                        "Codex model/list did not return a catalogue page",
-                    )
-                })?;
-            let page: NativeModelListResponse =
-                serde_json::from_value(response).map_err(|_| invalid_page())?;
-            entries.extend(page.data);
-            match page.next_cursor {
-                Some(next) if !next.is_empty() && seen_cursors.insert(next.clone()) => {
-                    cursor = Some(next);
-                }
-                Some(_) => {
-                    return Err(Error::new(
-                        "native_readback",
-                        "Codex model/list returned a repeated or invalid cursor",
-                    ));
-                }
-                None => break,
-            }
-        }
+            },
+            invalid_page,
+            || {
+                Error::new(
+                    "native_readback",
+                    "Codex model/list returned a repeated or invalid cursor",
+                )
+            },
+        )
+        .await?;
         let value = serde_json::to_value(&entries).map_err(|_| invalid_page())?;
         reject_secrets(&value, metadata_secrets)?;
         Ok(entries)

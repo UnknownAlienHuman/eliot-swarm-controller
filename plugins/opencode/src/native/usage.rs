@@ -38,11 +38,12 @@
 use std::{ffi::OsStr, process::Stdio, time::Duration};
 
 use eliot_core::{Error, Result};
+use eliot_plugin::native_lifecycle::kill_and_reap;
 use serde_json::{Value, json};
 use tokio::{
     io::AsyncReadExt,
     process::Command,
-    time::{Instant, timeout, timeout_at},
+    time::{Instant, timeout_at},
 };
 
 /// Exact argv for the native usage-limits read: `api
@@ -362,19 +363,6 @@ pub(crate) fn scoped_budget_windows(info: &UsageInfo) -> Vec<Value> {
         }
     }
     windows
-}
-
-/// Grace for reaping a usage child after the kill signal.
-const KILL_GRACE: Duration = Duration::from_secs(2);
-
-async fn kill_and_reap(child: &mut tokio::process::Child) -> bool {
-    // `start_kill` signals only; `kill` would wait unboundedly for exit
-    // (tokio `Child::kill` awaits `wait`), so the single bounded wait
-    // below is the only blocking call in cleanup.
-    let _ = child.start_kill();
-    timeout(KILL_GRACE, child.wait())
-        .await
-        .is_ok_and(|wait| wait.is_ok())
 }
 
 /// Latest deadline this module starts its own child under when the caller

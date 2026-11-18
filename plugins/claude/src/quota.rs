@@ -12,26 +12,27 @@ fn env_value<'a>(environment: &'a Value, name: &str) -> Option<&'a str> {
     })
 }
 
-fn external_route(environment: &Value) -> bool {
-    [
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-        "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-        "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_FOUNDRY",
-        "CLAUDE_CODE_USE_MANTLE",
-    ]
-    .iter()
-    .any(|key| env_value(environment, key).is_some_and(|value| !value.is_empty()))
-}
+/// Refuse user settings that select an external route: the daemon already
+/// refuses external provider routes from the frozen environment (see
+/// `router::catalog::external_quota_route`), but only this reader sees the
+/// native `settings.json`, so settings-selected routes are reported here.
+const EXTERNAL_SETTINGS_MARKERS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+];
 
-fn require_oauth_route(environment: &Value, settings: &Value) -> Result<()> {
+fn require_native_oauth_settings(settings: &Value) -> Result<()> {
     let settings_env = &settings["env"];
-    if external_route(environment)
-        || external_route(settings_env)
+    if EXTERNAL_SETTINGS_MARKERS
+        .iter()
+        .any(|marker| env_value(settings_env, marker).is_some_and(|text| !text.is_empty()))
         || env_value(settings_env, "CLAUDE_CONFIG_DIR").is_some()
         || env_value(settings_env, "CLAUDE_CODE_OAUTH_TOKEN").is_some()
         || settings.get("apiKeyHelper").is_some()
@@ -51,7 +52,9 @@ fn subscription_status(status: &Value) -> bool {
 
 pub(crate) async fn read(raw: &Value) -> Result<Value> {
     let params = q::decode(raw)?;
-    require_oauth_route(&params.environment, &Value::Null)?;
+    // External provider routes from the frozen environment never reach this
+    // reader: the daemon refuses them in
+    // `router::catalog::external_quota_route` before spawning any reader.
     let root = match env_value(&params.environment, "CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
         Some(root) if Path::new(root).is_absolute() => Path::new(root).to_owned(),
         Some(_) => {
@@ -68,7 +71,7 @@ pub(crate) async fn read(raw: &Value) -> Result<Value> {
     )
     .map_err(|_| q::environment("Claude quota could not verify native user settings"))?;
     if let Some(settings) = settings.as_ref() {
-        require_oauth_route(&params.environment, settings)?;
+        require_native_oauth_settings(settings)?;
     }
     let program = params.profile["cmd"]
         .as_str()
@@ -182,7 +185,10 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn oauth_quota_refuses_external_profile_and_native_settings_routes() {
+    fn oauth_quota_refuses_external_native_settings_routes() {
+        // Frozen-environment routes are refused by the daemon
+        // (`router::catalog::external_quota_route`, tested there); this
+        // reader refuses only settings-selected external routes.
         for selector in [
             "CLAUDE_CODE_USE_BEDROCK",
             "CLAUDE_CODE_USE_VERTEX",
@@ -190,20 +196,15 @@ mod tests {
         ] {
             let env = json!({(selector): "1"});
             assert_eq!(
-                require_oauth_route(&env, &json!({})).unwrap_err().code,
-                "quota_unavailable"
-            );
-            assert_eq!(
-                require_oauth_route(&json!({}), &json!({"env": env}))
+                require_native_oauth_settings(&json!({"env": env}))
                     .unwrap_err()
                     .code,
                 "quota_unavailable"
             );
         }
-        assert!(require_oauth_route(&json!({}), &json!({"apiKeyHelper": "helper"})).is_err());
+        assert!(require_native_oauth_settings(&json!({"apiKeyHelper": "helper"})).is_err());
         assert!(
-            require_oauth_route(&json!({}), &json!({"env": {"CLAUDE_CODE_USE_VERTEX": ""}}))
-                .is_ok()
+            require_native_oauth_settings(&json!({"env": {"CLAUDE_CODE_USE_VERTEX": ""}})).is_ok()
         );
         assert!(!subscription_status(&json!({
             "loggedIn": true, "authMethod": "claude.ai", "apiProvider": "bedrock",

@@ -249,7 +249,7 @@ impl Router {
             .map_err(|_| Error::new("internal", "harness models could not be encoded"))
     }
 
-    async fn models_for_snapshot(
+    pub(super) async fn models_for_snapshot(
         &self,
         harness: &str,
         snapshot: Option<Value>,
@@ -409,6 +409,38 @@ impl Router {
         let mut profile = snapshot
             .ok_or_else(|| Error::new("profile_error", "quota requires a native profile"))?;
         let route = crate::plugin_host::metadata_route(&profile)?;
+        // Universal policy, decided before any reader spawns and before any
+        // cache access: an external provider route never reports CLI/keyring
+        // quota for another route. The refusal flows through the same shaped
+        // error arm as a native reader refusal, so routing and
+        // `harness.quota` see identical facts, and it is never cached.
+        // Unavailable quota stays `unknown` via the existing projection,
+        // never 0.
+        if let Some(note) = catalog::external_quota_route(&harness, &route.environment) {
+            let mut response = eliot_core::api::HarnessQuotaResponse {
+                harness: harness.clone(),
+                scope,
+                fetched_at_ms: now_ms(),
+                ttl_ms: catalog::CATALOG_TTL_MS,
+                credential,
+                status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
+                note: None,
+                details: None,
+            };
+            catalog::quota_read_error(&mut response, eliot_plugin::quota::environment(note));
+            request.validate_response(&response)?;
+            let route_verified = catalog::canonical_cache_identity(
+                &label,
+                &profile,
+                route.identity.as_deref(),
+                &route.environment,
+            )
+            .is_some();
+            return Ok(catalog::ScopedQuota {
+                response,
+                route_verified,
+            });
+        }
         if harness == "antigravity" {
             let cmd = profile["cmd"].as_str().unwrap_or("agy");
             let (cmd, _) = crate::adhoc::reader_executable(cmd, &harness, deadline).await?;
@@ -853,6 +885,108 @@ fn muse_catalog_note(default: Option<&str>) -> String {
         ),
         _ => "Muse model/list names no default marker; the server default applies at launch"
             .to_owned(),
+    }
+}
+
+/// Universal external-route quota guard: a frozen profile that selects an
+/// external provider route must never report CLI/keyring quota measured for
+/// another route. The marker lists moved here from the Claude and
+/// Antigravity plugins (whose readers now report only native facts); the
+/// daemon refuses before spawning any reader, so routing and `harness.quota`
+/// share one decision. The one native fact it cannot see stays in the
+/// plugin: user settings that select an external route (Claude
+/// `settings.json`) are still refused by the Claude reader itself.
+pub(crate) fn external_quota_route(harness: &str, environment: &Value) -> Option<&'static str> {
+    // Claude matches its reader's lookup: exact on non-Windows, ASCII
+    // case-insensitive on Windows.
+    let present = |name: &str| {
+        environment
+            .as_object()
+            .into_iter()
+            .flatten()
+            .any(|(key, value)| {
+                (key == name || (cfg!(windows) && key.eq_ignore_ascii_case(name)))
+                    && value.as_str().is_some_and(|text| !text.is_empty())
+            })
+    };
+    match harness {
+        "claude"
+            if [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_BASE_URL",
+                "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+                "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDE_CODE_USE_MANTLE",
+            ]
+            .iter()
+            .any(|marker| present(marker)) =>
+        {
+            Some(
+                "Claude profile route is external or ambiguous; CLI OAuth quota would describe an unverified route",
+            )
+        }
+        // Antigravity matches its reader's lookup exactly.
+        "antigravity"
+            if [
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEY",
+                "GOOGLE_APPLICATION_CREDENTIALS",
+            ]
+            .iter()
+            .any(|marker| {
+                environment
+                    .get(*marker)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            }) =>
+        {
+            Some(
+                "Antigravity profile selects external auth; native keyring quota would describe another route",
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Daemon-owned launch default for an omitted model, decided over the
+/// daemon's own cached `harness.models` entry. Codex launches the native
+/// `isDefault` id; Muse defers to the server default (the marker is
+/// display-only), so an omitted Muse model resolves to no frozen value and
+/// only an empty catalogue refuses. Explicit models stay with the plugins,
+/// which validate them against their native entries at launch.
+pub(crate) fn launch_model_default(
+    harness: &str,
+    response: &HarnessModelsResponse,
+) -> Result<Option<String>> {
+    match harness {
+        "codex" => match response.default.clone() {
+            Some(model) => Ok(Some(model)),
+            None => Err(
+                eliot_plugin::start_classification::harness_unavailable_model(
+                    "codex",
+                    "model_list",
+                    "Codex model/list reported no default model; use an explicit model",
+                ),
+            ),
+        },
+        "muse" => {
+            if response.models.is_empty() {
+                return Err(Error::new(
+                    "profile_error",
+                    format!(
+                        "Muse model catalogue (source {}, {} models) names no default model; use an explicit model",
+                        response.catalogue,
+                        response.models.len()
+                    ),
+                ));
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1857,6 +1991,7 @@ fn evict_quotas(map: &mut HashMap<String, HarnessQuotaResponse>, now: i64) {
 mod tests {
     use super::super::tests::router;
     use super::*;
+    use eliot_core::api::HarnessModelEntry;
     use serde_json::json;
 
     fn obs<'a>(provider: &'a str, scope: &'a str, observed_at_ms: i64) -> QuotaObservation<'a> {
@@ -1865,6 +2000,159 @@ mod tests {
             scope,
             observed_at_ms,
         }
+    }
+
+    #[test]
+    fn external_quota_route_matches_the_plugin_refusals_verbatim() {
+        // Markers the Claude and Antigravity readers used to refuse themselves.
+        for (harness, marker) in [
+            ("claude", "ANTHROPIC_API_KEY"),
+            ("claude", "ANTHROPIC_BASE_URL"),
+            ("claude", "CLAUDE_CODE_USE_BEDROCK"),
+            ("antigravity", "GEMINI_API_KEY"),
+            ("antigravity", "GOOGLE_APPLICATION_CREDENTIALS"),
+        ] {
+            let note = external_quota_route(harness, &json!({marker: "non-empty"}))
+                .expect("external marker refuses");
+            assert!(!note.is_empty(), "{harness}/{marker}");
+        }
+        // Absent, blank, non-string and other-harness markers stay native.
+        for environment in [
+            json!({}),
+            json!({"ANTHROPIC_API_KEY": ""}),
+            json!({"ANTHROPIC_API_KEY": 1}),
+            json!({"GEMINI_API_KEY": "x"}),
+        ] {
+            let harness = if environment == json!({"GEMINI_API_KEY": "x"}) {
+                "claude"
+            } else {
+                "antigravity"
+            };
+            assert!(
+                external_quota_route(harness, &environment).is_none(),
+                "{harness} {environment}"
+            );
+        }
+        assert!(external_quota_route("codex", &json!({"ANTHROPIC_API_KEY": "x"})).is_none());
+        assert!(external_quota_route("muse", &json!({"GEMINI_API_KEY": "x"})).is_none());
+        assert!(external_quota_route("opencode", &json!({"GEMINI_API_KEY": "x"})).is_none());
+    }
+
+    fn models_response(models: &[(&str, bool)], default: Option<&str>) -> HarnessModelsResponse {
+        HarnessModelsResponse {
+            harness: "codex".to_owned(),
+            catalogue: "native".to_owned(),
+            models: models
+                .iter()
+                .map(|(id, default)| HarnessModelEntry {
+                    id: id.to_string(),
+                    display_name: Some(id.to_string()),
+                    default: *default,
+                    efforts: None,
+                    default_effort: None,
+                    source: Some("live".to_owned()),
+                })
+                .collect(),
+            default: default.map(str::to_owned),
+            note: None,
+            scope: "test".to_owned(),
+            fetched_at_ms: 0,
+            ttl_ms: CATALOG_TTL_MS,
+            credential: "none".to_owned(),
+            configure: Default::default(),
+        }
+    }
+
+    #[test]
+    fn launch_model_default_matches_the_plugin_choice() {
+        // Codex launches the native default; an unknown catalogue refuses.
+        let response = models_response(&[("m1", false), ("m2", true)], Some("m2"));
+        assert_eq!(
+            launch_model_default("codex", &response).expect("default"),
+            Some("m2".to_owned())
+        );
+        let empty = models_response(&[], None);
+        let error = launch_model_default("codex", &empty).expect_err("no default");
+        assert_eq!(error.code, "native_model_unavailable");
+        // Muse defers to the server default; only an empty catalogue refuses.
+        assert_eq!(
+            launch_model_default("muse", &response).expect("server default"),
+            None
+        );
+        let error = launch_model_default("muse", &empty).expect_err("empty");
+        assert_eq!(error.code, "profile_error");
+        // Other harnesses resolve nothing.
+        assert_eq!(
+            launch_model_default("claude", &response).expect("passthrough"),
+            None
+        );
+    }
+
+    #[test]
+    fn canonical_identity_separates_cmd_version_and_route() {
+        // A changed `cmd` must never reuse a stale catalogue entry: the key
+        // is the canonical executable/version/route identity, not scope.
+        let base = json!({"harness":"codex","cmd":"/bin/a","route_binding":{"name":"r"}});
+        let other_cmd = json!({"harness":"codex","cmd":"/bin/b","route_binding":{"name":"r"}});
+        let env = json!({});
+        let first = canonical_cache_identity("p", &base, Some("v1"), &env).expect("key");
+        let second = canonical_cache_identity("p", &other_cmd, Some("v1"), &env).expect("key");
+        assert_ne!(first, second, "changed executable separates the key");
+        // The native-read key needs a version: without one there is no key
+        // to share, so scope alone can never hit.
+        assert!(models_key(&first, "/bin/a", Some("1")).is_some());
+        assert!(models_key(&first, "/bin/a", None).is_none());
+        let same_scope = models_key(&first, "/bin/a", Some("1")).unwrap();
+        let other_version = models_key(&first, "/bin/a", Some("2")).unwrap();
+        assert_ne!(
+            same_scope, other_version,
+            "changed version separates the key"
+        );
+    }
+
+    #[test]
+    fn adhoc_freeze_shares_the_catalogue_label() {
+        // Catalogue ad-hoc reads cache under `adhoc`; the freeze must share
+        // it, never `adhoc-<harness>`, or a cold launch misses a warm cache.
+        let snapshot = json!({"harness":"codex"});
+        let (catalogue_scope, _) = describe_snapshot("adhoc", "codex", Some(&snapshot));
+        assert_eq!(catalogue_scope, "profile:adhoc harness:codex route:direct");
+        let (split_scope, _) = describe_snapshot("adhoc-codex", "codex", Some(&snapshot));
+        assert_ne!(
+            catalogue_scope, split_scope,
+            "the adhoc split would miss the catalogue entry"
+        );
+    }
+
+    #[test]
+    fn external_refusal_stays_unknown_never_zero() {
+        // An external-route refusal carries no windows: the existing
+        // projection stays `unknown` (None), never a fabricated 0.
+        let mut response = HarnessQuotaResponse {
+            harness: "antigravity".to_owned(),
+            scope: "profile:adhoc harness:antigravity".to_owned(),
+            fetched_at_ms: 1_000,
+            ttl_ms: CATALOG_TTL_MS,
+            credential: "none".to_owned(),
+            status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
+            note: None,
+            details: None,
+        };
+        quota_read_error(
+            &mut response,
+            eliot_plugin::quota::environment(
+                "Antigravity profile selects external auth; native keyring quota would describe another route",
+            ),
+        );
+        let details = response.details.expect("refusal carries error details");
+        assert!(details.get("windows").is_none(), "no windows to project");
+        let projection = project_quota(
+            obs("antigravity", &response.scope, 2_000),
+            &details,
+            Some("gemini"),
+            2_000,
+        );
+        assert!(projection.is_none(), "unavailable quota stays unknown");
     }
 
     #[test]

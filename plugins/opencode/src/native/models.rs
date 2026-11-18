@@ -12,15 +12,16 @@
 //! `GET /api/model` inventory instead, which needs a live session and is
 //! therefore not the catalogue reader.
 
-use std::{ffi::OsStr, path::Path, process::Stdio, time::Duration};
+use std::{ffi::OsStr, path::Path, process::Stdio};
 
 use eliot_core::api::harness::native_model_display_name;
 use eliot_core::{Error, Result};
+use eliot_plugin::native_lifecycle::kill_and_reap;
 use serde_json::Value;
 use tokio::{
     io::AsyncReadExt,
     process::Command,
-    time::{Instant, timeout, timeout_at},
+    time::{Instant, timeout_at},
 };
 
 /// Keep the private server under the reader Job, never the background service.
@@ -270,9 +271,6 @@ pub(crate) fn parse_model_list_output(text: &str) -> Result<Vec<NativeModelMetad
     Ok(entries)
 }
 
-/// Grace for reaping a catalogue child after the kill signal.
-const KILL_GRACE: Duration = Duration::from_secs(2);
-
 /// Run the frozen native exe with exact argv `models --standalone` and return its
 /// `provider/model` ids verbatim, in wire order. Bounded by `deadline` and
 /// [`MAX_MODELS_BYTES`]; stderr is discarded like every other helper, so
@@ -383,16 +381,6 @@ pub(crate) fn parse_models_output(text: &str) -> Result<Vec<String>> {
         }
     }
     Ok(ids)
-}
-
-async fn kill_and_reap(child: &mut tokio::process::Child) -> bool {
-    // `start_kill` signals only; `kill` would already wait unboundedly for
-    // exit (tokio `Child::kill` awaits `wait`), so the single bounded wait
-    // below is the only blocking call in cleanup.
-    let _ = child.start_kill();
-    timeout(KILL_GRACE, child.wait())
-        .await
-        .is_ok_and(|wait| wait.is_ok())
 }
 
 #[cfg(test)]

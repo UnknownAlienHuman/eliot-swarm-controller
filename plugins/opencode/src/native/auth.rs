@@ -37,14 +37,15 @@
 //! function on the caller's runtime, bounded owned children, no spawned
 //! tasks, no import retry.
 
-use std::{ffi::OsStr, ffi::OsString, path::Path, time::Duration};
+use std::{ffi::OsStr, ffi::OsString, path::Path};
 
 use eliot_core::{Error, Result};
+use eliot_plugin::native_lifecycle::kill_and_reap;
 use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, Command},
-    time::{Instant, timeout, timeout_at},
+    process::Command,
+    time::{Instant, timeout_at},
 };
 
 /// Largest accepted export document. One integration's credential is small;
@@ -57,10 +58,6 @@ const MAX_LIST_BYTES: usize = 64 * 1024;
 
 /// Longest accepted integration selector, in bytes.
 const MAX_SELECTOR_BYTES: usize = 128;
-
-/// Grace to reap a killed helper after a deadline before reporting. The
-/// caller owns the deadline; this only bounds our own cleanup.
-const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// One explicitly selected native integration (ID or name), validated but
 /// never defaulted. Deliberately without `Debug`: a caller bug must not be
@@ -661,19 +658,6 @@ pub async fn ensure_no_credential_for_provider(
         ));
     }
     Ok(())
-}
-
-/// Best-effort kill plus bounded reap, reporting positive exit proof: true
-/// only when the child's exit was actually reaped. `kill_on_drop` remains
-/// the backstop if this future is itself cancelled.
-async fn kill_and_reap(child: &mut Child) -> bool {
-    // `start_kill` signals only; `kill` would already wait unboundedly for
-    // exit (tokio 1.54.1 `Child::kill` awaits `wait`), so the single bounded
-    // wait below is the only blocking call in cleanup.
-    let _ = child.start_kill();
-    timeout(KILL_GRACE, child.wait())
-        .await
-        .is_ok_and(|wait| wait.is_ok())
 }
 
 /// Read only the selected canonical credential using the native export schema.
