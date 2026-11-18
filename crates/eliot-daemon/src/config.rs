@@ -1102,12 +1102,8 @@ struct ProfileEntry {
     setup: Vec<crate::setup::SetupEntry>,
     #[serde(default = "default_scratch")]
     scratch: Vec<String>,
-    /// Optional native `provider.<id>` fragment for OpenCode profiles only.
-    /// Each key is one OpenCode provider id; its value is written as-is
-    /// into the isolated `opencode.jsonc` under `providers`. Only the
-    /// `provider` table is admitted here, never other native top-level keys.
     #[serde(default)]
-    provider: Option<HashMap<String, toml::Value>>,
+    local_provider: Option<core::local_provider::LocalProvider>,
 }
 
 fn configured_route_credential_env_names(
@@ -1677,16 +1673,13 @@ fn snapshot_from_entry(
             "unsupported",
         ));
     }
-    // Native `provider.<id>` fragments are an OpenCode-only path. Any
-    // provider fragment on another harness is rejected, never silently
-    // frozen.
-    if harness != "opencode" && entry.provider.is_some() {
+    if harness != "opencode" && entry.local_provider.is_some() {
         return Err(profile_field_error(
             source,
             table_offset,
             name,
-            "provider",
-            "native provider fragments have no mapping on this harness",
+            "local_provider",
+            "local providers have no mapping on this harness",
             "unsupported",
         ));
     }
@@ -2245,184 +2238,6 @@ fn claude_snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
-/// Maximum native `provider.<id>` entries frozen on one OpenCode profile.
-/// One fragment usually carries one provider; the bound keeps the isolated
-/// config small and the cache key bounded.
-const MAX_OPENCODE_PROVIDERS: usize = 8;
-
-/// Maximum serialized bytes for one frozen provider entry. The isolated
-/// `opencode.jsonc` stays small; larger fragments are a profile error.
-const MAX_OPENCODE_PROVIDER_BYTES: usize = 32 * 1024;
-
-/// Map a shared fragment-shape refusal onto the frozen profile field error
-/// so the freeze location (file, table offset, profile and field) is kept
-/// while the refusal text stays the one every caller shares.
-fn fragment_shape_error(
-    source: &str,
-    table_offset: usize,
-    name: &str,
-    error: &core::Error,
-) -> core::Error {
-    profile_field_error(
-        source,
-        table_offset,
-        name,
-        "provider",
-        &error.message,
-        "profile_error",
-    )
-}
-
-/// Check every `{env:NAME}` in a shape-admitted fragment against the frozen
-/// `pass_env` allowlist (never a native-store selector): key values stay
-/// runtime-only and unlisted references refuse at freeze.
-fn validate_fragment_pass_env(
-    frozen: &serde_json::Map<String, Value>,
-    tail: &ProfileTail,
-    source: &str,
-    table_offset: usize,
-    name: &str,
-) -> core::Result<()> {
-    let mut refs = Vec::new();
-    core::opencode_fragment::collect_env_refs(frozen, &mut refs);
-    for name_ref in &refs {
-        if private_route_selector(name_ref) {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "provider",
-                "provider fragment cannot use a native store selector",
-                "profile_error",
-            ));
-        }
-        let allowed = tail.pass_env.iter().any(|allowed| {
-            if cfg!(windows) {
-                allowed.eq_ignore_ascii_case(name_ref)
-            } else {
-                allowed == name_ref
-            }
-        });
-        if !allowed {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "provider",
-                "provider fragment env references must be explicitly allowed by profile pass_env",
-                "profile_error",
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Freeze the optional native `provider.<id>` fragment of an OpenCode
-/// profile. The fragment is written as-is into the isolated `opencode.jsonc`
-/// under `providers`; only the `provider` table is admitted (no other native
-/// top-level keys). The shared strict validator admits per provider id only
-/// `package`, `settings` (exactly `baseURL`/`apiKey`, no userinfo or query
-/// credentials) and `models`, and refuses every other key — including the
-/// legacy `options`/`provider` shape, Bedrock-style `credentials` and
-/// arbitrary headers — plus literal credentials anywhere inside. Every
-/// `{env:NAME}` reference must name an entry of the frozen `pass_env`
-/// allowlist; key values stay runtime-only. A fragment combined with
-/// `auth_integration` refuses: the custom provider carries its own `{env:}`
-/// credentials, never a canonical integration.
-fn freeze_opencode_provider_fragment(
-    snapshot: &mut serde_json::Map<String, Value>,
-    name: &str,
-    entry: &ProfileEntry,
-    tail: &ProfileTail,
-    table_offset: usize,
-    source: &str,
-) -> core::Result<()> {
-    let Some(fragment) = entry.provider.as_ref() else {
-        return Ok(());
-    };
-    if fragment.is_empty() || fragment.len() > MAX_OPENCODE_PROVIDERS {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "provider",
-            "must name 1-8 provider ids",
-            "profile_error",
-        ));
-    }
-    if entry.auth_integration.is_some() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "auth_integration",
-            "a native provider fragment must not name a canonical auth_integration",
-            "profile_error",
-        ));
-    }
-    let mut frozen = serde_json::Map::new();
-    for (id, raw) in fragment {
-        let json = serde_json::to_value(raw).map_err(|_| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "provider",
-                "provider fragment must be a TOML table",
-                "profile_error",
-            )
-        })?;
-        let Value::Object(map) = json else {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "provider",
-                "each provider entry must be a table",
-                "profile_error",
-            ));
-        };
-        let bytes = serde_json::to_string(&map).map_err(|_| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "provider",
-                "provider fragment could not be encoded",
-                "profile_error",
-            )
-        })?;
-        if bytes.len() > MAX_OPENCODE_PROVIDER_BYTES {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "provider",
-                "provider entry exceeds 32 KiB",
-                "profile_error",
-            ));
-        }
-        if map.is_empty() {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "provider",
-                "each provider entry must be a non-empty table",
-                "profile_error",
-            ));
-        }
-        frozen.insert(id.trim().to_owned(), Value::Object(map));
-    }
-    // One shared strict allowlist at freeze and before any write: per
-    // provider id only package, settings (baseURL/apiKey) and models.
-    core::opencode_fragment::validate_fragment_shape(&frozen)
-        .map_err(|error| fragment_shape_error(source, table_offset, name, &error))?;
-    validate_fragment_pass_env(&frozen, tail, source, table_offset, name)?;
-    snapshot.insert("provider".to_owned(), Value::Object(frozen));
-    Ok(())
-}
-
 /// Names of configured OpenCode profiles backed by the daemon config file.
 /// Used by the `models.catalog` aggregate to merge profile-scoped provider
 /// previews independently of the ad-hoc read.
@@ -2455,11 +2270,8 @@ pub(crate) fn profile_names_for_harness(data_root: &Path, harness: &str) -> Vec<
 /// approval-policy presets have no OpenCode mapping and stay rejected until
 /// one lands.
 ///
-/// A profile may carry an optional native `provider.<id>` fragment. Each id
-/// maps to one OpenCode provider definition written as-is into the isolated
-/// `opencode.jsonc` under `providers`. Every `{env:NAME}` reference must name
-/// an entry of the frozen `pass_env` allowlist; key values stay runtime-only.
-/// A fragment combined with `auth_integration` refuses.
+/// A typed local provider selects one of its own models and uses optional
+/// environment-backed authentication in place of a canonical integration.
 fn opencode_snapshot_from_entry(
     name: &str,
     entry: &ProfileEntry,
@@ -2554,19 +2366,32 @@ fn opencode_snapshot_from_entry(
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
     }
-    if entry.provider.is_some() && model.is_none() {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
-            "model",
-            "a native provider fragment requires an explicit model",
-            "profile_error",
-        ));
-    }
-    freeze_opencode_provider_fragment(&mut snapshot, name, entry, &tail, table_offset, source)?;
-    if entry.auth_integration.is_some() && entry.provider.is_none() {
-        let selector = entry.auth_integration.as_deref().expect("checked above");
+    if let Some(provider) = entry.local_provider.as_ref() {
+        let field_error = |field, message: &str| {
+            profile_field_error(source, table_offset, name, field, message, "profile_error")
+        };
+        provider
+            .validate(&tail.pass_env)
+            .map_err(|message| field_error("local_provider", &message))?;
+        if !model
+            .and_then(split_provider_model)
+            .is_some_and(|(id, model)| provider.contains_model(id, model))
+        {
+            return Err(field_error(
+                "model",
+                "a local provider profile must select one of its declared models",
+            ));
+        }
+        if entry.auth_integration.is_some() {
+            return Err(field_error(
+                "auth_integration",
+                "a local provider profile cannot name a canonical auth_integration",
+            ));
+        }
+        let frozen = serde_json::to_value(provider)
+            .map_err(|_| field_error("local_provider", "could not encode local provider"))?;
+        snapshot.insert("local_provider".to_owned(), frozen);
+    } else if let Some(selector) = entry.auth_integration.as_deref() {
         snapshot.insert(
             "auth_integration".to_owned(),
             Value::String(selector.trim().to_owned()),
@@ -4799,182 +4624,103 @@ pass_env = ["OPENAI_API_KEY"]
         }
     }
 
-    #[test]
-    fn opencode_provider_fragment_freezes_as_is_with_env_allowlist() {
-        let source = r#"
+    const LOCAL_OPENCODE_PROFILE: &str = r#"
 [profiles.local]
 harness = "opencode"
 cmd = "C:/Tools/OpenCode/opencode.exe"
-model = "k173d-fixture/test-model"
-pass_env = ["K173D_PROOF_KEY"]
-
-[profiles.local.provider.k173d-fixture]
-package = "@opencode/ai/providers/openai-compatible"
-
-[profiles.local.provider.k173d-fixture.settings]
-baseURL = "http://127.0.0.1:1234/v1"
-apiKey = "{env:K173D_PROOF_KEY}"
-
-[profiles.local.provider.k173d-fixture.models.test-model]
-name = "test-model"
-tools = true
+model = "typed/family/model"
+pass_env = ["LOCAL_PROOF_KEY"]
 "#;
-        let snapshot = resolve_text_profile(source, "local").unwrap();
-        assert_eq!(snapshot["harness"], "opencode");
-        assert_eq!(snapshot["model"], "k173d-fixture/test-model");
-        let fragment = snapshot.get("provider").expect("fragment frozen");
-        let provider = &fragment["k173d-fixture"];
+
+    const LOCAL_OPENCODE_PROVIDER: &str = r#"
+[profiles.local.local_provider]
+id = "typed"
+package = "@ai-sdk/openai-compatible"
+base_url = "http://127.0.0.1:1234/v1"
+api_key_env = "LOCAL_PROOF_KEY"
+models = [{ id = "family/model", context_limit = 8192, output_limit = 1024 }]
+"#;
+
+    #[test]
+    fn opencode_freezes_only_typed_provider_fields() {
+        let source = format!("{LOCAL_OPENCODE_PROFILE}{LOCAL_OPENCODE_PROVIDER}");
+        let snapshot = resolve_text_profile(&source, "local").unwrap();
+        assert_eq!(snapshot["model"], "typed/family/model");
         assert_eq!(
-            provider["package"],
-            "@opencode/ai/providers/openai-compatible"
+            snapshot["local_provider"],
+            serde_json::json!({
+                "id": "typed",
+                "package": "@ai-sdk/openai-compatible",
+                "base_url": "http://127.0.0.1:1234/v1",
+                "api_key_env": "LOCAL_PROOF_KEY",
+                "models": [{ "id": "family/model", "context_limit": 8192, "output_limit": 1024 }],
+            })
         );
-        assert_eq!(provider["settings"]["baseURL"], "http://127.0.0.1:1234/v1");
-        assert_eq!(provider["settings"]["apiKey"], "{env:K173D_PROOF_KEY}");
+        assert!(snapshot.get("provider").is_none());
         assert!(snapshot.get("auth_integration").is_none());
-
-        // Arbitrary headers are refused even as {env:} references: the
-        // settings block admits only baseURL and apiKey.
-        let source = source.replace(
-            "apiKey = \"{env:K173D_PROOF_KEY}\"",
-            "apiKey = \"{env:K173D_PROOF_KEY}\"\nheaders = { X-Auth-Token = \"{env:K173D_PROOF_KEY}\" }",
-        );
-        let error = resolve_text_profile(&source, "local").expect_err("headers must fail");
-        assert_eq!(error.code, "profile_error");
-
-        // Seventeenth named profile is still discovered: no 16-cap.
-        // (Covered by profile_names_for_harness sorting; the aggregate merge
-        // reports incomplete discovery instead of silently dropping.)
-        let names_source = "[profiles.a]\nharness='opencode'\nmodel='p/m'\ncmd='C:/x.exe'\n";
-        assert!(resolve_text_profile(names_source, "a").is_ok());
     }
 
     #[test]
-    fn opencode_provider_fragment_rejects_mixed_unlisted_or_empty() {
-        let base = "[profiles.local]\nharness='opencode'\nmodel='k173d-fixture/m'\n\
-            cmd='C:/Tools/OpenCode/opencode.exe'\npass_env=['K173D_PROOF_KEY']\n";
-        let frag = "[profiles.local.provider.k173d-fixture]\npackage='p'\n";
-        // A canonical credential must never ride the fragment path.
-        let error = resolve_text_profile(
-            &format!("{base}auth_integration='openrouter'\n{frag}"),
-            "local",
-        )
-        .expect_err("fragment plus canonical auth must fail");
-        assert_eq!(error.code, "profile_error");
-        // Unlisted env references fail.
-        let bad = "[profiles.local]\nharness='opencode'\nmodel='k173d-fixture/m'\n\
-            cmd='C:/Tools/OpenCode/opencode.exe'\n[profiles.local.provider.k173d-fixture.settings]\napiKey='{env:MISSING_KEY}'\n";
-        let error = resolve_text_profile(bad, "local").expect_err("unlisted env must fail");
-        assert_eq!(error.code, "profile_error");
-        // Empty fragment fails.
-        let empty = "[profiles.local]\nharness='opencode'\nmodel='k173d-fixture/m'\n\
-            cmd='C:/Tools/OpenCode/opencode.exe'\n[profiles.local.provider.empty]\n";
-        let error = resolve_text_profile(empty, "local").expect_err("empty entry must fail");
-        assert_eq!(error.code, "profile_error");
-        // Fragment without a model fails.
-        let no_model = "[profiles.local]\nharness='opencode'\ncmd='C:/Tools/OpenCode/opencode.exe'\n[profiles.local.provider.k]\npackage='p'\n";
-        let error = resolve_text_profile(no_model, "local").expect_err("missing model must fail");
-        assert_eq!(error.code, "profile_error");
-        // Fragments have no mapping on other harnesses.
-        for (profile, source) in [
-            (
-                "c",
-                "[profiles.c]\nharness='codex'\nmodel='gpt-6-luna'\n[profiles.c.provider.k]\npackage='p'\n",
+    fn opencode_refuses_unsafe_local_provider_fields_at_freeze() {
+        let source = format!("{LOCAL_OPENCODE_PROFILE}{LOCAL_OPENCODE_PROVIDER}");
+        let invalid = [
+            source.replace("/v1", "/v1?%61pi_key=value"),
+            source.replace("http://127.0.0.1:1234/v1", "{file:provider-url}"),
+            source.replace(
+                "api_key_env = \"LOCAL_PROOF_KEY\"",
+                "api_key_env = \"ELIOT_AGENT_TOKEN\"",
             ),
-            (
-                "m",
-                "[profiles.m]\nharness='muse'\nmodel='m'\ncmd='C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe'\n[profiles.m.provider.k]\npackage='p'\n",
+            source.replace(
+                "api_key_env = \"LOCAL_PROOF_KEY\"",
+                "api_key_env = \"UNLISTED_KEY\"",
             ),
-        ] {
-            let error = resolve_text_profile(source, profile).expect_err("must reject");
-            assert_eq!(error.code, "unsupported", "{source}");
+            source.replace("context_limit = 8192", "context_limit = \"8192\""),
+            source.replace(
+                "output_limit = 1024",
+                "headers = { Authorization = \"{env:LOCAL_PROOF_KEY}\" }",
+            ),
+            source.replace(
+                "output_limit = 1024",
+                "settings = { credentials = { secretAccessKey = \"literal\" } }",
+            ),
+            source.replace("output_limit = 1024", "variants = []"),
+            format!("{source}headers = {{ X-Test = \"literal\" }}\n"),
+            format!("{LOCAL_OPENCODE_PROFILE}[profiles.local.provider.typed]\npackage = 'old'\n"),
+        ];
+        for (index, bad) in invalid.iter().enumerate() {
+            let error = parse_config(bad)
+                .and_then(|config| resolve_profile_in(&config, bad, "local"))
+                .expect_err("must refuse");
+            assert_eq!(error.code, "profile_error", "invalid case {index}");
         }
     }
 
     #[test]
-    fn opencode_provider_fragment_refuses_literal_credentials() {
-        let base = "[profiles.local]\nharness='opencode'\nmodel='k173d-fixture/m'\n\
-            cmd='C:/Tools/OpenCode/opencode.exe'\npass_env=['K173D_PROOF_KEY']\n";
-        // Literal apiKey reaches disk without this gate.
-        let literal = format!(
-            "{base}[profiles.local.provider.k173d-fixture.settings]\napiKey='sk-live-secret'\n"
-        );
-        let error = resolve_text_profile(&literal, "local").expect_err("literal apiKey must fail");
-        assert_eq!(error.code, "profile_error");
-        // Literal auth header reaches disk without this gate.
-        let header = format!(
-            "{base}[profiles.local.provider.k173d-fixture.settings]\napiKey='{{env:K173D_PROOF_KEY}}'\n\
-            [profiles.local.provider.k173d-fixture.settings.headers]\nX-Auth-Token='bearer-secret'\n"
-        );
-        let error = resolve_text_profile(&header, "local").expect_err("literal header must fail");
-        assert_eq!(error.code, "profile_error");
-        // URL userinfo reaches disk without this gate.
-        let url = format!(
-            "{base}[profiles.local.provider.k173d-fixture.settings]\nbaseURL='https://user:pass@127.0.0.1:1234/v1'\napiKey='{{env:K173D_PROOF_KEY}}'\n"
-        );
-        let error = resolve_text_profile(&url, "local").expect_err("URL userinfo must fail");
-        assert_eq!(error.code, "profile_error");
-        // Malformed {env:} placeholders fail instead of reaching disk.
-        for bad_ref in ["{env:}", "{env:BAD NAME}", "{env:UNLISTED_KEY}"] {
-            let bad = format!(
-                "{base}[profiles.local.provider.k173d-fixture.settings]\napiKey='{bad_ref}'\n"
+    fn opencode_requires_local_model_selection_without_canonical_auth() {
+        let source = format!("{LOCAL_OPENCODE_PROFILE}{LOCAL_OPENCODE_PROVIDER}");
+        for bad in [
+            source.replace("model = \"typed/family/model\"\n", ""),
+            source.replace("typed/family/model", "other/family/model"),
+            source.replace("typed/family/model", "typed/unlisted"),
+            format!(
+                "{LOCAL_OPENCODE_PROFILE}auth_integration = 'openrouter'\n{LOCAL_OPENCODE_PROVIDER}"
+            ),
+        ] {
+            assert_eq!(
+                resolve_text_profile(&bad, "local")
+                    .expect_err("must refuse")
+                    .code,
+                "profile_error",
             );
-            let error = resolve_text_profile(&bad, "local").expect_err("bad env ref must fail");
-            assert_eq!(error.code, "profile_error", "{bad_ref}");
         }
-        // Prefixed literals are not valid credential references either.
-        let prefixed = format!(
-            "{base}[profiles.local.provider.k173d-fixture.settings]\napiKey='Bearer {{env:K173D_PROOF_KEY}}'\n"
-        );
-        let error =
-            resolve_text_profile(&prefixed, "local").expect_err("prefixed apiKey must fail");
-        assert_eq!(error.code, "profile_error");
-    }
 
-    #[test]
-    fn opencode_provider_fragment_refuses_unadmitted_keys_and_query_credentials() {
-        let base = "[profiles.local]\nharness='opencode'\nmodel='k173d-fixture/m'\n\
-            cmd='C:/Tools/OpenCode/opencode.exe'\npass_env=['K173D_PROOF_KEY']\n";
-        // Bedrock-style credential tables refuse: only baseURL/apiKey admit.
-        let bedrock = format!(
-            "{base}[profiles.local.provider.k173d-fixture]\npackage='p'\n\
-            [profiles.local.provider.k173d-fixture.settings]\nregion='us-east-1'\n\
-            [profiles.local.provider.k173d-fixture.settings.credentials]\n\
-            accessKeyId='AKIAEXAMPLE'\nsecretAccessKey='literal-secret'\n"
+        let other = source.replace("harness = \"opencode\"", "harness = \"codex\"");
+        assert_eq!(
+            resolve_text_profile(&other, "local")
+                .expect_err("OpenCode only")
+                .code,
+            "unsupported",
         );
-        let error = resolve_text_profile(&bedrock, "local").expect_err("Bedrock creds must fail");
-        assert_eq!(error.code, "profile_error");
-        // Credential-bearing baseURL query parameters refuse.
-        let query = format!(
-            "{base}[profiles.local.provider.k173d-fixture]\npackage='p'\n\
-            [profiles.local.provider.k173d-fixture.settings]\n\
-            baseURL='http://127.0.0.1:1234/v1?api_key=secret'\napiKey='{{env:K173D_PROOF_KEY}}'\n"
-        );
-        let error = resolve_text_profile(&query, "local").expect_err("query creds must fail");
-        assert_eq!(error.code, "profile_error");
-        // The legacy options/provider shape, top-level headers/body and any
-        // other key refuse: per provider id only package, settings and models.
-        for (label, extra) in [
-            (
-                "options key",
-                "[profiles.local.provider.k]\noptions={baseURL='http://127.0.0.1:1234/v1'}\n",
-            ),
-            (
-                "provider key",
-                "[profiles.local.provider.k]\nprovider='openai-compatible'\n",
-            ),
-            (
-                "top-level headers",
-                "[profiles.local.provider.k]\nheaders={X-Token='{env:K173D_PROOF_KEY}'}\n",
-            ),
-            (
-                "settings region",
-                "[profiles.local.provider.k.settings]\nregion='us-east-1'\n",
-            ),
-        ] {
-            let source = format!("{base}{extra}");
-            let error = resolve_text_profile(&source, "local").expect_err(label);
-            assert_eq!(error.code, "profile_error", "{label}");
-        }
     }
 
     #[test]

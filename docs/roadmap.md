@@ -342,10 +342,10 @@ Codex or for unrelated adapters.
 The selected local scope remains in progress while the applicable L7
 qualification is incomplete; do not describe it as feature complete.
 
-- [ ] **Local models through harnesses.** Owner decision, 2026-11-18 (k173d simple path).
+- [ ] **Local models through harnesses.** Owner decision, 2026-11-18.
       - Swarm supports local models through the harness that runs them: OpenCode providers, Zed's own providers and other harnesses, including a harness whose local API is non-standard.
-      - An OpenCode profile selects `harness = "opencode"` with `model = "<provider>/<model>"` and an optional native `provider.<id>` fragment written as-is into the isolated `opencode.jsonc`. Catalog, readiness, limits and errors stay honest through OpenCode's native catalogue.
-      - Swarm adds **no backend-specific integrations**: no Strata, Unsloth Studio, LM Studio, llama.cpp, Ollama or vLLM presets, no `eliot-local` pinned path, no `/models` probe, and no management of model servers. #408's backend-specific scope is closed.
+      - A profile selects the harness's local provider and model. Catalog, readiness, limits and errors stay honest.
+      - Swarm adds **no backend-specific integrations**: no Strata, Unsloth Studio, LM Studio, llama.cpp, Ollama or vLLM presets, and no management of model servers. The existing `eliot-local` OpenCode path is reduced to one generic OpenAI-compatible provider shape. #408's backend-specific scope is closed.
       - Completion: one real local-model turn per supported harness on an endpoint the owner provides.
 
 - [ ] **Zed harness (#720): postponed and frozen.** Owner decision, 2026-11-18.

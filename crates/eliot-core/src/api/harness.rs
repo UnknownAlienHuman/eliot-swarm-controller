@@ -589,7 +589,7 @@ pub const CATALOG_UNKNOWN: &str = "unknown";
 /// Request for `models.catalog`: one owner-scoped read-only search over every
 /// installed harness catalogue. `query` filters case-insensitively over model
 /// id, display name, provider and harness. `after` is the last returned
-/// `harness:id` cursor of the same selection. Results are bounded and
+/// cursor of the same selection. Results are bounded and
 /// paginated.
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -598,7 +598,7 @@ pub struct ModelsCatalogRequest {
     /// harness (at most 128 bytes). Omitted or empty means no filtering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
-    /// Continue after the last `harness:id` cursor of the same selection.
+    /// Continue after the last cursor returned for the same selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
     /// Page size, 1..=100; default 50.
@@ -627,7 +627,7 @@ impl ModelsCatalogRequest {
         }) {
             return Err(Error::new(
                 "invalid",
-                "catalogue cursor must be a non-empty harness:id of at most 512 bytes",
+                "catalogue cursor must be non-empty and at most 512 bytes",
             ));
         }
         if !(1..=MAX_CATALOG_LIMIT).contains(&self.effective_limit()) {
@@ -676,15 +676,20 @@ pub struct ModelsCatalogEntry {
     /// frozen Claude alias/id list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Named profile that serves this model when the ad-hoc preview does
-    /// not list it (for example an OpenCode provider fragment defined only
-    /// by that profile). Absent for ad-hoc rows; the picker launches a
-    /// profile-only row with this profile so the fragment travels.
+    /// Named profile preset, with the profile's frozen model and effort.
+    /// Ad-hoc rows omit this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
 }
 
 impl ModelsCatalogEntry {
+    pub fn cursor(&self) -> String {
+        match self.profile.as_deref() {
+            Some(profile) => format!("profile:{}:{profile}", self.harness),
+            None => catalog_cursor(&self.harness, &self.id),
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_harness(&self.harness)?;
         if self.id.trim().is_empty()
@@ -730,9 +735,9 @@ impl ModelsCatalogEntry {
 pub struct ModelsCatalogResponse {
     /// Every installed harness with its version and status.
     pub harnesses: Vec<HarnessEntry>,
-    /// The bounded page of unified models, sorted by harness then id.
+    /// The bounded page of unified models, sorted by harness, id and profile.
     pub models: Vec<ModelsCatalogEntry>,
-    /// Last `harness:id` cursor of this page; absent at the end.
+    /// Cursor after the last model on this page; absent at the end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
     /// Milliseconds since the Unix epoch when the aggregate was completed.

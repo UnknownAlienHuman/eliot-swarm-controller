@@ -542,7 +542,10 @@ fn harness_rows(
         if provider.is_some_and(|(_, collapsed)| collapsed) {
             continue;
         }
-        let key = format!("{code}:{}", model.id);
+        let key = match model.profile.as_deref() {
+            Some(profile) => format!("{code}:profile:{profile}:{}", model.id),
+            None => format!("{code}:{}", model.id),
+        };
         let mut item = catalog_item(inputs, key, model, None);
         item.hidden = !visible(inputs, model);
         rows.push(Row::Choice(item));
@@ -633,7 +636,7 @@ fn claude_rows(
     let item = |key: String, model: Option<String>, title: String, detail: String| {
         let effort = row_effort(inputs, &key, code, model.as_deref(), None, None);
         Item {
-            current: is_current(inputs.current, code, model.as_deref()),
+            current: is_current(inputs.current, code, model.as_deref(), None),
             favorite: model
                 .as_deref()
                 .is_some_and(|model| is_favorite(&inputs.prefs.favorites, code, model)),
@@ -727,7 +730,7 @@ fn remembered_item(
                     known.effort.as_deref(),
                     None,
                 ),
-                current: is_current(inputs.current, &known.harness, Some(&known.model)),
+                current: is_current(inputs.current, &known.harness, Some(&known.model), None),
                 favorite: is_favorite(&inputs.prefs.favorites, &known.harness, &known.model),
                 key,
                 kind: ItemKind::Model {
@@ -769,17 +772,33 @@ fn catalog_item(
     model: &ModelsCatalogEntry,
     remembered: Option<&str>,
 ) -> Item {
-    let efforts = model.efforts.clone().unwrap_or_default();
+    let named_profile = model.profile.is_some();
+    // A named profile is a preset: its frozen effort is display-only and
+    // cannot be changed into a launch the profile will not honor.
+    let efforts = if named_profile {
+        Vec::new()
+    } else {
+        model.efforts.clone().unwrap_or_default()
+    };
     Item {
-        effort: row_effort(
-            inputs,
-            &key,
+        effort: if named_profile {
+            model.default_effort.clone()
+        } else {
+            row_effort(
+                inputs,
+                &key,
+                &model.harness,
+                Some(&model.id),
+                remembered,
+                model.default_effort.as_deref(),
+            )
+        },
+        current: is_current(
+            inputs.current,
             &model.harness,
             Some(&model.id),
-            remembered,
-            model.default_effort.as_deref(),
+            model.profile.as_deref(),
         ),
-        current: is_current(inputs.current, &model.harness, Some(&model.id)),
         favorite: is_favorite(&inputs.prefs.favorites, &model.harness, &model.id),
         kind: ItemKind::Model {
             harness: model.harness.clone(),
@@ -791,7 +810,10 @@ fn catalog_item(
         } else {
             model.display_name.clone()
         },
-        detail: String::new(),
+        detail: model
+            .profile
+            .as_deref()
+            .map_or_else(String::new, |profile| format!("Preset · {profile}")),
         efforts,
         default: model.default,
         disabled: (model.availability == HELD)
@@ -825,8 +847,13 @@ fn row_effort(
     remembered.or(default).map(str::to_owned)
 }
 
-fn is_current(current: &Choice, harness: &str, model: Option<&str>) -> bool {
-    matches!(current, Choice::Model(pick) if pick.harness == harness && pick.model.as_deref() == model)
+fn is_current(current: &Choice, harness: &str, model: Option<&str>, profile: Option<&str>) -> bool {
+    match profile {
+        Some(profile) => matches!(current, Choice::Preset(name) if name == profile),
+        None => {
+            matches!(current, Choice::Model(pick) if pick.harness == harness && pick.model.as_deref() == model)
+        }
+    }
 }
 
 fn is_favorite(favorites: &[ModelRef], harness: &str, model: &str) -> bool {
@@ -1440,8 +1467,73 @@ mod tests {
             efforts: &HashMap::new(),
             claude_efforts: &[],
         });
-        let row =
-            find(&shown, Some("opencode:k173d-fixture/test-model")).expect("profile-only row");
+        let row = find(
+            &shown,
+            Some("opencode:profile:opencode-local:k173d-fixture/test-model"),
+        )
+        .expect("profile-only row");
         assert_eq!(row.choice(), Choice::Preset("opencode-local".to_owned()));
+        assert_eq!(row.detail, "Preset · opencode-local");
+    }
+
+    #[test]
+    fn a_named_profile_row_is_distinct_from_the_matching_adhoc_row() {
+        let mut read = catalog();
+        if let Ok(reply) = read.as_mut() {
+            let mut named = model("opencode", "openai/test-model", &["low", "high"]);
+            named.profile = Some("local".to_owned());
+            named.default_effort = Some("high".to_owned());
+            reply.models.push(named);
+            reply
+                .models
+                .push(model("opencode", "openai/test-model", &["low"]));
+        }
+        let shown = rows(&Inputs {
+            catalog: Some(&read),
+            query: "",
+            prefs: &Preferences::default(),
+            only_harness: None,
+            presets: &[],
+            current: &Choice::Preset("local".to_owned()),
+            auto_detail: "",
+            efforts: &HashMap::new(),
+            claude_efforts: &[],
+        });
+        let choices: Vec<&Item> = shown
+            .iter()
+            .filter_map(|row| match row {
+                Row::Choice(item) if item.kind != ItemKind::Auto => Some(item),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            choices
+                .iter()
+                .filter(|item| {
+                    item.kind
+                        == (ItemKind::Model {
+                            harness: "opencode".to_owned(),
+                            model: Some("openai/test-model".to_owned()),
+                            profile: Some("local".to_owned()),
+                        })
+                })
+                .count(),
+            1
+        );
+        let named = choices
+            .iter()
+            .find(|item| {
+                matches!(
+                    item.kind,
+                    ItemKind::Model {
+                        profile: Some(_),
+                        ..
+                    }
+                )
+            })
+            .expect("named row");
+        assert_eq!(named.effort.as_deref(), Some("high"));
+        assert!(named.efforts.is_empty());
+        assert!(named.current);
     }
 }

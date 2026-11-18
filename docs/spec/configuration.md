@@ -322,44 +322,33 @@ cmd = "C:/Tools/OpenCode/opencode.exe"
 model = "k173d-fixture/test-model"
 pass_env = ["LOCAL_LLM_KEY"]
 
-[profiles.opencode-local.provider.k173d-fixture]
-package = "@opencode/ai/providers/openai-compatible"
-
-[profiles.opencode-local.provider.k173d-fixture.settings]
-baseURL = "http://127.0.0.1:1234/v1"
-apiKey = "{env:LOCAL_LLM_KEY}"
-
-[profiles.opencode-local.provider.k173d-fixture.models.test-model]
-name = "test-model"
-tools = true
+[profiles.opencode-local.local_provider]
+id = "k173d-fixture"
+package = "@ai-sdk/openai-compatible"
+base_url = "http://127.0.0.1:1234/v1"
+api_key_env = "LOCAL_LLM_KEY"
+models = [{ id = "test-model", context_limit = 32768, output_limit = 4096 }]
 ```
 
-`model` is the exact `provider/model` string; the `provider.<id>` fragment is
-written as-is into the isolated `opencode.jsonc` under `providers`. One shared
-strict allowlist (used at freeze and before every isolated-config write) admits
-per provider id only `package`, `settings` with exactly `baseURL`/`apiKey`, and
-`models`; the legacy `options`/`provider` keys, Bedrock-style `credentials`,
-arbitrary headers, and every other key refuse, as do literal credentials, URLs
-with userinfo or credential-bearing query parameters, and malformed `{env:}`
-references. Every surviving `{env:NAME}` must name a `pass_env`-allowed
-environment. A missing or empty required value refuses before startup instead
-of silently becoming no-auth. `auth_integration` must be absent on this path
-so no unrelated canonical credential is imported. Fragment sessions run under
-OpenCode's native project-config disable switch, so workspace project layers
-are never loaded for the session lifetime (including native reloads) and a
-workspace file redefining the fragment provider has no effect. The plugin
-verifies that the fragment defines the requested provider and verifies the
-exact pair through the live `GET /api/model` catalogue (carrying that row's
-context and output limits into the ready result, omitted as unknown) before any
-native session is created — every verification failure settles the launch as
-failed with a short safe reason, never unknown. An unreachable endpoint is
-not a start failure: the catalogue still lists the model and the native turn
-surfaces the refusal. Profile-scoped picker rows advertise only the profile's
-configured selection, and named-preview failures coalesce into one bounded
-catalogue entry.
+`model` is the exact `provider/model` string (model IDs may contain slash
+segments). Swarm generates the isolated
+OpenCode provider entry from `local_provider`: `base_url` becomes
+`settings.baseURL`, `api_key_env` becomes a `{env:NAME}` runtime reference,
+and each model record supplies its native model limits. The typed shape is
+validated at freeze, retained admission, and before every write; unknown
+fields, literal credentials, URL userinfo/query/fragment components, and
+substitutions are refused. `api_key_env` must be listed in `pass_env`, and
+`auth_integration` must be absent, so no unrelated canonical credential is
+imported. The adapter sets `OPENCODE_CONFIG_PROJECT_DISABLE` and strips
+`OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, and `OPENCODE_CONFIG_DIR` for the
+server and both preview readers. The plugin checks the exact model pair through the live `GET /api/model`
+catalogue before creating a session. An unreachable endpoint can still be
+listed and reports its failure on the native turn. Each named profile is a
+separate picker preset with its frozen model and effort. OpenCode catalogue
+failures share one bounded entry.
 There is no harness/model/account fallback. Codex profiles against these
 endpoints stay `unsupported`. See the
-[OpenCode harness page](../harnesses/opencode.md#custom-provider-fragments).
+[OpenCode harness page](../harnesses/opencode.md#typed-local-providers).
 
 ### Worker MCP policy
 

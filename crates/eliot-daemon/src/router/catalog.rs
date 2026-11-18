@@ -710,8 +710,8 @@ impl Router {
             // partial aggregate instead of holding the coalescing lock.
             let models_read =
                 tokio::time::timeout_at(discovery_deadline, read_models(params.clone())).await;
-            let (ad_hoc_response, ad_hoc_failed) = match models_read {
-                Ok(Ok(value)) => (Some(value), false),
+            let ad_hoc_response = match models_read {
+                Ok(Ok(value)) => Some(value),
                 Ok(Err(error)) => {
                     // The aggregate names the failed harness with its typed
                     // error instead of silently listing no models for it.
@@ -723,7 +723,7 @@ impl Router {
                         Some(&error),
                     );
                     failures.push(ModelsCatalogFailure::from_error(harness, &error));
-                    (None, true)
+                    None
                 }
                 Err(_) => {
                     failures.push(ModelsCatalogFailure::from_error(
@@ -733,14 +733,9 @@ impl Router {
                             "catalogue discovery budget elapsed; harness skipped",
                         ),
                     ));
-                    (None, true)
+                    None
                 }
             };
-            let mut seen: std::collections::HashSet<String> = models
-                .iter()
-                .filter(|entry| entry.harness == harness)
-                .map(|entry| entry.id.clone())
-                .collect();
             let mut ad_hoc_quota_for_cache: Option<catalog::ScopedQuota> = None;
             if let Some(response_value) = ad_hoc_response {
                 let response: eliot_core::api::HarnessModelsResponse =
@@ -753,7 +748,6 @@ impl Router {
                     .ok()
                     .and_then(Result::ok);
                 for model in response.models {
-                    seen.insert(model.id.clone());
                     models.push(catalog::catalog_entry(
                         harness,
                         model,
@@ -764,13 +758,9 @@ impl Router {
                 }
                 ad_hoc_quota_for_cache = quota;
             }
-            let _ = ad_hoc_failed;
-            // Profile-only models (for example a provider fragment defined
-            // only by an OpenCode profile) are absent from the ad-hoc preview.
-            // Feed the picker the same profile-scoped previews the existing
-            // `harness.models` reader serves, merged by id, independently of
-            // the ad-hoc read. Named models never inherit the ad-hoc hold or
-            // quota, so an unrelated ad-hoc hold cannot mark a fragment model.
+            // Profile models are independent preset rows. They remain visible
+            // when ad-hoc discovery returns the same id, and never inherit the
+            // ad-hoc hold or quota.
             if harness == "opencode" {
                 let profile_names =
                     crate::config::profile_names_for_harness(&self.inner.data_root, harness);
@@ -780,10 +770,7 @@ impl Router {
                 // naming the affected profiles: per-profile pushes would
                 // exceed the response failure bound and invalidate the whole
                 // catalogue. A profile-scoped row launches its profile as
-                // configured, so only the profile's configured selection is
-                // advertised with the profile tag; anything else the preview
-                // lists stays out of the picker instead of launching a
-                // different model than shown.
+                // configured, so only its frozen model and effort are shown.
                 let mut preview_failed: Vec<String> = Vec::new();
                 let mut preview_incomplete: Option<String> = None;
                 for name in profile_names {
@@ -823,22 +810,23 @@ impl Router {
                     let configured = self
                         .resolve_profile_cached(&name)
                         .ok()
-                        .and_then(|snapshot| catalog::profile_configured_model(&snapshot));
+                        .and_then(|snapshot| catalog::profile_frozen_selection(&snapshot));
+                    // A named profile is a preset, not another ad-hoc model
+                    // source. Profiles without a frozen model have no
+                    // truthful picker row and must not advertise every model
+                    // returned by their native reader.
+                    let Some((configured_model, frozen_effort)) = configured else {
+                        continue;
+                    };
                     for model in scoped_response.models {
-                        if seen.contains(&model.id) {
+                        if model.id != configured_model {
                             continue;
                         }
-                        if configured
-                            .as_deref()
-                            .is_some_and(|only| only != model.id.as_str())
-                        {
-                            continue;
-                        }
-                        seen.insert(model.id.clone());
                         models.push(catalog::profile_catalog_entry(
                             harness,
                             model,
                             &name,
+                            frozen_effort.as_deref(),
                             now_ms(),
                         ));
                     }
@@ -847,7 +835,14 @@ impl Router {
                     &preview_failed,
                     preview_incomplete.as_deref(),
                 ) {
-                    failures.push(entry);
+                    if let Some(existing) = failures
+                        .iter_mut()
+                        .find(|failure| failure.harness == "opencode")
+                    {
+                        catalog::append_failure_message(existing, &entry.message);
+                    } else {
+                        failures.push(entry);
+                    }
                 }
             }
             if let Some(quota) = ad_hoc_quota_for_cache.filter(|quota| quota.route_verified) {
@@ -855,8 +850,16 @@ impl Router {
             }
         }
         models.sort_by(|left, right| {
-            (left.harness.as_str(), left.id.as_str())
-                .cmp(&(right.harness.as_str(), right.id.as_str()))
+            (
+                left.harness.as_str(),
+                left.id.as_str(),
+                left.profile.as_deref(),
+            )
+                .cmp(&(
+                    right.harness.as_str(),
+                    right.id.as_str(),
+                    right.profile.as_deref(),
+                ))
         });
         let fetched_at_ms = now_ms();
         // A partial aggregate is never kept for the full TTL: it serves only
@@ -905,29 +908,36 @@ impl Router {
         fetched_at_ms: i64,
         ttl_ms: u64,
     ) -> Result<Value> {
-        use eliot_core::api::{ModelsCatalogResponse, catalog_cursor, catalog_matches};
+        use eliot_core::api::{ModelsCatalogResponse, catalog_matches};
         let mut filtered: Vec<eliot_core::api::ModelsCatalogEntry> = models
             .iter()
             .filter(|entry| catalog_matches(entry, query))
             .cloned()
             .collect();
         filtered.sort_by(|left, right| {
-            (left.harness.as_str(), left.id.as_str())
-                .cmp(&(right.harness.as_str(), right.id.as_str()))
+            (
+                left.harness.as_str(),
+                left.id.as_str(),
+                left.profile.as_deref(),
+            )
+                .cmp(&(
+                    right.harness.as_str(),
+                    right.id.as_str(),
+                    right.profile.as_deref(),
+                ))
         });
         let start = match after {
             None => 0,
             Some(cursor) => filtered
                 .iter()
-                .position(|entry| catalog_cursor(&entry.harness, &entry.id) == cursor)
+                .position(|entry| entry.cursor() == cursor)
                 .map(|index| index + 1)
                 .unwrap_or(0),
         };
         let page: Vec<eliot_core::api::ModelsCatalogEntry> =
             filtered.into_iter().skip(start).take(limit).collect();
         let next = if page.len() == limit {
-            page.last()
-                .map(|entry| catalog_cursor(&entry.harness, &entry.id))
+            page.last().map(eliot_core::api::ModelsCatalogEntry::cursor)
         } else {
             None
         };
@@ -1186,13 +1196,16 @@ pub(crate) fn describe_snapshot(
             {
                 scope.push_str(&format!(" auth:{integration}"));
                 credential = format!("auth:{integration}");
-            } else if let Some(fragment) = snapshot.get("provider").and_then(Value::as_object) {
-                let mut ids: Vec<&str> = fragment.keys().map(String::as_str).collect();
-                ids.sort_unstable();
-                if !ids.is_empty() {
-                    scope.push_str(&format!(" provider:{}", ids.join(",")));
+            } else if let Some(provider) = snapshot.get("local_provider") {
+                if let Some(id) = provider["id"].as_str() {
+                    let suffix = format!(" provider:{id}");
+                    if scope.len() + suffix.len() <= eliot_core::api::MAX_HARNESS_SCOPE_BYTES {
+                        scope.push_str(&suffix);
+                    }
                 }
-                credential = "fragment".to_owned();
+                if provider["api_key_env"].is_string() {
+                    credential = "local-provider-env".to_owned();
+                }
             }
         }
         "claude" => {
@@ -1231,7 +1244,7 @@ pub(crate) fn canonical_cache_identity(
         "harness": snapshot.get("harness"),
         "account": snapshot.get("account"),
         "auth": snapshot.get("auth_integration"),
-        "provider": snapshot.get("provider"),
+        "local_provider": snapshot.get("local_provider"),
         "route": snapshot.get("route_binding"),
         "executable": snapshot.get("cmd"),
         "identity": verified,
@@ -1543,32 +1556,39 @@ pub(crate) fn catalog_entry(
     }
 }
 
-/// Build one profile-only `models.catalog` entry: the same shape as the
-/// ad-hoc row, but carrying the named profile that serves it so the picker
-/// launches with that profile and its fragment travels.
+/// Build one named-profile preset entry carrying only its frozen model and
+/// effort. The picker launches this row with the named profile.
 pub(crate) fn profile_catalog_entry(
     harness: &str,
     model: eliot_core::api::HarnessModelEntry,
     profile: &str,
+    frozen_effort: Option<&str>,
     now: i64,
 ) -> eliot_core::api::ModelsCatalogEntry {
     let mut entry = catalog_entry(harness, model, None, None, now);
+    entry.efforts = frozen_effort.map(|effort| vec![effort.to_owned()]);
+    entry.default_effort = frozen_effort.map(str::to_owned);
+    entry.default = false;
     entry.profile = Some(profile.to_owned());
     entry
 }
 
-/// The model a named profile launches as configured: a profile-scoped picker
-/// row carries the profile tag only for this selection, so choosing the row
-/// launches exactly the configured model and never a sibling the preview
-/// happens to list. Profiles without a configured model advertise every
-/// previewed row, as before.
-pub(crate) fn profile_configured_model(snapshot: &Value) -> Option<String> {
-    snapshot
+/// The frozen model and effort a named profile launches. Profiles without a
+/// configured model have no truthful preset row.
+pub(crate) fn profile_frozen_selection(snapshot: &Value) -> Option<(String, Option<String>)> {
+    let model = snapshot
         .get("model")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|model| !model.is_empty())
-        .map(str::to_owned)
+        .map(str::to_owned)?;
+    let effort = snapshot
+        .get("effort")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .map(str::to_owned);
+    Some((model, effort))
 }
 
 /// Coalesce named-preview failures into one bounded OpenCode entry naming the
@@ -1623,6 +1643,26 @@ pub(crate) fn coalesced_preview_failure(
         "opencode",
         &Error::new("unavailable", message),
     ))
+}
+
+/// Keep one bounded OpenCode failure when both ad-hoc and named previews fail.
+pub(crate) fn append_failure_message(failure: &mut ModelsCatalogFailure, suffix: &str) {
+    if suffix.trim().is_empty() {
+        return;
+    }
+    let separator = if failure.message.trim().is_empty() {
+        ""
+    } else {
+        "; "
+    };
+    let combined = format!("{suffix}{separator}{}", failure.message);
+    let mut end = combined
+        .len()
+        .min(eliot_core::api::harness::MAX_CATALOG_FAILURE_MESSAGE_BYTES);
+    while !combined.is_char_boundary(end) {
+        end -= 1;
+    }
+    failure.message = combined[..end].to_owned();
 }
 
 /// Catalogue membership establishes identity, not account availability.
@@ -2796,14 +2836,19 @@ mod tests {
     }
 
     #[test]
-    fn profile_configured_model_selects_the_advertised_row() {
+    fn profile_frozen_selection_selects_model_and_effort() {
         assert_eq!(
-            profile_configured_model(&json!({"model": "k173d-fixture/test-model"})),
-            Some("k173d-fixture/test-model".to_owned())
+            profile_frozen_selection(
+                &json!({"model": "k173d-fixture/test-model", "effort": "high"})
+            ),
+            Some((
+                "k173d-fixture/test-model".to_owned(),
+                Some("high".to_owned()),
+            ))
         );
-        assert_eq!(profile_configured_model(&json!({"model": "  "})), None);
-        assert_eq!(profile_configured_model(&json!({})), None);
-        assert_eq!(profile_configured_model(&json!({"model": 7})), None);
+        assert_eq!(profile_frozen_selection(&json!({"model": "  "})), None);
+        assert_eq!(profile_frozen_selection(&json!({})), None);
+        assert_eq!(profile_frozen_selection(&json!({"model": 7})), None);
     }
 
     #[test]
@@ -2832,6 +2877,69 @@ mod tests {
         assert!(entry.message.contains("opencode-local"));
         assert!(entry.message.contains("profile preview incomplete"));
         entry.validate().expect("combined entry validates");
+    }
+
+    #[test]
+    fn named_preview_failure_merges_into_existing_opencode_failure() {
+        let mut failure = ModelsCatalogFailure::from_error(
+            "opencode",
+            &Error::new("harness_error", "ad-hoc failed"),
+        );
+        append_failure_message(
+            &mut failure,
+            "OpenCode named-profile preview failed for 1 profile(s): local",
+        );
+        assert_eq!(failure.harness, "opencode");
+        assert!(failure.message.contains("ad-hoc failed"));
+        assert!(failure.message.contains("local"));
+        assert!(
+            failure.message.len() <= eliot_core::api::harness::MAX_CATALOG_FAILURE_MESSAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn named_failure_is_retained_when_adhoc_message_is_at_bound() {
+        let mut failure = ModelsCatalogFailure::from_error(
+            "opencode",
+            &Error::new("harness_error", "x".repeat(700)),
+        );
+        append_failure_message(
+            &mut failure,
+            "OpenCode named-profile preview failed for 1 profile(s): local",
+        );
+        assert!(
+            failure
+                .message
+                .starts_with("OpenCode named-profile preview failed")
+        );
+        assert!(failure.message.contains("local"));
+        assert!(
+            failure.message.len() <= eliot_core::api::harness::MAX_CATALOG_FAILURE_MESSAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn named_catalog_entries_have_distinct_cursors() {
+        let mut first = profile_catalog_entry(
+            "opencode",
+            eliot_core::api::HarnessModelEntry {
+                id: "openai/test-model".to_owned(),
+                display_name: None,
+                default: false,
+                efforts: None,
+                default_effort: None,
+                source: None,
+            },
+            "local-a",
+            Some("high"),
+            1_000,
+        );
+        let mut second = first.clone();
+        second.profile = Some("local-b".to_owned());
+        assert_ne!(first.cursor(), second.cursor());
+        assert_eq!(first.cursor(), "profile:opencode:local-a");
+        first.profile = None;
+        assert_eq!(first.cursor(), "opencode:openai/test-model");
     }
 
     #[tokio::test]
@@ -3004,7 +3112,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_auth_and_fragment_scopes() {
+    fn opencode_auth_and_local_provider_scopes() {
         let snapshot = json!({"harness": "opencode", "auth_integration": "personal"});
         let (scope, credential) = describe_snapshot("oc", "opencode", Some(&snapshot));
         assert_eq!(scope, "profile:oc harness:opencode auth:personal");
@@ -3012,10 +3120,10 @@ mod tests {
 
         let snapshot = json!({
             "harness": "opencode",
-            "provider": {
-                "k173d-fixture": {
-                    "package": "@opencode/ai/providers/openai-compatible",
-                },
+            "local_provider": {
+                "id": "k173d-fixture",
+                "package": "@ai-sdk/openai-compatible",
+                "api_key_env": "LOCAL_API_KEY",
             },
         });
         let (scope, credential) = describe_snapshot("adhoc", "opencode", Some(&snapshot));
@@ -3023,7 +3131,7 @@ mod tests {
             scope,
             "profile:adhoc harness:opencode provider:k173d-fixture"
         );
-        assert_eq!(credential, "fragment");
+        assert_eq!(credential, "local-provider-env");
     }
 
     #[test]
@@ -3040,6 +3148,7 @@ mod tests {
                 source: None,
             },
             "opencode-local",
+            Some("high"),
             now,
         );
         assert_eq!(entry.profile.as_deref(), Some("opencode-local"));

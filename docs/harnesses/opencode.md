@@ -199,7 +199,7 @@ L7 verifies two-session isolation when shared mode is selected, adopted-service 
 204-vs-execution, lost stream/input, snapshot races, pagination, exact controls and no
 historical lifecycle duplication. Unsupported API semantics remain explicit.
 
-## Custom provider fragments
+## Typed local providers
 
 One documented OpenCode profile points an owner-run OpenAI-compatible endpoint
 at the existing isolated per-Agent root. Managed startup is deferred: only
@@ -207,26 +207,23 @@ already-running endpoints are supported, never an owned foreground server
 launcher or a detached command under Agent custody. See
 [configuration](../spec/configuration.md) for the frozen profile shape.
 
-The profile selects `harness = "opencode"` with `model = "<provider>/<model>"`
-and an optional native `provider.<id>` fragment. The fragment is written as-is
-into the isolated `opencode.jsonc` under `providers`; only the `provider` table
-is admitted. One shared strict allowlist (used at freeze and before every
-isolated-config write) admits per provider id only `package`,
-`settings` with exactly `baseURL`/`apiKey`, and `models`: the legacy
-`options`/`provider` keys, Bedrock-style `credentials`, arbitrary
-`headers`/`body`, and every other key refuse. The native v2.2.7 schema names
-the settings block `settings` (`@opencode/schema` `Config.Provider.Info`);
-`options` is the legacy V1 key and is refused rather than silently dropped.
-Every credential-bearing field must be exactly one valid `{env:NAME}` naming a
-frozen `pass_env` entry; any literal, prefixed, malformed or unlisted
-reference refuses at freeze with `profile_error`, and every URL must carry no
-userinfo and no credential-bearing query parameter. Key values stay
-runtime-only. A fragment combined with `auth_integration` refuses. A retained
-snapshot that fails the allowlist is refused before any isolated-config write.
-An unresolved or empty `{env:NAME}` refuses before `serve` starts, never
-silently becoming no-auth mode.
+An OpenCode profile with `[profiles.X.local_provider]` selects one declared
+model using `model = "<provider>/<model>"`. The table contains an `id` slug,
+a syntax-validated npm `package`, an absolute HTTP(S) `base_url`, an optional
+`api_key_env`, and a list of models. Each model has an `id` and optional integer
+`context_limit` and `output_limit`. Model IDs may contain slash segments.
+`base_url` rejects userinfo, queries, fragments, and substitutions. Swarm
+rejects unknown fields at freeze and retained admission and validates the typed
+provider before each isolated-config write.
 
-Fragment sessions run under OpenCode's native project-config disable switch
+Swarm generates the OpenCode `providers.<id>` entry with `settings.baseURL`,
+the configured model limits, and `settings.apiKey = "{env:NAME}"` when a key
+is configured. The variable must be explicitly listed in frozen `pass_env`
+and cannot be reserved for the controller or adapter. Swarm checks the value
+at runtime before writing the config. Local-provider profiles omit
+`auth_integration`.
+
+Local-provider sessions run under OpenCode's native project-config disable switch
 (`OPENCODE_CONFIG_PROJECT_DISABLE`, verified against installed v2.2.7
 `packages/cli/src/server-process.ts` and `packages/core/src/config.ts` /
 `config/discovery.ts`): the serve and the model-reader processes skip the
@@ -234,12 +231,13 @@ whole project walk (ancestor and cwd `opencode.json`/`opencode.jsonc`,
 `.opencode/` dirs, project `.agents`/`.claude` dirs) for the session
 lifetime, including native reloads. The project layer otherwise ranks above
 the isolated global config, so the switch — not a file scan — is the
-boundary: a workspace file redefining the fragment provider is never loaded
-and has no effect on the session. Cloud sessions keep the workspace project
-layers.
+boundary. Both native paths also strip `OPENCODE_CONFIG`,
+`OPENCODE_CONFIG_CONTENT`, and `OPENCODE_CONFIG_DIR` from their environment.
+Local-provider sessions skip the project MCP file scan and still check the
+effective MCP inventory. Cloud sessions keep the workspace project layers.
 
 Effective settings are read back, not assumed. Before inference the plugin
-checks that the fragment defines the requested provider. It then selects the
+checks that the generated provider defines the requested model. It then selects the
 exact frozen provider/model pair locally from the live `GET /api/model`
 catalogue (the endpoint answers an object with a `data` array) and carries
 that row's context and output limits into the ready result (omitted values
@@ -368,8 +366,8 @@ the bounded close budget) before starting the next command or returning a catalo
 Unconfirmed family closure returns `unknown`, including for the optional variants
 read; a failed variants read degrades to ids only after confirmed cleanup.
 With a named profile, both reads use the same generated provider configuration,
-target environment and selected auth as launch, including the native provider fragment. Pass `--workspace` to read in the intended launch
-directory. These results are previews, since the prospective launch's workspace
+target environment and selected auth as launch. Pass `--workspace` to read in
+the intended launch directory. These results are previews, since the workspace
 and live provider state can differ. An unscoped read uses the canonical native
 configuration and is also a preview. Each reader's isolated credential store
 lives under its private host-owned instance directory. The host verifies removal

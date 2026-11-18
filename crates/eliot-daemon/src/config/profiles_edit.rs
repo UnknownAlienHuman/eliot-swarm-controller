@@ -286,39 +286,25 @@ fn editability(source: &str, policy: &SecretPolicy) -> Option<&'static str> {
             );
         }
     };
-    if has_credentialed_url(&config, source) {
+    if has_unsafe_profile_or_proxy(&config) {
         return Some("the profiles fail the daemon's strict validation; edit config.toml directly");
     }
     None
 }
 
-/// Profiles or adopted proxies whose URL fields carry credentials (userinfo,
-/// query, fragment) must never be handed to the editor as safe source.
-/// Provider fragments are written as-is; any `{env:}`-free URL carrying
-/// userinfo in a fragment still blocks the editor.
-fn provider_fragment_has_credentialed_url(value: &toml::Value) -> bool {
-    match value {
-        toml::Value::String(text) => {
-            if let Some(after) = text.split("://").nth(1) {
-                let authority = after.split(['/', '?', '#']).next().unwrap_or(after);
-                if authority.contains('@') {
-                    return true;
-                }
-            }
-            false
-        }
-        toml::Value::Array(items) => items.iter().any(provider_fragment_has_credentialed_url),
-        toml::Value::Table(table) => table.values().any(provider_fragment_has_credentialed_url),
-        _ => false,
-    }
-}
-
-fn has_credentialed_url(config: &super::FileConfig, _source: &str) -> bool {
+/// Keep unsafe provider configuration and credential-bearing proxy URLs out
+/// of the profile editor.
+fn has_unsafe_profile_or_proxy(config: &super::FileConfig) -> bool {
     config.profiles.values().any(|entry| {
-        entry.get_ref().provider.as_ref().is_some_and(|fragment| {
-            fragment
-                .values()
-                .any(provider_fragment_has_credentialed_url)
+        let entry = entry.get_ref();
+        entry.local_provider.as_ref().is_some_and(|provider| {
+            let pass_env: Vec<_> = entry
+                .pass_env
+                .iter()
+                .flatten()
+                .map(|name| name.trim().to_owned())
+                .collect();
+            provider.validate(&pass_env).is_err()
         })
     }) || config.proxies.iter().any(|(name, entry)| {
         let proxy = entry.get_ref();

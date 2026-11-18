@@ -2,9 +2,9 @@ use crate::{
     events::{self, EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
     native::{
         AuthSetup, AuthTransfer, HttpOutcome, IntegrationSelector, OpenCodeHttp, OwnedServer,
-        ProviderFragment, SWARM_MCP_SERVER_NAME, ServerLaunch,
+        SWARM_MCP_SERVER_NAME, ServerLaunch,
         models::{MAX_MODEL_ID_BYTES, ReaderContext, run_model_metadata, run_models},
-        server::{fragment_serve_environment, provider_config, validate_fragment_environment},
+        server::{provider_config, validate_local_provider, validate_local_provider_environment},
         transfer_selected_integration,
         types::{
             ConfigEntry, ConfigMcpServer, InboxUser, McpServerReadback, ModelRef, NativeModelEntry,
@@ -12,6 +12,7 @@ use crate::{
         },
     },
 };
+use eliot_core::local_provider::LocalProvider;
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
@@ -317,14 +318,14 @@ struct AgentSession {
     stop_command_id: Option<String>,
     resources_proved_closed: bool,
     stop_end_ack_proved: bool,
-    provider_fragment: Option<ProviderFragment>,
+    local_provider: Option<LocalProvider>,
 }
 
 /// A start request that passed admission: decoded params plus the validated
 /// frozen profile, workspace, child environment, selected native auth
-/// integration (cloud path) or native provider fragment (fragment path), and
-/// redaction secrets. Exactly one of `auth_selector` and `provider_fragment`
-/// is set: the fragment path never imports a canonical credential.
+/// integration (cloud path) or typed local provider, and
+/// redaction secrets. Exactly one of `auth_selector` and `local_provider`
+/// is set: local providers use environment-backed authentication.
 struct ParsedStart {
     params: AgentStartParams,
     /// Frozen native-subagent switch (`allow` or `deny`): `deny` stores a
@@ -365,7 +366,7 @@ struct ParsedStart {
     program: OsString,
     environment: Vec<(OsString, OsString)>,
     auth_selector: Option<IntegrationSelector>,
-    provider_fragment: Option<ProviderFragment>,
+    local_provider: Option<LocalProvider>,
     secrets: Vec<String>,
     credential: String,
     instance_dir: String,
@@ -669,7 +670,7 @@ impl OpenCodePlugin {
             .map_or(base.as_path(), Path::new);
         let program = OsStr::new(program);
         let TargetEnvironment {
-            variables: mut environment,
+            variables: environment,
             ..
         } = target_environment(
             params.target_environment.as_ref(),
@@ -680,15 +681,9 @@ impl OpenCodePlugin {
             .as_object()
             .expect("harness already proved the profile is an object");
         let model = optional_profile_text(profile, "model", "OpenCode")?;
-        let fragment = start_provider_fragment(profile)?;
+        let fragment = start_local_provider(profile)?;
         if let Some(fragment) = fragment.as_ref() {
-            // Retained fragments are refused by the shared strict allowlist
-            // before the reader config write below, exactly like the serve
-            // path. The private reader server runs under the same native
-            // project-config disable switch, so workspace project layers
-            // cannot widen the preview either.
-            validate_fragment_environment(fragment, &environment)?;
-            environment.extend(fragment_serve_environment(Some(fragment)));
+            validate_local_provider_environment(fragment, profile.get("pass_env"), &environment)?;
         }
         let until = Instant::now() + RPC_TIMEOUT;
         let config_home = base.join("config");
@@ -742,6 +737,7 @@ impl OpenCodePlugin {
             workspace,
             environment: &environment,
             xdg: isolated.then_some((config_home.as_path(), data_home.as_path())),
+            local_provider: fragment.is_some(),
         };
         let models: Vec<Value> = match params.part {
             ModelListPart::Models => run_models(program, until, &context)
@@ -907,8 +903,8 @@ impl OpenCodePlugin {
         // A fragment profile always carries an explicit model: a fragment
         // without a model fails closed instead of falling back to the native
         // default.
-        let provider_fragment = start_provider_fragment(profile)?;
-        let auth_selector = start_auth_selector(profile, provider_fragment.is_some())?;
+        let local_provider = start_local_provider(profile)?;
+        let auth_selector = start_auth_selector(profile, local_provider.is_some())?;
         let (workspace, program) = start_paths(profile, &params)?;
         let TargetEnvironment {
             variables: environment,
@@ -959,7 +955,7 @@ impl OpenCodePlugin {
             program,
             environment,
             auth_selector,
-            provider_fragment,
+            local_provider,
             secrets,
             credential: initialized.credential.clone(),
             instance_dir: initialized.instance_dir.clone(),
@@ -1053,8 +1049,6 @@ impl OpenCodePlugin {
     /// stream, and assemble the session. The caller retains any error. A
     /// spawn failure carries its provenance: an uncertain auth import (code
     /// `unknown`) settles unknown, definite refusals settle failed.
-    /// The cloud path carries the selected native integration; the fragment
-    /// path carries the native provider fragment and no canonical credential.
     async fn launch_start_session(
         peer: &PeerClient,
         parsed: &ParsedStart,
@@ -1073,7 +1067,13 @@ impl OpenCodePlugin {
                     selector,
                     reuse_existing: parsed.resume.is_some(),
                 }),
-                provider_fragment: parsed.provider_fragment.clone(),
+                local_provider: parsed.local_provider.clone(),
+                frozen_pass_env: parsed
+                    .params
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| profile.get("pass_env"))
+                    .cloned(),
                 swarm_executable: parsed.swarm_executable.clone(),
                 swarm_data_dir: parsed.swarm_data_dir.clone(),
                 native_subagents: parsed.native_subagents.clone(),
@@ -1139,7 +1139,7 @@ impl OpenCodePlugin {
             stop_command_id: None,
             resources_proved_closed: false,
             stop_end_ack_proved: false,
-            provider_fragment: parsed.provider_fragment.clone(),
+            local_provider: parsed.local_provider.clone(),
         };
 
         Ok(session)
@@ -1210,29 +1210,6 @@ impl OpenCodePlugin {
     ) -> Result<CreateOutcome> {
         let _timing = crate::native::startup::Step::new("session_create_verify");
         session.native_scope = opencode_scope(session.server.data_dir());
-        // Pre-create verification: no native session or prompt exists yet.
-        // A fragment profile must define the requested provider locally;
-        // the exact pair is proven below through the live model catalogue
-        // like every other profile, with limits from that catalogue row. No
-        // workspace file scan runs here: the serve runs under the native
-        // project-config disable switch, so workspace project layers are
-        // never loaded for the session lifetime, including native reloads.
-        if let (Some(fragment), Some(requested)) = (
-            parsed.provider_fragment.as_ref(),
-            parsed.requested_model.as_deref(),
-        ) {
-            let provider_id = requested.split('/').next().unwrap_or("");
-            if !fragment_defines_provider(fragment, provider_id) {
-                let failure = Error::new(
-                    "profile_error",
-                    "OpenCode provider fragment does not define the requested provider",
-                );
-                discard_failed_start(&mut session, failure.clone(), envelope).await;
-                return Ok(CreateOutcome::ProvenFailed(
-                    self.retain_proven_no_effect_start(&parsed.params, StartPhase::Verify, failure),
-                ));
-            }
-        }
         // An explicit model must prove membership in the live catalogue
         // before the create below: `Session.create` publishes its input
         // model unchanged and only resolves availability lazily at
@@ -1312,11 +1289,13 @@ impl OpenCodePlugin {
         // merged them, so an owner-identity entry there must refuse the start
         // before the native session exists. Every policy, whatever the entry
         // is named.
-        if let Err(error) = refuse_owner_project_mcp(
-            &parsed.workspace,
-            &parsed.swarm_executable,
-            parsed.mcp_cloud_hostname.as_deref(),
-        ) {
+        if parsed.local_provider.is_none()
+            && let Err(error) = refuse_owner_project_mcp(
+                &parsed.workspace,
+                &parsed.swarm_executable,
+                parsed.mcp_cloud_hostname.as_deref(),
+            )
+        {
             let failure = error.clone();
             discard_failed_start(&mut session, error, envelope).await;
             return Ok(CreateOutcome::ProvenFailed(
@@ -1689,11 +1668,13 @@ impl OpenCodePlugin {
         // The resumed serve merges the current project layer again, so the
         // same owner-identity scan runs before the retained session is
         // touched: a project entry added since launch refuses the resume.
-        if let Err(error) = refuse_owner_project_mcp(
-            &parsed.workspace,
-            &parsed.swarm_executable,
-            parsed.mcp_cloud_hostname.as_deref(),
-        ) {
+        if parsed.local_provider.is_none()
+            && let Err(error) = refuse_owner_project_mcp(
+                &parsed.workspace,
+                &parsed.swarm_executable,
+                parsed.mcp_cloud_hostname.as_deref(),
+            )
+        {
             return Err(self.fail_resume(&parsed, session, error, envelope).await);
         }
         let deadline = phase_deadline(envelope, RPC_TIMEOUT);
@@ -1986,14 +1967,13 @@ impl OpenCodePlugin {
         // workspace file scan runs here either: the resumed serve regenerates
         // under the same native project-config disable switch, so workspace
         // project layers stay unloaded for the session lifetime.
-        if let (Some(fragment), Some(target)) = (parsed.provider_fragment.as_ref(), target_model) {
-            let provider_id = target.split('/').next().unwrap_or("");
-            if !fragment_defines_provider(fragment, provider_id) {
-                return Err(Error::new(
-                    "profile_error",
-                    "OpenCode provider fragment does not define the retained provider",
-                ));
-            }
+        if let (Some(provider), Some(target)) = (parsed.local_provider.as_ref(), target_model)
+            && !local_provider_contains(provider, target)
+        {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode local provider does not declare the retained model",
+            ));
         }
         if target_model.is_none() && target_variant.is_none() {
             return Ok(None);
@@ -2428,16 +2408,14 @@ impl OpenCodePlugin {
         // Fragment path: the regenerated server config must still carry the
         // frozen provider. The live catalogue proves the retained pair; a
         // miss fails the resume for a corrected retry.
-        if let Some(fragment) = parsed.provider_fragment.as_ref()
+        if let Some(provider) = parsed.local_provider.as_ref()
             && let Some(model) = effective.model.as_ref()
+            && !provider.contains_model(&model.provider_id, &model.id)
         {
-            let provider_id = model.provider_id.clone();
-            if !fragment.contains_key(&provider_id) {
-                return Err(Error::new(
-                    "profile_error",
-                    "OpenCode provider fragment does not define the retained provider",
-                ));
-            }
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode local provider does not declare the retained model",
+            ));
         }
         // The effective MCP proof ran pre-quiesce (`resume_prove_mcp`): no
         // inventory or effective-config read happens here after the
@@ -2843,17 +2821,14 @@ impl OpenCodePlugin {
         // The same membership rule as the start and resume paths, before
         // either one writes: a catalog-listed model outside the frozen
         // fragment refuses here, never after quiescing or switching.
-        if let (Some(fragment), Some(model)) = (
-            session.provider_fragment.as_ref(),
-            requested.model.as_deref(),
-        ) {
-            let provider_id = model.split('/').next().unwrap_or("");
-            if !fragment_defines_provider(fragment, provider_id) {
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": "OpenCode provider fragment does not define the requested provider",
-                }));
-            }
+        if let (Some(provider), Some(model)) =
+            (session.local_provider.as_ref(), requested.model.as_deref())
+            && !local_provider_contains(provider, model)
+        {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": "OpenCode local provider does not declare the requested model",
+            }));
         }
         let current = session
             .http
@@ -3837,7 +3812,7 @@ fn start_auth_selector(
         if raw.is_some() {
             return Err(Error::new(
                 "profile_error",
-                "OpenCode provider fragment profiles must not name a canonical auth_integration",
+                "OpenCode local provider profiles cannot name a canonical auth_integration",
             ));
         }
         return Ok(None);
@@ -3856,18 +3831,7 @@ fn start_auth_selector(
         .map_err(|error| error.with_code("profile_error"))
 }
 
-/// The frozen native `provider.<id>` fragment: an object whose keys are
-/// provider ids and whose values are written as-is into the isolated
-/// `opencode.jsonc` under `providers`. Only the `provider` table is admitted;
-/// any fragment without a model fails closed at admission. The retained
-/// snapshot passes the one shared strict allowlist also used at freeze, so a
-/// snapshot that fails it (unadmitted keys, literal credentials) is refused
-/// before any isolated-config write, on the start path and the model reader
-/// alike.
-/// A retained `eliot-local` profile predates the fragment path: its old
-/// TOML fields are rejected by the strict schema, and the frozen snapshot
-/// reaches here without a `provider` table. Report the migration naming
-/// `provider.<id>` instead of the misleading auth-selector guidance.
+/// Older local-provider snapshots need a new profile before they can run.
 fn retained_eliot_local_migration(profile: &serde_json::Map<String, Value>) -> Option<Error> {
     let has_old_fields = [
         "provider_base_url",
@@ -3886,65 +3850,50 @@ fn retained_eliot_local_migration(profile: &serde_json::Map<String, Value>) -> O
     if has_old_fields || is_eliot_local {
         Some(Error::new(
             "profile_error",
-            "OpenCode eliot-local profile migrated to provider.<id> fragment; recreate the profile with a provider.<id> table and model <provider>/<model>",
+            "OpenCode retained provider configuration must migrate to local_provider with model <provider>/<model>",
         ))
     } else {
         None
     }
 }
 
-fn start_provider_fragment(
-    profile: &serde_json::Map<String, Value>,
-) -> Result<Option<ProviderFragment>> {
-    let Some(fragment) = profile.get("provider") else {
-        if let Some(migration) = retained_eliot_local_migration(profile) {
-            return Err(migration);
-        }
-        return Ok(None);
-    };
-    let Some(map) = fragment.as_object() else {
+fn start_local_provider(profile: &serde_json::Map<String, Value>) -> Result<Option<LocalProvider>> {
+    if profile.contains_key("provider") {
         return Err(Error::new(
             "profile_error",
-            "OpenCode provider fragment must be an object",
-        ));
-    };
-    if map.is_empty() {
-        return Err(Error::new(
-            "profile_error",
-            "OpenCode provider fragment must name at least one provider",
+            "OpenCode retained provider configuration must migrate to local_provider",
         ));
     }
+    let Some(value) = profile.get("local_provider") else {
+        return match retained_eliot_local_migration(profile) {
+            Some(error) => Err(error),
+            None => Ok(None),
+        };
+    };
+    let provider: LocalProvider = serde_json::from_value(value.clone()).map_err(|_| {
+        Error::new(
+            "profile_error",
+            "OpenCode retained local_provider has invalid fields",
+        )
+    })?;
+    validate_local_provider(&provider, profile.get("pass_env"))?;
     if !profile
         .get("model")
         .and_then(Value::as_str)
-        .is_some_and(|model| !model.trim().is_empty())
+        .is_some_and(|model| local_provider_contains(&provider, model))
     {
         return Err(Error::new(
             "profile_error",
-            "OpenCode provider fragment requires an explicit model",
+            "OpenCode local provider profile must select one of its declared models",
         ));
     }
     if profile.contains_key("auth_integration") {
         return Err(Error::new(
             "profile_error",
-            "OpenCode provider fragment profiles must not name a canonical auth_integration",
+            "OpenCode local provider profiles cannot name a canonical auth_integration",
         ));
     }
-    let mut out = ProviderFragment::new();
-    for (id, value) in map {
-        if id.trim().is_empty() || !value.is_object() {
-            return Err(Error::new(
-                "profile_error",
-                "OpenCode provider fragment entries must be objects",
-            ));
-        }
-        out.insert(id.clone(), value.clone());
-    }
-    // A retained snapshot that fails the shared strict allowlist is refused
-    // before any isolated-config write, on the start path and the model
-    // reader alike.
-    eliot_core::opencode_fragment::validate_fragment_shape(&out)?;
-    Ok(Some(out))
+    Ok(Some(provider))
 }
 
 /// Read the frozen worker MCP policy back. The owned serve is already
@@ -4056,9 +4005,8 @@ fn refuse_owner_project_mcp(
     Ok(())
 }
 
-/// Whether the frozen fragment defines the requested provider id.
-fn fragment_defines_provider(fragment: &ProviderFragment, provider_id: &str) -> bool {
-    fragment.contains_key(provider_id)
+fn local_provider_contains(provider: &LocalProvider, model: &str) -> bool {
+    split_provider_model(model).is_some_and(|(id, model)| provider.contains_model(id, model))
 }
 
 /// Refuse the start when any effective `mcp.servers` entry carries the
@@ -4908,8 +4856,8 @@ mod tests {
         catalogue_contains, catalogue_entry, catalogue_variants, mcp_names, mcp_settle,
         opencode_manifest, opencode_scope, parse_configure_model, phase_budget, phase_deadline,
         policy_from_snapshot, presession_reason, split_model, start_auth_selector,
-        start_config_override, start_failure_is_proven_no_effect, start_model_ref,
-        start_provider_fragment, verify_managed_mcp_transport, winning_managed_mcp_server,
+        start_config_override, start_failure_is_proven_no_effect, start_local_provider,
+        start_model_ref, verify_managed_mcp_transport, winning_managed_mcp_server,
     };
     use crate::native::server::READINESS_TIMEOUT;
     use crate::native::types::{
@@ -5853,58 +5801,65 @@ mod tests {
 
     fn fragment_doc() -> serde_json::Value {
         serde_json::json!({
-            "k173d-fixture": {
-                "package": "@opencode/ai/providers/openai-compatible",
-                "settings": {
-                    "baseURL": "http://127.0.0.1:1234/v1",
-                    "apiKey": "{env:K173D_PROOF_KEY}",
-                },
-                "models": {
-                    "test-model": { "name": "test-model", "tools": true },
-                },
-            },
+            "id": "k173d-fixture",
+            "package": "@ai-sdk/openai-compatible",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "api_key_env": "K173D_PROOF_KEY",
+            "models": [{"id": "test-model"}],
         })
     }
 
     #[test]
-    fn fragment_parses_as_is_and_rejects_mixed_or_partial() {
+    fn retained_local_provider_requires_typed_fields_and_frozen_key_admission() {
         let profile = fragment_profile(serde_json::json!({
             "model": "k173d-fixture/test-model",
-            "provider": fragment_doc(),
+            "local_provider": fragment_doc(),
+            "pass_env": ["K173D_PROOF_KEY"],
         }));
-        let fragment = start_provider_fragment(&profile)
+        let fragment = start_local_provider(&profile)
             .expect("fragment")
             .expect("present");
-        assert!(fragment.contains_key("k173d-fixture"));
+        assert_eq!(fragment.id, "k173d-fixture");
+        let mut malformed = profile.clone();
+        malformed.remove("pass_env");
+        assert!(start_local_provider(&malformed).is_err());
+        malformed.insert("pass_env".to_owned(), json!(["K173D_PROOF_KEY", 9]));
+        assert!(start_local_provider(&malformed).is_err());
+        malformed.insert("pass_env".to_owned(), json!(["ELIOT_AGENT_TOKEN"]));
+        malformed.get_mut("local_provider").unwrap()["api_key_env"] = json!("ELIOT_AGENT_TOKEN");
+        assert!(start_local_provider(&malformed).is_err());
+        let mut legacy = profile.clone();
+        legacy.insert("provider".to_owned(), json!({}));
+        assert!(start_local_provider(&legacy).is_err());
+
         // Cloud profiles carry no fragment.
         let cloud = fragment_profile(
             serde_json::json!({ "model": "openrouter/m", "auth_integration": "openrouter" }),
         );
-        assert!(start_provider_fragment(&cloud).expect("cloud").is_none());
+        assert!(start_local_provider(&cloud).expect("cloud").is_none());
         // Mixed auth refuses.
         let mixed = fragment_profile(serde_json::json!({
             "model": "k173d-fixture/test-model",
-            "provider": fragment_doc(),
+            "local_provider": fragment_doc(),
             "auth_integration": "openrouter",
+            "pass_env": ["K173D_PROOF_KEY"],
         }));
         assert_eq!(
-            start_provider_fragment(&mixed).expect_err("mixed").code,
+            start_local_provider(&mixed).expect_err("mixed").code,
             "profile_error"
         );
         // Missing model refuses.
-        let no_model = fragment_profile(serde_json::json!({ "provider": fragment_doc() }));
+        let no_model = fragment_profile(serde_json::json!({ "local_provider": fragment_doc() }));
         assert_eq!(
-            start_provider_fragment(&no_model)
-                .expect_err("no model")
-                .code,
+            start_local_provider(&no_model).expect_err("no model").code,
             "profile_error"
         );
         // Empty fragment refuses.
         let empty = fragment_profile(
-            serde_json::json!({ "model": "k173d-fixture/test-model", "provider": {} }),
+            serde_json::json!({ "model": "k173d-fixture/test-model", "local_provider": {} }),
         );
         assert_eq!(
-            start_provider_fragment(&empty).expect_err("empty").code,
+            start_local_provider(&empty).expect_err("empty").code,
             "profile_error"
         );
     }
@@ -5933,20 +5888,6 @@ mod tests {
                 .expect("fragment none")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn fragment_environment_requires_non_empty_reference() {
-        use std::ffi::OsString;
-        let mut fragment = crate::native::server::ProviderFragment::new();
-        fragment.insert(
-            "k173d-fixture".to_owned(),
-            serde_json::json!({ "settings": { "apiKey": "{env:K173D_PROOF_KEY}" } }),
-        );
-        let empty: Vec<(OsString, OsString)> = Vec::new();
-        assert!(crate::native::server::validate_fragment_environment(&fragment, &empty).is_err());
-        let env = vec![(OsString::from("K173D_PROOF_KEY"), OsString::from("secret"))];
-        assert!(crate::native::server::validate_fragment_environment(&fragment, &env).is_ok());
     }
 
     #[test]
@@ -6228,14 +6169,17 @@ mod tests {
 
     #[test]
     fn fragment_membership_rule_matches_configure_and_resume() {
-        use super::{fragment_defines_provider, retained_eliot_local_migration};
-        use crate::native::server::ProviderFragment;
-        let mut fragment = ProviderFragment::new();
-        fragment.insert("k173d-fixture".to_owned(), json!({"package": "p"}));
-        assert!(fragment_defines_provider(&fragment, "k173d-fixture"));
-        assert!(!fragment_defines_provider(&fragment, "other"));
+        use super::{local_provider_contains, retained_eliot_local_migration};
+        use eliot_core::local_provider::LocalProvider;
+        let fragment: LocalProvider = serde_json::from_value(json!({
+            "id": "k173d-fixture", "package": "@ai-sdk/openai-compatible",
+            "base_url": "http://127.0.0.1:1234", "models": [{"id": "m"}],
+        }))
+        .expect("typed provider");
+        assert!(local_provider_contains(&fragment, "k173d-fixture/m"));
+        assert!(!local_provider_contains(&fragment, "k173d-fixture/other"));
         // A catalog-listed model outside the fragment refuses on both paths.
-        assert!(!fragment_defines_provider(&fragment, "openrouter"));
+        assert!(!local_provider_contains(&fragment, "openrouter/m"));
         // Retained eliot-local profiles name the migration, not auth.
         let retained: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
             "harness": "opencode",
@@ -6244,7 +6188,7 @@ mod tests {
         .expect("retained snapshot decodes");
         let migration = retained_eliot_local_migration(&retained).expect("migration error");
         assert_eq!(migration.code, "profile_error");
-        assert!(migration.message.contains("provider.<id>"));
+        assert!(migration.message.contains("local_provider"));
         let old_fields: serde_json::Map<String, serde_json::Value> =
             serde_json::from_value(json!({
                 "harness": "opencode",
