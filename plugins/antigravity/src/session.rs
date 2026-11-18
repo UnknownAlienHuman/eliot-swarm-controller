@@ -284,7 +284,17 @@ impl Session {
             cwd: plan.launch.cwd.clone(),
             environment,
         };
-        let mut native = AgyProcess::spawn(launch, plan.policy.clone()).await?;
+        let mut native = AgyProcess::spawn(
+            launch,
+            plan.policy.clone(),
+            eliot_plugin::native_transport::NativeLabels {
+                short: "Antigravity",
+                server: "Antigravity ACP server",
+            },
+            "agy",
+            "plugin.antigravity.native.response",
+        )
+        .await?;
         let client = native.client();
         let frames = native.take_frames()?;
         let stream = native.stream_state();

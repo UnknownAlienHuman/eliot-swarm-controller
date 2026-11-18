@@ -104,7 +104,7 @@ use crate::views::{self, RenderCache, RenderedItem, RowCallbacks};
 /// Agent rows per `agent.list` page in the navigation list.
 const AGENT_PAGE: usize = 100;
 /// Harnesses an Owner ad-hoc launch accepts (the daemon validates again).
-const ADHOC_HARNESSES: [&str; 5] = ["codex", "claude", "muse", "opencode", "antigravity"];
+const ADHOC_HARNESSES: [&str; 6] = ["codex", "claude", "muse", "opencode", "antigravity", "zed"];
 
 /// UI copy of one project registration. Its name is derived, never the
 /// registration ID ([`DesktopApp::place_title`]).

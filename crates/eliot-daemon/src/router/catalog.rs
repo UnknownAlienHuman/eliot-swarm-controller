@@ -193,6 +193,12 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
+        if harness == "zed" {
+            return Err(Error::new(
+                "unsupported",
+                "Zed eval-cli has no read-only model catalogue",
+            ));
+        }
         let profile = request.profile.as_deref().map(str::trim);
         let (snapshot, label, live_identity) = match request.agent.as_deref() {
             Some(agent) => self.agent_catalog_snapshot(agent, &harness).await?,
@@ -469,6 +475,11 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
+        if harness == "zed" {
+            return self
+                .quota_for_snapshot(harness, None, "adhoc".to_owned(), deadline)
+                .await;
+        }
         let profile = request.profile.as_deref().map(str::trim);
         let (snapshot, label) = self
             .resolve_catalog_snapshot(&harness, profile, true, deadline)
@@ -489,6 +500,21 @@ impl Router {
             profile: None,
         };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+        if harness == "zed" {
+            return Ok(catalog::ScopedQuota {
+                route_verified: false,
+                response: HarnessQuotaResponse {
+                    harness,
+                    scope,
+                    credential,
+                    fetched_at_ms: now_ms(),
+                    ttl_ms: catalog::CATALOG_TTL_MS,
+                    status: "unsupported".to_owned(),
+                    note: Some("Zed eval-cli exposes no account quota readback".to_owned()),
+                    details: None,
+                },
+            });
+        }
         let mut profile = snapshot
             .ok_or_else(|| Error::new("profile_error", "quota requires a native profile"))?;
         let route = crate::plugin_host::metadata_route(&profile)?;

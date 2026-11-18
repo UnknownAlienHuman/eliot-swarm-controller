@@ -75,7 +75,7 @@ impl HarnessListRequest {
 /// One harness installation fact.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessEntry {
-    /// Harness code: codex|claude|muse|opencode|antigravity.
+    /// Harness code: codex|claude|muse|opencode|antigravity|zed.
     pub harness: String,
     /// True when the installed native executable was found.
     pub installed: bool,
@@ -119,7 +119,7 @@ pub struct HarnessListResponse {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessModelsRequest {
-    /// Harness code: codex|claude|muse|opencode|antigravity.
+    /// Harness code: codex|claude|muse|opencode|antigravity|zed.
     pub harness: String,
     /// Optional named profile selecting the native route/account. Omitted or
     /// null means ad-hoc daemon defaults for the harness. A supplied profile
@@ -186,7 +186,7 @@ fn validate_harness(harness: &str) -> Result<()> {
     }
     if !matches!(
         trimmed,
-        "codex" | "claude" | "muse" | "opencode" | "antigravity"
+        "codex" | "claude" | "muse" | "opencode" | "antigravity" | "zed"
     ) {
         return Err(Error::new(
             "unsupported",
@@ -448,7 +448,7 @@ impl HarnessModelsResponse {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessQuotaRequest {
-    /// Harness code: codex|claude|muse|opencode|antigravity.
+    /// Harness code: codex|claude|muse|opencode|antigravity|zed.
     pub harness: String,
     /// Optional named profile selecting the native route/account. Omitted or
     /// null means ad-hoc daemon defaults for the harness. A supplied profile
@@ -650,7 +650,7 @@ impl ModelsCatalogRequest {
 /// One unified catalogue model.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelsCatalogEntry {
-    /// Harness code: codex|claude|muse|opencode|antigravity.
+    /// Harness code: codex|claude|muse|opencode|antigravity|zed.
     pub harness: String,
     /// Native model id verbatim (`provider/model` for OpenCode).
     pub id: String,
@@ -744,7 +744,7 @@ pub const MAX_CATALOG_FAILURE_MESSAGE_BYTES: usize = 512;
 /// error of its `harness.models` read.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelsCatalogFailure {
-    /// Harness code: codex|claude|muse|opencode|antigravity.
+    /// Harness code: codex|claude|muse|opencode|antigravity|zed.
     pub harness: String,
     /// The read's error code (`busy`, `unavailable`, `harness_error`, ...).
     pub code: String,

@@ -440,7 +440,7 @@ fn desktop_key_valid(value: &str) -> bool {
         && value == value.trim()
 }
 
-const DESKTOP_HARNESSES: [&str; 5] = ["codex", "claude", "muse", "opencode", "antigravity"];
+const DESKTOP_HARNESSES: [&str; 6] = ["codex", "claude", "muse", "opencode", "antigravity", "zed"];
 
 fn desktop_error(message: &str) -> core::Error {
     core::Error::new("profile_error", format!("config.toml: {message}"))
@@ -480,7 +480,7 @@ impl DesktopSettings {
             let harness = entry.harness.as_str();
             if !matches!(
                 harness,
-                "codex" | "claude" | "muse" | "opencode" | "antigravity"
+                "codex" | "claude" | "muse" | "opencode" | "antigravity" | "zed"
             ) {
                 return Err(core::Error::new(
                     "profile_error",
@@ -1290,7 +1290,7 @@ fn freeze_native_subagents(
             if has_children { "deny" } else { "allow" }.to_owned()
         }
     };
-    if effective == "deny" && matches!(harness.as_str(), "muse" | "antigravity") {
+    if effective == "deny" && matches!(harness.as_str(), "muse" | "antigravity" | "zed") {
         return Err(profile_field_error(
             source,
             table_offset,
@@ -1498,6 +1498,7 @@ fn snapshot_from_entry(
         && harness != "claude"
         && harness != "opencode"
         && harness != "antigravity"
+        && harness != "zed"
     {
         return Err(profile_field_error(
             source,
@@ -1533,6 +1534,9 @@ fn snapshot_from_entry(
     }
     if harness == "antigravity" {
         return antigravity_snapshot_from_entry(name, entry, table_offset, source);
+    }
+    if harness == "zed" {
+        return zed_snapshot_from_entry(name, entry, table_offset, source);
     }
     let model = entry.model.as_deref();
     if let Some(model) = model {
@@ -2485,6 +2489,100 @@ fn opencode_snapshot_from_entry(
         McpHarnessSupport {
             harness: "OpenCode",
             minimal: true,
+            allow: false,
+        },
+    )?;
+    insert_control(
+        &mut snapshot,
+        name,
+        entry.control.as_deref(),
+        source,
+        table_offset,
+    )?;
+    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
+    Ok(Value::Object(snapshot))
+}
+
+fn zed_snapshot_from_entry(
+    name: &str,
+    entry: &ProfileEntry,
+    table_offset: usize,
+    source: &str,
+) -> core::Result<Value> {
+    let invalid = |field, message| {
+        profile_field_error(source, table_offset, name, field, message, "profile_error")
+    };
+    let model = entry
+        .model
+        .as_deref()
+        .ok_or_else(|| invalid("model", "Zed eval-cli requires an explicit provider/model"))?;
+    validate_model(name, model, source, table_offset)?;
+    if eliot_plugin::session::split_provider_model(model).is_none() {
+        return Err(invalid(
+            "model",
+            "Zed eval-cli requires an explicit provider/model",
+        ));
+    }
+    for (field, present) in [
+        ("effort", entry.effort.is_some()),
+        ("permissions", entry.permissions.is_some()),
+        ("approval", entry.approval.is_some()),
+        ("approval_policy", entry.approval_policy.is_some()),
+        ("collaboration_mode", entry.collaboration_mode.is_some()),
+        ("mode", entry.mode.is_some()),
+        ("auth_integration", entry.auth_integration.is_some()),
+        ("proxy", entry.proxy.is_some()),
+        ("account", entry.account.is_some()),
+        (
+            "child_profiles",
+            entry
+                .child_profiles
+                .as_ref()
+                .is_some_and(|names| !names.is_empty()),
+        ),
+    ] {
+        if present {
+            return Err(profile_field_error(
+                source,
+                table_offset,
+                name,
+                field,
+                "Zed eval-cli has no mapping for this field",
+                "unsupported",
+            ));
+        }
+    }
+    if entry.dangerously_skip_permissions != Some(true) {
+        return Err(invalid(
+            "dangerously_skip_permissions",
+            "Zed eval-cli requires explicit true because it auto-allows native tools",
+        ));
+    }
+    let tail = validate_profile_tail(name, entry, table_offset, source)?;
+    if tail
+        .cmd
+        .as_deref()
+        .is_none_or(|cmd| !crate::adhoc::eval_cli_name(cmd))
+    {
+        return Err(invalid(
+            "cmd",
+            "must name the standalone eval-cli executable",
+        ));
+    }
+    let mut snapshot = serde_json::Map::from_iter([
+        ("harness".to_owned(), json!("zed")),
+        ("model".to_owned(), json!(model)),
+        ("dangerously_skip_permissions".to_owned(), json!(true)),
+    ]);
+    freeze_mcp_policy(
+        &mut snapshot,
+        name,
+        entry,
+        table_offset,
+        source,
+        McpHarnessSupport {
+            harness: "Zed",
+            minimal: false,
             allow: false,
         },
     )?;

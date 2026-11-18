@@ -128,6 +128,12 @@ async fn run_plugin_command(command: PluginCommand) -> Result<u8, Failure> {
                 .map_err(|error| Failure::new(1, error.to_string()))?;
             Ok(0)
         }
+        PluginCommand::Zed => {
+            eliot_plugin_zed::run()
+                .await
+                .map_err(|error| Failure::new(1, error.to_string()))?;
+            Ok(0)
+        }
         PluginCommand::Antigravity => {
             eliot_plugin_antigravity::run()
                 .await

@@ -311,7 +311,7 @@ pub(crate) struct DiscoverArgs {
 
 #[derive(Args)]
 pub(crate) struct ModelsArgs {
-    /// Harness code: codex|claude|muse|opencode|antigravity. Omitted lists
+    /// Harness code: codex|claude|muse|opencode|antigravity|zed. Omitted lists
     /// every harness through the unified catalogue.
     #[arg(long, value_name = "HARNESS")]
     pub(crate) harness: Option<String>,
@@ -349,7 +349,7 @@ pub(crate) struct ModelsArgs {
 
 #[derive(Args)]
 pub(crate) struct QuotaArgs {
-    /// Harness code: codex|claude|muse|opencode|antigravity.
+    /// Harness code: codex|claude|muse|opencode|antigravity|zed.
     #[arg(long, value_name = "HARNESS")]
     pub(crate) harness: String,
     /// Optional named profile selecting the native route/account. Omitted
@@ -385,7 +385,7 @@ pub(crate) struct LaunchArgs {
     /// role is the default role; the CLI preserves omission for replay identity.
     #[arg(long, value_name = "ROLE", conflicts_with_all = ["profile", "harness"])]
     pub(crate) role: Option<String>,
-    /// Ad-hoc Owner launch harness (codex|claude|muse|opencode|antigravity).
+    /// Ad-hoc Owner launch harness (codex|claude|muse|opencode|antigravity|zed).
     /// The daemon freezes a profile-equivalent snapshot from built-in
     /// per-harness defaults plus --model/--effort/--auth. Owner-only.
     #[arg(long, value_name = "HARNESS")]
@@ -1391,6 +1391,9 @@ pub(crate) enum PluginCommand {
     /// Internal Antigravity plugin entry point (hidden).
     #[command(hide = true)]
     Antigravity,
+    /// Internal Zed batch plugin entry point (hidden).
+    #[command(hide = true)]
+    Zed,
     /// Internal Antigravity command-hook entry point (hidden).
     #[command(name = "antigravity-hook", hide = true)]
     AntigravityHook,

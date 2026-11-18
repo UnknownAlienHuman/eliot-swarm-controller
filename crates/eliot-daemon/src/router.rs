@@ -5782,7 +5782,7 @@ fn install_frozen_profile(
 ) -> Result<()> {
     if !matches!(
         harness,
-        "codex" | "muse" | "claude" | "opencode" | "antigravity"
+        "codex" | "muse" | "claude" | "opencode" | "antigravity" | "zed"
     ) {
         return Err(Error::new(
             "unsupported",

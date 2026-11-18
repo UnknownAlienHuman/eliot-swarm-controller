@@ -1,16 +1,14 @@
-//! Antigravity native transport: AGY ACP over the shared child transport.
+//! ACP stdio client with ordered prompt and load responses.
 //!
 //! The process, pump and correlation machinery live in
-//! [`eliot_plugin::native_transport`]; this module is the ACP framing on
-//! top, following the Claude plugin's custom-client precedent instead of
-//! the shared JSON-RPC client. The one protocol-specific piece is the
+//! [`crate::native_transport`]; this module owns ACP framing. The one protocol-specific piece is the
 //! **fenced prompt call**: a `session/prompt` response is the turn's
 //! terminal fact, so it must be processed behind every `session/update`
 //! that preceded it on the wire. A normal correlated reply would route
 //! straight to the awaiting task and could settle the turn before queued
 //! updates are consumed (dropping pending text and misattributing late
 //! chunks). Fenced replies therefore re-enter the ordered frame channel
-//! as [`AgyFrame::PromptResponse`] and are consumed by the same event
+//! as [`AcpFrame::PromptResponse`] and are consumed by the same event
 //! task, in wire order. Ordinary calls keep the nonblocking
 //! lossy-overflow reply contract: routing never waits behind the emit
 //! queue, and an overflow latches the existing stream-fault gap.
@@ -21,14 +19,15 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
-use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
-use eliot_plugin::{
+use crate::{
     StderrView,
     native_transport::{
         DEFAULT_MAX_NATIVE_FRAME_BYTES, NativeChild, NativeLabels, NativeLaunch, NativeStreamFault,
-        NativeWriter, PendingCalls, PendingGuard, PumpAction, PumpMode, encode_frame, spawn_pumped,
+        NativeWriter, PendingCalls, PendingGuard, PumpAction, PumpMode, StreamState, encode_frame,
+        spawn_pumped,
     },
 };
+use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
@@ -36,25 +35,18 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
-const LABELS: NativeLabels = NativeLabels {
-    short: "Antigravity",
-    server: "Antigravity ACP server",
-};
-pub(crate) use eliot_plugin::native_transport::StreamState;
-const ID_PREFIX: &str = "agy";
-
 /// Which ordered fence a fenced reply belongs to. The classifier emits
 /// the frame variant matching the pending call's kind, so a load reply
 /// can never be mistaken for a prompt terminal (or vice versa).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FencedKind {
+pub enum FencedKind {
     Prompt,
     Load,
 }
 
 /// One ACP stream record for the event task, in wire order.
 #[derive(Debug)]
-pub(crate) enum AgyFrame {
+pub enum AcpFrame {
     /// Ordered record-local fault, behind every retained pre-fault frame.
     StreamFault(NativeStreamFault),
     /// A `session/update` notification body.
@@ -81,7 +73,7 @@ pub(crate) enum AgyFrame {
 /// pending-map entry (via [`PendingGuard`]) and the fenced id. Never
 /// `mem::forget`-ed: the reply channel receiver is dropped at dispatch
 /// because the reply travels as an ordered frame instead.
-pub(crate) struct FencedGuard {
+pub struct FencedGuard {
     /// Held for its `Drop` only: removes the pending-map entry.
     _guard: PendingGuard,
     fenced: Arc<StdMutex<HashMap<String, FencedKind>>>,
@@ -91,12 +83,12 @@ pub(crate) struct FencedGuard {
 /// A locally registered fenced call whose native write has not started.
 /// The caller can arm the corresponding event state with `request_id`
 /// before dispatching it.
-pub(crate) struct PreparedFencedCall {
+pub struct PreparedFencedCall {
     write: FencedWrite,
     registration: FencedGuard,
 }
 
-pub(crate) struct FencedWrite {
+pub struct FencedWrite {
     id: String,
     method: String,
     encoded: String,
@@ -122,7 +114,8 @@ impl Drop for FencedGuard {
 }
 
 #[derive(Clone)]
-pub(crate) struct AgyClient {
+pub struct AcpClient {
+    labels: NativeLabels,
     writer: NativeWriter,
     pending: PendingCalls,
     fenced: Arc<StdMutex<HashMap<String, FencedKind>>>,
@@ -130,10 +123,10 @@ pub(crate) struct AgyClient {
     policy: SecretPolicy,
 }
 
-pub(crate) struct AgyProcess {
+pub struct AcpProcess {
     pub transport: NativeChild,
-    client: AgyClient,
-    frames: Option<mpsc::Receiver<AgyFrame>>,
+    client: AcpClient,
+    frames: Option<mpsc::Receiver<AcpFrame>>,
     stream: watch::Receiver<StreamState>,
 }
 
@@ -189,8 +182,14 @@ struct NativeRpcError {
     message: &'static str,
 }
 
-impl AgyProcess {
-    pub async fn spawn(launch: NativeLaunch, policy: SecretPolicy) -> Result<Self> {
+impl AcpProcess {
+    pub async fn spawn(
+        launch: NativeLaunch,
+        policy: SecretPolicy,
+        labels: NativeLabels,
+        id_prefix: &'static str,
+        response_origin: &'static str,
+    ) -> Result<Self> {
         let fenced = Arc::new(StdMutex::new(HashMap::new()));
         let fenced_classify = Arc::clone(&fenced);
         // JSON-RPC: keep nonblocking routing; a pending reply must never
@@ -198,16 +197,17 @@ impl AgyProcess {
         let (transport, pending, frame_rx, stream_rx) = spawn_pumped(
             launch,
             policy.clone(),
-            LABELS,
-            ID_PREFIX,
+            labels,
+            id_prefix,
             PumpMode::LossyOverflow,
             DEFAULT_MAX_NATIVE_FRAME_BYTES,
             OVERSIZED_KNOWN_METHODS,
-            move |value| classify_agy_frame(value, &fenced_classify),
-            Some(AgyFrame::StreamFault),
+            move |value| classify_acp_frame(value, &fenced_classify, labels.short, response_origin),
+            Some(AcpFrame::StreamFault),
         )
         .await?;
-        let client = AgyClient {
+        let client = AcpClient {
+            labels,
             writer: transport.writer(),
             pending,
             fenced,
@@ -227,15 +227,18 @@ impl AgyProcess {
         self.transport.pid()
     }
 
-    pub fn client(&self) -> AgyClient {
+    pub fn client(&self) -> AcpClient {
         self.client.clone()
     }
 
-    pub fn take_frames(&mut self) -> Result<mpsc::Receiver<AgyFrame>> {
+    pub fn take_frames(&mut self) -> Result<mpsc::Receiver<AcpFrame>> {
         self.frames.take().ok_or_else(|| {
             Error::new(
                 "bad_state",
-                "Antigravity native event reader already has an owner",
+                format!(
+                    "{} native event reader already has an owner",
+                    self.client.labels.short
+                ),
             )
         })
     }
@@ -249,7 +252,7 @@ impl AgyProcess {
     }
 }
 
-impl AgyClient {
+impl AcpClient {
     /// One correlated ACP request/response round trip.
     pub async fn call(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
         self.call_inner(method, params, deadline)
@@ -267,11 +270,14 @@ impl AgyClient {
         if method.trim().is_empty() || params.as_ref().is_some_and(|value| !value.is_object()) {
             return Err(Error::new(
                 "invalid",
-                "Antigravity notification has invalid method or params",
+                format!(
+                    "{} notification has invalid method or params",
+                    self.labels.short
+                ),
             ));
         }
         let encoded = encode_frame(
-            LABELS.server,
+            self.labels.server,
             &OutboundNotification {
                 jsonrpc: "2.0",
                 method,
@@ -293,12 +299,15 @@ impl AgyClient {
         if method.trim().is_empty() || !params.is_object() {
             return Err(Error::new(
                 "invalid",
-                "Antigravity fenced call requires a method and object params",
+                format!(
+                    "{} fenced call requires a method and object params",
+                    self.labels.short
+                ),
             ));
         }
         let id = self.pending.mint_id()?;
         let encoded = encode_frame(
-            LABELS.server,
+            self.labels.server,
             &OutboundRequest {
                 jsonrpc: "2.0",
                 id: id.clone(),
@@ -358,7 +367,7 @@ impl AgyClient {
                 }
                 Err(Error::new(
                     "unknown",
-                    format!("Antigravity {method} dispatch outcome is unknown"),
+                    format!("{} {method} dispatch outcome is unknown", self.labels.short),
                 ))
             }
         }
@@ -378,11 +387,14 @@ impl AgyClient {
         if !result.is_object() {
             return Err(Error::new(
                 "invalid",
-                "Antigravity permission answer requires an object result",
+                format!(
+                    "{} permission answer requires an object result",
+                    self.labels.short
+                ),
             ));
         }
         let encoded = encode_frame(
-            LABELS.server,
+            self.labels.server,
             &OutboundResult {
                 jsonrpc: "2.0",
                 id,
@@ -411,7 +423,7 @@ impl AgyClient {
             (-32601, "unsupported")
         };
         let encoded = encode_frame(
-            LABELS.server,
+            self.labels.server,
             &OutboundResponse {
                 jsonrpc: "2.0",
                 id,
@@ -434,12 +446,15 @@ impl AgyClient {
         if method.trim().is_empty() || !params.is_object() {
             return Err(Error::new(
                 "invalid",
-                "Antigravity call requires a method and object params",
+                format!(
+                    "{} call requires a method and object params",
+                    self.labels.short
+                ),
             ));
         }
         let id = self.pending.mint_id()?;
         let encoded = encode_frame(
-            LABELS.server,
+            self.labels.server,
             &OutboundRequest {
                 jsonrpc: "2.0",
                 id: id.clone(),
@@ -454,7 +469,7 @@ impl AgyClient {
             }
             return Err(Error::new(
                 "unknown",
-                format!("Antigravity {method} dispatch outcome is unknown"),
+                format!("{} {method} dispatch outcome is unknown", self.labels.short),
             ));
         }
         timeout_at(deadline, response_rx)
@@ -462,13 +477,13 @@ impl AgyClient {
             .map_err(|_| {
                 Error::new(
                     "unknown",
-                    format!("Antigravity {method} response is unknown"),
+                    format!("{} {method} response is unknown", self.labels.short),
                 )
             })?
             .map_err(|_| {
                 Error::new(
                     "unknown",
-                    format!("Antigravity {method} response channel closed"),
+                    format!("{} {method} response channel closed", self.labels.short),
                 )
             })?
     }
@@ -484,10 +499,15 @@ impl AgyClient {
 /// Map a native JSON-RPC error body to a call outcome: standard validation
 /// errors prove non-admission; anything else leaves an admitted write
 /// unruled-out and stays unknown. The message is never surfaced.
-fn map_response_error(code: i64, message: String) -> Result<Value> {
+fn map_response_error(
+    code: i64,
+    message: String,
+    harness: &str,
+    response_origin: &str,
+) -> Result<Value> {
     if matches!(code, -32602..=-32600) {
         Err(Error::new("native_rejected", message)
-            .with_where("plugin.antigravity.native.response")
+            .with_where(response_origin)
             .with_origin(
                 eliot_core::FailureOrigin::Harness,
                 "ACP validation refusal; no documented upstream error shape",
@@ -495,9 +515,9 @@ fn map_response_error(code: i64, message: String) -> Result<Value> {
     } else {
         Err(Error::new(
             "unknown",
-            format!("Antigravity ACP call failed with native code {code}"),
+            format!("{harness} ACP call failed with native code {code}"),
         )
-        .with_where("plugin.antigravity.native.response")
+        .with_where(response_origin)
         .with_origin(
             eliot_core::FailureOrigin::Harness,
             "native ACP error; upstream origin not documented",
@@ -505,14 +525,16 @@ fn map_response_error(code: i64, message: String) -> Result<Value> {
     }
 }
 
-fn classify_agy_frame(
+fn classify_acp_frame(
     value: Value,
     fenced: &Arc<StdMutex<HashMap<String, FencedKind>>>,
-) -> PumpAction<AgyFrame> {
+    harness: &str,
+    response_origin: &str,
+) -> PumpAction<AcpFrame> {
     if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return PumpAction::Malformed(
-            "Antigravity stream contained an invalid JSON-RPC version".to_owned(),
-        );
+        return PumpAction::Malformed(format!(
+            "{harness} stream contained an invalid JSON-RPC version"
+        ));
     }
     if let Some(id) = value.get("id").cloned() {
         if value.get("method").is_some() {
@@ -521,7 +543,7 @@ fn classify_agy_frame(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            return PumpAction::Emit(AgyFrame::ServerRequest {
+            return PumpAction::Emit(AcpFrame::ServerRequest {
                 id,
                 method,
                 params: value.get("params").cloned().unwrap_or(Value::Null),
@@ -533,17 +555,18 @@ fn classify_agy_frame(
                 error.get("code").and_then(Value::as_i64),
                 error.get("message").and_then(Value::as_str),
             ) {
-                (Some(code), Some(message)) => map_response_error(code, message.to_owned()),
+                (Some(code), Some(message)) => {
+                    map_response_error(code, message.to_owned(), harness, response_origin)
+                }
                 _ => Err(Error::new(
                     "unknown",
-                    "Antigravity ACP error response did not match its envelope",
+                    format!("{harness} ACP error response did not match its envelope"),
                 )),
             },
             _ => {
-                return PumpAction::Malformed(
-                    "Antigravity ACP response did not contain exactly one result or error"
-                        .to_owned(),
-                );
+                return PumpAction::Malformed(format!(
+                    "{harness} ACP response did not contain exactly one result or error"
+                ));
             }
         };
         let key = id
@@ -559,8 +582,8 @@ fn classify_agy_frame(
             .remove(&key);
         if let Some(kind) = kind {
             return PumpAction::Emit(match kind {
-                FencedKind::Prompt => AgyFrame::PromptResponse(result),
-                FencedKind::Load => AgyFrame::LoadResponse {
+                FencedKind::Prompt => AcpFrame::PromptResponse(result),
+                FencedKind::Load => AcpFrame::LoadResponse {
                     request_id: key,
                     result,
                 },
@@ -569,12 +592,12 @@ fn classify_agy_frame(
         return PumpAction::Route { key, result };
     }
     match value.get("method").and_then(Value::as_str) {
-        Some("session/update") => PumpAction::Emit(AgyFrame::Update(
+        Some("session/update") => PumpAction::Emit(AcpFrame::Update(
             value.get("params").cloned().unwrap_or(Value::Null),
         )),
         Some(_) => PumpAction::Skip,
-        None => {
-            PumpAction::Malformed("Antigravity frame was not a notification or response".to_owned())
-        }
+        None => PumpAction::Malformed(format!(
+            "{harness} frame was not a notification or response"
+        )),
     }
 }

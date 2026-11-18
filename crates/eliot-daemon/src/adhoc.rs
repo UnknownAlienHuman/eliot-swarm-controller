@@ -18,8 +18,12 @@ use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 
 pub(crate) const ADHOC_PROFILE_PREFIX: &str = "adhoc-";
+mod zed;
+
+pub(crate) use zed::eval_cli_name;
+
 pub(crate) const SUPPORTED_HARNESSES: &[&str] =
-    &["codex", "claude", "muse", "opencode", "antigravity"];
+    &["codex", "claude", "muse", "opencode", "antigravity", "zed"];
 
 pub(crate) const DISCOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 use std::time::{Duration, Instant};
@@ -332,6 +336,10 @@ fn apply_adhoc_access(
                 "ad-hoc access must be ask, auto or full",
             )),
         },
+        "zed" if access == "full" => {
+            snapshot.insert("dangerously_skip_permissions".to_owned(), Value::Bool(true));
+            Ok(())
+        }
         "antigravity" => match access {
             // `false` keeps the ACP `session/request_permission` round-trip
             // that bridges to `swarm approve`/`deny`; `true` is the
@@ -448,6 +456,29 @@ pub(crate) fn adhoc_snapshot(
                 .transpose()?,
         ),
     };
+    if harness == "zed" {
+        if catalogue_only {
+            return Err(core::Error::new(
+                "unsupported",
+                "Zed eval-cli has no read-only model catalogue",
+            ));
+        }
+        if access.map(str::trim) != Some("full") {
+            return Err(core::Error::new(
+                "unsupported",
+                "Zed eval-cli requires explicit --access full",
+            ));
+        }
+        if model
+            .as_deref()
+            .is_none_or(|model| split_provider_model(model).is_none())
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                "Zed eval-cli requires an explicit provider/model",
+            ));
+        }
+    }
     if harness == "antigravity" && model.is_none() && !catalogue_only {
         return Err(core::Error::new(
             "profile_error",
@@ -539,6 +570,16 @@ pub(crate) fn adhoc_snapshot(
                 snapshot.insert("auth_integration".to_owned(), Value::String(selector));
             }
         }
+        "zed" => {
+            let cmd = cmd.ok_or_else(zed::missing)?;
+            if !eval_cli_name(&cmd) {
+                return Err(zed::missing());
+            }
+            snapshot.insert(
+                "cmd".to_owned(),
+                Value::String(validate_native_cmd(&profile_name, &cmd)?),
+            );
+        }
         "antigravity" => {
             let cmd = cmd.ok_or_else(|| {
                 core::Error::new(
@@ -605,7 +646,18 @@ pub(crate) fn adhoc_snapshot(
         "native_subagents".to_owned(),
         Value::String("allow".to_owned()),
     );
-    snapshot.insert("pass_env".to_owned(), Value::Array(Vec::new()));
+    let pass_env = if harness == "zed" {
+        json!([
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_AI_API_KEY",
+            "OLLAMA_API_KEY"
+        ])
+    } else {
+        json!([])
+    };
+    snapshot.insert("pass_env".to_owned(), pass_env);
     snapshot.insert("scratch".to_owned(), json!(["target/", "node_modules/"]));
     snapshot.insert(
         "capacity_scopes".to_owned(),
@@ -747,6 +799,7 @@ fn discover_cmd_for_harness(harness: &str, deadline: Instant) -> core::Result<Op
         "muse" => discover_muse_cmd(Path::new(r"C:\Tools\MuseCode")).map(Some),
         "opencode" => discover_opencode_cmd().map(Some),
         "antigravity" => discover_antigravity_cmd().map(Some),
+        "zed" => zed::discover().map(Some),
         _ => Err(core::Error::new(
             "unsupported",
             "unsupported native discovery harness",
@@ -1680,8 +1733,11 @@ fn agy_help_has_acp(help: &[u8]) -> bool {
 /// The installed CLI carries its upstream Go module name. Screen the file
 /// before execution so an IDE copied to a file named agy is also refused.
 fn has_agy_cli_module(program: &str, deadline: Instant) -> bool {
+    executable_contains(program, b"google-antigravity/antigravity-cli", deadline)
+}
+
+fn executable_contains(program: &str, marker: &[u8], deadline: Instant) -> bool {
     use std::io::Read;
-    const MODULE: &[u8] = b"google-antigravity/antigravity-cli";
     let Ok(mut file) = std::fs::File::open(program) else {
         return false;
     };
@@ -1702,12 +1758,12 @@ fn has_agy_cli_module(program: &str, deadline: Instant) -> bool {
         }
         let end = carry + read;
         if bytes[..end]
-            .windows(MODULE.len())
-            .any(|window| window == MODULE)
+            .windows(marker.len())
+            .any(|window| window == marker)
         {
             return true;
         }
-        carry = (MODULE.len() - 1).min(end);
+        carry = (marker.len() - 1).min(end);
         bytes.copy_within(end - carry..end, 0);
     }
     false
@@ -1719,6 +1775,12 @@ pub(crate) async fn reader_executable(
     deadline: Instant,
 ) -> core::Result<(String, Option<String>)> {
     let cmd = cmd.to_owned();
+    if harness == "zed" {
+        return blocking_discovery(deadline, move || {
+            zed::probe(&cmd, deadline).map(|cmd| (cmd, None))
+        })
+        .await?;
+    }
     let agy = harness == "antigravity";
     blocking_discovery(deadline, move || {
         let cmd = resolve_native_executable(&cmd, agy)?;
@@ -1770,6 +1832,10 @@ fn installation_error(harness: &str, error: core::Error) -> Value {
 pub(crate) fn harness_installation(harness: &str, deadline: Instant) -> Value {
     let read = || -> core::Result<Value> {
         let discovered = discover_cmd_for_harness(harness, deadline)?;
+        if harness == "zed" {
+            let cmd = zed::probe(discovered.as_deref().ok_or_else(zed::missing)?, deadline)?;
+            return Ok(json!({"harness": harness, "installed": true, "cmd": cmd, "version": null}));
+        }
         let agy = harness == "antigravity";
         let cmd = resolve_native_executable(discovered.as_deref().unwrap_or("codex"), agy)?;
         let version = probe_native_version(&cmd, agy, deadline)?;

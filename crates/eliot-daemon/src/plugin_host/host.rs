@@ -433,7 +433,7 @@ impl PluginHost {
         }
         if !matches!(
             agent.harness.as_str(),
-            "codex" | "muse" | "claude" | "opencode" | "antigravity"
+            "codex" | "muse" | "claude" | "opencode" | "antigravity" | "zed"
         ) || agent.generation <= 0
         {
             return Err(Error::new(
@@ -474,11 +474,16 @@ impl PluginHost {
         } else {
             None
         };
-        if agent.harness == "antigravity" {
-            let cmd = agent.profile_snapshot["cmd"].as_str().unwrap_or("agy");
+        if matches!(agent.harness.as_str(), "antigravity" | "zed") {
+            let fallback = if agent.harness == "zed" {
+                "eval-cli"
+            } else {
+                "agy"
+            };
+            let cmd = agent.profile_snapshot["cmd"].as_str().unwrap_or(fallback);
             let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
             let (program, _) =
-                crate::adhoc::reader_executable(cmd, "antigravity", deadline).await?;
+                crate::adhoc::reader_executable(cmd, &agent.harness, deadline).await?;
             agent.profile_snapshot["cmd"] = Value::String(program);
         }
         let key = AgentKey {
@@ -2509,7 +2514,7 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
 
     if !matches!(
         harness,
-        "codex" | "muse" | "claude" | "opencode" | "antigravity"
+        "codex" | "muse" | "claude" | "opencode" | "antigravity" | "zed"
     ) {
         return Err(unsupported_manifest());
     }

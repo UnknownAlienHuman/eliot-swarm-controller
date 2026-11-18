@@ -32,9 +32,9 @@ jobs:
       - name: Formatting
         run: cargo fmt --check
       - name: Scoped Clippy and static checks
-        run: cargo clippy --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode -p eliot-plugin-antigravity -p swarm-desktop -- -D warnings
+        run: cargo clippy --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode -p eliot-plugin-antigravity -p eliot-plugin-zed -p swarm-desktop -- -D warnings
       - name: Static compilation of maintained packages (all targets)
         # CI enforces static validation only; runtime qualification is actual installed
         # vendor agents through Swarm on real tasks, with exact binary, model, principal,
         # outcomes, and owned cleanup recorded in the PR.
-        run: cargo build --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode -p eliot-plugin-antigravity -p swarm-desktop
+        run: cargo build --locked --all-targets -p eliot -p eliot-core -p eliot-store -p eliot-plugin -p eliot-daemon -p eliot-plugin-codex -p eliot-plugin-muse -p eliot-plugin-claude -p eliot-plugin-opencode -p eliot-plugin-antigravity -p eliot-plugin-zed -p swarm-desktop

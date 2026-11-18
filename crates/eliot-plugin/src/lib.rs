@@ -1,3 +1,4 @@
+pub mod acp;
 mod bounded_file;
 pub mod debug;
 mod file_identity;
@@ -27,6 +28,16 @@ pub use protocol::{
     RpcResponse,
 };
 pub use stderr::{StderrCapture, StderrSnapshot, StderrView, spawn_plugin_stderr, spawn_stderr};
+
+/// Read a bounded regular file produced by an owned native invocation.
+pub fn read_native_artifact(path: &std::path::Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    bounded_file::read_regular_file(path, limit).map_err(|error| match error {
+        bounded_file::BoundedFileError::Io(error) => error,
+        bounded_file::BoundedFileError::TooLarge => {
+            std::io::Error::other("native artifact exceeded its size limit")
+        }
+    })
+}
 
 #[cfg(test)]
 mod agent_start_frame {

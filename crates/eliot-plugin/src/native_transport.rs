@@ -22,6 +22,7 @@ use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
+    io::AsyncWriteExt,
     process::{ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -749,6 +750,8 @@ fn read_oversized_json_string(bytes: &[u8], start: usize) -> Option<(String, usi
 pub struct NativeChild {
     pid: Option<u32>,
     kill: Option<oneshot::Sender<()>>,
+    #[cfg(target_os = "linux")]
+    interrupt: mpsc::Sender<oneshot::Sender<bool>>,
     process_exit: watch::Receiver<Option<ProcessExit>>,
     process_task: Option<tokio::task::JoinHandle<()>>,
     writer: NativeWriter,
@@ -857,7 +860,28 @@ impl NativeChild {
         policy: SecretPolicy,
         labels: NativeLabels,
     ) -> Result<(Self, ChildStdout)> {
+        Self::spawn_inner(launch, policy, labels, false).await
+    }
+
+    /// Spawn a batch program with only its explicitly scoped environment.
+    pub async fn spawn_with_private_environment(
+        launch: NativeLaunch,
+        policy: SecretPolicy,
+        labels: NativeLabels,
+    ) -> Result<(Self, ChildStdout)> {
+        Self::spawn_inner(launch, policy, labels, true).await
+    }
+
+    async fn spawn_inner(
+        launch: NativeLaunch,
+        policy: SecretPolicy,
+        labels: NativeLabels,
+        private_environment: bool,
+    ) -> Result<(Self, ChildStdout)> {
         let mut command = Command::new(&launch.program);
+        if private_environment {
+            command.env_clear();
+        }
         command
             .args(&launch.args)
             .current_dir(&launch.cwd)
@@ -926,20 +950,38 @@ impl NativeChild {
         }
         let (exit_tx, process_exit) = watch::channel(None);
         let (kill, mut kill_rx) = oneshot::channel();
+        #[cfg(target_os = "linux")]
+        let (interrupt, mut interrupt_rx) = mpsc::channel::<oneshot::Sender<bool>>(1);
         let server = labels.server;
         let writer = NativeWriter::new(stdin, labels);
         let exit_writer = writer.clone();
         let process_task = tokio::spawn(async move {
-            let result = tokio::select! {
-                status = child.wait() => status,
-                _ = &mut kill_rx => {
-                    match child.start_kill() {
-                        Ok(()) => child.wait().await,
-                        Err(kill_error) => match child.try_wait() {
-                            Ok(Some(status)) => Ok(status),
-                            Ok(None) => Err(kill_error),
-                            Err(wait_error) => Err(wait_error),
-                        },
+            let result = loop {
+                tokio::select! {
+                    status = child.wait() => break status,
+                    _ = &mut kill_rx => {
+                        break match child.start_kill() {
+                            Ok(()) => child.wait().await,
+                            Err(kill_error) => match child.try_wait() {
+                                Ok(Some(status)) => Ok(status),
+                                Ok(None) => Err(kill_error),
+                                Err(wait_error) => Err(wait_error),
+                            },
+                        };
+                    }
+                    reply = async {
+                        #[cfg(target_os = "linux")]
+                        { interrupt_rx.recv().await }
+                        #[cfg(not(target_os = "linux"))]
+                        { std::future::pending::<Option<oneshot::Sender<bool>>>().await }
+                    } => {
+                        if let Some(reply) = reply {
+                            #[cfg(target_os = "linux")]
+                            let delivered = terminate_owned_linux_child(&mut child);
+                            #[cfg(not(target_os = "linux"))]
+                            let delivered = false;
+                            let _ = reply.send(delivered);
+                        }
                     }
                 }
             };
@@ -980,6 +1022,8 @@ impl NativeChild {
         let child = Self {
             pid,
             kill: Some(kill),
+            #[cfg(target_os = "linux")]
+            interrupt,
             process_exit,
             process_task: Some(process_task),
             writer,
@@ -1145,6 +1189,34 @@ impl NativeChild {
         }
     }
 
+    /// Request SIGTERM on the same unreaped Linux child. The caller must
+    /// still wait for native terminal evidence.
+    pub async fn request_interrupt(&self, deadline: Instant) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let (reply, completion) = oneshot::channel();
+            let signal = async {
+                self.interrupt.send(reply).await.ok()?;
+                completion.await.ok()
+            };
+            match timeout_at(deadline, signal).await {
+                Ok(Some(true)) => Ok(()),
+                _ => Err(Error::new(
+                    "unknown",
+                    "native interrupt delivery was not confirmed",
+                )),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = deadline;
+            Err(Error::new(
+                "unsupported",
+                "native batch interrupt is Linux-only",
+            ))
+        }
+    }
+
     /// Flush input, then end the owned process. The graceful close only fires
     /// when the process is still running; the kill path only fires when the
     /// graceful close cannot be confirmed.
@@ -1216,6 +1288,21 @@ impl NativeChild {
         self.await_output_drained(deadline).await?;
         Ok(status)
     }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn terminate_owned_linux_child(child: &mut tokio::process::Child) -> bool {
+    // The only waiter owns Child. try_wait refuses an already-exited process,
+    // and the unreaped child cannot recycle its PID while the signal is sent.
+    if !matches!(child.try_wait(), Ok(None)) {
+        return false;
+    }
+    let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) else {
+        return false;
+    };
+    // SAFETY: pid is the positive PID of this task's unreaped child.
+    unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
 }
 
 impl Drop for NativeChild {
@@ -1333,6 +1420,34 @@ impl NativeWriter {
             Ok(Err(_)) | Err(_) => Err(Error::new(
                 "unknown",
                 format!("{} write outcome is unknown", self.labels.server),
+            )),
+        }
+    }
+
+    /// Send the exact bytes and EOF to a one-shot reader. Do not use this on
+    /// a framed connection.
+    pub async fn send_batch_input(&self, input: &[u8], deadline: Instant) -> Result<()> {
+        let mut slot = timeout_at(deadline, self.writer.lock())
+            .await
+            .map_err(|_| {
+                Error::new(
+                    "native_not_dispatched",
+                    "native batch input writer was busy",
+                )
+            })?;
+        let mut writer = slot.take().ok_or_else(|| {
+            Error::new(
+                "native_not_dispatched",
+                "native batch input is already closed",
+            )
+        })?;
+        let result = timeout_at(deadline, writer.get_mut().write_all(input)).await;
+        drop(writer);
+        match result {
+            Ok(Ok(())) => Ok(()),
+            _ => Err(Error::new(
+                "unknown",
+                "native batch input delivery was not confirmed",
             )),
         }
     }

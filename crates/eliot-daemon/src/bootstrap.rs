@@ -352,6 +352,10 @@ fn installed_default_profiles(
 ) -> serde_json::Map<String, Value> {
     let mut profiles = serde_json::Map::new();
     for harness in crate::adhoc::SUPPORTED_HARNESSES {
+        // Zed eval runs with full tool access and needs an explicit model.
+        if *harness == "zed" {
+            continue;
+        }
         if *harness == "muse" {
             let Some(cmd) = muse_cmd.clone() else {
                 continue;
