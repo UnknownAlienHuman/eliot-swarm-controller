@@ -235,6 +235,8 @@ pub(super) fn caller_may_command(
 pub(super) struct ParentLink {
     pub(super) num: i64,
     pub(super) project: String,
+    pub(super) project_scope: String,
+    pub(super) chat: bool,
     pub(super) root_num: i64,
     pub(super) depth: i64,
     pub(super) profile: String,
@@ -284,7 +286,9 @@ pub(super) fn resolve_launch_parent(
     let root_num = parse_agent_id(&parent_agent.root)?;
     Ok(Some(ParentLink {
         num: parent_num,
-        project: parent_agent.project_scope().to_owned(),
+        project_scope: parent_agent.project_scope().to_owned(),
+        project: parent_agent.project,
+        chat: parent_agent.chat,
         root_num,
         depth: parent_agent.depth,
         profile: parent_agent.profile.clone(),
@@ -1686,7 +1690,10 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "ALTER TABLE turns DROP COLUMN resolution_source;
+                    "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                 ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 DELETE FROM schema_migrations WHERE version=57;
+                 ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version=56;
                  ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;

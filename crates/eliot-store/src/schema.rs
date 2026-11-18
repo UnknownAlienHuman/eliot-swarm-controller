@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 56;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 57;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1323,6 +1323,20 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 57 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE project_assignments ADD COLUMN workspace_path TEXT;
+                 ALTER TABLE project_assignments ADD COLUMN workspace_adopted INTEGER NOT NULL DEFAULT 0
+                     CHECK(workspace_adopted IN (0, 1));
+                 INSERT INTO schema_migrations(version) VALUES (57);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1362,7 +1376,10 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN resolution_source;
+                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                 ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 DELETE FROM schema_migrations WHERE version = 57;
+                 ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version = 56;",
             )
             .unwrap();
@@ -1394,7 +1411,10 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN resolution_source;
+                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                 ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 DELETE FROM schema_migrations WHERE version=57;
+                 ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version=56;
                  ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
@@ -1461,7 +1481,10 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN resolution_source;
+                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                 ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 DELETE FROM schema_migrations WHERE version=57;
+                 ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version=56;
                  ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
@@ -1513,7 +1536,10 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN resolution_source;
+                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                 ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 DELETE FROM schema_migrations WHERE version=57;
+                 ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version=56;
                  ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
@@ -1608,7 +1634,10 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN resolution_source;
+                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                 ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 DELETE FROM schema_migrations WHERE version=57;
+                 ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version=56;
                  ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;

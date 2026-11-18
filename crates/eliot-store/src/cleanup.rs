@@ -727,6 +727,23 @@ impl Store {
         Ok((plan, response, true))
     }
 
+    pub fn cleanup_worktree_blocker(
+        &self,
+        artifact: &ArtifactView,
+    ) -> Result<Option<&'static str>> {
+        self.ensure_committed_reads()?;
+        if artifact.kind != ArtifactKind::Worktree {
+            return Ok(None);
+        }
+        if project_assignment::workspace_path_bound(&self.connection, &artifact.path)? {
+            return Ok(Some("assignment_bound"));
+        }
+        if workspace::workspace_has_borrowers(&self.connection, &artifact.agent, &artifact.path)? {
+            return Ok(Some("workspace_borrowed"));
+        }
+        Ok(None)
+    }
+
     pub fn cleanup_agent_quiescent(&self, artifact: &ArtifactView) -> Result<bool> {
         let Some(agent) = self.get_agent(&artifact.agent)? else {
             return Ok(false);

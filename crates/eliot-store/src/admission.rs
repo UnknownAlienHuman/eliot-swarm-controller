@@ -812,21 +812,18 @@ fn admit_launch_tx(
         .get("chat")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let inherited_chat = parent_link
-        .as_ref()
-        .map(|p| load_agent_by_num(tx, p.num))
-        .transpose()?
-        .flatten()
-        .is_some_and(|p| p.chat);
+    let inherited_chat = parent_link.as_ref().is_some_and(|parent| parent.chat);
     let scope = match parent_link.as_ref() {
-        Some(parent) => parent.project.clone(),
+        Some(parent) => parent.project_scope.clone(),
         None if chat && principal == "owner" => String::new(),
         None => required_string(&request.args, "project")?,
     };
-    let project = if chat || inherited_chat {
-        scope.clone()
-    } else {
-        optional_string(&request.args, "registered_project")?.unwrap_or_else(|| scope.clone())
+    let project = match parent_link.as_ref() {
+        Some(parent) => parent.project.clone(),
+        None if chat => scope.clone(),
+        None => {
+            optional_string(&request.args, "registered_project")?.unwrap_or_else(|| scope.clone())
+        }
     };
     let project_scope = (scope != project).then_some(&scope);
     let harness = required_string(&request.args, "harness")?;
@@ -981,12 +978,15 @@ fn admit_launch_tx(
         .get(project_assignment::MANAGER_LAUNCH_ARG)
         .is_some()
     {
-        if principal != "owner" || parent_num.is_some() || chat || preparation.is_some() {
+        if principal != "owner" || parent_num.is_some() || chat {
             return Err(Error::new(
                 "not_allowed",
                 "manager launch must be an Owner root launch",
             ));
         }
+        // A managed manager launch carries its frozen worktree preparation
+        // (or an explicit adoption recorded beside it): the same transaction
+        // reserves the assignment, the workspace row and capacity together.
         project_assignment::reserve_launch(tx, &project, agent_num, &request.id)?;
     }
     let command = CommandInsert::admitted(principal, request, payload_digest, (agent_num, 0), now);

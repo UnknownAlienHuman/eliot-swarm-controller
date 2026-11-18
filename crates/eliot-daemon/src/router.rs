@@ -1726,7 +1726,7 @@ impl Router {
                 let frozen = async {
                     {
                         let store = self.inner.store.lock().await;
-                        hierarchy::default_agent_child_workspace(&store, &mut request, principal)?;
+                        hierarchy::default_child_workspace(&store, &mut request)?;
                     }
                     let chat = match request.args.get("chat") {
                         None => false,
@@ -1761,12 +1761,18 @@ impl Router {
                         request.args["workspace"] = json!(root.to_string_lossy());
                     }
                     normalize_launch(&mut request, principal)?;
-                    let inherited_chat = {
+                    let parent_workspace_shared = {
                         let store = self.inner.store.lock().await;
                         hierarchy::inherit_launch_project_scope(&store, &mut request)?
                     };
-                    self.freeze_launch_admission(principal, &mut request, !chat && !inherited_chat)
-                        .await
+                    let resolve_project = !chat && request.args.get("parent").is_none();
+                    self.freeze_launch_admission(
+                        principal,
+                        &mut request,
+                        resolve_project,
+                        parent_workspace_shared,
+                    )
+                    .await
                 }
                 .await;
                 workspace = match frozen {
@@ -1942,6 +1948,7 @@ impl Router {
         principal: &Principal,
         request: &mut SubmitCommand,
         resolve_project: bool,
+        parent_workspace_shared: bool,
     ) -> Result<Option<WorkspacePreparationInput>> {
         if self.freeze_launch_profile(principal, request).await? {
             return retained_preparation(&request.args);
@@ -1967,12 +1974,13 @@ impl Router {
             }
         }
         let Some(branch) = request.args.get("worktree").and_then(Value::as_str) else {
-            if request
-                .args
-                .get("profile_snapshot")
-                .and_then(|profile| profile.get("setup"))
-                .and_then(Value::as_array)
-                .is_some_and(|setup| !setup.is_empty())
+            if !parent_workspace_shared
+                && request
+                    .args
+                    .get("profile_snapshot")
+                    .and_then(|profile| profile.get("setup"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|setup| !setup.is_empty())
             {
                 return Err(Error::new(
                     "unsupported",

@@ -179,8 +179,8 @@ and the competing caller receives the current record with a typed reason.
 Release advances the epoch and retains the vacant record. Resume advances the
 manager generation and epoch atomically with dispatch. Replacement requires an
 explicit release and new assignment. Release revokes Swarm authority and
-leaves existing execution to its native lifecycle. An unresolved manager start
-blocks release. Ordinary startup of a separate root is refused while the
+leaves existing execution to its native lifecycle. Dispatched or unresolved
+native startup blocks release. Ordinary startup of a separate root is refused while the
 assignment is occupied. Restart reads the existing record. A heartbeat timeout,
 lost process or uncertain startup never frees an assignment. Owner retains explicit
 administrative and recovery authority. A scoped self-claim requires a live eligible
@@ -196,6 +196,35 @@ respect current authority. Automation uses the same command fence. Legacy rows
 with no assignment history retain ordinary control. Adoption must account for
 existing writers before claiming exclusive workspace custody. Assignment is
 Swarm control authority. Filesystem isolation depends on the native sandbox.
+
+A manager launch in managed multi-project mode reserves the assignment,
+the workspace and capacity in one Store transaction before any external
+effect. The daemon resolves the registered repository, verifies its identity,
+freezes the base OID from the local HEAD without fetching, and prepares a
+fresh opaque worktree on a unique branch through the existing [preparation
+and setup chain](monitoring.md#workspace-preparation). Native dispatch starts
+only once that worktree is ready. A retry under the same operation ID returns
+the retained result; after a restart the daemon reads back the existing
+preparation instead of preparing a second worktree or re-running an unknown
+setup. A confirmed preparation failure or cancellation settles the launch and
+clears the assignment, binding and unstarted capacity together. Uncertain
+preparation retains a blocked assignment with the workspace and start command ID.
+The Owner can explicitly release that epoch. Release preserves the unknown
+command, workspace receipt and capacity, and fences subsequent startup.
+
+Workers launched by that manager inherit its project assignment and workspace
+automatically through the existing parent link. They run in the manager's ready
+worktree under the current assignment fence and can reuse a frozen profile with
+setup entries. Workspace setup runs only during preparation of a new worktree.
+
+The current workspace binding to the assignment is recorded separately from
+the historical creator receipt, so a later transfer can move the binding without
+rewriting history. Cleanup planning, cleanup apply and worktree removal keep
+bound worktrees and worktrees with nonterminal borrowers, including after release.
+Explicit adoption verifies the canonical checkout and common directory, rejects
+overlap with retained bindings, managed worktrees and live Agent workspaces, and
+freezes the approved profile for native startup. It keeps the existing checkout
+environment and creates no setup effects or worktree cleanup artifact.
 
 ## Conversation association
 

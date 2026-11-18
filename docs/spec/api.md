@@ -476,11 +476,25 @@ epoch. An Owner grant permits eligible Agents to claim themselves. Launch uses
 the Owner principal in 2a. A competing claim or
 launch returns the occupied assignment with a typed reason. Mutations retain
 their outcome under the existing operation ID and principal. A read returns the
-latest record, including a vacant record after release. Remote assignment is
+latest record, including its current workspace and start command ID when present.
+A confirmed preparation failure or cancellation leaves a vacant record. An
+unknown preparation reads as blocked, with the outcome on the start command.
+Owner release revokes that assignment at its epoch and retains the preparation
+receipt and unknown outcome. Remote assignment is
 unsupported. CLI callers use `swarm project assignment get|claim|launch|release`.
 An explicit Owner claim supplies the Agent ID and generation. A scoped claim
 omits the manager to select the caller. The project action
 `project.assignment.claim` grants self-claim under the configured profile allowlist.
+
+A managed manager launch always runs in a project worktree. Without an explicit
+`adopt_worktree` the daemon prepares a fresh opaque worktree on a unique
+branch from the frozen base OID and runs the existing preparation and setup chain
+before native dispatch; workers inherit that worktree through the parent link.
+`adopt_worktree` names an existing checkout of the same repository explicitly;
+adoption verifies Git identity and live workspace overlap, and freezes the profile
+without running its setup. Cleanup and worktree removal keep bound or borrowed
+worktrees. Releasing the assignment clears its binding.
+CLI callers add `--adopt-worktree PATH` to the launch form when adopting.
 
 For ordinary commands, a supplied `args.assignment_epoch` is a precondition when
 the verb accepts it. Admission records the current binding even when it is
@@ -1085,14 +1099,16 @@ from the parent snapshot's captured `child_profiles` allow-list; the daemon reso
 that configured profile now and freezes its snapshot for the child. A `role`
 instead selects ordered candidates intersected with the parent's frozen allow-list
 (including its inherited profile). An unlisted name is rejected before any native effect. An omitted
-`workspace` defaults to the parent's workspace; an explicit different workspace
+`workspace` defaults to the parent's workspace, including for CLI child launches.
+The child keeps the parent's recorded project ID. An explicit different workspace
 rejects, so a child never escapes the parent's workspace. Same-harness children
 retain model/effort-only confinement and inherit captured credential bindings
 verbatim. An allow-listed different harness is an explicit Owner grant of that
 profile's own native policy and bindings; parent credential/native-store bindings
 are never copied across harnesses. Capacity scopes keep every non-profile scope
 of the parent with the same bounds alongside the child's own scopes; conflicting
-bounds reject. Then the authority check below
+bounds reject. Inherited workspace launches use the prepared environment without
+running setup. Then the authority check below
 applies: control is narrowed or equal, the workspace is shared, and no worktree is
 minted. An Owner child launch may instead supply `profile`, a different workspace,
 and `worktree`, and remains unrestricted by that check

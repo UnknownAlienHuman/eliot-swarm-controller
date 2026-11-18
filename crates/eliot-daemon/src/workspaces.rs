@@ -940,13 +940,16 @@ impl WorkspaceManager {
                     if matches!(outcome, WorkspaceCreationOutcome::Verified { .. }) {
                         let _gate = slot.gate.clone().lock_owned().await;
                         let mut store = self.inner.store.lock().await;
-                        let change = store.settle_workspace_creation(
+                        match store.settle_workspace_creation(
                             &preparation.start_command_id,
                             preparation.target_generation,
                             safe_creation(outcome),
                             now_ms(),
-                        )?;
-                        self.publish(&change.events);
+                        ) {
+                            Ok(change) => self.publish(&change.events),
+                            Err(error) if error.code == "stale_assignment" => return Ok(None),
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
                 Some("removal") => {

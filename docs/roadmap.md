@@ -86,11 +86,11 @@ Checked layers record delivered increments, not full crash/load qualification.
 
 ## Multi-project Swarm (#657)
 
-- [ ] **1. Desktop project identity.** Fix Move and Handoff selection using the
+- [x] **1. Desktop project identity.** Fix Move and Handoff selection using the
   registration ID and preserve server-side authorization scope.
 - [x] **2a. Manager assignment core.** Persist atomic assignment and epoch, expose
   CLI/MCP claim, launch, read and release, and fence admission and queued dispatch.
-- [ ] **2b. Manager worktree and worker inheritance.** Reserve the manager's workspace
+- [x] **2b. Manager worktree and worker inheritance.** Reserve the manager's workspace
   with launch, use existing preparation and setup, and have workers inherit it.
 - [ ] **2c. Project and global capacity and readback.** Extend transactional
   reservations and return exact project, manager and fleet usage.

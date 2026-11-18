@@ -67,6 +67,14 @@ impl Store {
         read_assignment(&self.connection, project)
     }
 
+    /// Whether a worktree path is currently bound to a project manager
+    /// assignment. Cleanup planning and worktree removal both refuse bound
+    /// paths; release unbinds them.
+    pub fn workspace_assignment_bound(&self, path: &str) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        workspace_path_bound(&self.connection, path)
+    }
+
     pub fn claim_project_manager(
         &mut self,
         principal: &str,
@@ -154,7 +162,7 @@ impl Store {
     pub fn launch_project_manager(
         &mut self,
         request: &ProjectAssignmentLaunchRequest,
-        prepared: Result<SubmitCommand>,
+        prepared: Result<(SubmitCommand, Option<WorkspacePreparationInput>)>,
         now: i64,
     ) -> Result<Change<ProjectAssignmentResult>> {
         request.validate()?;
@@ -169,11 +177,10 @@ impl Store {
                     Vec::new(),
                 ));
             }
-            let mut launch = prepared?;
+            let (mut launch, preparation) = prepared?;
             if launch.id != request.id
                 || launch.verb != "launch"
                 || launch.args["profile"].as_str() != Some(request.profile.as_str())
-                || launch.args["workspace"].as_str() != Some(registration.checkout.as_str())
                 || !registration.actions.iter().any(|action| action == "launch")
                 || !registration.profiles.contains(&request.profile)
             {
@@ -182,9 +189,37 @@ impl Store {
                     "manager launch binding differs from the approved project and profile",
                 ));
             }
+            let adopted = request.adopt_worktree.as_deref();
+            let bound_path = match (adopted, &preparation) {
+                (None, Some(input)) => {
+                    if launch.args["workspace"].as_str() != Some(registration.checkout.as_str()) {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "manager worktree must start from the registered checkout",
+                        ));
+                    }
+                    input.worktree_path.clone()
+                }
+                (Some(_), None) => {
+                    // The router has normalized the request path and verified
+                    // its Git identity before freezing this launch.
+                    let workspace = required_string(&launch.args, "workspace")?;
+                    workspace::require_absolute_workspace_path(&workspace)?;
+                    require_no_adoption_writers(tx, &workspace)?;
+                    workspace
+                }
+                _ => {
+                    return Err(Error::new(
+                        "invalid",
+                        "manager launch prepares a worktree or adopts a checkout, never both",
+                    ));
+                }
+            };
             launch.args["registered_project"] = json!(request.project);
             launch.args[MANAGER_LAUNCH_ARG] = json!(registration.revision);
-            let admission = admission::submit_tx(tx, "owner", launch, None, now, false, limits)?;
+            let admission =
+                admission::submit_tx(tx, "owner", launch, preparation, now, false, limits)?;
+            bind_manager_workspace(tx, &request.project, &bound_path, adopted.is_some())?;
             let result = ProjectAssignmentResult {
                 assignment: read_assignment(tx, &request.project)?,
                 outcome: ProjectAssignmentOutcome::LaunchAdmitted,
@@ -219,9 +254,7 @@ impl Store {
                 ProjectAssignmentOutcome::StaleEpoch
             } else if current.manager.is_none() {
                 ProjectAssignmentOutcome::Vacant
-            } else if start_state(tx, &request.project)?.is_some_and(|state| {
-                matches!(state, CommandState::Dispatched | CommandState::Unknown)
-            }) {
+            } else if startup_blocks_release(tx, &current)? {
                 ProjectAssignmentOutcome::StartupUncertain
             } else {
                 write_next_assignment(tx, &current, None, None)?;
@@ -335,24 +368,41 @@ fn load_row(conn: &Connection, project: &str) -> Result<Option<AssignmentRow>> {
     ).optional().map_err(sql_error)
 }
 
-fn start_state(conn: &Connection, project: &str) -> Result<Option<CommandState>> {
-    let state: Option<String> = conn.query_row(
-        "SELECT c.state FROM project_assignments a JOIN commands c ON c.id=a.start_command WHERE a.project=?1",
-        [project], |row| row.get(0),
-    ).optional().map_err(sql_error)?;
-    state
-        .map(|state| parse_enum(&state, "assignment start command state"))
-        .transpose()
+fn startup_blocks_release(conn: &Connection, assignment: &ProjectAssignment) -> Result<bool> {
+    let Some(id) = &assignment.start_command_id else {
+        return Ok(false);
+    };
+    let Some(start) = load_command(conn, id)? else {
+        return Ok(false);
+    };
+    // Operator release can revoke a blocked pre-native launch. Its uncertain
+    // effect and capacity remain retained independently of the assignment.
+    let preparation_unknown = start.verb == "launch"
+        && start.generation == Some(0)
+        && start.outcome.as_ref().is_some_and(|outcome| {
+            outcome["stage"] == "workspace" && outcome["native_dispatched"] == false
+        });
+    Ok(start.state == CommandState::Dispatched
+        || start.state == CommandState::Unknown && !preparation_unknown)
 }
 
 fn read_assignment(conn: &Connection, project: &str) -> Result<ProjectAssignment> {
     let (num, generation, epoch, revision) = load_row(conn, project)?.unwrap_or((None, None, 0, 0));
+    let (workspace, start_command_id, state): (Option<String>, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT a.workspace_path, a.start_command, c.state
+             FROM project_assignments a LEFT JOIN commands c ON c.id=a.start_command
+             WHERE a.project=?1",
+            [project],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .unwrap_or_default();
     let (manager, state) = if let Some((num, generation)) = num.zip(generation) {
-        let state = match start_state(conn, project)? {
-            Some(CommandState::Unknown) => ProjectAssignmentState::Blocked,
-            Some(CommandState::Accepted | CommandState::Queued | CommandState::Dispatched) => {
-                ProjectAssignmentState::Starting
-            }
+        let state = match state.as_deref() {
+            Some("unknown") => ProjectAssignmentState::Blocked,
+            Some("accepted" | "queued" | "dispatched") => ProjectAssignmentState::Starting,
             _ => match load_agent_by_num(conn, num)? {
                 Some(agent) if agent.generation == generation && manager_live(agent.state) => {
                     ProjectAssignmentState::Active
@@ -376,6 +426,8 @@ fn read_assignment(conn: &Connection, project: &str) -> Result<ProjectAssignment
         epoch,
         revision,
         state,
+        workspace,
+        start_command_id,
     })
 }
 
@@ -395,9 +447,29 @@ fn write_next_assignment(
          VALUES(?1,?2,?3,?4,?5,?6)
          ON CONFLICT(project) DO UPDATE SET manager=excluded.manager,
              manager_generation=excluded.manager_generation, epoch=excluded.epoch,
-             revision=excluded.revision, start_command=excluded.start_command",
+             revision=excluded.revision, start_command=excluded.start_command,
+             workspace_path=CASE WHEN excluded.manager IS NOT NULL THEN workspace_path END,
+             workspace_adopted=CASE WHEN excluded.manager IS NULL THEN 0 ELSE workspace_adopted END",
         params![current.project,manager,generation,epoch,revision,start],
     ));
+    Ok(())
+}
+
+pub(super) fn clear_failed_preparation(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    command_id: &str,
+) -> Result<()> {
+    let assignment = read_assignment(tx, &agent.project)?;
+    if assignment.start_command_id.as_deref() == Some(command_id)
+        && assignment.manager
+            == Some(ProjectManagerIdentity::Local {
+                agent: agent.id.clone(),
+                generation: 1,
+            })
+    {
+        write_next_assignment(tx, &assignment, None, None)?;
+    }
     Ok(())
 }
 
@@ -405,6 +477,83 @@ fn next_epoch(epoch: i64) -> Result<i64> {
     epoch
         .checked_add(1)
         .ok_or_else(|| Error::new("bad_state", "assignment sequence exhausted"))
+}
+
+/// Record the current workspace binding for a manager assignment, separate
+/// from the historical creator receipt (`start_command`). The binding moves
+/// with the assignment: a fresh manager launch overwrites it, release clears
+/// it, resume keeps it. A bound worktree is never removed; an adopted checkout
+/// additionally never becomes a cleanup artifact.
+fn bind_manager_workspace(
+    tx: &Transaction<'_>,
+    project: &str,
+    path: &str,
+    adopted: bool,
+) -> Result<()> {
+    let mut rows = tx.prepare(
+        "SELECT workspace_path FROM project_assignments WHERE workspace_path IS NOT NULL AND project <> ?1
+         UNION ALL SELECT worktree_path FROM workspaces WHERE phase <> 'removed'
+         AND (?2 OR worktree_path <> ?3)",
+    )
+        .map_err(sql_error)?;
+    for other in rows
+        .query_map(params![project, adopted, path], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(sql_error)?
+    {
+        if workspaces_overlap(path, &other.map_err(sql_error)?) {
+            return Err(Error::new(
+                "id_conflict",
+                "bound worktree overlaps a retained worktree",
+            ));
+        }
+    }
+    db!(tx.execute(
+        "UPDATE project_assignments SET workspace_path = ?1, workspace_adopted = ?2 WHERE project = ?3",
+        params![path, i64::from(adopted), project],
+    ));
+    Ok(())
+}
+
+fn require_no_adoption_writers(tx: &Transaction<'_>, path: &str) -> Result<()> {
+    let mut statement = tx
+        .prepare(
+            "SELECT workspace FROM agents a WHERE workspace IS NOT NULL
+         AND (a.state IN ('created','starting','idle','busy','waiting','unknown')
+              OR EXISTS (SELECT 1 FROM processes p WHERE p.state <> 'exited'
+                         AND p.owner IN ('agent:a' || a.id || '#' || a.generation,
+                                         'workspace:a' || a.id || '#' || a.generation)))",
+        )
+        .map_err(sql_error)?;
+    for other in statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sql_error)?
+    {
+        if workspaces_overlap(path, &other.map_err(sql_error)?) {
+            return Err(Error::new(
+                "id_conflict",
+                "adopted checkout overlaps a live Agent workspace",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn workspaces_overlap(a: &str, b: &str) -> bool {
+    workspace::managed_path_contains(a, b) || workspace::managed_path_contains(b, a)
+}
+
+/// Whether any current assignment binds this worktree path. The binding is
+/// currency by itself: release clears it and a new launch overwrites it, so a
+/// set path always names a live assignment.
+pub(super) fn workspace_path_bound(conn: &Connection, path: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM project_assignments WHERE workspace_path = ?1)",
+        [path],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 pub(super) fn reserve_launch(

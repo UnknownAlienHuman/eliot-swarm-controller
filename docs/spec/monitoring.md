@@ -327,10 +327,10 @@ removal cleanup and prevents a stale observation from recreating removed provena
 A workspace identifies the concrete checkout, branch and frozen base OID, using
 the existing preparation receipt when Swarm creates it. The receipt preserves the
 creating Agent and generation. The current workspace binding to a manager
-assignment is independent of that receipt. When assignment-bound worktrees are
-implemented, workers inherit that binding and preparation, and transfer and cleanup
-must check its current owner and borrowers. The 2a assignment core uses existing
-workspace selection.
+assignment is independent of that receipt. Workers share the manager's prepared
+worktree through the parent link. Cleanup planning, cleanup apply and worktree
+removal respect the current binding and nonterminal borrowers. Releasing the
+assignment preserves the preparation receipt and any existing borrowers.
 
 ## Git and filesystem monitor
 
