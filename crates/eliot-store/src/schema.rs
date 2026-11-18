@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 52;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 53;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1233,6 +1233,20 @@ impl Store {
             ).map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 53 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE agents ADD COLUMN project_scope TEXT;
+                 CREATE INDEX agents_list_project_scope
+                   ON agents(COALESCE(project_scope, project), id);
+                 INSERT INTO schema_migrations(version) VALUES (53);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1247,7 +1261,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+                "DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                 DELETE FROM schema_migrations WHERE version=53;
+                 DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
                  DELETE FROM schema_migrations WHERE version=52;
                  DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
                  DROP INDEX processes_live_owner;
@@ -1304,7 +1320,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+                "DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                 DELETE FROM schema_migrations WHERE version=53;
+                 DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
                  DELETE FROM schema_migrations WHERE version=52;
                  DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
                  DROP INDEX processes_live_owner;
@@ -1346,7 +1364,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+                "DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                 DELETE FROM schema_migrations WHERE version=53;
+                 DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
                  DELETE FROM schema_migrations WHERE version=52;
                  DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
                  DROP INDEX processes_live_owner;
@@ -1431,7 +1451,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+                "DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                 DELETE FROM schema_migrations WHERE version=53;
+                 DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
                  DELETE FROM schema_migrations WHERE version=52;
                  DROP INDEX events_git_hints; DELETE FROM schema_migrations WHERE version=51;
                  DROP INDEX processes_live_owner;

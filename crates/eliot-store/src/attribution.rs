@@ -119,9 +119,9 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, generation, state, project, workspace FROM agents
+                "SELECT id, generation, state, COALESCE(project_scope, project), workspace FROM agents
                  WHERE state NOT IN ('stopped','failed','lost')
-                   AND (?1 IS NULL OR project = ?1)
+                   AND (?1 IS NULL OR COALESCE(project_scope, project) = ?1)
                  ORDER BY id ASC LIMIT ?2",
             )
             .map_err(sql_error)?;
@@ -219,7 +219,7 @@ impl Store {
                 let row = load_agent_by_num(&self.connection, num)?.ok_or_else(|| {
                     Error::new("not_found", format!("Agent {agent} was not found"))
                 })?;
-                Some((num, row.project))
+                Some((num, row.project_scope().to_owned()))
             }
         };
         match parse_sender(principal, "coordination")? {
@@ -241,17 +241,20 @@ impl Store {
                 let project_mismatch = request
                     .project
                     .as_deref()
-                    .is_some_and(|project| project != current.project)
+                    .is_some_and(|project| project != current.project_scope())
                     || agent
                         .as_ref()
-                        .is_some_and(|(_, project)| project != &current.project);
+                        .is_some_and(|(_, project)| project != current.project_scope());
                 if project_mismatch {
                     return Err(Error::new(
                         "not_allowed",
                         "Agents list only their own project claims",
                     ));
                 }
-                Ok((Some(current.project), agent.map(|(num, _)| num)))
+                Ok((
+                    Some(current.project_scope().to_owned()),
+                    agent.map(|(num, _)| num),
+                ))
             }
         }
     }
@@ -266,13 +269,13 @@ impl Store {
                 num, generation, ..
             } => {
                 let current = load_current_claim_agent(&self.connection, num, generation)?;
-                if project.is_some_and(|project| project != current.project) {
+                if project.is_some_and(|project| project != current.project_scope()) {
                     return Err(Error::new(
                         "not_allowed",
                         "Agents read only their own project workers",
                     ));
                 }
-                Ok(Some(current.project))
+                Ok(Some(current.project_scope().to_owned()))
             }
         }
     }
@@ -291,7 +294,7 @@ impl Store {
                  WHERE c.expires_at > ?1
                    AND c.generation = a.generation
                    AND a.state NOT IN ('stopped','failed','lost')
-                   AND (?2 IS NULL OR a.project = ?2)
+                   AND (?2 IS NULL OR COALESCE(a.project_scope, a.project) = ?2)
                    AND (?3 IS NULL OR c.agent = ?3)
                  ORDER BY c.agent ASC, c.glob ASC LIMIT ?4",
             )
@@ -365,7 +368,7 @@ impl Store {
         let (target_num, expires_at) =
             Self::admit_claim_row(&tx, &target, &glob, request.note.as_deref(), ttl_secs, now)?;
         let (conflicts, truncated) =
-            Self::scan_claim_conflicts(&tx, &target.project, &target.id, &glob, now)?;
+            Self::scan_claim_conflicts(&tx, target.project_scope(), &target.id, &glob, now)?;
         let event = insert_daemon_event(
             &tx,
             now,
@@ -593,14 +596,14 @@ pub(super) fn transfer_claims_tx(
     let to_num = parse_agent_id(&to.id)?;
     let claims = Store::live_claims(
         tx,
-        Some(&from.project),
+        Some(from.project_scope()),
         Some(from_num),
         now,
         MAX_CLAIMS_PER_AGENT as i64 + 1,
     )?;
     let destination = Store::live_claims(
         tx,
-        Some(&to.project),
+        Some(to.project_scope()),
         Some(to_num),
         now,
         MAX_CLAIMS_PER_AGENT as i64 + 1,
@@ -661,7 +664,8 @@ pub(super) fn transfer_claims_tx(
     let mut seen = std::collections::HashSet::new();
     let mut truncated = false;
     for glob in &moved {
-        let (found, capped) = Store::scan_claim_conflicts(tx, &to.project, &to.id, glob, now)?;
+        let (found, capped) =
+            Store::scan_claim_conflicts(tx, to.project_scope(), &to.id, glob, now)?;
         truncated |= capped;
         for conflict in found {
             if seen.insert((

@@ -429,6 +429,9 @@ pub struct Agent {
     pub control: AgentControl,
     pub name: Option<String>,
     pub project: String,
+    /// The pre-resolution authorization namespace when it differs from the project.
+    #[serde(skip)]
+    pub project_scope: Option<String>,
     pub harness: String,
     pub profile: String,
     #[serde(default = "empty_object")]
@@ -490,6 +493,7 @@ impl Agent {
             control: AgentControl::Slf,
             name: None,
             project: project.into(),
+            project_scope: None,
             harness: harness.into(),
             profile: profile.into(),
             profile_snapshot: empty_object(),
@@ -512,6 +516,10 @@ impl Agent {
         }
     }
 
+    pub fn project_scope(&self) -> &str {
+        self.project_scope.as_deref().unwrap_or(&self.project)
+    }
+
     pub fn is_terminal(&self) -> bool {
         self.state.is_terminal()
     }
@@ -530,7 +538,7 @@ pub struct EventSubject {
 impl From<&Agent> for EventSubject {
     fn from(agent: &Agent) -> Self {
         Self {
-            project: agent.project.clone(),
+            project: agent.project_scope().to_owned(),
             harness: agent.harness.clone(),
             profile: agent.profile.clone(),
             state: agent.state,

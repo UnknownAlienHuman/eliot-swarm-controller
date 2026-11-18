@@ -101,7 +101,7 @@ const NONTERMINAL_AGENTS_WHERE: &str =
 const LIST_NONTERMINAL_AGENTS_COLUMNS: &str = "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat
+                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat, project_scope
                  FROM agents";
 const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
     "state IN ('accepted', 'queued', 'dispatched', 'unknown') AND (
@@ -873,7 +873,7 @@ impl Store {
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat
+                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat, project_scope
                  FROM agents WHERE id > ?1 ORDER BY id LIMIT ?2",
             )
             .map_err(sql_error)?;
@@ -902,7 +902,7 @@ impl Store {
                 "SELECT id, generation, name, project, harness, profile,
                         profile_snapshot, native_scope, native_ref, workspace, effective,
                         pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat
+                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat, project_scope
                  FROM agents
                  WHERE id > ?1 AND observe_only = 0 AND (state IN ('busy', 'waiting')
                    OR EXISTS(SELECT 1 FROM native_child_registrations r
@@ -3170,6 +3170,7 @@ fn validate_process_generation(
 }
 
 struct AgentRecord {
+    project_scope: Option<String>,
     id: i64,
     generation: i64,
     name: Option<String>,
@@ -3502,6 +3503,7 @@ fn agent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecor
         profile_choice: row.get(24)?,
         archived: row.get(25)?,
         chat: row.get(26)?,
+        project_scope: row.get(27)?,
     })
 }
 
@@ -3532,6 +3534,7 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
         control: AgentControl::parse(&record.control)?,
         name: record.name,
         project: record.project,
+        project_scope: record.project_scope,
         harness: record.harness,
         profile: record.profile,
         profile_snapshot: decode_json(&record.profile_snapshot)?,
@@ -3584,7 +3587,7 @@ fn load_agent_by_num(connection: &Connection, id: i64) -> Result<Option<Agent>> 
             "SELECT id, generation, name, project, harness, profile,
                     profile_snapshot, native_scope, native_ref, workspace, effective,
                     pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                    parent, root, depth, control, profile_inherited, profile_choice, archived, chat
+                    parent, root, depth, control, profile_inherited, profile_choice, archived, chat, project_scope
              FROM agents WHERE id = ?1",
             [id],
             agent_record_from_row,

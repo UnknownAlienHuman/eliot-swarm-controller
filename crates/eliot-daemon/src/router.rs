@@ -1747,25 +1747,12 @@ impl Router {
                         request.args["workspace"] = json!(root.to_string_lossy());
                     }
                     normalize_launch(&mut request, principal)?;
-                    if matches!(principal, Principal::Owner)
-                        && !chat
-                        && let Some(workspace) =
-                            request.args.get("workspace").and_then(Value::as_str)
-                    {
-                        let policy = self.secret_policy_snapshot();
-                        crate::bootstrap::discover_project(
-                            &self.inner.data_root,
-                            &self.inner.store,
-                            std::path::Path::new(workspace),
-                            &policy,
-                        )
-                        .await?;
-                    }
-                    {
+                    let inherited_chat = {
                         let store = self.inner.store.lock().await;
-                        hierarchy::inherit_launch_project(&store, &mut request)?;
-                    }
-                    self.freeze_launch_admission(principal, &mut request).await
+                        hierarchy::inherit_launch_project_scope(&store, &mut request)?
+                    };
+                    self.freeze_launch_admission(principal, &mut request, !chat && !inherited_chat)
+                        .await
                 }
                 .await;
                 workspace = match frozen {
@@ -1940,9 +1927,30 @@ impl Router {
         &self,
         principal: &Principal,
         request: &mut SubmitCommand,
+        resolve_project: bool,
     ) -> Result<Option<WorkspacePreparationInput>> {
         if self.freeze_launch_profile(principal, request).await? {
             return retained_preparation(&request.args);
+        }
+        if resolve_project {
+            let workspace = std::path::Path::new(required_text(&request.args, "workspace")?);
+            let project = if matches!(principal, Principal::Owner) {
+                crate::bootstrap::discover_project(
+                    &self.inner.data_root,
+                    &self.inner.store,
+                    workspace,
+                    &self.secret_policy_snapshot(),
+                )
+                .await?
+                .project
+                .map(|project| project.id)
+            } else {
+                crate::bootstrap::resolve_registered_project(&self.inner.data_root, workspace)
+                    .await?
+            };
+            if let Some(project) = project {
+                request.args["registered_project"] = json!(project);
+            }
         }
         let Some(branch) = request.args.get("worktree").and_then(Value::as_str) else {
             if request
@@ -5560,6 +5568,7 @@ struct RetainedLaunchProfile {
     profile_choice: Option<Value>,
     workspace: Option<Value>,
     project: Option<Value>,
+    registered_project: Option<Value>,
     preparation: Option<Value>,
     agent_child: bool,
 }
@@ -5632,6 +5641,7 @@ fn retained_launch_profile(
         .cloned();
     let workspace = command.args.get("workspace").cloned();
     let project = command.args.get("project").cloned();
+    let registered_project = command.args.get("registered_project").cloned();
     let preparation = command.args.get("workspace_preparation").cloned();
     let agent_child =
         command.principal.starts_with("agent:") && command.args.get("parent").is_some();
@@ -5664,6 +5674,7 @@ fn retained_launch_profile(
             profile_choice,
             workspace,
             project,
+            registered_project,
             preparation,
             agent_child,
         }));
@@ -5690,6 +5701,7 @@ fn retained_launch_profile(
             profile_choice,
             workspace,
             project,
+            registered_project,
             preparation,
             agent_child,
         }));
@@ -5760,6 +5772,7 @@ fn install_retained_profile(
         profile_choice,
         workspace,
         project,
+        registered_project,
         preparation,
         agent_child,
     } = retained;
@@ -5815,6 +5828,11 @@ fn install_retained_profile(
         }
         if let Some(project) = project {
             args.insert("project".to_owned(), project);
+        }
+        if let Some(project) = registered_project {
+            args.insert("registered_project".to_owned(), project);
+        } else {
+            args.remove("registered_project");
         }
     }
     Ok(())
@@ -5907,6 +5925,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
         ));
     }
     for reserved in [
+        "registered_project",
         "profile_choice",
         "source_plan",
         "target_environment",

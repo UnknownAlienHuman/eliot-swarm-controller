@@ -164,7 +164,9 @@ fn schema_51_upgrade_records_the_legacy_generation_name_before_reminting() {
         .target
         .unwrap();
     store.dispatch(&id, now).unwrap();
-    store.connection.execute_batch("DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace; DELETE FROM schema_migrations WHERE version=52;").unwrap();
+    store.connection.execute_batch("DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                 DELETE FROM schema_migrations WHERE version=53;
+                 DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace; DELETE FROM schema_migrations WHERE version=52;").unwrap();
     drop(store);
     let store = Store::open(&path).unwrap();
     let git_hints_index: bool = store.connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='events_git_hints')", [], |row| row.get(0)).unwrap();
@@ -647,7 +649,9 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+            "DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                 DELETE FROM schema_migrations WHERE version=53;
+                 DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
                  DELETE FROM schema_migrations WHERE version=52;
                  DROP INDEX events_git_hints;
                  DELETE FROM schema_migrations WHERE version=51;

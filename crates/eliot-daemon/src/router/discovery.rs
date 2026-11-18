@@ -395,7 +395,7 @@ impl Router {
                     .ok_or_else(|| Error::new("not_found", "authenticated Agent no longer exists"))?;
                 Ok(IdentityResponse {
                     principal:"agent".to_owned(), agent_id:Some(id.clone()), generation:Some(*generation),
-                    allowed_scopes:vec!["global".to_owned(), format!("project:{}", agent.project), format!("mailbox:{id}")],
+                    allowed_scopes:vec!["global".to_owned(), format!("project:{}", agent.project_scope()), format!("mailbox:{id}")],
                     limits:"Variables default to your project. Global variables are read-only for Agents; other-project variables reject. agent.list follows your frozen control scope (self, subtree, or project); event visibility is self-scoped. Mail send addresses concrete Agents; mailbox reads/acks are self-only. Agent control/read visibility and approved child profiles remain checked at the existing authority boundaries.".to_owned(),
                 })
             }

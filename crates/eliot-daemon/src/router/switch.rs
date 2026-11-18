@@ -69,15 +69,14 @@ impl Router {
                     )
                 })?;
             launch.args = request.launch.args(workspace)?;
-            let project = source.project;
+            let scope = source.project_scope();
             let mut prepared = self
                 .prepare_submission_after_authorization(launch, &Principal::Owner, false, false)
                 .await?;
-            // The source project is trusted Store identity, not caller authority. Workspace
-            // canonicalization/Git freeze stay normal; a different worktree is still this project.
-            prepared.request.args["project"] = json!(project);
+            // The replacement retains the source's authorization namespace for handoff.
+            prepared.request.args["project"] = json!(scope);
             if let Some(workspace) = &mut prepared.workspace {
-                workspace.project = project;
+                workspace.project = scope.to_owned();
                 prepared.request.args["workspace_preparation"] = serde_json::to_value(workspace)
                     .map_err(|_| Error::new("internal", "cannot encode switch workspace"))?;
             }

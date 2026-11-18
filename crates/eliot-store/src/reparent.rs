@@ -138,7 +138,7 @@ pub(super) fn reparent_tx(
                     "native child parentage is harness-owned",
                 ));
             }
-            if agent.project != parent.project {
+            if agent.project_scope() != parent.project_scope() {
                 return Err(Error::new(
                     "not_allowed",
                     "reparent must stay in the same project",

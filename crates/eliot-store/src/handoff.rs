@@ -243,7 +243,7 @@ pub(super) fn handoff_tx(
     if from.generation != request.from_generation || to.generation != request.to_generation {
         return Err(Error::new("stale_generation", "handoff generation moved"));
     }
-    if from.project != to.project {
+    if from.project_scope() != to.project_scope() {
         return Err(Error::new(
             "not_allowed",
             "handoff must stay in one project",

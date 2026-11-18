@@ -51,7 +51,11 @@ pub struct AgentSummary {
     pub id: String,
     #[schemars(range(min = 0))]
     pub generation: i64,
+    /// The recorded registration ID, or a legacy/unregistered project label.
     pub project: String,
+    /// Repository identity retained by a managed worktree, including after removal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_common_dir: Option<String>,
     /// The retained execution directory, independently of the project label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
@@ -114,9 +118,14 @@ impl AgentSummary {
             text(&self.project)?;
         }
         text(&self.harness)?;
-        for value in [&self.name, &self.profile, &self.preview]
-            .into_iter()
-            .flatten()
+        for value in [
+            &self.name,
+            &self.profile,
+            &self.preview,
+            &self.repo_common_dir,
+        ]
+        .into_iter()
+        .flatten()
         {
             text(value)?;
         }

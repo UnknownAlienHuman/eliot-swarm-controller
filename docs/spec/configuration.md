@@ -720,22 +720,27 @@ prefers the registered primary checkout even when a legacy registration names th
 worktree itself. Without a registered primary checkout, discovery can reuse a
 sole registration for the common directory. Ambiguous matches refuse discovery.
 Reuse returns that registration's checkout and exact allowlists, preserves the
-Agent's workspace, and adds no settings entry. Workspace inventory is read-only.
-Daemon startup performs no project discovery: a removed project stays removed
-across restarts, and no checkout is ever registered implicitly. Registration
-runs only through an explicit Owner open (`project.discover`), an Owner
-launch in the checkout, or the desktop's workspace checkout.
+Agent's workspace, and adds no settings entry. A launch records the selected
+registration ID independently of its execution workspace and authorization scope.
+Agent-principal launches use the same Git matching with read-only access to existing
+registrations. Workspace inventory is read-only. Daemon startup performs no project
+discovery. Registration runs through an explicit Owner open (`project.discover`),
+an Owner launch in the checkout, or the desktop's workspace checkout.
 `path` names the canonical
 Git checkout; `profiles` and `actions` are explicit allowlists over existing global
 profiles and implemented actions. Missing or empty allowlists deny all. Project
 registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
-project identity includes the canonical checkout and Git common directory, not an Agent's
-project label. The registration ID names nothing a person reads: a project's name is the
+project identity includes the canonical checkout and Git common directory. The registration ID names nothing a person reads: a project's name is the
 owner's `[desktop] display_names` entry, else the repository name of its `origin` remote
 (the readback's read-only `origin`, [api](api.md)), else the folder of the repository's
 main checkout. The daemon readback identifies the main checkout even when Git metadata
 lives in a separate directory. A linked worktree is a subproject of its repository,
 named by the branch from the daemon's verified checkout readback when available.
+The sidebar places an Agent by its recorded registration ID, including after its
+worktree is removed. For legacy path labels it uses any retained managed-worktree
+common directory or an exact, currently verified checkout path. Unresolved legacy
+paths appear in **Other locations**. This is a display derivation and leaves
+historical Agent rows intact.
 
 The optional owner-global `[projects.ID.git]` table binds fetch authority to that
 registration. `fetch_remotes` maps exact remote names to approved direct endpoints without
