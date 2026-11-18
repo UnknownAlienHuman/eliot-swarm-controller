@@ -149,12 +149,14 @@ impl Router {
             }
             let mut launch = SubmitCommand::new(request.id.clone(), "launch");
             // A manager launch always runs in a project worktree. Without an
-            // explicit adoption the daemon prepares a fresh opaque worktree on
-            // a unique branch from the frozen base OID and runs the existing
-            // preparation and setup chain before native dispatch. An explicit
-            // adoption names an existing checkout of the same repository; the
-            // daemon never adopts automatically, and an adopted checkout keeps
-            // its environment with no setup side effects.
+            // explicit adoption the daemon prepares a fresh standard worktree
+            // (`<project>/<agent>-manager`) from the frozen base OID and runs
+            // the existing preparation and setup chain before native dispatch.
+            // The branch is finalized with the admitted Agent ID, never from
+            // the launch operation ID. An explicit adoption names an existing
+            // checkout of the same repository; the daemon never adopts
+            // automatically, and an adopted checkout keeps its environment
+            // with no setup side effects.
             let preparation = if let Some(adopt) = request.adopt_worktree.as_deref() {
                 launch.args = json!({"workspace": adopt, "profile": request.profile});
                 normalize_launch(&mut launch, principal)?;
@@ -169,8 +171,10 @@ impl Router {
                 self.freeze_launch_profile(principal, &mut launch, false).await?;
                 None
             } else {
-                launch.args = json!({"workspace": registration.checkout, "profile": request.profile, "worktree": manager_branch(&request.id)});
+                launch.args = json!({"workspace": registration.checkout, "profile": request.profile, "worktree": ""});
                 normalize_launch(&mut launch, principal)?;
+                launch.args["auto_worktree"] =
+                    json!({"project": request.project, "task": "manager"});
                 let input = self
                     .freeze_launch_admission(principal, &mut launch, false, false, false)
                     .await?;
@@ -218,37 +222,21 @@ fn encode_assignment(value: impl serde::Serialize) -> Result<Value> {
         .map_err(|_| Error::new("internal", "assignment result could not be encoded"))
 }
 
-/// Unique branch for one manager worktree, derived from the launch operation
-/// ID. Retries of the same ID reuse the same branch and read back the retained
-/// preparation instead of preparing a second worktree.
-fn manager_branch(id: &str) -> String {
-    // Git refs can be case-insensitive on disk. Preserve the original case
-    // in a numeric suffix while keeping canonical ULID branches unchanged.
-    let case = id.bytes().fold(0_u32, |bits, byte| {
-        (bits << 1) | u32::from(byte.is_ascii_lowercase())
-    });
-    let name = id.to_ascii_lowercase();
-    if case == 0 {
-        format!("swarm/{name}")
-    } else {
-        format!("swarm/{name}-{case:x}")
-    }
-}
-
+/// Manager launches mint a standard worktree (`<project>/<agent>-manager`)
+/// finalized with the admitted Agent ID. All standard names are lowercase
+/// ASCII, so case-insensitive filesystems keep them distinct. Retries of the
+/// same launch ID read back the retained preparation instead of preparing a
+/// second worktree.
 #[cfg(test)]
 mod tests {
-    use super::manager_branch;
-
     #[test]
-    fn manager_branches_keep_case_distinctions_on_windows() {
-        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
-        let canonical = manager_branch(id);
-        let lower = manager_branch(&id.to_ascii_lowercase());
-        let mixed = manager_branch(&id.replacen('A', "a", 1));
-        assert_eq!(canonical, format!("swarm/{}", id.to_ascii_lowercase()));
-        assert_ne!(canonical, lower);
-        assert_ne!(canonical, mixed);
-        assert_ne!(lower, mixed);
-        assert_eq!(manager_branch(id), canonical);
+    fn manager_naming_hint_carries_project_and_task() {
+        let hint = serde_json::json!({"project": "Atlas", "task": "manager"});
+        assert_eq!(hint["project"], "Atlas");
+        assert_eq!(hint["task"], "manager");
+        assert_eq!(
+            eliot_core::standard_branch("Atlas", "a7", "manager"),
+            "atlas/a7-manager"
+        );
     }
 }

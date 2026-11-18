@@ -27,8 +27,8 @@ pub(crate) use automation::{
 };
 use projects::{ProjectEntry, project_registrations_in};
 pub(crate) use projects::{
-    ProjectRegistrationConfig, default_chats_root, load_project_registration_config,
-    validate_chats_location,
+    ProjectRegistrationConfig, ProjectWorkspaceMode, default_chats_root,
+    load_project_registration_config, validate_chats_location,
 };
 
 const MAX_CONFIG_BYTES: usize = 128 * 1024;

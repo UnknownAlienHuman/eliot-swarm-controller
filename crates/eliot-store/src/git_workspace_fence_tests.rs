@@ -74,6 +74,7 @@ fn admit_workspace(
         base_oid: "d".repeat(40),
         worktree_path,
         frozen_setup: Vec::new(),
+        generated: None,
     };
     let start_command_id = Ulid::new().to_string();
     let mut launch = SubmitCommand::new(start_command_id.clone(), "launch");

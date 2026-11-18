@@ -68,6 +68,7 @@ fn managed_launch(
         base_oid: "0123456789abcdef0123456789abcdef01234567".into(),
         worktree_path: worktree.into(),
         frozen_setup: Vec::new(),
+        generated: None,
     };
     (request, input)
 }

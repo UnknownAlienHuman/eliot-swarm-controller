@@ -230,6 +230,43 @@ pub(super) fn validate_setup_file(file: &FrozenSetupFile) -> Result<()> {
     Ok(())
 }
 
+/// Finalize a daemon-generated standard worktree with the admitted Agent
+/// ID: `<project>/<agent>-<task-slug>` under the frozen worktrees parent.
+/// The Store is the only place that knows both the worktrees root (from the
+/// frozen placeholder's parent) and the admitted Agent ID, so the standard
+/// is implemented once here and never derives from caller command-id syntax.
+fn finalize_generated_naming(
+    connection: &Connection,
+    input: &WorkspacePreparationInput,
+    agent_id: &str,
+    naming: &core::GeneratedWorktreeNaming,
+) -> Result<(String, String)> {
+    require_nonempty(&naming.project_slug, "generated project slug")?;
+    require_nonempty(&naming.task_slug, "generated task slug")?;
+    let branch = core::standard_branch(&naming.project_slug, agent_id, &naming.task_slug);
+    let parent = std::path::Path::new(&input.worktree_path)
+        .parent()
+        .ok_or_else(|| Error::new("invalid", "generated worktree path has no parent"))?;
+    let path = parent.join(core::standard_leaf(agent_id, &naming.task_slug));
+    let path = path
+        .to_str()
+        .ok_or_else(|| Error::new("invalid", "generated worktree path is not valid UTF-8"))?;
+    require_absolute_workspace_path(path)?;
+    if path == input.repo_path {
+        return Err(Error::new(
+            "invalid",
+            "prepared worktree must differ from owner repository",
+        ));
+    }
+    if load_workspace_by_path(connection, path)?.is_some() {
+        return Err(Error::new(
+            "id_conflict",
+            "generated worktree path is already managed",
+        ));
+    }
+    Ok((branch, path.to_owned()))
+}
+
 pub(super) fn validate_workspace_input(input: &WorkspacePreparationInput) -> Result<()> {
     if encode_json(input)?.len() > MAX_PAGE_BYTES {
         return Err(Error::new(
@@ -643,6 +680,13 @@ pub(super) fn admit_workspace_preparation(
             return Ok(());
         };
         require_workspace_sources_ready(tx, &input.repo_path, &input.frozen_setup, 0)?;
+        // A generated standard is finalized here, where the admitted Agent
+        // ID is known. Uniqueness comes from that ID, never from caller
+        // command-id syntax; an explicitly requested branch always wins.
+        let (requested_branch, worktree_path) = match input.generated.as_ref() {
+            Some(naming) => finalize_generated_naming(tx, input, &agent.id, naming)?,
+            None => (input.requested_branch.clone(), input.worktree_path.clone()),
+        };
         let workspace = WorkspacePreparation {
             agent: agent.id,
             target_generation: target,
@@ -650,10 +694,10 @@ pub(super) fn admit_workspace_preparation(
             project: input.project.clone(),
             repo_path: input.repo_path.clone(),
             repo_common_dir: input.repo_common_dir.clone(),
-            requested_branch: input.requested_branch.clone(),
+            requested_branch,
             base_ref: input.base_ref.clone(),
             base_oid: input.base_oid.clone(),
-            worktree_path: input.worktree_path.clone(),
+            worktree_path,
             frozen_setup: input.frozen_setup.clone(),
             phase: WorkspacePhase::Creating,
             setup_index: 0,
@@ -677,6 +721,15 @@ pub(super) fn admit_workspace_preparation(
                 workspace.requested_branch, workspace.base_ref, workspace.base_oid, workspace.worktree_path, encode_json(&workspace.frozen_setup)?,
                 workspace.outcome.as_ref().map(encode_json).transpose()?, now],
         ));
+        if input.generated.is_some() {
+            // The admitted Agent row still carries the frozen placeholder;
+            // rebind it to the finalized standard worktree so the dispatch
+            // gate and `swarm show` readback agree with the workspace row.
+            db!(tx.execute(
+                "UPDATE agents SET workspace = ?1 WHERE id = ?2",
+                params![workspace.worktree_path, agent_num],
+            ));
+        }
         events.push(workspace_event(tx, &workspace, now)?);
     } else if let Some(mut workspace) = load_workspace(tx, agent_num)? {
         if workspace.phase != WorkspacePhase::Ready

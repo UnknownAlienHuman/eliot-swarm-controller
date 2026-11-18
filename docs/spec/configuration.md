@@ -545,6 +545,7 @@ path = "C:/src/app"
 profiles = ["codex-luna"]
 actions = ["run", "interrupt", "send", "stop", "git.fetch"]
 run_env = ["CI"]
+workspace = "worktree"
 
 [projects.app.git]
 fetch_remotes = { origin = "https://github.com/example/app.git" }
@@ -749,7 +750,11 @@ discovery. Registration runs through an explicit Owner open (`project.discover`)
 an Owner launch in the checkout, or the desktop's workspace checkout.
 `path` names the canonical
 Git checkout; `profiles` and `actions` are explicit allowlists over existing global
-profiles and implemented actions. Missing or empty allowlists deny all. Project
+profiles and implemented actions. Missing or empty allowlists deny all.
+`workspace` selects managed-worktree policy for top-level launches in the
+project: `worktree` (the default for registered projects) prepares one standard
+worktree per top-level launch without any flag, while `shared` keeps sharing
+the registered checkout as before. Any other value is invalid. Project
 registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
 project identity includes the canonical checkout and Git common directory. The registration ID names nothing a person reads: a project's name is the
 owner's `[desktop] display_names` entry, else the repository name of its `origin` remote

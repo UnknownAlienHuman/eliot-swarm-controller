@@ -176,13 +176,21 @@ impl WorkspaceGit {
                 "workspace path or branch is already registered",
             ));
         }
-        let reference = base_ref.unwrap_or("HEAD");
-        if reference.is_empty() || reference.contains('\0') {
-            return Err(problem(
-                "invalid",
-                "workspace base reference is empty or malformed",
-            ));
-        }
+        let reference = match base_ref {
+            Some(reference) if !reference.is_empty() && !reference.contains('\0') => {
+                reference.to_owned()
+            }
+            Some(_) => {
+                return Err(problem(
+                    "invalid",
+                    "workspace base reference is empty or malformed",
+                ));
+            }
+            // No explicit base: the project's default branch as it is
+            // locally. Without a readable default this stays local HEAD,
+            // the previous behavior.
+            None => self.default_base_ref(&source.root, deadline).await?,
+        };
         let commit = format!("{reference}^{{commit}}");
         let base_oid = self
             .read_line(
@@ -813,6 +821,110 @@ impl WorkspaceGit {
             ));
         }
         Ok(())
+    }
+
+    /// The project's default branch as it is locally: the short form of
+    /// `refs/remotes/origin/HEAD` when it resolves to a commit, else HEAD.
+    /// Read-only; a missing or unreadable default is not an error.
+    pub(crate) async fn default_base_ref(&self, root: &Path, deadline: Instant) -> Result<String> {
+        let output = self
+            .git
+            .workspace_command(
+                root,
+                &[
+                    "symbolic-ref",
+                    "--short",
+                    "--quiet",
+                    "refs/remotes/origin/HEAD",
+                ],
+                deadline,
+            )
+            .await?;
+        if output.code == 0
+            && let Ok(name) = std::str::from_utf8(&output.stdout)
+            && let name = name.trim_end_matches(['\r', '\n'])
+            && !name.is_empty()
+            && !name.contains('\0')
+        {
+            let commit = format!("{name}^{{commit}}");
+            if let Ok(oid) = self
+                .read_line(root, &["rev-parse", "--verify", &commit], deadline)
+                .await
+                && is_oid(&oid)
+            {
+                return Ok(name.to_owned());
+            }
+        }
+        Ok("HEAD".to_owned())
+    }
+
+    /// Whether `branch` is merged into its base: the branch tip is an
+    /// ancestor of the base tip. The base is the explicit ref when given,
+    /// else the project default as it is locally. Any unreadable identity
+    /// is an error, never a silent unmerged verdict.
+    pub(crate) async fn branch_merged_into_base(
+        &self,
+        repo_root: &Path,
+        branch: &str,
+        base_ref: Option<&str>,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let tip = self
+            .read_line(
+                repo_root,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &branch_ref(branch),
+                ],
+                deadline,
+            )
+            .await?;
+        if !is_oid(&tip) {
+            return Err(problem(
+                "source_integrity",
+                "managed branch tip is not a commit id",
+            ));
+        }
+        let base = match base_ref.filter(|base| !base.is_empty()) {
+            Some(base) => base.to_owned(),
+            None => self.default_base_ref(repo_root, deadline).await?,
+        };
+        if base.contains('\0') {
+            return Err(problem("invalid", "managed base reference is malformed"));
+        }
+        let base_tip = self
+            .read_line(
+                repo_root,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("{base}^{{commit}}"),
+                ],
+                deadline,
+            )
+            .await?;
+        if !is_oid(&base_tip) {
+            return Err(problem(
+                "source_integrity",
+                "managed base tip is not a commit id",
+            ));
+        }
+        let ancestor = self
+            .git
+            .workspace_command(
+                repo_root,
+                &["merge-base", "--is-ancestor", &tip, &base_tip],
+                deadline,
+            )
+            .await?;
+        match ancestor.code {
+            0 => Ok(true),
+            1 => Ok(false),
+            _ => Err(problem("unknown", "branch merge check did not complete")),
+        }
     }
 
     async fn validate_branch(&self, root: &Path, branch: &str, deadline: Instant) -> Result<()> {

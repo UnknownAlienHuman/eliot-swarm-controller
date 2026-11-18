@@ -1997,6 +1997,52 @@ impl Router {
         Ok(())
     }
 
+    /// Whether a top-level launch gets its own prepared worktree without any
+    /// flag: Owner launches in a registered project whose `workspace` setting
+    /// is not `shared` (the default for registered projects). Workers keep
+    /// sharing their parent's worktree; chats never mint one.
+    async fn auto_worktree_for_top_level(
+        &self,
+        principal: &Principal,
+        request: &SubmitCommand,
+    ) -> Result<bool> {
+        if !matches!(principal, Principal::Owner) {
+            return Ok(false);
+        }
+        if request.args.get("parent").is_some() {
+            return Ok(false);
+        }
+        if request.args.get("chat") == Some(&Value::Bool(true)) {
+            return Ok(false);
+        }
+        let Some(project) = request
+            .args
+            .get("registered_project")
+            .and_then(Value::as_str)
+        else {
+            return Ok(false);
+        };
+        let mode = crate::config::load_project_registration_config(&self.inner.data_root)
+            .map(|registrations| {
+                registrations
+                    .into_iter()
+                    .find(|registration| registration.id == project)
+                    .map(|registration| registration.workspace)
+            })
+            .unwrap_or(None);
+        if matches!(mode, Some(crate::config::ProjectWorkspaceMode::Shared)) {
+            return Ok(false);
+        }
+        // Auto preparation needs the exact repository root as its source: a
+        // subdirectory launch keeps its shared workspace instead of failing
+        // the freeze.
+        let workspace = required_text(&request.args, "workspace")?;
+        let identity = crate::workspace_git::WorkspaceGit::new()?
+            .repository_identity(workspace)
+            .await;
+        Ok(identity.is_ok_and(|(root, _)| root == workspace))
+    }
+
     async fn freeze_launch_admission(
         &self,
         principal: &Principal,
@@ -2031,21 +2077,35 @@ impl Router {
                 request.args["registered_project"] = json!(project);
             }
         }
-        let Some(branch) = request.args.get("worktree").and_then(Value::as_str) else {
-            if !parent_workspace_shared
-                && request
-                    .args
-                    .get("profile_snapshot")
-                    .and_then(|profile| profile.get("setup"))
-                    .and_then(Value::as_array)
-                    .is_some_and(|setup| !setup.is_empty())
-            {
-                return Err(Error::new(
-                    "unsupported",
-                    "profile setup requires --worktree",
-                ));
+        // A requested branch name always wins. A bare `--worktree` (an empty
+        // value) or a top-level launch in a `worktree`-mode project generates
+        // the standard branch instead. Workers keep sharing their parent's
+        // worktree through the parent link and never mint one.
+        let generated = match request.args.get("worktree").and_then(Value::as_str) {
+            Some(branch) if !branch.is_empty() => None,
+            Some(_) => Some(generated_naming(request)?),
+            None => {
+                if request.args.get("auto_worktree").is_some()
+                    || self.auto_worktree_for_top_level(principal, request).await?
+                {
+                    Some(generated_naming(request)?)
+                } else {
+                    if !parent_workspace_shared
+                        && request
+                            .args
+                            .get("profile_snapshot")
+                            .and_then(|profile| profile.get("setup"))
+                            .and_then(Value::as_array)
+                            .is_some_and(|setup| !setup.is_empty())
+                    {
+                        return Err(Error::new(
+                            "unsupported",
+                            "profile setup requires --worktree",
+                        ));
+                    }
+                    return Ok(None);
+                }
             }
-            return Ok(None);
         };
         if contains_known_secret(&request.args, &self.inner.secrets) {
             return Err(Error::new(
@@ -2053,19 +2113,40 @@ impl Router {
                 "durable launch contains a known credential",
             ));
         }
-        let input = self
-            .inner
-            .workspaces
-            .freeze_launch(
-                required_text(&request.args, "workspace")?,
-                branch,
-                request.args.get("base").and_then(Value::as_str),
-                request
+        let snapshot = request
+            .args
+            .get("profile_snapshot")
+            .ok_or_else(|| Error::new("internal", "launch profile was not frozen"))?;
+        let input = match generated {
+            Some((project_slug, task_slug)) => {
+                self.inner
+                    .workspaces
+                    .freeze_launch_generated(
+                        required_text(&request.args, "workspace")?,
+                        &project_slug,
+                        &task_slug,
+                        request.args.get("base").and_then(Value::as_str),
+                        snapshot,
+                    )
+                    .await?
+            }
+            None => {
+                let branch = request
                     .args
-                    .get("profile_snapshot")
-                    .ok_or_else(|| Error::new("internal", "launch profile was not frozen"))?,
-            )
-            .await?;
+                    .get("worktree")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::new("internal", "launch worktree branch vanished"))?;
+                self.inner
+                    .workspaces
+                    .freeze_launch(
+                        required_text(&request.args, "workspace")?,
+                        branch,
+                        request.args.get("base").and_then(Value::as_str),
+                        snapshot,
+                    )
+                    .await?
+            }
+        };
         let metadata = serde_json::to_value(&input)
             .map_err(|_| Error::new("internal", "workspace input could not be encoded"))?;
         request
@@ -5387,6 +5468,51 @@ fn validate_project_rule_resume_command(
     Ok(())
 }
 
+/// Naming parts for a generated standard worktree: the registration's
+/// logical name (or the checkout folder for unregistered checkouts) and the
+/// prompt text the Store slugs into `<project>/<agent>-<task-slug>`.
+/// A daemon-set `auto_worktree` hint (manager launches) wins when present.
+fn generated_naming(request: &SubmitCommand) -> Result<(String, String)> {
+    if let Some(hint) = request.args.get("auto_worktree") {
+        let project = hint
+            .get("project")
+            .and_then(Value::as_str)
+            .filter(|project| !project.trim().is_empty())
+            .ok_or_else(|| Error::new("internal", "auto worktree hint has no project"))?;
+        let task = hint
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("manager");
+        return Ok((project.to_owned(), task.to_owned()));
+    }
+    let project = request
+        .args
+        .get("registered_project")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            request
+                .args
+                .get("workspace")
+                .and_then(Value::as_str)
+                .and_then(|workspace| {
+                    std::path::Path::new(workspace)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                })
+        })
+        .filter(|project| !project.trim().is_empty())
+        .ok_or_else(|| Error::new("invalid", "launch workspace has no project name"))?;
+    let task = request
+        .args
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok((project, task))
+}
+
 fn normalize_launch(request: &mut SubmitCommand, _principal: &Principal) -> Result<()> {
     if request.verb != "launch" {
         return Ok(());
@@ -5405,10 +5531,12 @@ fn normalize_launch(request: &mut SubmitCommand, _principal: &Principal) -> Resu
         }
     }
     if let Some(worktree) = request.args.get("worktree") {
-        if worktree
-            .as_str()
-            .is_none_or(|branch| branch.trim().is_empty())
-        {
+        let Some(branch) = worktree.as_str() else {
+            return Err(Error::new("invalid", "worktree must name a new branch"));
+        };
+        // A bare `--worktree` carries an empty value and means "generate the
+        // standard branch". Any other blank value is rejected.
+        if !branch.is_empty() && branch.trim().is_empty() {
             return Err(Error::new("invalid", "worktree must name a new branch"));
         }
     } else if request.args.get("base").is_some() {
@@ -6037,6 +6165,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     for reserved in [
         "registered_project",
         "admission_mode",
+        "auto_worktree",
         "project_assignment_launch",
         "project_transfer_launch",
         "profile_choice",
@@ -6278,6 +6407,49 @@ mod tests {
             Arc::new(AsyncMutex::new(store)),
             Bus::new(16),
         )
+    }
+
+    #[test]
+    fn generated_naming_prefers_hint_then_registration_then_folder() {
+        let mut hinted = SubmitCommand::new("id-hint", "launch");
+        hinted.args = json!({"auto_worktree": {"project": "Atlas", "task": "manager"}});
+        assert_eq!(
+            generated_naming(&hinted).unwrap(),
+            ("Atlas".to_owned(), "manager".to_owned())
+        );
+        let mut registered = SubmitCommand::new("id-reg", "launch");
+        registered.args = json!({
+            "workspace": "C:/src/atlas",
+            "registered_project": "Atlas",
+            "text": "Fix login bug\nsecond line",
+        });
+        assert_eq!(
+            generated_naming(&registered).unwrap(),
+            ("Atlas".to_owned(), "Fix login bug\nsecond line".to_owned())
+        );
+        let mut folder = SubmitCommand::new("id-folder", "launch");
+        folder.args = json!({"workspace": "C:/src/atlas"});
+        assert_eq!(
+            generated_naming(&folder).unwrap(),
+            ("atlas".to_owned(), String::new())
+        );
+    }
+
+    #[test]
+    fn normalize_launch_accepts_bare_worktree_as_generate() {
+        let existing = std::env::temp_dir().to_string_lossy().into_owned();
+        let mut bare = SubmitCommand::new("id-bare", "launch");
+        bare.args = json!({"workspace": existing, "worktree": ""});
+        normalize_launch(&mut bare, &Principal::Owner).unwrap();
+        assert_eq!(bare.args["worktree"], json!(""));
+        let mut blank = SubmitCommand::new("id-blank", "launch");
+        blank.args = json!({"workspace": existing, "worktree": "  "});
+        assert_eq!(
+            normalize_launch(&mut blank, &Principal::Owner)
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
     }
 
     #[tokio::test]
@@ -6974,6 +7146,7 @@ mod tests {
             base_oid: "d".repeat(40),
             worktree_path: root.join("worktree").display().to_string(),
             frozen_setup: Vec::new(),
+            generated: None,
         };
         let start_id = ulid::Ulid::new().to_string();
         let mut launch = SubmitCommand::new(start_id.clone(), "launch");
@@ -9401,6 +9574,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 base_oid: base_oid.clone(),
                 worktree_path: worktree.clone(),
                 frozen_setup: Vec::new(),
+                generated: None,
             };
 
             let launch_id = ulid::Ulid::new().to_string();
@@ -9667,6 +9841,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 base_oid: base_oid.clone(),
                 worktree_path: worktree.clone(),
                 frozen_setup: Vec::new(),
+                generated: None,
             };
             let launch_id = ulid::Ulid::new().to_string();
             let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
@@ -9900,6 +10075,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             base_oid: base_oid.clone(),
             worktree_path: worktree.clone(),
             frozen_setup: Vec::new(),
+            generated: None,
         };
         let (agent, resume_id) = {
             let mut store = router.inner.store.lock().await;
@@ -11196,6 +11372,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             base_oid: "0".repeat(40),
             worktree_path: "worktree".to_owned(),
             frozen_setup: Vec::new(),
+            generated: None,
         });
         assert_eq!(
             validate_rule_resume_preparation(&managed, Some(&without_send))
@@ -11406,6 +11583,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             base_oid: "0".repeat(40),
             worktree_path: "worktree".to_owned(),
             frozen_setup: Vec::new(),
+            generated: None,
         });
         assert_eq!(
             validate_rule_launch_preparation(&prepared)
@@ -11673,6 +11851,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 base_oid: "a".repeat(40),
                 worktree_path: "/synthetic-worktree".to_owned(),
                 frozen_setup: Vec::new(),
+                generated: None,
             };
             let id = store.submit_with_workspace("owner", SubmitCommand {
                 id:ulid::Ulid::new().to_string(), target:None, selector:None, verb:"launch".to_owned(),

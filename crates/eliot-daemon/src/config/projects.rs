@@ -14,6 +14,17 @@ use std::{
 
 const MAX_PROJECT_PATH_LEN: usize = 4096;
 
+/// Managed-worktree policy for top-level launches in a registered project.
+/// `worktree` (the default) prepares one standard worktree per top-level
+/// launch without any flag; `shared` keeps sharing the registered checkout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProjectWorkspaceMode {
+    #[default]
+    Worktree,
+    Shared,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectRegistrationConfig {
     pub id: String,
@@ -23,6 +34,7 @@ pub(crate) struct ProjectRegistrationConfig {
     pub git: Option<core::api::ProjectGitView>,
     pub interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
     pub run_env: Vec<String>,
+    pub workspace: ProjectWorkspaceMode,
 }
 
 pub(crate) fn default_chats_root() -> core::Result<std::path::PathBuf> {
@@ -182,6 +194,9 @@ pub(super) struct ProjectEntry {
     interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
     #[serde(default)]
     run_env: Vec<String>,
+    /// `workspace = "worktree" | "shared"`, default `worktree`.
+    #[serde(default)]
+    workspace: ProjectWorkspaceMode,
 }
 
 /// Read only owner-configured project registrations. Paths and Git identity are
@@ -294,6 +309,7 @@ pub(super) fn project_registrations_in(
             git,
             interpreters: run_grant.interpreters,
             run_env: run_grant.run_env,
+            workspace: entry.workspace,
         });
     }
     projects.sort_by(|left, right| left.id.cmp(&right.id));
@@ -413,6 +429,27 @@ mod tests {
     use super::super::automation::forbidden_run_env_name;
     use super::super::tests::AutomationConfigFixture;
     use super::*;
+
+    #[test]
+    fn project_workspace_mode_defaults_to_worktree_and_accepts_shared() {
+        let fixture = AutomationConfigFixture::new();
+        let project_path = format!("{:?}", fixture.root.to_string_lossy());
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nprofiles = []\nactions = []\n"
+        ));
+        let registrations = load_project_registration_config(&fixture.root).unwrap();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].workspace, ProjectWorkspaceMode::Worktree);
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nprofiles = []\nactions = []\nworkspace = \"shared\"\n"
+        ));
+        let registrations = load_project_registration_config(&fixture.root).unwrap();
+        assert_eq!(registrations[0].workspace, ProjectWorkspaceMode::Shared);
+        fixture.write(&format!(
+            "[projects.sample]\npath = {project_path}\nworkspace = \"checkout\"\n"
+        ));
+        assert!(load_project_registration_config(&fixture.root).is_err());
+    }
 
     #[test]
     fn chats_reject_protected_roots_and_nonexistent_descendants() {

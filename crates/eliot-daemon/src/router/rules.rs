@@ -1260,6 +1260,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                     .to_string_lossy()
                     .into_owned(),
                 frozen_setup: Vec::new(),
+                generated: None,
             };
             let launch = store
                 .submit_with_workspace(
