@@ -113,6 +113,11 @@ pub struct OrgLinkView {
     /// write whose revision moved.
     #[serde(default = "default_link_revision")]
     pub revision: i64,
+    /// The switch source this Agent continues, when a switch created it. A
+    /// plain Agent id, never a foreign key: deleting the source leaves this
+    /// display-only provenance dangling without faulting the Store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_from: Option<String>,
 }
 
 /// The revision of a freshly written overlay row; older retained receipts
@@ -133,6 +138,9 @@ impl OrgLinkView {
                 "unknown",
                 "organization link revision is invalid",
             ));
+        }
+        if let Some(source) = &self.continued_from {
+            parse_agent_id(source)?;
         }
         Ok(())
     }
@@ -163,6 +171,10 @@ pub struct OrgMemberView {
     pub project_link: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The switch source this Agent continues, when a switch created it. See
+    /// [`OrgLinkView::continued_from`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_from: Option<String>,
     /// True when this row is grouped by its placement link, not execution.
     #[serde(default)]
     pub placed: bool,
@@ -202,7 +214,11 @@ impl OrgMemberView {
                 ));
             }
         }
-        validate_tags(&self.tags)
+        validate_tags(&self.tags)?;
+        if let Some(source) = &self.continued_from {
+            parse_agent_id(source)?;
+        }
+        Ok(())
     }
 }
 
@@ -726,6 +742,7 @@ mod tests {
                 project_link: Some("app".to_owned()),
                 tags: Vec::new(),
                 revision: 2,
+                continued_from: None,
             }],
         };
         request.validate_response(&reply).unwrap();
@@ -770,6 +787,7 @@ mod tests {
                 project_link: None,
                 tags: vec!["inbox".to_owned()],
                 revision: 1,
+                continued_from: None,
             }],
         };
         request.validate_response(&reply).unwrap();
@@ -813,6 +831,7 @@ mod tests {
             project_link: None,
             tags: Vec::new(),
             revision: 0,
+            continued_from: None,
         };
         assert!(stale.validate().is_err());
     }
@@ -830,6 +849,7 @@ mod tests {
                     .map(|tag| format!("{tag:016}{}", "t".repeat(MAX_ORG_TAG_BYTES - 16)))
                     .collect(),
                 revision: 1,
+                continued_from: Some(format!("a{}", i64::MAX)),
             })
             .collect();
         let reply = ChatOrganizationMutationResponse {
@@ -903,6 +923,7 @@ mod tests {
             archived: false,
             project_link: None,
             tags: Vec::new(),
+            continued_from: None,
             placed: false,
         };
         let reply = ChatOrganizationResponse {

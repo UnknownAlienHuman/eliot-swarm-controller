@@ -171,7 +171,10 @@ pub use scripts::{
     ScriptInterpreter, ScriptProcessResult, ScriptRuleContext, ScriptRunApplied,
     ScriptTimerContext, ScriptTimerInvocation, bound_script_outcome_stderr,
 };
-pub use switch::{SwitchAgent, SwitchLaunch, SwitchRequest, SwitchResponse};
+pub use switch::{
+    SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchAgent, SwitchLaunch, SwitchRequest,
+    SwitchResponse,
+};
 pub use timers::{CatchUp, TimerGetRequest, TimerRunRequest, TimerSchedule, TimerStateView};
 pub use usage::{
     SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,

@@ -146,12 +146,19 @@ impl AgentSummary {
             &self.profile,
             &self.preview,
             &self.repo_common_dir,
-            &self.project_scope,
         ]
         .into_iter()
         .flatten()
         {
             text(value)?;
+        }
+        // A switch that continues a projectless chat keeps the blank source
+        // namespace on a project worker so the handoff stays in one
+        // namespace; any other scope keeps the usual text check.
+        if let Some(scope) = &self.project_scope
+            && !scope.is_empty()
+        {
+            text(scope)?;
         }
         if self
             .preview

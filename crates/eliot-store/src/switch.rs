@@ -1,6 +1,9 @@
 //! Switch orchestration uses only existing command rows and normal launch/handoff admission.
 use super::*;
-use eliot_core::api::{SwitchAgent, SwitchRequest, SwitchResponse};
+use eliot_core::api::{
+    ORGANIZATION_CHANGED_KIND, OrgRowChange, OrganizationChangedEvent, SwitchAgent, SwitchRequest,
+    SwitchResponse,
+};
 
 const METHOD: &str = "swarm.switch";
 
@@ -200,7 +203,7 @@ impl Store {
             }
             let source: SwitchRequest = serde_json::from_value(parent.args)
                 .map_err(|_| Error::new("source_integrity", "switch request malformed"))?;
-            let agent = source_tx(&tx, &source, self.hierarchy_limits)?;
+            let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits)?;
             let requested = serde_json::to_value(&source.launch)
                 .map_err(|_| Error::new("internal", "cannot encode switch selectors"))?;
             for key in [
@@ -220,6 +223,89 @@ impl Store {
                 return Err(Error::new(
                     "not_allowed",
                     "switch launch must keep the source project",
+                ));
+            }
+            // Continue-in-project keeps the source authorization scope above
+            // and additionally binds the resolved execution registration: the
+            // prepared launch must carry the target the worker verified, at
+            // the revision it verified, or a mismatched workspace or a
+            // revoked registration refuses inside this transaction.
+            if let Some(registration) = target {
+                if request
+                    .args
+                    .get("registered_project")
+                    .and_then(Value::as_str)
+                    != Some(registration.id.as_str())
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "switch target project differs from prepared registration",
+                    ));
+                }
+                let revision = request
+                    .args
+                    .get(core::api::SWITCH_PROJECT_REVISION_ARG)
+                    .and_then(Value::as_i64);
+                if revision != Some(registration.revision) {
+                    return Err(Error::new(
+                        "stale_assignment",
+                        "switch target registration changed",
+                    ));
+                }
+                // The frozen checkout admitted here must already be the
+                // target registration's checkout: a changed registration or
+                // a preparation from another repository refuses before any
+                // workspace row or Agent is created.
+                if request.args.get("workspace").and_then(Value::as_str)
+                    != Some(registration.checkout.as_str())
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "switch workspace differs from its target registration",
+                    ));
+                }
+                if let Some(input) = preparation.as_ref()
+                    && (input.repo_path != registration.checkout
+                        || input.repo_common_dir != registration.repo_common_dir
+                        || input.project != registration.checkout)
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "switch workspace preparation differs from its target registration",
+                    ));
+                }
+                if let Some(preparation) = request.args.get("workspace_preparation") {
+                    let repo_path = preparation.get("repo_path").and_then(Value::as_str);
+                    let repo_common_dir =
+                        preparation.get("repo_common_dir").and_then(Value::as_str);
+                    let preparation_project = preparation.get("project").and_then(Value::as_str);
+                    if repo_path != Some(registration.checkout.as_str())
+                        || repo_common_dir != Some(registration.repo_common_dir.as_str())
+                        || preparation_project != Some(registration.checkout.as_str())
+                    {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "switch workspace preparation differs from its target registration",
+                        ));
+                    }
+                }
+            } else if request
+                .args
+                .get("registered_project")
+                .and_then(Value::as_str)
+                .is_some_and(|project| project != agent.project)
+                || (agent.project != agent.project_scope()
+                    && request
+                        .args
+                        .get("registered_project")
+                        .and_then(Value::as_str)
+                        != Some(agent.project.as_str()))
+            {
+                // An ordinary switch preserves both the execution project and
+                // the authorization scope.
+                return Err(Error::new(
+                    "not_allowed",
+                    "switch must keep the source execution project",
                 ));
             }
             if load_command(&tx, &request.id)?.is_some()
@@ -282,11 +368,16 @@ impl Store {
             let mut events = Vec::new();
             let mut state = CommandState::Failed;
             let mut error = None;
+            // The destination binding is captured before the transfer creates
+            // B's first input; re-deriving it afterwards would see that input
+            // and refuse.
+            let mut continued_to: Option<String> = None;
             if launch.state == CommandState::Applied {
                 tx.execute_batch("SAVEPOINT switch_transfer")
                     .map_err(sql_error)?;
                 let transfer: Result<handoff::HandoffAdmission> = (|| {
                     let destination = ready_destination_tx(&tx, &launch)?;
+                    continued_to = Some(destination.id.clone());
                     let handoff = request.handoff(
                         &plan.handoff_command,
                         &destination.id,
@@ -308,6 +399,64 @@ impl Store {
                         tx.execute_batch("RELEASE switch_transfer")
                             .map_err(sql_error)?;
                         events.extend(change.events);
+                        // The continuation rides the existing overlay: B's
+                        // link records the source it continues. Plain text,
+                        // never a foreign key, so deleting the source
+                        // afterwards cannot fault the Store writer.
+                        let created = continued_to
+                            .as_deref()
+                            .ok_or_else(|| {
+                                Error::new("source_integrity", "switch destination binding missing")
+                            })
+                            .and_then(|destination| {
+                                parse_agent_id(destination).map_err(|_| {
+                                    Error::new(
+                                        "source_integrity",
+                                        "switch destination id malformed",
+                                    )
+                                })
+                            })?;
+                        parse_agent_id(&request.from).map_err(|_| {
+                            Error::new("source_integrity", "switch source id malformed")
+                        })?;
+                        // An existing row (a menu write raced the handoff)
+                        // moves to a new revision like any overlay write, so
+                        // a menu that read it before the switch is refused.
+                        db!(tx.execute(
+                            "INSERT INTO chat_organization(agent, project_link, tags, continued_from)
+                             VALUES (?1, NULL, '[]', ?2)
+                             ON CONFLICT(agent) DO UPDATE SET continued_from = excluded.continued_from,
+                                 revision = chat_organization.revision + 1",
+                            params![created, request.from],
+                        ));
+                        // The event names B's row as this write left it, so a
+                        // loaded sidebar refreshes B by id at its revision.
+                        let (organization, tags, revision) =
+                            organization::agent_organization(&tx, created)?;
+                        let change = OrganizationChangedEvent {
+                            id: id.to_owned(),
+                            method: METHOD.to_owned(),
+                            rows: vec![OrgRowChange {
+                                agent: format_agent_id(created),
+                                organization,
+                                tags,
+                                revision: revision.ok_or_else(|| {
+                                    Error::new("internal", "switch overlay row is missing")
+                                })?,
+                            }],
+                        };
+                        change.validate()?;
+                        events.push(insert_daemon_event(
+                            &tx,
+                            now,
+                            ORGANIZATION_CHANGED_KIND,
+                            "organization",
+                            None,
+                            None,
+                            serde_json::to_value(&change).map_err(|_| {
+                                Error::new("internal", "cannot encode organization event")
+                            })?,
+                        )?);
                         state = CommandState::Applied;
                     }
                     Err(e) => {
@@ -491,7 +640,7 @@ fn source_tx(
     tx: &Transaction<'_>,
     request: &SwitchRequest,
     limits: core::api::HierarchyLimits,
-) -> Result<Agent> {
+) -> Result<(Agent, Option<core::api::ProjectRegistrationView>)> {
     if request.commands.len() as i64 > limits.max_selector_targets {
         return Err(Error::new(
             "fanout_limit",
@@ -504,7 +653,29 @@ fn source_tx(
         return Err(Error::new("stale_generation", "source generation moved"));
     }
     handoff::quiescent(tx, &source, false)?;
-    Ok(source)
+    // Continue-in-project binds the target registration at reserve time, so
+    // preparation resolves the target checkout and never the source repo.
+    // A projectless source has no execution project for B: it must name one.
+    // An Agent continued into a project keeps that execution project, so an
+    // ordinary switch afterwards needs no target.
+    let target = match request.launch.project.as_deref() {
+        Some(project) => Some(projects::project_registration_tx(tx, project)?.ok_or_else(
+            || {
+                Error::new(
+                    "not_found",
+                    format!("switch target project {project} was not found"),
+                )
+            },
+        )?),
+        None if source.project.is_empty() => {
+            return Err(Error::new(
+                "invalid",
+                "switch from a projectless chat needs a target project",
+            ));
+        }
+        None => None,
+    };
+    Ok((source, target))
 }
 
 fn ready_destination_tx(tx: &Connection, launch: &Command) -> Result<Agent> {

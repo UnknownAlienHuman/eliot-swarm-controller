@@ -1392,9 +1392,14 @@ impl Router {
     }
 
     pub(super) async fn settle_workspace_prepare_error(&self, id: &str, error: &Error) {
-        // Typed creation/setup failures settle in WorkspaceManager. If the
-        // final pre-native identity read is uncertain, Store rechecks the
-        // pending command and workspace phase before recording it.
+        // Typed creation/setup failures settle in WorkspaceManager. Pre-effect
+        // revision or identity refusals settle as Rejected here; if the final
+        // pre-native identity read is uncertain, Store rechecks the pending
+        // command and workspace phase before recording it.
+        if matches!(error.code.as_str(), "stale_assignment" | "not_allowed") {
+            self.reject_undispatched_error(id, error).await;
+            return;
+        }
         if error.code == "unknown" {
             let mut store = self.inner.store.lock().await;
             if let Ok(Some(command)) = store.get_command(id)

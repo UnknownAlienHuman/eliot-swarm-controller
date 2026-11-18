@@ -835,9 +835,16 @@ fn admit_launch_tx(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let inherited_chat = parent_link.as_ref().is_some_and(|parent| parent.chat);
+    // A switch that continues a projectless source keeps the blank source
+    // namespace on B. Only the switch worker sets this flag after
+    // preparation; callers cannot forge it through `reject_launch_derived_keys`.
+    let switch_blank_scope = request
+        .args
+        .get(core::api::SWITCH_BLANK_SCOPE_ARG)
+        .is_some_and(|flag| flag == &Value::Bool(true));
     let scope = match parent_link.as_ref() {
         Some(parent) => parent.project_scope.clone(),
-        None if chat && principal == "owner" => String::new(),
+        None if principal == "owner" && (chat || switch_blank_scope) => String::new(),
         None => required_string(&request.args, "project")?,
     };
     let project = match parent_link.as_ref() {
@@ -877,7 +884,23 @@ fn admit_launch_tx(
     let encoded_profile_snapshot = encode_json(&profile_snapshot)?;
     let workspace = match preparation {
         Some(input) => {
-            if input.project != scope {
+            // The frozen preparation belongs to the launch scope, or to the
+            // registered project a switch worker resolved for a continue: the
+            // registration is daemon-frozen beside the launch selectors, and
+            // callers cannot forge it through `reject_launch_derived_keys`.
+            // The workspace record keeps the canonical checkout; the project
+            // ID travels separately in `registered_project`.
+            let registered = optional_string(&request.args, "registered_project")?;
+            let mut matches =
+                input.project == scope || Some(input.project.as_str()) == registered.as_deref();
+            if !matches
+                && let Some(project) = registered.as_deref()
+                && let Some(registration) = projects::project_registration_tx(tx, project)?
+                && input.project == registration.checkout
+            {
+                matches = true;
+            }
+            if !matches {
                 return Err(Error::new(
                     "invalid",
                     "workspace project differs from launch",

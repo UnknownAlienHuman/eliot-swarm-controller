@@ -532,7 +532,8 @@ Tags).
 Organization is placement, never authority: attach, detach and tag write the
 organizational overlay beside the Agent id through Owner-only Store
 transactions (`chat_organization` with placement, tags and a link revision
-beside the Agent id, schema v64 and v65); the execution project, scope,
+beside the Agent id, schema v64 and v65, plus the switch's display-only
+`continued_from` pointer, v66, which these writes preserve); the execution project, scope,
 workspace and history of every Agent keep their retained values.
 
 `chat.organization` (`ChatOrganizationRequest`/`ChatOrganizationResponse` in
@@ -569,7 +570,8 @@ nominal receipt (every link with a full-length project and a full tag set)
 inside the 64 KiB retained-result bound. Every mutation carries an id:
 exact replay returns the committed result before current-state checks, and the
 response carries the committed per-Agent links (`id`, `links:
-Vec<OrgLinkView>` with placement, tags and the new link `revision`). The
+Vec<OrgLinkView>` with placement, tags, the new link `revision` and any
+`continued_from`). The
 optional `expected_revision` carries, per selected Agent in order, the link
 revision it was read with (`agent.list` `organization_revision`, 0 before its
 first organization write); a write whose revision moved since, by any caller,

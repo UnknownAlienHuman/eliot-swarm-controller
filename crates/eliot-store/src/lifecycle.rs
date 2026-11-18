@@ -880,7 +880,21 @@ fn check_settle_verb_guards(
             && matches!(
                 record.state,
                 CommandState::Accepted | CommandState::Queued | CommandState::Unknown
-            ))
+            )
+            && !(record.command.verb == "launch"
+                && state == CommandState::Rejected
+                && matches!(record.state, CommandState::Accepted | CommandState::Queued)
+                && !workspace::workspace_cancel_requested(&workspace)
+                && (matches!(
+                    workspace.phase,
+                    WorkspacePhase::SetupReady | WorkspacePhase::Ready
+                ) || (workspace.phase == WorkspacePhase::Creating
+                    && workspace
+                        .outcome
+                        .as_ref()
+                        .and_then(|value| value.get("native_git_write_dispatched"))
+                        .and_then(Value::as_bool)
+                        == Some(false)))))
             || (record.command.verb == "stop"
                 && workspace
                     .outcome
@@ -1035,6 +1049,18 @@ fn apply_settle_agent_transition(
     if initial_launch_never_dispatched {
         let agent_num = target.ok_or_else(|| Error::new("internal", "launch has no Agent"))?;
         fail_unstarted_launch_tx(tx, agent_num, id, now, events)?;
+        if let Some(agent) = load_agent_by_num(tx, agent_num)? {
+            project_assignment::clear_failed_preparation(tx, &agent, id)?;
+        }
+        if let Some(old_workspace) = workspace::load_workspace(tx, agent_num)?
+            && old_workspace.start_command_id == id
+        {
+            let mut workspace = old_workspace.clone();
+            workspace.phase = WorkspacePhase::Failed;
+            workspace.updated_at = now;
+            workspace::persist_workspace(tx, &old_workspace, &workspace)?;
+            events.push(workspace::workspace_event(tx, &workspace, now)?);
+        }
     } else if matches!(record.command.verb.as_str(), "launch" | "resume")
         && matches!(state, CommandState::Rejected | CommandState::Failed)
     {
