@@ -5,6 +5,8 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use eliot_core::{Error, Result, api::MAX_SCRIPT_EDIT_BYTES};
@@ -126,18 +128,12 @@ impl Directory {
         expected: &[u8],
         bytes: &[u8],
     ) -> Result<()> {
-        // Preserve the existing entry's permission bits on the replacement
-        // inode: the staged temporary starts 0600 inside a private 0700
-        // staging directory on the same filesystem and would otherwise strip
-        // execute and group/other readability on rename. Only
-        // owner/group/other read/write/execute carry over; set-user-ID,
-        // set-group-ID and sticky bits are never copied onto a saved edit.
-        // New private artifacts keep their restrictive creation mode; this
-        // path only replaces an existing project script. Staging in a
-        // private directory (not a same-directory `.tmp`) means a rejected
-        // save leaves no group/other-readable file behind.
         #[cfg(unix)]
-        let preserved = native::permission_bits(original).map_err(io)? & 0o777;
+        let original_metadata = original.metadata().map_err(io)?;
+        #[cfg(unix)]
+        let original_owner = (original_metadata.uid(), original_metadata.gid());
+        #[cfg(unix)]
+        let preserved = original_metadata.mode() & 0o777;
         #[cfg(unix)]
         let stage_name = format!(".{}.stage", ulid::Ulid::new());
         #[cfg(unix)]
@@ -156,7 +152,13 @@ impl Directory {
         #[cfg(unix)]
         let temp_name = "data";
         #[cfg(unix)]
-        let mut temp = native::open(&stage, temp_name.as_ref(), false, true).map_err(io)?;
+        let mut temp = match native::open(&stage, temp_name.as_ref(), false, true) {
+            Ok(file) => file,
+            Err(error) => {
+                native::remove_stage_dir(self.handle(), &stage, &stage_name);
+                return Err(io(error));
+            }
+        };
         #[cfg(not(unix))]
         let temporary = format!(".{}.tmp", ulid::Ulid::new());
         #[cfg(not(unix))]
@@ -169,11 +171,26 @@ impl Directory {
             if !native::same(original, &current).map_err(io)? || read(&mut current)? != expected {
                 return Err(conflict());
             }
-            // The conflict check passed, so the staged replacement may now
-            // carry the preserved mode; until this point it stayed 0600
-            // inside the private staging directory.
             #[cfg(unix)]
-            native::apply_mode(&temp, preserved).map_err(io)?;
+            {
+                let current = current.metadata().map_err(io)?;
+                if (current.uid(), current.gid()) != original_owner
+                    || current.mode() & 0o7777 != original_metadata.mode() & 0o7777
+                {
+                    return Err(conflict());
+                }
+                let staged = temp.metadata().map_err(io)?;
+                if (staged.uid(), staged.gid()) != original_owner {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "script save would change the original owner or group",
+                    ));
+                }
+                // Widen permissions only after the final conflict and owner
+                // checks, while the replacement is still private.
+                native::apply_mode(&temp, preserved).map_err(io)?;
+                temp.sync_all().map_err(io)?;
+            }
             // Directory handle + single leaf name: never follows an ancestor.
             // The staging directory lives in the same parent, so the rename
             // stays on one filesystem.
@@ -193,9 +210,11 @@ impl Directory {
                 // unknown, never success.
                 let verify = || -> Result<()> {
                     let mut installed = self.file(name)?;
+                    let metadata = installed.metadata().map_err(io)?;
                     if !native::same(&temp, &installed).map_err(io)?
                         || read(&mut installed)? != bytes
-                        || native::permission_bits(&installed).map_err(io)? != preserved
+                        || (metadata.uid(), metadata.gid()) != original_owner
+                        || metadata.mode() & 0o7777 != preserved
                     {
                         return Err(conflict());
                     }
@@ -204,7 +223,7 @@ impl Directory {
                 verify().map_err(|_| {
                     Error::new(
                         "unknown",
-                        "script replacement identity, bytes or mode could not be verified",
+                        "script replacement identity, bytes, ownership or mode could not be verified",
                     )
                 })?;
             }
@@ -906,23 +925,6 @@ mod native {
         let b = b.metadata()?;
         Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
     }
-    #[allow(dead_code)]
-    pub(super) fn replace(parent: &File, _: &File, temp: &str, target: &str) -> io::Result<()> {
-        let a = name(OsStr::new(temp))?;
-        let b = name(OsStr::new(target))?;
-        if unsafe {
-            libc::renameat(
-                parent.as_raw_fd(),
-                a.as_ptr(),
-                parent.as_raw_fd(),
-                b.as_ptr(),
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
     /// Rename a staged replacement out of its private staging directory into
     /// the parent. Both directories live on the same filesystem (the stage
     /// is a child of the parent), so the rename stays atomic.
@@ -947,20 +949,9 @@ mod native {
         }
         Ok(())
     }
-    /// Installed mode bits for the post-rename readback: all 0o7777 bits so
-    /// an unexpected set-user-ID, set-group-ID or sticky bit is unknown,
-    /// never success. The preserved value masks to 0o777 at the call site.
-    pub(super) fn permission_bits(file: &File) -> io::Result<u32> {
-        Ok(file.metadata()?.mode() & 0o7777)
-    }
     pub(super) fn apply_mode(file: &File, mode: u32) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(std::fs::Permissions::from_mode(mode))
-    }
-    pub(super) fn remove(_: &File, _: &File, _: &str) {
-        // unlinkat cannot consume the open inode. A name recheck followed by
-        // unlink still races another directory writer; leave a failed temp for
-        // explicit owner cleanup rather than possibly deleting their entry.
     }
     /// True when the held staging directory is a private directory owned by
     /// this process: a real directory substituted by another writer between
@@ -971,14 +962,12 @@ mod native {
         let meta = stage.metadata()?;
         Ok(meta.file_type().is_dir()
             && meta.uid() == unsafe { libc::geteuid() }
-            && meta.mode() & 0o7777 == 0o700)
+            && matches!(meta.mode() & 0o7777, 0o700 | 0o2700))
     }
     /// True when `stage_name` under `parent` still names the held staging
     /// directory: same device and inode, still a directory owned by this
-    /// process. Name-based cleanup runs only inside this daemon-created
-    /// namespace, so an entry another writer substituted is left for its
-    /// owner instead of being removed.
-    pub(super) fn stage_matches(parent: &File, stage_name: &str, stage: &File) -> bool {
+    /// process. Call only when the parent is controlled by that owner.
+    fn stage_matches(parent: &File, stage_name: &str, stage: &File) -> bool {
         let expected = match stage.metadata() {
             Ok(meta) => meta,
             Err(_) => return false,
@@ -1007,10 +996,7 @@ mod native {
             && actual.uid() == unsafe { libc::geteuid() }
     }
     /// Remove a failed staged replacement. Unlinking the staged file through
-    /// the held directory handle is safe; removing the staging directory by
-    /// name runs only when the name still resolves to that held directory.
-    /// Best-effort; failures leave the private stage for explicit owner
-    /// cleanup.
+    /// the held private directory handle is safe even in a shared parent.
     pub(super) fn remove_staged(parent: &File, stage: &File, stage_name: &str, temp: &str) {
         if let Ok(temp_name) = name(OsStr::new(temp)) {
             unsafe {
@@ -1020,12 +1006,17 @@ mod native {
         remove_stage_dir(parent, stage, stage_name);
     }
     /// Remove the (now empty) staging directory after a successful rename,
-    /// or an ours-but-unusable staging directory before any write. Runs only
-    /// when the name still resolves to the held directory: a substituted
-    /// entry belongs to its owner, not to this cleanup. Best-effort; a
-    /// leftover private 0700 directory never exposes entry bytes.
+    /// or an unusable staging directory before any write. A shared parent
+    /// can race the identity check and unlink, so leave its empty stage for
+    /// owner cleanup.
     pub(super) fn remove_stage_dir(parent: &File, stage: &File, stage_name: &str) {
-        if !stage_matches(parent, stage_name, stage) {
+        let Ok(metadata) = parent.metadata() else {
+            return;
+        };
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0
+            || !stage_matches(parent, stage_name, stage)
+        {
             return;
         }
         if let Ok(dir_name) = name(OsStr::new(stage_name)) {

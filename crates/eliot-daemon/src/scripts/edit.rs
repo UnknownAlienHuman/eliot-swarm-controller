@@ -799,6 +799,66 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_to_replace_a_script_with_a_different_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
+
+        let files = Files::new();
+        let policy = SecretPolicy::default();
+        files.put("restricted.txt", "old");
+        let path = files.0.join("scripts/restricted.txt");
+        let group = std::fs::metadata(&path).unwrap().gid();
+        let other_group = if group == 0 { 1 } else { 0 };
+        match chown(&path, None, Some(other_group)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("fixture chown: {error}"),
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let revision = files.read("restricted.txt", &policy).unwrap().revision;
+        let error = files
+            .save("restricted.txt", revision, "edit", &policy)
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+        assert!(error.message.contains("original owner or group"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.gid(), other_group);
+        assert_eq!(metadata.mode() & 0o7777, 0o640);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn save_under_shared_setgid_parent_keeps_ownership_and_leaves_empty_stage() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let files = Files::new();
+        let policy = SecretPolicy::default();
+        let scripts = files.0.join("scripts");
+        std::fs::set_permissions(&scripts, std::fs::Permissions::from_mode(0o2775)).unwrap();
+        files.put("shared.txt", "old");
+        let path = scripts.join("shared.txt");
+        let original = std::fs::metadata(&path).unwrap();
+        let revision = files.read("shared.txt", &policy).unwrap().revision;
+        files.save("shared.txt", revision, "edit", &policy).unwrap();
+
+        let installed = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (installed.uid(), installed.gid()),
+            (original.uid(), original.gid())
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"edit");
+        let stage = std::fs::read_dir(scripts)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "stage"))
+            .expect("leftover stage in shared parent");
+        assert_eq!(std::fs::metadata(&stage).unwrap().mode() & 0o7777, 0o2700);
+        assert!(std::fs::read_dir(stage).unwrap().next().is_none());
+    }
+
     /// A rejected save stages in a private directory until rename, so no
     /// group/other-readable `.tmp` with the rejected edit remains behind.
     #[cfg(unix)]
