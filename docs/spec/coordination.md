@@ -346,10 +346,13 @@ commands and report their actual application point. Presented is not read or und
 
 With `wake_on_mail=true` (read from the recipient's frozen profile snapshot,
 default true), a routed recipient may receive one generic coalesced notice
-per minute, with at most one open notice command: `N unread messages; run swarm inbox, then ack processed delivery IDs`.
-An OpenCode or Antigravity recipient (both receive the Agent-scoped eliot-swarm MCP server) names the coordination tool it actually has instead:
-`N unread messages; use the eliot-swarm MCP swarm tool (method mail.inbox), then ack processed delivery IDs`
-(and `use the eliot-swarm MCP swarm tool (method who)` for claim notices).
+per minute, with at most one open notice command. The wake text is one
+neutral line for every harness: `N unread: mail.inbox, then mail.ack`
+(`N overlapping work claims: who` for claim notices). An unread reply whose
+`reply_to_delivery` names mail the recipient itself sent, admitted after the
+last presentation, skips the one-minute cooldown once, so an answer to an
+Agent's own question wakes it at once; the open-notice, busy, pending-input
+and unknown gates still apply.
 The notice is an ordinary owner `send` bound to the recipient's current
 generation and carrying only the unread count at claim time. It never contains
 the body or marks it read. Unknown notice is not blindly retried;
@@ -428,7 +431,13 @@ first; pending digests are never pruned.
 ### Read and acknowledgement
 
 `mail.inbox` returns at most 100 unread rows within the encoded frame limit for the
-authenticated stable Agent, including older generations with their original metadata. `mail.read` returns one exact row. Both
+authenticated stable Agent, including older generations with their original metadata. The page may be
+narrowed by `thread` or by one exact `reply_to` delivery id, and `wait_ms`
+(clamped to 30,000) long-polls for the first matching delivery. Every delivery
+appends one bodyless `mail.delivered` event bound to the recipient generation
+(a rule child's delivery also carries that command's cause), so the long-poll
+wakes without reading any body.
+`mail.read` returns one exact row. Both
 are read-only. After CLI output completes:
 
 ```text
@@ -459,7 +468,13 @@ membership and return `unsupported`. JSON values are at most 16 KiB encoded,
 known secrets rejected. Each write increments version; `expect_version` is CAS,
 not last-writer guess: an omitted expectation writes unconditionally, while a
 supplied one must equal the current version, where an absent row reads as 0.
-`set_by` records the current principal. Changes emit `var.changed`.
+`set_by` records the current principal. Changes emit `var.changed`: one
+bodyless fact naming scope, key, version and `set_by`. It names no Agent, and an
+Agent's event filter admits it for the scopes that Agent can read. `var.get`
+takes an optional `after_version` baseline; `wait_ms` (clamped to 30,000)
+requires it. The read returns at once when the version already differs, and
+otherwise long-polls for the matching version bump; an absent row reads as
+version 0.
 Concurrent queued writes use bounded [Store commit grouping](core.md#storage);
 each request still has its own CAS result and retained idempotency binding.
 

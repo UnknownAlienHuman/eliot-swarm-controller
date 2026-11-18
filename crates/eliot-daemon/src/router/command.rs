@@ -2260,6 +2260,8 @@ mod tests {
                 &eliot_core::api::VarGetRequest {
                     scope: Some("global".to_owned()),
                     key: "result".to_owned(),
+                    after_version: None,
+                    wait_ms: 0,
                 },
             )
             .unwrap();

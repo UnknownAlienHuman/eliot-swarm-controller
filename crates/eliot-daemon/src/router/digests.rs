@@ -165,7 +165,10 @@ impl Router {
         // Freeze visibility with the caller's scope: entries outside scope
         // read `not_visible` now and stay masked at delivery.
         let wait_request = wait_request_for_digest(&request);
-        let snapshot = self.wait_snapshot(&wait_request, principal).await?;
+        let snapshot = self
+            .wait_snapshot(&wait_request, principal, None)
+            .await?
+            .results;
         let hidden: Vec<bool> = snapshot
             .iter()
             .map(|entry| entry.status == "not_visible")
@@ -213,7 +216,10 @@ impl Router {
     async fn digest_owner_results(&self, row: &DigestRow) -> Result<Vec<WaitEntryResult>> {
         let wait_request = wait_request_for_row(row);
         let owner = Principal::Owner;
-        let results = self.wait_snapshot(&wait_request, &owner).await?;
+        let results = self
+            .wait_snapshot(&wait_request, &owner, None)
+            .await?
+            .results;
         Ok(masked_results(results, &row.hidden))
     }
 

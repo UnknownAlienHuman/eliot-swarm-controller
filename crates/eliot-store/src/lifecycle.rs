@@ -580,8 +580,15 @@ impl Store {
             projects::validate_project_command_dispatch_tx(&tx, &record)?;
             let sender = super::coordination::Sender::Owner;
             let delivery_prefix = rule_mail_delivery_prefix(&record.command)?;
-            let response =
-                Self::mail_effect_tx(&tx, &sender, &definition, limits, &delivery_prefix, now)?;
+            let (response, mail_events) = Self::mail_effect_tx(
+                &tx,
+                &sender,
+                &definition,
+                limits,
+                &delivery_prefix,
+                Some(command_id),
+                now,
+            )?;
             if response.deliveries.len() != definition.to.len() {
                 return Err(Error::new("internal", "mail effect did not fan out"));
             }
@@ -610,7 +617,9 @@ impl Store {
                 None,
                 now,
             )?;
-            let mut events = Vec::new();
+            // Bodyless delivery facts lead the settlement batch in row order,
+            // so recipient long-polls wake on rule mail too.
+            let mut events = mail_events;
             events.push(insert_daemon_command_event(
                 &tx,
                 now,

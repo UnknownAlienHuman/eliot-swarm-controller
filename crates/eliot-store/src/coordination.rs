@@ -374,6 +374,21 @@ impl Store {
         Ok(response)
     }
 
+    /// Highest message row id in the caller's resolved mailbox, 0 when empty.
+    /// A mailbox long-poll baselines this before subscribing: any new
+    /// delivery raises the watermark, so the wake never depends on an unread
+    /// count that a concurrent acknowledgement could lower again.
+    pub fn mail_mailbox_high_water(&self, principal: &str, agent: Option<&str>) -> Result<i64> {
+        let mailbox = self.resolve_mailbox(principal, agent)?;
+        self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM messages WHERE recipient = ?1",
+                params![mailbox],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
     /// Read one exact delivery. Read-only: nothing is marked. An absent
     /// delivery whose write id is old enough to have been pruned reads
     /// `history_gap`; any other absent delivery reads `not_found`.
@@ -558,6 +573,13 @@ impl Store {
             .collect()
     }
 
+    /// Encoded variable scope for a principal without reading any value.
+    /// A long-polling `var.get` matches `var.changed` wake facts against
+    /// this scope and the requested key.
+    pub fn var_scope_encoded(&self, principal: &str, scope: Option<&str>) -> Result<String> {
+        Ok(self.resolve_var_scope(principal, scope, false)?.encoded())
+    }
+
     /// Read one variable value with its version and writer.
     pub fn var_get(&self, principal: &str, request: &VarGetRequest) -> Result<VarGetResponse> {
         request.validate()?;
@@ -664,7 +686,9 @@ impl Store {
     /// mail recipient, or nothing pending) returning `Ok(None)` and
     /// recording nothing. A claim preserves the prior presentation time
     /// (0 until first presentation); mail wakes and claim conflicts share
-    /// one cooldown and one open notice command.
+    /// one cooldown and one open notice command. An unread reply to the
+    /// recipient's own mail, admitted after the last presentation, skips
+    /// only that cooldown; every other gate still applies.
     pub fn notice_claim(
         &mut self,
         recipient: &str,
@@ -917,12 +941,23 @@ impl Store {
                 "SELECT {DELIVERY_COLUMNS} FROM messages m
                  WHERE m.recipient = ?1 AND m.read_at IS NULL
                    AND (?2 IS NULL OR m.id > ?2)
+                   AND (?4 IS NULL OR m.thread = ?4)
+                   AND (?5 IS NULL OR m.reply_to_delivery = ?5)
                  ORDER BY m.id ASC LIMIT ?3"
             ))
             .map_err(sql_error)?;
         let limit = i64::try_from(request.effective_limit()).unwrap_or(i64::MAX);
         let deliveries = statement
-            .query_map(params![mailbox, after_row, limit], delivery_row)
+            .query_map(
+                params![
+                    mailbox,
+                    after_row,
+                    limit,
+                    request.thread.as_deref(),
+                    request.reply_to.as_deref()
+                ],
+                delivery_row,
+            )
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<MailDelivery>>>()
             .map_err(sql_error)?;
@@ -1137,7 +1172,8 @@ impl Store {
             thread: request.thread.clone(),
             reply_to_delivery: request.reply_to_delivery.clone(),
         };
-        let value = Self::mail_effect_tx(&tx, sender, &definition, limits, &request.id, now)?;
+        let (value, events) =
+            Self::mail_effect_tx(&tx, sender, &definition, limits, &request.id, None, now)?;
         request.validate_response(&value)?;
         if digest_exempt {
             retain_write_tx_allow_digest(
@@ -1171,7 +1207,7 @@ impl Store {
         commit_transaction(tx, &self.write_faulted)?;
         Ok(MailSendResult {
             value,
-            events: Vec::new(),
+            events,
             outcome: MailSendOutcome::Fresh,
         })
     }
@@ -1412,15 +1448,19 @@ impl Store {
     /// public path enforces those before calling, and the rule-child commit
     /// path never enters the public write-id namespace. Recipient rows are
     /// snapshotted once with all mailbox bounds checked before any write, so
-    /// an overfull mailbox rejects without a partial fanout.
+    /// an overfull mailbox rejects without a partial fanout. Each delivery
+    /// also appends one bodyless `mail.delivered` event bound to the
+    /// recipient generation, so a recipient long-poll wakes without reading
+    /// the body.
     pub(super) fn mail_effect_tx(
         tx: &Transaction<'_>,
         sender: &Sender,
         definition: &MailDefinitionArgs,
         limits: MailLimits,
         delivery_prefix: &str,
+        command_id: Option<&str>,
         now: i64,
-    ) -> Result<MailSendResponse> {
+    ) -> Result<(MailSendResponse, Vec<super::Event>)> {
         limits.validate()?;
         let to = &definition.to;
         let text = &definition.text;
@@ -1473,6 +1513,7 @@ impl Store {
             Sender::Agent { id, generation, .. } => (id.clone(), Some(*generation)),
         };
         let mut deliveries = Vec::with_capacity(recipients.len());
+        let mut events = Vec::with_capacity(recipients.len());
         for agent in &recipients {
             let num = parse_agent_id(&agent.id)?;
             let delivery_id = format!("{delivery_prefix}/{}", agent.id);
@@ -1504,13 +1545,33 @@ impl Store {
                     now
                 ],
             ));
+            // Bodyless wake fact bound to the recipient generation. A rule
+            // child's delivery carries that command's cause even though the
+            // event names the recipient, so rule depth still bounds loops.
+            let mut input = DaemonEventInput::new(
+                now,
+                "mail.delivered",
+                "coordination",
+                Some(num),
+                Some(agent.generation),
+                json!({
+                    "recipient": agent.id,
+                    "delivery_id": delivery_id,
+                    "sender": sender_name,
+                    "thread": thread,
+                }),
+            );
+            if let Some(id) = command_id {
+                input.cause = super::command_cause_tx(tx, id)?;
+            }
+            events.push(insert_daemon_event_input(tx, input)?);
             deliveries.push(MailDeliverySummary {
                 delivery_id,
                 recipient: agent.id.clone(),
                 recipient_generation: agent.generation,
             });
         }
-        Ok(MailSendResponse { deliveries })
+        Ok((MailSendResponse { deliveries }, events))
     }
 
     /// Shared versioned-variable row effect on the caller's transaction.
@@ -1825,10 +1886,30 @@ fn notice_pending_count_tx(
     }
 }
 
+/// True when the recipient's mailbox holds an unread reply, admitted after
+/// the last presentation, whose `reply_to_delivery` names mail the recipient
+/// itself sent: the answer to its own question bypasses the cooldown once.
+fn fresh_reply_to_own_mail_tx(tx: &Transaction<'_>, agent: &Agent, since: i64) -> Result<bool> {
+    let num = parse_agent_id(&agent.id)?;
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM messages reply
+             JOIN messages asked ON asked.delivery_id = reply.reply_to_delivery
+             WHERE reply.recipient = ?1 AND reply.read_at IS NULL
+               AND reply.admitted_at > ?2 AND asked.sender = ?3
+         )",
+        params![num, since, agent.id],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
 /// Shared suppression gates: cooldown from actual presentation, open
 /// notice command, unknown command/turn, pending request, provider hold,
 /// or busy/waiting/input-pending mail recipient. Suppression records
 /// nothing; mail defers on busy/pending/unknown input, claims still queue.
+/// An unread reply to the recipient's own mail skips only the presentation
+/// cooldown; the open, busy and unknown gates still suppress.
 fn notice_suppressed_tx(
     tx: &Transaction<'_>,
     num: i64,
@@ -1850,9 +1931,9 @@ fn notice_suppressed_tx(
         )
         .optional()
         .map_err(sql_error)?;
-    if notice
-        .as_ref()
-        .is_some_and(|(last, _)| now.saturating_sub(*last) < MAIL_NOTICE_COOLDOWN_MS)
+    if let Some((last, _)) = notice.as_ref()
+        && now.saturating_sub(*last) < MAIL_NOTICE_COOLDOWN_MS
+        && !(pending.kind() == NoticeKind::Mail && fresh_reply_to_own_mail_tx(tx, agent, *last)?)
     {
         return Ok(true);
     }
@@ -2151,6 +2232,9 @@ mod tests {
             agent: None,
             limit: None,
             after: None,
+            wait_ms: 0,
+            thread: None,
+            reply_to: None,
         };
         let first = store
             .mail_inbox(&agent_principal(&b), &inbox, now)
@@ -2239,6 +2323,9 @@ mod tests {
                     agent: None,
                     limit: Some(100),
                     after: None,
+                    wait_ms: 0,
+                    thread: None,
+                    reply_to: None,
                 },
                 now,
             )
@@ -2281,6 +2368,9 @@ mod tests {
                         agent: None,
                         limit: Some(100),
                         after: after.clone(),
+                        wait_ms: 0,
+                        thread: None,
+                        reply_to: None,
                     },
                     now,
                 )
@@ -2436,6 +2526,9 @@ mod tests {
                     agent: None,
                     limit: None,
                     after: None,
+                    wait_ms: 0,
+                    thread: None,
+                    reply_to: None,
                 },
                 now,
             )
@@ -2454,6 +2547,9 @@ mod tests {
             agent: None,
             limit: None,
             after: None,
+            wait_ms: 0,
+            thread: None,
+            reply_to: None,
         };
         assert_eq!(
             store.mail_inbox(&stale, &inbox, now).unwrap_err().code,
@@ -2507,6 +2603,8 @@ mod tests {
                     &VarGetRequest {
                         scope: Some("project:app".to_owned()),
                         key: "k".to_owned(),
+                        after_version: None,
+                        wait_ms: 0,
                     },
                 )
                 .unwrap_err()
@@ -2689,6 +2787,9 @@ mod tests {
             agent: None,
             limit: None,
             after: Some(pruned_id.clone()),
+            wait_ms: 0,
+            thread: None,
+            reply_to: None,
         };
         assert_eq!(
             store
@@ -2735,6 +2836,9 @@ mod tests {
             agent: None,
             limit: None,
             after: Some(format!("{}/{}", Ulid::new(), a)),
+            wait_ms: 0,
+            thread: None,
+            reply_to: None,
         };
         assert_eq!(
             store
@@ -3263,6 +3367,8 @@ mod tests {
                 &VarGetRequest {
                     scope: Some(scope.clone()),
                     key: "branch".to_owned(),
+                    after_version: None,
+                    wait_ms: 0,
                 },
             )
             .expect("read variable");
@@ -3442,6 +3548,8 @@ mod tests {
                 &VarGetRequest {
                     scope: None,
                     key: "k".to_owned(),
+                    after_version: None,
+                    wait_ms: 0,
                 },
             )
             .expect("implied project read");
@@ -3465,6 +3573,8 @@ mod tests {
                     &VarGetRequest {
                         scope: Some("project:other".to_owned()),
                         key: "k".to_owned(),
+                        after_version: None,
+                        wait_ms: 0,
                     },
                 )
                 .unwrap_err()
@@ -3493,6 +3603,8 @@ mod tests {
                 &VarGetRequest {
                     scope: Some("global".to_owned()),
                     key: "flag".to_owned(),
+                    after_version: None,
+                    wait_ms: 0,
                 },
             )
             .expect("Agents read global variables");
@@ -3519,6 +3631,8 @@ mod tests {
                     &VarGetRequest {
                         scope: None,
                         key: "missing".to_owned(),
+                        after_version: None,
+                        wait_ms: 0,
                     },
                 )
                 .unwrap_err()
@@ -3532,6 +3646,8 @@ mod tests {
                     &VarGetRequest {
                         scope: Some("global".to_owned()),
                         key: "missing".to_owned(),
+                        after_version: None,
+                        wait_ms: 0,
                     },
                 )
                 .unwrap_err()
@@ -4043,5 +4159,299 @@ mod tests {
         assert_eq!(state.open_notice_command.as_deref(), Some(second.as_str()));
         // Releasing an unknown recipient id is a parse error, not a panic.
         assert!(store.notice_release("a0", &second).is_err());
+    }
+
+    #[test]
+    fn mail_send_emits_bodyless_delivered_events() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let b = ready_agent(&mut store, "app", now);
+        let request = MailSendRequest {
+            thread: Some("task-1".to_owned()),
+            ..send_request(vec![a.clone(), b.clone()], "hello")
+        };
+        let result = store
+            .mail_send("owner", &request, MailLimits::default(), now)
+            .expect("queue mail");
+        assert_eq!(result.outcome, MailSendOutcome::Fresh);
+        assert_eq!(result.events.len(), 2);
+        let mut seen = 0;
+        for (event, recipient) in result.events.iter().zip([&a, &b]) {
+            assert_eq!(event.kind, "mail.delivered");
+            assert_eq!(event.agent.as_deref(), Some(recipient.as_str()));
+            assert_eq!(event.data["recipient"].as_str(), Some(recipient.as_str()));
+            assert_eq!(
+                event.data["delivery_id"].as_str(),
+                Some(result.value.deliveries[seen].delivery_id.as_str())
+            );
+            assert_eq!(event.data["sender"].as_str(), Some("owner"));
+            assert_eq!(event.data["thread"].as_str(), Some("task-1"));
+            assert!(event.data.get("text").is_none());
+            assert!(event.data.get("mode").is_none());
+            seen += 1;
+        }
+        assert_eq!(seen, 2);
+        // A retained replay emits no second event.
+        let replay = store
+            .mail_send("owner", &request, MailLimits::default(), now)
+            .expect("replay mail");
+        assert_eq!(replay.outcome, MailSendOutcome::Retained);
+        assert!(replay.events.is_empty());
+    }
+
+    #[test]
+    fn mail_inbox_filters_by_thread_and_reply_to() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let first = store
+            .mail_send(
+                "owner",
+                &MailSendRequest {
+                    thread: Some("task-1".to_owned()),
+                    ..send_request(vec![a.clone()], "one")
+                },
+                MailLimits::default(),
+                now,
+            )
+            .expect("queue first")
+            .value
+            .deliveries
+            .remove(0)
+            .delivery_id;
+        store
+            .mail_send(
+                "owner",
+                &MailSendRequest {
+                    thread: Some("task-2".to_owned()),
+                    ..send_request(vec![a.clone()], "two")
+                },
+                MailLimits::default(),
+                now,
+            )
+            .expect("queue second");
+        let principal = agent_principal(&a);
+        let page = |store: &Store, thread: Option<&str>, reply_to: Option<&str>| {
+            store
+                .mail_inbox(
+                    &principal,
+                    &MailInboxRequest {
+                        agent: None,
+                        limit: None,
+                        after: None,
+                        wait_ms: 0,
+                        thread: thread.map(str::to_owned),
+                        reply_to: reply_to.map(str::to_owned),
+                    },
+                    now,
+                )
+                .expect("read filtered inbox")
+        };
+        assert_eq!(page(&store, None, None).deliveries.len(), 2);
+        let one = page(&store, Some("task-1"), None);
+        assert_eq!(one.deliveries.len(), 1);
+        assert_eq!(one.deliveries[0].delivery_id, first);
+        assert!(page(&store, Some("task-9"), None).deliveries.is_empty());
+        // A reply reference narrows to the one answer that names it.
+        let reply = store
+            .mail_send(
+                &principal,
+                &MailSendRequest {
+                    reply_to_delivery: Some(first.clone()),
+                    ..send_request(vec![a.clone()], "ack")
+                },
+                MailLimits::default(),
+                now,
+            )
+            .expect("reply to self mailbox")
+            .value
+            .deliveries
+            .remove(0)
+            .delivery_id;
+        let narrowed = page(&store, None, Some(&first));
+        assert_eq!(narrowed.deliveries.len(), 1);
+        assert_eq!(narrowed.deliveries[0].delivery_id, reply);
+    }
+
+    #[test]
+    fn reply_to_own_mail_bypasses_only_the_cooldown() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let b = ready_agent(&mut store, "app", now);
+        let num = parse_agent_id(&a).unwrap();
+        let asked = store
+            .mail_send(
+                &agent_principal(&a),
+                &send_request(vec![b.clone()], "question?"),
+                MailLimits::default(),
+                now,
+            )
+            .expect("ask")
+            .value
+            .deliveries
+            .remove(0)
+            .delivery_id;
+        // Native presentation stamps the cooldown and closes the notice.
+        let present = |store: &mut Store, at: i64| {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO mail_notices(recipient, last_notice_at, open_notice_command)
+                     VALUES (?1, ?2, NULL)
+                     ON CONFLICT(recipient) DO UPDATE SET
+                         last_notice_at = excluded.last_notice_at, open_notice_command = NULL",
+                    params![num, at],
+                )
+                .unwrap();
+        };
+        let claim = |store: &mut Store, at: i64| {
+            store
+                .notice_claim(&a, &Ulid::new().to_string(), NoticePending::Mail, at)
+                .unwrap()
+        };
+        let reply = |store: &mut Store, text: &str, at: i64| {
+            store
+                .mail_send(
+                    &agent_principal(&b),
+                    &MailSendRequest {
+                        reply_to_delivery: Some(asked.clone()),
+                        ..send_request(vec![a.clone()], text)
+                    },
+                    MailLimits::default(),
+                    at,
+                )
+                .expect("reply");
+        };
+        present(&mut store, now + 1_000);
+        store
+            .mail_send(
+                "owner",
+                &send_request(vec![a.clone()], "fyi"),
+                MailLimits::default(),
+                now + 2_000,
+            )
+            .expect("plain mail");
+        assert_eq!(
+            claim(&mut store, now + 3_000),
+            None,
+            "plain mail waits out the cooldown"
+        );
+        reply(&mut store, "answer", now + 4_000);
+        assert!(
+            claim(&mut store, now + 5_000).is_some(),
+            "the answer to A's own question wakes inside the cooldown"
+        );
+        reply(&mut store, "more", now + 6_000);
+        assert_eq!(
+            claim(&mut store, now + 7_000),
+            None,
+            "the open notice still coalesces a second answer"
+        );
+        present(&mut store, now + 8_000);
+        assert_eq!(
+            claim(&mut store, now + 9_000),
+            None,
+            "announced answers bypass only once"
+        );
+        reply(&mut store, "late", now + 10_000);
+        assert!(claim(&mut store, now + 11_000).is_some());
+    }
+
+    #[test]
+    fn mailbox_high_water_tracks_deliveries_not_acks() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let principal = agent_principal(&a);
+        assert_eq!(store.mail_mailbox_high_water(&principal, None).unwrap(), 0);
+        let sent = store
+            .mail_send(
+                "owner",
+                &send_request(vec![a.clone()], "wake"),
+                MailLimits::default(),
+                now,
+            )
+            .expect("queue mail")
+            .value;
+        let water = store.mail_mailbox_high_water(&principal, None).unwrap();
+        assert!(water > 0);
+        store
+            .mail_ack(
+                &principal,
+                &MailAckRequest {
+                    id: Ulid::new().to_string(),
+                    agent: None,
+                    deliveries: vec![sent.deliveries[0].delivery_id.clone()],
+                },
+                now,
+            )
+            .expect("ack mail");
+        assert_eq!(
+            store.mail_mailbox_high_water(&principal, None).unwrap(),
+            water
+        );
+    }
+
+    #[test]
+    fn agent_event_replay_includes_readable_var_changed_only() {
+        let mut store = store();
+        let now = now_ms();
+        let a = ready_agent(&mut store, "app", now);
+        let num = parse_agent_id(&a).unwrap();
+        for (scope, key) in [("global", "flag"), ("project:other", "hidden")] {
+            let change = store
+                .var_set(
+                    "owner",
+                    &VarSetRequest {
+                        id: Ulid::new().to_string(),
+                        scope: Some(scope.to_owned()),
+                        key: key.to_owned(),
+                        value: json!(true),
+                        expect_version: None,
+                        note: None,
+                    },
+                    now,
+                )
+                .expect("set variable");
+            assert_eq!(change.events[0].kind, "var.changed");
+            assert!(change.events[0].agent.is_none());
+        }
+        let readable = ["global", "project:app"];
+        let keys = |events: &[crate::Event]| -> Vec<String> {
+            events
+                .iter()
+                .filter(|event| event.kind == "var.changed")
+                .map(|event| event.data["key"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        // An Agent-scoped replay sees unbound variable facts only for the
+        // scopes it can read.
+        let replayed = store
+            .read_agent_events(&[num], &[], &[], &readable, 0, i64::MAX, 100)
+            .expect("replay agent events");
+        assert_eq!(keys(&replayed), vec!["flag".to_owned()]);
+        let narrowed = store
+            .read_agent_events(&[num], &["var.changed"], &[], &readable, 0, i64::MAX, 100)
+            .expect("replay narrowed to var.changed");
+        assert!(narrowed.iter().all(|event| event.kind == "var.changed"));
+        assert_eq!(keys(&narrowed), vec!["flag".to_owned()]);
+        let other = store
+            .read_agent_events(
+                &[num],
+                &["turn.completed"],
+                &[],
+                &readable,
+                0,
+                i64::MAX,
+                100,
+            )
+            .expect("replay narrowed elsewhere");
+        assert!(keys(&other).is_empty());
+        let unscoped = store
+            .read_agent_events(&[num], &[], &[], &[], 0, i64::MAX, 100)
+            .expect("replay without variable scopes");
+        assert!(keys(&unscoped).is_empty());
     }
 }

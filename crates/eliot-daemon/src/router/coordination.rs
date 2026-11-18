@@ -12,8 +12,8 @@ use crate::common::now_ms;
 use eliot_core::{
     AgentState, Error, Result,
     api::{
-        MailAckRequest, MailDelivery, MailInboxRequest, MailInboxResponse, MailReadRequest,
-        MailSendRequest, MailSendResponse, VarGetRequest, VarGetResponse, VarSetRequest,
+        MailAckRequest, MailDelivery, MailInboxRequest, MailReadRequest, MailSendRequest,
+        MailSendResponse, VarGetRequest, VarSetRequest,
     },
 };
 use eliot_plugin::sync::LockExt;
@@ -89,32 +89,15 @@ fn wake_enabled(snapshot: &Value) -> bool {
         .unwrap_or(true)
 }
 
-/// Harnesses whose Agents receive the Agent-scoped `eliot-swarm` MCP server
-/// (OpenCode through its per-Agent `mcp.servers` config, Antigravity through
-/// ACP `session/new` `mcpServers`). Their notices name that tool; every other
-/// harness keeps the `swarm` shell CLI wording it relies on today.
-fn has_swarm_mcp_notice(harness: &str) -> bool {
-    matches!(harness, "opencode" | "antigravity")
-}
-
-/// Notice text naming the coordination surface the recipient actually has.
-fn notice_text(kind: NoticeKind, count: i64, harness: &str) -> String {
-    let mcp = has_swarm_mcp_notice(harness);
+/// One neutral wake text for every harness: the unread count plus the
+/// coordination method path. Every harness resolves `mail.inbox`/`mail.ack`
+/// through its own surface (the MCP swarm tool or the shell CLI), so the
+/// notice no longer selects wording per harness.
+fn notice_text(kind: NoticeKind, count: i64) -> String {
     match kind {
-        NoticeKind::Mail if mcp => format!(
-            "{count} unread messages; use the eliot-swarm MCP swarm tool (method mail.inbox), then ack processed delivery IDs"
-        ),
-        NoticeKind::Mail => {
-            format!("{count} unread messages; run swarm inbox, then ack processed delivery IDs")
-        }
-        NoticeKind::Claim if count == 1 && mcp => {
-            "1 overlapping work claim; use the eliot-swarm MCP swarm tool (method who)".to_owned()
-        }
-        NoticeKind::Claim if count == 1 => "1 overlapping work claim; run swarm who".to_owned(),
-        NoticeKind::Claim if mcp => format!(
-            "{count} overlapping work claims; use the eliot-swarm MCP swarm tool (method who)"
-        ),
-        NoticeKind::Claim => format!("{count} overlapping work claims; run swarm who"),
+        NoticeKind::Mail => format!("{count} unread: mail.inbox, then mail.ack"),
+        NoticeKind::Claim if count == 1 => "1 overlapping work claim: who".to_owned(),
+        NoticeKind::Claim => format!("{count} overlapping work claims: who"),
     }
 }
 
@@ -171,12 +154,33 @@ impl Router {
             MailInboxRequest::validate,
         )?;
         let name = principal_name(principal);
-        let response: MailInboxResponse =
-            self.inner
+        // An Agent reads its own mailbox (it may omit `agent`); the owner
+        // names it. The long-poll wakes on bodyless deliveries to it and the
+        // page itself applies the `thread`/`reply_to` selection.
+        let mailbox = match principal {
+            Principal::Agent { id, .. } => Some(id.clone()),
+            _ => request.agent.clone(),
+        };
+        let mut poll = self.long_poll(request.wait_ms);
+        let response = loop {
+            let page = self
+                .inner
                 .store
                 .lock()
                 .await
                 .mail_inbox(&name, &request, now_ms())?;
+            if !page.deliveries.is_empty()
+                || !poll
+                    .wake(|event| {
+                        event.kind == "mail.delivered"
+                            && event.agent.is_some()
+                            && event.agent == mailbox
+                    })
+                    .await?
+            {
+                break page;
+            }
+        };
         request.validate_response(&response)?;
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "mail inbox could not be encoded"))
@@ -341,7 +345,38 @@ impl Router {
             VarGetRequest::validate,
         )?;
         let name = principal_name(principal);
-        let response: VarGetResponse = self.inner.store.lock().await.var_get(&name, &request)?;
+        // `after_version` waits until the version differs; an absent row
+        // reads as version 0, so only `not_found` is a waitable state.
+        let scope = self
+            .inner
+            .store
+            .lock()
+            .await
+            .var_scope_encoded(&name, request.scope.as_deref())?;
+        let mut poll = self.long_poll(request.wait_ms);
+        let read = loop {
+            let read = match self.inner.store.lock().await.var_get(&name, &request) {
+                Err(error) if error.code != "not_found" => return Err(error),
+                read => read,
+            };
+            let version = read.as_ref().map_or(0, |response| response.version);
+            if request
+                .after_version
+                .is_none_or(|baseline| version != baseline)
+                || !poll
+                    .wake(|event| {
+                        event.kind == "var.changed"
+                            && event.data.get("scope").and_then(Value::as_str)
+                                == Some(scope.as_str())
+                            && event.data.get("key").and_then(Value::as_str)
+                                == Some(request.key.as_str())
+                    })
+                    .await?
+            {
+                break read;
+            }
+        };
+        let response = read?;
         request.validate_response(&response)?;
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "variable read could not be encoded"))
@@ -416,7 +451,7 @@ impl Router {
             "target": recipient,
             "verb": "send",
             "expected_generation": claim.generation,
-            "args": {"text": notice_text(claim.kind, claim.count, &agent.harness), "notice_kind": notice_kind},
+            "args": {"text": notice_text(claim.kind, claim.count), "notice_kind": notice_kind},
         });
         if self.submit(&params, &Principal::Owner).await.is_err() {
             let mut store = self.inner.store.lock().await;
@@ -494,6 +529,7 @@ pub(crate) async fn run_mail_reoffer(
 mod tests {
     use super::*;
     use crate::bus::Bus;
+    use eliot_core::api::{MailInboxResponse, VarGetResponse};
     use eliot_core::{
         NativeEvent, SourceBatch, SubmitCommand,
         api::{MailAckResponse, VarSetResponse},
@@ -953,6 +989,9 @@ mod tests {
                         agent: Some(recipient.clone()),
                         limit: None,
                         after: None,
+                        wait_ms: 0,
+                        thread: None,
+                        reply_to: None,
                     },
                     now_ms(),
                 )
@@ -1060,35 +1099,23 @@ mod tests {
     }
 
     #[test]
-    fn notices_name_the_swarm_surface_each_harness_has() {
-        // OpenCode and Antigravity Agents receive the Agent-scoped
-        // eliot-swarm MCP server; their notices name that tool and method.
-        for harness in ["opencode", "antigravity"] {
-            assert_eq!(
-                notice_text(NoticeKind::Mail, 2, harness),
-                "2 unread messages; use the eliot-swarm MCP swarm tool (method mail.inbox), then ack processed delivery IDs",
-                "{harness} names the MCP tool",
-            );
-            assert_eq!(
-                notice_text(NoticeKind::Claim, 1, harness),
-                "1 overlapping work claim; use the eliot-swarm MCP swarm tool (method who)",
-            );
-            assert_eq!(
-                notice_text(NoticeKind::Claim, 3, harness),
-                "3 overlapping work claims; use the eliot-swarm MCP swarm tool (method who)",
-            );
-        }
-        // Every other harness keeps the swarm CLI wording.
-        for harness in ["codex", "claude", "muse", "unknown-harness"] {
-            assert_eq!(
-                notice_text(NoticeKind::Mail, 2, harness),
-                "2 unread messages; run swarm inbox, then ack processed delivery IDs",
-                "harness {harness} keeps the CLI text",
-            );
-            assert_eq!(
-                notice_text(NoticeKind::Claim, 1, harness),
-                "1 overlapping work claim; run swarm who",
-            );
-        }
+    fn notices_use_one_neutral_wake_text() {
+        // One text for every harness: no per-harness selection remains.
+        assert_eq!(
+            notice_text(NoticeKind::Mail, 2),
+            "2 unread: mail.inbox, then mail.ack",
+        );
+        assert_eq!(
+            notice_text(NoticeKind::Mail, 1),
+            "1 unread: mail.inbox, then mail.ack"
+        );
+        assert_eq!(
+            notice_text(NoticeKind::Claim, 1),
+            "1 overlapping work claim: who",
+        );
+        assert_eq!(
+            notice_text(NoticeKind::Claim, 3),
+            "3 overlapping work claims: who",
+        );
     }
 }

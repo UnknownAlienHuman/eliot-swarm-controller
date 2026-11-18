@@ -1616,13 +1616,23 @@ terminal outcome of its exact captured command or turn. Per-entry `status` is on
 `succeeded`, `failed`, `interrupted` or `unknown` (from the canonical `TurnOutcome`),
 `still_running` at timeout, or `not_found`/`not_visible` for ids outside the caller's
 scope. A direct or command-bound turn can also carry its
-[resolution provenance](#input-turn-and-unknown-gates).
+[resolution provenance](#input-turn-and-unknown-gates). Every entry that
+resolved to a turn also carries that turn's identity (`agent`, `generation`,
+`turn_id`); a completed turn additionally carries its retained `final_text`,
+cut to 16 KiB per entry within one 64 KiB response budget, with `truncated`
+marking a cut or a text withheld by the budget (`agent.result` reads the whole
+text). `mailbox: true` (Agent callers only; the owner has no mailbox) also ends
+the wait with `mail_wake` when mail admitted after the wait started reaches the
+caller's own mailbox; drain the inbox first when older mail must count. The
+wait snapshots every entry under one Store lock and re-snapshots only on
+command, turn, session, request or agent events of its own entries, or on a
+delivery to that mailbox.
 An Agent caller may wait only on what its frozen control scope permits, the same
 rule as `agent.list` and direct reads; the set holds at most 256 entries. The daemon
 reuses existing command/turn readback and its event bus for wakeups; there is no
 scheduler or persistent workflow beyond the digest below. Run and project-rule principals are rejected;
 Owner and Agent principals are allowed. Timeout never cancels admitted work. The CLI is
-`swarm wait --all|--any --timeout-seconds N ID...`, where an `ID` containing `/` is an
+`swarm wait --all|--any [--mail] --timeout-seconds N ID...`, where an `ID` containing `/` is an
 exact `agent/generation/turn_id` turn ref whose first segment is an `a<number>`
 Agent id, and any other `ID` is a command id. A slashed positional whose first
 segment is not an Agent id is a usage error, not a turn; Command ids
@@ -1963,7 +1973,9 @@ field, or any wrong field type is `invalid`. Each `agents`, `kinds` or `sources`
 may contain at most 1,000 raw entries; every entry must be a nonempty string. Agent filter
 strings are compared verbatim rather than canonicalized, so a noncanonical value may
 simply match no events. An Agent principal remains scoped to itself; an explicit nonempty
-agent filter that excludes it returns `not_allowed`.
+agent filter that excludes it returns `not_allowed`. Its filter also admits the
+Agent-less, bodyless `var.changed` facts of the variable scopes it can read (global and
+its own project).
 
 Only `events.subscribe` accepts `wait_ms`. It defaults to 0, must be a nonnegative `u64`
 when supplied, and values above 30,000 are clamped to 30,000. Bad types, negative values
@@ -2026,6 +2038,13 @@ every other coordination payload, rejects known credentials with
 `mail.inbox` pages unread rows oldest-first with a limit of 1–100 (default
 100) and an `after` delivery cursor, truncated to the encoded response
 bound; `next` is the last returned delivery id, or null on an empty page.
+The page may be narrowed by `thread` or by one exact `reply_to` delivery id
+(rows whose `reply_to_delivery` names it), and `wait_ms` (clamped to 30,000)
+long-polls for the first matching delivery instead of returning an empty page.
+Every delivery appends one bodyless `mail.delivered` event
+(`recipient`, `delivery_id`, `sender`, `thread`) bound to the recipient
+generation, so the long-poll wakes without reading any body. The CLI is
+`swarm inbox [--thread T] [--reply-to DELIVERY] [--wait SECS]`.
 `mail.read` returns one exact row. Both are read-only. An Agent caller reads
 only its own stable mailbox and may omit `agent`; the owner must name the
 mailbox explicitly. `mail.ack` acknowledges only the listed exact delivery
@@ -2048,6 +2067,11 @@ plus global ones. Values are JSON of at most 16 KiB encoded. An omitted
 current version, where an absent row reads as 0, otherwise the write is
 rejected with `version_conflict` and nothing changes. Every write
 increments the version, records `set_by`, and emits `var.changed`.
+`var.get` takes an optional `after_version` baseline; `wait_ms` (clamped to
+30,000) requires it. The read returns at once when the version already differs,
+and otherwise long-polls for the matching `var.changed`; an absent row reads as
+version 0, so a nonzero baseline on an absent row returns `not_found` at once.
+The CLI is `swarm var get [--scope S] [--after-version N] [--wait SECS] KEY`.
 
 The CLI supplies exactly one value source: inline `VALUE` or `--value-file
 PATH`, mutually exclusive. The file is read as bounded UTF-8 (at most 16 KiB)
@@ -2057,9 +2081,11 @@ only the resulting value is stored.
 
 A routed recipient with `wake_on_mail` (profile snapshot, default true) may
 receive one generic coalesced wake per minute with at most one open notice
-command per recipient across mail and claims: `N unread messages; run swarm inbox, then ack processed delivery IDs`.
-An OpenCode or Antigravity recipient instead names the coordination tool it actually
-has: `N unread messages; use the eliot-swarm MCP swarm tool (method mail.inbox), then ack processed delivery IDs`.
+command per recipient across mail and claims. The wake text is one neutral
+line for every harness: `N unread: mail.inbox, then mail.ack`. An unread reply
+whose `reply_to_delivery` names mail the recipient itself sent, admitted after
+the last presentation, skips the one-minute cooldown once; the open-notice,
+busy, pending-input and unknown gates still apply.
 The notice never contains
 the body, is sent through the ordinary owner `send` path bound to the
 recipient's current generation, and is skipped — never retried — while a
@@ -2093,9 +2119,8 @@ by the next claim write. A conflict — two globs that may overlap after
 normalization (segments are compatible when equal or either side carries
 a wildcard, with `**` realigning across directories), in the same project
 — is reported in-band in the `claim.set` response and routes at most one
-coalesced generic notice per holder: `1 overlapping work claim` /
-`N overlapping work claims`, plus `; run swarm who` (an OpenCode or Antigravity holder
-instead gets `; use the eliot-swarm MCP swarm tool (method who)`). Detection is
+coalesced generic notice per holder: `1 overlapping work claim: who` /
+`N overlapping work claims: who`, the same text for every harness. Detection is
 conservative: a false positive only adds an
 advisory notice. The in-band list holds at most 100 conflicts;
 `truncated` signals the scan or report cap engaged. The notice shares the

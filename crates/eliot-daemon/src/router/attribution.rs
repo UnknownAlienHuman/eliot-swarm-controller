@@ -776,10 +776,7 @@ mod tests {
                 .expect("notice command admitted");
             assert_eq!(command.verb, "send");
             assert_eq!(command.target.as_deref(), Some(holder.as_str()));
-            assert_eq!(
-                command.args["text"],
-                json!("1 overlapping work claim; run swarm who")
-            );
+            assert_eq!(command.args["text"], json!("1 overlapping work claim: who"));
         }
         assert_eq!(
             holder_notice_sends(&store, &a, &b).expect("count notices"),

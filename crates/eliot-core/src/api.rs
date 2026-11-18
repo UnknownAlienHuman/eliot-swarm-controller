@@ -178,8 +178,8 @@ pub use usage::{
     UsageSummaryRequest, UsageSummaryResponse,
 };
 pub use waits::{
-    MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, SwarmWaitRequest, SwarmWaitResponse,
-    WaitEntryResult, WaitTurnRef,
+    MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
+    SwarmWaitRequest, SwarmWaitResponse, WaitEntryResult, WaitTurnRef,
 };
 pub use workspaces::{ManagedWorkspaceView, WorkspaceListRequest, WorkspaceListResponse};
 

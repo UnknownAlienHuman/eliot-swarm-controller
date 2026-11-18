@@ -247,15 +247,20 @@ pub(crate) async fn run_inbox(
         agent,
         limit,
         after,
+        thread,
+        reply_to,
         wait,
     }: InboxArgs,
     data_dir: PathBuf,
     json_output: bool,
 ) -> Result<u8, Failure> {
-    let request = MailInboxRequest {
+    let mut request = MailInboxRequest {
         agent,
         limit,
         after,
+        wait_ms: 0,
+        thread,
+        reply_to,
     };
     request.validate().map_err(Failure::for_read)?;
     // One checked absolute deadline bounds every wait RPC and sleep; a short
@@ -266,6 +271,16 @@ pub(crate) async fn run_inbox(
     let (deadline, waited) = inbox_deadline(wait)?;
     let mut last: Option<MailInboxResponse> = None;
     loop {
+        // Each wait RPC long-polls the server for the time left under the
+        // deadline (the server clamps past 30 seconds); the client loop
+        // stays for the exit-5 accounting and the kept page.
+        request.wait_ms = match deadline {
+            Some(end) => end
+                .checked_duration_since(Instant::now())
+                .map(|left| left.as_millis().min(30_000) as u64)
+                .unwrap_or(0),
+            None => 0,
+        };
         let response: MailInboxResponse = match deadline {
             Some(end) => {
                 match timeout_at(
@@ -403,20 +418,94 @@ pub(crate) async fn run_var(
             print_value(&value, json_output);
             Ok(0)
         }
-        VarCommand::Get(VarGetArgs { key, scope }) => {
-            let request = VarGetRequest { scope, key };
+        VarCommand::Get(VarGetArgs {
+            key,
+            scope,
+            after_version,
+            wait,
+        }) => {
+            if wait.unwrap_or(0) > 0 && after_version.is_none() {
+                return Err(Failure::new(2, "--wait needs --after-version"));
+            }
+            let mut request = VarGetRequest {
+                scope,
+                key,
+                after_version,
+                wait_ms: 0,
+            };
             request.validate().map_err(Failure::for_read)?;
-            let response: VarGetResponse =
-                eliot_daemon::client_call_typed(&data_dir, "var.get", &request)
+            // Same deadline plan as `inbox --wait`: no wait reads once and
+            // exits 0; a wait exits 5 when the version never moves. Each wait
+            // RPC long-polls the server for the time left under the deadline.
+            let (deadline, waited) = inbox_deadline(wait)?;
+            let mut last: Option<VarGetResponse> = None;
+            loop {
+                request.wait_ms = match deadline {
+                    Some(end) => end
+                        .checked_duration_since(Instant::now())
+                        .map(|left| left.as_millis().min(30_000) as u64)
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                let response: VarGetResponse = match deadline {
+                    Some(end) => {
+                        match timeout_at(
+                            end,
+                            eliot_daemon::client_call_typed(&data_dir, "var.get", &request),
+                        )
+                        .await
+                        {
+                            Ok(Ok(response)) => response,
+                            Ok(Err(error)) => return Err(Failure::for_read(error)),
+                            Err(_) => {
+                                if let Some(read) = last {
+                                    let rendered = serde_json::to_value(read).map_err(|_| {
+                                        Failure::new(4, "var.get response is invalid")
+                                    })?;
+                                    print_value(&rendered, json_output);
+                                    return Ok(5);
+                                }
+                                return Err(Failure::new(
+                                    5,
+                                    "variable wait timed out before a read completed",
+                                ));
+                            }
+                        }
+                    }
+                    None => eliot_daemon::client_call_typed(&data_dir, "var.get", &request)
+                        .await
+                        .map_err(Failure::for_read)?,
+                };
+                request
+                    .validate_response(&response)
+                    .map_err(Failure::invalid_response)?;
+                let changed = after_version.is_none_or(|baseline| response.version != baseline);
+                let done = match deadline {
+                    None => true,
+                    Some(end) => changed || Instant::now() >= end,
+                };
+                if done {
+                    let value = serde_json::to_value(response)
+                        .map_err(|_| Failure::new(4, "var.get response is invalid"))?;
+                    print_value(&value, json_output);
+                    if waited && !changed {
+                        return Ok(5);
+                    }
+                    return Ok(0);
+                }
+                last = Some(response);
+                if sleep_before_deadline(deadline.expect("wait has a deadline"))
                     .await
-                    .map_err(Failure::for_read)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "var.get response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+                    .is_err()
+                {
+                    if let Some(read) = last {
+                        let rendered = serde_json::to_value(read)
+                            .map_err(|_| Failure::new(4, "var.get response is invalid"))?;
+                        print_value(&rendered, json_output);
+                    }
+                    return Ok(5);
+                }
+            }
         }
     }
 }

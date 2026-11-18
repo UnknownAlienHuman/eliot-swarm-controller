@@ -1835,12 +1835,18 @@ impl Store {
     /// and `sources` when those are nonempty, in sequence order, at most
     /// `limit` rows within the page byte bound. The work is bounded by the
     /// named Agents' own rows, never by the rest of the journal. No Agent
-    /// matches no row (after the same retention check).
+    /// matches no row (after the same retention check). Agent-less
+    /// `var.changed` facts whose encoded scope is in `var_scopes` ride
+    /// along through the `events_kind` index, so an Agent waiting on a
+    /// variable it can read sees the version bump; the fact never carries
+    /// the value.
+    #[allow(clippy::too_many_arguments)]
     pub fn read_agent_events(
         &self,
         agents: &[i64],
         kinds: &[&str],
         sources: &[&str],
+        var_scopes: &[&str],
         after: i64,
         through: i64,
         limit: usize,
@@ -1849,7 +1855,7 @@ impl Store {
         if after < 0 || through < after {
             return Err(Error::new("invalid", "invalid event sequence bounds"));
         }
-        if [agents.len(), kinds.len(), sources.len()]
+        if [agents.len(), kinds.len(), sources.len(), var_scopes.len()]
             .into_iter()
             .any(|len| len > MAX_PAGE_ENTRIES)
         {
@@ -1890,6 +1896,32 @@ impl Store {
         let mut events = Vec::new();
         for row in rows {
             events.push(event_from_record(row.map_err(sql_error)?)?);
+        }
+        if !var_scopes.is_empty() && (kinds.is_empty() || kinds.contains(&"var.changed")) {
+            let mut sql = format!(
+                "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
+                 FROM events INDEXED BY events_kind
+                 WHERE kind = 'var.changed' AND seq > ? AND seq <= ? AND agent IS NULL
+                   AND json_extract(data, '$.scope') IN ({})",
+                placeholders(var_scopes.len())
+            );
+            if !sources.is_empty() {
+                sql.push_str(&format!(" AND source IN ({})", placeholders(sources.len())));
+            }
+            sql.push_str(" ORDER BY seq LIMIT ?");
+            let mut values: Vec<rusqlite::types::Value> = vec![after.into(), through.into()];
+            values.extend(var_scopes.iter().map(|scope| (*scope).to_owned().into()));
+            values.extend(sources.iter().map(|source| (*source).to_owned().into()));
+            values.push((limit as i64).into());
+            let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(values), event_record_from_row)
+                .map_err(sql_error)?;
+            for row in rows {
+                events.push(event_from_record(row.map_err(sql_error)?)?);
+            }
+            events.sort_by_key(|event| event.seq);
+            events.truncate(limit);
         }
         enforce_page_bytes(&mut events)?;
         Ok(events)

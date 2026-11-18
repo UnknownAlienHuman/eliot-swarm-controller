@@ -433,9 +433,9 @@ running daemon. Partial, conflicting, or revoked managed identity fails closed; 
 owner caller uses the existing owner credential path. Administrative methods (such as `daemon.status`)
 are rejected with `not_allowed` for managed Agent callers.
 
-Wake and claim notices sent to an Antigravity Agent name the tool it
-actually has (`use the eliot-swarm MCP swarm tool (method mail.inbox)` / `use the swarm tool
-(who)`) instead of the `swarm` shell CLI other harnesses still rely on.
+Wake and claim notices use the one neutral text every harness gets
+(`N unread: mail.inbox, then mail.ack`); an Antigravity Agent resolves those
+methods through this tool.
 
 Readback: ACP exposes no MCP inventory on any checked surface
 (`session/new` / `session/load` results carry no server list;

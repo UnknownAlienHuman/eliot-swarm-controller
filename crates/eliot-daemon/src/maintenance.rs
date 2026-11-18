@@ -648,6 +648,9 @@ mod tests {
                     agent: None,
                     limit: None,
                     after: None,
+                    wait_ms: 0,
+                    thread: None,
+                    reply_to: None,
                 },
                 pruned_at,
             )

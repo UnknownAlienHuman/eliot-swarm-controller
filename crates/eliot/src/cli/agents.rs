@@ -749,6 +749,7 @@ pub(crate) async fn run_wait(
         ids,
         command,
         turn,
+        mail,
     }: WaitArgs,
     data_dir: PathBuf,
     json_output: bool,
@@ -761,6 +762,7 @@ pub(crate) async fn run_wait(
         ids,
         command,
         turn,
+        mail,
         json_output,
     )
     .await
@@ -1071,6 +1073,7 @@ pub(crate) async fn swarm_wait(
     ids: Vec<String>,
     explicit_commands: Vec<String>,
     explicit_turns: Vec<String>,
+    mail: bool,
     json_output: bool,
 ) -> Result<u8, Failure> {
     if all == any {
@@ -1108,7 +1111,7 @@ pub(crate) async fn swarm_wait(
         return Err(Failure::new(2, "swarm wait requires 1..=256 captured ids"));
     }
     let wait_ms = timeout_seconds.saturating_mul(1_000);
-    let params = SwarmWaitRequest::new(commands, turns, mode, wait_ms);
+    let params = SwarmWaitRequest::new(commands, turns, mode, wait_ms).with_mailbox(mail);
     params.validate().map_err(Failure::for_read)?;
     let response: SwarmWaitResponse =
         eliot_daemon::client_call_typed(data_dir, "swarm.wait", &params)
@@ -1367,6 +1370,7 @@ mod tests {
             mode: mode.to_owned(),
             completed: true,
             timed_out: false,
+            mail_wake: false,
             results: statuses
                 .iter()
                 .enumerate()
@@ -1401,6 +1405,7 @@ mod tests {
             mode: "all".to_owned(),
             completed: false,
             timed_out: true,
+            mail_wake: false,
             results: vec![WaitEntryResult::new("command", "c0", "still_running")],
         };
         assert_eq!(swarm_wait_exit_code(&timed_out), 5);
@@ -1413,6 +1418,7 @@ mod tests {
             ids,
             command,
             turn,
+            mail,
         })) = cli.command
         else {
             panic!("wait command required");
@@ -1423,6 +1429,12 @@ mod tests {
         assert_eq!(ids, vec!["c1".to_owned()]);
         assert!(command.is_empty());
         assert!(turn.is_empty());
+        assert!(!mail);
+        let cli = Cli::try_parse_from(["swarm", "wait", "--all", "--mail", "c1"]).unwrap();
+        let Some(CliCommand::Wait(WaitArgs { mail, .. })) = cli.command else {
+            panic!("wait command required");
+        };
+        assert!(mail);
         let cli = Cli::try_parse_from([
             "swarm",
             "wait",
