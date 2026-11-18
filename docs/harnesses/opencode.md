@@ -123,7 +123,7 @@ fail readiness with location-not-found (observed in the Linux Docker image).
 | detach | explicitly stop controlling/observing as defined, leaving native service/session alive |
 | resume | installed exact native session reattachment: `GET /api/session/{id}` proves the retained session, then the live catalogue proves an explicit realignment target with proven no effect before any native interrupt or setter (a miss fails the resume without touching the retained turn), then the interrupt-quiesce (`POST .../interrupt`, which aborts a running retained execution — refusing would wedge crash-recovery resume) plus the empty `inbox`/`permission`/`form` lists prove it idle (anything still pending refuses the resume); never replays the prompt |
 | approve/deny/answer | installed `POST .../permission/{id}/reply` (`once`/`always`/`reject`; approve must name `once` or `always`, there is no default choice), `POST .../form/{id}/reply` (`answer` map), `DELETE .../form/{id}` for deny; the public request id is the native id, request.opened details are the shared ApprovalRequest/QuestionRequest, answers are the shared AnswerArgs converted to the field-typed native value (string, string array, number, boolean), choices stage against the offered schema (a miss rejects before any write), a lost reply is unknown and never rewritten |
-| configure | mid-run model and/or effort switch at configure time: the requested `provider/model` must be in the live `GET /api/model` catalogue or the command rejects before any write, and a requested effort must be one of that model's installed `variants` ids (the TUI "Variant" switch; the installed server validates nothing and echoes even bogus switches, so the catalogue gate is the honest failure); the switch runs installed `POST /api/session/{id}/model` with the documented `Model.Ref.variant` and a fresh `session.get` effective readback (`model_verified` and, when an effort was requested, `effort_verified` only from that readback), then the Router stores the overlay — a refused or unproven switch stores nothing and never claims applied. A model switch without an effort runs the server default variant. Resume-time realign proves live catalogue membership for an explicit target model (plus variant membership when an effort is carried) before any installed `POST .../model` / `POST .../agent` setter against the retained session, then verifies with `session.get` effective readback (a refused switch fails the resume as unknown; the catalogue gate already ran before the interrupt-quiesce, so an unreadable catalogue that early and a catalogue miss both fail the resume with proven no effect), targeting the inherited overlay revision when a resume carries one |
+| configure | mid-run model and/or effort switch at configure time: the requested `provider/model` must be in the live `GET /api/model` catalogue or the command rejects before any write, and a requested effort must be one of that model's installed `variants` ids (the TUI "Variant" switch; the installed server validates nothing and echoes even bogus switches, so the catalogue gate is the honest failure); the switch runs installed `POST /api/session/{id}/model` with the documented `Model.Ref.variant` and a fresh `session.get` effective readback (`model_verified` and, when an effort was requested, `effort_verified` only from that readback), then the Router stores the overlay — a refused or unproven switch stores nothing and never claims applied. A model switch without an effort runs the server default variant. Resume-time realign proves live catalogue membership for an explicit target model (plus variant membership when an effort is carried) before any installed `POST .../model` / `POST .../agent` setter against the retained session, then verifies with `session.get` effective readback (a refused switch fails the resume as unknown; the catalogue gate already ran before the interrupt-quiesce, so an unreadable catalogue that early and a catalogue miss both fail the resume with proven no effect), targeting the inherited overlay revision when a resume carries one. The Agent-scoped `harness.models` catalogue is that same live set, so the picker and this gate never disagree |
 | fork/background | installed native method and exact resulting identity/state |
 | goal | explicitly selected Eliot Goal; no assumed native Goal |
 
@@ -374,11 +374,18 @@ and waits for its Job family to empty (terminating a remaining server tail withi
 the bounded close budget) before starting the next command or returning a catalogue.
 Unconfirmed family closure returns `unknown`, including for the optional variants
 read; a failed variants read degrades to ids only after confirmed cleanup.
-Both catalogue commands intentionally inherit the reader's environment and canonical
-native configuration/auth stores, without the per-Agent XDG redirect used by
-`server.rs` and `auth.rs`: discovery must see the owner's authenticated providers.
-They create no session and import or modify no credentials. Process custody and
-private standalone execution do not imply an isolated credential store.
+When the frozen snapshot names an `auth_integration`, both catalogue commands run
+under ephemeral per-call XDG roots holding that same frozen auth (transferred the
+way the pre-serve hook transfers it), so the read lists exactly the providers the
+session would accept; the response provenance says `isolated`. Without a frozen
+selector (ad-hoc catalogue reads) they inherit the reader's environment and the
+canonical native configuration/auth stores and say `canonical`: a later launch
+under frozen auth may accept fewer models. An Agent-scoped read (`harness.models`
+with `agent`) prefers the live session's own `GET /api/model` set (`session`
+provenance) -- the exact set the start, resume and configure gates admit against --
+and falls back to the isolated reader when the session is not ready. Catalogue
+reads create no session and, outside the isolated transfer, import or modify no
+credentials.
 A launch resolves
 the full provider/model pair, an omitted model leaves the configured native
 default, read back from the session echo. A stored profile may also carry

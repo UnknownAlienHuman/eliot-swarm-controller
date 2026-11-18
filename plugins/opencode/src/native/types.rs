@@ -588,6 +588,10 @@ pub struct NativeModelEntry {
     pub id: Option<String>,
     #[serde(default, rename = "providerID")]
     pub provider_id: Option<String>,
+    /// Verbatim live display name (Model.Info.name) when present. The
+    /// reader overlay carries names too; the picker falls back to the id.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub limit: Option<NativeModelLimit>,
     #[serde(default)]

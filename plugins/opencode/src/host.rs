@@ -1,9 +1,10 @@
 use crate::{
     events::{EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
     native::{
-        AuthSetup, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider, OpenCodeHttp,
-        OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
-        models::{run_model_metadata, run_models},
+        AuthSetup, AuthTransfer, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider,
+        OpenCodeHttp, OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
+        models::{MAX_MODEL_ID_BYTES, run_model_metadata, run_models},
+        transfer_selected_integration,
         types::{
             ConfigEntry, ConfigMcpServer, InboxUser, McpServerReadback, ModelRef, NativeModelEntry,
             PermissionRule, SessionInfo,
@@ -26,8 +27,9 @@ use reqwest::{redirect, retry};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 use tokio::{
     sync::mpsc,
@@ -701,13 +703,22 @@ impl OpenCodePlugin {
                 )
             })?;
         let until = Instant::now() + RPC_TIMEOUT;
+        // One catalogue per Agent route: when the frozen snapshot names
+        // the auth integration the session would transfer, the reader
+        // runs under that same isolated config and frozen auth, so the
+        // picker lists exactly what the live session accepts. Otherwise
+        // the reader inherits the canonical stores and says so.
+        let isolation =
+            Self::isolate_catalog_reader(snapshot, std::ffi::OsStr::new(program), until).await?;
+        let xdg = isolation.xdg();
+        let provenance = isolation.provenance();
         let models: Vec<Value> = match params.part {
-            ModelListPart::Models => run_models(std::ffi::OsStr::new(program), until)
+            ModelListPart::Models => run_models(std::ffi::OsStr::new(program), until, xdg)
                 .await?
                 .into_iter()
                 .map(|id| json!({"id": id, "default": false}))
                 .collect(),
-            ModelListPart::Variants => run_model_metadata(std::ffi::OsStr::new(program), until)
+            ModelListPart::Variants => run_model_metadata(std::ffi::OsStr::new(program), until, xdg)
                 .await?
                 .into_iter()
                 .map(|entry| {
@@ -715,7 +726,81 @@ impl OpenCodePlugin {
                 })
                 .collect(),
         };
-        Ok(json!({"models": models, "default": Value::Null}))
+        Ok(json!({"models": models, "default": Value::Null, "provenance": provenance}))
+    }
+
+    /// The frozen auth integration selecting the isolated reader, if
+    /// any: the non-empty `auth_integration` the session would transfer.
+    fn catalog_auth_selector(snapshot: &Value) -> Option<String> {
+        snapshot
+            .get("auth_integration")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|selector| !selector.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Isolate one `model.list` read under the frozen auth the session
+    /// would get: ephemeral per-call XDG roots receive the selected
+    /// canonical credential through the same opaque transfer the
+    /// pre-serve hook uses, then both catalogue readers run under those
+    /// roots. Without a frozen selector the read inherits the canonical
+    /// stores. The temp base is removed when the read ends, whatever the
+    /// outcome; an unproven transfer fails the read instead of guessing.
+    async fn isolate_catalog_reader(
+        snapshot: &Value,
+        program: &OsStr,
+        deadline: Instant,
+    ) -> Result<CatalogIsolation> {
+        let Some(selector) = Self::catalog_auth_selector(snapshot) else {
+            return Ok(CatalogIsolation::canonical());
+        };
+        let selector = IntegrationSelector::new(&selector).map_err(|_| {
+            Error::new(
+                "profile_error",
+                "OpenCode model.list auth integration selector is invalid",
+            )
+        })?;
+        let seq = CATALOG_ISOLATION_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!(
+            "eliot-opencode-catalog-{}-{seq}-{nanos}",
+            std::process::id()
+        ));
+        let empty_config = base.join("empty-config");
+        let config_home = base.join("config");
+        let data_home = base.join("data");
+        for dir in [&base, &empty_config, &config_home, &data_home] {
+            std::fs::create_dir_all(dir).map_err(|_| {
+                Error::new(
+                    "native_spawn",
+                    "OpenCode model.list isolated reader store could not start",
+                )
+            })?;
+        }
+        let transfer = AuthTransfer {
+            program,
+            selector: &selector,
+            workspace: &base,
+            export_environment: &[],
+            canonical_config_home: &empty_config,
+            import_environment: &[],
+            isolated_config_home: &config_home,
+            isolated_data_home: &data_home,
+            reuse_existing: false,
+        };
+        if let Err(error) = transfer_selected_integration(&transfer, deadline).await {
+            let _ = std::fs::remove_dir_all(&base);
+            return Err(error);
+        }
+        Ok(CatalogIsolation {
+            temp_base: Some(base),
+            config_home: Some(config_home),
+            data_home: Some(data_home),
+        })
     }
 
     /// Retain a proven-no-effect start failure and build its failed-state
@@ -2689,12 +2774,49 @@ impl OpenCodePlugin {
             "configure" => self.configure_command(params).await,
             "steer" => self.steer_command(params).await,
             "interrupt" => self.interrupt_command(params).await,
+            "models" => self.session_models(params).await,
             "approve" | "deny" | "answer" => self.reply_command(params).await,
             _ => Err(Error::new(
                 "unsupported",
                 "OpenCode plugin command verb is not implemented",
             )),
         }
+    }
+
+    /// Read-only live model catalogue for the owned session: the exact
+    /// `GET /api/model` set the start, resume and configure gates admit
+    /// against, so an Agent-scoped `harness.models` read lists precisely
+    /// what this session accepts. Provenance `session`. No session, a
+    /// failed start, or a not-ready session is `bad_state`: the caller
+    /// falls back to the isolated reader instead of inventing a list.
+    async fn session_models(&self, params: AgentCommandParams) -> Result<Value> {
+        let session = self.session.as_ref().ok_or_else(|| {
+            Error::new(
+                "bad_state",
+                "OpenCode session catalogue needs a live Agent session",
+            )
+        })?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "OpenCode",
+        )?;
+        if self.failed_start.is_some()
+            || session.phase != SessionPhase::Ready
+            || native_io_blocked(session)
+        {
+            return Err(Error::new(
+                "bad_state",
+                "OpenCode session catalogue is not ready",
+            ));
+        }
+        let catalogue = session
+            .http
+            .list_native_models(Instant::now() + RPC_TIMEOUT)
+            .await?;
+        Ok(session_catalog_json(&catalogue))
     }
 
     /// Native `configure`: switch the retained session's model and/or
@@ -4702,6 +4824,110 @@ fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
 /// different providers never substitute for each other. The installed
 /// server echoes even bogus switches, so this row (read before any write)
 /// is what fails an unknown model honestly.
+/// Reader isolation for one `model.list` call: ephemeral per-call XDG
+/// roots holding the frozen auth transfer (`isolated`), or the inherited
+/// canonical stores (`canonical`). The temp base is removed when the read
+/// ends, whatever the outcome.
+struct CatalogIsolation {
+    temp_base: Option<PathBuf>,
+    config_home: Option<PathBuf>,
+    data_home: Option<PathBuf>,
+}
+
+impl CatalogIsolation {
+    fn canonical() -> Self {
+        Self {
+            temp_base: None,
+            config_home: None,
+            data_home: None,
+        }
+    }
+
+    fn provenance(&self) -> &'static str {
+        if self.temp_base.is_some() {
+            "isolated"
+        } else {
+            "canonical"
+        }
+    }
+
+    fn xdg(&self) -> Option<(&Path, &Path)> {
+        match (&self.config_home, &self.data_home) {
+            (Some(config), Some(data)) => Some((config.as_path(), data.as_path())),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for CatalogIsolation {
+    fn drop(&mut self) {
+        if let Some(base) = self.temp_base.take() {
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+}
+
+/// Per-call reader sequence for unique ephemeral catalogue roots.
+static CATALOG_ISOLATION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Live `GET /api/model` entries in `model.list` response shape with
+/// `session` provenance. Entries without a usable provider/model pair
+/// are skipped, never guessed; the endpoint names no default.
+fn session_catalog_json(catalogue: &[NativeModelEntry]) -> Value {
+    let models: Vec<Value> = catalogue
+        .iter()
+        .filter_map(|entry| {
+            let provider = entry
+                .provider_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|provider| {
+                    !provider.is_empty()
+                        && provider.len() <= MAX_MODEL_ID_BYTES
+                        && !provider
+                            .chars()
+                            .any(|c| c.is_control() || c.is_whitespace())
+                })?;
+            let id = entry.id.as_deref().map(str::trim).filter(|id| {
+                !id.is_empty()
+                    && id.len() <= MAX_MODEL_ID_BYTES
+                    && !id.chars().any(|c| c.is_control() || c.is_whitespace())
+            })?;
+            if provider.len() + id.len() + 1 > MAX_MODEL_ID_BYTES {
+                return None;
+            }
+            let efforts = entry.variants.as_ref().map(|variants| {
+                let mut ids = Vec::with_capacity(variants.len());
+                for variant in variants {
+                    let Some(variant) = variant.id.as_deref().map(str::trim).filter(|variant| {
+                        !variant.is_empty()
+                            && variant.len() <= 128
+                            && !variant.chars().any(|c| c.is_control() || c.is_whitespace())
+                    }) else {
+                        continue;
+                    };
+                    if !ids.iter().any(|known: &String| known == variant) {
+                        ids.push(variant.to_owned());
+                    }
+                }
+                ids
+            });
+            let display_name = entry
+                .name
+                .as_deref()
+                .and_then(eliot_core::api::harness::native_model_display_name)
+                .map(str::to_owned);
+            Some(json!({
+                "id": format!("{provider}/{id}"),
+                "default": false,
+                "efforts": efforts,
+                "display_name": display_name,
+            }))
+        })
+        .collect();
+    json!({"models": models, "default": Value::Null, "provenance": "session"})
+}
+
 fn catalogue_entry_for<'a>(
     catalogue: &'a [NativeModelEntry],
     provider_id: &str,
@@ -5216,6 +5442,66 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reader_uses_frozen_auth_selector_only() {
+        assert_eq!(
+            super::OpenCodePlugin::catalog_auth_selector(
+                &json!({"auth_integration": "opencode-go"})
+            ),
+            Some("opencode-go".to_owned())
+        );
+        assert_eq!(
+            super::OpenCodePlugin::catalog_auth_selector(&json!({"auth_integration": "  "})),
+            None
+        );
+        assert_eq!(
+            super::OpenCodePlugin::catalog_auth_selector(&json!({})),
+            None
+        );
+    }
+
+    #[test]
+    fn session_catalog_matches_configure_identity_rules() {
+        let live: Vec<NativeModelEntry> = serde_json::from_value(json!([
+            {"providerID": "opencode", "id": "deepseek-v4.1-flash-free",
+             "name": "DeepSeek V4.1 Flash Free",
+             "variants": [{"id": "low"}, {"id": "low"}, {"id": "has space"}, {"id": ""}]},
+            {"providerID": "openrouter", "id": "meta/muse-spark-open",
+             "name": "Muse Spark Open"},
+            {"providerID": "opencode-go", "id": "  ", "name": "Blank"},
+            {"providerID": "bad provider", "id": "m", "name": "Space"},
+            {"id": "no-provider", "name": "Missing"},
+        ]))
+        .expect("live fixture decodes");
+        let reply = super::session_catalog_json(&live);
+        assert_eq!(
+            reply.get("provenance").and_then(serde_json::Value::as_str),
+            Some("session")
+        );
+        assert!(reply.get("default").unwrap().is_null());
+        let models = reply
+            .get("models")
+            .and_then(serde_json::Value::as_array)
+            .expect("models array");
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models[0].get("id").and_then(serde_json::Value::as_str),
+            Some("opencode/deepseek-v4.1-flash-free")
+        );
+        assert_eq!(
+            models[0]
+                .get("display_name")
+                .and_then(serde_json::Value::as_str),
+            Some("DeepSeek V4.1 Flash Free")
+        );
+        assert_eq!(models[0].get("efforts").unwrap(), &json!(["low"]));
+        assert_eq!(
+            models[1].get("id").and_then(serde_json::Value::as_str),
+            Some("openrouter/meta/muse-spark-open")
+        );
+        assert!(models[1].get("efforts").unwrap().is_null());
+    }
+
+    #[test]
     fn frozen_policy_reads_snapshot_and_rejects_allow() {
         use serde_json::json;
         // Keyless snapshots keep their recorded meaning, `inherit`; new
@@ -5469,6 +5755,7 @@ mod tests {
                 id: Some("kimi".to_owned()),
                 provider_id: Some("opencode".to_owned()),
                 limit: None,
+                name: None,
                 variants: Some(vec![
                     NativeModelVariant {
                         id: Some("low".to_owned()),
@@ -5482,12 +5769,14 @@ mod tests {
                 id: None,
                 provider_id: Some("opencode".to_owned()),
                 limit: None,
+                name: None,
                 variants: None,
             },
             NativeModelEntry {
                 id: Some("kimi".to_owned()),
                 provider_id: Some("other".to_owned()),
                 limit: None,
+                name: None,
                 variants: Some(vec![NativeModelVariant {
                     id: Some("sibling".to_owned()),
                 }]),
@@ -5520,6 +5809,7 @@ mod tests {
             id: Some("kimi ".to_owned()),
             provider_id: Some(" opencode".to_owned()),
             limit: None,
+            name: None,
             variants: None,
         }];
         assert!(!catalogue_contains(&padded, "opencode/kimi"));
@@ -5622,6 +5912,7 @@ mod tests {
                 id: Some("c".to_owned()),
                 provider_id: Some("a/b".to_owned()),
                 limit: None,
+                name: None,
                 variants: Some(vec![NativeModelVariant {
                     id: Some("low".to_owned()),
                 }]),
@@ -5630,6 +5921,7 @@ mod tests {
                 id: Some("b/c".to_owned()),
                 provider_id: Some("a".to_owned()),
                 limit: None,
+                name: None,
                 variants: Some(vec![NativeModelVariant {
                     id: Some("high".to_owned()),
                 }]),
