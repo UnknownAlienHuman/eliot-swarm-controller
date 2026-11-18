@@ -579,7 +579,18 @@ impl SettingsState {
             Page::Routing => one(Section::Routing, model::routing_for_save(&self.routing)),
             Page::Projects => one(Section::Projects, self.projects.clone()),
             Page::Automations => one(Section::Automation, self.automation.clone()),
-            Page::CloudMcp => one(Section::CloudMcp, self.cloud.clone()),
+            Page::CloudMcp => {
+                let cloud = self.cloud.clone();
+                // A fresh template is a local draft, never a save: its
+                // required fields are empty and the daemon would refuse
+                // it, discarding the new page (#678).
+                if model::cloud_enabled(&cloud)
+                    && let Some(missing) = model::cloud_missing(&cloud)
+                {
+                    return Err(format!("Fill in {missing} before Cloud MCP is saved."));
+                }
+                one(Section::CloudMcp, cloud)
+            }
             Page::Advanced => {
                 let sections = self.json_edits()?;
                 if sections.is_empty() {
@@ -1149,7 +1160,19 @@ impl DesktopApp {
                     } else {
                         json!({})
                     };
-                    self.autosave(Page::CloudMcp, context);
+                    if on {
+                        // The template stays a local draft until every
+                        // field is filled; each typed field saves when it
+                        // rests, and the gate above holds back the
+                        // incomplete draft instead of sending it to a
+                        // refusal that would discard the new page (#678).
+                        s.notes.insert(
+                            Page::CloudMcp,
+                            Note::info("Fill in every field; Cloud MCP saves when complete."),
+                        );
+                    } else {
+                        self.autosave(Page::CloudMcp, context);
+                    }
                 }
             }
             SettingsMsg::AllDraft(text) => {
@@ -2201,5 +2224,23 @@ model = \"gpt-6\"
         assert!(saved_here(Section::Profiles, &sent, [&saves]));
         let other = json!({"dev": {"harness": "codex", "model": "gpt-7"}});
         assert!(!saved_here(Section::Profiles, &other, [&saves]));
+    }
+    #[test]
+    fn cloud_template_is_held_back_until_every_field_is_filled() {
+        // #678: a fresh template must never be sent (the daemon would
+        // refuse it and discard the new page); only a complete draft
+        // and the empty (off) section go out.
+        let mut state = SettingsState::default();
+        state.cloud = model::cloud_template();
+        let refused = state
+            .request_sections(Page::CloudMcp, "")
+            .expect_err("bare template is not sent");
+        assert!(refused.contains("Public hostname"), "{refused}");
+        for (key, _) in model::CLOUD_FIELDS {
+            model::set_cloud_field(&mut state.cloud, key, "x");
+        }
+        assert!(state.request_sections(Page::CloudMcp, "").is_ok());
+        state.cloud = serde_json::json!({});
+        assert!(state.request_sections(Page::CloudMcp, "").is_ok());
     }
 }

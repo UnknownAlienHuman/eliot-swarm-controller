@@ -407,6 +407,27 @@ pub fn cloud_enabled(draft: &Value) -> bool {
     draft.as_object().is_some_and(|map| !map.is_empty())
 }
 
+/// Required Cloud MCP fields still blank, in form order: `None` when the
+/// draft is complete. An empty section (Cloud MCP off) is complete by
+/// definition; the caller decides whether an enabled-but-incomplete draft
+/// may be sent (#678).
+pub fn cloud_missing(cloud: &Value) -> Option<String> {
+    if !cloud_enabled(cloud) {
+        return None;
+    }
+    let missing: Vec<&str> = CLOUD_FIELDS
+        .iter()
+        .filter(|(key, _)| {
+            cloud
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+        })
+        .map(|(_, label)| *label)
+        .collect();
+    (!missing.is_empty()).then(|| missing.join(", "))
+}
+
 /// An empty form for every Cloud MCP field.
 pub fn cloud_template() -> Value {
     Value::Object(
@@ -937,5 +958,17 @@ mod tests {
         );
         assert_eq!(utc_minute(0), "1970-01-01 00:00 UTC");
         assert_eq!(utc_minute(1_763_215_380_000), "2025-11-15 14:03 UTC");
+    }
+    #[test]
+    fn cloud_missing_names_blank_fields_in_form_order() {
+        // #678: the send gate for a Cloud MCP draft.
+        let mut template = cloud_template();
+        let missing = cloud_missing(&template).expect("empty template is incomplete");
+        assert_eq!(missing, "cloudflared executable, Tunnel id, Tunnel credentials file, Public hostname, Access team name, Access audience tag");
+        set_cloud_field(&mut template, "hostname", "example.com");
+        let missing = cloud_missing(&template).expect("still incomplete");
+        assert!(!missing.contains("Public hostname"));
+        assert!(missing.contains("Tunnel id"));
+        assert!(cloud_missing(&json!({})).is_none());
     }
 }
