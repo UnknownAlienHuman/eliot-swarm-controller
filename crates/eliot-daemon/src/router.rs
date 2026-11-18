@@ -3742,7 +3742,7 @@ impl Router {
             // Historical configuration from each turn's exact retained
             // revision, never the current overlay.
             for turn in &mut turns {
-                turn.config = store.turn_config_view(&agent, turn)?;
+                store.fill_turn_readback(&agent, turn)?;
             }
             (agent, generation, turns)
         };
@@ -3773,7 +3773,7 @@ impl Router {
                 .ok_or_else(|| Error::new("not_found", format!("turn {turn_id} was not found")))?;
             // Historical configuration from the turn's exact retained
             // generation and revision, never the current overlay.
-            turn.config = store.turn_config_view(&agent_row, &turn)?;
+            store.fill_turn_readback(&agent_row, &mut turn)?;
             turn
         };
         self.mask_unknown_turns(agent, generation, std::slice::from_mut(&mut turn))

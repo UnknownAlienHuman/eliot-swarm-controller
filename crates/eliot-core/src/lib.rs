@@ -808,6 +808,12 @@ pub struct Turn {
     /// Absent for native completion, unsettled turns, and old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_source: Option<TurnResolutionSource>,
+    /// Effective native model observed for the turn, or its verified launch selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_model: Option<String>,
+    /// Message from the committed native terminal error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_error_message: Option<String>,
 }
 
 /// Native token usage attributed to one terminal turn. Every member is

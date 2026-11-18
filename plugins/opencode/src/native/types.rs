@@ -588,6 +588,10 @@ pub struct NativeModelEntry {
     pub id: Option<String>,
     #[serde(default, rename = "providerID")]
     pub provider_id: Option<String>,
+    /// Verbatim live display name (Model.Info.name) when present. The
+    /// reader overlay carries names too; the picker falls back to the id.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub limit: Option<NativeModelLimit>,
     #[serde(default)]
@@ -687,6 +691,14 @@ pub struct ExecutionEventData {
     pub error: Option<StructuredError>,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// Bound inference model in the installed `session.step.started` event.
+#[derive(Debug, Deserialize)]
+pub struct StepStartedData {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    pub model: ModelRef,
 }
 
 /// `session.created` / `session.deleted` data subset: the exact session id.

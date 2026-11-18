@@ -123,7 +123,7 @@ fail readiness with location-not-found (observed in the Linux Docker image).
 | detach | explicitly stop controlling/observing as defined, leaving native service/session alive |
 | resume | installed exact native session reattachment: `GET /api/session/{id}` proves the retained session, then the live catalogue proves an explicit realignment target with proven no effect before any native interrupt or setter (a miss fails the resume without touching the retained turn), then the interrupt-quiesce (`POST .../interrupt`, which aborts a running retained execution — refusing would wedge crash-recovery resume) plus the empty `inbox`/`permission`/`form` lists prove it idle (anything still pending refuses the resume); never replays the prompt |
 | approve/deny/answer | installed `POST .../permission/{id}/reply` (`once`/`always`/`reject`; approve must name `once` or `always`, there is no default choice), `POST .../form/{id}/reply` (`answer` map), `DELETE .../form/{id}` for deny; the public request id is the native id, request.opened details are the shared ApprovalRequest/QuestionRequest, answers are the shared AnswerArgs converted to the field-typed native value (string, string array, number, boolean), choices stage against the offered schema (a miss rejects before any write), a lost reply is unknown and never rewritten |
-| configure | mid-run model and/or effort switch at configure time: the requested `provider/model` must be in the live `GET /api/model` catalogue or the command rejects before any write, and a requested effort must be one of that model's installed `variants` ids (the TUI "Variant" switch; the installed server validates nothing and echoes even bogus switches, so the catalogue gate is the honest failure); the switch runs installed `POST /api/session/{id}/model` with the documented `Model.Ref.variant` and a fresh `session.get` effective readback (`model_verified` and, when an effort was requested, `effort_verified` only from that readback), then the Router stores the overlay — a refused or unproven switch stores nothing and never claims applied. A model switch without an effort runs the server default variant. Resume-time realign proves live catalogue membership for an explicit target model (plus variant membership when an effort is carried) before any installed `POST .../model` / `POST .../agent` setter against the retained session, then verifies with `session.get` effective readback (a refused switch fails the resume as unknown; the catalogue gate already ran before the interrupt-quiesce, so an unreadable catalogue that early and a catalogue miss both fail the resume with proven no effect), targeting the inherited overlay revision when a resume carries one |
+| configure | mid-run model and/or effort switch at configure time: the requested `provider/model` must be in the live `GET /api/model` catalogue or the command rejects before any write, and a requested effort must be one of that model's installed `variants` ids (the TUI "Variant" switch; the installed server validates nothing and echoes even bogus switches, so the catalogue gate is the honest failure); the switch runs installed `POST /api/session/{id}/model` with the documented `Model.Ref.variant` and a fresh `session.get` effective readback (`model_verified` and, when an effort was requested, `effort_verified` only from that readback), then the Router stores the overlay — a refused or unproven switch stores nothing and never claims applied. A model switch without an effort runs the server default variant. Resume-time realign proves live catalogue membership for an explicit target model (plus variant membership when an effort is carried) before any installed `POST .../model` / `POST .../agent` setter against the retained session, then verifies with `session.get` effective readback (a refused switch fails the resume as unknown; the catalogue gate already ran before the interrupt-quiesce, so an unreadable catalogue that early and a catalogue miss both fail the resume with proven no effect), targeting the inherited overlay revision when a resume carries one. The Agent-scoped `harness.models` catalogue is that same live set, so the picker and this gate never disagree |
 | fork/background | installed native method and exact resulting identity/state |
 | goal | explicitly selected Eliot Goal; no assumed native Goal |
 
@@ -374,15 +374,33 @@ and waits for its Job family to empty (terminating a remaining server tail withi
 the bounded close budget) before starting the next command or returning a catalogue.
 Unconfirmed family closure returns `unknown`, including for the optional variants
 read; a failed variants read degrades to ids only after confirmed cleanup.
-Both catalogue commands intentionally inherit the reader's environment and canonical
-native configuration/auth stores, without the per-Agent XDG redirect used by
-`server.rs` and `auth.rs`: discovery must see the owner's authenticated providers.
-They create no session and import or modify no credentials. Process custody and
-private standalone execution do not imply an isolated credential store.
-A launch resolves
-the full provider/model pair, an omitted model leaves the configured native
-default, read back from the session echo. A stored profile may also carry
-`effort`, frozen the same way.
+With a named profile, both reads use the same generated provider configuration,
+target environment and selected auth as launch, including the dedicated local
+provider for an adopted backend. Pass `--workspace` to read in the intended launch
+directory. These results are previews, since the prospective launch's workspace
+and live provider state can differ. An unscoped read uses the canonical native
+configuration and is also a preview. Each reader's isolated credential store
+lives under its private host-owned instance directory. The host verifies removal
+after process-family closure on success, timeout and cancellation. Unconfirmed
+removal returns `unknown`.
+
+`swarm models --harness opencode --agent <id>` reads the owned generation's
+`GET /api/model` through `agent.models`. It applies the same exact model and
+variant identity rules as configure. Missing or unready sessions and failed
+or preempted reads return errors. The desktop fetches this catalogue whenever
+the Agent picker opens. This read performs no inference.
+
+Omitting the model leaves selection to OpenCode. The launch reports
+`model_source: native_default` and verifies the selected identity only when
+the session echoes one. Otherwise `native_default_model` reports the location
+default from `GET /api/model/default` when available. This optional preview
+runs before create when time remains ahead of the create request's RPC budget.
+The native inference step supplies the model that actually ran. Catalogue
+membership and a verified session selection do not establish provider inference
+access. Failed turns retain the native
+error message and the effective model where known. The chat's **Pick another
+model** action opens the Agent's live picker without retrying the failed input.
+
 ## Agent skill delivery (`eliot-swarm`)
 
 At spawn, the plugin copies the daemon-materialized canonical skill files

@@ -639,6 +639,8 @@ mod tests {
             config: None,
             preceded_by: None,
             resolution_source: None,
+            effective_model: None,
+            native_error_message: None,
         };
         serde_json::to_value(AgentResultResponse {
             agent: "a1".to_owned(),

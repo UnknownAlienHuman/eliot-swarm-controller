@@ -130,12 +130,13 @@ impl Router {
     /// The route an existing Agent's `configure` draws from: its frozen
     /// launch snapshot, never the current profile file. The label carries the
     /// exact Agent generation so a later profile edit cannot share its cache
-    /// entry. Observed Agents have no Eliot launch route.
+    /// entry. Observed Agents have no Eliot launch route. The returned
+    /// identity lets an OpenCode read try the live session catalogue first.
     async fn agent_catalog_snapshot(
         &self,
         agent: &str,
         harness: &str,
-    ) -> Result<(Option<Value>, String)> {
+    ) -> Result<(Option<Value>, String, Option<(String, i64)>)> {
         let agent = self
             .inner
             .store
@@ -156,16 +157,12 @@ impl Router {
             ));
         }
         let label = format!("{}@{}g{}", agent.profile, agent.id, agent.generation);
-        Ok((Some(agent.profile_snapshot), label))
+        let identity = (agent.id.clone(), agent.generation);
+        Ok((Some(agent.profile_snapshot), label, Some(identity)))
     }
 
-    /// Read-only native model catalogue for a harness: no model turn, no
-    /// inference. Codex/Muse/OpenCode/Antigravity use the harness's own
-    /// read-only method through a dedicated metadata reader, cached per native
-    /// route/account with freshness and credential identity; Claude reports
-    /// its frozen documented aliases and full model ids plus the CLI
-    /// default, each entry marked `documented_alias`. Native model ids are
-    /// retained verbatim: no fallback model is ever selected.
+    /// OpenCode Agent reads go to the owned generation. A standalone
+    /// catalogue is available independently as a launch preview.
     pub(super) async fn harness_models(
         &self,
         params: &Value,
@@ -197,18 +194,21 @@ impl Router {
             ));
         }
         let profile = request.profile.as_deref().map(str::trim);
-        let (snapshot, label) = match request.agent.as_deref() {
+        let (snapshot, label, live_identity) = match request.agent.as_deref() {
             Some(agent) => self.agent_catalog_snapshot(agent, &harness).await?,
             None => {
-                self.resolve_catalog_snapshot(&harness, profile, false, deadline)
-                    .await?
+                let (snapshot, label) = self
+                    .resolve_catalog_snapshot(&harness, profile, false, deadline)
+                    .await?;
+                (snapshot, label, None)
             }
         };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+        let live_opencode = live_identity.as_ref().filter(|_| harness == "opencode");
         let mut snapshot = snapshot;
         let mut environment = None;
         let mut cache_key = None;
-        if harness != "claude" {
+        if harness != "claude" && live_opencode.is_none() {
             let profile = snapshot.as_mut().ok_or_else(|| {
                 Error::new(
                     "internal",
@@ -219,9 +219,11 @@ impl Router {
             let cmd = profile["cmd"].as_str().unwrap_or(&harness);
             let (cmd, version) = crate::adhoc::reader_executable(cmd, &harness, deadline).await?;
             profile["cmd"] = Value::String(cmd.clone());
-            cache_key =
-                catalog::canonical_cache_identity(&label, profile, route.identity.as_deref())
-                    .and_then(|key| catalog::models_key(&key, &cmd, version.as_deref()));
+            if request.workspace.is_none() {
+                cache_key =
+                    catalog::canonical_cache_identity(&label, profile, route.identity.as_deref())
+                        .and_then(|key| catalog::models_key(&key, &cmd, version.as_deref()));
+            }
             environment = Some(route.environment);
         }
         let now = now_ms();
@@ -265,13 +267,48 @@ impl Router {
                     .get("cmd")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                let environment = environment
-                    .ok_or_else(|| Error::new("internal", "model reader environment missing"))?;
-                let raw = self
-                    .inner
-                    .plugin_host
-                    .models(snapshot, environment, deadline.into())
-                    .await?;
+                let (raw, provenance) = if let Some((agent_id, generation)) = live_opencode {
+                    let result = self
+                        .inner
+                        .plugin_host
+                        .agent_models(agent_id, *generation)
+                        .await?;
+                    if !self
+                        .inner
+                        .store
+                        .lock()
+                        .await
+                        .get_agent(agent_id)?
+                        .is_some_and(|agent| agent.generation == *generation)
+                    {
+                        return Err(Error::new(
+                            "stale_generation",
+                            "Agent generation changed during its model read",
+                        ));
+                    }
+                    (result, "session")
+                } else {
+                    let environment = environment.ok_or_else(|| {
+                        Error::new("internal", "model reader environment missing")
+                    })?;
+                    let raw = self
+                        .inner
+                        .plugin_host
+                        .models(
+                            snapshot,
+                            environment,
+                            request.workspace.clone(),
+                            deadline.into(),
+                        )
+                        .await?;
+                    let provenance =
+                        if raw.get("provenance").and_then(Value::as_str) == Some("preview") {
+                            "preview"
+                        } else {
+                            "canonical"
+                        };
+                    (raw, provenance)
+                };
                 let models = raw
                     .get("models")
                     .and_then(Value::as_array)
@@ -339,10 +376,7 @@ impl Router {
                 } else if harness == "opencode" {
                     (
                         "native".to_owned(),
-                        Some(
-                            "OpenCode catalogue from native `opencode models`; ids are provider/model verbatim, the frozen auth integration applies at launch"
-                                .to_owned(),
-                        ),
+                        Some(opencode_catalog_note(provenance).to_owned()),
                     )
                 } else if harness == "antigravity" {
                     (
@@ -877,6 +911,23 @@ pub(crate) const PARTIAL_AGGREGATE_TTL_MS: u64 = 30_000;
 /// for display. An omitted `--model` always defers to the server default at
 /// launch (MSP `session/start.modelId`: "server default when omitted"),
 /// whether or not the catalogue marks a row.
+/// Provenance note for an OpenCode catalogue read: the picker and the
+/// configure gate must never disagree, so the note always names which
+/// session-true source produced the list.
+fn opencode_catalog_note(provenance: &str) -> &'static str {
+    match provenance {
+        "session" => {
+            "OpenCode catalogue from the live session GET /api/model; the picker lists exactly what configure admits for this Agent generation"
+        }
+        "preview" => {
+            "OpenCode launch preview using the profile's provider settings and auth; workspace and live provider state can change availability"
+        }
+        _ => {
+            "OpenCode preview from the canonical native stores; an isolated session may accept a different set"
+        }
+    }
+}
+
 fn muse_catalog_note(default: Option<&str>) -> String {
     match default {
         Some(marked) if !marked.trim().is_empty() => format!(
@@ -1819,6 +1870,17 @@ mod tests {
             assert_eq!(provider.status, "supported");
             assert_eq!(provider.details.unwrap()["origin"], "provider");
         }
+    }
+
+    #[test]
+    fn opencode_catalog_note_names_its_source() {
+        assert!(opencode_catalog_note("session").contains("live session"));
+        assert!(opencode_catalog_note("preview").contains("launch preview"));
+        assert!(opencode_catalog_note("canonical").contains("canonical"));
+        assert_ne!(
+            opencode_catalog_note("session"),
+            opencode_catalog_note("preview")
+        );
     }
 
     #[test]

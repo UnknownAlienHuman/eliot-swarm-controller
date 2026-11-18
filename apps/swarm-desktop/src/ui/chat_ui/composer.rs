@@ -265,7 +265,7 @@ impl DesktopApp {
         &self,
         harness: &str,
     ) -> Option<&Fallible<ModelsCatalogResponse>> {
-        if self.agent_catalog().is_some() {
+        if harness == "opencode" || self.agent_catalog().is_some() {
             return None;
         }
         self.launch.catalog.as_ref().filter(|read| {
@@ -374,23 +374,24 @@ impl DesktopApp {
             None => "Checking what this task can change…".to_owned(),
             Some(Err(_)) => String::new(),
         };
-        let change_model: View = if (ready && !model_locked) || preview.is_some() {
-            StackPanel::new().spacing(tokens::spacing::XS).children((
-                m3::divider(palette),
-                m3::row(palette, false)
-                    .is_enabled(!self.submitting())
-                    .automation_name("Change model")
-                    .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Model))))
-                    .content(m3::row_content(
-                        Some(m3::glyph::MODEL),
-                        "Change model…",
-                        "",
-                        m3::icon(m3::glyph::CHEVRON_RIGHT),
-                    )),
-            ))
-        } else {
-            View::empty()
-        };
+        let change_model: View =
+            if (ready && !model_locked) || preview.is_some() || detail.harness == "opencode" {
+                StackPanel::new().spacing(tokens::spacing::XS).children((
+                    m3::divider(palette),
+                    m3::row(palette, false)
+                        .is_enabled(!self.submitting())
+                        .automation_name("Change model")
+                        .on_click(context.message(Message::Launch(LaunchMsg::Toggle(Pop::Model))))
+                        .content(m3::row_content(
+                            Some(m3::glyph::MODEL),
+                            "Change model…",
+                            "",
+                            m3::icon(m3::glyph::CHEVRON_RIGHT),
+                        )),
+                ))
+            } else {
+                View::empty()
+            };
         let hints: View = if effort_locked || !ready || efforts.is_empty() {
             View::empty()
         } else {

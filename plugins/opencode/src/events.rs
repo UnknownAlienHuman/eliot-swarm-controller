@@ -41,8 +41,8 @@ use crate::native::{
     types::{
         AgentSelectedData, AssistantContent, AssistantTokens, EliotContextHook,
         EliotContextResolveInput, ExecutionEventData, FormCancelledData, FormCreatedData,
-        FormRepliedData, InboxEventData, Message, ModelSelectedData, PermissionAskedData,
-        PermissionRepliedData, SessionLifecycleData, SseEnvelope, StructuredError,
+        FormRepliedData, InboxEventData, Message, ModelRef, ModelSelectedData, PermissionAskedData,
+        PermissionRepliedData, SessionLifecycleData, SseEnvelope, StepStartedData, StructuredError,
     },
 };
 
@@ -267,6 +267,7 @@ struct EventProcessor {
     /// Inbox id of the currently open turn: the prompt response id, which
     /// is the user message id the terminal readback bounds against.
     open_inbox_id: Option<String>,
+    active_model: Option<ModelRef>,
     /// Inbox ids observed as enqueued or delivered, by id. Bounded by the
     /// per-generation command history the host keeps.
     seen_inbox: HashSet<String>,
@@ -637,6 +638,7 @@ impl EventProcessor {
             gap_reported: false,
             pending: None,
             open_inbox_id: None,
+            active_model: None,
             seen_inbox: HashSet::new(),
             seen_delivered: HashSet::new(),
             seen_cancelled: HashSet::new(),
@@ -878,8 +880,9 @@ impl EventProcessor {
             "session.execution.succeeded"
                 | "session.execution.failed"
                 | "session.execution.interrupted"
+                | "session.step.started"
         ) {
-            // A terminal buffers only while an association may still open
+            // A step or terminal buffers only while an association may still open
             // its turn: our send is in flight, or a start awaits its
             // association. A turn-less terminal with neither coming is
             // classifiable now — the dead generation's close (dropped) or a
@@ -1524,6 +1527,15 @@ impl EventProcessor {
             "session.inbox.delivered" => self.observe_inbox(&envelope.data, true).await,
             "session.inbox.cancelled" => self.observe_inbox_cancelled(&envelope.data).await,
             "session.execution.started" => self.observe_execution_started(&envelope).await,
+            "session.step.started" => {
+                if self.status.active_turn_id.is_some()
+                    && let Ok(step) = serde_json::from_value::<StepStartedData>(envelope.data)
+                    && self.status.session_id.as_deref() == Some(step.session_id.as_str())
+                {
+                    self.active_model = Some(step.model);
+                }
+                Ok(())
+            }
             "session.execution.succeeded"
             | "session.execution.failed"
             | "session.execution.interrupted" => self.complete_turn(&envelope).await,
@@ -1834,6 +1846,10 @@ impl EventProcessor {
             readback.as_ref(),
             &secrets,
         );
+        if let Some(model) = self.active_model.take() {
+            data["effective_model"] =
+                json!(secrets.redact_text(&format!("{}/{}", model.provider_id, model.id)));
+        }
         data["outcome"] = json!(outcome);
         data["native_status"] = json!(envelope.event_type.as_str());
         let native_id = event_id(
@@ -2006,6 +2022,7 @@ impl EventProcessor {
         self.status.active_turn_id = None;
         self.pending = None;
         self.open_inbox_id = None;
+        self.active_model = None;
         self.stashed_started = None;
         self.pending_requests.clear();
         self.abort_context_hooks();

@@ -108,6 +108,7 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `agent.command` | agent/generation, command id, verb/args, exact turn/request where required, optional dispatch_seq | applied/rejected/failed/unknown, native mechanism and application point |
 | `agent.stop` | agent/generation, command id, force | success means the bound controlled session/generation ended, not merely that observation detached |
 | `agent.snapshot` | controlled command/turn binding, or exact subject plus `observation` page query | bounded readback; private history never acknowledges controlled effects |
+| `agent.models` | exact Agent and generation ([`AgentModelsParams`](../../crates/eliot-plugin/src/protocol.rs)) | read the owned session's model catalogue; OpenCode advertises `models` in its manifest and echoes the exact binding. A control request can preempt this bounded read |
 | `agent.attach` | exact subject, generation, observe/control, profile/environment, source plan/cursors | attach only to that subject; otherwise not found/unsupported. A bound `failed` result is limited to a proven pre-native refusal or `native_start_failed` (no thread/session effect and confirmed native-helper cleanup); uncertain outcomes remain unknown. |
 | `agent.detach` | exact observed subject/generation and command id | close only its reader; never end the native session |
 | `discover` | frozen profile, target environment without Agent identity, optional exact scope/cursor, `archived` (default `false`), bounded limit | read-only native-subject metadata page |

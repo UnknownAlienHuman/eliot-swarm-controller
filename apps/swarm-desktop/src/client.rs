@@ -724,6 +724,7 @@ pub async fn harness_models(
         harness: harness.to_owned(),
         profile: None,
         agent: agent.map(str::to_owned),
+        workspace: None,
     };
     params.validate()?;
     let reply: HarnessModelsResponse =

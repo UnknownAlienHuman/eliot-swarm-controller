@@ -319,6 +319,22 @@ pub(crate) struct ModelsArgs {
     /// means ad-hoc daemon defaults for the harness. Only with --harness.
     #[arg(long, value_name = "PROFILE")]
     pub(crate) profile: Option<String>,
+    /// Read a live Agent's catalogue. Only with --harness.
+    #[arg(
+        long,
+        value_name = "AGENT",
+        requires = "harness",
+        conflicts_with = "profile"
+    )]
+    pub(crate) agent: Option<String>,
+    /// Existing workspace for an OpenCode catalogue preview.
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires = "harness",
+        conflicts_with = "agent"
+    )]
+    pub(crate) workspace: Option<String>,
     /// Case-insensitive filter over model id, display name, provider and
     /// harness. Only without --harness (unified catalogue).
     #[arg(long, value_name = "QUERY")]
@@ -1538,11 +1554,7 @@ mod tests {
     fn models_and_quota_cli_scope_catalog_and_quota_by_profile() {
         let cli = Cli::try_parse_from(["swarm", "models", "--harness", "codex"]).unwrap();
         let Some(CliCommand::Models(ModelsArgs {
-            harness,
-            profile,
-            query: _,
-            after: _,
-            limit: _,
+            harness, profile, ..
         })) = cli.command
         else {
             panic!("models command required");
@@ -1559,11 +1571,7 @@ mod tests {
         ])
         .unwrap();
         let Some(CliCommand::Models(ModelsArgs {
-            harness,
-            profile,
-            query: _,
-            after: _,
-            limit: _,
+            harness, profile, ..
         })) = cli.command
         else {
             panic!("models command required");
@@ -1588,6 +1596,7 @@ mod tests {
             query,
             after,
             limit,
+            ..
         })) = cli.command
         else {
             panic!("models command required");

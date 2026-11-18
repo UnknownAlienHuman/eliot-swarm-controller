@@ -71,6 +71,8 @@ pub(crate) async fn run_models(
     ModelsArgs {
         harness,
         profile,
+        agent,
+        workspace,
         query,
         after,
         limit,
@@ -102,7 +104,8 @@ pub(crate) async fn run_models(
             HarnessModelsRequest {
                 harness,
                 profile,
-                agent: None,
+                agent,
+                workspace,
             },
             HarnessModelsResponse
         )

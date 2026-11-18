@@ -768,6 +768,31 @@ impl OpenCodeHttp {
         Err(readback_error("model list", &response))
     }
 
+    /// Location default when there is no explicit session selection.
+    pub async fn default_model(&self, deadline: Instant) -> Result<Option<NativeModelEntry>> {
+        let response = self
+            .send(
+                reqwest::Method::GET,
+                "/api/model/default",
+                &[],
+                None,
+                deadline,
+            )
+            .await
+            .map_err(readback_outcome_as_error)?;
+        if response.status != 200 {
+            return Err(readback_error("model default", &response));
+        }
+        serde_json::from_slice::<DataEnvelope<Option<NativeModelEntry>>>(&response.body)
+            .map(|envelope| envelope.data)
+            .map_err(|_| {
+                Error::new(
+                    "native_readback",
+                    "OpenCode default model response was invalid",
+                )
+            })
+    }
+
     /// `GET /api/session/{id}/message`: newest-first message page.
     /// `cursor=None` starts at the live edge (`order=desc`); otherwise the
     /// opaque `cursor.next` continues toward older messages.

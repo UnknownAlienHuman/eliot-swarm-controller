@@ -106,6 +106,8 @@ pub(super) fn persist_turn_fact(
         config: None,
         preceded_by: None,
         resolution_source: None,
+        effective_model: None,
+        native_error_message: None,
     });
     match event.kind.as_str() {
         "turn.started" => {
@@ -194,6 +196,7 @@ pub(super) fn persist_turn_fact(
                 usage: None,
                 config_revision: turn.config_revision,
                 preceded_by: turn.preceded_by.as_deref(),
+                effective_model: None,
             },
         )?;
     } else {
