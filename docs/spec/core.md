@@ -255,7 +255,10 @@ retained-unresolved instead, and the stored outcome stays `unknown`.
 Retirement follows the same evidence. An ended native observed child
 (`stopped`, grant revoked, custody drained) retires through `agent.archive` or
 `agent.delete` with its unknown turn retained as ended-observation evidence,
-never resolved or completed.
+never resolved or completed. A detached external observer (`unknown`, no live
+reader, custody drained) retires the same way without taking a native
+lifecycle state. Live observation (an attached observer with an open source,
+or a native child whose producer generation is still live) still blocks both.
 
 Compute `apply(state,input) -> (next_state,effects)` without I/O or mutating published
 state. Store commits event, next projection and derived facts atomically, then publishes.

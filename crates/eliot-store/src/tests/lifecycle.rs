@@ -999,3 +999,100 @@ fn historical_unknown_turn_resolves_after_resume_and_unblocks_delete() {
         .unwrap_err();
     assert_eq!(future.code, "stale_generation");
 }
+
+#[test]
+fn detached_external_observer_retires_but_attached_observer_stays_blocked() {
+    // #651: a successfully detached external observer has unknown state by
+    // contract, no turns, no live commands and closed custody: it must
+    // retire through archive/delete without pretending native stopped.
+    // A still-attached observer keeps its open source and stays blocked.
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let attach = |store: &mut Store, scope: &str, reference: &str, now: i64| -> (String, String) {
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "attach");
+        request.args = json!({
+            "profile": "reader", "harness": "codex",
+            "native_scope": scope, "native_ref": reference,
+            "mode": "observe", "profile_snapshot": {},
+            "project": "observed",
+        });
+        let admitted = store.submit("owner", request, now).unwrap();
+        let agent = admitted
+            .command
+            .target
+            .expect("attach creates the observer");
+        let attach_id = admitted.command.id.clone();
+        store.dispatch(&attach_id, now).unwrap();
+        let agent_row = store.get_agent(&agent).unwrap().unwrap();
+        store
+            .settle_observe_attach(
+                &attach_id,
+                json!({
+                    "agent_id": agent, "generation": agent_row.generation,
+                    "command_id": attach_id,
+                    "native_scope": scope, "native_ref": reference,
+                    "state": "attached", "observation_state": "unknown",
+                    "metadata": {}, "coverage": {},
+                }),
+                now,
+            )
+            .unwrap();
+        (agent, attach_id)
+    };
+    let detach = |store: &mut Store, agent: &str, scope: &str, reference: &str, now: i64| {
+        let generation = store.get_agent(agent).unwrap().unwrap().generation;
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "detach");
+        request.target = Some(agent.to_owned());
+        request.args = json!({"mode": "observe"});
+        request.expected_generation = Some(generation);
+        let admitted = store.submit("owner", request, now).unwrap();
+        let detach_id = admitted.command.id.clone();
+        store.dispatch(&detach_id, now).unwrap();
+        let agent_row = store.get_agent(agent).unwrap().unwrap();
+        store
+            .settle_observe_detach(
+                &detach_id,
+                json!({
+                    "agent_id": agent, "generation": agent_row.generation,
+                    "command_id": detach_id,
+                    "native_scope": scope, "native_ref": reference,
+                    "state": "detached", "observation_state": "unknown",
+                }),
+                now,
+            )
+            .unwrap();
+    };
+
+    // Attach then detach: no turns, no live commands, closed custody.
+    let (observer, _) = attach(&mut store, "scope-651", "ref-651", now);
+    detach(&mut store, &observer, "scope-651", "ref-651", now);
+    let settled = store.get_agent(&observer).unwrap().unwrap();
+    assert_eq!(settled.state, AgentState::Unknown);
+    assert!(settled.observe_only);
+    assert!(settled.active_turn.is_none());
+    let archived = store
+        .change_agent_tree(&Ulid::new().to_string(), &observer, Some(true), now)
+        .expect("detached observer archives");
+    assert_eq!(archived["archived"], true);
+    assert!(store.get_agent(&observer).unwrap().unwrap().archived);
+    let deleted = store
+        .change_agent_tree(&Ulid::new().to_string(), &observer, None, now)
+        .expect("detached observer deletes");
+    assert_eq!(deleted["deleted"], true);
+    assert!(store.get_agent(&observer).unwrap().is_none());
+    assert!(!store.is_write_faulted());
+
+    // A still-attached observer keeps its open source and stays blocked even
+    // though Unknown observe-only rows now retire: custody still proves the
+    // live reader.
+    let (live, _) = attach(&mut store, "scope-651-live", "ref-651-live", now);
+    let blocked = store
+        .change_agent_tree(&Ulid::new().to_string(), &live, None, now)
+        .unwrap_err();
+    assert_eq!(blocked.code, "busy");
+    assert!(
+        blocked.message.contains("open observe source"),
+        "{}",
+        blocked.message
+    );
+}

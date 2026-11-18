@@ -95,15 +95,24 @@ impl Store {
         for num in &members {
             let row = load_agent_by_num(&tx, *num)?
                 .ok_or_else(|| Error::new("source_integrity", "Agent tree changed"))?;
-            // Archive hides a tree that is not working: idle, or ended
-            // (stopped, failed or lost). Delete needs a settled end.
+            // Archive hides a tree that is not working: idle, ended
+            // (stopped, failed or lost), or detached external observation.
+            // Delete needs a settled end or a detached observer. A detached
+            // observer is an observe-only Unknown row with no live reader:
+            // the custody check below still refuses an attached observer
+            // with an open source, and the turn/command checks still apply.
+            // Native observed children keep their own rule: live ones are
+            // Unknown and stay blocked here; ended ones are stopped.
+            let detached_observer = row.observe_only
+                && row.origin == core::AgentOrigin::External
+                && row.state == AgentState::Unknown;
             let allowed = if archived.is_some() {
                 matches!(
                     row.state,
                     AgentState::Idle | AgentState::Stopped | AgentState::Failed | AgentState::Lost
-                )
+                ) || detached_observer
             } else {
-                matches!(row.state, AgentState::Stopped | AgentState::Failed)
+                matches!(row.state, AgentState::Stopped | AgentState::Failed) || detached_observer
             };
             if !allowed {
                 return Err(Error::new(
