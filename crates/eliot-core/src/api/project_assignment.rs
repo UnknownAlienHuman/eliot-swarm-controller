@@ -75,6 +75,11 @@ pub struct ProjectAssignmentLaunchRequest {
     pub id: String,
     pub project: String,
     pub profile: String,
+    /// Explicitly adopt an existing checkout of the project repository as the
+    /// manager workspace instead of preparing a fresh managed worktree.
+    /// Absent means a new opaque worktree; the daemon never adopts automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopt_worktree: Option<String>,
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
@@ -120,7 +125,16 @@ impl ProjectAssignmentClaimRequest {
 impl ProjectAssignmentLaunchRequest {
     pub fn validate(&self) -> Result<()> {
         validate_name(&self.project, "params.project")?;
-        validate_name(&self.profile, "params.profile")
+        validate_name(&self.profile, "params.profile")?;
+        if let Some(adopt) = &self.adopt_worktree
+            && (adopt.is_empty() || adopt.contains('\0'))
+        {
+            return Err(Error::invalid_field(
+                "params.adopt_worktree",
+                "nonempty path",
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -338,6 +338,14 @@ pub(super) fn require_workspace_removable(
     agent: &Agent,
     workspace: &WorkspacePreparation,
 ) -> Result<()> {
+    // A worktree bound to a current project assignment is never removed,
+    // borrowed or not: release the assignment first.
+    if project_assignment::workspace_path_bound(connection, &workspace.worktree_path)? {
+        return Err(Error::new(
+            "busy",
+            "worktree is bound to a current project assignment",
+        ));
+    }
     if !agent.is_terminal()
         || agent.active_turn.is_some()
         || matches!(

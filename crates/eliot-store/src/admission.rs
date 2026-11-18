@@ -981,12 +981,15 @@ fn admit_launch_tx(
         .get(project_assignment::MANAGER_LAUNCH_ARG)
         .is_some()
     {
-        if principal != "owner" || parent_num.is_some() || chat || preparation.is_some() {
+        if principal != "owner" || parent_num.is_some() || chat {
             return Err(Error::new(
                 "not_allowed",
                 "manager launch must be an Owner root launch",
             ));
         }
+        // A managed manager launch carries its frozen worktree preparation
+        // (or an explicit adoption recorded beside it): the same transaction
+        // reserves the assignment, the workspace row and capacity together.
         project_assignment::reserve_launch(tx, &project, agent_num, &request.id)?;
     }
     let command = CommandInsert::admitted(principal, request, payload_digest, (agent_num, 0), now);
