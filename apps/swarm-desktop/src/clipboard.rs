@@ -15,15 +15,29 @@ use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock,
 
 const CF_UNICODETEXT: u32 = 13;
 
-/// Closes the clipboard on every exit path once it is open.
-struct OpenGuard;
+/// Close the clipboard after `prior` was already captured (Some: the
+/// operation failed first; None: the copy succeeded and only the close
+/// can still fail). A failed close is reported alongside the captured
+/// error instead of replacing it (#647).
+fn close(prior: Option<String>) -> Result<(), String> {
+    // SAFETY: the clipboard is open on this thread: OpenClipboard
+    // succeeded and no path closes it twice.
+    let closed = if unsafe { CloseClipboard() } == 0 {
+        Err(last_error("the clipboard could not be closed"))
+    } else {
+        Ok(())
+    };
+    close_outcome(prior, closed)
+}
 
-impl Drop for OpenGuard {
-    fn drop(&mut self) {
-        // SAFETY: constructed only after OpenClipboard succeeded on this thread.
-        unsafe {
-            CloseClipboard();
-        }
+/// Fold a close outcome into an already-captured error: the close
+/// result is always checked, and it never replaces the operation's
+/// own error.
+fn close_outcome(prior: Option<String>, closed: Result<(), String>) -> Result<(), String> {
+    match (prior, closed) {
+        (None, closed) => closed,
+        (Some(error), Ok(())) => Err(error),
+        (Some(first), Err(second)) => Err(format!("{first}; {second}")),
     }
 }
 
@@ -60,36 +74,60 @@ pub fn set_text(text: &str) -> Result<(), String> {
         if block.is_null() {
             return Err(last_error("clipboard memory could not be allocated"));
         }
-        if block.is_null() {
-            return Err("clipboard memory could not be allocated".to_owned());
-        }
         let target = GlobalLock(block).cast::<u16>();
         if target.is_null() {
+            // Captured before freeing: a failed cleanup must not
+            // obscure the locking error (#647). The clipboard was
+            // never opened, so there is nothing to close.
+            let error = last_error("clipboard memory could not be locked");
             GlobalFree(block);
-            return Err("clipboard memory could not be locked".to_owned());
+            return Err(error);
         }
         std::ptr::copy_nonoverlapping(wide.as_ptr(), target, wide.len());
         GlobalUnlock(block);
         if OpenClipboard(owner) == 0 {
+            let error = last_error("the clipboard is in use by another application");
             GlobalFree(block);
-            return Err(last_error("the clipboard is in use by another application"));
+            return Err(error);
         }
-        let _guard = OpenGuard;
         if EmptyClipboard() == 0 {
+            let error = last_error("the clipboard could not be cleared");
             GlobalFree(block);
-            return Err(last_error("the clipboard could not be cleared"));
+            return close(Some(error));
         }
         if SetClipboardData(CF_UNICODETEXT, block).is_null() {
+            let error = last_error("the clipboard rejected the text");
             GlobalFree(block);
-            return Err(last_error("the clipboard rejected the text"));
+            return close(Some(error));
         }
+        // Success transfers the block's ownership to the
+        // clipboard; only the close can still fail.
+        return close(None);
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_close_never_replaces_the_captured_error() {
+        // #647: the operation's error is captured before cleanup;
+        // the close result is then checked without replacing it.
+        assert_eq!(close_outcome(None, Ok(())), Ok(()));
+        assert_eq!(
+            close_outcome(None, Err("close".to_owned())),
+            Err("close".to_owned())
+        );
+        assert_eq!(
+            close_outcome(Some("op".to_owned()), Ok(())),
+            Err("op".to_owned())
+        );
+        assert_eq!(
+            close_outcome(Some("op".to_owned()), Err("close".to_owned())),
+            Err("op; close".to_owned())
+        );
+    }
 
     #[test]
     fn copy_without_a_window_leaves_the_clipboard_alone() {
