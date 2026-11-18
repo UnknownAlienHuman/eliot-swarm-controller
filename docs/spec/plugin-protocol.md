@@ -167,7 +167,14 @@ An initial send linked to launch or resume follows ordinary send dispatch.
 A controlled snapshot using the session's start or stop command ID may omit the turn
 ID to request session state. Other command snapshots need an exact turn, supplied by
 the caller or proven by the adapter's current native binding. A read that cannot prove
-the requested binding returns an unknown snapshot.
+the requested binding returns an unknown snapshot. When an exact-turn snapshot
+obtains fresh native evidence, it reports the Agent, generation, command, native
+scope/reference, session state, active native turn, and the exact turn's
+status and terminal flag. `turn_evidence` names the native read that established the
+facts. An idle session alone does not establish the turn's outcome.
+The attention monitor applies its bounded active-turn recovery only to adapters
+that return native `turn_evidence` for these snapshots (currently Codex, Muse, and
+OpenCode).
 
 For SEND, the same `agent.command` effect carries the FIFO `next_input` items claimed
 from existing command rows, plus the effective configuration overlay when one
@@ -579,11 +586,14 @@ turn evidence is committed before retirement; retirement never manufactures
 `session.ended` or changes an already-applied command. The daemon independently
 confirms its owned plugin exit and drains the plugin reader before its existing
 generation-fenced loss settlement. Without a committed terminal turn, the running
-turn becomes `unknown`; completed turns remain completed. A live host whose view
-projection fails without recovery settles only the gapped turn `unknown` via a
-committed `turn.unknown` fact (exact command/turn binding with the gap reason),
-without retiring the plugin, closing the session, or marking the Agent lost;
-later facts for that turn must not resurrect it. Retiring or duplicate
+turn becomes `unknown`; completed turns remain completed. For an active turn
+with a committed native source gap, stale health, or source closure, the daemon's attention
+monitor makes at most four read-only snapshot attempts with backoff. Fresh
+evidence that the exact turn is still running keeps it open for the next sweep.
+The Store rechecks the generation, native subject, turn, and source episode
+before committing `turn.completed` from a proven terminal or `turn.unknown`
+after four inconclusive reads. It retains the source gap and settles only that
+turn. Later facts cannot reopen it. Retiring or duplicate
 exit observations cannot settle a newer generation and never authorize replay.
 An event owner closing before the tail barrier or a drain deadline expiring is
 an explicit unknown retirement error, never successful tail settlement. Retirement

@@ -431,6 +431,24 @@ fn projection_gap_turn_unknown_settles_once_without_resurrection() {
     let send_id = send.id.clone();
     store.submit("owner", send, now + 4).expect("admit send");
     store.dispatch(&send_id, now + 5).expect("dispatch send");
+    let gap = store
+        .record_source_gap(
+            SourceGap {
+                gap_id: format!("projection-gap-{send_id}"),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                families: vec!["turn".to_owned()],
+                reason: format!(
+                    "{} (projectionUnavailable)",
+                    eliot_core::MUSE_VIEW_UNAVAILABLE_REASON_PREFIX
+                ),
+                from: None,
+                to: None,
+            },
+            now + 5,
+        )
+        .expect("record projection gap between dispatch and association");
     let turn_id = format!("fake-turn-{send_id}");
     store
         .put_batch(
@@ -450,28 +468,34 @@ fn projection_gap_turn_unknown_settles_once_without_resurrection() {
             now + 6,
         )
         .expect("commit turn started");
-    store
-        .put_batch(
-            SourceBatch {
-                batch_id: format!("projection-gap-{send_id}-unknown"),
-                agent_id: agent.clone(),
-                generation: 1,
-                source: "stream".to_owned(),
-                events: vec![NativeEvent {
-                    ts: None,
-                    kind: "turn.unknown".to_owned(),
-                    native_id: format!("projection-gap-{send_id}:turn.unknown"),
-                    data: json!({
-                        "command_id": send_id,
-                        "turn_id": turn_id.clone(),
-                        "reason": "Muse native view recovery did not prove live delivery after the recorded gap (projectionUnavailable)",
-                    }),
-                }],
-                cursor: None,
-            },
-            now + 7,
-        )
-        .expect("commit turn unknown");
+    let captured = store.get_agent(&agent).unwrap().unwrap();
+    let recovery = store.active_turn_recovery(&captured).unwrap().unwrap();
+    assert_eq!(recovery.command_id, send_id);
+    assert_eq!(recovery.turn_id, turn_id);
+    let mut stale = captured.clone();
+    stale.generation += 1;
+    assert!(
+        store
+            .settle_recovered_turn(&stale, &recovery, None, now + 7)
+            .unwrap()
+            .is_empty()
+    );
+    let events = store
+        .settle_recovered_turn(&captured, &recovery, None, now + 7)
+        .unwrap();
+    assert_eq!(events[0].kind, "turn.unknown");
+    assert_eq!(events[0].source, "daemon");
+    assert_eq!(events[0].data["source_event_seq"], gap.value.seq);
+    assert_eq!(
+        events[0].data["reason"],
+        eliot_core::MUSE_VIEW_UNKNOWN_REASON_PREFIX
+    );
+    assert!(
+        store
+            .settle_recovered_turn(&captured, &recovery, None, now + 7)
+            .unwrap()
+            .is_empty()
+    );
     let agent_row = store
         .get_agent(&agent)
         .expect("read agent")

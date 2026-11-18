@@ -1,15 +1,9 @@
-mod recovery;
-use self::recovery::{
-    ActorQueues, ProjectionTurnState, RECOVERY_SHUTDOWN_CODE, RecoveryPoll, ViewRecovery,
-    fenced_recovery_attempts, recovery_shutdown,
-};
 #[path = "../workflow_child.rs"]
 mod workflow_child;
 
 use eliot_core::{
-    ContextItem, Error, MUSE_VIEW_UNAVAILABLE_REASON_PREFIX, MUSE_VIEW_UNKNOWN_REASON_PREFIX,
-    ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceHealthUpdate,
-    VIEW_RECOVERY_MARKER_FIELD, VIEW_RECOVERY_READBACK,
+    ContextItem, Error, MUSE_VIEW_UNAVAILABLE_REASON_PREFIX, ProviderRestriction, Result,
+    SecretPolicy, SessionUsage, SourceHealthUpdate,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -34,7 +28,6 @@ use self::workflow_child::{
     child_event_id, complete_event_data, is_admission_rejection, is_workflow_item_frame,
     muse_child_key, register_child, should_bypass_parent_buffer, start_event_data,
 };
-use crate::host::{MAX_VIEW_PAGES, STOP_NATIVE_BUDGET, VIEW_PAGE_SIZE};
 use crate::native::{
     NativeClient, NativeFrame, StreamState, native_error_code,
     requests::{
@@ -46,14 +39,13 @@ use crate::native::{
         NativeApprovalUpdatedNotification, NativeHistoryNoneReason, NativeItem,
         NativeItemCompletedNotification, NativeItemReadOutputParams, NativeItemReadOutputResult,
         NativeItemStartedNotification, NativePatchRef, NativeSessionClosedNotification,
-        NativeSessionContextUsageNotification, NativeSessionReadParams, NativeSessionReadResult,
+        NativeSessionContextUsageNotification, NativeSessionReadResult,
         NativeSessionStartedNotification, NativeSessionTokenUsageNotification,
         NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
         NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
-        NativeUnframedViewEvent, NativeUserInputAnswerResult, NativeUserInputCancelResult,
-        NativeUserInputSettledNotification, NativeViewHealth, NativeViewPageParams,
-        NativeViewPageResult, NativeViewSubscribeParams, NativeViewSubscribeResult,
-        NativeWorkflowChild, NativeWorkflowItemNotification, session_usage_from_context_usage,
+        NativeUserInputAnswerResult, NativeUserInputCancelResult,
+        NativeUserInputSettledNotification, NativeViewHealth, NativeWorkflowChild,
+        NativeWorkflowItemNotification, session_usage_from_context_usage,
         session_usage_from_token_usage, turn_usage,
     },
 };
@@ -160,7 +152,7 @@ pub(crate) struct EventStatus {
     pub needs_idle_proof: bool,
     /// The owned native host failed its MCP startup audit (E47): a
     /// host-level posture that persists across turns on that host. Latched
-    /// at terminal commit and never cleared by idle recovery; only a fresh
+    /// at terminal commit and only cleared by a fresh
     /// host (Agent restart) drops it. While set, follow-up sends are
     /// rejected with the restart action instead of dispatching.
     pub mcp_startup_audit_failed: bool,
@@ -215,19 +207,10 @@ impl EventStatus {
 /// restarts on a fresh native host.
 pub(crate) fn is_view_related_failure(reason: &str) -> bool {
     reason.contains("native view is unavailable")
-        || reason.contains("view recovery pending")
-        || reason.contains("unavailable-view terminal requires")
         || reason.contains("native observation is unresolved")
         || reason.contains("native view readback is unavailable")
         || reason.contains("native observation remains unresolved")
-        || reason.contains(PROJECTION_GAP_SETTLEMENT_CAUSE)
 }
-
-/// Typed projection-gap cause shared with k170's `turn.unknown`
-/// settlement: bounded readbacks never proved live delivery. Recognizing
-/// the cause as view-related lets exact idle proof clear the live latch
-/// while the journal's `turn.unknown` stands untouched.
-pub(crate) const PROJECTION_GAP_SETTLEMENT_CAUSE: &str = "native view recovery did not prove";
 
 /// Host-level MCP posture failure (E47): the owned native host failed its
 /// MCP startup audit, so MCP stays disabled for that host's lifetime.
@@ -516,17 +499,12 @@ struct EventProcessor {
     pending_end_stop: Option<oneshot::Sender<Result<()>>>,
     writes_blocked: bool,
     gap_reported: bool,
-    /// Exact (command, turn) settled `unknown` after a projection gap. A
-    /// late terminal or final message naming it is dropped against the
-    /// standing gap instead of buffering as a turn awaiting association.
-    settled_unknown_turn: Option<(String, String)>,
     /// The native transport itself was lost (queue overflow, unplanned close,
     /// malformed frame, unplanned reader end): facts may be missing, so the
     /// source reports a gap once the native frames are drained.
     transport_loss: bool,
     view_stale_reported: bool,
     /// Advance only after successful processing/commit on this actor.
-    last_view_cursor: Option<String>,
     /// Latest merged session-scoped snapshot from `session/tokenUsage`
     /// (cumulative counted-once totals plus estimated cost) and
     /// `session/contextUsage` (occupancy triple). Never turn expenditure;
@@ -539,7 +517,6 @@ struct EventProcessor {
     /// Monotonic counter for `session.usage` native ids so each accepted
     /// update commits under a unique identity.
     session_usage_seq: u64,
-    view_recovery: Option<ViewRecovery>,
     /// Cursors already normalized on this actor. A replayed copy skips
     /// normalization; the first application did the binding and conflict
     /// checks. Remembered only on success, never on gaps or failures.
@@ -851,14 +828,11 @@ impl EventProcessor {
             pending_end_stop: None,
             writes_blocked: false,
             gap_reported: false,
-            settled_unknown_turn: None,
             transport_loss: false,
             view_stale_reported: false,
-            last_view_cursor: None,
             session_usage: None,
             session_usage_committed: None,
             session_usage_seq: 0,
-            view_recovery: None,
             applied_view_cursors: AppliedViewCursors::default(),
             messages: TurnMessages::default(),
             pending_requests: HashMap::new(),
@@ -1049,17 +1023,85 @@ impl EventProcessor {
         }
     }
 
-    async fn handle_frame(
+    fn bind_view_session(&mut self, session_id: &str) -> Result<()> {
+        if session_id.trim().is_empty()
+            || self
+                .status
+                .session_id
+                .as_deref()
+                .is_some_and(|owned| owned != session_id)
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "Muse view-health readback named another session",
+            ));
+        }
+        self.status.session_id = Some(session_id.to_owned());
+        Ok(())
+    }
+
+    fn reestablish_idle(&mut self, session_id: &str) -> Result<bool> {
+        if self.status.session_id.as_deref() != Some(session_id) {
+            return Err(Error::new(
+                "source_integrity",
+                "Muse idle readback named another session",
+            ));
+        }
+        if self.writes_blocked {
+            return Ok(false);
+        }
+        let had_turn = self.status.active_turn_id.take().is_some();
+        self.status.active_command_id = None;
+        if had_turn {
+            self.pending_requests.clear();
+            self.observe();
+        }
+        let cleared = self.status.clear_stale_idle_latch();
+        let gate_held = std::mem::replace(&mut self.status.needs_idle_proof, false);
+        if cleared {
+            self.gap_reported = false;
+            self.view_stale_reported = false;
+        }
+        Ok(had_turn || cleared || gate_held)
+    }
+
+    /// Record the native projection gap (E46). Recovery, retries and turn
+    /// settlement are daemon responsibilities; this translator only latches
+    /// the native evidence loss and keeps subsequent snapshot reads truthful.
+    async fn view_unavailable(
         &mut self,
-        frame: Option<NativeFrame>,
-        queues: &mut Option<ActorQueues<'_>>,
-    ) -> bool {
+        session_id: &str,
+        reason: NativeHistoryNoneReason,
+    ) -> Result<()> {
+        if self.status.session_id.as_deref() != Some(session_id) {
+            return Err(Error::new(
+                "source_integrity",
+                "Muse view-health readback named another session",
+            ));
+        }
+        let new_episode = !self.status.view_unavailable;
+        let reason_label = format!("{reason:?}");
+        self.status.view_unavailable = true;
+        self.status.view_unavailable_reason = Some(reason);
+        self.status.source_unknown = true;
+        if new_episode && !self.writes_blocked {
+            // The projection failure is distinct from an earlier transport gap.
+            self.gap_reported = false;
+            self.record_gap(&format!(
+                "{MUSE_VIEW_UNAVAILABLE_REASON_PREFIX} ({reason_label})"
+            ))
+            .await?;
+        }
+        self.report_view_stale().await;
+        Ok(())
+    }
+
+    async fn handle_frame(&mut self, frame: Option<NativeFrame>) -> bool {
         match frame {
             Some(NativeFrame::Request { id, method, params }) => {
                 if !self.status.ready || self.status.active_turn_id.is_none() {
                     self.buffer_frame(BufferedNativeFrame::Request { id, method, params });
                 } else if let Err(error) = self.process_request(id, method, params).await {
-                    self.invalidate_view_recovery();
                     self.status.source_unknown = true;
                     if !self.gap_reported
                         && !self.writes_blocked
@@ -1083,13 +1125,9 @@ impl EventProcessor {
                     &method,
                     &params,
                 );
-                if !bypass_buffer && self.buffer_notification(&method, &params) {
+                if !bypass_buffer && self.should_buffer(&method) {
                     self.buffer_frame(BufferedNativeFrame::Notification { method, params });
-                } else if let Err(error) = self.process_notification(method, params, queues).await {
-                    if error.code == RECOVERY_SHUTDOWN_CODE {
-                        return false;
-                    }
-                    self.invalidate_view_recovery();
+                } else if let Err(error) = self.process_notification(method, params).await {
                     self.status.source_unknown = true;
                     if !self.gap_reported
                         && !self.writes_blocked
@@ -1130,7 +1168,6 @@ impl EventProcessor {
     }
 
     fn defer_gap(&mut self, reason: impl Into<String>) {
-        self.invalidate_view_recovery();
         if self.loss_reason.is_none() {
             self.loss_reason = Some(reason.into());
         }
@@ -1146,24 +1183,6 @@ impl EventProcessor {
         }
         if queue_empty && self.transport_loss {
             self.report_view_stale().await;
-            // Reader loss is source loss, not process-death evidence. The
-            // command plane may still answer, so keep the same bounded
-            // readback path alive even without a view-health notification.
-            if !self.planned_stop
-                && self.status.active_turn_id.is_some()
-                && self.view_recovery.is_none()
-            {
-                // Transport loss alone is not an unavailable-view episode:
-                // it retries with the source stale and never settles on
-                // the projection path with the counted prefix.
-                self.view_recovery = Some(ViewRecovery {
-                    head: None,
-                    head_seen: false,
-                    deadline: Instant::now(),
-                    projection: false,
-                    unproven_attempts: 0,
-                });
-            }
         }
     }
 
@@ -1182,55 +1201,6 @@ impl EventProcessor {
                 | "approval/updated"
                 | "userInput/settled"
         ) && (!self.status.ready || self.status.active_turn_id.is_none())
-    }
-
-    /// Buffer gate with settled-turn routing: a terminal or final message
-    /// naming the turn already settled `unknown` is never buffered as a
-    /// turn awaiting association; it processes inline and drops against
-    /// the standing gap.
-    fn buffer_notification(&self, method: &str, params: &Value) -> bool {
-        if matches!(method, "turn/completed" | "item/completed")
-            && self.names_settled_turn(method, params)
-        {
-            return false;
-        }
-        self.should_buffer(method)
-    }
-
-    /// Whether this frame names the exact turn already settled `unknown`
-    /// after its projection gap. Shapes are read loosely (never decoded):
-    /// a frame that cannot name its turn is not a settled terminal.
-    fn names_settled_turn(&self, method: &str, params: &Value) -> bool {
-        let Some((_, turn_id)) = self.settled_unknown_turn.as_ref() else {
-            return false;
-        };
-        match method {
-            "turn/completed" => {
-                params.get("turnId").and_then(Value::as_str) == Some(turn_id.as_str())
-            }
-            "item/completed" => {
-                params
-                    .get("item")
-                    .and_then(|item| item.get("turnId"))
-                    .and_then(Value::as_str)
-                    == Some(turn_id.as_str())
-            }
-            _ => false,
-        }
-    }
-
-    /// Drop a late terminal for the settled turn against the standing
-    /// projection gap. The outcome stays `unknown`: a replayed terminal
-    /// never resurrects a settled turn, and the recorded gap already covers
-    /// the loss, so nothing is committed and no new gap is needed.
-    async fn drop_settled_frame(&mut self, what: &str) -> Result<()> {
-        if self.gap_reported {
-            return Ok(());
-        }
-        self.record_gap(&format!(
-            "Muse {what} arrived after its turn settled unknown"
-        ))
-        .await
     }
 
     fn buffer_frame(&mut self, frame: BufferedNativeFrame) {
@@ -1377,16 +1347,8 @@ impl EventProcessor {
         }
         self.commit_event("turn.started", native_id, data).await?;
         self.messages = TurnMessages::default();
-        // The gap may have landed while `turn/start` awaited its reply, with
-        // no active turn to arm recovery for. Now that association is
-        // acknowledged, arm its settlement deadline when view loss is latched.
-        self.arm_recovery_after_associate().await;
         self.flush_buffer().await?;
         self.apply_stashed_entries().await?;
-        // A buffered terminal for a turn settled `unknown` drops against
-        // the standing gap during the flush above; a new association then
-        // retires the marker.
-        self.settled_unknown_turn = None;
         Ok(())
     }
 
@@ -1401,7 +1363,7 @@ impl EventProcessor {
                         self.status.session_id.is_some(),
                         method,
                         params,
-                    ) && self.buffer_notification(method, params)
+                    ) && self.should_buffer(method)
                 }
                 BufferedNativeFrame::Request { .. } => {
                     !self.status.ready || self.status.active_turn_id.is_none()
@@ -1416,9 +1378,7 @@ impl EventProcessor {
             }
             // Buffered flushes already run inside frame/control processing,
             // so they must not re-enter the live queues.
-            let mut no_queues: Option<ActorQueues> = None;
-            self.process_buffered_frame(frame.frame, &mut no_queues)
-                .await?;
+            self.process_buffered_frame(frame.frame).await?;
             if self.writes_blocked {
                 break;
             }
@@ -1445,9 +1405,7 @@ impl EventProcessor {
             self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
             // Buffered flushes already run inside frame/control processing,
             // so they must not re-enter the live queues.
-            let mut no_queues: Option<ActorQueues> = None;
-            self.process_buffered_frame(frame.frame, &mut no_queues)
-                .await?;
+            self.process_buffered_frame(frame.frame).await?;
             if self.writes_blocked {
                 break;
             }
@@ -1455,14 +1413,10 @@ impl EventProcessor {
         Ok(())
     }
 
-    async fn process_buffered_frame(
-        &mut self,
-        frame: BufferedNativeFrame,
-        queues: &mut Option<ActorQueues<'_>>,
-    ) -> Result<()> {
+    async fn process_buffered_frame(&mut self, frame: BufferedNativeFrame) -> Result<()> {
         let result = match frame {
             BufferedNativeFrame::Notification { method, params } => {
-                self.process_notification(method, params, queues).await
+                self.process_notification(method, params).await
             }
             BufferedNativeFrame::Request { id, method, params } => {
                 self.process_request(id, method, params).await
@@ -1823,8 +1777,7 @@ impl EventProcessor {
         self.frame_decide_diag = DecideViewDiag::default();
         // Decide pumps already run inside control processing, so the frame
         // path must not re-enter the live queues here.
-        let mut no_queues: Option<ActorQueues> = None;
-        let _ = self.handle_frame(Some(frame), &mut no_queues).await;
+        let _ = self.handle_frame(Some(frame)).await;
         self.report_gap_if_queue_empty(frames.is_empty()).await;
         if self.frame_decide_diag.resolved_seen {
             diag.resolved_seen = true;
@@ -2420,12 +2373,7 @@ impl EventProcessor {
         Ok(())
     }
 
-    async fn process_notification(
-        &mut self,
-        method: String,
-        params: Value,
-        queues: &mut Option<ActorQueues<'_>>,
-    ) -> Result<()> {
+    async fn process_notification(&mut self, method: String, params: Value) -> Result<()> {
         let cursor = self
             .status
             .session_id
@@ -2454,49 +2402,14 @@ impl EventProcessor {
             // session/turn binding and conflict checks.
             return Ok(());
         }
-        if let Err(error) = self.apply_notification(method, params, queues).await {
-            self.invalidate_view_recovery();
-            return Err(error);
-        }
+        self.apply_notification(method, params).await?;
         if let Some(key) = applied_key {
             self.applied_view_cursors.insert(key);
-        }
-        if let Some(cursor) = cursor {
-            let live = self.view_recovery.as_mut().is_some_and(|recovery| {
-                if recovery.head.as_ref() == Some(&cursor) {
-                    recovery.head_seen = true;
-                    false
-                } else {
-                    recovery.head.is_some() && recovery.head_seen
-                }
-            });
-            self.last_view_cursor = Some(cursor);
-            if live && !self.writes_blocked {
-                if self
-                    .set_source_health("ok", Instant::now() + EVENT_DEADLINE)
-                    .await
-                {
-                    self.view_recovery = None;
-                    self.status.view_unavailable = false;
-                    self.status.view_unavailable_reason = None;
-                    self.status.source_unknown = false;
-                    self.status.failure = None;
-                    self.gap_reported = false;
-                    self.view_stale_reported = false;
-                } else {
-                    self.invalidate_view_recovery();
-                }
-            }
         }
         Ok(())
     }
 
-    async fn apply_notification(
-        &mut self,
-        method: String,
-        params: Value,
-        queues: &mut Option<ActorQueues<'_>>,
-    ) -> Result<()> {
+    async fn apply_notification(&mut self, method: String, params: Value) -> Result<()> {
         if is_workflow_item_frame(&method, &params) {
             return self.observe_workflow_item(params).await;
         }
@@ -2572,9 +2485,6 @@ impl EventProcessor {
                 )?;
             }
             "item/completed" => {
-                if self.names_settled_turn(&method, &params) {
-                    return self.drop_settled_frame("item/completed").await;
-                }
                 let notification: NativeItemCompletedNotification =
                     serde_json::from_value(params.clone()).map_err(|_| {
                         Error::new(
@@ -2598,61 +2508,7 @@ impl EventProcessor {
                 }
             }
             "turn/completed" => {
-                if self.names_settled_turn(&method, &params) {
-                    return self.drop_settled_frame("turn/completed").await;
-                }
-                if needs_terminal_fence(&self.status, &params) {
-                    if !self.status.view_unavailable {
-                        let session_id = self.status.session_id.clone().unwrap_or_default();
-                        let turn_id = self.status.active_turn_id.clone().unwrap_or_default();
-                        let mut proven = false;
-                        match self.recovery_gate(queues).await {
-                            RecoveryPoll::Shutdown => return Err(recovery_shutdown()),
-                            // A requested stop owns the remaining stop
-                            // budget for native termination: abandon the
-                            // inline prove and fall through to the fence.
-                            RecoveryPoll::Yielded => {}
-                            RecoveryPoll::Ready(()) => {
-                                if self
-                                    .projection_turn_state_checked(&session_id, &turn_id)
-                                    .await
-                                    .0
-                                    == ProjectionTurnState::Idle
-                                {
-                                    match self.recover_projection_terminal(queues).await {
-                                        RecoveryPoll::Shutdown => {
-                                            return Err(recovery_shutdown());
-                                        }
-                                        RecoveryPoll::Yielded => {}
-                                        RecoveryPoll::Ready(ok) => proven = ok,
-                                    }
-                                }
-                            }
-                        }
-                        if proven {
-                            return Ok(());
-                        }
-                        self.view_unavailable(&session_id, NativeHistoryNoneReason::Unknown)
-                            .await?;
-                    }
-                    // Replay from the same unavailable projection needs the
-                    // same command-plane fence as private page readback. An
-                    // error also prevents marking this cursor applied. The
-                    // replay proves nothing, so the consecutive-failure
-                    // count survives it instead of restarting.
-                    self.view_recovery = Some(ViewRecovery {
-                        head: None,
-                        head_seen: false,
-                        deadline: Instant::now(),
-                        projection: self.projection_episode(),
-                        unproven_attempts: fenced_recovery_attempts(self.view_recovery.as_ref()),
-                    });
-                    return Err(Error::new(
-                        "native_readback",
-                        "Muse unavailable-view terminal requires command-plane confirmation",
-                    ));
-                }
-                self.complete_turn(params, false).await?;
+                self.complete_turn(params).await?;
             }
             "usage/changed" => {
                 // Optional quota sample: a malformed sample is dropped
@@ -2742,7 +2598,6 @@ impl EventProcessor {
                         )
                     })?;
                 if self.status.session_id.as_deref() == Some(notification.session_id.as_str()) {
-                    self.invalidate_view_recovery();
                     return self
                         .stream_source()
                         .record_gap_range_until(
@@ -3143,13 +2998,8 @@ impl EventProcessor {
         Ok(Some((command_id, turn_id.to_owned())))
     }
 
-    /// Commit one turn terminal. `readback_recovery` is true only when the
-    /// terminal was proven from a bounded durable `view/page` scan after the
-    /// live view was lost: the committed fact gains one fixed machine marker
-    /// so the daemon can count the recovery without re-parsing native
-    /// history. The marker never alters the terminal shape the reducer and
-    /// readbacks validate.
-    async fn complete_turn(&mut self, params: Value, readback_recovery: bool) -> Result<()> {
+    /// Commit one natively observed turn terminal.
+    async fn complete_turn(&mut self, params: Value) -> Result<()> {
         let notification: NativeTurnCompletedNotification = serde_json::from_value(params)
             .map_err(|_| {
                 Error::new(
@@ -3166,6 +3016,21 @@ impl EventProcessor {
             return self
                 .record_gap("Muse terminal notification did not match the exact active turn")
                 .await;
+        }
+        if self.status.view_unavailable
+            || (notification.terminal == NativeTurnTerminal::Failed && notification.error.is_none())
+        {
+            self.status.needs_idle_proof = true;
+            if !self.status.view_unavailable {
+                self.view_unavailable(&notification.session_id, NativeHistoryNoneReason::Unknown)
+                    .await?;
+            }
+            // Leave the cursor and active turn in place until the daemon has
+            // command-plane evidence. A projection can synthesize this frame.
+            return Err(Error::new(
+                "native_readback",
+                "Muse native view is unavailable; terminal requires command-plane confirmation",
+            ));
         }
         let Some(status_text) = turn_status(&notification.terminal) else {
             return self
@@ -3229,16 +3094,17 @@ impl EventProcessor {
         // falling back to the terminal reason the readback used to drop.
         let native_error = turn_native_error(&notification, &notification.terminal, &secrets);
         attach_native_error(&mut data, native_error.as_deref(), &secrets);
-        if readback_recovery {
-            mark_readback_recovery(&mut data);
-        }
         let native_id = event_id(
             self.status.session_id.as_deref().unwrap_or_default(),
             &notification.turn_id,
             &notification.turn_id,
             "turn.completed",
         )?;
-        self.commit_event("turn.completed", native_id, data).await?;
+        let committed = match self.commit_event("turn.completed", native_id, data).await {
+            Ok(()) => true,
+            Err(error) if error.failure_where.as_deref() == Some("plugin.events.put") => false,
+            Err(error) => return Err(error),
+        };
         // Session facts already committed when each notification was
         // accepted, so the terminal carries turn scope only. A terminal
         // whose native turn carries no usage leaves `data.usage` unset: for
@@ -3256,13 +3122,10 @@ impl EventProcessor {
         self.status.active_command_id = None;
         self.messages = TurnMessages::default();
         self.status.clear_stale_idle_latch();
-        // k167b: a readback-settled terminal proves the durable view, not
-        // the live source, so it keeps the send gate until the owned
-        // session proves idle with a fresh `session/read`. A live terminal
-        // proves live delivery and drops the gate. The MCP startup-audit
-        // latch is host-scoped: once a terminal proves that posture it is
-        // only ever set here, never cleared by idle recovery.
-        self.status.needs_idle_proof = readback_recovery;
+        // A definite Store rejection leaves degraded coverage and requires a
+        // fresh native idle proof before the next send. The host owns the gap.
+        self.status.needs_idle_proof = !committed;
+        self.status.source_unknown |= !committed;
         if self
             .status
             .last_turn
@@ -3272,7 +3135,6 @@ impl EventProcessor {
         {
             self.status.mcp_startup_audit_failed = true;
         }
-        self.view_recovery = None;
         self.gap_reported = false;
         // The turn's requests die with it: drop them locally (their Store
         // rows stay bound to the dead turn, so no later reply can address
@@ -4172,7 +4034,6 @@ impl EventProcessor {
     }
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
-        self.invalidate_view_recovery();
         self.stream_source().record_gap(reason).await
     }
 
@@ -4211,16 +4072,9 @@ async fn run(
 ) {
     loop {
         let accept_frames = processor.accept_frames;
-        let recovery_deadline = processor
-            .view_recovery
-            .as_ref()
-            .map(|recovery| recovery.deadline);
         // Frames win over controls when both are ready: a `CheckTurn`
         // arriving after the queued terminal frame must see the finished
-        // turn, never a still-live one. Controls win over the recovery
-        // timer for the same reason: a queued `BeginStop` must be applied
-        // before recovery spends another bounded native call, keeping the
-        // stop budget for native termination.
+        // turn, never a still-live one.
         tokio::select! {
             biased;
             frame = frames.recv(), if accept_frames => {
@@ -4228,11 +4082,7 @@ async fn run(
                     let current = *stream.borrow_and_update();
                     processor.handle_stream_state(current).await;
                 }
-                let mut queues = Some(ActorQueues {
-                    frames: &mut frames,
-                    controls: &mut controls,
-                });
-                if !processor.handle_frame(frame, &mut queues).await {
+                if !processor.handle_frame(frame).await {
                     break;
                 }
                 processor.report_gap_if_queue_empty(frames.is_empty()).await;
@@ -4260,15 +4110,6 @@ async fn run(
                     None => break,
                 }
             }
-            _ = tokio::time::sleep_until(recovery_deadline.unwrap_or_else(Instant::now)), if recovery_deadline.is_some() => {
-                let mut queues = Some(ActorQueues {
-                    frames: &mut frames,
-                    controls: &mut controls,
-                });
-                if !processor.expire_view_recovery(&mut queues).await {
-                    break;
-                }
-            }
         }
         processor.status.native_drained = processor.frames_drained;
         let _ = status_tx.send(processor.status.clone());
@@ -4283,17 +4124,6 @@ fn validate_session_and_turn(status: &EventStatus, session_id: &str, turn_id: &s
         ));
     }
     Ok(())
-}
-
-fn needs_terminal_fence(status: &EventStatus, params: &Value) -> bool {
-    let Ok(terminal) = serde_json::from_value::<NativeTurnCompletedNotification>(params.clone())
-    else {
-        return false;
-    };
-    status.session_id.as_deref() == Some(terminal.session_id.as_str())
-        && status.active_turn_id.as_deref() == Some(terminal.turn_id.as_str())
-        && (status.view_unavailable
-            || terminal.terminal == NativeTurnTerminal::Failed && terminal.error.is_none())
 }
 
 /// Shared native event identity, kept under the local path for the
@@ -4415,14 +4245,6 @@ fn tool_label(item: &NativeItem) -> Option<String> {
         "userShell" => Some("userShell".to_owned()),
         _ => None,
     }
-}
-
-/// Attach the fixed readback-recovery marker to an otherwise unchanged
-/// `turn.completed`: the daemon counts the recovery from this exact key and
-/// value without re-parsing native history. Only the readback-recovery path
-/// calls this; live terminals never carry the marker.
-fn mark_readback_recovery(data: &mut Value) {
-    data[VIEW_RECOVERY_MARKER_FIELD] = Value::from(VIEW_RECOVERY_READBACK);
 }
 
 /// Muse edit-family tool names: workspace mutators whose terminal revision
@@ -4803,6 +4625,104 @@ fn terminal_provider_restriction(
 mod tests {
     use super::*;
     use eliot_plugin::protocol::MAX_COMMAND_ID_BYTES;
+
+    #[tokio::test]
+    async fn unproven_terminal_keeps_the_turn_and_cursor_fenced() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (host_io, plugin_io) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(plugin_io);
+        let mut peer = eliot_plugin::Peer::from_io(read, write);
+        let client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let mut native = crate::native::NativeProcess::spawn(
+            crate::native::NativeLaunch {
+                program: std::env::current_exe().unwrap().into_os_string(),
+                args: vec!["--list".into()],
+                cwd: std::env::current_dir().unwrap(),
+                environment: Vec::new(),
+            },
+            SecretPolicy::default(),
+        )
+        .await
+        .unwrap();
+        let mut processor = EventProcessor::new(
+            native.client(),
+            client,
+            EventConfig {
+                credential: "test-credential".into(),
+                agent_id: "a1".into(),
+                generation: 1,
+                secrets: Vec::new(),
+            },
+        );
+        processor.status.ready = true;
+        processor.status.session_id = Some("session-1".into());
+        processor.status.active_command_id = Some("send-1".into());
+        processor.status.active_turn_id = Some("turn-1".into());
+
+        let terminal = |outcome, cursor| NativeFrame::Notification {
+            method: "turn/completed".to_owned(),
+            params: json!({"sessionId":"session-1", "turnId":"turn-1",
+                "viewCursor":cursor, "terminal":outcome}),
+        };
+        let (read, mut write) = tokio::io::split(host_io);
+        let mut read = BufReader::new(read);
+        let (kept_running, ()) = tokio::join!(
+            processor.handle_frame(Some(terminal("failed", "rev-1"))),
+            async {
+                let mut line = String::new();
+                read.read_line(&mut line).await.unwrap();
+                let gap: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(gap.method, "source.gap");
+                assert!(
+                    gap.params["reason"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(MUSE_VIEW_UNAVAILABLE_REASON_PREFIX)
+                );
+                let reply = json!({"jsonrpc":"2.0", "id":gap.id,
+                "result":{"gap_id":gap.params["gap_id"], "seq":1}});
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+
+                line.clear();
+                read.read_line(&mut line).await.unwrap();
+                let health: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(health.method, "source.health");
+                assert_eq!(health.params["health"], "stale");
+                let mut result = health.params;
+                result.as_object_mut().unwrap().remove("credential");
+                let reply = json!({"jsonrpc":"2.0", "id":health.id, "result":result});
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        );
+        assert!(kept_running && processor.status.view_unavailable);
+
+        // Even a completed frame needs idle proof while the view is unavailable.
+        assert!(
+            processor
+                .handle_frame(Some(terminal("completed", "rev-2")))
+                .await
+        );
+        assert_eq!(processor.status.active_turn_id.as_deref(), Some("turn-1"));
+        assert!(processor.status.last_turn.is_none());
+        assert!(processor.applied_view_cursors.seen.is_empty());
+        assert!(processor.status.needs_idle_proof);
+        assert!(processor.reestablish_idle("session-1").unwrap());
+        assert!(!processor.status.needs_idle_proof && processor.status.failure.is_none());
+
+        native
+            .terminate(true, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        peer_task.abort();
+    }
 
     #[tokio::test]
     async fn busy_stop_without_native_terminal_keeps_exact_turn_unknown() {

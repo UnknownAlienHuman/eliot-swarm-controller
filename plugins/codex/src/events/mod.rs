@@ -1522,7 +1522,14 @@ impl EventProcessor {
             &notification.turn.id,
             "turn.completed",
         )?;
-        self.commit_event("turn.completed", native_id, data).await?;
+        if let Err(error) = self.commit_event("turn.completed", native_id, data).await {
+            if error.failure_where.as_deref() != Some("plugin.events.put") {
+                return Err(error);
+            }
+            // The host owns the gap. The terminal notification still proves
+            // these native handles can be released.
+            self.status.source_unknown = true;
+        }
         // Session facts already committed when each update was accepted, so
         // the terminal carries turn scope only and never re-commits session
         // scope.

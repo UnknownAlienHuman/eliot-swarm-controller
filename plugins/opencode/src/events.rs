@@ -64,10 +64,18 @@ pub(crate) struct EventStatus {
     pub active_command_id: Option<String>,
     pub active_turn_id: Option<String>,
     pub last_turn: Option<TurnFacts>,
+    pub turn_input: Option<TurnInput>,
     pub failure: Option<String>,
     pub batch_unknown: bool,
     pub source_unknown: bool,
     pub stopped: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TurnInput {
+    pub command_id: String,
+    pub turn_id: String,
+    pub inbox_id: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -266,7 +274,6 @@ struct EventProcessor {
     pending: Option<PendingInbox>,
     /// Inbox id of the currently open turn: the prompt response id, which
     /// is the user message id the terminal readback bounds against.
-    open_inbox_id: Option<String>,
     active_model: Option<ModelRef>,
     /// Inbox ids observed as enqueued or delivered, by id. Bounded by the
     /// per-generation command history the host keeps.
@@ -637,7 +644,6 @@ impl EventProcessor {
             writes_blocked: false,
             gap_reported: false,
             pending: None,
-            open_inbox_id: None,
             active_model: None,
             seen_inbox: HashSet::new(),
             seen_delivered: HashSet::new(),
@@ -1216,7 +1222,11 @@ impl EventProcessor {
         let command_id = pending.command_id.clone();
         let context = pending.context.clone();
         let inbox_id = pending.inbox_id.clone();
-        self.open_inbox_id = Some(inbox_id.clone());
+        self.status.turn_input = Some(TurnInput {
+            command_id: command_id.clone(),
+            turn_id: turn_id.clone(),
+            inbox_id: inbox_id.clone(),
+        });
         self.status.active_command_id = Some(command_id.clone());
         self.status.active_turn_id = Some(turn_id.clone());
         // A delivery observed before the turn opened still bound the exact
@@ -1799,8 +1809,19 @@ impl EventProcessor {
         // The exactly associated stream terminal proves status independently
         // of optional HTTP text/usage enrichment. A dead server cannot revoke
         // terminal evidence already received on this generation's stream.
-        let readback =
-            optional_terminal_readback(self.read_terminal_messages(&terminal.session_id).await)?;
+        let input =
+            self.status.turn_input.as_ref().ok_or_else(|| {
+                Error::new("unknown", "OpenCode turn has no exact input association")
+            })?;
+        let readback = optional_terminal_readback(
+            read_turn_messages(
+                &self.http,
+                &terminal.session_id,
+                &input.inbox_id,
+                Instant::now() + EVENT_DEADLINE,
+            )
+            .await,
+        )?;
         if readback
             .as_ref()
             .is_some_and(|readback| readback.outcome != status)
@@ -1812,8 +1833,52 @@ impl EventProcessor {
                 "OpenCode turn outcome is contradictory",
             ));
         }
+        let input = input.clone();
+        if let Err(error) = self
+            .commit_terminal_facts(
+                &input,
+                &terminal,
+                &envelope.event_type,
+                (status, outcome),
+                readback.as_ref(),
+            )
+            .await
+        {
+            if error.failure_where.as_deref() != Some("plugin.events.put") {
+                return Err(error);
+            }
+            // The host recorded the gap. The native execution already ended,
+            // so its local handles can be released while the daemon settles it.
+            self.status.source_unknown = true;
+            self.active_model = None;
+        }
+        // The completed turn clears its Eliot pendings; drop the retained
+        // native offers with it so a later ask reopens instead of reviving.
+        self.drop_turn_requests(&turn_id);
+        self.status.last_turn = Some(TurnFacts {
+            command_id,
+            turn_id: turn_id.clone(),
+            status: Some(status.to_owned()),
+            final_text: readback.and_then(|readback| readback.final_text),
+            terminal: true,
+        });
+        self.status.active_turn_id = None;
+        self.status.active_command_id = None;
+        Ok(())
+    }
+
+    async fn commit_terminal_facts(
+        &mut self,
+        input: &TurnInput,
+        terminal: &ExecutionEventData,
+        event_type: &str,
+        (status, outcome): (&str, &str),
+        readback: Option<&TerminalReadback>,
+    ) -> Result<()> {
+        let command_id = input.command_id.as_str();
+        let turn_id = input.turn_id.as_str();
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        if let Some(readback) = readback.as_ref()
+        if let Some(readback) = readback
             && let Some(text) = readback.final_text.as_deref()
         {
             let data = json!({
@@ -1832,7 +1897,7 @@ impl EventProcessor {
             }
             let native_id = event_id(
                 &terminal.session_id,
-                &turn_id,
+                turn_id,
                 &readback.idle_id,
                 "message.completed",
                 "opencode",
@@ -1841,154 +1906,23 @@ impl EventProcessor {
             self.commit_event("message.completed", native_id, data)
                 .await?;
         }
-        let mut data = terminal_turn_data(
-            &command_id,
-            &turn_id,
-            status,
-            &terminal,
-            readback.as_ref(),
-            &secrets,
-        );
+        let mut data =
+            terminal_turn_data(command_id, turn_id, status, terminal, readback, &secrets);
         if let Some(model) = self.active_model.take() {
             data["effective_model"] =
                 json!(secrets.redact_text(&format!("{}/{}", model.provider_id, model.id)));
         }
         data["outcome"] = json!(outcome);
-        data["native_status"] = json!(envelope.event_type.as_str());
+        data["native_status"] = json!(event_type);
         let native_id = event_id(
             &terminal.session_id,
-            &turn_id,
-            &turn_id,
+            turn_id,
+            turn_id,
             "turn.completed",
             "opencode",
             "OpenCode",
         )?;
-        self.commit_event("turn.completed", native_id, data).await?;
-        // The completed turn clears its Eliot pendings; drop the retained
-        // native offers with it so a later ask reopens instead of reviving.
-        self.drop_turn_requests(&turn_id);
-        self.status.last_turn = Some(TurnFacts {
-            command_id,
-            turn_id: turn_id.clone(),
-            status: Some(status.to_owned()),
-            final_text: readback.and_then(|readback| readback.final_text),
-            terminal: true,
-        });
-        self.status.active_turn_id = None;
-        self.status.active_command_id = None;
-        self.open_inbox_id = None;
-        Ok(())
-    }
-
-    /// Terminal readback: page the newest-first message list (bounded) and
-    /// find our user message plus the newest `idle` message after it. Final
-    /// text is the concatenated assistant text parts strictly between the
-    /// two in newest-first page order, reversed to chronological order
-    /// with each message's native `content` array order preserved (page
-    /// position decides; timestamps never reorder it). Usage is the
-    /// final assistant message's native token usage in that same exact
-    /// user-to-selected-idle slice, attributed at message scope. Anything
-    /// else (missing user message, missing idle, contradictory outcome) is
-    /// a gap, never an inference. Only HTTP `native_readback` unavailability
-    /// permits status-only settlement from the exactly associated SSE terminal.
-    async fn read_terminal_messages(&self, session_id: &str) -> Result<TerminalReadback> {
-        let inbox_id = self
-            .open_inbox_id
-            .clone()
-            .ok_or_else(|| Error::new("unknown", "OpenCode turn has no exact input association"))?;
-        let mut cursor: Option<String> = None;
-        let mut user_position: Option<usize> = None;
-        let mut idle: Option<(String, String, Option<StructuredError>, usize)> = None;
-        let mut texts: Vec<(usize, usize, i64, String)> = Vec::new();
-        let mut usages: HashMap<String, (usize, i64, Option<AssistantTokens>)> = HashMap::new();
-        let mut position: usize = 0;
-        for _ in 0..MAX_MESSAGE_PAGES {
-            let page = self
-                .http
-                .list_messages(
-                    session_id,
-                    cursor.as_deref(),
-                    Instant::now() + EVENT_DEADLINE,
-                )
-                .await?;
-            if page.data.is_empty() {
-                break;
-            }
-            for message in &page.data {
-                match message {
-                    Message::User(user) if user.id == inbox_id => {
-                        user_position = Some(position);
-                    }
-                    Message::Assistant(assistant) => {
-                        for (part_index, part) in assistant.content.iter().enumerate() {
-                            if let AssistantContent::Text(text) = part
-                                && let Some(body) = text.text.as_deref()
-                            {
-                                texts.push((
-                                    position,
-                                    part_index,
-                                    assistant.time.created,
-                                    body.to_owned(),
-                                ));
-                            }
-                        }
-                        // A repeated message id replaces its usage; repeated
-                        // observations are never summed.
-                        usages.insert(
-                            assistant.id.clone(),
-                            (position, assistant.time.created, assistant.tokens.clone()),
-                        );
-                    }
-                    Message::Idle(idle_message) if idle.is_none() && user_position.is_none() => {
-                        // Newest-first: the first idle seen before our
-                        // user message is the newest idle after it.
-                        idle = Some((
-                            idle_message.id.clone(),
-                            idle_message.outcome.clone(),
-                            idle_message.error.clone(),
-                            position,
-                        ));
-                    }
-                    _ => {}
-                }
-                position += 1;
-            }
-            if user_position.is_some() {
-                break;
-            }
-            cursor = page.cursor.next.clone();
-            if cursor.is_none() {
-                break;
-            }
-        }
-        let Some(user_position) = user_position else {
-            return Err(Error::new(
-                "unknown",
-                "OpenCode terminal readback found no exact user message",
-            ));
-        };
-        let Some((idle_id, outcome, idle_error, idle_position)) = idle else {
-            return Err(Error::new(
-                "unknown",
-                "OpenCode terminal readback found no terminal idle message",
-            ));
-        };
-        // Assistant text strictly between our input and the selected idle in
-        // newest-first page order: positions after the idle, before our user.
-        // Both text and usage share this exact slice, so assistants newer
-        // than the selected idle never leak into either.
-        let final_text = project_terminal_text(texts, idle_position, user_position);
-        Ok(TerminalReadback {
-            idle_id,
-            outcome: match outcome.as_str() {
-                "succeeded" => "completed".to_owned(),
-                "failed" => "failed".to_owned(),
-                _ => "interrupted".to_owned(),
-            },
-            idle_error,
-            final_text,
-            usage: final_message_usage(&usages, idle_position, user_position),
-        })
+        self.commit_event("turn.completed", native_id, data).await
     }
 
     async fn finish_stop(&mut self) -> Result<()> {
@@ -2024,7 +1958,7 @@ impl EventProcessor {
         self.status.active_command_id = None;
         self.status.active_turn_id = None;
         self.pending = None;
-        self.open_inbox_id = None;
+        self.status.turn_input = None;
         self.active_model = None;
         self.stashed_started = None;
         self.pending_requests.clear();
@@ -2553,11 +2487,13 @@ impl EventProcessor {
     }
 }
 
-fn optional_terminal_readback(
-    result: Result<TerminalReadback>,
-) -> Result<Option<TerminalReadback>> {
+fn optional_terminal_readback(result: Result<TurnReadback>) -> Result<Option<TerminalReadback>> {
     match result {
-        Ok(readback) => Ok(Some(readback)),
+        Ok(TurnReadback::Terminal(readback)) => Ok(Some(*readback)),
+        Ok(TurnReadback::Running) => Err(Error::new(
+            "unknown",
+            "OpenCode terminal readback found no terminal idle message",
+        )),
         Err(error) if error.code == "native_readback" => Ok(None),
         Err(error) => Err(error),
     }
@@ -2617,11 +2553,136 @@ fn terminal_turn_data(
     data
 }
 
-struct TerminalReadback {
+/// Terminal readback: page the newest-first message list (bounded) and
+/// find our user message plus the newest `idle` message after it. Final
+/// text is the concatenated assistant text parts strictly between the
+/// two in newest-first page order, reversed to chronological order
+/// with each message's native `content` array order preserved (page
+/// position decides; timestamps never reorder it). Usage is the
+/// final assistant message's native token usage in that same exact
+/// user-to-selected-idle slice, attributed at message scope.
+/// A healthy read with the exact user message and no newer idle proves
+/// running. A missing user message, invalid history or HTTP failure does
+/// not establish either state.
+pub(crate) async fn read_turn_messages(
+    http: &OpenCodeHttp,
+    session_id: &str,
+    inbox_id: &str,
+    deadline: Instant,
+) -> Result<TurnReadback> {
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let mut user_position: Option<usize> = None;
+    let mut idle: Option<(String, String, Option<StructuredError>, usize)> = None;
+    let mut texts: Vec<(usize, usize, i64, String)> = Vec::new();
+    let mut usages: HashMap<String, (usize, i64, Option<AssistantTokens>)> = HashMap::new();
+    let mut position: usize = 0;
+    for _ in 0..MAX_MESSAGE_PAGES {
+        let page = http
+            .list_messages(session_id, cursor.as_deref(), deadline)
+            .await?;
+        if page.data.is_empty() {
+            break;
+        }
+        for message in &page.data {
+            match message {
+                Message::User(user) if user.id == inbox_id => {
+                    user_position = Some(position);
+                    break;
+                }
+                Message::Assistant(assistant) => {
+                    for (part_index, part) in assistant.content.iter().enumerate() {
+                        if let AssistantContent::Text(text) = part
+                            && let Some(body) = text.text.as_deref()
+                        {
+                            texts.push((
+                                position,
+                                part_index,
+                                assistant.time.created,
+                                body.to_owned(),
+                            ));
+                        }
+                    }
+                    // A repeated message id replaces its usage; repeated
+                    // observations are never summed.
+                    usages.insert(
+                        assistant.id.clone(),
+                        (position, assistant.time.created, assistant.tokens.clone()),
+                    );
+                }
+                Message::Idle(idle_message) if idle.is_none() => {
+                    // Newest-first: the first idle seen before our
+                    // user message is the newest idle after it.
+                    idle = Some((
+                        idle_message.id.clone(),
+                        idle_message.outcome.clone(),
+                        idle_message.error.clone(),
+                        position,
+                    ));
+                }
+                _ => {}
+            }
+            position += 1;
+        }
+        if user_position.is_some() {
+            break;
+        }
+        match page.cursor.next {
+            Some(next) if !next.is_empty() && seen_cursors.insert(next.clone()) => {
+                cursor = Some(next)
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    "native_readback",
+                    "OpenCode message cursor did not advance",
+                ));
+            }
+            None => break,
+        }
+    }
+    let Some(user_position) = user_position else {
+        return Err(Error::new(
+            "unknown",
+            "OpenCode terminal readback found no exact user message",
+        ));
+    };
+    let Some((idle_id, outcome, idle_error, idle_position)) = idle else {
+        return Ok(TurnReadback::Running);
+    };
+    // Assistant text strictly between our input and the selected idle in
+    // newest-first page order: positions after the idle, before our user.
+    // Both text and usage share this exact slice, so assistants newer
+    // than the selected idle never leak into either.
+    let final_text = project_terminal_text(texts, idle_position, user_position);
+    Ok(TurnReadback::Terminal(Box::new(TerminalReadback {
+        idle_id,
+        outcome: match outcome.as_str() {
+            "succeeded" => "completed".to_owned(),
+            "failed" => "failed".to_owned(),
+            "interrupted" => "interrupted".to_owned(),
+            _ => {
+                return Err(Error::new(
+                    "unknown",
+                    "OpenCode idle message has an unknown outcome",
+                ));
+            }
+        },
+        idle_error,
+        final_text,
+        usage: final_message_usage(&usages, idle_position, user_position),
+    })))
+}
+
+pub(crate) enum TurnReadback {
+    Running,
+    Terminal(Box<TerminalReadback>),
+}
+
+pub(crate) struct TerminalReadback {
     idle_id: String,
-    outcome: String,
-    idle_error: Option<StructuredError>,
-    final_text: Option<String>,
+    pub outcome: String,
+    pub idle_error: Option<StructuredError>,
+    pub final_text: Option<String>,
     usage: Option<TurnUsage>,
 }
 
@@ -2934,6 +2995,67 @@ mod tests {
     };
     use tokio::time::Instant;
 
+    #[tokio::test]
+    async fn bound_user_without_newer_idle_proves_running_only_on_a_healthy_read() {
+        use super::{TurnReadback, read_turn_messages};
+        use crate::native::client::OpenCodeHttp;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http = OpenCodeHttp::new(
+            listener.local_addr().unwrap().port(),
+            "test-password".to_owned(),
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                (
+                    "200 OK",
+                    r#"{"data":[{"type":"user","id":"msg_bound","time":{"created":2}},{"type":"idle","id":"msg_old","time":{"created":1},"outcome":"succeeded"}]}"#,
+                ),
+                (
+                    "200 OK",
+                    r#"{"data":[{"type":"user","id":"msg_foreign","time":{"created":2}}]}"#,
+                ),
+                ("503 Service Unavailable", "{}"),
+            ] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("GET /api/session/ses_bound/message?"));
+                loop {
+                    line.clear();
+                    assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                socket.get_mut().write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let read = || {
+            read_turn_messages(
+                &http,
+                "ses_bound",
+                "msg_bound",
+                Instant::now() + Duration::from_secs(5),
+            )
+        };
+        assert!(matches!(read().await, Ok(TurnReadback::Running)));
+        assert!(matches!(read().await, Err(error) if error.code == "unknown"));
+        assert!(matches!(read().await, Err(error) if error.code == "native_readback"));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn unavailable_terminal_enrichment_preserves_bound_status_without_text_or_usage() {
         for status in ["completed", "failed", "interrupted"] {
@@ -2972,13 +3094,16 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(error.code, "unknown");
-        let readback = super::optional_terminal_readback(Ok(super::TerminalReadback {
-            idle_id: "idle-1".to_owned(),
-            outcome: "failed".to_owned(),
-            idle_error: None,
-            final_text: None,
-            usage: None,
-        }))
+        assert!(super::optional_terminal_readback(Ok(super::TurnReadback::Running)).is_err());
+        let readback = super::optional_terminal_readback(Ok(super::TurnReadback::Terminal(
+            Box::new(super::TerminalReadback {
+                idle_id: "idle-1".to_owned(),
+                outcome: "failed".to_owned(),
+                idle_error: None,
+                final_text: None,
+                usage: None,
+            }),
+        )))
         .unwrap()
         .unwrap();
         // Successful conflicting evidence is retained for complete_turn's
@@ -3061,7 +3186,11 @@ mod tests {
             );
             processor.status.ready = true;
             processor.status.session_id = Some("test-session".to_owned());
-            processor.open_inbox_id = Some("input-1".to_owned());
+            processor.status.turn_input = Some(super::TurnInput {
+                inbox_id: "input-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                command_id: "send-1".to_owned(),
+            });
             processor.status.active_command_id = Some("send-1".to_owned());
             processor.status.active_turn_id = Some("turn-1".to_owned());
             let frame: crate::native::types::SseEnvelope = serde_json::from_value(serde_json::json!({

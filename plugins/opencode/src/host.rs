@@ -1,5 +1,5 @@
 use crate::{
-    events::{EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
+    events::{self, EventConfig, EventHandle, EventStatus, InboxRecord, SteerVerdict, TurnFacts},
     native::{
         AuthSetup, AuthTransfer, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider,
         OpenCodeHttp, OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
@@ -240,9 +240,6 @@ fn presession_reason(phase: StartPhase, code: &str) -> String {
         "no native session or prompt was dispatched by this generation",
     )
 }
-
-const RESUME_DRAIN_ROUNDS: usize = 20;
-const RESUME_DRAIN_BEAT: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Default)]
 struct OpenCodePlugin {
@@ -1672,10 +1669,9 @@ impl OpenCodePlugin {
     /// generation. No prompt is ever replayed: the new server serves the
     /// same per-Agent store, the preflight proves the retained session
     /// exists, then proves the realignment target in the live catalogue
-    /// and the effective MCP proof before the quiesce interrupt can abort
-    /// a running retained turn, then proves the session idle; the
-    /// model/agent realign to the frozen profile with an effective
-    /// readback, and readiness adopts the live edge.
+    /// and the effective MCP proof before checking the native pending legs.
+    /// The model/agent realign to the frozen profile with effective readback,
+    /// and readiness adopts the live edge.
     async fn resume_start_session(
         &mut self,
         parsed: ParsedStart,
@@ -1769,9 +1765,6 @@ impl OpenCodePlugin {
                     ));
                 }
             };
-        if let Err(error) = Self::resume_quiesce(&session, &retained.id, deadline).await {
-            return Err(self.stash_resume_unknown(session, *error.message).await);
-        }
         if let Err(error) = Self::resume_verify_idle(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, *error.message).await);
         }
@@ -1880,61 +1873,32 @@ impl OpenCodePlugin {
         Ok(retained)
     }
 
-    /// Resume quiesce: one `session.interrupt` must report no running
-    /// execution. A running retained execution is aborted (refusing would
-    /// wedge crash-recovery resume) and its settle is awaited on a bounded
-    /// leg poll; anything else refuses the resume as unknown. The native
-    /// idle proof is this interrupt plus the empty inbox/permission/form
-    /// lists, not served history.
-    async fn resume_quiesce(
+    /// Stop's explicit interrupt is a single native control. Recovery never
+    /// calls this path: a retained running turn is left for the daemon's
+    /// bounded snapshot monitor rather than being polled or retried here.
+    async fn stop_quiesce(
         session: &AgentSession,
         session_id: &str,
         deadline: Instant,
     ) -> Result<()> {
-        let interrupted = match session.http.interrupt(session_id, deadline).await {
-            Ok(interrupted) => interrupted,
+        match session.http.interrupt(session_id, deadline).await {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(Error::new(
+                "unknown",
+                "OpenCode stop interrupt did not prove native idle",
+            )),
             Err(outcome) => {
                 let reason = match outcome {
-                    HttpOutcome::Rejected { reason, .. } => reason,
-                    HttpOutcome::Unknown { reason } | HttpOutcome::NotDispatched { reason } => {
-                        reason
-                    }
+                    HttpOutcome::Rejected { reason, .. }
+                    | HttpOutcome::Unknown { reason }
+                    | HttpOutcome::NotDispatched { reason } => reason,
                 };
-                return Err(Error::new(
+                Err(Error::new(
                     "unknown",
-                    format!("OpenCode resume quiesce is unresolved ({reason})"),
-                ));
-            }
-        };
-        if !interrupted {
-            return Ok(());
-        }
-        for _ in 0..RESUME_DRAIN_ROUNDS {
-            tokio::time::sleep(RESUME_DRAIN_BEAT).await;
-            if !Self::resume_legs_quiet(session, session_id, deadline).await? {
-                continue;
-            }
-            match session.http.interrupt(session_id, deadline).await {
-                Ok(false) => return Ok(()),
-                Ok(true) => continue,
-                Err(outcome) => {
-                    let reason = match outcome {
-                        HttpOutcome::Rejected { reason, .. } => reason,
-                        HttpOutcome::Unknown { reason } | HttpOutcome::NotDispatched { reason } => {
-                            reason
-                        }
-                    };
-                    return Err(Error::new(
-                        "unknown",
-                        format!("OpenCode resume quiesce is unresolved ({reason})"),
-                    ));
-                }
+                    format!("OpenCode stop interrupt is unresolved ({reason})"),
+                ))
             }
         }
-        Err(Error::new(
-            "unknown",
-            "OpenCode retained session did not settle after its interrupt",
-        ))
     }
 
     /// Resume idle legs: the inbox, permission and form lists must all be
@@ -1966,17 +1930,6 @@ impl OpenCodePlugin {
             ));
         }
         Ok(())
-    }
-
-    /// Await-helper for the quiesce drain: all three legs quiet.
-    async fn resume_legs_quiet(
-        session: &AgentSession,
-        session_id: &str,
-        deadline: Instant,
-    ) -> Result<bool> {
-        let (inbox, permissions, forms) =
-            Self::resume_leg_counts(session, session_id, deadline).await?;
-        Ok(inbox == 0 && permissions == 0 && forms == 0)
     }
 
     /// Read the three idle legs as pending counts. Any read failure is
@@ -3570,32 +3523,85 @@ impl OpenCodePlugin {
             Ok(request) => request,
             Err(reason) => return unknown_snapshot(&params, reason),
         };
-        let last_turn = match Self::snapshot_turn_facts(
-            &event_status,
-            &params,
-            request.turn_id.as_deref(),
-            &session.start_command_id,
-            session.stop_command_id.as_deref(),
-        ) {
-            Ok(last_turn) => last_turn,
-            Err(reason) => return unknown_snapshot(&params, reason),
-        };
-        // The session readback proves the exact owned session is alive; turn
-        // facts come from the committed stream fold.
-        if !Self::session_readback_proven(&session.http, &request.session_id).await {
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        if !session
+            .http
+            .get_session(&request.session_id, deadline)
+            .await
+            .is_ok_and(|native| native.id == request.session_id)
+        {
             return unknown_snapshot(
                 &params,
                 "OpenCode session readback did not prove the exact owned session",
             );
         }
-        let state = if event_status.active_turn_id.is_some() {
+        let native_turn = if let Some(input) = event_status.turn_input.as_ref().filter(|input| {
+            request.turn_id.as_deref() == Some(input.turn_id.as_str())
+                && params.command_id == input.command_id
+                && event_status
+                    .active_turn_id
+                    .as_ref()
+                    .is_none_or(|active| active == &input.turn_id)
+        }) {
+            events::read_turn_messages(
+                &session.http,
+                &request.session_id,
+                &input.inbox_id,
+                deadline,
+            )
+            .await
+            .ok()
+            .filter(|readback| {
+                !matches!(readback, events::TurnReadback::Running)
+                    || event_status.active_turn_id.as_deref() == Some(input.turn_id.as_str())
+            })
+        } else {
+            None
+        };
+        let turn_evidence = native_turn
+            .as_ref()
+            .map(|_| "GET /api/session/{id}+GET /api/session/{id}/message");
+        let active_turn = if matches!(&native_turn, Some(events::TurnReadback::Terminal(_))) {
+            None
+        } else {
+            event_status.active_turn_id.clone()
+        };
+        let last_turn = match native_turn {
+            Some(events::TurnReadback::Running) => json!({
+                "command_id": params.command_id,
+                "turn_id": request.turn_id,
+                "status": "inProgress",
+                "terminal": false,
+            }),
+            Some(events::TurnReadback::Terminal(terminal)) => {
+                json!({
+                    "command_id": params.command_id,
+                    "turn_id": request.turn_id,
+                    "status": terminal.outcome,
+                    "terminal": true,
+                    "final_text": terminal.final_text,
+                    "native_error": terminal.idle_error.map(|error| error.message),
+                })
+            }
+            None => match Self::snapshot_turn_facts(
+                &event_status,
+                &params,
+                request.turn_id.as_deref(),
+                &session.start_command_id,
+                session.stop_command_id.as_deref(),
+            ) {
+                Ok(facts) => serde_json::to_value(facts).map_err(|_| {
+                    Error::new("internal", "OpenCode turn snapshot could not be encoded")
+                })?,
+                Err(reason) => return unknown_snapshot(&params, reason),
+            },
+        };
+        let state = if active_turn.is_some() {
             "busy"
         } else {
             "idle"
         };
-        let result_known = last_turn
-            .as_ref()
-            .is_some_and(|turn| turn.final_text.is_some());
+        let result_known = last_turn["final_text"].is_string();
         Ok(json!({
             "agent_id": params.agent_id,
             "generation": params.generation,
@@ -3603,8 +3609,9 @@ impl OpenCodePlugin {
             "state": state,
             "native_scope": session.native_scope,
             "native_ref": request.session_id,
-            "active_turn": event_status.active_turn_id,
+            "active_turn": active_turn,
             "last_turn": last_turn,
+            "turn_evidence": turn_evidence,
             "batch_unknown": event_status.batch_unknown,
             "source_unknown": event_status.source_unknown,
             "result_known": result_known,
@@ -3664,13 +3671,6 @@ impl OpenCodePlugin {
             turn_id,
             session_id: session_id.to_owned(),
         })
-    }
-
-    /// Snapshot phase 3, liveness: the exact owned session answers readback.
-    async fn session_readback_proven(http: &OpenCodeHttp, session_id: &str) -> bool {
-        http.get_session(session_id, Instant::now() + RPC_TIMEOUT)
-            .await
-            .is_ok()
     }
 
     /// The requested turn from the committed stream fold. Only the native
@@ -4892,8 +4892,7 @@ fn start_paths(
 
 /// Stop quiesces the native session and ends the owned server while
 /// retaining the native session for resume. Ordinary stop never deletes
-/// the session; it quiesces any running execution with the same native
-/// interrupt the resume preflight uses, proves the exact session still
+/// the session; it requests a native interrupt and proves the exact session still
 /// exists by readback, then ends the owned server through generation
 /// process custody. Proven retained applies; proven absent or any
 /// ambiguous readback is unknown. Force ends the owned server without
@@ -4921,7 +4920,7 @@ async fn terminate_session(
                 // Cleanup is read-only even if that write was uncertain.
                 OpenCodePlugin::resume_verify_idle(session, &session_id, deadline).await
             } else {
-                OpenCodePlugin::resume_quiesce(session, &session_id, deadline).await
+                OpenCodePlugin::stop_quiesce(session, &session_id, deadline).await
             };
             if quiet.is_err() {
                 semantic_error = true;

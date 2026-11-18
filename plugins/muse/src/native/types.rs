@@ -1025,20 +1025,6 @@ pub struct NativeViewPageResult {
     pub next_cursor: Option<String>,
 }
 
-/// Read-only reattachment: replay `(after, head]` before live view delivery.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeViewSubscribeParams {
-    pub session_id: String,
-    pub after: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeViewSubscribeResult {
-    pub view_cursor: String,
-}
-
 /// The closed reasoning-effort tier vocabulary (SS3.2), spelled identically
 /// on the fresh-turn and steer lanes and in `session/setReasoningEffort`.
 pub use eliot_core::api::MUSE_REASONING_EFFORT_TIERS as REASONING_EFFORT_TIERS;

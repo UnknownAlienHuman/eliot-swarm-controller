@@ -83,7 +83,6 @@ struct SubjectRead {
 
 enum LiveIntent {
     Begin(String),
-    Recover(String),
     Gap {
         reason: String,
         checkpoint: Option<String>,
@@ -115,7 +114,10 @@ pub(crate) struct ObserverSession {
     live_cursor: Option<String>,
     live_baseline: Option<String>,
     live_started: bool,
-    live_recovery_required: bool,
+    // This records that the current live view has an acknowledged gap. It is
+    // deliberately not a recovery latch: the daemon owns turn recovery and
+    // settlement; the observer only preserves the source gap and stale health.
+    live_gap_recorded: bool,
     live_stale: bool,
     live_publication_failed: bool,
     live_reopen: bool,
@@ -231,7 +233,7 @@ impl ObserverSession {
             live_cursor: None,
             live_baseline: None,
             live_started: false,
-            live_recovery_required: false,
+            live_gap_recorded: false,
             live_stale: false,
             live_publication_failed: false,
             live_reopen: false,
@@ -427,7 +429,7 @@ impl ObserverSession {
     async fn poll_live_inner(&mut self, deadline: Instant) -> Result<()> {
         if let Some(reason) = self.live_problem {
             self.publish_live_intent(
-                live_problem_intent(reason, self.live_started, self.live_recovery_required),
+                live_problem_intent(reason, self.live_started, self.live_gap_recorded),
                 deadline,
             )
             .await?;
@@ -516,10 +518,6 @@ impl ObserverSession {
                 {
                     return Err(integrity());
                 }
-                if self.live_recovery_required {
-                    self.publish_live_intent(LiveIntent::Recover(from), deadline)
-                        .await?;
-                }
                 let result = self
                     .live_publisher
                     .as_mut()
@@ -528,6 +526,11 @@ impl ObserverSession {
                     .await;
                 self.live_publication_failed = result.is_err();
                 self.live_cursor = Some(result?);
+                // A verified native record restores live coverage. The
+                // durable source gap remains in Store as historical evidence;
+                // this local marker only controls current health reporting.
+                self.live_gap_recorded = false;
+                self.live_problem = None;
             } else {
                 if page.cursor == from && !page.at_end && !page.partial_tail {
                     return Err(integrity());
@@ -539,7 +542,7 @@ impl ObserverSession {
             }
             self.publish_live_health(
                 "transcript",
-                if self.live_recovery_required {
+                if self.live_gap_recorded {
                     "stale"
                 } else if page.at_end || page.partial_tail {
                     "ok"
@@ -558,12 +561,17 @@ impl ObserverSession {
 
     async fn finish_live_baseline(&mut self, deadline: Instant) -> Result<()> {
         if let Some(edge) = self.live_baseline.clone() {
-            let intent = if self.live_started {
-                LiveIntent::Recover(edge)
+            if self.live_started {
+                // Reopening a native tail after a read failure is a local
+                // continuation. Do not repeat the observer handoff or invent
+                // a recovery gap; the daemon owns any controlled-turn
+                // settlement from the already-recorded gap.
+                self.live_cursor = Some(edge);
+                self.live_baseline = None;
             } else {
-                LiveIntent::Begin(edge)
-            };
-            self.publish_live_intent(intent, deadline).await?;
+                self.publish_live_intent(LiveIntent::Begin(edge), deadline)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -588,7 +596,6 @@ impl ObserverSession {
         let publisher = self.live_publisher.as_mut().ok_or_else(live_unknown)?;
         let result = match &intent {
             LiveIntent::Begin(edge) => publisher.begin(edge, self.live_problem, deadline).await,
-            LiveIntent::Recover(edge) => publisher.recover(edge, deadline).await,
             LiveIntent::Gap { reason, checkpoint } => {
                 publisher.gap(reason, checkpoint.clone(), deadline).await
             }
@@ -600,13 +607,9 @@ impl ObserverSession {
         // file cursor or trigger another write from this reader.
         self.live_publication_failed = result.is_err();
         result?;
-        acknowledge_live_outage(
-            &intent,
-            &mut self.live_problem,
-            &mut self.live_recovery_required,
-        );
+        acknowledge_live_outage(&intent, &mut self.live_problem, &mut self.live_gap_recorded);
         match intent {
-            LiveIntent::Begin(edge) | LiveIntent::Recover(edge) => {
+            LiveIntent::Begin(edge) => {
                 if self.live_baseline.as_deref() == Some(edge.as_str()) {
                     self.live_cursor = Some(edge);
                     self.live_baseline = None;
@@ -1322,15 +1325,15 @@ fn live_read_timeout() -> Error {
     Error::new("busy", "Codex live rollout read deadline elapsed")
 }
 
-fn live_problem_intent(reason: &str, started: bool, gap_acknowledged: bool) -> LiveIntent {
-    if started && !gap_acknowledged {
+fn live_problem_intent(reason: &str, started: bool, gap_recorded: bool) -> LiveIntent {
+    if started && !gap_recorded {
         LiveIntent::Gap {
             reason: reason.to_owned(),
             checkpoint: None,
         }
     } else {
-        // Before handoff there is no transcript. After gap acknowledgement,
-        // retain that same uncovered interval until a verified file edge.
+        // Before handoff there is no transcript. After recording a gap, keep
+        // the source stale; only the daemon can settle the affected turn.
         LiveIntent::Health {
             source: if started { "transcript" } else { "observe" }.to_owned(),
             health: "stale".to_owned(),
@@ -1341,13 +1344,13 @@ fn live_problem_intent(reason: &str, started: bool, gap_acknowledged: bool) -> L
 fn acknowledge_live_outage(
     intent: &LiveIntent,
     problem: &mut Option<&'static str>,
-    recovery_required: &mut bool,
+    gap_recorded: &mut bool,
 ) {
     match intent {
-        LiveIntent::Gap { .. } => *recovery_required = true,
-        LiveIntent::Begin(_) | LiveIntent::Recover(_) => {
+        LiveIntent::Gap { .. } => *gap_recorded = true,
+        LiveIntent::Begin(_) => {
             *problem = None;
-            *recovery_required = false;
+            *gap_recorded = false;
         }
         LiveIntent::Health { .. } => {}
     }
@@ -1384,10 +1387,10 @@ mod tests {
     };
 
     #[test]
-    fn acknowledged_outage_retains_problem_until_verified_edge() {
+    fn acknowledged_outage_retains_gap_and_stale_health_without_plugin_recovery() {
         let mut problem = Some("observer rollout live edge is unavailable");
-        let mut recovery_required = false;
-        let first = live_problem_intent(problem.unwrap(), true, recovery_required);
+        let mut gap_recorded = false;
+        let first = live_problem_intent(problem.unwrap(), true, gap_recorded);
         assert!(matches!(
             first,
             LiveIntent::Gap {
@@ -1395,59 +1398,38 @@ mod tests {
                 ..
             }
         ));
-        acknowledge_live_outage(&first, &mut problem, &mut recovery_required);
+        acknowledge_live_outage(&first, &mut problem, &mut gap_recorded);
         assert!(problem.is_some());
-        assert!(recovery_required);
+        assert!(gap_recorded);
 
         for _ in 0..4 {
             // The real open/read failure path can assign the same problem again.
             problem = Some("observer rollout live edge is unavailable");
-            let intent = live_problem_intent(problem.unwrap(), true, recovery_required);
+            let intent = live_problem_intent(problem.unwrap(), true, gap_recorded);
             assert!(matches!(&intent, LiveIntent::Health { source, health }
                 if source == "transcript" && health == "stale"));
-            acknowledge_live_outage(&intent, &mut problem, &mut recovery_required);
+            acknowledge_live_outage(&intent, &mut problem, &mut gap_recorded);
             assert!(problem.is_some());
-            assert!(recovery_required);
+            assert!(gap_recorded);
         }
-
-        acknowledge_live_outage(
-            &LiveIntent::Recover("verified-held-file-edge".to_owned()),
-            &mut problem,
-            &mut recovery_required,
-        );
-        assert!(problem.is_none());
-        assert!(!recovery_required);
-
-        problem = Some("observer rollout live edge is unavailable");
-        let next = live_problem_intent(problem.unwrap(), true, recovery_required);
-        assert!(matches!(
-            next,
-            LiveIntent::Gap {
-                checkpoint: None,
-                ..
-            }
-        ));
-        acknowledge_live_outage(&next, &mut problem, &mut recovery_required);
-        assert!(problem.is_some());
-        assert!(recovery_required);
     }
 
     #[test]
     fn prebaseline_unavailability_stays_on_observe_until_verified_begin() {
         let mut problem = Some("observer exact subject has no rollout path");
-        let mut recovery_required = false;
-        let intent = live_problem_intent(problem.unwrap(), false, recovery_required);
+        let mut gap_recorded = false;
+        let intent = live_problem_intent(problem.unwrap(), false, gap_recorded);
         assert!(matches!(&intent, LiveIntent::Health { source, health }
             if source == "observe" && health == "stale"));
-        acknowledge_live_outage(&intent, &mut problem, &mut recovery_required);
+        acknowledge_live_outage(&intent, &mut problem, &mut gap_recorded);
         assert!(problem.is_some());
         acknowledge_live_outage(
             &LiveIntent::Begin("verified-initial-edge".to_owned()),
             &mut problem,
-            &mut recovery_required,
+            &mut gap_recorded,
         );
         assert!(problem.is_none());
-        assert!(!recovery_required);
+        assert!(!gap_recorded);
     }
 
     #[test]
