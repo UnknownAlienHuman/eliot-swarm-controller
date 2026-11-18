@@ -482,6 +482,9 @@ mod tests {
     fn mutation_errors_share_core_admission_classification() {
         // Only confirmed pre-admission rejections through the one Core
         // predicate exit 3, including phases a CLI-only list lost.
+        // `version_conflict` stays here: the Store's CAS guard returns
+        // before any write, so a stale expectation is a confirmed
+        // pre-effect refusal, not an uncertain effect.
         for code in [
             "routing_unavailable",
             "conflict",
@@ -490,6 +493,7 @@ mod tests {
             "bad_state",
             "stale_generation",
             "frame_too_large",
+            "version_conflict",
         ] {
             assert_eq!(Failure::mutation_exit_code(code), 3, "{code}");
             let failure = Failure::for_mutation(CoreError::new(code, "refused"));
@@ -511,7 +515,6 @@ mod tests {
             "mailbox_full",
             "rejected",
             "stale_round",
-            "version_conflict",
             "claim_limit",
             "id_conflict",
             "id_expired",

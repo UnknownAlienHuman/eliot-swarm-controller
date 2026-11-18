@@ -275,7 +275,11 @@ pub(crate) async fn run_inbox(
                 .await
                 {
                     Ok(Ok(response)) => response,
-                    Ok(Err(error)) => return Err(Failure::readback(error)),
+                    // A completed inbox RPC failed before any wait expiry:
+                    // the read-only path wrote nothing, so this is a plain
+                    // read error (exit 1), not an uncertain command outcome.
+                    // Exit 5 stays for deadline expiry below.
+                    Ok(Err(error)) => return Err(Failure::for_read(error)),
                     Err(_) => {
                         if let Some(page) = last {
                             print_inbox_page(&page, json_output)?;

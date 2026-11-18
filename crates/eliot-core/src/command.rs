@@ -19,6 +19,9 @@ pub fn validate_command_id(id: &str) -> crate::Result<()> {
 /// Whether a code is a deterministic refusal before an external effect is
 /// dispatched. After dispatch, callers must use `classify_dispatched_error`;
 /// these codes alone do not prove that native I/O did not occur.
+/// `version_conflict` is the Store's compare-and-swap guard: it returns
+/// before any write, so a stale expectation is a confirmed pre-effect
+/// refusal, not an uncertain outcome.
 pub fn is_deterministic_pre_admission_rejection(code: &str) -> bool {
     matches!(
         code,
@@ -36,6 +39,7 @@ pub fn is_deterministic_pre_admission_rejection(code: &str) -> bool {
             | "stale_generation"
             | "stale_assignment"
             | "unsupported"
+            | "version_conflict"
     )
 }
 
@@ -167,6 +171,7 @@ mod tests {
             "secret_in_payload",
             "stale_generation",
             "unsupported",
+            "version_conflict",
         ] {
             assert!(is_deterministic_pre_admission_rejection(code), "{code}");
         }
