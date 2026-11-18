@@ -246,31 +246,60 @@ fn custody_blocker_tx(tx: &Transaction<'_>, agent: i64, observers: bool) -> Resu
 }
 
 fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()> {
+    const MAX_DELETE_COMMANDS: usize = 10_000;
     // Temporary selection is transaction-local and is never a second deletion ledger.
-    db!(tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS deleted_agents(id INTEGER PRIMARY KEY); DELETE FROM deleted_agents;"));
+    db!(tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS deleted_agents(id INTEGER PRIMARY KEY);
+         CREATE TEMP TABLE IF NOT EXISTS deleted_commands(id TEXT PRIMARY KEY NOT NULL);
+         DELETE FROM deleted_agents;
+         DELETE FROM deleted_commands;"
+    ));
     for num in members {
         db!(tx.execute("INSERT INTO deleted_agents VALUES (?1)", [num]));
     }
-    // Active cleanup attempts already block in custody_blocker_tx. Deleting
-    // the Agent supersedes plan items that never acquired an attempt fence.
-    let crossing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM commands c JOIN commands p ON p.id=c.parent_command WHERE (c.target IN (SELECT id FROM deleted_agents)) != (p.target IN (SELECT id FROM deleted_agents)))",[],|r|r.get(0)).map_err(sql_error)?;
+    let mut command_count = db!(tx.execute(
+        "INSERT INTO deleted_commands
+         SELECT id FROM commands WHERE target IN (SELECT id FROM deleted_agents) LIMIT ?1",
+        [MAX_DELETE_COMMANDS as i64 + 1],
+    ));
+    if command_count <= MAX_DELETE_COMMANDS {
+        // A selector parent records the expansion, with no Agent target. Its
+        // concrete members have already passed the per-Agent settlement checks.
+        command_count += db!(tx.execute(
+            "INSERT INTO deleted_commands
+             SELECT DISTINCT p.id FROM deleted_commands d
+             JOIN commands c ON c.id=d.id JOIN commands p ON p.id=c.parent_command
+             WHERE c.link_kind=?1 AND p.target IS NULL AND p.selector IS NOT NULL
+               AND p.parent_command IS NULL AND p.state='applied'
+             LIMIT ?2",
+            params![
+                hierarchy::SELECTOR_LINK_KIND,
+                (MAX_DELETE_COMMANDS - command_count) as i64 + 1
+            ],
+        ));
+    }
+    if command_count > MAX_DELETE_COMMANDS {
+        return Err(Error::new(
+            "unavailable",
+            "Agent command tree exceeds deletion bound",
+        ));
+    }
+    let crossing: bool = db!(tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM deleted_commands d JOIN commands c ON c.id=d.id
+             WHERE c.parent_command IS NOT NULL
+               AND c.parent_command NOT IN (SELECT id FROM deleted_commands)
+         ) OR EXISTS(
+             SELECT 1 FROM deleted_commands d JOIN commands c ON c.parent_command=d.id
+             WHERE c.id NOT IN (SELECT id FROM deleted_commands)
+         )",
+        [],
+        |r| r.get(0),
+    ));
     if crossing {
         return Err(Error::new(
             "busy",
             "command tree crosses the selected Agent tree",
-        ));
-    }
-    let command_count: i64 = tx
-        .query_row(
-            "SELECT COUNT(*) FROM commands WHERE target IN (SELECT id FROM deleted_agents)",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(sql_error)?;
-    if command_count > 10000 {
-        return Err(Error::new(
-            "unavailable",
-            "Agent command tree exceeds deletion bound",
         ));
     }
     let latest: i64=tx.query_row("SELECT COALESCE(MAX(seq),0) FROM events WHERE agent IN (SELECT id FROM deleted_agents)",[],|r|r.get(0)).map_err(sql_error)?;
@@ -284,8 +313,22 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
             "retained history is pinned by a live rule cursor",
         ));
     }
-    let ids: Vec<String> = tx.prepare("WITH RECURSIVE tree(id,depth) AS (SELECT id,0 FROM commands WHERE target IN (SELECT id FROM deleted_agents) AND parent_command IS NULL UNION ALL SELECT c.id,t.depth+1 FROM commands c JOIN tree t ON c.parent_command=t.id WHERE t.depth<1000) SELECT id FROM tree ORDER BY depth DESC").map_err(sql_error)?.query_map([],|r|r.get(0)).map_err(sql_error)?.collect::<rusqlite::Result<_>>().map_err(sql_error)?;
-    if ids.len() != command_count as usize {
+    let ids: Vec<String> = tx
+        .prepare(
+            "WITH RECURSIVE tree(id,depth) AS (
+                 SELECT c.id,0 FROM deleted_commands d JOIN commands c ON c.id=d.id
+                 WHERE c.parent_command IS NULL
+                 UNION ALL
+                 SELECT c.id,t.depth+1 FROM commands c JOIN tree t ON c.parent_command=t.id
+                 WHERE t.depth<1000
+             ) SELECT id FROM tree ORDER BY depth DESC",
+        )
+        .map_err(sql_error)?
+        .query_map([], |r| r.get(0))
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(sql_error)?;
+    if ids.len() != command_count {
         return Err(Error::new(
             "source_integrity",
             "command tree is incomplete or exceeds its depth bound",
@@ -293,8 +336,10 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     }
     db!(tx.execute("DELETE FROM processes WHERE EXISTS(SELECT 1 FROM deleted_agents d WHERE processes.owner GLOB 'agent:a'||d.id||'#*' OR processes.owner GLOB 'workspace:a'||d.id||'#*')",[]));
     // Keep retry identities after removing payloads: a deleted native effect can never be admitted again.
-    db!(tx.execute("INSERT INTO writes(id,principal,method,payload_digest,result,created_at) SELECT id,principal,method,payload_digest,'{}',?1 FROM commands WHERE target IN (SELECT id FROM deleted_agents)",[now]));
-    db!(tx.execute("UPDATE provider_holds SET probe_command=NULL WHERE probe_command IN (SELECT id FROM commands WHERE target IN (SELECT id FROM deleted_agents))",[]));
+    db!(tx.execute("INSERT INTO writes(id,principal,method,payload_digest,result,created_at) SELECT c.id,c.principal,c.method,c.payload_digest,'{}',?1 FROM deleted_commands d JOIN commands c ON c.id=d.id",[now]));
+    db!(tx.execute("UPDATE provider_holds SET probe_command=NULL WHERE probe_command IN (SELECT id FROM deleted_commands)",[]));
+    // Active cleanup attempts already block. Deleting the Agent supersedes
+    // plan items that never acquired an attempt fence.
     for (table, column) in [
         ("agent_config", "agent"),
         ("agent_edits", "agent"),
@@ -335,7 +380,7 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
         "DELETE FROM agents WHERE id IN (SELECT id FROM deleted_agents)",
         []
     ));
-    db!(tx.execute("DELETE FROM deleted_agents", []));
+    db!(tx.execute_batch("DELETE FROM deleted_commands; DELETE FROM deleted_agents;"));
     Ok(())
 }
 

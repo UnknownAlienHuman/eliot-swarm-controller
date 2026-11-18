@@ -1518,6 +1518,104 @@ mod tests {
         );
     }
 
+    fn stop_tree_for_delete(
+        store: &mut Store,
+        now: i64,
+        child_outcome: CommandState,
+    ) -> (String, String, SubmitCommand) {
+        let parent = ready_agent(store, "delete-stopped-tree", now);
+        let child = launch_child(store, "owner", &parent, json!({}), now);
+        ready_launched_agent(store, &child, now);
+        for agent in [&parent, &child] {
+            crate::tests::install_live_custody_observations(store, agent, 1, now);
+        }
+
+        let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+        stop.selector = Some(format!("tree:{parent}"));
+        let admission = store.submit("owner", stop.clone(), now).unwrap();
+        assert_eq!(admission.command.state, CommandState::Applied);
+        assert!(admission.command.target.is_none());
+        for (agent, state) in [(&parent, CommandState::Applied), (&child, child_outcome)] {
+            let id = selector_child_id(&stop.id, agent);
+            store.dispatch(&id, now).unwrap();
+            store
+                .put_batch(
+                    crate::tests::native_batch(agent, 1, "session.ended", json!({"command_id":id})),
+                    now,
+                )
+                .unwrap();
+            store.settle(&id, state, None, now).unwrap();
+            crate::tests::simulate_normal_stop_proof(store, agent, 1, now);
+            assert_eq!(
+                store.get_agent(agent).unwrap().unwrap().state,
+                AgentState::Stopped
+            );
+        }
+        (parent, child, stop)
+    }
+
+    #[test]
+    fn delete_removes_a_settled_stop_selector_as_one_command_tree() {
+        let mut store = store();
+        let now = now_ms();
+        let (parent, child, stop) = stop_tree_for_delete(&mut store, now, CommandState::Applied);
+        let ids = child_ids(&store, &stop.id);
+        assert_eq!(ids.len(), 2);
+        let error = store
+            .change_agent_tree(&Ulid::new().to_string(), &child, None, now)
+            .unwrap_err();
+        assert_eq!(error.code, "busy");
+        assert!(error.message.contains("command tree crosses"));
+        assert_eq!(child_ids(&store, &stop.id), ids);
+        assert_eq!(agent_count(&store), 2);
+
+        let delete_id = Ulid::new().to_string();
+        let deleted = store
+            .change_agent_tree(&delete_id, &parent, None, now)
+            .unwrap();
+        assert_eq!(
+            deleted,
+            json!({"agent":parent,"affected":2,"archived":null,"deleted":true})
+        );
+        assert_eq!(agent_count(&store), 0);
+        for id in ids.iter().chain(std::iter::once(&stop.id)) {
+            assert!(store.get_command(id).unwrap().is_none());
+            assert!(write_exists(&store.connection, id).unwrap());
+        }
+        assert_eq!(
+            store
+                .change_agent_tree(&delete_id, &parent, None, now)
+                .unwrap(),
+            deleted
+        );
+        assert_eq!(
+            store.submit("owner", stop, now).unwrap_err().code,
+            "id_conflict"
+        );
+    }
+
+    #[test]
+    fn delete_refuses_a_stopped_tree_with_an_unknown_stop_member() {
+        let mut store = store();
+        let now = now_ms();
+        let (parent, child, stop) = stop_tree_for_delete(&mut store, now, CommandState::Unknown);
+        let unknown_id = selector_child_id(&stop.id, &child);
+        let ids = child_ids(&store, &stop.id);
+        let unknown = store.get_command(&unknown_id).unwrap().unwrap();
+        assert_eq!(unknown.state, CommandState::Unknown);
+        let error = store
+            .change_agent_tree(&Ulid::new().to_string(), &parent, None, now)
+            .unwrap_err();
+        assert_eq!(error.code, "busy");
+        assert!(error.message.contains(&format!(
+            "{child} has unknown command {unknown_id} (generation 1)"
+        )));
+        assert_eq!(agent_count(&store), 2);
+        assert_eq!(child_ids(&store, &stop.id), ids);
+        assert_eq!(store.get_command(&unknown_id).unwrap(), Some(unknown));
+        assert!(!store.submit("owner", stop, now).unwrap().is_new);
+    }
+
     #[test]
     fn tree_stop_skips_observe_only_native_children() {
         let mut store = store();
