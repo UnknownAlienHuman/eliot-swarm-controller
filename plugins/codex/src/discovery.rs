@@ -1071,15 +1071,9 @@ pub(crate) async fn verify_initialized_store(
 /// same canonical representation admission uses (so a `~/.codex` symlink
 /// that starts still archives). Accepts the exact frozen separate-root
 /// binding and the home form; anything else (including a home-form scope on
-/// a separate-root binding) is unverified. Retained legacy scopes are
-/// verified against their original admission identity (the frozen strings
-/// as-is) when the canonical directories are unavailable. A binding frozen
-/// before the canonical-home fix behind a symlinked home carries a scope
-/// derived from the reported alias, which no longer exists anywhere in the
-/// frozen binding: neither derivation can recover that spelling, so it stays
-/// unverified with an explicit rebinding path instead of a guessed accept.
-/// Re-admission (profile.store) verifies the store pin before freezing a
-/// fresh canonical binding; the scope is never edited by hand.
+/// a separate-root binding) is unverified. The frozen strings can also
+/// prove the scope if the directories are unavailable. A legacy scope
+/// derived from a home alias whose spelling was lost stays unverified.
 pub(crate) fn verify_archive_scope(binding: &NativeStoreBinding) -> Result<()> {
     let (home, root) = binding_paths(binding)?;
     // Primary: the same canonical representation admission freezes. The
@@ -1102,7 +1096,7 @@ pub(crate) fn verify_archive_scope(binding: &NativeStoreBinding) -> Result<()> {
     }
     Err(Error::new(
         "native_scope_unverified",
-        "Codex archive scope does not match the frozen home and store: re-run store admission (profile.store) against the live Codex home to freeze a fresh canonical binding, then retry the archive with that binding",
+        "Codex archive scope does not match the frozen home and store. Only a new launch can capture a verified binding. This retained session remains ineligible for Swarm archive.",
     ))
 }
 
@@ -2097,8 +2091,7 @@ mod tests {
         // home carries the canonical path with a scope derived from the
         // reported alias. That spelling exists nowhere in the frozen
         // binding, so neither the canonical nor the legacy derivation can
-        // recover it: the gate must stay `native_scope_unverified` (never a
-        // guessed accept) and name the verified rebinding path.
+        // recover it. A new launch obtains a fresh binding for its own subject.
         let base = std::env::temp_dir().join(format!("eliot-codex-legacy-{}", ulid::Ulid::new()));
         let home = base.join("home");
         std::fs::create_dir_all(&home).expect("legacy home");
@@ -2113,11 +2106,13 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.code, "native_scope_unverified");
+        assert!(error.message.contains("Only a new launch"));
         assert!(
-            error.message.contains("profile.store"),
-            "rebinding path missing: {}",
-            error.message
+            error
+                .message
+                .contains("retained session remains ineligible")
         );
+        assert!(!error.message.contains("profile.store"));
         std::fs::remove_dir_all(&base).ok();
     }
 
