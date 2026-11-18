@@ -3,7 +3,8 @@ use crate::{
     native::{
         AuthSetup, AuthTransfer, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider,
         OpenCodeHttp, OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
-        models::{MAX_MODEL_ID_BYTES, run_model_metadata, run_models},
+        models::{MAX_MODEL_ID_BYTES, ReaderContext, run_model_metadata, run_models},
+        server::provider_config,
         transfer_selected_integration,
         types::{
             ConfigEntry, ConfigMcpServer, InboxUser, McpServerReadback, ModelRef, NativeModelEntry,
@@ -15,7 +16,7 @@ use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Resu
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
-    protocol::{ModelListParams, ModelListPart},
+    protocol::{AgentModelsParams, ModelListParams, ModelListPart},
     session::{
         ResumeSubject, TargetEnvironment, decode, known_command, native_no_write, not_initialized,
         optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
@@ -29,7 +30,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 use tokio::{
     sync::mpsc,
@@ -457,6 +457,10 @@ struct SnapshotRequest {
     session_id: String,
 }
 
+fn is_preemptible_read(method: &str) -> bool {
+    matches!(method, "agent.snapshot" | "agent.models")
+}
+
 pub(crate) async fn run() -> Result<()> {
     let mut peer = Peer::stdio();
     let client = peer.client();
@@ -505,7 +509,7 @@ pub(crate) async fn run() -> Result<()> {
             break;
         };
         let is_shutdown = request.method == "shutdown";
-        let result = if request.method == "agent.snapshot" {
+        let result = if is_preemptible_read(&request.method) {
             match eliot_plugin::preemptible_snapshot(
                 &mut requests,
                 plugin.dispatch(&request, &client),
@@ -519,7 +523,7 @@ pub(crate) async fn run() -> Result<()> {
                             request.id.clone(),
                             Err(Error::new(
                                 "busy",
-                                "status snapshot was preempted by a host request",
+                                format!("{} read was preempted by a host request", request.method),
                             )),
                             Instant::now() + RPC_TIMEOUT,
                         )
@@ -572,6 +576,7 @@ impl OpenCodePlugin {
             "quota.read" => crate::quota::read(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => self.command(&request.params).await,
+            "agent.models" => self.session_models(&request.params).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
             "agent.stop" => self.stop(&request.params).await,
             "shutdown" => self.shutdown().await,
@@ -702,23 +707,97 @@ impl OpenCodePlugin {
                     "OpenCode model.list requires a discovered native cmd",
                 )
             })?;
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("OpenCode"))?;
+        let base =
+            Path::new(&initialized.instance_dir).join(eliot_plugin::protocol::MODEL_READER_DIR);
+        if !base.is_dir() {
+            return Err(Error::new(
+                "native_spawn",
+                "OpenCode model reader has no host-owned directory",
+            ));
+        }
+        let workspace = params
+            .workspace
+            .as_deref()
+            .map_or(base.as_path(), Path::new);
+        let program = OsStr::new(program);
+        let TargetEnvironment {
+            variables: environment,
+            ..
+        } = target_environment(
+            params.target_environment.as_ref(),
+            snapshot.get("pass_env"),
+            "OpenCode",
+        )?;
+        let profile = snapshot
+            .as_object()
+            .expect("harness already proved the profile is an object");
+        let model = optional_profile_text(profile, "model", "OpenCode")?;
+        let model_ref = model.as_deref().and_then(split_model);
+        let local = start_local_provider(profile, model_ref.as_ref())?;
         let until = Instant::now() + RPC_TIMEOUT;
-        // One catalogue per Agent route: when the frozen snapshot names
-        // the auth integration the session would transfer, the reader
-        // runs under that same isolated config and frozen auth, so the
-        // picker lists exactly what the live session accepts. Otherwise
-        // the reader inherits the canonical stores and says so.
-        let isolation =
-            Self::isolate_catalog_reader(snapshot, std::ffi::OsStr::new(program), until).await?;
-        let xdg = isolation.xdg();
-        let provenance = isolation.provenance();
+        let config_home = base.join("config");
+        let data_home = base.join("data");
+        let auth = if local.is_some() || profile.get("auth_integration").is_some() {
+            start_auth_selector(profile, local.is_some())?
+        } else {
+            None
+        };
+        let isolated = auth.is_some() || local.is_some();
+        if isolated {
+            let empty_config = base.join("auth-config");
+            let config_dir = config_home.join("opencode");
+            for dir in [&empty_config, &config_dir, &data_home] {
+                std::fs::create_dir_all(dir).map_err(|_| {
+                    Error::new(
+                        "native_spawn",
+                        "OpenCode model reader could not prepare its private stores",
+                    )
+                })?;
+            }
+            std::fs::write(
+                config_dir.join("opencode.jsonc"),
+                provider_config(model.as_deref(), local.as_ref()).to_string(),
+            )
+            .map_err(|_| {
+                Error::new(
+                    "native_spawn",
+                    "OpenCode model reader could not write its provider config",
+                )
+            })?;
+            if let Some(selector) = auth.as_ref() {
+                transfer_selected_integration(
+                    &AuthTransfer {
+                        program,
+                        selector,
+                        workspace,
+                        export_environment: &[],
+                        canonical_config_home: &empty_config,
+                        import_environment: &environment,
+                        isolated_config_home: &config_home,
+                        isolated_data_home: &data_home,
+                        reuse_existing: false,
+                    },
+                    until,
+                )
+                .await?;
+            }
+        }
+        let context = ReaderContext {
+            workspace,
+            environment: &environment,
+            xdg: isolated.then_some((config_home.as_path(), data_home.as_path())),
+        };
         let models: Vec<Value> = match params.part {
-            ModelListPart::Models => run_models(std::ffi::OsStr::new(program), until, xdg)
+            ModelListPart::Models => run_models(program, until, &context)
                 .await?
                 .into_iter()
                 .map(|id| json!({"id": id, "default": false}))
                 .collect(),
-            ModelListPart::Variants => run_model_metadata(std::ffi::OsStr::new(program), until, xdg)
+            ModelListPart::Variants => run_model_metadata(program, until, &context)
                 .await?
                 .into_iter()
                 .map(|entry| {
@@ -726,81 +805,8 @@ impl OpenCodePlugin {
                 })
                 .collect(),
         };
+        let provenance = if isolated { "preview" } else { "canonical" };
         Ok(json!({"models": models, "default": Value::Null, "provenance": provenance}))
-    }
-
-    /// The frozen auth integration selecting the isolated reader, if
-    /// any: the non-empty `auth_integration` the session would transfer.
-    fn catalog_auth_selector(snapshot: &Value) -> Option<String> {
-        snapshot
-            .get("auth_integration")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|selector| !selector.is_empty())
-            .map(str::to_owned)
-    }
-
-    /// Isolate one `model.list` read under the frozen auth the session
-    /// would get: ephemeral per-call XDG roots receive the selected
-    /// canonical credential through the same opaque transfer the
-    /// pre-serve hook uses, then both catalogue readers run under those
-    /// roots. Without a frozen selector the read inherits the canonical
-    /// stores. The temp base is removed when the read ends, whatever the
-    /// outcome; an unproven transfer fails the read instead of guessing.
-    async fn isolate_catalog_reader(
-        snapshot: &Value,
-        program: &OsStr,
-        deadline: Instant,
-    ) -> Result<CatalogIsolation> {
-        let Some(selector) = Self::catalog_auth_selector(snapshot) else {
-            return Ok(CatalogIsolation::canonical());
-        };
-        let selector = IntegrationSelector::new(&selector).map_err(|_| {
-            Error::new(
-                "profile_error",
-                "OpenCode model.list auth integration selector is invalid",
-            )
-        })?;
-        let seq = CATALOG_ISOLATION_SEQ.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0);
-        let base = std::env::temp_dir().join(format!(
-            "eliot-opencode-catalog-{}-{seq}-{nanos}",
-            std::process::id()
-        ));
-        let empty_config = base.join("empty-config");
-        let config_home = base.join("config");
-        let data_home = base.join("data");
-        for dir in [&base, &empty_config, &config_home, &data_home] {
-            std::fs::create_dir_all(dir).map_err(|_| {
-                Error::new(
-                    "native_spawn",
-                    "OpenCode model.list isolated reader store could not start",
-                )
-            })?;
-        }
-        let transfer = AuthTransfer {
-            program,
-            selector: &selector,
-            workspace: &base,
-            export_environment: &[],
-            canonical_config_home: &empty_config,
-            import_environment: &[],
-            isolated_config_home: &config_home,
-            isolated_data_home: &data_home,
-            reuse_existing: false,
-        };
-        if let Err(error) = transfer_selected_integration(&transfer, deadline).await {
-            let _ = std::fs::remove_dir_all(&base);
-            return Err(error);
-        }
-        Ok(CatalogIsolation {
-            temp_base: Some(base),
-            config_home: Some(config_home),
-            data_home: Some(data_home),
-        })
     }
 
     /// Retain a proven-no-effect start failure and build its failed-state
@@ -959,18 +965,7 @@ impl OpenCodePlugin {
         // A local-backend profile always carries an explicit model (the
         // eliot-local segment): local fields without a model fail closed
         // instead of falling back to the native default.
-        let local = match model_ref.as_ref() {
-            Some(model_ref) => parse_local_provider(profile, model_ref)?,
-            None => {
-                if has_local_fields(profile) {
-                    return Err(Error::new(
-                        "profile_error",
-                        "OpenCode local backend requires an explicit model with the dedicated eliot-local provider segment",
-                    ));
-                }
-                None
-            }
-        };
+        let local = start_local_provider(profile, model_ref.as_ref())?;
         let auth_selector = start_auth_selector(profile, local.is_some())?;
         let (workspace, program) = start_paths(profile, &params)?;
         let TargetEnvironment {
@@ -1259,8 +1254,8 @@ impl OpenCodePlugin {
 
     /// Start phase 4, create: open the native session and verify its
     /// effective model and directory against the frozen profile. A readback
-    /// mismatch best-effort deletes the created session and surfaces the
-    /// kill result; no session is kept.
+    /// failure settles only after proving deletion of the created session;
+    /// otherwise the exact session and server remain available as unknown.
     ///
     /// Adopted local path: the provider, catalogue, limits and backend
     /// inventory verification runs BEFORE `POST /api/session` creates any
@@ -1405,6 +1400,27 @@ impl OpenCodePlugin {
         let deny_native_subagents = parsed.native_subagents.as_deref() == Some("deny");
         let deny_permissions = deny_native_subagents.then(Self::subagent_deny_permissions);
         let cutoff = create_cutoff(envelope);
+        // The location default is only a preview. Look it up before create,
+        // and only when there is spare time ahead of the create request's
+        // full RPC budget. Do not spend verification or cleanup time on it.
+        let mut native_default_model = None;
+        if parsed.requested_model.is_none()
+            && let Some(preview_cutoff) = cutoff.checked_sub(RPC_TIMEOUT)
+            && Instant::now() < preview_cutoff
+            && let Ok(Some(default)) = session
+                .http
+                .default_model(phase_deadline(
+                    preview_cutoff,
+                    std::time::Duration::from_secs(5),
+                ))
+                .await
+            && let (Some(provider), Some(id)) = (default.provider_id, default.id)
+        {
+            let label = format!("{provider}/{id}");
+            if split_catalogue_model(&label) == Some((provider.as_str(), id.as_str())) {
+                native_default_model = Some(label);
+            }
+        }
         let create_timing = crate::native::startup::Step::new("session_create");
         let created = match session
             .http
@@ -1463,8 +1479,7 @@ impl OpenCodePlugin {
         drop(create_timing);
         session.session_id = Some(created.id.clone());
         // Effective readback before readiness: the create response states the
-        // exact model and location; on any mismatch no `session.ready` is
-        // published and no session is kept.
+        // exact model and location; a mismatch prevents `session.ready`.
         let effective_model = created
             .model
             .as_ref()
@@ -1472,12 +1487,8 @@ impl OpenCodePlugin {
         // An omitted request accepts the configured native default as
         // effective; an explicit request must match exactly. A requested
         // effort must echo as the native variant.
-        let model_verified = parsed.requested_model.as_deref().is_none_or(|requested| {
-            created
-                .model
-                .as_ref()
-                .is_some_and(|model| model_ref_is(requested, model))
-        });
+        let (model_verified, model_source) =
+            launch_model_readback(parsed.requested_model.as_deref(), created.model.as_ref());
         let effective_variant = created
             .model
             .as_ref()
@@ -1504,11 +1515,17 @@ impl OpenCodePlugin {
         let mut effective = json!({
             "model": effective_model.clone(),
             "model_verified": model_verified,
+            "model_source": model_source,
             "model_variant": effective_variant.clone(),
             "effort": effective_variant,
             "effort_verified": effort_verified,
             "cwd": created.location.as_ref().map(|location| location.directory.clone()),
         });
+        if created.model.is_none()
+            && let Some(default) = native_default_model
+        {
+            effective["native_default_model"] = json!(default);
+        }
         // The adopted provider fragment was proven before the session
         // existed; merge it into the effective readback here. Post-create
         // failures below keep their historical settlement: the create may
@@ -1610,11 +1627,9 @@ impl OpenCodePlugin {
         // never inherits an expired deadline. A missing or unreadable denial
         // goes to cleanup before hooks bind: a proved removal fails the
         // start (an installed version that cannot store the ruleset can
-        // never serve a `deny` profile), while an unproved removal commits
-        // the exact native identity as an unresolved start fact and retains
-        // it as unknown with the live server instead of stopping it while
-        // the stable store silently retains the session. The same readback
-        // sets the verification flag.
+        // never serve a `deny` profile), while an unproved removal keeps the
+        // exact native identity in memory as unknown with the live server.
+        // The same readback sets the verification flag.
         let subagents_verified = if deny_native_subagents {
             match Self::readback_subagent_deny(
                 &session.http,
@@ -1673,20 +1688,20 @@ impl OpenCodePlugin {
         } else {
             with_context_points(effective, &[InjectPoint::NextInput])
         };
-        if !model_verified || !effort_verified || !location_ok || !subagents_verified {
-            return Err(
-                self.fail_created_start(
+        if (parsed.requested_model.is_some() && !model_verified) || !effort_verified || !location_ok
+        {
+            return Err(self
+                .fail_created_start(
                     &parsed.params,
                     session,
                     &created.id,
                     Error::new(
                         "profile_error",
-                        "OpenCode effective model, effort, session directory or subagent denial did not match the frozen profile",
+                        "OpenCode effective model, effort or session directory did not match the frozen profile",
                     ),
                     envelope,
                 )
-                .await,
-            );
+                .await);
         }
         Ok(CreateOutcome::Created(
             Box::new(session),
@@ -2774,7 +2789,6 @@ impl OpenCodePlugin {
             "configure" => self.configure_command(params).await,
             "steer" => self.steer_command(params).await,
             "interrupt" => self.interrupt_command(params).await,
-            "models" => self.session_models(params).await,
             "approve" | "deny" | "answer" => self.reply_command(params).await,
             _ => Err(Error::new(
                 "unsupported",
@@ -2786,10 +2800,9 @@ impl OpenCodePlugin {
     /// Read-only live model catalogue for the owned session: the exact
     /// `GET /api/model` set the start, resume and configure gates admit
     /// against, so an Agent-scoped `harness.models` read lists precisely
-    /// what this session accepts. Provenance `session`. No session, a
-    /// failed start, or a not-ready session is `bad_state`: the caller
-    /// falls back to the isolated reader instead of inventing a list.
-    async fn session_models(&self, params: AgentCommandParams) -> Result<Value> {
+    /// what this session accepts. A missing or unready session is `bad_state`.
+    async fn session_models(&self, raw: &Value) -> Result<Value> {
+        let params: AgentModelsParams = decode(raw, "OpenCode agent.models params are invalid")?;
         let session = self.session.as_ref().ok_or_else(|| {
             Error::new(
                 "bad_state",
@@ -2814,9 +2827,12 @@ impl OpenCodePlugin {
         }
         let catalogue = session
             .http
-            .list_native_models(Instant::now() + RPC_TIMEOUT)
+            .list_native_models(Instant::now() + std::time::Duration::from_secs(5))
             .await?;
-        Ok(session_catalog_json(&catalogue))
+        let mut result = session_catalog_json(&catalogue);
+        result["agent_id"] = json!(session.agent_id);
+        result["generation"] = json!(session.generation);
+        Ok(result)
     }
 
     /// Native `configure`: switch the retained session's model and/or
@@ -4085,6 +4101,22 @@ fn has_local_fields(profile: &serde_json::Map<String, Value>) -> bool {
 /// `api_key_env` reference (absent means explicit no-auth mode). Key values
 /// stay runtime-only; only the env name is frozen. Any local field without
 /// the full set fails closed instead of falling back to another auth mode.
+fn start_local_provider(
+    profile: &serde_json::Map<String, Value>,
+    model_ref: Option<&ModelRef>,
+) -> Result<Option<LocalProvider>> {
+    if let Some(model_ref) = model_ref {
+        return parse_local_provider(profile, model_ref);
+    }
+    if has_local_fields(profile) {
+        return Err(Error::new(
+            "profile_error",
+            "OpenCode local backend requires an explicit model with the dedicated eliot-local provider segment",
+        ));
+    }
+    Ok(None)
+}
+
 fn parse_local_provider(
     profile: &serde_json::Map<String, Value>,
     model_ref: &ModelRef,
@@ -4785,7 +4817,7 @@ fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
                 .ok_or_else(|| {
                     Error::new("invalid", "OpenCode configure requires a non-empty model")
                 })?;
-            split_model(model).ok_or_else(|| {
+            split_catalogue_model(model).ok_or_else(|| {
                 Error::new(
                     "invalid",
                     "OpenCode configure model must be provider/model with non-empty slash segments and no variant suffix",
@@ -4800,7 +4832,17 @@ fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
             let text = value.as_str().ok_or_else(|| {
                 Error::new("invalid", "OpenCode configure effort must be a string")
             })?;
-            checked_effort(Some(text), "invalid")?
+            if text.is_empty() {
+                None
+            } else {
+                if !valid_catalogue_variant(text) {
+                    return Err(Error::new(
+                        "invalid",
+                        "OpenCode configure effort must be an exact variant id",
+                    ));
+                }
+                Some(text.to_owned())
+            }
         }
     };
     if model.is_none() && effort.is_none() {
@@ -4812,113 +4854,30 @@ fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
     Ok(ConfigureModelRequest { model, effort })
 }
 
-/// The live native catalogue row for one exact native provider/model pair:
-/// the entry's provider AND model id must both match, compared as
-/// independent fields exactly as the installed resolver does
-/// (`model.providerID === ref.providerID && model.id === ref.id` in
-/// `packages/core/src/session/runner/model.ts`). Never join the pair into
-/// a `provider/model` display string first: re-splitting joins at the
-/// first slash, so a slash in the native provider ID would compare against
-/// another provider instead of matching. No trimming: a native id carrying
-/// whitespace never equals the frozen pair, and identical model ids under
-/// different providers never substitute for each other. The installed
-/// server echoes even bogus switches, so this row (read before any write)
-/// is what fails an unknown model honestly.
-/// Reader isolation for one `model.list` call: ephemeral per-call XDG
-/// roots holding the frozen auth transfer (`isolated`), or the inherited
-/// canonical stores (`canonical`). The temp base is removed when the read
-/// ends, whatever the outcome.
-struct CatalogIsolation {
-    temp_base: Option<PathBuf>,
-    config_home: Option<PathBuf>,
-    data_home: Option<PathBuf>,
-}
-
-impl CatalogIsolation {
-    fn canonical() -> Self {
-        Self {
-            temp_base: None,
-            config_home: None,
-            data_home: None,
-        }
-    }
-
-    fn provenance(&self) -> &'static str {
-        if self.temp_base.is_some() {
-            "isolated"
-        } else {
-            "canonical"
-        }
-    }
-
-    fn xdg(&self) -> Option<(&Path, &Path)> {
-        match (&self.config_home, &self.data_home) {
-            (Some(config), Some(data)) => Some((config.as_path(), data.as_path())),
-            _ => None,
-        }
-    }
-}
-
-impl Drop for CatalogIsolation {
-    fn drop(&mut self) {
-        if let Some(base) = self.temp_base.take() {
-            let _ = std::fs::remove_dir_all(base);
-        }
-    }
-}
-
-/// Per-call reader sequence for unique ephemeral catalogue roots.
-static CATALOG_ISOLATION_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// Live `GET /api/model` entries in `model.list` response shape with
 /// `session` provenance. Entries without a usable provider/model pair
 /// are skipped, never guessed; the endpoint names no default.
 fn session_catalog_json(catalogue: &[NativeModelEntry]) -> Value {
+    let mut ids = HashSet::new();
     let models: Vec<Value> = catalogue
         .iter()
         .filter_map(|entry| {
-            let provider = entry
-                .provider_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|provider| {
-                    !provider.is_empty()
-                        && provider.len() <= MAX_MODEL_ID_BYTES
-                        && !provider
-                            .chars()
-                            .any(|c| c.is_control() || c.is_whitespace())
-                })?;
-            let id = entry.id.as_deref().map(str::trim).filter(|id| {
-                !id.is_empty()
-                    && id.len() <= MAX_MODEL_ID_BYTES
-                    && !id.chars().any(|c| c.is_control() || c.is_whitespace())
-            })?;
-            if provider.len() + id.len() + 1 > MAX_MODEL_ID_BYTES {
+            let provider = entry.provider_id.as_deref()?;
+            let native_id = entry.id.as_deref()?;
+            let id = format!("{provider}/{native_id}");
+            if split_catalogue_model(&id)? != (provider, native_id)
+                || !ids.insert((provider, native_id))
+            {
                 return None;
             }
-            let efforts = entry.variants.as_ref().map(|variants| {
-                let mut ids = Vec::with_capacity(variants.len());
-                for variant in variants {
-                    let Some(variant) = variant.id.as_deref().map(str::trim).filter(|variant| {
-                        !variant.is_empty()
-                            && variant.len() <= 128
-                            && !variant.chars().any(|c| c.is_control() || c.is_whitespace())
-                    }) else {
-                        continue;
-                    };
-                    if !ids.iter().any(|known: &String| known == variant) {
-                        ids.push(variant.to_owned());
-                    }
-                }
-                ids
-            });
+            let efforts = catalogue_entry_variants(entry);
             let display_name = entry
                 .name
                 .as_deref()
                 .and_then(eliot_core::api::harness::native_model_display_name)
                 .map(str::to_owned);
             Some(json!({
-                "id": format!("{provider}/{id}"),
+                "id": id,
                 "default": false,
                 "efforts": efforts,
                 "display_name": display_name,
@@ -4950,8 +4909,15 @@ fn catalogue_entry<'a>(
     catalogue: &'a [NativeModelEntry],
     requested: &str,
 ) -> Option<&'a NativeModelEntry> {
-    let (provider, id) = split_provider_model(requested)?;
+    let (provider, id) = split_catalogue_model(requested)?;
     catalogue_entry_for(catalogue, provider, id)
+}
+
+fn split_catalogue_model(model: &str) -> Option<(&str, &str)> {
+    if model.len() > MAX_MODEL_ID_BYTES {
+        return None;
+    }
+    split_provider_model(model)
 }
 
 /// Whether an installed `Model.Ref` names exactly the requested
@@ -4960,6 +4926,21 @@ fn catalogue_entry<'a>(
 fn model_ref_is(requested: &str, model: &ModelRef) -> bool {
     split_provider_model(requested)
         .is_some_and(|(provider, id)| model.provider_id == provider && model.id == id)
+}
+
+/// Verification describes the session's selected identity. Inference
+/// availability is learned only from a turn using that identity.
+fn launch_model_readback(
+    requested: Option<&str>,
+    selected: Option<&ModelRef>,
+) -> (bool, &'static str) {
+    match requested {
+        Some(requested) => (
+            selected.is_some_and(|model| model_ref_is(requested, model)),
+            "requested",
+        ),
+        None => (selected.is_some(), "native_default"),
+    }
 }
 
 /// Whether an installed `Model.Ref` is exactly the switch target: both
@@ -5013,14 +4994,7 @@ fn catalogue_variants_for(
     provider_id: &str,
     id: &str,
 ) -> Option<Vec<String>> {
-    catalogue_entry_for(catalogue, provider_id, id).and_then(|entry| {
-        entry.variants.as_ref().map(|variants| {
-            variants
-                .iter()
-                .filter_map(|variant| variant.id.clone())
-                .collect()
-        })
-    })
+    catalogue_entry_for(catalogue, provider_id, id).and_then(catalogue_entry_variants)
 }
 
 /// The live native catalogue's selectable variant ids for one exact
@@ -5028,14 +5002,24 @@ fn catalogue_variants_for(
 /// the entry is absent or reports no variants member: unknown, never an
 /// empty wardrobe.
 fn catalogue_variants(catalogue: &[NativeModelEntry], requested: &str) -> Option<Vec<String>> {
-    catalogue_entry(catalogue, requested).and_then(|entry| {
-        entry.variants.as_ref().map(|variants| {
-            variants
-                .iter()
-                .filter_map(|variant| variant.id.clone())
-                .collect()
-        })
+    catalogue_entry(catalogue, requested).and_then(catalogue_entry_variants)
+}
+
+fn catalogue_entry_variants(entry: &NativeModelEntry) -> Option<Vec<String>> {
+    entry.variants.as_ref().map(|variants| {
+        let mut seen = HashSet::new();
+        variants
+            .iter()
+            .filter_map(|variant| {
+                let id = variant.id.as_deref()?;
+                (valid_catalogue_variant(id) && seen.insert(id)).then(|| id.to_owned())
+            })
+            .collect()
     })
+}
+
+fn valid_catalogue_variant(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && !id.chars().any(|ch| ch.is_control() || ch.is_whitespace())
 }
 
 /// A frozen effort value: the trimmed string, non-empty, at most 128
@@ -5389,6 +5373,7 @@ fn opencode_manifest() -> PluginManifest {
             "resume".to_owned(),
             "send".to_owned(),
             "configure".to_owned(),
+            "models".to_owned(),
             "steer".to_owned(),
             "interrupt".to_owned(),
             "approve".to_owned(),
@@ -5442,32 +5427,16 @@ mod tests {
     }
 
     #[test]
-    fn catalog_reader_uses_frozen_auth_selector_only() {
-        assert_eq!(
-            super::OpenCodePlugin::catalog_auth_selector(
-                &json!({"auth_integration": "opencode-go"})
-            ),
-            Some("opencode-go".to_owned())
-        );
-        assert_eq!(
-            super::OpenCodePlugin::catalog_auth_selector(&json!({"auth_integration": "  "})),
-            None
-        );
-        assert_eq!(
-            super::OpenCodePlugin::catalog_auth_selector(&json!({})),
-            None
-        );
-    }
-
-    #[test]
     fn session_catalog_matches_configure_identity_rules() {
         let live: Vec<NativeModelEntry> = serde_json::from_value(json!([
             {"providerID": "opencode", "id": "deepseek-v4.1-flash-free",
              "name": "DeepSeek V4.1 Flash Free",
-             "variants": [{"id": "low"}, {"id": "low"}, {"id": "has space"}, {"id": ""}]},
+             "variants": [{"id": "low"}, {"id": "low"}, {"id": "has space"}, {"id": " low"}, {"id": ""}]},
             {"providerID": "openrouter", "id": "meta/muse-spark-open",
              "name": "Muse Spark Open"},
             {"providerID": "opencode-go", "id": "  ", "name": "Blank"},
+            {"providerID": "opencode ", "id": "padded", "name": "Padded"},
+            {"providerID": "openrouter/meta", "id": "muse-spark-open", "variants": [{"id": "wrong"}]},
             {"providerID": "bad provider", "id": "m", "name": "Space"},
             {"id": "no-provider", "name": "Missing"},
         ]))
@@ -5499,6 +5468,59 @@ mod tests {
             Some("openrouter/meta/muse-spark-open")
         );
         assert!(models[1].get("efforts").unwrap().is_null());
+        assert!(catalogue_contains(&live, "openrouter/meta/muse-spark-open"));
+        assert!(!catalogue_contains(&live, "opencode/padded"));
+        assert_eq!(
+            catalogue_variants(&live, "opencode/deepseek-v4.1-flash-free"),
+            Some(vec!["low".to_owned()])
+        );
+        assert!(parse_configure_model(&json!({"effort": " low"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_preempts_a_stalled_agent_models_read() {
+        assert!(super::is_preemptible_read("agent.models"));
+        let (sender, mut requests) = tokio::sync::mpsc::channel(1);
+        let read = async {
+            let interrupt = eliot_plugin::RpcRequest {
+                jsonrpc: "2.0".into(),
+                id: json!(2),
+                method: "agent.command".into(),
+                params: json!({"verb": "interrupt"}),
+            };
+            assert!(
+                sender.try_send(interrupt).is_ok(),
+                "enqueue interrupt during GET"
+            );
+            std::future::pending::<()>().await
+        };
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            eliot_plugin::preemptible_snapshot(&mut requests, read),
+        )
+        .await
+        .unwrap();
+        let eliot_plugin::SnapshotDispatch::Preempted(Some(interrupt)) = settled else {
+            panic!("interrupt must preempt the read");
+        };
+        assert_eq!(interrupt.params["verb"], "interrupt");
+    }
+
+    #[test]
+    fn absent_default_echo_is_unverified_without_substituting_a_model() {
+        let selected = split_model("opencode-go/iceman-contributor-free").unwrap();
+        assert_eq!(
+            super::launch_model_readback(None, None),
+            (false, "native_default")
+        );
+        assert_eq!(
+            super::launch_model_readback(None, Some(&selected)),
+            (true, "native_default")
+        );
+        assert_eq!(
+            super::launch_model_readback(Some("opencode/other"), Some(&selected)),
+            (false, "requested")
+        );
     }
 
     #[test]
@@ -6016,6 +6038,7 @@ mod tests {
                 "resume",
                 "send",
                 "configure",
+                "models",
                 "steer",
                 "interrupt",
                 "approve",

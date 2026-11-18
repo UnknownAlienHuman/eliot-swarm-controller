@@ -374,22 +374,33 @@ and waits for its Job family to empty (terminating a remaining server tail withi
 the bounded close budget) before starting the next command or returning a catalogue.
 Unconfirmed family closure returns `unknown`, including for the optional variants
 read; a failed variants read degrades to ids only after confirmed cleanup.
-When the frozen snapshot names an `auth_integration`, both catalogue commands run
-under ephemeral per-call XDG roots holding that same frozen auth (transferred the
-way the pre-serve hook transfers it), so the read lists exactly the providers the
-session would accept; the response provenance says `isolated`. Without a frozen
-selector (ad-hoc catalogue reads) they inherit the reader's environment and the
-canonical native configuration/auth stores and say `canonical`: a later launch
-under frozen auth may accept fewer models. An Agent-scoped read (`harness.models`
-with `agent`) prefers the live session's own `GET /api/model` set (`session`
-provenance) -- the exact set the start, resume and configure gates admit against --
-and falls back to the isolated reader when the session is not ready. Catalogue
-reads create no session and, outside the isolated transfer, import or modify no
-credentials.
-A launch resolves
-the full provider/model pair, an omitted model leaves the configured native
-default, read back from the session echo. A stored profile may also carry
-`effort`, frozen the same way.
+With a named profile, both reads use the same generated provider configuration,
+target environment and selected auth as launch, including the dedicated local
+provider for an adopted backend. Pass `--workspace` to read in the intended launch
+directory. These results are previews, since the prospective launch's workspace
+and live provider state can differ. An unscoped read uses the canonical native
+configuration and is also a preview. Each reader's isolated credential store
+lives under its private host-owned instance directory. The host verifies removal
+after process-family closure on success, timeout and cancellation. Unconfirmed
+removal returns `unknown`.
+
+`swarm models --harness opencode --agent <id>` reads the owned generation's
+`GET /api/model` through `agent.models`. It applies the same exact model and
+variant identity rules as configure. Missing or unready sessions and failed
+or preempted reads return errors. The desktop fetches this catalogue whenever
+the Agent picker opens. This read performs no inference.
+
+Omitting the model leaves selection to OpenCode. The launch reports
+`model_source: native_default` and verifies the selected identity only when
+the session echoes one. Otherwise `native_default_model` reports the location
+default from `GET /api/model/default` when available. This optional preview
+runs before create when time remains ahead of the create request's RPC budget.
+The native inference step supplies the model that actually ran. Catalogue
+membership and a verified session selection do not establish provider inference
+access. Failed turns retain the native
+error message and the effective model where known. The chat's **Pick another
+model** action opens the Agent's live picker without retrying the failed input.
+
 ## Agent skill delivery (`eliot-swarm`)
 
 At spawn, the plugin copies the daemon-materialized canonical skill files

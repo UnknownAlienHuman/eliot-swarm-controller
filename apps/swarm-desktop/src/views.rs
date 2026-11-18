@@ -173,6 +173,7 @@ pub struct RowCallbacks {
     pub workspace: String,
     /// Retry a local input that did not start (the failure part's key).
     pub retry: Callback<String>,
+    pub pick_model: Option<Callback<()>>,
     pub copy_code: Callback<(String, usize)>,
     pub toggle_tools: Callback<(String, bool)>,
 }
@@ -393,8 +394,8 @@ fn part_view(
         )),
         // A start that did not happen: why (`swarm why`), its origin, and
         // Retry when the failure is definite.
-        PartKind::Failed | PartKind::Unconfirmed => {
-            let retry: View = if part.kind == PartKind::Failed {
+        PartKind::Failed | PartKind::TurnFailed | PartKind::Unconfirmed => {
+            let action: View = if part.kind == PartKind::Failed {
                 let retry = callbacks.retry.clone();
                 let key = part.key.clone();
                 crate::m3::outlined(palette)
@@ -404,6 +405,16 @@ fn part_view(
                         let _ = retry.call(key.clone());
                     })
                     .content(crate::m3::label("Retry"))
+            } else if let (PartKind::TurnFailed, Some(pick_model)) =
+                (part.kind, callbacks.pick_model.clone())
+            {
+                crate::m3::outlined(palette)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .automation_name("Pick another model")
+                    .on_click(move || {
+                        let _ = pick_model.call(());
+                    })
+                    .content(crate::m3::label("Pick another model"))
             } else {
                 View::empty()
             };
@@ -415,7 +426,7 @@ fn part_view(
                     .is_text_selection_enabled(true)
                     .foreground(palette.error()),
                 label(&part.detail.join(" · ")),
-                retry,
+                action,
             ))
         }
         PartKind::Notice => TextBlock::new()

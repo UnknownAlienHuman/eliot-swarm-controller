@@ -80,6 +80,16 @@ impl DesktopApp {
                 Message::Chat(ChatMsg::CopyCode(key, index))
             }),
             retry: context.callback(|key| Message::Chat(ChatMsg::RetryInput(key))),
+            pick_model: self
+                .chat
+                .detail
+                .as_ref()
+                .filter(|detail| {
+                    eliot_core::api::ConfigureSupport::for_harness(&detail.harness)
+                        .model_refusal
+                        .is_none()
+                })
+                .map(|_| context.callback(|()| Message::Launch(LaunchMsg::OpenModel))),
             toggle_tools: context.callback(|(key, expanded): (String, bool)| {
                 Message::Chat(ChatMsg::ToolsToggled(key, expanded))
             }),

@@ -237,6 +237,7 @@ impl PluginHost {
         &self,
         profile: Value,
         environment: Value,
+        workspace: Option<String>,
         deadline: Instant,
     ) -> Result<Value> {
         if !profile
@@ -249,17 +250,50 @@ impl PluginHost {
                 "harness.models needs a codex, muse, opencode or antigravity profile",
             ));
         }
+        let workspace = if let Some(workspace) = workspace {
+            let workspace = crate::adhoc::blocking_discovery(deadline.into(), move || {
+                let path = std::path::Path::new(&workspace);
+                if !path.is_absolute() || !path.is_dir() {
+                    return Err(Error::new(
+                        "invalid",
+                        "model preview workspace must be an existing absolute directory",
+                    ));
+                }
+                Ok(workspace)
+            })
+            .await??;
+            Some(workspace)
+        } else {
+            None
+        };
+        let request = ModelListParams {
+            target_environment: Some(environment),
+            profile,
+            workspace,
+            part: ModelListPart::Models,
+        };
         let slot = tokio::time::timeout_at(deadline, self.discovery_slot())
             .await
             .map_err(|_| crate::adhoc::discovery_timeout())??;
         let until = deadline.min(Instant::now() + READER_DEADLINE);
         let (id, stop_rx, done_tx) = self.register_metadata_reader_slot(slot)?;
         let host = self.clone();
-        let (reply, response) = tokio::sync::oneshot::channel();
+        let stop_tx = self.state.readers.lock_recover()[&id].stop.clone();
+        let (mut reply, response) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let completion = host
-                .read_model_catalogue(profile, environment, stop_rx, until)
-                .await;
+            let read = host.read_model_catalogue(request, stop_rx, until);
+            tokio::pin!(read);
+            let completion = tokio::select! {
+                completion = &mut read => completion,
+                _ = reply.closed() => {
+                    stop_tx.send_if_modified(|stop| {
+                        if stop.is_some() { return false; }
+                        *stop = Some(Instant::now() + READER_CLOSE_BUDGET);
+                        true
+                    });
+                    read.await
+                }
+            };
             host.finish_metadata_reader(&id, done_tx, completion.cleanup);
             let _ = reply.send(completion.result);
         });
@@ -552,30 +586,22 @@ impl PluginHost {
 
     async fn read_model_catalogue(
         &self,
-        profile: Value,
-        environment: Value,
+        mut request: ModelListParams,
         stop: watch::Receiver<Option<Instant>>,
         until: Instant,
     ) -> MetadataRead<Value> {
         // OpenCode's two CLI operations must never share a reader lifetime:
         // closing the first Job proves its standalone server is gone before
         // starting the metadata command. Retain one admission slot throughout.
-        let opencode = profile["harness"] == "opencode";
+        let opencode = request.profile["harness"] == "opencode";
         let mut catalogue = self
-            .read_model_catalogue_part(
-                profile.clone(),
-                environment.clone(),
-                stop.clone(),
-                ModelListPart::Models,
-                until,
-            )
+            .read_model_catalogue_part(request.clone(), stop.clone(), until)
             .await;
         if !opencode || catalogue.result.is_err() || catalogue.cleanup != ReaderCleanup::Confirmed {
             return catalogue;
         }
-        let metadata = self
-            .read_model_catalogue_part(profile, environment, stop, ModelListPart::Variants, until)
-            .await;
+        request.part = ModelListPart::Variants;
+        let metadata = self.read_model_catalogue_part(request, stop, until).await;
         // A missing optional inventory can degrade only after proven cleanup.
         // In particular a cancelled read or unknown family cannot become success.
         if metadata.cleanup != ReaderCleanup::Confirmed
@@ -594,10 +620,8 @@ impl PluginHost {
 
     async fn read_model_catalogue_part(
         &self,
-        profile: Value,
-        environment: Value,
+        request: ModelListParams,
         mut stop: watch::Receiver<Option<Instant>>,
-        part: ModelListPart,
         until: Instant,
     ) -> MetadataRead<Value> {
         if stop.borrow().is_some() {
@@ -618,6 +642,8 @@ impl PluginHost {
                 cleanup: ReaderCleanup::Confirmed,
             };
         }
+        let profile = &request.profile;
+        let environment = request.target_environment.as_ref().unwrap_or(&Value::Null);
         let Some(harness) = profile["harness"].as_str() else {
             return MetadataRead {
                 result: Err(Error::new("invalid", "missing harness")),
@@ -632,8 +658,8 @@ impl PluginHost {
                     generation: 0,
                 },
                 &harness,
-                &profile,
-                &environment,
+                profile,
+                environment,
                 None,
             )
             .await;
@@ -645,11 +671,14 @@ impl PluginHost {
         };
         let mut known: Vec<_> = self.state.secrets.lock_recover().iter().cloned().collect();
         known.extend([self.state.owner_token.clone(), reader.credential.clone()]);
-        let metadata_secrets = metadata_secret_snapshot(&profile, &environment, known);
+        let metadata_secrets = metadata_secret_snapshot(profile, environment, known);
         let read = async {
+            if harness == "opencode" {
+                reader.create_model_catalogue_dir()?;
+            }
             let manifest = reader.initialize(&harness, until).await?;
-            require_proxy_capability(&profile, &manifest)?;
-            let request = serde_json::to_value(ModelListParams { profile, part })
+            require_proxy_capability(profile, &manifest)?;
+            let request = serde_json::to_value(&request)
                 .map_err(|_| Error::new("internal", "model.list params encoding failed"))?;
             let value = reader.client.call("model.list", request, until).await?;
             if SecretPolicy::new(metadata_secrets.iter()).contains_value(&value) {
@@ -1197,10 +1226,13 @@ mod tests {
         let (_stop, stopped) = watch::channel(Some(until));
         let read = host
             .read_model_catalogue_part(
-                json!({"harness": "opencode"}),
-                json!({}),
+                ModelListParams {
+                    profile: json!({"harness": "opencode"}),
+                    target_environment: Some(json!({})),
+                    workspace: None,
+                    part: ModelListPart::Variants,
+                },
                 stopped,
-                ModelListPart::Variants,
                 until,
             )
             .await;

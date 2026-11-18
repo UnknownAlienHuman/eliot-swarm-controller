@@ -1708,7 +1708,7 @@ impl Store {
             .prepare(
                 "SELECT agent, generation, turn_id, state, status, outcome, native_status,
                         final_text, started_at, completed_at, usage, config_revision, preceded_by,
-                        resolution_source
+                        resolution_source, effective_model, native_error_message
                  FROM turns WHERE agent = ?1 AND generation = ?2
                  ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
                  LIMIT ?3",
@@ -3346,6 +3346,8 @@ struct TurnRecord {
     /// Owner provenance: 'owner' only for turns settled by an owner
     /// `turn.resolve` assertion without native terminal evidence, else NULL.
     resolution_source: Option<String>,
+    effective_model: Option<String>,
+    native_error_message: Option<String>,
 }
 
 struct SourceStateRecord {
@@ -3546,6 +3548,7 @@ struct TurnInsert<'a> {
     usage: Option<&'a str>,
     config_revision: i64,
     preceded_by: Option<&'a str>,
+    effective_model: Option<&'a str>,
 }
 
 /// One live custody owner: an Agent generation with at least one
@@ -4694,6 +4697,8 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
         config_revision: row.get(11)?,
         preceded_by: row.get(12)?,
         resolution_source: row.get(13)?,
+        effective_model: row.get(14)?,
+        native_error_message: row.get(15)?,
     })
 }
 
@@ -4733,6 +4738,8 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
         config: None,
         preceded_by: record.preceded_by.filter(|value| !value.is_empty()),
         resolution_source,
+        effective_model: record.effective_model,
+        native_error_message: record.native_error_message,
     })
 }
 
@@ -5061,7 +5068,7 @@ fn load_turn(
         .query_row(
             "SELECT agent, generation, turn_id, state, status, outcome, native_status,
                     final_text, started_at, completed_at, usage, config_revision, preceded_by,
-                    resolution_source
+                    resolution_source, effective_model, native_error_message
              FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
             params![agent, generation, turn_id],
             turn_record_from_row,
@@ -5092,8 +5099,8 @@ fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
     db!(tx.execute(
         "INSERT INTO turns(agent, generation, turn_id, state, status, outcome, native_status,
                            final_text, started_at, completed_at, usage, config_revision,
-                           preceded_by)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                           preceded_by, effective_model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             turn.agent,
             turn.generation,
@@ -5108,6 +5115,7 @@ fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
             turn.usage,
             turn.config_revision,
             turn.preceded_by,
+            turn.effective_model,
         ],
     ));
     Ok(())

@@ -192,6 +192,7 @@ impl Drop for ForceStopGuard {
 
 struct RuntimeEntry {
     sender: mpsc::Sender<RuntimeMessage>,
+    client: PluginClient,
     start_command_id: String,
     verbs: HashSet<String>,
     stderr: StderrView,
@@ -695,6 +696,7 @@ impl PluginHost {
                 actor_key.clone(),
                 RuntimeEntry {
                     sender: message_tx,
+                    client: client.clone(),
                     start_command_id: command.id.clone(),
                     verbs: ["launch", "send", "stop"]
                         .into_iter()
@@ -1102,6 +1104,55 @@ impl PluginHost {
                 id: agent.to_owned(),
                 generation,
             })
+    }
+
+    pub(crate) async fn agent_models(&self, agent_id: &str, generation: i64) -> Result<Value> {
+        let key = AgentKey {
+            id: agent_id.to_owned(),
+            generation,
+        };
+        let (client, credentials) = {
+            let running = self.state.running.lock_recover();
+            let entry = running.get(&key).ok_or_else(|| {
+                Error::new(
+                    "unavailable",
+                    "OpenCode Agent has no live plugin for this generation",
+                )
+            })?;
+            if !entry.verbs.contains("models") {
+                return Err(Error::new(
+                    "unavailable",
+                    "owned plugin has not advertised model reads",
+                ));
+            }
+            (entry.client.clone(), Arc::clone(&entry.source_credentials))
+        };
+        let params = serde_json::to_value(eliot_plugin::protocol::AgentModelsParams {
+            agent_id: key.id.clone(),
+            generation,
+        })
+        .map_err(|_| Error::new("internal", "agent.models params encoding failed"))?;
+        let result = client
+            .call(
+                "agent.models",
+                params,
+                Instant::now() + Duration::from_secs(8),
+            )
+            .await
+            .map_err(|error| redact_native_error(error, &credentials))?;
+        if !self.state.running.lock_recover().contains_key(&key) {
+            return Err(Error::new(
+                "unavailable",
+                "OpenCode Agent stopped during its model read",
+            ));
+        }
+        if SecretPolicy::new(credentials.iter()).contains_value(&result) {
+            return Err(Error::new(
+                "source_integrity",
+                "agent.models returned reserved credentials",
+            ));
+        }
+        validate_models_catalog_result(result, &key)
     }
 
     fn sender(
@@ -2205,9 +2256,6 @@ fn agent_command_params(
 
 fn validate_agent_command_result(value: Value, harness: &str, command: &Command) -> Result<Value> {
     let verb = command.verb.as_str();
-    if verb == "models" {
-        return validate_models_catalog_result(value);
-    }
     match value.get("state").and_then(Value::as_str) {
         Some("applied") if verb == "send" => validate_send_result(value),
         Some("applied") if verb == "configure" && harness == "claude" => {
@@ -2310,11 +2358,14 @@ fn complete_plugin_command(
 /// A read-only live session catalogue: the `model.list` response shape
 /// with `session` provenance. No state is claimed; the shape alone proves
 /// the read.
-fn validate_models_catalog_result(value: Value) -> Result<Value> {
-    if value.get("provenance").and_then(Value::as_str) != Some("session") {
+fn validate_models_catalog_result(value: Value, key: &AgentKey) -> Result<Value> {
+    if value.get("provenance").and_then(Value::as_str) != Some("session")
+        || value.get("agent_id").and_then(Value::as_str) != Some(key.id.as_str())
+        || value.get("generation").and_then(Value::as_i64) != Some(key.generation)
+    {
         return Err(Error::new(
             "source_integrity",
-            "plugin session catalogue omitted its live provenance",
+            "plugin session catalogue did not bind to the requested live Agent generation",
         ));
     }
     let models = value
@@ -2445,7 +2496,9 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         || !["launch", "send", "stop"]
             .iter()
             .all(|required| verbs.contains(required))
-        || verbs.iter().any(|verb| !implemented_verbs.contains(verb))
+        || verbs.iter().any(|verb| {
+            !implemented_verbs.contains(verb) && !(harness == "opencode" && *verb == "models")
+        })
         || !manifest.child_verbs.is_empty()
         || manifest.features.start_requires_input
         || (manifest.features.native_children
@@ -3805,6 +3858,31 @@ mod tests {
         for family in ["message", "request", "session", "turn"] {
             assert_eq!(plan[family], "stream");
         }
+    }
+
+    #[test]
+    fn opencode_models_read_requires_advertisement_and_exact_generation() {
+        let mut manifest = test_manifest("opencode", "2.2.7");
+        manifest.verbs.push("models".to_owned());
+        assert!(manifest_source_plan(&manifest, "opencode").is_ok());
+        manifest.name = "codex".to_owned();
+        assert!(manifest_source_plan(&manifest, "codex").is_err());
+
+        let key = AgentKey {
+            id: "a1".to_owned(),
+            generation: 3,
+        };
+        let catalogue = json!({"agent_id":"a1", "generation":3, "provenance":"session",
+                               "models":[{"id":"opencode/free"}], "default":null});
+        assert!(validate_models_catalog_result(catalogue.clone(), &key).is_ok());
+        let mut wrong = catalogue;
+        wrong["generation"] = json!(2);
+        assert_eq!(
+            validate_models_catalog_result(wrong, &key)
+                .unwrap_err()
+                .code,
+            "source_integrity"
+        );
     }
 
     const SECRET: &str = "__payload_guard_secret__";

@@ -672,6 +672,94 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn first_opencode_failure_reads_back_the_committed_error_and_native_default() {
+        let router = test_router().await;
+        let model = "opencode-go/iceman-contributor-free";
+        let agent = {
+            let mut store = router.inner.store.lock().await;
+            let now = now_ms();
+            let launch_id = ulid::Ulid::new().to_string();
+            let mut launch = SubmitCommand::new(launch_id.clone(), "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({"project":"e42", "workspace":"fixture-workspace",
+                "harness":"opencode", "profile":"opencode", "profile_snapshot": {"harness":"opencode"}});
+            let agent = store
+                .submit("owner", launch, now)
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            store.dispatch(&launch_id, now).unwrap();
+            let plan = ["session", "turn", "message"]
+                .into_iter()
+                .map(|family| (family.to_owned(), "stream".to_owned()))
+                .collect();
+            store
+                .install_plugin_sources(&agent, 1, &launch_id, &plan, now)
+                .unwrap();
+            let commit = |store: &mut eliot_store::Store, kind: &str, data| {
+                store
+                    .put_batch(
+                        SourceBatch {
+                            batch_id: kind.to_owned(),
+                            agent_id: agent.clone(),
+                            generation: 1,
+                            source: "stream".to_owned(),
+                            cursor: None,
+                            events: vec![NativeEvent {
+                                ts: None,
+                                kind: kind.to_owned(),
+                                native_id: kind.to_owned(),
+                                data,
+                            }],
+                        },
+                        now,
+                    )
+                    .unwrap();
+            };
+            commit(
+                &mut store,
+                "session.ready",
+                json!({"command_id":launch_id,
+                "native_scope":"test-scope", "native_ref":"test-session", "effective":{"model":null}}),
+            );
+            store
+                .settle(&launch_id, CommandState::Applied, None, now)
+                .unwrap();
+            let send_id = ulid::Ulid::new().to_string();
+            let mut send = SubmitCommand::new(send_id.clone(), "send");
+            send.target = Some(agent.clone());
+            send.expected_generation = Some(1);
+            send.args = json!({"text":"hi"});
+            store.submit("owner", send, now).unwrap();
+            store.dispatch(&send_id, now).unwrap();
+            commit(
+                &mut store,
+                "turn.started",
+                json!({"command_id":send_id,"turn_id":"first"}),
+            );
+            commit(
+                &mut store,
+                "turn.completed",
+                json!({"command_id":send_id,"turn_id":"first",
+                "status":"failed","outcome":"failure","native_status":"session.execution.failed","effective_model":model,
+                "native_error":{"message":"Workspace access denied","origin":"provider"}}),
+            );
+            agent
+        };
+        let result = router
+            .agent_result(&json!({"id":agent,"generation":1}), &Principal::Owner)
+            .await
+            .unwrap();
+        let turn = &result["turns"][0];
+        assert_eq!(turn["config_revision"], 0);
+        assert!(turn["config"].is_null());
+        assert_eq!(turn["native_status"], "session.execution.failed");
+        assert_eq!(turn["native_error_message"], "Workspace access denied");
+        assert_eq!(turn["effective_model"], model);
+    }
+
     fn unknown_work_fixture(store: &mut eliot_store::Store) -> (String, String) {
         let id = ulid::Ulid::new().to_string();
         let mut launch = SubmitCommand::new(id.clone(), "launch");

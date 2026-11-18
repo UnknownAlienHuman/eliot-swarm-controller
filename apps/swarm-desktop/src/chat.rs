@@ -144,9 +144,8 @@ struct TurnEntry {
     command_id: Option<String>,
     final_text: Option<String>,
     event_final: Option<String>,
-    /// Raw vendor terminal reason from the authoritative turn readback;
-    /// shown when the turn failed.
-    native_status: Option<String>,
+    /// Committed vendor error or terminal status from turn readback.
+    failure_reason: Option<String>,
     /// Effective model the failed turn ran under, from its retained
     /// configuration; named in the failure so a denied default says so.
     failure_model: Option<String>,
@@ -169,7 +168,7 @@ impl TurnEntry {
             command_id: None,
             final_text: None,
             event_final: None,
-            native_status: None,
+            failure_reason: None,
             failure_model: None,
             read_back: false,
             activity: Vec::new(),
@@ -445,6 +444,8 @@ pub enum PartKind {
     /// A submitted input that definitely did not go through: the `swarm
     /// why` summary, its origin, and Retry.
     Failed,
+    /// A native turn that started and then failed.
+    TurnFailed,
     /// A submitted input whose outcome Swarm cannot prove: the summary and
     /// origin, never Retry (an uncertain effect is not replayed).
     Unconfirmed,
@@ -729,8 +730,15 @@ impl Conversation {
                 TurnState::Unknown => TurnStatus::Unknown,
             };
             turn.final_text = read.final_text.as_deref().map(bound_text);
-            turn.native_status = read.native_status.as_deref().map(bound_text);
-            turn.failure_model = read.config.as_ref().and_then(|config| config.model.clone());
+            turn.failure_reason = read
+                .native_error_message
+                .as_deref()
+                .or(read.native_status.as_deref())
+                .map(bound_text);
+            turn.failure_model = read
+                .effective_model
+                .clone()
+                .or_else(|| read.config.as_ref().and_then(|config| config.model.clone()));
             turn.read_back = true;
         }
         self.enforce_bounds();
@@ -1096,14 +1104,13 @@ impl Conversation {
             TurnStatus::Completed(Some(TurnOutcome::Failure))
         ) {
             let reason = turn
-                .native_status
+                .failure_reason
                 .clone()
                 .unwrap_or_else(|| "The turn failed.".to_owned());
             let mut detail = Vec::new();
             if let Some(model) = turn.failure_model.as_deref() {
                 detail.push(format!("Model {model}"));
             }
-            detail.push("Open the model picker to try another model.".to_owned());
             let final_part = parts.pop().expect("final part was just pushed");
             let (text, detail) = match final_part.kind {
                 PartKind::Final => {
@@ -1115,7 +1122,7 @@ impl Conversation {
             };
             parts.push(Part::new(
                 format!("failed:{}", turn.turn_id),
-                PartKind::Failed,
+                PartKind::TurnFailed,
                 final_part.label,
                 text,
                 detail,
@@ -1327,6 +1334,8 @@ mod tests {
             config: None,
             preceded_by: None,
             resolution_source: None,
+            effective_model: None,
+            native_error_message: None,
         }
     }
 
@@ -1335,27 +1344,16 @@ mod tests {
         let mut chat = Conversation::new("a1");
         let mut failed = turn("t9", TurnState::Completed, None);
         failed.outcome = Some(TurnOutcome::Failure);
-        failed.native_status = Some("Workspace access denied".to_owned());
-        failed.config = Some(eliot_core::api::AgentConfigView {
-            revision: 1,
-            application: "next_turn".to_owned(),
-            provenance: "configure".to_owned(),
-            profile: "adhoc-opencode".to_owned(),
-            profile_inherited: false,
-            requested_model: None,
-            requested_effort: None,
-            model: Some("opencode-go/iceman-contributor-free".to_owned()),
-            effort: None,
-            original_model: None,
-            original_effort: None,
-        });
+        failed.native_status = Some("session.execution.failed".to_owned());
+        failed.native_error_message = Some("Workspace access denied".to_owned());
+        failed.effective_model = Some("opencode-go/iceman-contributor-free".to_owned());
         chat.apply_turns(&[failed]);
         let items = chat.items();
         assert_eq!(items.len(), 1);
         let failed_part = items[0]
             .parts
             .iter()
-            .find(|part| part.kind == PartKind::Failed)
+            .find(|part| part.kind == PartKind::TurnFailed)
             .expect("failed turn shows its native error");
         assert!(
             failed_part.text.contains("Workspace access denied"),
@@ -1370,13 +1368,12 @@ mod tests {
             "denied model is named: {:?}",
             failed_part.detail
         );
+        assert_eq!(failed_part.key, "failed:t9");
         assert!(
-            failed_part
-                .detail
+            items[0]
+                .parts
                 .iter()
-                .any(|line| line.contains("model picker")),
-            "picker affordance is offered: {:?}",
-            failed_part.detail
+                .all(|part| part.kind != PartKind::Failed)
         );
     }
 

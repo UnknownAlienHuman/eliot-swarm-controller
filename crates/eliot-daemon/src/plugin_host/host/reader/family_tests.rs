@@ -55,6 +55,7 @@ fn reader(family: &Family, mode: &str) -> ReaderTransport {
         metadata_secrets: Arc::from([]),
         credential: "reader-test".into(),
         instance_dir: family.root.join("instance"),
+        model_catalogue_dir: None,
         store_root: family.root.clone(),
         observer,
         requests,

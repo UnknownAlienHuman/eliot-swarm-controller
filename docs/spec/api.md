@@ -969,7 +969,9 @@ never rewrites a retained generation, a pending command, or an
 unknown-outcome resolution: after revision 2 applies, a retained
 revision-1 turn still reads back revision 1's configuration. Readback
 validators reject a negative `config_revision` and a `config` view whose
-revision does not match the stamped revision. A `resume` explicitly inherits
+revision does not match the stamped revision. Turn reads also carry the
+effective native model when known and the message of a committed native
+terminal error independently of the overlay revision. A `resume` explicitly inherits
 the previous generation's latest overlay as its new generation's revision 1
 with provenance `\"inherited_from\"` (the frozen snapshot is unchanged;
 generations without an overlay start at 0). The lane is ordered by shared admission order: a
@@ -1595,9 +1597,11 @@ profile remedy), or `none` when the harness exposes no catalogue.
 An optional `profile` selects the native route/account
 (the named profile must exist and its frozen harness must match); omitted it
 means ad-hoc daemon defaults. An optional `agent` (exclusive with `profile`)
-reads under that controlled Agent's frozen launch snapshot instead, the route
-its `configure` draws from, never the current profile file; the Agent's
-harness must match and observed Agents are `not_allowed`. Every response
+selects the controlled Agent's frozen route. For OpenCode it reads the
+owned generation's live session catalogue on every call and reports any read
+failure. Without an Agent, OpenCode discovery is a launch preview and may take
+an existing absolute `workspace` to apply that directory's configuration.
+The Agent's harness must match and observed Agents are `not_allowed`. Every response
 carries `configure`, the harness's mid-session `configure` support from the
 same table `configure` admission uses: `model_refusal`/`effort_refusal` are
 absent when the field has a verified mechanism and otherwise hold the exact
@@ -1606,7 +1610,8 @@ opaque route identity verified against the exact private environment supplied
 to the reader. The private key also binds the account, integration, full
 configured endpoint and executable. Missing selectors, admitted unset
 selectors and admitted empty values are distinct. Legacy and unverified
-routes bypass the cache. Public `scope` names the profile and route without
+routes and previews with an explicit `workspace` bypass the cache.
+Public `scope` names the profile and route without
 private store paths. Every response carries `scope`, `fetched_at_ms`, `ttl_ms`
 and a nonsecret `credential` reference. Native model IDs remain verbatim.
 `harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is an Owner-only,

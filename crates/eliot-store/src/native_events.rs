@@ -139,6 +139,7 @@ fn persist_turn_associated(
         generation,
         now,
         native_event,
+        next_agent,
         ..
     } = scope;
     let command = load_command_record(tx, command_id)?.ok_or_else(|| {
@@ -185,6 +186,11 @@ fn persist_turn_associated(
             usage: None,
             config_revision: command.config_revision,
             preceded_by: None,
+            effective_model: (command.config_revision == 0)
+                .then_some(next_agent.effective.as_ref())
+                .flatten()
+                .and_then(|effective| effective.get("model"))
+                .and_then(Value::as_str),
         },
     )?;
     // The applied send outcome repeats what the native turn request
@@ -601,7 +607,7 @@ fn persist_turn_terminal(
         generation,
         now,
         next_agent,
-        ..
+        native_event,
     } = scope;
     if let Some(text) = final_text
         && text.len() > MAX_EVENT_BYTES
@@ -635,6 +641,19 @@ fn persist_turn_terminal(
         Some("failure") | Some("interrupted") | Some("unknown") => command_id,
         _ => None,
     };
+    let native_error_message = native_event
+        .data
+        .pointer("/native_error/message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty());
+    let effective_model = (next_agent.harness == "opencode")
+        .then(|| {
+            native_event
+                .data
+                .get("effective_model")
+                .and_then(Value::as_str)
+        })
+        .flatten();
     let changed = tx
         .execute(
             "UPDATE turns SET state = ?1, status = COALESCE(?2, status),
@@ -642,8 +661,10 @@ fn persist_turn_terminal(
                               native_status = COALESCE(?4, native_status),
                               final_text = COALESCE(?5, final_text), completed_at = ?6,
                               usage = COALESCE(?7, usage),
-                              preceded_by = COALESCE(?8, preceded_by)
-             WHERE agent = ?9 AND generation = ?10 AND turn_id = ?11",
+                              preceded_by = COALESCE(?8, preceded_by),
+                              native_error_message = COALESCE(?9, native_error_message),
+                              effective_model = COALESCE(?10, effective_model)
+             WHERE agent = ?11 AND generation = ?12 AND turn_id = ?13",
             params![
                 turn_state_name(state),
                 status,
@@ -653,6 +674,8 @@ fn persist_turn_terminal(
                 completed_at,
                 usage,
                 preceded_by,
+                native_error_message,
+                effective_model,
                 agent_num,
                 generation,
                 turn_id,

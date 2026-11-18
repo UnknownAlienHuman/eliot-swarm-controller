@@ -31,6 +31,7 @@ pub(super) struct ReaderTransport {
     pub metadata_secrets: Arc<[String]>,
     pub credential: String,
     instance_dir: PathBuf,
+    model_catalogue_dir: Option<PathBuf>,
     store_root: PathBuf,
     observer: Option<CustodyObserver>,
     requests: JoinHandle<()>,
@@ -185,6 +186,7 @@ impl PluginHost {
                 metadata_secrets,
                 credential,
                 instance_dir,
+                model_catalogue_dir: None,
                 store_root: self.state.data_root.join("plugins"),
                 observer,
                 requests,
@@ -196,6 +198,34 @@ impl PluginHost {
 }
 
 impl ReaderTransport {
+    pub(super) fn create_model_catalogue_dir(&mut self) -> Result<()> {
+        let dir = self
+            .instance_dir
+            .join(eliot_plugin::protocol::MODEL_READER_DIR);
+        #[cfg(windows)]
+        if !crate::platform::windows::create_private_directory(&dir)? {
+            return Err(Error::new(
+                "platform_io",
+                "model reader directory already exists",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|_| {
+                    Error::new(
+                        "platform_io",
+                        "could not create private model reader directory",
+                    )
+                })?;
+        }
+        self.model_catalogue_dir = Some(dir);
+        Ok(())
+    }
+
     pub(super) fn diagnose(&self, error: Error) -> Error {
         super::diagnose_error(error, &self.stderr.view(), &self.secrets)
     }
@@ -328,12 +358,23 @@ impl ReaderTransport {
             .finish(bounded_deadline(close_until, RPC_GRACE))
             .await;
         host.remove_plugin_secret(&self.credential);
-        remove_empty_instance_dir(&self.instance_dir);
+        let removed = self
+            .model_catalogue_dir
+            .as_deref()
+            .is_none_or(|dir| reaped && empty && remove_model_catalogue_dir(dir));
+        if removed {
+            remove_empty_instance_dir(&self.instance_dir);
+        }
         ReaderClose {
-            closed: reaped && empty && drained,
+            closed: reaped && empty && drained && removed,
             stderr,
         }
     }
+}
+
+fn remove_model_catalogue_dir(dir: &std::path::Path) -> bool {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::symlink_metadata(dir).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
 fn bounded_deadline(close_until: Instant, budget: std::time::Duration) -> Instant {
@@ -353,6 +394,30 @@ fn remaining(until: Instant) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_cleanup_checks_that_the_owned_subtree_is_gone() {
+        let root = std::env::temp_dir().join(format!("eliot-reader-cleanup-{}", ulid::Ulid::new()));
+        let reader = root.join(eliot_plugin::protocol::MODEL_READER_DIR);
+        std::fs::create_dir_all(&reader).unwrap();
+        let credential = reader.join("credential");
+        std::fs::write(&credential, "test").unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let open = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&credential)
+                .unwrap();
+            assert!(!remove_model_catalogue_dir(&reader));
+            drop(open);
+        }
+        assert!(remove_model_catalogue_dir(&reader));
+        assert!(remove_model_catalogue_dir(&reader));
+        assert!(root.is_dir());
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn spawn_error_does_not_confirm_reader_cleanup() {

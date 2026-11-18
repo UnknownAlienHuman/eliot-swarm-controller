@@ -127,18 +127,32 @@ pub struct HarnessModelsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     /// Optional Agent whose frozen launch snapshot selects the route/account
-    /// (exactly what that Agent's live session accepts: the session catalogue
-    /// when the session owns it, else the isolated reader under the frozen
-    /// auth -- the same set `configure` admits against). Exclusive with
-    /// `profile`; the Agent's harness must match `harness`.
+    /// (for OpenCode, the owned generation's live catalogue). Exclusive
+    /// with `profile`; the Agent's harness must match `harness`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Existing workspace for an OpenCode launch preview. The live Agent
+    /// already supplies its own workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 impl HarnessModelsRequest {
     pub fn validate(&self) -> Result<()> {
         validate_harness(&self.harness)?;
         validate_profile_opt(self.profile.as_deref())?;
+        if let Some(workspace) = self.workspace.as_deref()
+            && (self.agent.is_some()
+                || self.harness.trim() != "opencode"
+                || workspace.is_empty()
+                || workspace.len() > 4096
+                || workspace.chars().any(char::is_control))
+        {
+            return Err(Error::new(
+                "invalid",
+                "workspace requires an OpenCode catalogue preview and a valid path",
+            ));
+        }
         if let Some(agent) = self.agent.as_deref() {
             if self.profile.is_some() {
                 return Err(Error::new(
@@ -972,6 +986,7 @@ mod tests {
             harness: "codex".to_owned(),
             profile: None,
             agent: None,
+            workspace: None,
         }
         .validate()
         .unwrap();
@@ -979,6 +994,7 @@ mod tests {
             harness: "codex".to_owned(),
             profile: Some("codex-main".to_owned()),
             agent: None,
+            workspace: None,
         }
         .validate()
         .unwrap();
@@ -986,6 +1002,7 @@ mod tests {
             harness: "fake".to_owned(),
             profile: None,
             agent: None,
+            workspace: None,
         }
         .validate()
         .unwrap_err();
@@ -994,6 +1011,7 @@ mod tests {
             harness: String::new(),
             profile: None,
             agent: None,
+            workspace: None,
         }
         .validate()
         .unwrap_err();
@@ -1006,6 +1024,7 @@ mod tests {
             harness: "codex".to_owned(),
             profile: profile.map(str::to_owned),
             agent: agent.map(str::to_owned),
+            workspace: None,
         };
         request(None, Some("a7")).validate().unwrap();
         assert_eq!(
@@ -1107,6 +1126,7 @@ mod tests {
             harness: "codex".to_owned(),
             profile: None,
             agent: None,
+            workspace: None,
         };
         let mut other = models_response("muse", vec![]);
         other.scope = "profile:adhoc harness:muse".to_owned();

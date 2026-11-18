@@ -208,6 +208,8 @@ mod tests {
             config: None,
             preceded_by: None,
             resolution_source: None,
+            effective_model: None,
+            native_error_message: None,
         }
     }
 

@@ -188,6 +188,37 @@ impl Store {
         self.retained_config_view(agent, turn.generation, turn.config_revision)
     }
 
+    pub fn fill_turn_readback(&self, agent: &Agent, turn: &mut Turn) -> Result<()> {
+        turn.config = self.turn_config_view(agent, turn)?;
+        if agent.harness == "opencode" && turn.outcome == Some(TurnOutcome::Failure) {
+            // Older rows predate the retained failure fields. Recover the
+            // exact terminal diagnostic while its event is still available.
+            if turn.native_error_message.is_none() {
+                turn.native_error_message = self
+                    .turn_terminal_event(&turn.agent, turn.generation, &turn.turn_id)?
+                    .and_then(|event| {
+                        event
+                            .data
+                            .pointer("/native_error/message")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+            }
+            if turn.config_revision == 0
+                && turn.effective_model.is_none()
+                && agent.generation == turn.generation
+            {
+                turn.effective_model = agent
+                    .effective
+                    .as_ref()
+                    .and_then(|effective| effective.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+        }
+        Ok(())
+    }
+
     /// Build the readback view from the exact retained overlay row. The
     /// profile name, snapshot originals, and launch inheritance come from
     /// the retained Agent row; the revision, provenance, and requested and

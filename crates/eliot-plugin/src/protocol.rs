@@ -164,8 +164,15 @@ pub struct ProfileStoreParams {
 pub struct ModelListParams {
     pub profile: Value,
     #[serde(default)]
+    pub target_environment: Option<Value>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
     pub part: ModelListPart,
 }
+
+/// Host-owned scratch subtree for OpenCode's short-lived reader credentials.
+pub const MODEL_READER_DIR: &str = "model-catalogue";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -311,6 +318,13 @@ pub struct AgentSnapshotParams {
     pub command_id: String,
     #[serde(default)]
     pub turn_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentModelsParams {
+    pub agent_id: String,
+    pub generation: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

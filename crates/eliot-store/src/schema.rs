@@ -1392,6 +1392,17 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 58 {
+            self.connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                 ALTER TABLE turns ADD COLUMN effective_model TEXT;
+                 ALTER TABLE turns ADD COLUMN native_error_message TEXT;
+                 INSERT INTO schema_migrations(version) VALUES (58);
+                 COMMIT;",
+                )
+                .map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1433,6 +1444,9 @@ mod continuity_tests {
             .execute_batch(
                 "DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 ALTER TABLE turns DROP COLUMN effective_model;
+                 ALTER TABLE turns DROP COLUMN native_error_message;
+                 DELETE FROM schema_migrations WHERE version=58;
                  DELETE FROM schema_migrations WHERE version = 57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version = 56;",
@@ -1468,6 +1482,9 @@ mod continuity_tests {
             .execute_batch(
                 "DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 ALTER TABLE turns DROP COLUMN effective_model;
+                 ALTER TABLE turns DROP COLUMN native_error_message;
+                 DELETE FROM schema_migrations WHERE version=58;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version=56;
@@ -1538,6 +1555,9 @@ mod continuity_tests {
             .execute_batch(
                 "DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 ALTER TABLE turns DROP COLUMN effective_model;
+                 ALTER TABLE turns DROP COLUMN native_error_message;
+                 DELETE FROM schema_migrations WHERE version=58;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version=56;
@@ -1593,6 +1613,9 @@ mod continuity_tests {
             .execute_batch(
                 "DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 ALTER TABLE turns DROP COLUMN effective_model;
+                 ALTER TABLE turns DROP COLUMN native_error_message;
+                 DELETE FROM schema_migrations WHERE version=58;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version=56;
@@ -1691,6 +1714,9 @@ mod continuity_tests {
             .execute_batch(
                 "DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 ALTER TABLE turns DROP COLUMN effective_model;
+                 ALTER TABLE turns DROP COLUMN native_error_message;
+                 DELETE FROM schema_migrations WHERE version=58;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version=56;

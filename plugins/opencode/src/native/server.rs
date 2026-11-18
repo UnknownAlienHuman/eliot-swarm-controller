@@ -140,10 +140,21 @@ fn agent_config_json(
         mcp.insert("servers".to_owned(), serde_json::Value::Object(servers));
         mcp
     });
+    let mut document = provider_config(model, local);
+    document["mcp"] = mcp;
+    if let Some(permission) = native_subagents_permission(native_subagents) {
+        document["permission"] = permission;
+    }
+    document.to_string()
+}
+
+pub(crate) fn provider_config(
+    model: Option<&str>,
+    local: Option<&LocalProvider>,
+) -> serde_json::Value {
     let mut document = match local {
         None => serde_json::json!({
             "$schema": "https://opencode.ai/config.json",
-            "mcp": mcp,
         }),
         Some(provider) => {
             let mut settings = serde_json::Map::new();
@@ -170,25 +181,21 @@ fn agent_config_json(
                 }),
             );
             serde_json::json!({
-                "$schema": "https://opencode.ai/config.json",
-                "providers": {
-                    &provider.provider_id: {
-                        "package": provider.package,
-                        "settings": settings,
-                        "models": models,
-                    },
+            "$schema": "https://opencode.ai/config.json",
+            "providers": {
+                &provider.provider_id: {
+                    "package": provider.package,
+                    "settings": settings,
+                    "models": models,
                 },
-                "mcp": mcp,
+            },
             })
         }
     };
     if let Some(model) = model {
         document["model"] = serde_json::Value::String(model.to_owned());
     }
-    if let Some(permission) = native_subagents_permission(native_subagents) {
-        document["permission"] = permission;
-    }
-    document.to_string()
+    document
 }
 
 pub struct ServerLaunch {
@@ -920,6 +927,25 @@ mod tests {
         assert_eq!(model["tools"], true);
         assert_eq!(model["limit"]["context"], 131072);
         assert_eq!(model["limit"]["output"], 8192);
+    }
+
+    #[test]
+    fn preview_uses_the_launch_provider_document() {
+        let (executable, data_dir) = swarm_fixture();
+        let local = local_provider_fixture(Some("LOCAL_LLM_KEY"));
+        let model = Some("eliot-local/qwen3-8b");
+        let preview = provider_config(model, Some(&local));
+        let launch: serde_json::Value = serde_json::from_str(&agent_config_json(
+            model,
+            Some(&local),
+            executable,
+            data_dir,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(preview["providers"], launch["providers"]);
+        assert_eq!(preview["model"], launch["model"]);
+        assert!(preview.get("mcp").is_none());
     }
 
     #[test]

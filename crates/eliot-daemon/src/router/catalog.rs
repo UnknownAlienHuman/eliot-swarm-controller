@@ -9,7 +9,7 @@ use eliot_core::api::{
     HARNESS_READ_TTL_MS, HarnessEntry, HarnessModelsResponse, HarnessQuotaResponse,
     ModelsCatalogEntry, ModelsCatalogFailure,
 };
-use eliot_core::{Command, CommandState, Error, Result};
+use eliot_core::{Error, Result};
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -161,86 +161,8 @@ impl Router {
         Ok((Some(agent.profile_snapshot), label, Some(identity)))
     }
 
-    /// Live OpenCode session catalogue for one Agent generation: the
-    /// exact `GET /api/model` set the configure gate admits against.
-    /// Any failure (no live plugin, not ready, unknown) returns Err so
-    /// the caller falls back to the isolated reader; the picker never
-    /// invents a list.
-    async fn live_opencode_catalog(&self, agent_id: &str, generation: i64) -> Result<Value> {
-        let agent = self
-            .inner
-            .store
-            .lock()
-            .await
-            .get_agent(agent_id)?
-            .ok_or_else(|| Error::new("not_found", "Agent was not found"))?;
-        if agent.harness != "opencode" || agent.generation != generation {
-            return Err(Error::new(
-                "invalid",
-                "Agent route does not match the live OpenCode session",
-            ));
-        }
-        let now = now_ms();
-        let command = Command {
-            id: ulid::Ulid::new().to_string(),
-            principal: "owner".to_owned(),
-            method: "plugin.opencode.command.models".to_owned(),
-            verb: "models".to_owned(),
-            target: Some(agent.id.clone()),
-            selector: None,
-            expected_generation: Some(agent.generation),
-            generation: Some(agent.generation),
-            args: json!({}),
-            state: CommandState::Accepted,
-            turn_id: None,
-            request_id: None,
-            outcome: None,
-            created_at: now,
-            updated_at: now,
-            probe: true,
-            config_revision: 0,
-            config: None,
-        };
-        self.inner.plugin_host.command(&agent, command, None).await
-    }
-
-    /// OpenCode catalogue bytes plus provenance: the live session set
-    /// when the plugin owns it, else the reader (isolated under the
-    /// frozen auth when the snapshot names one, canonical otherwise).
-    async fn opencode_catalog_raw(
-        &self,
-        live: Option<&(String, i64)>,
-        snapshot: &Value,
-        environment: Value,
-        deadline: Instant,
-    ) -> Result<(Value, &'static str)> {
-        if let Some((agent_id, generation)) = live
-            && let Ok(raw) = self.live_opencode_catalog(agent_id, *generation).await
-        {
-            return Ok((raw, "session"));
-        }
-        let raw = self
-            .inner
-            .plugin_host
-            .models(snapshot.clone(), environment, deadline.into())
-            .await?;
-        let isolated = raw.get("provenance").and_then(Value::as_str) == Some("isolated");
-        Ok((raw, if isolated { "isolated" } else { "canonical" }))
-    }
-
-    /// Read-only native model catalogue for a harness: no model turn, no
-    /// inference. Codex/Muse/Antigravity use the harness's own read-only
-    /// method through a dedicated metadata reader, cached per native
-    /// route/account with freshness and credential identity; OpenCode
-    /// Agent-scoped reads use the live session catalogue first (the exact
-    /// `GET /api/model` set the configure gate admits against), falling
-    /// back to an isolated reader under the frozen auth, and
-    /// profile-scoped OpenCode reads use that isolated reader whenever
-    /// the snapshot names an auth integration, else the canonical
-    /// stores; Claude reports its frozen documented aliases and full
-    /// model ids plus the CLI default, each entry marked
-    /// `documented_alias`. Native model ids are retained verbatim: no
-    /// fallback model is ever selected.
+    /// OpenCode Agent reads go to the owned generation. A standalone
+    /// catalogue is available independently as a launch preview.
     pub(super) async fn harness_models(
         &self,
         params: &Value,
@@ -282,10 +204,11 @@ impl Router {
             }
         };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+        let live_opencode = live_identity.as_ref().filter(|_| harness == "opencode");
         let mut snapshot = snapshot;
         let mut environment = None;
         let mut cache_key = None;
-        if harness != "claude" {
+        if harness != "claude" && live_opencode.is_none() {
             let profile = snapshot.as_mut().ok_or_else(|| {
                 Error::new(
                     "internal",
@@ -296,9 +219,11 @@ impl Router {
             let cmd = profile["cmd"].as_str().unwrap_or(&harness);
             let (cmd, version) = crate::adhoc::reader_executable(cmd, &harness, deadline).await?;
             profile["cmd"] = Value::String(cmd.clone());
-            cache_key =
-                catalog::canonical_cache_identity(&label, profile, route.identity.as_deref())
-                    .and_then(|key| catalog::models_key(&key, &cmd, version.as_deref()));
+            if request.workspace.is_none() {
+                cache_key =
+                    catalog::canonical_cache_identity(&label, profile, route.identity.as_deref())
+                        .and_then(|key| catalog::models_key(&key, &cmd, version.as_deref()));
+            }
             environment = Some(route.environment);
         }
         let now = now_ms();
@@ -342,25 +267,47 @@ impl Router {
                     .get("cmd")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                let environment = environment
-                    .ok_or_else(|| Error::new("internal", "model reader environment missing"))?;
-                // An Agent-scoped OpenCode read lists exactly what the
-                // live session accepts: the session catalogue when the
-                // plugin owns it, else the isolated reader under the
-                // frozen auth (profile-scoped likewise). Canonical only
-                // when no frozen auth selects isolation, and the note
-                // always names the source.
-                let (raw, provenance) = if harness == "opencode" {
-                    self.opencode_catalog_raw(live_identity.as_ref(), &snapshot, environment, deadline)
-                        .await?
+                let (raw, provenance) = if let Some((agent_id, generation)) = live_opencode {
+                    let result = self
+                        .inner
+                        .plugin_host
+                        .agent_models(agent_id, *generation)
+                        .await?;
+                    if !self
+                        .inner
+                        .store
+                        .lock()
+                        .await
+                        .get_agent(agent_id)?
+                        .is_some_and(|agent| agent.generation == *generation)
+                    {
+                        return Err(Error::new(
+                            "stale_generation",
+                            "Agent generation changed during its model read",
+                        ));
+                    }
+                    (result, "session")
                 } else {
-                    (
-                        self.inner
-                            .plugin_host
-                            .models(snapshot, environment, deadline.into())
-                            .await?,
-                        "canonical",
-                    )
+                    let environment = environment.ok_or_else(|| {
+                        Error::new("internal", "model reader environment missing")
+                    })?;
+                    let raw = self
+                        .inner
+                        .plugin_host
+                        .models(
+                            snapshot,
+                            environment,
+                            request.workspace.clone(),
+                            deadline.into(),
+                        )
+                        .await?;
+                    let provenance =
+                        if raw.get("provenance").and_then(Value::as_str) == Some("preview") {
+                            "preview"
+                        } else {
+                            "canonical"
+                        };
+                    (raw, provenance)
                 };
                 let models = raw
                     .get("models")
@@ -972,11 +919,11 @@ fn opencode_catalog_note(provenance: &str) -> &'static str {
         "session" => {
             "OpenCode catalogue from the live session GET /api/model; the picker lists exactly what configure admits for this Agent generation"
         }
-        "isolated" => {
-            "OpenCode catalogue from an isolated reader under the frozen auth integration; the live session accepts the same set"
+        "preview" => {
+            "OpenCode launch preview using the profile's provider settings and auth; workspace and live provider state can change availability"
         }
         _ => {
-            "OpenCode catalogue from the canonical native stores; a session with frozen auth may accept fewer models"
+            "OpenCode preview from the canonical native stores; an isolated session may accept a different set"
         }
     }
 }
@@ -1928,11 +1875,11 @@ mod tests {
     #[test]
     fn opencode_catalog_note_names_its_source() {
         assert!(opencode_catalog_note("session").contains("live session"));
-        assert!(opencode_catalog_note("isolated").contains("isolated reader"));
+        assert!(opencode_catalog_note("preview").contains("launch preview"));
         assert!(opencode_catalog_note("canonical").contains("canonical"));
         assert_ne!(
             opencode_catalog_note("session"),
-            opencode_catalog_note("isolated")
+            opencode_catalog_note("preview")
         );
     }
 

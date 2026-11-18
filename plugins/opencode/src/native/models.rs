@@ -67,6 +67,28 @@ pub(crate) struct NativeModelMetadata {
     pub variants: Option<Vec<String>>,
 }
 
+/// Native catalogue commands share the profile workspace and environment.
+pub(crate) struct ReaderContext<'a> {
+    pub workspace: &'a Path,
+    pub environment: &'a [(std::ffi::OsString, std::ffi::OsString)],
+    pub xdg: Option<(&'a Path, &'a Path)>,
+}
+
+impl ReaderContext<'_> {
+    fn command(&self, program: &OsStr) -> Command {
+        let mut command = Command::new(program);
+        command
+            .current_dir(self.workspace)
+            .envs(self.environment.iter().cloned());
+        if let Some((config_home, data_home)) = self.xdg {
+            command
+                .env("XDG_CONFIG_HOME", config_home)
+                .env("XDG_DATA_HOME", data_home);
+        }
+        command
+    }
+}
+
 /// Run the frozen native exe with exact argv `api model.list --standalone` and return
 /// one entry per reported model with metadata, in wire
 /// order. Bounded by `deadline` and [`MAX_MODEL_LIST_BYTES`]; like
@@ -77,14 +99,9 @@ pub(crate) struct NativeModelMetadata {
 pub(crate) async fn run_model_metadata(
     program: &OsStr,
     deadline: Instant,
-    xdg: Option<(&Path, &Path)>,
+    context: &ReaderContext<'_>,
 ) -> Result<Vec<NativeModelMetadata>> {
-    let mut command = Command::new(program);
-    if let Some((config_home, data_home)) = xdg {
-        command
-            .env("XDG_CONFIG_HOME", config_home)
-            .env("XDG_DATA_HOME", data_home);
-    }
+    let mut command = context.command(program);
     command
         .args(model_list_argv())
         .stdin(Stdio::null())
@@ -263,14 +280,9 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 pub(crate) async fn run_models(
     program: &OsStr,
     deadline: Instant,
-    xdg: Option<(&Path, &Path)>,
+    context: &ReaderContext<'_>,
 ) -> Result<Vec<String>> {
-    let mut command = Command::new(program);
-    if let Some((config_home, data_home)) = xdg {
-        command
-            .env("XDG_CONFIG_HOME", config_home)
-            .env("XDG_DATA_HOME", data_home);
-    }
+    let mut command = context.command(program);
     command
         .args(models_argv())
         .stdin(Stdio::null())

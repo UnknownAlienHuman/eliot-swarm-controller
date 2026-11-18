@@ -69,6 +69,7 @@ pub(super) enum LaunchMsg {
     CatalogRetry,
     /// Open a popover, or close it when it is the one open.
     Toggle(Pop),
+    OpenModel,
     /// Close the open popover (a click outside it, Esc).
     Close,
     /// The pointer entered (true) or left the composer's message field,
@@ -389,7 +390,16 @@ impl DesktopApp {
                 }
                 self.keep_highlight();
             }
-            LaunchMsg::CatalogRetry => self.load_catalog(context),
+            LaunchMsg::CatalogRetry => {
+                if self
+                    .popover_agent()
+                    .is_some_and(|detail| detail.harness == "opencode")
+                {
+                    self.open_popover(Pop::Model, context);
+                } else {
+                    self.load_catalog(context);
+                }
+            }
             LaunchMsg::Toggle(pop) => {
                 if self.launch.open == Some(pop) {
                     self.close_popover();
@@ -397,6 +407,7 @@ impl DesktopApp {
                     self.open_popover(pop, context);
                 }
             }
+            LaunchMsg::OpenModel => self.open_popover(Pop::Model, context),
             LaunchMsg::Close => self.close_popover(),
             LaunchMsg::ComposerPointer { over, pressed } => {
                 crate::shortcuts::set_composer_over(over);
@@ -613,7 +624,8 @@ impl DesktopApp {
             (true, Pop::Model)
                 if self.agent_model_allowed()
                     || self.popover_agent().is_some_and(|detail| {
-                        self.agent_launch_catalog(&detail.harness).is_some()
+                        detail.harness == "opencode"
+                            || self.agent_launch_catalog(&detail.harness).is_some()
                     }) =>
             {
                 pop
@@ -629,8 +641,13 @@ impl DesktopApp {
         match pop {
             Pop::Model => {
                 self.launch.query.clear();
-                self.launch.highlight = picker::initial(&self.picker_rows());
                 if agent {
+                    if self
+                        .popover_agent()
+                        .is_some_and(|detail| detail.harness == "opencode")
+                    {
+                        self.configure.catalog = None;
+                    }
                     self.ensure_catalog(context);
                 } else {
                     // Every open revalidates (the daemon serves a complete
@@ -638,6 +655,7 @@ impl DesktopApp {
                     // again); the rows show the last read meanwhile.
                     self.load_catalog(context);
                 }
+                self.launch.highlight = picker::initial(&self.picker_rows());
                 crate::shortcuts::set_popover(HookPopover::Picker);
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
                 self.reveal(context);

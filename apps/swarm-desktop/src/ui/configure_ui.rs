@@ -46,7 +46,11 @@ impl DesktopApp {
                     self.configure.catalog = Some(catalog);
                     match self.launch.open {
                         Some(launch_ui::Pop::Model) if self.popover_agent().is_some() => {
-                            if self.agent_model_allowed() {
+                            if self.agent_model_allowed()
+                                || self
+                                    .popover_agent()
+                                    .is_some_and(|detail| detail.harness == "opencode")
+                            {
                                 self.keep_highlight();
                             } else {
                                 self.launch_update(
