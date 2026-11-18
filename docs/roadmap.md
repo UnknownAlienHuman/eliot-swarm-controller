@@ -86,7 +86,7 @@ Checked layers record delivered increments, not full crash/load qualification.
 
 ## Multi-project Swarm (#657)
 
-- [ ] **1. Desktop project identity.** Fix Move and Handoff selection using the
+- [x] **1. Desktop project identity.** Fix Move and Handoff selection using the
   registration ID and preserve server-side authorization scope.
 - [x] **2a. Manager assignment core.** Persist atomic assignment and epoch, expose
   CLI/MCP claim, launch, read and release, and fence admission and queued dispatch.
