@@ -996,6 +996,33 @@ mod tests {
     }
 
     #[test]
+    fn explicit_chats_root_equal_to_owner_tree_is_honored() {
+        let root = TestRoot::new();
+        let store = Store::open(Path::new(":memory:")).expect("open Store");
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .expect("home is set for the chats_root fixture");
+        let owner_chats = PathBuf::from(home).join("Eliot").join("chats");
+        let source = format!(
+            "[daemon]\nchats_root = '{}'\n",
+            owner_chats.to_string_lossy()
+        );
+        std::fs::write(root.0.join("config.toml"), source).expect("write owner-tree config");
+        let read = read_internal(&root.0, &store, Some(&[SettingsSection::Daemon]), &policy)
+            .expect("an explicit owner chat tree is the Owner's choice");
+        let value = read.sections[&SettingsSection::Daemon]
+            .get("chats_root")
+            .and_then(JsonValue::as_str)
+            .expect("effective chats_root reads back");
+        // Readback is canonical (a verbatim `\\?\` prefix on Windows).
+        let readback = value.strip_prefix(r"\\?\").unwrap_or(value);
+        assert_eq!(
+            std::path::absolute(readback).expect("absolute readback"),
+            std::path::absolute(&owner_chats).expect("absolute owner tree")
+        );
+    }
+
+    #[test]
     fn default_chats_root_reads_back_disjoint_from_the_owner_tree() {
         let root = TestRoot::new();
         let store = Store::open(Path::new(":memory:")).expect("open Store");

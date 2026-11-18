@@ -129,12 +129,29 @@ pub(crate) fn validate_chats_location(
     data_root: &Path,
     chats_root: Option<&str>,
 ) -> core::Result<std::path::PathBuf> {
-    let root = chats_root
-        .map(std::path::PathBuf::from)
-        .map(Ok)
-        .unwrap_or_else(|| default_chats_root(data_root))?;
-    let protected = protected_paths(data_root)?;
+    let explicit = chats_root.map(std::path::PathBuf::from);
+    let root = match &explicit {
+        Some(root) => root.clone(),
+        None => default_chats_root(data_root)?,
+    };
+    let mut protected = protected_paths(data_root)?;
+    // An Owner may explicitly choose the canonical chat tree itself for a
+    // non-default data dir (a production controller dir, for example).
+    // Derived defaults and every other explicit root stay outside it.
+    if explicit.is_some() && !is_owner_default_data_dir(data_root) {
+        let owner = owner_chats_root()?;
+        if same_absolute_path(&root, &owner) {
+            protected.retain(|path| !same_absolute_path(path, &owner));
+        }
+    }
     validate_chats_root(&root, &protected)
+}
+
+fn same_absolute_path(left: &Path, right: &Path) -> bool {
+    match (std::path::absolute(left), std::path::absolute(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Every location a chat root must stay disjoint from: the daemon data

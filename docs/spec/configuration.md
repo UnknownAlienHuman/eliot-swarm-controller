@@ -1465,7 +1465,10 @@ becomes implemented; absent later features return `unsupported`, not a hidden su
 defaulting to `<user home>/Eliot/chats`. `settings.read` exposes the effective
 root and `settings.save` replaces it with the daemon section; both resolve the
 explicit and the default root through the same validator, so a stored root
-inside the owner chat tree is refused at readback exactly as at launch. When
+inside the owner chat tree is refused at readback exactly as at launch. The one
+exception is an explicit root equal to the canonical owner chat tree itself: the
+Owner may choose it for a non-default data directory, such as a production
+controller. Derived defaults never resolve there. When
 the owner home cannot be resolved for a non-default data directory, validation
 fails closed instead of omitting the owner tree from the protected set. It must
 be outside the daemon data directory, harness homes and user configuration
