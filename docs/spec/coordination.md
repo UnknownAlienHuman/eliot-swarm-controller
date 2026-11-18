@@ -182,7 +182,9 @@ below. Only owner/global automation writes
 global vars. Agent-launched children stay within parental Eliot scope; a frozen
 Owner-written `child_profiles` entry explicitly grants a different harness's own
 native policy, as defined under [Claims and hierarchy](#claims-and-hierarchy). Only the Owner
-may grant a different manager control through [Handoff](#handoff). A native child without isolated
+may grant a different manager control through [reparent](#change-the-manager-implemented);
+[Handoff](#task-handoff-to-an-existing-agent-implemented) between two workers of the same
+manager needs only that manager's own controlled scope. A native child without isolated
 environment has no independent Eliot principal; calls from its parent environment are
 attributed to that parent and this limitation is shown.
 
@@ -652,7 +654,7 @@ is an unknown observation until that readback; there is no native effect to repl
 
 ### Task handoff to an existing Agent (implemented)
 
-`swarm.handoff` is one Owner operation bound to explicit A/B generations, an explicit
+`swarm.handoff` is one Owner-or-manager operation bound to explicit A/B generations, an explicit
 original-task SEND command ID and an ordered set of at most 64 distinct undispatched
 SEND IDs, also bounded by the configured selector-target limit. The sole DTOs live in
 [`api/handoff.rs`](../../crates/eliot-core/src/api/handoff.rs). Empty selection transfers
@@ -663,6 +665,9 @@ round reservation. B must be controlled, nonterminal, same-scope (the
 authorization scope, `COALESCE(project_scope, project)`) and cleanly idle
 under the existing input/unknown gates. Explicitly retry after quiescence with a new
 operation ID only if the previous operation was definitely rejected before admission.
+Authority never widens: the Owner hands off anywhere, while a manager may hand off
+only between two workers in its own controlled scope (both endpoints pass the
+frozen `control` scope check). `reparent` and `switch` stay Owner-only.
 
 Only plain `send` commands in `accepted|queued` state are transferable. Never transfer
 in-flight, unknown, turn/request-bound controls or queued context injections; reject
@@ -720,8 +725,10 @@ leave successors queued. Automatic native loss/restart preserves these withheld 
 even when B becomes terminal. Owner may assert an unknown brief applied via
 `command.resolve`; the same Owner assertion is narrowly available for a failed
 handoff brief. It records `resolution_source=owner`, invents no native receipt and
-never resends input. Owner can instead withdraw each accepted/queued handoff input
-with `command.cancel`; dispatched/unknown input cannot be cancelled. Explicit
+never resends input. The Owner can withdraw each accepted/queued handoff input
+with `command.cancel`; a manager may cancel a `send` it issued itself while still
+accepted/queued in its controlled scope, with no effect once dispatched.
+Dispatched/unknown input cannot be cancelled. Explicit
 generation/stop lifecycle cancellation keeps its ordinary no-effect semantics.
 The parent result updates only `brief_state` and `successor_gate` as delivery settles;
 its original transfer identities and component facts remain fixed. `command.children`

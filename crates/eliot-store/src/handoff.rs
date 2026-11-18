@@ -24,9 +24,6 @@ impl Store {
     ) -> Result<Option<HandoffResponse>> {
         self.ensure_committed_reads()?;
         request.validate()?;
-        if principal != "owner" {
-            return Err(Error::new("not_allowed", "only Owner may hand off tasks"));
-        }
         let digest = canonical::digest(
             &serde_json::to_value(request)
                 .map_err(|_| Error::new("internal", "cannot encode handoff"))?,
@@ -40,7 +37,10 @@ impl Store {
                     "handoff id used by another write",
                 ));
             }
-            return Ok(None);
+            if principal == "owner" || principal.starts_with("agent:") {
+                return Ok(None);
+            }
+            return Err(Error::new("not_allowed", "only Owner may hand off tasks"));
         };
         if p != principal || method != METHOD || binding != digest {
             return Err(Error::new("id_conflict", "handoff id has another binding"));
@@ -106,12 +106,6 @@ impl Store {
         now: i64,
     ) -> Result<Change<CommandCancelResponse>> {
         request.validate()?;
-        if principal != "owner" {
-            return Err(Error::new(
-                "not_allowed",
-                "only Owner may withdraw a handoff input",
-            ));
-        }
         let digest = canonical::digest(&json!({"command_id":request.command_id}))?;
         let tx = self
             .connection
@@ -139,20 +133,77 @@ impl Store {
         let record = load_command_record(&tx, &request.command_id)?
             .ok_or_else(|| Error::new("not_found", "input missing"))?;
         let eligible:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM commands c JOIN commands p ON p.id=c.parent_command WHERE c.id=?1 AND c.link_kind='handoff' AND p.method='swarm.handoff')",[&request.command_id],|row|row.get(0)).map_err(sql_error)?;
-        if !eligible {
-            return Err(Error::new(
-                "bad_state",
-                "command.cancel supports only handoff SEND children; launch/resume inputs and ordinary commands cannot be withdrawn",
-            ));
-        }
-        if record.command.verb != "send"
-            || !matches!(record.state, CommandState::Accepted | CommandState::Queued)
-        {
-            return Err(Error::new(
-                "bad_state",
-                "cancel requires an undispatched handoff SEND",
-            ));
-        }
+        let reason = if principal == "owner" {
+            if !eligible {
+                return Err(Error::new(
+                    "bad_state",
+                    "command.cancel supports only handoff SEND children; launch/resume inputs and ordinary commands cannot be withdrawn",
+                ));
+            }
+            if record.command.verb != "send"
+                || !matches!(record.state, CommandState::Accepted | CommandState::Queued)
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "cancel requires an undispatched handoff SEND",
+                ));
+            }
+            "owner_handoff_no_effect"
+        } else {
+            // A manager may cancel a send it issued itself while still
+            // accepted/queued, before dispatch. The target must be in the
+            // caller's controlled scope; dispatched work is never withdrawn.
+            let caller = hierarchy::parse_caller(&tx, principal)?;
+            let caller_num = match &caller {
+                hierarchy::Caller::Agent { num, .. } => *num,
+                _ => {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "only Owner may withdraw a handoff input",
+                    ));
+                }
+            };
+            let caller_agent = load_agent_by_num(&tx, caller_num)?.ok_or_else(|| {
+                Error::new("stale_generation", "caller generation is no longer current")
+            })?;
+            observer::require_controlled(&caller_agent)?;
+            if record.command.principal != principal {
+                return Err(Error::new(
+                    "not_allowed",
+                    "only the send issuer may cancel its queued input",
+                ));
+            }
+            let target_num = record
+                .target
+                .ok_or_else(|| Error::new("source_integrity", "input target missing"))?;
+            let target_agent = load_agent_by_num(&tx, target_num)?
+                .ok_or_else(|| Error::new("not_found", "cancel target is no longer retained"))?;
+            observer::require_controlled(&target_agent)?;
+            hierarchy::caller_may_command(&tx, &caller, &target_agent)?;
+            let ordinary: bool = tx
+                .query_row(
+                    "SELECT parent_command IS NULL AND link_kind IS NULL FROM commands WHERE id=?1",
+                    [&request.command_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if !eligible && !ordinary {
+                return Err(Error::new(
+                    "bad_state",
+                    "command.cancel supports only own handoff SEND children and own ordinary SENDs; launch/resume inputs cannot be withdrawn",
+                ));
+            }
+            if record.command.verb != "send"
+                || !matches!(record.state, CommandState::Accepted | CommandState::Queued)
+                || record.command.turn_id.is_some()
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "cancel requires an undispatched SEND",
+                ));
+            }
+            "manager_cancel_no_effect"
+        };
         let mut events = Vec::new();
         cancel_pending_command_tx(
             &tx,
@@ -164,7 +215,7 @@ impl Store {
                 .generation
                 .ok_or_else(|| Error::new("source_integrity", "input generation missing"))?,
             &request.command_id,
-            "owner_handoff_no_effect",
+            reason,
             now,
             &mut events,
         )?;
@@ -197,9 +248,23 @@ pub(super) fn handoff_tx(
     limits: core::api::HierarchyLimits,
 ) -> Result<HandoffAdmission> {
     request.validate()?;
-    if principal != "owner" {
-        return Err(Error::new("not_allowed", "only Owner may hand off tasks"));
-    }
+    // Owner hands off anywhere. A manager may hand off between two workers in
+    // its own controlled scope; the scope check below never widens authority.
+    let manager_caller = if principal == "owner" {
+        None
+    } else {
+        let caller = hierarchy::parse_caller(tx, principal)?;
+        match &caller {
+            hierarchy::Caller::Owner => None,
+            hierarchy::Caller::Agent { num, .. } => {
+                let caller_agent = load_agent_by_num(tx, *num)?.ok_or_else(|| {
+                    Error::new("stale_generation", "caller generation is no longer current")
+                })?;
+                observer::require_controlled(&caller_agent)?;
+                Some(caller)
+            }
+        }
+    };
     let payload = serde_json::to_value(request)
         .map_err(|_| Error::new("internal", "cannot encode handoff"))?;
     let digest = canonical::digest(&payload)?;
@@ -248,6 +313,10 @@ pub(super) fn handoff_tx(
             "not_allowed",
             "handoff must stay in one project",
         ));
+    }
+    if let Some(caller) = &manager_caller {
+        hierarchy::caller_may_command(tx, caller, &from)?;
+        hierarchy::caller_may_command(tx, caller, &to)?;
     }
     project_transfer::require_no_intent(tx, &from.project)?;
     project_transfer::require_no_intent(tx, &to.project)?;

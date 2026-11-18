@@ -35,8 +35,9 @@ subcommand's help. A discovered method grants no access outside your scope.
 | `settings.read`, `settings.save` | `swarm settings read`, `swarm settings save` | Owner-only settings operations. |
 | `rule.*`, `timer.*`, `goal.*` | `swarm rule`, `swarm timer`, `swarm goal` | Owner-only automation and Goal operations. |
 | `agent.discover`, `diagnose` | `swarm discover`, `swarm why` | Owner-only discovery and diagnosis. |
-| `swarm.handoff`, `swarm.reparent`, `swarm.switch` | `swarm handoff`, `swarm reparent`, `swarm switch` | Owner-only hierarchy or task transfers. |
-| `command.cancel` | `swarm cmd cancel` | Owner-only withdrawal of an undispatched handoff input. |
+| `swarm.handoff` | `swarm handoff` | Owner anywhere, or a manager between two workers in its own controlled scope; `reparent`/`switch` stay Owner-only. |
+| `swarm.reparent`, `swarm.switch` | `swarm reparent`, `swarm switch` | Owner-only hierarchy or task transfers. |
+| `command.cancel` | `swarm cmd cancel` | Owner withdraws handoff inputs; an issuing manager cancels its own queued SEND in scope. |
 | `command.resolve`, `turn.resolve` | `swarm cmd resolve`, `swarm turn resolve` | Owner-only outcome assertions. |
 
 Owner-only methods can be hidden from Agent discovery. An Agent that needs

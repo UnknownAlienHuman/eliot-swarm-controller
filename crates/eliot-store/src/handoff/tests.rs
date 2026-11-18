@@ -827,3 +827,231 @@ fn handoff_accepts_64_successors_in_the_requested_order() {
         );
     }
 }
+
+fn managed_agent(store: &mut Store, parent: Option<&str>) -> String {
+    let mut r = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    r.expected_generation = Some(0);
+    r.args = json!({"project":"handoff","workspace":"handoff-unit","harness":"codex","profile":"worker","profile_snapshot":{"control":"tree"}});
+    if let Some(parent) = parent {
+        r.args["parent"] = json!(parent);
+    }
+    let admitted = store.submit("owner", r, now()).unwrap();
+    let id = admitted.command.target.unwrap();
+    store.dispatch(&admitted.command.id, now()).unwrap();
+    crate::tests::install_fixture_sources(store, &id, &admitted.command.id, 1, now());
+    store
+        .put_batch(
+            core::SourceBatch {
+                batch_id: Ulid::new().to_string(),
+                agent_id: id.clone(),
+                generation: 1,
+                source: "stream".into(),
+                cursor: None,
+                events: vec![core::NativeEvent {
+                    ts: None,
+                    kind: "session.ready".into(),
+                    native_id: Ulid::new().to_string(),
+                    data: json!({"command_id":admitted.command.id}),
+                }],
+            },
+            now(),
+        )
+        .unwrap();
+    store
+        .settle(&admitted.command.id, CommandState::Applied, None, now())
+        .unwrap();
+    id
+}
+
+fn manager_principal(manager: &str) -> String {
+    format!("agent:{manager}:1")
+}
+
+fn manager_send(store: &mut Store, manager: &str, target: &str, text: &str) -> String {
+    let mut r = SubmitCommand::new(Ulid::new().to_string(), "send");
+    r.target = Some(target.into());
+    r.expected_generation = Some(1);
+    r.args = json!({"text": text});
+    store
+        .submit(&manager_principal(manager), r, now())
+        .unwrap()
+        .command
+        .id
+}
+
+fn managed_setup() -> (Store, String, String, String, String, String) {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let manager = managed_agent(&mut store, None);
+    let a = managed_agent(&mut store, Some(&manager));
+    let b = managed_agent(&mut store, Some(&manager));
+    let task = manager_send(&mut store, &manager, &a, "original task");
+    let queued = manager_send(&mut store, &manager, &a, "selected queued work");
+    (store, manager, a, b, task, queued)
+}
+
+#[test]
+fn manager_can_cancel_own_queued_send_before_dispatch() {
+    let (mut s, manager, _a, b, _task, _queued) = managed_setup();
+    let principal = manager_principal(&manager);
+    let first = manager_send(&mut s, &manager, &b, "first");
+    let second = manager_send(&mut s, &manager, &b, "second");
+    assert!(matches!(
+        s.get_command(&second).unwrap().unwrap().state,
+        CommandState::Accepted | CommandState::Queued
+    ));
+    let cancel = CommandCancelRequest {
+        id: Ulid::new().to_string(),
+        command_id: second.clone(),
+    };
+    let result = s.cancel_handoff_input(&principal, &cancel, now()).unwrap();
+    assert_eq!(result.value.command_id, second);
+    assert_eq!(result.value.state, CommandState::Cancelled);
+    assert_eq!(
+        s.get_command(&second).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+    assert!(matches!(
+        s.get_command(&first).unwrap().unwrap().state,
+        CommandState::Accepted | CommandState::Queued
+    ));
+    // Same mutation id replays without new effects.
+    assert!(
+        s.cancel_handoff_input(&principal, &cancel, now())
+            .unwrap()
+            .events
+            .is_empty()
+    );
+}
+
+#[test]
+fn manager_handoff_between_own_workers_succeeds() {
+    let (mut s, manager, a, b, task, queued) = managed_setup();
+    let principal = manager_principal(&manager);
+    let request = HandoffRequest {
+        id: Ulid::new().to_string(),
+        from: a.clone(),
+        from_generation: 1,
+        to: b.clone(),
+        to_generation: 1,
+        task_command: task.clone(),
+        commands: vec![queued.clone()],
+    };
+    let result = s
+        .handoff(&principal, &request, &core::SecretPolicy::default(), now())
+        .unwrap();
+    assert!(result.is_new);
+    assert_eq!(result.value.children.len(), 2);
+    assert_eq!(
+        s.get_command(&queued).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+    let successor = result.value.transfers[0].successor.clone();
+    assert!(matches!(
+        s.get_command(&successor).unwrap().unwrap().state,
+        CommandState::Accepted | CommandState::Queued
+    ));
+    // Same handoff id replays the retained transfer.
+    let replay = s
+        .replay_handoff(&principal, &request)
+        .unwrap()
+        .expect("manager handoff must replay");
+    assert_eq!(replay.children, result.value.children);
+}
+
+#[test]
+fn foreign_manager_cannot_cancel_or_handoff() {
+    let (mut s, manager, a, _b, _task, _queued) = managed_setup();
+    let other_manager = managed_agent(&mut s, None);
+    let other_worker = managed_agent(&mut s, Some(&other_manager));
+    let other_principal = manager_principal(&other_manager);
+    let own_principal = manager_principal(&manager);
+    // Another manager's worker is outside the caller's controlled scope.
+    let bad_handoff = HandoffRequest {
+        id: Ulid::new().to_string(),
+        from: a.clone(),
+        from_generation: 1,
+        to: other_worker.clone(),
+        to_generation: 1,
+        task_command: send(&mut s, &a, "task for cross check"),
+        commands: vec![],
+    };
+    assert_eq!(
+        s.handoff(
+            &own_principal,
+            &bad_handoff,
+            &core::SecretPolicy::default(),
+            now()
+        )
+        .unwrap_err()
+        .code,
+        "not_allowed"
+    );
+    // A foreign issuer cannot cancel another manager's send.
+    let foreign_send = manager_send(&mut s, &other_manager, &other_worker, "foreign");
+    let cancel = CommandCancelRequest {
+        id: Ulid::new().to_string(),
+        command_id: foreign_send,
+    };
+    assert_eq!(
+        s.cancel_handoff_input(&own_principal, &cancel, now())
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+    // Cross-scope handoff between two outsiders is also refused.
+    let outsider_handoff = HandoffRequest {
+        id: Ulid::new().to_string(),
+        from: other_manager.clone(),
+        from_generation: 1,
+        to: other_worker.clone(),
+        to_generation: 1,
+        task_command: send(&mut s, &other_manager, "outsider task"),
+        commands: vec![],
+    };
+    // Seed quiescence for the outsider pair would still fail scope first.
+    let _ = &other_principal;
+    assert_eq!(
+        s.handoff(
+            &own_principal,
+            &outsider_handoff,
+            &core::SecretPolicy::default(),
+            now()
+        )
+        .unwrap_err()
+        .code,
+        "not_allowed"
+    );
+}
+
+#[test]
+fn manager_cancel_refuses_dispatched_and_foreign_issuer() {
+    let (mut s, manager, a, b, _task, _queued) = managed_setup();
+    let principal = manager_principal(&manager);
+    // Foreign issuer: Owner sent to our worker, manager cannot withdraw it.
+    let owner_send = send(&mut s, &a, "owner input");
+    let cancel = CommandCancelRequest {
+        id: Ulid::new().to_string(),
+        command_id: owner_send,
+    };
+    assert_eq!(
+        s.cancel_handoff_input(&principal, &cancel, now())
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+    // Dispatched: manager's own send can no longer be withdrawn.
+    let own = manager_send(&mut s, &manager, &b, "will dispatch");
+    s.connection
+        .execute("UPDATE commands SET state='dispatched' WHERE id=?1", [&own])
+        .unwrap();
+    let cancel = CommandCancelRequest {
+        id: Ulid::new().to_string(),
+        command_id: own,
+    };
+    assert_eq!(
+        s.cancel_handoff_input(&principal, &cancel, now())
+            .unwrap_err()
+            .code,
+        "bad_state"
+    );
+}
