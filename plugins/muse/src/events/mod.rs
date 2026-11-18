@@ -7,9 +7,9 @@ use self::recovery::{
 mod workflow_child;
 
 use eliot_core::{
-    ContextItem, Error, MUSE_VIEW_UNAVAILABLE_REASON_PREFIX, ProviderRestriction, Result,
-    SecretPolicy, SessionUsage, SourceHealthUpdate, VIEW_RECOVERY_MARKER_FIELD,
-    VIEW_RECOVERY_READBACK,
+    ContextItem, Error, MUSE_VIEW_UNAVAILABLE_REASON_PREFIX, MUSE_VIEW_UNKNOWN_REASON_PREFIX,
+    ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceHealthUpdate,
+    VIEW_RECOVERY_MARKER_FIELD, VIEW_RECOVERY_READBACK,
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,

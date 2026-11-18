@@ -224,14 +224,20 @@ that identity state or replace the text. Recovery marks those records applied
 so a later live replay of the same revision skips instead of recommitting,
 retires the recovery deadline, and keeps the recorded gap and stale health
 latched. A readback that proves nothing (a failed `session/read`, an
-unexpected shape, or an idle scan with no durable terminal) never settles the
-turn. It re-arms a bounded `session/read` after a backoff (5s, 10s, 20s,
-then at most the 30s recovery interval), with no attempt-count cutoff. An exact
-`running` observation resets that cadence. The turn stays open and the Agent
-stays busy across read failures; a new send cannot enter that turn. A timer,
-subscription admission, or exhausted read budget never proves completion or
+unexpected shape, or an idle scan with no durable terminal) re-arms one more
+bounded `session/read` after a backoff (5s, 10s, 20s, then at most the 30s
+recovery interval). An exact `running` observation resets that cadence: while
+the command plane positively proves the exact turn still runs, the turn stays
+open and the Agent stays busy, and a new send cannot enter that turn. Only the
+fifth consecutive unproven readback settles the active turn `unknown` through
+the shared turn-unknown path (`turn.unknown` with the exact command/turn
+binding, the recorded gap label and the exact readback failure), never as
+success or failure (#427). The turn binding clears only after that terminal
+write is acknowledged; a failed write keeps the binding at the cap and retries
+on the next opportunity instead of stranding the Store turn. A timer,
+subscription admission, or an exhausted read budget never proves completion or
 process death. A failed terminal commit keeps the binding for another attempt.
-Only acknowledged native terminal proof clears it in recovery. Actual endpoint
+Only acknowledged native terminal proof otherwise clears it in recovery. Actual endpoint
 exit still uses the existing host/daemon custody and source-drain path: drain
 queued facts first, then preserve an unestablished outcome as unknown and settle
 loss only after exact generation custody is empty, per monitoring.md's Liveness
@@ -262,8 +268,10 @@ episode alone therefore does not justify changing consumer bounds or claiming
 that batching repairs the native failure.
 PR #422's shared native-exit lifecycle helper still applies only after actual
 endpoint exit; projection unavailability alone cannot invoke that exit path.
-The projection path keeps retrying without retiring the plugin or reporting a
-stopped session to stand in for lost observation.
+The projection path reuses the turn-unknown settlement without retiring the
+plugin or reporting a stopped session to stand in for lost observation: the host
+stays alive and the Agent is not marked lost, so stop, readback and owner
+resolution keep working after the settle.
 
 Guard a pending-request snapshot with a local observation counter so a newer stream
 resolution cannot be overwritten by stale snapshot data. This is an in-memory race guard,
