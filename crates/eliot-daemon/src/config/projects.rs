@@ -253,24 +253,25 @@ pub(super) fn project_registrations_in(
         )?;
         let actions =
             normalize_project_allowlist(&entry.actions, source, offset, id, "actions", |action| {
-                matches!(
-                    action,
-                    "launch"
-                        | "resume"
-                        | "stop"
-                        | "send"
-                        | "git.fetch"
-                        | "steer"
-                        | "interrupt"
-                        | "approve"
-                        | "deny"
-                        | "answer"
-                        | "run"
-                        | "notify"
-                        | "emit"
-                        | "mail.send"
-                        | "var.set"
-                )
+                action == eliot_core::api::PROJECT_ASSIGNMENT_CLAIM_ACTION
+                    || matches!(
+                        action,
+                        "launch"
+                            | "resume"
+                            | "stop"
+                            | "send"
+                            | "git.fetch"
+                            | "steer"
+                            | "interrupt"
+                            | "approve"
+                            | "deny"
+                            | "answer"
+                            | "run"
+                            | "notify"
+                            | "emit"
+                            | "mail.send"
+                            | "var.set"
+                    )
             })?;
         let git = entry.git.clone();
         if let Some(git) = &git {
@@ -317,7 +318,7 @@ fn normalize_project_allowlist(
                 offset,
                 &format!("projects.{project_id}.{field}"),
                 if field == "actions" {
-                    "only implemented launch, resume, stop, send, git.fetch, steer, interrupt, approve, deny, answer, run, notify and emit actions may be approved"
+                    "only implemented command and project assignment actions may be approved"
                 } else {
                     "must name an existing global profile"
                 },

@@ -756,3 +756,6 @@ mod tests {
     }
 }
 pub mod inference;
+
+mod project_assignment;
+pub use project_assignment::*;

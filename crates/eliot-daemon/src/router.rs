@@ -15,6 +15,7 @@ mod goals;
 mod handoff;
 mod hierarchy;
 mod inference;
+mod project_assignment;
 mod resolution;
 mod routing;
 mod rules;
@@ -427,6 +428,14 @@ impl Router {
             "swarm.handoff" => self.swarm_handoff(&params, &principal).await,
             "swarm.switch" => self.swarm_switch(&params, &principal).await,
             "command.cancel" => self.command_cancel(&params, &principal).await,
+            "project.assignment.get" => self.project_assignment_get(&params, &principal).await,
+            "project.assignment.claim" => self.project_assignment_claim(&params, &principal).await,
+            "project.assignment.launch" => {
+                self.project_assignment_launch(&params, &principal).await
+            }
+            "project.assignment.release" => {
+                self.project_assignment_release(&params, &principal).await
+            }
             "project.get" => self.project_get(&params, &principal).await,
             "project.list" => self.project_list(&params, &principal).await,
             "workspace.list" => self.workspace_list(&params, &principal).await,
@@ -5928,6 +5937,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
     }
     for reserved in [
         "registered_project",
+        "project_assignment_launch",
         "profile_choice",
         "source_plan",
         "target_environment",

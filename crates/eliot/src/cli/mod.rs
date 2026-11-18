@@ -6,6 +6,7 @@ pub(crate) mod args;
 mod cleanup;
 mod coord;
 mod daemon;
+mod project_assignment;
 mod reads;
 mod rules;
 mod settings;
@@ -30,7 +31,7 @@ pub(crate) async fn dispatch(
         CliCommand::Status => daemon::run_status(data_dir, json_output).await,
         CliCommand::Maintenance(args) => daemon::run_maintenance(args, data_dir, json_output).await,
         CliCommand::Provider(args) => rules::run_provider(args, data_dir, json_output, id).await,
-        CliCommand::Project(args) => rules::run_project(args, data_dir, json_output).await,
+        CliCommand::Project(args) => rules::run_project(args, data_dir, json_output, id).await,
         CliCommand::Rule(args) => rules::run_rule(args, data_dir, json_output, id).await,
         CliCommand::Timer(args) => rules::run_timer(args, data_dir, json_output, id).await,
         CliCommand::Goal(args) => rules::run_goal(args, data_dir, json_output, id).await,

@@ -1280,6 +1280,40 @@ pub(crate) enum ProjectCommand {
     List,
     /// Show one owner-registered project readback.
     Show(ProjectShowArgs),
+    /// Read or change current project manager assignments.
+    Assignment(ProjectAssignmentArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ProjectAssignmentArgs {
+    #[command(subcommand)]
+    pub(crate) command: ProjectAssignmentCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ProjectAssignmentCommand {
+    /// Read a project's current assignment.
+    Get { project: String },
+    /// Claim as the current Agent, or explicitly name an Agent as Owner.
+    Claim {
+        project: String,
+        #[arg(long, requires = "generation")]
+        agent: Option<String>,
+        #[arg(long, requires = "agent", value_parser = clap::value_parser!(i64).range(1..))]
+        generation: Option<i64>,
+    },
+    /// Reserve and launch the manager using an approved profile.
+    Launch {
+        project: String,
+        #[arg(long)]
+        profile: String,
+    },
+    /// Release an assignment using its current epoch.
+    Release {
+        project: String,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..))]
+        epoch: i64,
+    },
 }
 
 #[derive(Args)]

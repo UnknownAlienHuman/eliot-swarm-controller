@@ -204,6 +204,11 @@ impl Router {
         {
             return None;
         }
+        let assignment = self.inner.store.lock().await.check_assignment_dispatch(id);
+        if let Err(error) = assignment {
+            self.reject_undispatched_error(id, &error).await;
+            return None;
+        }
         if !self.prepare_start_workspace(id, &command).await {
             return None;
         }
