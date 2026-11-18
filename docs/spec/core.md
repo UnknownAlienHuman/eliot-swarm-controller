@@ -177,8 +177,11 @@ authorize a later force-stop of the conflicting Job.
 A controlled loss records its cause on `agent.lost` and, when a turn is open,
 on that turn's `turn.unknown`: `root_exited` for a spontaneous plugin root
 exit (the drain detail stays on `source.gap`), `daemon_restart` for restart
-recovery, and `owner_marked_lost` only for an explicit Owner assertion of
-loss. Readers accept persisted rows carrying any of these reasons.
+recovery, `owner_marked_lost` only for an explicit Owner assertion of
+loss, and otherwise the settlement path's own cause (reader EOF or failure,
+owner-channel closure, daemon force-stop, startup cleanup, or the stop's own
+exit; see [Process observation and terminal ordering](monitoring.md#process-observation-and-terminal-ordering)).
+Readers accept persisted rows carrying any of these reasons.
 
 An open stop/transition is a command beside the observed state, not another state
 machine. Generation transition blocks ordinary turn work. Terminal settlement cancels

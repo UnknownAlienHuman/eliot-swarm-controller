@@ -103,6 +103,24 @@ impl OwnedChild {
         }
     }
 
+    /// Nonblocking root-exit observation for select arbitration: true only
+    /// when the leader exit was already observed. Linux never reaps here so
+    /// the birth-checked group drain still runs before the reap; elsewhere
+    /// the reaped status is cached by the child handle.
+    pub fn try_observe_root_exit(&mut self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.try_wait_exit_unreaped().unwrap_or(false)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.child
+                .try_wait()
+                .map(|status| status.is_some())
+                .unwrap_or(false)
+        }
+    }
+
     /// Separate from leader wait(): only Windows can prove exact family exit.
     /// `false` means the bounded wait expired, never that the family was killed.
     #[cfg(windows)]

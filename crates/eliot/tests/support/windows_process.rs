@@ -25,6 +25,7 @@ struct FileTime {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+    fn GetLastError() -> u32;
     fn GetProcessTimes(
         process: *mut c_void,
         creation: *mut FileTime,
@@ -37,14 +38,30 @@ unsafe extern "system" {
     fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
 }
 
+/// Access denied proves existence: the PID names a live process this test
+/// cannot open, so it must not be mistaken for a gone one.
+const ERROR_ACCESS_DENIED: u32 = 5;
+
+/// Query rights for the liveness probe. Termination rights live only on the
+/// owned `Daemon` handle below, which is the single handle that may signal
+/// that exact process object.
+const PROBE_ACCESS: u32 = 0x1000 | 0x0010_0000; // QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+
+/// Termination plus query rights for the owned `Daemon` handle, requested on
+/// the same birth-verified open so `TerminateProcess` cannot fail for want of
+/// access on an otherwise valid handle.
+const OWN_ACCESS: u32 = 0x0001 | 0x1000 | 0x0010_0000; // TERMINATE | QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+
 /// True only when the exact birth-verified process is still running: a gone
-/// PID, an unreadable process, a recycled PID with a different birth, or a
-/// signaled (exited) handle all report not-live. Only a wait timeout is live.
+/// PID, a recycled PID with a different birth, or a signaled (exited) handle
+/// all report not-live. Only a wait timeout is live. An open refused for
+/// access still proves the PID exists, so it reports live.
 pub fn exact_process_is_live(pid: u32, expected_birth: u64) -> bool {
-    // PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE; never inherit the handle.
-    let raw = unsafe { OpenProcess(0x1000 | 0x0010_0000, 0, pid) };
+    // Never inherit the handle.
+    let raw = unsafe { OpenProcess(PROBE_ACCESS, 0, pid) };
     if raw.is_null() {
-        return false;
+        // SAFETY: OpenProcess failed; reading the thread error is valid.
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
     }
     // SAFETY: OpenProcess returned one owned, non-null process handle.
     let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
@@ -96,8 +113,8 @@ impl Daemon {
     pub fn try_open(data: &Path, info: &Value) -> Option<Self> {
         let pid = u32::try_from(info["pid"].as_u64()?).ok()?;
         let expected_birth = info["process_birth"].as_str()?;
-        // PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE; never inherit the handle.
-        let raw = unsafe { OpenProcess(0x1000 | 0x0010_0000, 0, pid) };
+        // Termination rights on the same birth-verified open; never inherit.
+        let raw = unsafe { OpenProcess(OWN_ACCESS, 0, pid) };
         if raw.is_null() {
             return None;
         }
@@ -166,19 +183,33 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         // Own the exact background process: a test that panics after spawn
-        // must not leak it. Best-effort graceful stop first (it preserves the
-        // daemon log), then terminate the exact handle and reap in-bounds.
-        if !matches!(self.wait(Duration::ZERO), Ok(None)) {
-            return;
-        }
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::support::cli(&self.data, &["daemon", "stop", "--force"])
-        }));
-        if matches!(self.wait(Duration::from_secs(5)), Ok(None)) {
-            let _ = self.terminate();
-            if matches!(self.wait(Duration::from_secs(10)), Ok(None)) {
-                eprintln!("background test daemon survived termination; leaked");
+        // must not leak it. Unwind uses only the retained birth-verified
+        // handle, never IPC by data directory: the original may have exited
+        // and a replacement may have bound the directory before an RPC
+        // arrives. Both the terminate and the reap results are checked.
+        match self.wait(Duration::ZERO) {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("background test daemon wait failed: {error}; terminating exact handle");
             }
+        }
+        if let Err(error) = self.terminate() {
+            eprintln!(
+                "background test daemon terminate failed (data={}): {error}",
+                self.data.display()
+            );
+        }
+        match self.wait(Duration::from_secs(10)) {
+            Ok(Some(_)) => {}
+            Ok(None) => eprintln!(
+                "background test daemon survived termination (data={}); leaked",
+                self.data.display()
+            ),
+            Err(error) => eprintln!(
+                "background test daemon reap failed (data={}): {error}; leaked",
+                self.data.display()
+            ),
         }
     }
 }

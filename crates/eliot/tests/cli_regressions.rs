@@ -248,41 +248,15 @@ fn assert_public_mutation_grammar(fixture: &Fixture, runtime: &tokio::runtime::R
 
 #[test]
 fn cli_launch_rejects_selector_credential_collision_before_persistence() {
-    let fixture = Fixture::new("selector credential collision");
+    // The foreground daemon runs under the same file-backed guard as every
+    // other fixture: stderr goes to a fixture-owned file (never a pipe the
+    // daemon could hold), and the credential redaction below reads that file.
+    let mut fixture = Fixture::new("selector credential collision");
     let credential = format!("test-selector-credential-{}", ulid::Ulid::new());
-
-    let mut data_argument = fixture.data.as_os_str().to_os_string();
-    data_argument.push(std::path::MAIN_SEPARATOR_STR);
-    let mut daemon_command = Command::new(CLI);
-    scrub_ambient_identity(&mut daemon_command);
-    daemon_command
-        .arg("--data-dir")
-        .arg(data_argument)
-        .args(["daemon", "--foreground"])
-        .env("CODEX_HOME", credential.as_str())
-        .env("CODEX_SQLITE_HOME", credential.as_str())
-        .env("EPHEMERAL_TOKEN", credential.as_str());
-    let mut daemon = Captured::spawn(daemon_command);
-    let startup_deadline = std::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(exit) = daemon.child.try_wait().expect("foreground daemon status") {
-            let (stdout, stderr) = daemon.output(Duration::from_secs(2));
-            let safe_output = format!("stdout: {stdout}\nstderr: {stderr}")
-                .replace(credential.as_str(), "[REDACTED_TEST_CREDENTIAL]");
-            let bounded_output = safe_output.chars().take(2048).collect::<String>();
-            panic!("foreground daemon exited during startup ({exit}): {bounded_output}");
-        }
-        let status = cli(&fixture.data, &["status"]);
-        if status.status.success() {
-            assert_eq!(status.json()["state"], "running");
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < startup_deadline,
-            "foreground daemon readiness deadline"
-        );
-        std::thread::sleep(Duration::from_millis(50));
+    for key in ["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"] {
+        fixture.set_daemon_env(key, credential.as_str());
     }
+    fixture.start();
 
     fs::write(
         fixture.data.join("config.toml"),
@@ -321,20 +295,13 @@ pass_env = ["CODEX_HOME", "CODEX_SQLITE_HOME", "EPHEMERAL_TOKEN"]
     assert_eq!(fixture.json(&["status"])["agents"], 0);
     assert!(fixture.events().is_empty(), "rejected launch wrote events");
 
-    let stop = cli(&fixture.data, &["daemon", "stop", "--force"]);
-    assert!(
-        matches!(stop.status.code(), Some(0 | 6)),
-        "daemon cleanup request failed"
-    );
-    assert!(
-        daemon
-            .wait(Duration::from_secs(20))
-            .expect("owned daemon shutdown deadline")
-            .success(),
-        "owned daemon returned nonzero"
-    );
-    let (_, daemon_stderr) = daemon.output(Duration::from_secs(2));
+    fixture.stop(false);
+    let daemon_stderr = fixture.daemon_stderr_tail();
     assert!(!daemon_stderr.contains("panicked"), "daemon panicked");
+    assert!(
+        !daemon_stderr.contains(credential.as_str()),
+        "daemon stderr file must not carry the injected credential"
+    );
 
     let secret_bytes = credential.as_bytes();
     assert!(
@@ -1265,13 +1232,29 @@ fn background_startup_releases_capture_before_daemon_exit() {
         .arg(data_argument)
         .args(["--json", "daemon"]);
     let mut starter = Captured::spawn(command);
-    let starter_status = starter
-        .wait(Duration::from_secs(40))
-        .expect("background starter deadline");
-    // Claim the detached daemon before asserting anything: under load the
-    // starter may spawn it and then fail its own readiness wait, and only a
-    // birth-verified handle still owns it on that panic path.
-    let mut held = claim_background_daemon(&fixture.data);
+    // Claim the detached daemon the moment its metadata appears, while the
+    // starter still runs: custody is established at creation, not after the
+    // starter exits. Under load the starter may spawn the daemon and then
+    // fail its own readiness wait; only a birth-verified handle claimed here
+    // still owns it on that failure path, where `daemon.json` alone would
+    // leave `held` as None with no endpoint to stop.
+    let mut held = None;
+    let starter_deadline = std::time::Instant::now() + Duration::from_secs(40);
+    let starter_status = loop {
+        if held.is_none() {
+            held = claim_background_daemon(&fixture.data);
+        }
+        match starter.child.try_wait().expect("background starter status") {
+            Some(status) => break status,
+            None => {
+                assert!(
+                    std::time::Instant::now() < starter_deadline,
+                    "background starter deadline"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+    };
     assert!(starter_status.success());
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let info = loop {
@@ -1588,9 +1571,33 @@ fn daemon_birth_ticks(data: &Path) -> u64 {
         .expect("birth ticks")
 }
 
+/// Start time of a Unix daemon PID from `/proc/<pid>/stat` field 22, the
+/// birth identity the liveness proof compares. None when procfs is missing or
+/// the PID is gone.
+#[cfg(not(windows))]
+fn proc_start_time(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field may contain spaces and parens; start time is field 22,
+    // counted from the state field right after the last `)`.
+    let after = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[after + 1..].split_whitespace().collect();
+    fields.get(19).map(|ticks| ticks.to_string())
+}
+
+/// True only when the exact Unix daemon is still running: the PID must exist
+/// in procfs with the start time captured before unwinding. A missing PID, a
+/// missing procfs, or a recycled PID with a different start time all report
+/// not-live, so neither a procfs gap nor PID reuse can mistake another
+/// process for the daemon.
+#[cfg(not(windows))]
+fn exact_daemon_is_live(pid: u32, birth: &str) -> bool {
+    proc_start_time(pid).is_some_and(|start| start == birth)
+}
+
 /// E43: a panic after spawning a daemon must not leak it. The fixture's guard
 /// kills and reaps the exact owned child while unwinding; afterwards neither
-/// the OS (exact PID, birth-verified on Windows) nor IPC may show a live daemon.
+/// the OS (exact PID, birth-verified on both platforms) nor IPC may show a
+/// live daemon.
 #[test]
 fn panicking_after_spawn_leaves_no_live_daemon() {
     use std::cell::RefCell;
@@ -1598,20 +1605,27 @@ fn panicking_after_spawn_leaves_no_live_daemon() {
     #[derive(Clone)]
     struct Probe {
         pid: u32,
+        root: std::path::PathBuf,
         data: std::path::PathBuf,
         #[cfg(windows)]
         birth: u64,
+        #[cfg(not(windows))]
+        birth: String,
     }
 
     let probe: RefCell<Option<Probe>> = RefCell::new(None);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut fixture = Fixture::new("panic-owned-daemon");
         fixture.start();
+        let pid = fixture.daemon_pid();
         *probe.borrow_mut() = Some(Probe {
-            pid: fixture.daemon_pid(),
+            pid,
+            root: fixture.root.clone(),
             data: fixture.data.clone(),
             #[cfg(windows)]
             birth: daemon_birth_ticks(&fixture.data),
+            #[cfg(not(windows))]
+            birth: proc_start_time(pid).expect("daemon start time"),
         });
         panic!("intentional panic after spawning the owned daemon");
     }));
@@ -1625,7 +1639,7 @@ fn panicking_after_spawn_leaves_no_live_daemon() {
         #[cfg(windows)]
         let live = windows_process::exact_process_is_live(probe.pid, probe.birth);
         #[cfg(not(windows))]
-        let live = std::path::Path::new(&format!("/proc/{}", probe.pid)).exists();
+        let live = exact_daemon_is_live(probe.pid, &probe.birth);
         let status = cli(&probe.data, &["status"]);
         if !live && !status.status.success() {
             break;
@@ -1637,4 +1651,7 @@ fn panicking_after_spawn_leaves_no_live_daemon() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    // The proof succeeded, so the intentionally retained panic fixture is
+    // removed instead of leaking a temp dir per run.
+    fs::remove_dir_all(&probe.root).expect("remove proven panic fixture");
 }

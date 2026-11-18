@@ -141,9 +141,21 @@ and final native events:
    tail;
 5. only then emit `agent.lost` when exact/shared readback proves control is gone.
 
-The loss records its cause: `root_exited` for a spontaneous plugin root exit,
-and `owner_marked_lost` only for an explicit Owner assertion of loss. The
-drain detail (which gap the reader hit) stays on `source.gap`.
+The loss records its cause: `root_exited` for a spontaneous plugin root
+exit (the observed process exit with its numeric code and redacted stderr
+tail), `owner_marked_lost` only for an explicit Owner assertion of loss, and
+otherwise the settlement path's own cause: `stream_eof_without_session_terminal`
+when the reader reached EOF with no terminal fact and no observed exit,
+`stream_task_failed` when the reader task itself failed,
+`plugin_owner_closed_without_session_terminal` when the Owner channel closed,
+`daemon_force_exit_without_session_terminal` for a daemon force-stop,
+`plugin_startup_exit` for a failed start, or the stop's own exit
+(`stop_exit_without_session_terminal`,
+`force_stop_exit_without_session_terminal`) once its custody exit is proven.
+The drain detail (which gap the reader hit, including
+`root_exit_source_failed`, `root_exit_drain_timeout`,
+`owned_exit_source_failed` and `owned_exit_drain_timeout`) stays on
+`source.gap`.
 
 For a controlled start/resume, a plugin may report a positively observed native endpoint
 exit after its reader has closed and finished. The daemon preserves the command outcome
