@@ -743,6 +743,17 @@ impl Store {
                 "mutation id is already used by a command",
             ));
         }
+        // Completion-digest registrations reserve the shared mutation-id
+        // namespace: a generic write admitted under a pending digest id
+        // would poison the later digest delivery with a write binding.
+        // Only the exact registered digest-delivery conversion (through
+        // `mail_send_digest_delivery`) may reuse the id.
+        if digest_id_bound(&tx, id)? {
+            return Err(Error::new(
+                "id_conflict",
+                "write id is already used by a completion digest",
+            ));
+        }
         if let Some((old_principal, old_method, old_digest, old_result)) = write_binding(&tx, id)? {
             if old_principal != principal || old_method != method || old_digest != digest {
                 return Err(Error::new(

@@ -494,6 +494,18 @@ fn submit_head_tx(
             "mutation id is already used by another write",
         ));
     }
+    // Completion-digest registrations reserve the shared mutation-id
+    // namespace symmetrically to commands and writes: only the exact
+    // registered digest-delivery conversion (through
+    // `mail_send_digest_delivery`) may reuse the id. Without this gate an
+    // ordinary command admitted under a pending digest id would poison the
+    // later delivery with `command_binding`.
+    if digest_id_bound(tx, &request.id)? {
+        return Err(Error::new(
+            "id_conflict",
+            "command id is already used by a completion digest",
+        ));
+    }
     if matches!(request.verb.as_str(), "launch" | "attach")
         && request
             .args

@@ -466,6 +466,55 @@ mod tests {
     }
 
     #[test]
+    fn submit_and_record_write_reject_digest_bound_id() {
+        use eliot_core::SubmitCommand;
+
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let id = ulid::Ulid::new().to_string();
+        let req = digest_request(&id, &parent);
+        store
+            .digest_register("owner", &req, &[false], now)
+            .expect("register");
+        // An ordinary command under a pending digest id would poison the
+        // later delivery with `command_binding`: the shared namespace
+        // reservation rejects it symmetrically to mail/handoff/switch.
+        let mut launch = SubmitCommand::new(id.clone(), "launch");
+        launch.expected_generation = Some(0);
+        launch.args = json!({"project": "p", "workspace": "synthetic-workspace",
+            "harness": "codex", "profile": "fake", "profile_snapshot": {}});
+        let err = store.submit("owner", launch, now).unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // A generic write under the same id would poison delivery with a
+        // write binding instead; it rejects the same way.
+        let err = store
+            .record_write(
+                &id,
+                "owner",
+                "probe.write",
+                &json!({"probe": true}),
+                &json!({"ok": true}),
+                now,
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // The digest registration itself survives both rejections and still
+        // delivers through the exact registered conversion.
+        let mail = MailSendRequest {
+            id: id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "digest body".to_owned(),
+            thread: None,
+            reply_to_delivery: None,
+        };
+        store
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now)
+            .expect("digest delivery");
+    }
+
+    #[test]
     fn digest_restart_keeps_single_mail_identity() {
         let mut store = open_store();
         let now = now_ms();
