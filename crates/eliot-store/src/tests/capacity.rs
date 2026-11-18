@@ -164,7 +164,7 @@ fn schema_51_upgrade_records_the_legacy_generation_name_before_reminting() {
         .target
         .unwrap();
     store.dispatch(&id, now).unwrap();
-    store.connection.execute_batch("ALTER TABLE turns DROP COLUMN effective_model;
+    store.connection.execute_batch("ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -175,8 +175,7 @@ fn schema_51_upgrade_records_the_legacy_generation_name_before_reminting() {
                  ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
                  DROP TABLE project_assignments;
-                 ALTER TABLE artifacts DROP COLUMN seq;
-                 DELETE FROM schema_migrations WHERE version IN (55, 56);
+                 DELETE FROM schema_migrations WHERE version=55;
                  DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
                  DELETE FROM schema_migrations WHERE version=54;
                  DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
@@ -664,7 +663,7 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "ALTER TABLE turns DROP COLUMN effective_model;
+            "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -675,8 +674,7 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
                  ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
                  DROP TABLE project_assignments;
-                 ALTER TABLE artifacts DROP COLUMN seq;
-                 DELETE FROM schema_migrations WHERE version IN (55, 56);
+                 DELETE FROM schema_migrations WHERE version=55;
                  DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
                  DELETE FROM schema_migrations WHERE version=54;
                  DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;

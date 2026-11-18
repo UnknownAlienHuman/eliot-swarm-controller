@@ -197,13 +197,43 @@ pub(super) fn claim_next_input_tx(
         .map_err(|_| Error::new("internal", "context receipt could not be encoded"))
         .map(|bytes| bytes.len())
     };
-    // Lone fitness uses a minimal send: an item that still exceeds a budget
-    // with no send text can never fit a later send either, so it is rejected
-    // with evidence instead of wedging the queue behind every dispatch.
-    let mut minimal_args = send.args.clone();
-    if let Some(object) = minimal_args.as_object_mut() {
-        object.insert("text".to_owned(), Value::String(String::new()));
-    }
+    // Intrinsic fitness uses a canonical minimal send: an item that still
+    // exceeds the plugin envelope with empty send text can never fit a
+    // later send either, so it is rejected with evidence instead of wedging
+    // the queue behind every dispatch. Testing against the current send's
+    // text and metadata instead would permanently reject an inject that
+    // fits a later ordinary send.
+    let minimal_send: Value = json!({"text": ""});
+    // Worst-case `agent.command` plugin envelope in the exact shape the
+    // plugin host transmits: top-level `context` plus the dispatch and
+    // configuration overrides. Ids and overrides unknown at claim time use
+    // their enforced encoded bounds. Over-estimating only defers an item to
+    // a later send; under-estimating would overflow before plugin I/O and
+    // have the committed claims settled as rejected.
+    let plugin_frame = |args: &Value, context: &[ContextItem]| -> Result<Value> {
+        let mut bare = args.clone();
+        if let Some(object) = bare.as_object_mut() {
+            object.remove(CONTEXT_ITEMS_ARG);
+        }
+        let mut params = json!({
+            "agent_id": agent.id,
+            "generation": agent.generation,
+            "command_id": send.id,
+            "verb": "send",
+            "turn_id": send.turn_id.as_deref().unwrap_or(max_turn_id.as_str()),
+            "request_id": send.request_id.as_deref().unwrap_or(max_turn_id.as_str()),
+            "args": bare,
+            "dispatch_seq": i64::MAX,
+        });
+        if !context.is_empty() {
+            params["context"] = serde_json::to_value(context)
+                .map_err(|_| Error::new("internal", "context items could not be encoded"))?;
+        }
+        params["model_override"] = Value::String(max_model.clone());
+        params["effort_override"] = Value::String(max_effort.clone());
+        params["config_revision"] = json!(i64::MAX);
+        Ok(params)
+    };
     'scan: loop {
         let (records, next_cursor) = pending_context_batch_page(
             tx,
@@ -257,14 +287,7 @@ pub(super) fn claim_next_input_tx(
                 continue;
             }
             let lone = vec![item.clone()];
-            let lone_args = send_args(&minimal_args, &lone)?;
-            let lone_frame = json!({
-                "agent_id": agent.id,
-                "generation": agent.generation,
-                "command_id": send.id,
-                "verb": "send",
-                "args": lone_args,
-            });
+            let lone_frame = plugin_frame(&minimal_send, &lone)?;
             match check_rpc_frame("agent.command", &lone_frame) {
                 Ok(()) => {}
                 Err(error) if error.code == "frame_too_large" => {
@@ -289,14 +312,7 @@ pub(super) fn claim_next_input_tx(
             if combined_send_text_len(&send.args, &candidate)? > MAX_TEXT_BYTES {
                 break 'scan;
             }
-            let candidate_args = send_args(&send.args, &candidate)?;
-            let frame = json!({
-                "agent_id": agent.id,
-                "generation": agent.generation,
-                "command_id": send.id,
-                "verb": "send",
-                "args": candidate_args,
-            });
+            let frame = plugin_frame(&send.args, &candidate)?;
             match check_rpc_frame("agent.command", &frame) {
                 Ok(()) => {
                     let mut candidate_outcomes = selected_outcomes.clone();
@@ -1672,6 +1688,48 @@ mod tests {
             pending_injects(&store),
             (queued.len() - claimed.len()) as i64
         );
+    }
+
+    #[test]
+    fn near_limit_send_metadata_does_not_reject_a_later_send_fit() {
+        // Review #662: an admitted near-limit send carries ~900 KiB of
+        // metadata beside a small text. The lone-item check must test the
+        // inject against a canonical minimal send, not the current send's
+        // metadata: a 200 KiB inject fits a later ordinary send with room
+        // to spare, so it must wait for that send instead of being
+        // permanently rejected here.
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let agent = live_next_input_agent(&mut store, now);
+        submit_inject(&mut store, &agent, &"x".repeat(200_000), now);
+        let heavy_id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: heavy_id.clone(),
+                    target: Some(agent.clone()),
+                    selector: None,
+                    verb: "send".to_owned(),
+                    args: json!({"text": "go", "pad": "p".repeat(900_000)}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .unwrap();
+        let claimed = store
+            .dispatch_with_context(&heavy_id, now)
+            .unwrap()
+            .value
+            .context_items;
+        // The batch cannot carry the inject inside the actual plugin
+        // envelope, so nothing is claimed; the inject stays pending for a
+        // later ordinary send instead of being rejected with evidence.
+        assert!(claimed.is_empty());
+        assert_eq!(pending_injects(&store), 1);
     }
 
     #[test]

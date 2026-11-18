@@ -557,10 +557,35 @@ impl Router {
             CleanupPlanRequest::validate,
         )?;
         let name = principal_name(principal);
+        let continued = request
+            .continuation
+            .as_deref()
+            .map(PlanContinuation::decode)
+            .transpose()?
+            .unwrap_or(PlanContinuation {
+                artifact_after: None,
+                safe_skipped: 0,
+                kept_skipped: 0,
+                regs_revision: None,
+                snapshot_seq: None,
+                safe_ids: None,
+                kept_ids: None,
+                backfill_after: None,
+            });
         // Backfill only facts already retained by Swarm, not arbitrary files.
-        let (agents, agents_truncated) = self.inner.store.lock().await.list_agents(None, 1000)?;
+        // Every page resumes after the previous backfill position instead of
+        // restarting from the first row, so a persistently capped fleet
+        // still terminates instead of repeating the same empty page.
+        let (agents, agents_truncated) = self
+            .inner
+            .store
+            .lock()
+            .await
+            .list_agents(continued.backfill_after.as_deref(), 1000)?;
         let mut inventory_incomplete = agents_truncated || agents.len() == 1000;
-        for agent in agents {
+        let mut backfill_after = continued.backfill_after.clone();
+        for agent in &agents {
+            backfill_after = Some(agent.id.clone());
             if request
                 .project
                 .as_ref()
@@ -573,10 +598,13 @@ impl Router {
                 .store
                 .lock()
                 .await
-                .cleanup_visible_agent(&name, &agent)?;
+                .cleanup_visible_agent(&name, agent)?;
             if allowed {
-                inventory_incomplete |= self.record_agent_artifacts(&agent).await.is_err();
+                inventory_incomplete |= self.record_agent_artifacts(agent).await.is_err();
             }
+        }
+        if !inventory_incomplete {
+            backfill_after = None;
         }
         // The Store pages the final candidate order once: ordinary rows,
         // then worktrees, then branches and native sessions, each oldest
@@ -588,18 +616,7 @@ impl Router {
             .lock()
             .await
             .cleanup_inventory(&name, &request)?;
-        let page = request
-            .continuation
-            .as_deref()
-            .map(PlanContinuation::decode)
-            .transpose()?
-            .unwrap_or(PlanContinuation {
-                artifact_after: None,
-                safe_skipped: 0,
-                kept_skipped: 0,
-                regs_revision: None,
-                snapshot_seq: None,
-            });
+        let page = continued;
         let mut plan = CleanupPlan {
             plan_id: ulid::Ulid::new().to_string(),
             created_at: now_ms(),
@@ -610,7 +627,14 @@ impl Router {
         let (safe_projects, kept_projects, regs_revision): (Vec<_>, Vec<_>, Option<String>) =
             if matches!(principal, Principal::Owner) {
                 let (registrations, revision) = self.plan_project_registrations(&request).await?;
-                if page.safe_skipped != 0 || page.kept_skipped != 0 || page.regs_revision.is_some()
+                let (safe, kept): (Vec<_>, Vec<_>) = registrations
+                    .into_iter()
+                    .partition(|item| item.verdict == "safe");
+                if page.safe_skipped != 0
+                    || page.kept_skipped != 0
+                    || page.regs_revision.is_some()
+                    || page.safe_ids.is_some()
+                    || page.kept_ids.is_some()
                 {
                     // Offsets index a project set by position: a changed
                     // settings revision restarts the whole listing instead
@@ -618,17 +642,41 @@ impl Router {
                     if page.regs_revision != revision {
                         return Err(Error::new("invalid", "cleanup continuation is stale"));
                     }
+                    // Verdicts move without touching the settings revision:
+                    // a checkout appearing or disappearing reclassifies its
+                    // project between kept and safe. The saved offsets would
+                    // then skip or repeat a registration, so the ordered ids
+                    // and verdict bands must still match exactly.
+                    if !continuation_order_valid(&page, &revision, &safe, &kept) {
+                        return Err(Error::new("invalid", "cleanup continuation is stale"));
+                    }
                 }
-                let (safe, kept): (Vec<_>, Vec<_>) = registrations
-                    .into_iter()
-                    .partition(|item| item.verdict == "safe");
                 (safe, kept, revision)
             } else {
-                if page.safe_skipped != 0 || page.kept_skipped != 0 || page.regs_revision.is_some()
+                // The backfill cursor is not project state: Agents page the
+                // fleet scan with it while carrying no registration offsets.
+                if page.safe_skipped != 0
+                    || page.kept_skipped != 0
+                    || page.regs_revision.is_some()
+                    || page.safe_ids.is_some()
+                    || page.kept_ids.is_some()
                 {
                     return Err(Error::new("invalid", "cleanup continuation is stale"));
                 }
                 (Vec::new(), Vec::new(), None)
+            };
+        // The token pins the full ordered traversal behind the offsets, so
+        // a reclassified project is detected on the next page instead of
+        // skipping or repeating a registration. Non-owners never carry
+        // project state: any such token in their hands is stale.
+        let (safe_ids, kept_ids): (Option<Vec<String>>, Option<Vec<String>>) =
+            if matches!(principal, Principal::Owner) {
+                (
+                    Some(project_ids(&safe_projects)),
+                    Some(project_ids(&kept_projects)),
+                )
+            } else {
+                (None, None)
             };
         let safe_total = safe_projects.len();
         let kept_total = kept_projects.len();
@@ -640,6 +688,7 @@ impl Router {
         {
             shown_safe.push(item);
         }
+        let artifacts_total = artifacts.len();
         let mut middle = Vec::new();
         for artifact in artifacts
             .into_iter()
@@ -724,16 +773,30 @@ impl Router {
             }
             middle.push(candidate);
         }
+        let middle_len = middle.len();
         let (items, safe_shown, kept_shown) =
             merge_cleanup_page(shown_safe, middle, kept_projects, page.kept_skipped);
         plan.items = items;
-        plan.truncated |= safe_total > page.safe_skipped + safe_shown
-            || kept_total > page.kept_skipped + kept_shown;
+        // Project rows consume page slots: when they displace artifact rows
+        // off a full Store page, the listing continues even though the
+        // Store reported no truncation of its own.
+        plan.truncated |= artifact_listing_truncated(
+            artifacts_truncated,
+            inventory_incomplete,
+            artifacts_total,
+            middle_len,
+            safe_total,
+            page.safe_skipped + safe_shown,
+            kept_total,
+            page.kept_skipped + kept_shown,
+        );
         if plan.truncated {
             // The next page resumes after the last shown artifact inside the
             // same ledger snapshot, skipping the project rows already
             // emitted. Registration ids are minted fresh per plan, so the
-            // offsets travel in the token instead of as row ids.
+            // offsets travel in the token instead of as row ids. The ordered
+            // project ids pin the traversal: a reclassified project makes
+            // the next page stale instead of skipping or repeating a row.
             let last_artifact = plan
                 .items
                 .iter()
@@ -748,6 +811,9 @@ impl Router {
                     kept_skipped: page.kept_skipped + kept_shown,
                     regs_revision,
                     snapshot_seq: Some(snapshot_seq),
+                    safe_ids,
+                    kept_ids,
+                    backfill_after,
                 }
                 .encode()?,
             );
@@ -1770,6 +1836,53 @@ impl Router {
         Ok(!heads.stdout.is_empty())
     }
 }
+/// Ordered project ids of one verdict band, in traversal order. The
+/// continuation pins these so a reclassified project (same settings
+/// revision, different verdict) is detected instead of skipped or repeated.
+fn project_ids(candidates: &[CleanupCandidate]) -> Vec<String> {
+    candidates
+        .iter()
+        .map(|item| item.artifact.project.clone())
+        .collect()
+}
+
+/// Whether a continued page may reuse its offsets: the settings revision
+/// matches and the ordered project ids and verdict bands are unchanged. A
+/// checkout appearing or disappearing reclassifies its project without
+/// moving the revision; the saved positional offsets would then skip or
+/// repeat a registration, so the page is stale instead.
+fn continuation_order_valid(
+    page: &PlanContinuation,
+    revision: &Option<String>,
+    safe: &[CleanupCandidate],
+    kept: &[CleanupCandidate],
+) -> bool {
+    page.regs_revision == *revision
+        && page.safe_ids.as_ref() == Some(&project_ids(safe))
+        && page.kept_ids.as_ref() == Some(&project_ids(kept))
+}
+
+/// Whether the artifact listing continues: the Store still holds eligible
+/// rows, the agent backfill is capped, project rows remain, or project
+/// rows displaced artifact rows off this page.
+#[allow(clippy::too_many_arguments)]
+fn artifact_listing_truncated(
+    artifacts_truncated: bool,
+    inventory_incomplete: bool,
+    artifacts_total: usize,
+    middle_len: usize,
+    safe_total: usize,
+    safe_consumed: usize,
+    kept_total: usize,
+    kept_consumed: usize,
+) -> bool {
+    artifacts_truncated
+        || inventory_incomplete
+        || artifacts_total > middle_len
+        || safe_total > safe_consumed
+        || kept_total > kept_consumed
+}
+
 /// Splice one listing page in final candidate order: the already-offset
 /// safe project rows, the classified artifact page, then the kept rows.
 /// Caps the merged page at `MAX_CLEANUP_ITEMS` and reports how many
@@ -1904,6 +2017,39 @@ impl Router {
         Ok(())
     }
 
+    /// Classify one retirement artifact: the planning gate (quiescence,
+    /// then the bound-worktree blocker) runs before any preflight, so a
+    /// borrowed or assignment-bound worktree stays `keep` and its row is
+    /// never fenced `unknown` across a restart. The apply-time recheck in
+    /// `cleanup_remove` stays as the second gate.
+    async fn classify_retirement_artifact(&self, artifact: ArtifactView) -> CleanupCandidate {
+        let mut candidate = CleanupCandidate {
+            artifact,
+            bytes: None,
+            verdict: "keep".to_owned(),
+            reason: "retirement_preflight".to_owned(),
+        };
+        match self
+            .inner
+            .store
+            .lock()
+            .await
+            .retirement_plan_gate(&candidate.artifact)
+        {
+            Ok(None) => match self.cleanup_preflight(&candidate.artifact).await {
+                Ok(bytes) => {
+                    candidate.verdict = "safe".to_owned();
+                    candidate.reason = "retirement_owned_artifact".to_owned();
+                    candidate.bytes = Some(bytes);
+                }
+                Err(error) => candidate.reason = error.code,
+            },
+            Ok(Some(reason)) => candidate.reason = reason.to_owned(),
+            Err(error) => candidate.reason = error.code,
+        }
+        candidate
+    }
+
     /// Retire one assignment Agent's build and temp directories and managed
     /// worktrees after its stop is applied, when the assignment opts in with
     /// `cleanup_on_retire`. This runs inline in the existing stop worker, not
@@ -1964,33 +2110,8 @@ impl Router {
                 plan.truncated = true;
                 break;
             }
-            let mut candidate = CleanupCandidate {
-                artifact,
-                bytes: None,
-                verdict: "keep".to_owned(),
-                reason: "retirement_preflight".to_owned(),
-            };
-            let quiescent = self
-                .inner
-                .store
-                .lock()
-                .await
-                .cleanup_agent_quiescent(&candidate.artifact)
-                .unwrap_or(false);
-            if quiescent {
-                match self.cleanup_preflight(&candidate.artifact).await {
-                    Ok(bytes) => {
-                        candidate.verdict = "safe".to_owned();
-                        candidate.reason = "retirement_owned_artifact".to_owned();
-                        candidate.bytes = Some(bytes);
-                    }
-                    Err(error) => candidate.reason = error.code,
-                }
-                // TODO(k157): apply the bound-worktree blocker here too once it lands.
-            } else {
-                candidate.reason = "agent_not_quiescent".to_owned();
-            }
-            plan.items.push(candidate);
+            plan.items
+                .push(self.classify_retirement_artifact(artifact).await);
         }
         if !plan.items.iter().any(|item| item.verdict == "safe") {
             return;
@@ -2691,5 +2812,67 @@ mod merge_tests {
         assert_eq!(next.len(), 2);
         assert_eq!(next[0].artifact.id, "worktree-0");
         assert_eq!(next[1].artifact.id, "kept-reg");
+    }
+
+    #[test]
+    fn displaced_artifacts_force_a_continuation() {
+        // Review #661: 63 builds, one worktree, one safe project row and
+        // zero kept rows. The Store fills its 64-row page and reports no
+        // truncation of its own, but the safe row displaces the worktree:
+        // the listing must continue instead of dropping the worktree.
+        assert!(artifact_listing_truncated(false, false, 64, 63, 1, 1, 0, 0));
+        // Full Store pages and remaining project rows continue too.
+        assert!(artifact_listing_truncated(true, false, 64, 64, 0, 0, 0, 0));
+        assert!(artifact_listing_truncated(false, true, 10, 10, 0, 0, 0, 0));
+        assert!(artifact_listing_truncated(false, false, 10, 10, 2, 1, 0, 0));
+        assert!(artifact_listing_truncated(false, false, 10, 10, 0, 0, 1, 0));
+        // A complete page with nothing displaced ends the listing.
+        assert!(!artifact_listing_truncated(
+            false, false, 64, 64, 1, 1, 0, 0
+        ));
+        assert!(!artifact_listing_truncated(
+            false, false, 10, 10, 0, 0, 0, 0
+        ));
+    }
+
+    fn project_reg(id: &str, verdict: &str) -> CleanupCandidate {
+        let mut candidate = merge_reg(id, verdict);
+        candidate.artifact.project = id.to_owned();
+        candidate
+    }
+
+    fn continuation_page(revision: Option<&str>, safe: &[&str], kept: &[&str]) -> PlanContinuation {
+        PlanContinuation {
+            artifact_after: None,
+            safe_skipped: 0,
+            kept_skipped: 0,
+            regs_revision: revision.map(str::to_owned),
+            snapshot_seq: None,
+            safe_ids: Some(safe.iter().map(|id| (*id).to_owned()).collect()),
+            kept_ids: Some(kept.iter().map(|id| (*id).to_owned()).collect()),
+            backfill_after: None,
+        }
+    }
+
+    #[test]
+    fn reclassified_project_rejects_the_continuation() {
+        // Review #661: page one emits safe project `z`. Before page two,
+        // the checkout for earlier-sorting project `a` disappears, moving
+        // `a` from kept to safe without changing the settings revision. The
+        // saved safe offset would skip `a` and emit `z` again, so the pinned
+        // ordering must reject the page instead.
+        let revision = Some("r".to_owned());
+        let page = continuation_page(Some("r"), &["z"], &["a"]);
+        let safe = vec![project_reg("a", "safe"), project_reg("z", "safe")];
+        let kept: Vec<CleanupCandidate> = Vec::new();
+        assert!(!continuation_order_valid(&page, &revision, &safe, &kept));
+        // An unchanged traversal reuses its offsets.
+        let page = continuation_page(Some("r"), &["z"], &["a"]);
+        let safe = vec![project_reg("z", "safe")];
+        let kept = vec![project_reg("a", "keep")];
+        assert!(continuation_order_valid(&page, &revision, &safe, &kept));
+        // A moved settings revision is stale however the order compares.
+        let page = continuation_page(Some("old"), &["z"], &["a"]);
+        assert!(!continuation_order_valid(&page, &revision, &safe, &kept));
     }
 }

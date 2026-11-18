@@ -37,9 +37,12 @@ them before the page cap keeps a settled prefix from starving later eligible
 rows. The Store pages the final candidate order once (ordinary rows, then
 worktrees, then branches and native sessions, each oldest insertion first), and a
 truncated plan returns an opaque `continuation` token: the last shown artifact, the
-consumed project-row offsets, the settings revision those offsets were read at, and
-the ledger snapshot the pages are pinned to. Rows inserted after the snapshot surface
-on a fresh listing, never inside a page; a moved settings revision or an unresolvable
+consumed project-row offsets, the settings revision those offsets were read at, the
+ordered project IDs and verdict bands those offsets were computed against, the
+agent-backfill position, and the ledger snapshot the pages are pinned to. Rows
+inserted after the snapshot surface on a fresh listing, never inside a page; a moved
+settings revision, a reclassified project (a checkout appearing or disappearing moves
+it between kept and safe without moving the revision), or an unresolvable
 cursor rejects the continued page as stale. Automatic retirement filters the exact Agent,
 generation and kind before the same cap.
 Agents are restricted to their frozen and current subtree; Owner selects project

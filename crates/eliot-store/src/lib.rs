@@ -47,10 +47,9 @@ use eliot_core::{
     GitHintPage, GitPathStatus, GitSnapshot, InjectPoint, NativeEvent, NativeStoreBinding,
     PendingRequest, ProcessIdentity, ProcessRecord, ProcessSnapshot, ProcessState, SessionUsage,
     SourceBatch, SourceGap, SourceGapAck, SubmitCommand, Turn, TurnOutcome, TurnResolutionSource,
-    TurnState, TurnUsage,
-    WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
-    WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome,
-    parse_agent_id,
+    TurnState, TurnUsage, WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase,
+    WorkspacePreparation, WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg,
+    WorkspaceSetupOutcome, parse_agent_id,
 };
 pub use eliot_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};

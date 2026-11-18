@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 59;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 60;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1405,6 +1405,19 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 60 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE artifacts ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+                 UPDATE artifacts SET seq = (SELECT COUNT(*) FROM artifacts AS older WHERE older.id <= artifacts.id);
+                 INSERT INTO schema_migrations(version) VALUES (60);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1444,7 +1457,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN effective_model;
+                "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -1482,7 +1495,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN effective_model;
+                "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -1555,7 +1568,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN effective_model;
+                "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -1613,7 +1626,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN effective_model;
+                "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -1714,7 +1727,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN effective_model;
+                "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -1854,14 +1867,16 @@ mod continuity_tests {
                 .unwrap();
             assert!(exists, "index {name} exists on fresh open");
         }
-        // A database at main's v57 (all four v58 indexes dropped, v58
-        // unrecorded) gains exactly those indexes from the v58 upgrade
-        // without touching the assignment tables.
+        // A database at v57 (v60 seq column and v59 diagnostics dropped and
+        // unrecorded, all four v58 indexes dropped, v58 unrecorded) gains
+        // exactly the v58 indexes, the v59 diagnostics columns and the v60
+        // seq column from the upgrade without touching
+        // the assignment tables.
         let mut main_v57 = Store::open(std::path::Path::new(":memory:")).unwrap();
         main_v57
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN effective_model;
+                "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58;",
@@ -1911,7 +1926,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN effective_model;
+                "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;",
             )
@@ -1925,10 +1940,58 @@ mod continuity_tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 59);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
         store
             .connection
             .prepare("SELECT effective_model, native_error_message FROM turns")
             .unwrap();
+    }
+
+    #[test]
+    fn v60_assigns_distinct_artifact_seq() {
+        use eliot_core::api::{ArtifactKind, ArtifactView};
+        let mut store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let version: i64 = store
+            .connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 60);
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','idle',1,0,0)",
+                [],
+            )
+            .unwrap();
+        let artifact = |id: &str| ArtifactView {
+            id: id.to_owned(),
+            agent: "a1".to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: vec!["a1:1".to_owned()],
+            path: format!("C:/seq/{id}"),
+            kind: ArtifactKind::Build,
+            purpose: "seq probe".to_owned(),
+            identity: format!("identity-{id}"),
+            created_at: 0,
+            state: "registered".to_owned(),
+            git: None,
+        };
+        let first = Ulid::new().to_string();
+        let second = Ulid::new().to_string();
+        store.record_known_artifact(artifact(&first)).unwrap();
+        store.record_known_artifact(artifact(&second)).unwrap();
+        let seqs: Vec<i64> = store
+            .connection
+            .prepare("SELECT seq FROM artifacts ORDER BY seq")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(seqs.len(), 2);
+        assert!(seqs[0] < seqs[1], "artifact seq values are distinct");
     }
 }

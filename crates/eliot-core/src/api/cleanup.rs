@@ -165,6 +165,21 @@ pub struct PlanContinuation {
     /// land past it and surface on a fresh listing, never inside a page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_seq: Option<i64>,
+    /// Ordered project ids behind the registration offsets, split by the
+    /// verdict band the router emitted. A page whose traversal reclassifies
+    /// any project (a checkout appearing or disappearing moves it between
+    /// kept and safe without changing the settings revision) is stale: the
+    /// positional offsets would skip or repeat a registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_ids: Option<Vec<String>>,
+    /// Agent-list position the artifact backfill had reached. Every page
+    /// resumes the fleet scan after this id instead of restarting from the
+    /// first row, so a persistently capped fleet still terminates instead
+    /// of returning the same empty page and token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_after: Option<String>,
 }
 impl PlanContinuation {
     pub fn encode(&self) -> Result<String> {

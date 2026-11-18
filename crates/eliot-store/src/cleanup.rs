@@ -184,6 +184,39 @@ impl Store {
         }
         Ok(out)
     }
+    /// Frozen and live subtree membership without consulting the project
+    /// assignment gate. Mirrors the membership half of
+    /// `cleanup_authorized` so the inventory scan can skip unrelated rows
+    /// before their gate is allowed to fail the whole page.
+    fn cleanup_subtree_member(&self, caller: &Sender, artifact: &ArtifactView) -> Result<bool> {
+        let Sender::Agent { id, generation, .. } = caller else {
+            return Ok(true);
+        };
+        if artifact
+            .tree
+            .iter()
+            .any(|entry| entry == &format!("{id}:{generation}"))
+        {
+            return Ok(true);
+        }
+        let mut current = self.get_agent(&artifact.agent)?;
+        for _ in 0..64 {
+            let Some(row) = current else {
+                return Ok(false);
+            };
+            if row.id == *id {
+                return Ok(true);
+            }
+            current = row
+                .parent
+                .as_deref()
+                .map(|p| self.get_agent(p))
+                .transpose()?
+                .flatten();
+        }
+        Ok(false)
+    }
+
     pub fn cleanup_authorized(&self, principal: &str, artifact: &ArtifactView) -> Result<bool> {
         match parse_sender(principal, "cleanup")? {
             Sender::Owner => Ok(true),
@@ -263,6 +296,9 @@ impl Store {
                 kept_skipped: 0,
                 regs_revision: None,
                 snapshot_seq: None,
+                safe_ids: None,
+                kept_ids: None,
+                backfill_after: None,
             });
         let snapshot: i64 = match page.snapshot_seq {
             Some(snapshot) => snapshot,
@@ -322,8 +358,18 @@ impl Store {
                 .as_ref()
                 .is_some_and(|p| p != &artifact.project)
                 || request.older_than.is_some_and(|t| artifact.created_at >= t)
-                || !self.cleanup_authorized(principal, &artifact)?
             {
+                continue;
+            }
+            // Frozen and live subtree membership is checked before the
+            // target's assignment gate: a later row from another managed
+            // project must skip, never abort the page with `not_allowed`.
+            // Only rows in the caller's own subtree reach the gate in
+            // `cleanup_authorized`, where a real assignment refusal aborts.
+            if !self.cleanup_subtree_member(&caller, &artifact)? {
+                continue;
+            }
+            if !self.cleanup_authorized(principal, &artifact)? {
                 continue;
             }
             eligible.push((rank, seq, artifact));
@@ -726,6 +772,7 @@ impl Store {
                     created_at: 0,
                     items: Vec::new(),
                     truncated: false,
+                    continuation: None,
                 },
                 Err(error) => return Err(error),
             };
@@ -882,6 +929,20 @@ impl Store {
         )?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok((plan, response, true))
+    }
+
+    /// Retirement planning gate for one artifact: quiescence first, then
+    /// the bound-worktree blocker. `None` means planning may proceed to
+    /// preflight; `Some(reason)` keeps the row with that reason and
+    /// reserves no attempt, so a borrowed worktree is never fenced
+    /// `unknown` across a restart. Retirement planning must consult this
+    /// before any preflight; the apply-time recheck stays as the second
+    /// gate.
+    pub fn retirement_plan_gate(&self, artifact: &ArtifactView) -> Result<Option<&'static str>> {
+        if !self.cleanup_agent_quiescent(artifact)? {
+            return Ok(Some("agent_not_quiescent"));
+        }
+        self.cleanup_worktree_blocker(artifact)
     }
 
     pub fn cleanup_worktree_blocker(
@@ -1428,6 +1489,7 @@ mod tests {
             created_at: now,
             items: vec![candidate(&artifact)],
             truncated: false,
+            continuation: None,
         };
         store.retain_cleanup_plan("owner", &settled, now).unwrap();
         let settle_apply = CleanupApplyRequest {
@@ -1453,6 +1515,7 @@ mod tests {
             created_at: now,
             items: vec![candidate(&artifact)],
             truncated: false,
+            continuation: None,
         };
         store.retain_cleanup_plan("owner", &unknown, now).unwrap();
         let unknown_apply = CleanupApplyRequest {
@@ -1472,6 +1535,7 @@ mod tests {
             created_at: now,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         store.retain_cleanup_plan("owner", &fresh, now).unwrap();
         // Fill the rest of the ledger with abandoned never-consumed previews.
@@ -1481,6 +1545,7 @@ mod tests {
             created_at: stale_at,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         for _ in 0..(MAX_CLEANUP_PLANS - 3) {
             let mut preview = stale.clone();
@@ -1505,6 +1570,7 @@ mod tests {
             created_at: now,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         store
             .retain_cleanup_plan("owner", &admitted, now)
@@ -1577,6 +1643,7 @@ mod tests {
                 reason: "terminal".to_owned(),
             }],
             truncated: false,
+            continuation: None,
         };
         store.retain_cleanup_plan("owner", &plan, now).unwrap();
         let apply = CleanupApplyRequest {
@@ -1613,6 +1680,7 @@ mod tests {
                 created_at: stale_at,
                 items: vec![],
                 truncated: false,
+                continuation: None,
             };
             store
                 .connection
@@ -1627,6 +1695,7 @@ mod tests {
             created_at: now,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         store
             .retain_cleanup_plan("owner", &admitted, now)
@@ -1682,6 +1751,7 @@ mod tests {
             created_at: now,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         let err = store
             .retain_cleanup_plan("owner", &admitted, now)
@@ -1727,6 +1797,7 @@ mod tests {
                 reason: "terminal".to_owned(),
             }],
             truncated: false,
+            continuation: None,
         };
         store.retain_cleanup_plan("owner", &plan, now).unwrap();
         let apply = CleanupApplyRequest {
@@ -1757,6 +1828,7 @@ mod tests {
                 created_at: stale_at,
                 items: vec![],
                 truncated: false,
+                continuation: None,
             };
             store
                 .connection
@@ -1771,6 +1843,7 @@ mod tests {
             created_at: now,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         store
             .retain_cleanup_plan("owner", &admitted, now)
@@ -2023,6 +2096,9 @@ mod tests {
                     kept_skipped: 0,
                     regs_revision: None,
                     snapshot_seq: Some(snapshot),
+                    safe_ids: None,
+                    kept_ids: None,
+                    backfill_after: None,
                 }
                 .encode()
                 .unwrap(),
@@ -2070,6 +2146,113 @@ mod tests {
         assert!(!truncated);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, other);
+    }
+
+    fn managed_inventory_agent(
+        store: &Store,
+        project: &str,
+        token: Option<&str>,
+        state: &str,
+        base_ms: i64,
+    ) {
+        let token: Option<String> = token.map(str::to_owned);
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project,harness,profile,token,observe_only,state,generation,created_at,updated_at) VALUES (?1,'codex','p',?2,0,?3,1,?4,?4)",
+                params![project, token, state, base_ms],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn unrelated_managed_project_does_not_abort_subtree_page() {
+        // Review #661: after 65 eligible rows for a manager, a later row
+        // from another managed project must skip, never raise `not_allowed`
+        // and discard the page. Frozen and live subtree membership is
+        // checked before the target's assignment gate; only rows in the
+        // caller's own subtree reach the gate.
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let base = Ulid::new().timestamp_ms();
+        managed_inventory_agent(&store, "p1", Some("tok-a1"), "idle", base as i64);
+        managed_inventory_agent(&store, "p2", Some("tok-a2"), "idle", base as i64);
+        managed_inventory_agent(&store, "p2", None, "idle", base as i64);
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO project_registrations(id,checkout,repo_common_dir,profiles,actions)
+                 VALUES ('p2','/chk','/common','[]','[\"stop\"]');
+                 INSERT INTO project_assignments(project,manager,manager_generation,epoch,revision)
+                 VALUES ('p2',2,1,1,1);",
+            )
+            .unwrap();
+        let mut project_artifact = |id: &str, agent: &str, project: &str| {
+            let mut artifact = inventory_artifact(id, agent, ArtifactKind::Build, base as i64);
+            artifact.project = project.to_owned();
+            store.record_known_artifact(artifact).unwrap();
+        };
+        for i in 0..65 {
+            let id = Ulid::from_parts(base + i as u64, 0).to_string();
+            project_artifact(&id, "a1", "p1");
+        }
+        let foreign = Ulid::from_parts(base + 65, 0).to_string();
+        project_artifact(&foreign, "a3", "p2");
+        let request = CleanupPlanRequest {
+            scope: CleanupScope::SelfTree,
+            project: None,
+            older_than: None,
+            continuation: None,
+        };
+        let (items, truncated, _) = store.cleanup_inventory("agent:a1:1", &request).unwrap();
+        assert!(truncated);
+        assert_eq!(items.len(), MAX_CLEANUP_ITEMS);
+        assert!(items.iter().all(|item| item.agent == "a1"));
+    }
+
+    #[test]
+    fn retirement_gate_names_a_live_borrower_before_any_attempt() {
+        // Review #698: a stopped manager's clean worktree can still have a
+        // live borrower. The planning gate must name the blocker before an
+        // attempt is reserved instead of letting the row go safe and fence
+        // it `unknown` across a restart.
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let base = Ulid::new().timestamp_ms();
+        managed_inventory_agent(&store, "mp", None, "stopped", base as i64);
+        let path = "C:/borrowed/wt";
+        let borrower: Option<String> = Some(path.to_owned());
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project,harness,profile,workspace,state,generation,created_at,updated_at) VALUES ('other','codex','p',?1,'idle',1,?2,?2)",
+                params![borrower, base as i64],
+            )
+            .unwrap();
+        let id = Ulid::new().to_string();
+        let mut artifact = inventory_artifact(&id, "a1", ArtifactKind::Worktree, base as i64);
+        artifact.project = "mp".to_owned();
+        artifact.path = path.to_owned();
+        artifact.purpose = "managed worktree".to_owned();
+        store.record_known_artifact(artifact.clone()).unwrap();
+        assert_eq!(
+            store.retirement_plan_gate(&artifact).unwrap(),
+            Some("workspace_borrowed")
+        );
+        // Without the borrower the same quiescent worktree may proceed to
+        // preflight instead of being kept.
+        store
+            .connection
+            .execute("UPDATE agents SET workspace = NULL WHERE id = 2", [])
+            .unwrap();
+        assert_eq!(store.retirement_plan_gate(&artifact).unwrap(), None);
+        // A live manager is never a retirement candidate, borrower or not.
+        store
+            .connection
+            .execute("UPDATE agents SET state = 'idle' WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(
+            store.retirement_plan_gate(&artifact).unwrap(),
+            Some("agent_not_quiescent")
+        );
     }
 }
 #[cfg(test)]
@@ -2127,6 +2310,9 @@ mod continuation_tests {
                     kept_skipped: 0,
                     regs_revision: None,
                     snapshot_seq: Some(snapshot),
+                    safe_ids: None,
+                    kept_ids: None,
+                    backfill_after: None,
                 }
                 .encode()
                 .unwrap(),
@@ -2255,6 +2441,9 @@ mod continuation_tests {
                     kept_skipped: 0,
                     regs_revision: None,
                     snapshot_seq: Some(0),
+                    safe_ids: None,
+                    kept_ids: None,
+                    backfill_after: None,
                 }
                 .encode()
                 .unwrap(),
