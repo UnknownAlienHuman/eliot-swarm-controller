@@ -894,12 +894,7 @@ impl DesktopApp {
         self.post_reveal_highlight(self.menu.reveal_epoch, 0, context);
     }
 
-    fn post_reveal_highlight(
-        &self,
-        epoch: u64,
-        delay_ms: u64,
-        context: &ComponentContext<Self>,
-    ) {
+    fn post_reveal_highlight(&self, epoch: u64, delay_ms: u64, context: &ComponentContext<Self>) {
         let _task = context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
             if delay_ms > 0 {

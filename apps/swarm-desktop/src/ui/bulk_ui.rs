@@ -762,7 +762,8 @@ impl DesktopApp {
                 if let Pick::Missing { project, checkout } = &dialog.pick
                     && !matches!(&result, Err((true, _)))
                 {
-                    self.ledger.complete(&missing_cleanup_key(project, checkout));
+                    self.ledger
+                        .complete(&missing_cleanup_key(project, checkout));
                     self.missing_cleanup
                         .remove(&missing_cleanup_key(project, checkout));
                 }
@@ -830,13 +831,9 @@ impl DesktopApp {
         let _task = context.spawn_background(move |_| {
             let plan = match &pick {
                 Pick::Tasks(scope) => plan_tasks(&data_dir, op, scope.as_deref(), show_archived),
-                Pick::Missing { project, checkout } => plan_missing_project(
-                    &data_dir,
-                    project,
-                    scope.clone(),
-                    checkout,
-                    retained,
-                ),
+                Pick::Missing { project, checkout } => {
+                    plan_missing_project(&data_dir, project, scope.clone(), checkout, retained)
+                }
                 _ => plan_projects(&data_dir, &pick),
             };
             Message::Bulk(BulkMsg::Planned(seq, op, pick, scope, plan))
@@ -1168,9 +1165,7 @@ fn step_current(dialog: Option<&BulkDialog>, seq: u64, index: usize) -> bool {
 /// and the running phase. The apply is spawned once, on the single
 /// Confirm-to-Running transition, so a second reply is always stale.
 fn removal_current(dialog: Option<&BulkDialog>, seq: u64) -> bool {
-    dialog.is_some_and(|dialog| {
-        dialog.seq == seq && matches!(dialog.phase, Phase::Running { .. })
-    })
+    dialog.is_some_and(|dialog| dialog.seq == seq && matches!(dialog.phase, Phase::Running { .. }))
 }
 
 fn step_key(op: BulkOp, agent: &str) -> String {

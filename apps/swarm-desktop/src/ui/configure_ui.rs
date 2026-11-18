@@ -72,13 +72,11 @@ impl ConfigureState {
     /// id, Agent and generation must all match (#681). A reply for an
     /// earlier read (same Agent and generation, older id) changes nothing.
     fn reply_current(&self, request: u64, agent: &str, generation: i64) -> bool {
-        self.loading.as_ref().is_some_and(
-            |(pending, pending_agent, pending_generation)| {
-                *pending == request
-                    && pending_agent == agent
-                    && *pending_generation == generation
-            },
-        )
+        self.loading
+            .as_ref()
+            .is_some_and(|(pending, pending_agent, pending_generation)| {
+                *pending == request && pending_agent == agent && *pending_generation == generation
+            })
     }
 }
 

@@ -827,9 +827,10 @@ impl Conversation {
             // Replies for departed owners never load the budget: only a
             // waiting local input or a resident turn's command keeps text.
             let wanted = self.local.iter().any(|known| known == &command)
-                || self.turns.values().any(|turn| {
-                    turn.command_id.as_deref() == Some(command.as_str())
-                });
+                || self
+                    .turns
+                    .values()
+                    .any(|turn| turn.command_id.as_deref() == Some(command.as_str()));
             if wanted {
                 self.inputs.insert(command, text);
             }
@@ -1904,9 +1905,10 @@ mod tests {
         // waiting local input owns is dropped instead of retained.
         let mut chat = Conversation::new("a1");
         chat.apply_events(&[event(1, "turn.started", json!({"turn_id": "t0"}))]);
-        chat.apply_inputs(vec![
-            ("c-gone".to_owned(), InputText::Loaded("x".repeat(1_024))),
-        ]);
+        chat.apply_inputs(vec![(
+            "c-gone".to_owned(),
+            InputText::Loaded("x".repeat(1_024)),
+        )]);
         assert!(!chat.inputs.contains_key("c-gone"));
         // A waiting local input's own fetch is kept.
         chat.note_local_input("c-wait", "hello");

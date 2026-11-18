@@ -2260,7 +2260,10 @@ model = \"gpt-6\"
         let mut state = SettingsState::default();
         let draft = serde_json::json!({"hostname": "example.com"});
         state.cloud = draft.clone();
-        state.refused(Page::CloudMcp, Note::error("Cloud MCP configuration is malformed."));
+        state.refused(
+            Page::CloudMcp,
+            Note::error("Cloud MCP configuration is malformed."),
+        );
         assert_eq!(state.cloud, draft);
         let note = &state.notes[&Page::CloudMcp];
         assert!(note.error);
