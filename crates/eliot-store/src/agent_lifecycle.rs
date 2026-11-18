@@ -2,6 +2,22 @@
 use super::*;
 use eliot_core::api::AgentTreeResponse;
 
+fn delete_sql_error(error: rusqlite::Error) -> Error {
+    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+        return Error::new(
+            "source_integrity",
+            "Agent deletion violates a Store constraint",
+        );
+    }
+    sql_error(error)
+}
+
+macro_rules! delete_db {
+    ($expression:expr) => {
+        $expression.map_err(delete_sql_error)?
+    };
+}
+
 impl Store {
     /// First retained unknown of each kind across all generations. Lifecycle
     /// deletion checks historical work too; diagnosis must use the same scope,
@@ -39,6 +55,7 @@ impl Store {
         } else {
             "agent.delete"
         };
+        self.ensure_committed_reads()?;
         if let Some(result) = self.cleanup_replay(
             "owner",
             id,
@@ -49,7 +66,16 @@ impl Store {
         }
         self.ensure_writer_healthy()?;
         let result = self.change_agent_tree_inner(id, agent, archived, now);
-        self.fault_on_persistence_error(&result);
+        if archived.is_some() {
+            self.fault_on_persistence_error(&result);
+        } else if result.is_err() && !self.connection.is_autocommit() {
+            // A failed automatic rollback leaves the writer connection unsafe to reuse.
+            self.write_faulted.set(true);
+            return Err(Error::new(
+                "unknown",
+                "Agent deletion rollback could not be verified",
+            ));
+        }
         result
     }
     fn change_agent_tree_inner(
@@ -233,8 +259,31 @@ impl Store {
             deleted: archived.is_none(),
         })
         .map_err(|_| Error::new("internal", "Agent tree result encoding failed"))?;
-        db!(tx.execute("INSERT INTO writes(id,principal,method,payload_digest,result,created_at) VALUES (?1,'owner',?2,?3,?4,?5)",params![id,method,digest,encode_json(&result)?,now]));
-        commit_transaction(tx, &self.write_faulted)?;
+        let receipt = tx.execute(
+            "INSERT INTO writes(id,principal,method,payload_digest,result,created_at)
+             VALUES (?1,'owner',?2,?3,?4,?5)",
+            params![id, method, digest, encode_json(&result)?, now],
+        );
+        if archived.is_some() {
+            db!(receipt);
+            commit_transaction(tx, &self.write_faulted)?;
+        } else {
+            delete_db!(receipt);
+            if let Err(error) = commit_sql(&tx) {
+                // An open transaction can still roll back. A constraint refusal
+                // also proves SQLite did not commit, including a commit-hook veto.
+                if tx.is_autocommit()
+                    && error.sqlite_error_code() != Some(rusqlite::ErrorCode::ConstraintViolation)
+                {
+                    self.write_faulted.set(true);
+                    return Err(Error::new(
+                        "unknown",
+                        "Agent deletion commit outcome is unknown",
+                    ));
+                }
+                return Err(delete_sql_error(error));
+            }
+        }
         Ok(result)
     }
 }
@@ -325,16 +374,16 @@ fn custody_blocker_tx(tx: &Transaction<'_>, agent: i64, observers: bool) -> Resu
 fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()> {
     const MAX_DELETE_COMMANDS: usize = 10_000;
     // Temporary selection is transaction-local and is never a second deletion ledger.
-    db!(tx.execute_batch(
+    delete_db!(tx.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS deleted_agents(id INTEGER PRIMARY KEY);
          CREATE TEMP TABLE IF NOT EXISTS deleted_commands(id TEXT PRIMARY KEY NOT NULL);
          DELETE FROM deleted_agents;
          DELETE FROM deleted_commands;"
     ));
     for num in members {
-        db!(tx.execute("INSERT INTO deleted_agents VALUES (?1)", [num]));
+        delete_db!(tx.execute("INSERT INTO deleted_agents VALUES (?1)", [num]));
     }
-    let mut command_count = db!(tx.execute(
+    let mut command_count = delete_db!(tx.execute(
         "INSERT INTO deleted_commands
          SELECT id FROM commands WHERE target IN (SELECT id FROM deleted_agents) LIMIT ?1",
         [MAX_DELETE_COMMANDS as i64 + 1],
@@ -342,7 +391,7 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     if command_count <= MAX_DELETE_COMMANDS {
         // Selector and automation admission parents have no Agent target. The
         // link check below still requires every member of each included set.
-        command_count += db!(tx.execute(
+        command_count += delete_db!(tx.execute(
             "INSERT INTO deleted_commands
              SELECT DISTINCT p.id FROM deleted_commands d
              JOIN commands c ON c.id=d.id JOIN commands p ON p.id=c.parent_command
@@ -362,7 +411,7 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
             "Agent command tree exceeds deletion bound",
         ));
     }
-    let crossing: bool = db!(tx.query_row(
+    let crossing: bool = delete_db!(tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM deleted_commands d JOIN commands c ON c.id=d.id
              WHERE c.parent_command IS NOT NULL
@@ -380,11 +429,11 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
             "command tree crosses the selected Agent tree",
         ));
     }
-    let latest: i64=tx.query_row("SELECT COALESCE(MAX(seq),0) FROM events WHERE agent IN (SELECT id FROM deleted_agents)",[],|r|r.get(0)).map_err(sql_error)?;
+    let latest: i64=tx.query_row("SELECT COALESCE(MAX(seq),0) FROM events WHERE agent IN (SELECT id FROM deleted_agents)",[],|r|r.get(0)).map_err(delete_sql_error)?;
     // Rules traverse the global log. Per-Agent sources consume only their own
     // generation's history; the stopped-and-drained guard already excludes
     // every live source in the selected tree.
-    let pinned: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM rule_state WHERE enabled=1 AND (current_cursor<?1 OR retiring_cursor<?1))",[latest],|r|r.get(0)).map_err(sql_error)?;
+    let pinned: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM rule_state WHERE enabled=1 AND (current_cursor<?1 OR retiring_cursor<?1))",[latest],|r|r.get(0)).map_err(delete_sql_error)?;
     if pinned {
         return Err(Error::new(
             "busy",
@@ -401,26 +450,33 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
                  WHERE t.depth<1000
              ) SELECT id FROM tree ORDER BY depth DESC",
         )
-        .map_err(sql_error)?
+        .map_err(delete_sql_error)?
         .query_map([], |r| r.get(0))
-        .map_err(sql_error)?
+        .map_err(delete_sql_error)?
         .collect::<rusqlite::Result<_>>()
-        .map_err(sql_error)?;
+        .map_err(delete_sql_error)?;
     if ids.len() != command_count {
         return Err(Error::new(
             "source_integrity",
             "command tree is incomplete or exceeds its depth bound",
         ));
     }
-    db!(tx.execute("DELETE FROM processes WHERE EXISTS(SELECT 1 FROM deleted_agents d WHERE processes.owner GLOB 'agent:a'||d.id||'#*' OR processes.owner GLOB 'workspace:a'||d.id||'#*')",[]));
-    // Keep retry identities after removing payloads: a deleted native effect can never be admitted again.
-    db!(tx.execute("INSERT INTO writes(id,principal,method,payload_digest,result,created_at) SELECT c.id,c.principal,c.method,c.payload_digest,'{}',?1 FROM deleted_commands d JOIN commands c ON c.id=d.id",[now]));
+    delete_db!(tx.execute("DELETE FROM processes WHERE EXISTS(SELECT 1 FROM deleted_agents d WHERE processes.owner GLOB 'agent:a'||d.id||'#*' OR processes.owner GLOB 'workspace:a'||d.id||'#*')",[]));
+    // Preserve existing mutation receipts. Create retry tombstones only
+    // for commands whose identities would otherwise disappear.
+    delete_db!(tx.execute(
+        "INSERT INTO writes(id,principal,method,payload_digest,result,created_at)
+         SELECT c.id,c.principal,c.method,c.payload_digest,'{}',?1
+         FROM deleted_commands d JOIN commands c ON c.id=d.id
+         WHERE NOT EXISTS (SELECT 1 FROM writes w WHERE w.id=c.id)",
+        [now],
+    ));
     // A deleted probe binding is proven settled (the tree guard above admits
     // no live or unknown command), so its claim falls back to the
     // conservative held restriction instead of violating the held/probing
     // CHECK or silently dropping the restriction. Genuinely unknown ongoing
     // probes never reach this statement: they block the delete above.
-    db!(tx.execute("UPDATE provider_holds SET probe_command=NULL, state='held', updated_at=?1 WHERE probe_command IN (SELECT id FROM deleted_commands)",[now]));
+    delete_db!(tx.execute("UPDATE provider_holds SET probe_command=NULL, state='held', updated_at=?1 WHERE probe_command IN (SELECT id FROM deleted_commands)",[now]));
     // Active cleanup attempts already block. Deleting the Agent supersedes
     // plan items that never acquired an attempt fence.
     for (table, column) in [
@@ -441,29 +497,32 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
         ("completion_digests", "parent"),
         ("artifacts", "agent"),
     ] {
-        db!(tx.execute(
+        delete_db!(tx.execute(
             &format!("DELETE FROM {table} WHERE {column} IN (SELECT id FROM deleted_agents)"),
             []
         ));
     }
-    db!(tx.execute("DELETE FROM native_child_registrations WHERE producer IN (SELECT id FROM deleted_agents) OR parent IN (SELECT id FROM deleted_agents) OR child IN (SELECT id FROM deleted_agents)",[]));
-    db!(tx.execute("DELETE FROM messages WHERE recipient IN (SELECT id FROM deleted_agents) OR sender IN (SELECT 'a'||id FROM deleted_agents)",[]));
+    delete_db!(tx.execute("DELETE FROM native_child_registrations WHERE producer IN (SELECT id FROM deleted_agents) OR parent IN (SELECT id FROM deleted_agents) OR child IN (SELECT id FROM deleted_agents)",[]));
+    delete_db!(tx.execute("DELETE FROM messages WHERE recipient IN (SELECT id FROM deleted_agents) OR sender IN (SELECT 'a'||id FROM deleted_agents)",[]));
     // Mark a conservative history floor before removing individual retained events.
-    db!(tx.execute("UPDATE rule_history_coverage SET pruned_through=MAX(pruned_through,COALESCE((SELECT MAX(seq) FROM events WHERE agent IN (SELECT id FROM deleted_agents)),0)) WHERE singleton=1",[]));
-    db!(tx.execute(
+    delete_db!(tx.execute("UPDATE rule_history_coverage SET pruned_through=MAX(pruned_through,COALESCE((SELECT MAX(seq) FROM events WHERE agent IN (SELECT id FROM deleted_agents)),0)) WHERE singleton=1",[]));
+    delete_db!(tx.execute(
         "DELETE FROM events WHERE agent IN (SELECT id FROM deleted_agents)",
         []
     ));
-    retention::delete_commands_tx(tx, ids.iter().map(String::as_str))?;
-    db!(tx.execute(
+    delete_db!(retention::delete_commands_tx(
+        tx,
+        ids.iter().map(String::as_str)
+    ));
+    delete_db!(tx.execute(
         "UPDATE agents SET parent=NULL,root=NULL WHERE id IN (SELECT id FROM deleted_agents)",
         []
     ));
-    db!(tx.execute(
+    delete_db!(tx.execute(
         "DELETE FROM agents WHERE id IN (SELECT id FROM deleted_agents)",
         []
     ));
-    db!(tx.execute_batch("DELETE FROM deleted_commands; DELETE FROM deleted_agents;"));
+    delete_db!(tx.execute_batch("DELETE FROM deleted_commands; DELETE FROM deleted_agents;"));
     Ok(())
 }
 
@@ -490,6 +549,56 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_constraint_refusals_roll_back_and_keep_writer_healthy() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = ulid::Ulid::new().timestamp_ms() as i64;
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at)
+             VALUES ('','muse','p','stopped',1,?1,?1)",
+                [now],
+            )
+            .unwrap();
+        let id = ulid::Ulid::new().to_string();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER refuse_delete BEFORE DELETE ON agents
+             BEGIN SELECT RAISE(ABORT, 'injected delete constraint'); END;",
+            )
+            .unwrap();
+        let expect_rolled_back = |store: &mut Store| {
+            assert_eq!(
+                store
+                    .change_agent_tree(&id, "a1", None, now)
+                    .unwrap_err()
+                    .code,
+                "source_integrity"
+            );
+            assert!(store.get_agent("a1").unwrap().is_some());
+            assert!(write_binding(&store.connection, &id).unwrap().is_none());
+            assert!(store.connection.is_autocommit());
+            assert!(!store.is_write_faulted());
+        };
+        expect_rolled_back(&mut store);
+        store.connection.execute_batch(
+            "DROP TRIGGER refuse_delete;
+             CREATE TABLE delete_guard(agent INTEGER REFERENCES agents(id) DEFERRABLE INITIALLY DEFERRED);
+             INSERT INTO delete_guard VALUES(1);",
+        ).unwrap();
+        expect_rolled_back(&mut store);
+        store
+            .connection
+            .execute_batch("DROP TABLE delete_guard;")
+            .unwrap();
+        assert_eq!(
+            store.change_agent_tree(&id, "a1", None, now).unwrap()["deleted"],
+            true
+        );
+    }
 
     #[test]
     fn stopped_tree_refusal_names_its_historical_unknown_turn() {

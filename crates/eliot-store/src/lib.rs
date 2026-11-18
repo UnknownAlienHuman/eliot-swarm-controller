@@ -240,21 +240,24 @@ static TXN_COMMIT_ERRORS: AtomicU64 = AtomicU64::new(0);
 static TXN_COMMIT_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 fn commit_transaction(tx: Transaction<'_>, write_faulted: &Cell<bool>) -> Result<()> {
+    commit_sql(&tx).map_err(|error| {
+        write_faulted.set(true);
+        sql_error(error)
+    })
+}
+
+fn commit_sql(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     let started = std::time::Instant::now();
-    let result = tx.commit();
+    let result = tx.execute_batch("COMMIT");
     TXN_COMMITS.fetch_add(1, Ordering::Relaxed);
     TXN_COMMIT_MS_TOTAL.fetch_add(
         started.elapsed().as_millis().min(u64::MAX as u128) as u64,
         Ordering::Relaxed,
     );
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            TXN_COMMIT_ERRORS.fetch_add(1, Ordering::Relaxed);
-            write_faulted.set(true);
-            Err(sql_error(error))
-        }
+    if result.is_err() {
+        TXN_COMMIT_ERRORS.fetch_add(1, Ordering::Relaxed);
     }
+    result
 }
 
 #[derive(Clone, Debug, PartialEq)]

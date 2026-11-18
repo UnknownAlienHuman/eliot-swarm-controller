@@ -59,8 +59,10 @@ different binding fails `id_conflict`. Absent ids outside the supported retry wi
 (default 24 h, shorter than retention) fail `id_expired`.
 
 Commands store this directly; other writes use the API's small `writes` table. One
-writer checks both namespaces. Derived ids identify linked inputs, selector children,
-rule actions and Goal rounds. There is no universal receipt/floor subsystem.
+writer checks both namespaces. A compound write may share its receipt ID with the
+command it admits. Agent deletion preserves that receipt and records a tombstone only
+for a command ID without a receipt. Derived ids identify linked inputs, selector
+children, rule actions and Goal rounds. There is no universal receipt/floor subsystem.
 
 ### Memory physical calls
 
@@ -660,8 +662,9 @@ rotation or log loss leaves the unadmitted ID `not_found`.
 
 ## Storage
 
-Use bundled SQLite, WAL, synchronous FULL, one writer and bounded read queries. Commit
-failure blocks new writes/dispatch and never repeats the external cause. The SQL below
+Use bundled SQLite, WAL, synchronous FULL, one writer and bounded read queries. An
+uncertain commit outcome blocks new writes/dispatch and never repeats the external
+cause. Agent deletion also fences the writer if rollback cannot be verified. The SQL below
 is a compact view of current table shapes, not a migration script or a requirement to
 create unused subsystems. Exact schema evolution lives in numbered migrations.
 

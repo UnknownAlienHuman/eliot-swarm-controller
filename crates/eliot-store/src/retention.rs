@@ -338,7 +338,8 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let deleted = delete_commands_tx(&tx, doomed.iter().map(|member| member.id.as_str()))?;
+        let deleted = delete_commands_tx(&tx, doomed.iter().map(|member| member.id.as_str()))
+            .map_err(sql_error)?;
         let writes = prune_writes_tx(&tx, cutoff)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok((deleted, writes))
@@ -664,17 +665,14 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
 pub(super) fn delete_commands_tx<'a>(
     tx: &Transaction<'_>,
     ids: impl IntoIterator<Item = &'a str>,
-) -> Result<i64> {
+) -> rusqlite::Result<i64> {
     let mut clear = tx
-        .prepare("UPDATE mail_notices SET open_notice_command=NULL WHERE open_notice_command=?1")
-        .map_err(sql_error)?;
-    let mut delete = tx
-        .prepare("DELETE FROM commands WHERE id=?1")
-        .map_err(sql_error)?;
+        .prepare("UPDATE mail_notices SET open_notice_command=NULL WHERE open_notice_command=?1")?;
+    let mut delete = tx.prepare("DELETE FROM commands WHERE id=?1")?;
     let mut deleted = 0;
     for id in ids {
-        db!(clear.execute([id]));
-        deleted += db!(delete.execute([id])) as i64;
+        clear.execute([id])?;
+        deleted += delete.execute([id])? as i64;
     }
     Ok(deleted)
 }

@@ -751,9 +751,12 @@ floor return `busy`; oversized operations return `unavailable` atomically. An un
 the deleted tree's items. Delete never stops an Agent or deletes workspace files,
 native stores or Git branches. Run artifact cleanup separately before removing its
 ownership records. Process records for every generation of the tree are removed;
-consumed cleanup plans and their exact apply replay remain retained. Deleted command IDs
-remain bound until the retry window expires, preventing a deleted native effect from
-being readmitted.
+consumed cleanup plans and their exact apply replay remain retained. A deleted command
+keeps any existing write receipt verbatim, including the receipt for a managed
+`project.assignment.launch`. Delete records a retry tombstone when the command ID has
+no receipt. Both preserve the ID binding until the retry window expires, preventing a
+deleted native effect from being readmitted. A Store constraint refusal returns
+`source_integrity` after rollback and leaves the writer available.
 Archive/delete replies are `{agent, affected, archived:bool|null, deleted:bool}`;
 mutation ID, result and changes commit together. Exact retries return the retained
 reply even after deletion; changed payloads return `id_conflict`. MCP mints `id`
