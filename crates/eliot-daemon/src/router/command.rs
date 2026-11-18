@@ -1352,13 +1352,13 @@ impl Router {
     }
 
     pub(super) async fn settle_workspace_prepare_error(&self, id: &str, error: &Error) {
-        // WorkspaceManager persists its typed creation/setup outcomes. A Ready
-        // retained Resume readback is the remaining pre-native Unknown; Store
-        // rechecks that exact pending marker atomically before recording it.
+        // Typed creation/setup failures settle in WorkspaceManager. If the
+        // final pre-native identity read is uncertain, Store rechecks the
+        // pending command and workspace phase before recording it.
         if error.code == "unknown" {
             let mut store = self.inner.store.lock().await;
             if let Ok(Some(command)) = store.get_command(id)
-                && command.verb == "resume"
+                && matches!(command.verb.as_str(), "launch" | "resume")
                 && matches!(command.state, CommandState::Accepted | CommandState::Queued)
                 && let Some(target_generation) = command
                     .generation

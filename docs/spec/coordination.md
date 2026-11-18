@@ -179,8 +179,8 @@ and the competing caller receives the current record with a typed reason.
 Release advances the epoch and retains the vacant record. Resume advances the
 manager generation and epoch atomically with dispatch. Replacement requires an
 explicit release and new assignment. Release revokes Swarm authority and
-leaves existing execution to its native lifecycle. An unresolved manager start
-blocks release. Ordinary startup of a separate root is refused while the
+leaves existing execution to its native lifecycle. Dispatched or unresolved
+native startup blocks release. Ordinary startup of a separate root is refused while the
 assignment is occupied. Restart reads the existing record. A heartbeat timeout,
 lost process or uncertain startup never frees an assignment. Owner retains explicit
 administrative and recovery authority. A scoped self-claim requires a live eligible
@@ -206,20 +206,25 @@ and setup chain](monitoring.md#workspace-preparation). Native dispatch starts
 only once that worktree is ready. A retry under the same operation ID returns
 the retained result; after a restart the daemon reads back the existing
 preparation instead of preparing a second worktree or re-running an unknown
-setup. A refused or unknown launch before startup leaves no assignment behind.
+setup. A confirmed preparation failure or cancellation settles the launch and
+clears the assignment, binding and unstarted capacity together. Uncertain
+preparation retains a blocked assignment with the workspace and start command ID.
+The Owner can explicitly release that epoch. Release preserves the unknown
+command, workspace receipt and capacity, and fences subsequent startup.
 
 Workers launched by that manager inherit its project assignment and workspace
-automatically through the existing parent link: they run in the manager worktree
-under the current assignment fence. A worker launch while the manager worktree
-is not ready is refused rather than admitted into a half-prepared checkout.
+automatically through the existing parent link. They run in the manager's ready
+worktree under the current assignment fence and can reuse a frozen profile with
+setup entries. Workspace setup runs only during preparation of a new worktree.
 
 The current workspace binding to the assignment is recorded separately from
 the historical creator receipt, so a later transfer can move the binding without
-rewriting history. Cleanup and worktree removal respect the binding: a bound or
-borrowed worktree is never removed, and only release unbinds it. An existing
-checkout may be adopted explicitly as a manager workspace; adoption is never
-automatic, keeps the checkout environment with no setup side effects, and never
-turns the checkout into a cleanup artifact.
+rewriting history. Cleanup planning, cleanup apply and worktree removal keep
+bound worktrees and worktrees with nonterminal borrowers, including after release.
+Explicit adoption verifies the canonical checkout and common directory, rejects
+overlap with retained bindings, managed worktrees and live Agent workspaces, and
+freezes the approved profile for native startup. It keeps the existing checkout
+environment and creates no setup effects or worktree cleanup artifact.
 
 ## Conversation association
 

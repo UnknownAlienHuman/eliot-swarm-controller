@@ -33,6 +33,10 @@ pub struct ProjectAssignment {
     pub epoch: i64,
     pub revision: i64,
     pub state: ProjectAssignmentState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_command_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]

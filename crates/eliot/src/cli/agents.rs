@@ -232,7 +232,11 @@ pub(crate) async fn run_launch(
         .map(std::path::absolute)
         .transpose()
         .map_err(|error| Failure::new(2, format!("cannot resolve launch workspace: {error}")))?;
-    if workspace.is_none() && !chat {
+    if workspace.is_none()
+        && !chat
+        && parent.is_none()
+        && std::env::var_os("ELIOT_AGENT_ID").is_none()
+    {
         return Err(Failure::new(2, "launch requires --workspace or --chat"));
     }
     if let Some(name) = &harness

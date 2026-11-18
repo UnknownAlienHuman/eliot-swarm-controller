@@ -80,6 +80,17 @@ fn managed_request(project: &str) -> ProjectAssignmentLaunchRequest {
     }
 }
 
+fn reserved_generation(store: &Store, agent: i64) -> Option<i64> {
+    store
+        .connection
+        .query_row(
+            "SELECT capacity_generation FROM agents WHERE id = ?1",
+            [agent],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 /// Drive a freshly admitted managed worktree to `ready`, standing in for the
 /// daemon preparation chain which has no Store-level side effects to test.
 fn mark_worktree_ready(store: &Store, agent: i64) {
@@ -506,9 +517,7 @@ fn worker_inherits_assignment_and_workspace() {
         .unwrap();
     let mut child = launch(Ulid::new().to_string(), "alpha");
     child.args["parent"] = json!(manager);
-    // The router resolves this from the inherited workspace via project
-    // discovery; the Store test pins the same binding explicitly.
-    child.args["registered_project"] = json!("alpha");
+    // The Store also inherits the parent's project without a router hint.
     child.args["workspace"] = json!("/wt/manager");
     let principal = format!("agent:{manager}:1");
     let worker = store
@@ -522,8 +531,34 @@ fn worker_inherits_assignment_and_workspace() {
     assert_eq!(worker_row.project, "alpha");
     assert_eq!(worker_row.workspace, manager_row.workspace);
     assert_eq!(worker_row.workspace.as_deref(), Some("/wt/manager"));
-    assert_eq!(worker_row.parent, Some(manager));
+    assert_eq!(worker_row.parent.as_deref(), Some(manager.as_str()));
     assert_eq!(worker_row.root, manager_row.root);
+    let artifact = core::api::ArtifactView {
+        id: "worktree-test".into(),
+        agent: manager,
+        generation: 1,
+        project: "alpha".into(),
+        tree: Vec::new(),
+        path: "/wt/manager".into(),
+        kind: core::api::ArtifactKind::Worktree,
+        purpose: "managed worktree".into(),
+        identity: "test".into(),
+        created_at: now,
+        state: "registered".into(),
+        git: None,
+    };
+    assert_eq!(
+        store.cleanup_worktree_blocker(&artifact).unwrap(),
+        Some("assignment_bound")
+    );
+    assert_eq!(
+        release(&mut store, 1, now + 1).outcome,
+        ProjectAssignmentOutcome::Released
+    );
+    assert_eq!(
+        store.cleanup_worktree_blocker(&artifact).unwrap(),
+        Some("workspace_borrowed")
+    );
 }
 
 #[test]
@@ -544,6 +579,12 @@ fn same_id_retry_after_restart_creates_no_duplicate() {
     drop(first);
     let mut restarted = Store::open(&db_path).unwrap();
     restarted.recover_on_restart(now + 1).unwrap();
+    let recovered = restarted.project_assignment("owner", "alpha").unwrap();
+    assert_eq!(recovered.state, ProjectAssignmentState::Blocked);
+    assert_eq!(
+        recovered.start_command_id.as_deref(),
+        Some(request.id.as_str())
+    );
     let (command, input) = managed_launch(request.id.clone(), "alpha", "/wt/alpha-1");
     let retried = restarted
         .launch_project_manager(&request, Ok((command, Some(input))), now + 1)
@@ -569,7 +610,7 @@ fn same_id_retry_after_restart_creates_no_duplicate() {
 }
 
 #[test]
-fn refused_or_unknown_launch_leaves_no_fake_assignment() {
+fn pre_admission_refusal_does_not_reserve_assignment() {
     let now = Ulid::new().timestamp_ms() as i64;
     let mut store = Store::open(Path::new(":memory:")).unwrap();
     register(&mut store, now);
@@ -589,8 +630,7 @@ fn refused_or_unknown_launch_leaves_no_fake_assignment() {
             })
             .unwrap()
     };
-    // An unknown preparation fails before any Store write: no assignment,
-    // no Agent, no workspace row.
+    // A preflight error leaves no admitted assignment, Agent, or workspace.
     let request = managed_request("alpha");
     let failed: Result<_> = store.launch_project_manager(
         &request,
@@ -621,6 +661,165 @@ fn refused_or_unknown_launch_leaves_no_fake_assignment() {
     assert!(store.get_command(&competitor.id).unwrap().is_none());
     assert_eq!(count_agents(&store), 1);
     assert_eq!(count_workspaces(&store), 1);
+}
+
+#[test]
+fn failed_preparation_settles_launch_and_clears_assignment() {
+    let now = Ulid::new().timestamp_ms() as i64;
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    register(&mut store, now);
+    let request = managed_request("alpha");
+    let (command, input) = managed_launch(request.id.clone(), "alpha", "/wt/failed");
+    let admitted = store
+        .launch_project_manager(&request, Ok((command, Some(input))), now)
+        .unwrap()
+        .value;
+    let manager = store
+        .get_command(&request.id)
+        .unwrap()
+        .unwrap()
+        .target
+        .unwrap();
+    let manager_num = parse_agent_id(&manager).unwrap();
+    assert_eq!(reserved_generation(&store, manager_num), Some(1));
+    assert!(store.workspace_assignment_bound("/wt/failed").unwrap());
+
+    let failed = store
+        .settle_workspace_creation(
+            &request.id,
+            1,
+            core::WorkspaceCreationOutcome::Failed {
+                code: "git_exit".into(),
+                message: "worktree was not created".into(),
+                failure_where: None,
+                origin: None,
+                origin_evidence: None,
+            },
+            now + 1,
+        )
+        .unwrap()
+        .value;
+    assert_eq!(failed.phase, core::WorkspacePhase::Failed);
+    assert_eq!(
+        store.get_command(&request.id).unwrap().unwrap().state,
+        CommandState::Failed
+    );
+    assert_eq!(
+        store.get_agent(&manager).unwrap().unwrap().state,
+        AgentState::Failed
+    );
+    assert_eq!(reserved_generation(&store, manager_num), None);
+    let vacant = store.project_assignment("owner", "alpha").unwrap();
+    assert_eq!(vacant.state, ProjectAssignmentState::Vacant);
+    assert_eq!(vacant.epoch, admitted.assignment.epoch + 1);
+    assert_eq!(vacant.manager, None);
+    assert_eq!(vacant.workspace, None);
+    assert_eq!(vacant.start_command_id, None);
+    assert!(!store.workspace_assignment_bound("/wt/failed").unwrap());
+    assert_eq!(
+        release(&mut store, vacant.epoch, now + 2).outcome,
+        ProjectAssignmentOutcome::Vacant
+    );
+    assert_eq!(
+        store
+            .replay_project_manager_launch(&request, now + 3)
+            .unwrap(),
+        Some(admitted)
+    );
+    let replacement = managed_request("alpha");
+    let (command, input) = managed_launch(replacement.id.clone(), "alpha", "/wt/replacement");
+    assert_eq!(
+        store
+            .launch_project_manager(&replacement, Ok((command, Some(input))), now + 3)
+            .unwrap()
+            .value
+            .outcome,
+        ProjectAssignmentOutcome::LaunchAdmitted
+    );
+}
+
+#[test]
+fn unknown_preparation_is_readable_and_explicit_release_fences_readback() {
+    let now = Ulid::new().timestamp_ms() as i64;
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    register(&mut store, now);
+    let request = managed_request("alpha");
+    let (command, input) = managed_launch(request.id.clone(), "alpha", "/wt/unknown");
+    let verified = core::WorkspaceCreationOutcome::Verified {
+        repo_path: input.repo_path.clone(),
+        repo_common_dir: input.repo_common_dir.clone(),
+        worktree_path: input.worktree_path.clone(),
+        branch: input.requested_branch.clone(),
+        head: input.base_oid.clone(),
+    };
+    let admitted = store
+        .launch_project_manager(&request, Ok((command, Some(input))), now)
+        .unwrap()
+        .value;
+    let manager = store
+        .get_command(&request.id)
+        .unwrap()
+        .unwrap()
+        .target
+        .unwrap();
+    let manager_num = parse_agent_id(&manager).unwrap();
+    let unknown = store
+        .settle_workspace_creation(
+            &request.id,
+            1,
+            core::WorkspaceCreationOutcome::Unknown {
+                code: "git_unknown".into(),
+                message: "no verified worktree result".into(),
+                failure_where: None,
+                origin: None,
+                origin_evidence: None,
+            },
+            now + 1,
+        )
+        .unwrap()
+        .value;
+    assert_eq!(unknown.phase, core::WorkspacePhase::Unknown);
+    let blocked = store.project_assignment("owner", "alpha").unwrap();
+    assert_eq!(blocked.state, ProjectAssignmentState::Blocked);
+    assert_eq!(blocked.epoch, admitted.assignment.epoch);
+    assert_eq!(blocked.workspace.as_deref(), Some("/wt/unknown"));
+    assert_eq!(
+        blocked.start_command_id.as_deref(),
+        Some(request.id.as_str())
+    );
+    assert!(store.workspace_assignment_bound("/wt/unknown").unwrap());
+    assert_eq!(
+        store.get_command(&request.id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+    assert_eq!(reserved_generation(&store, manager_num), Some(1));
+    let released = release(&mut store, blocked.epoch, now + 2);
+    assert_eq!(released.outcome, ProjectAssignmentOutcome::Released);
+    assert_eq!(released.assignment.state, ProjectAssignmentState::Vacant);
+    assert_eq!(released.assignment.workspace, None);
+    assert!(!store.workspace_assignment_bound("/wt/unknown").unwrap());
+    assert_eq!(
+        store
+            .settle_workspace_creation(&request.id, 1, verified, now + 3)
+            .unwrap_err()
+            .code,
+        "stale_assignment"
+    );
+    assert_eq!(
+        store.get_workspace(&manager).unwrap().unwrap().phase,
+        core::WorkspacePhase::Unknown
+    );
+    assert_eq!(
+        store.get_command(&request.id).unwrap().unwrap().state,
+        CommandState::Unknown
+    );
+    assert_eq!(reserved_generation(&store, manager_num), Some(1));
+    assert_eq!(
+        store
+            .replay_project_manager_launch(&request, now + 3)
+            .unwrap(),
+        Some(admitted)
+    );
 }
 
 #[test]
@@ -706,4 +905,31 @@ fn explicit_adoption_binds_without_a_worktree_row() {
         "id_conflict"
     );
     assert!(store.get_command(&competitor.id).unwrap().is_none());
+}
+
+#[test]
+fn adoption_refuses_overlapping_unmanaged_agent_workspaces() {
+    let now = Ulid::new().timestamp_ms() as i64;
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    register(&mut store, now);
+    let mut writer = launch(Ulid::new().to_string(), "/adopted/alpha/subdirectory");
+    writer.args["workspace"] = json!("/adopted/alpha/subdirectory");
+    store.submit("owner", writer, now).unwrap();
+
+    let mut request = managed_request("alpha");
+    request.adopt_worktree = Some("/adopted/alpha".into());
+    let mut command = launch(request.id.clone(), "/adopted/alpha");
+    command.args["workspace"] = json!("/adopted/alpha");
+    assert_eq!(
+        store
+            .launch_project_manager(&request, Ok((command, None)), now)
+            .unwrap_err()
+            .code,
+        "id_conflict"
+    );
+    assert!(store.get_command(&request.id).unwrap().is_none());
+    assert_eq!(
+        store.project_assignment("owner", "alpha").unwrap().state,
+        ProjectAssignmentState::Vacant
+    );
 }

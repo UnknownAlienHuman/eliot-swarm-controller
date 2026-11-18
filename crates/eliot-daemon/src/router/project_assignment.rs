@@ -69,9 +69,7 @@ impl Router {
                 ));
             }
             let git = crate::workspace_git::WorkspaceGit::new()?;
-            let (checkout, common_dir) = git
-                .repository_identity(&registration.checkout)
-                .await?;
+            let (checkout, common_dir) = git.repository_identity(&registration.checkout).await?;
             if checkout != registration.checkout || common_dir != registration.repo_common_dir {
                 return Err(Error::new(
                     "not_allowed",
@@ -87,37 +85,23 @@ impl Router {
             // daemon never adopts automatically, and an adopted checkout keeps
             // its environment with no setup side effects.
             let preparation = if let Some(adopt) = request.adopt_worktree.as_deref() {
-                let adopted = std::fs::canonicalize(adopt).map_err(|_| {
-                    Error::new("invalid", "adopted checkout must be an existing directory")
-                })?;
-                let adopted = adopted.to_str().ok_or_else(|| {
-                    Error::new("invalid", "adopted checkout path is not Unicode")
-                })?;
-                let (_, adopt_common) =
-                    git.repository_identity(adopted).await?;
-                if adopt_common != registration.repo_common_dir {
+                launch.args = json!({"workspace": adopt, "profile": request.profile});
+                normalize_launch(&mut launch, principal)?;
+                let canonical = required_text(&launch.args, "workspace")?;
+                let (adopt_checkout, adopt_common) = git.repository_identity(canonical).await?;
+                if adopt_checkout != canonical || adopt_common != registration.repo_common_dir {
                     return Err(Error::new(
                         "not_allowed",
                         "adopted checkout is outside this project repository",
                     ));
                 }
-                {
-                    let store = self.inner.store.lock().await;
-                    if store.get_workspace_by_path(adopted)?.is_some() {
-                        return Err(Error::new(
-                            "id_conflict",
-                            "adopted checkout is already a managed worktree",
-                        ));
-                    }
-                }
-                launch.args = json!({"workspace": adopted, "profile": request.profile});
-                normalize_launch(&mut launch, principal)?;
+                self.freeze_launch_profile(principal, &mut launch).await?;
                 None
             } else {
                 launch.args = json!({"workspace": registration.checkout, "profile": request.profile, "worktree": manager_branch(&request.id)});
                 normalize_launch(&mut launch, principal)?;
                 let input = self
-                    .freeze_launch_admission(principal, &mut launch, false)
+                    .freeze_launch_admission(principal, &mut launch, false, false)
                     .await?;
                 Some(input.ok_or_else(|| {
                     Error::new("internal", "manager worktree was not frozen")
@@ -135,6 +119,15 @@ impl Router {
         let mut store = self.inner.store.lock().await;
         let prepared = prepared.and_then(|prepared| {
             self.check_command_admission_mode("launch")?;
+            if !store
+                .get_project_registration("owner", &request.project)?
+                .is_some_and(|current| current.revision == registration.revision)
+            {
+                return Err(Error::new(
+                    "stale_assignment",
+                    "manager launch registration changed",
+                ));
+            }
             Ok(prepared)
         });
         let change = store.launch_project_manager(&request, prepared, now_ms())?;
@@ -158,5 +151,33 @@ fn encode_assignment(value: impl serde::Serialize) -> Result<Value> {
 /// ID. Retries of the same ID reuse the same branch and read back the retained
 /// preparation instead of preparing a second worktree.
 fn manager_branch(id: &str) -> String {
-    format!("swarm/{}", id.to_ascii_lowercase())
+    // Git refs can be case-insensitive on disk. Preserve the original case
+    // in a numeric suffix while keeping canonical ULID branches unchanged.
+    let case = id.bytes().fold(0_u32, |bits, byte| {
+        (bits << 1) | u32::from(byte.is_ascii_lowercase())
+    });
+    let name = id.to_ascii_lowercase();
+    if case == 0 {
+        format!("swarm/{name}")
+    } else {
+        format!("swarm/{name}-{case:x}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::manager_branch;
+
+    #[test]
+    fn manager_branches_keep_case_distinctions_on_windows() {
+        let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let canonical = manager_branch(id);
+        let lower = manager_branch(&id.to_ascii_lowercase());
+        let mixed = manager_branch(&id.replacen('A', "a", 1));
+        assert_eq!(canonical, format!("swarm/{}", id.to_ascii_lowercase()));
+        assert_ne!(canonical, lower);
+        assert_ne!(canonical, mixed);
+        assert_ne!(lower, mixed);
+        assert_eq!(manager_branch(id), canonical);
+    }
 }

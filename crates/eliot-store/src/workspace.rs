@@ -333,6 +333,28 @@ pub(super) fn gate_workspace_start(
     Ok(())
 }
 
+pub(super) fn workspace_has_borrowers(
+    connection: &Connection,
+    owner: &str,
+    path: &str,
+) -> Result<bool> {
+    let mut statement = connection
+        .prepare(
+            "SELECT workspace FROM agents WHERE id <> ?1 AND workspace IS NOT NULL
+             AND state IN ('created','starting','idle','busy','waiting','unknown')",
+        )
+        .map_err(sql_error)?;
+    let borrowers = statement
+        .query_map([parse_agent_id(owner)?], |row| row.get::<_, String>(0))
+        .map_err(sql_error)?;
+    for borrower in borrowers {
+        if managed_path_contains(path, &borrower.map_err(sql_error)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn require_workspace_removable(
     connection: &Connection,
     agent: &Agent,
@@ -384,22 +406,11 @@ pub(super) fn require_workspace_removable(
             "cancel the pending start before removing its workspace",
         ));
     }
-    let mut statement = connection
-        .prepare(
-            "SELECT workspace FROM agents WHERE id <> ?1 AND workspace IS NOT NULL
-         AND state IN ('created','starting','idle','busy','waiting','unknown')",
-        )
-        .map_err(sql_error)?;
-    let borrowers = statement
-        .query_map([parse_agent_id(&agent.id)?], |row| row.get::<_, String>(0))
-        .map_err(sql_error)?;
-    for borrower in borrowers {
-        if managed_path_contains(&workspace.worktree_path, &borrower.map_err(sql_error)?) {
-            return Err(Error::new(
-                "busy",
-                "another nonterminal Agent references this worktree or a descendant",
-            ));
-        }
+    if workspace_has_borrowers(connection, &agent.id, &workspace.worktree_path)? {
+        return Err(Error::new(
+            "busy",
+            "another nonterminal Agent references this worktree or a descendant",
+        ));
     }
     let mut sources = connection
         .prepare("SELECT repo_path FROM workspaces WHERE agent <> ?1 AND phase <> 'removed'")
@@ -767,6 +778,9 @@ pub(super) fn settle_preparation_command(
             };
             db!(tx.execute("UPDATE agents SET state = ?1, updated_at = ?2 WHERE id = ?3 AND generation = 0 AND state = 'created'",
                 params![agent_state_name(next), now, parse_agent_id(&agent.id)?]));
+            if matches!(state, CommandState::Failed | CommandState::Cancelled) {
+                project_assignment::clear_failed_preparation(tx, &agent, &command.command.id)?;
+            }
         }
         if matches!(state, CommandState::Failed | CommandState::Cancelled) {
             cancel_workspace_input(tx, &command.command.id, now, events)?;
@@ -1454,13 +1468,32 @@ impl Store {
         }
         match action {
             WorkspaceAction::Creation(outcome) => {
+                let pending =
+                    matches!(command.state, CommandState::Accepted | CommandState::Queued);
+                let unknown = matches!(&outcome, WorkspaceCreationOutcome::Unknown { .. });
                 let ready_resume_unknown = workspace.phase == WorkspacePhase::Ready
                     && command.command.verb == "resume"
                     && reuse
                     && workspace.setup_index == workspace.frozen_setup.len()
-                    && matches!(command.state, CommandState::Accepted | CommandState::Queued)
-                    && matches!(&outcome, WorkspaceCreationOutcome::Unknown { .. });
-                if !(matches!(
+                    && pending
+                    && unknown;
+                let manager_identity_unknown = command.command.verb == "launch"
+                    && command
+                        .command
+                        .args
+                        .get(project_assignment::MANAGER_LAUNCH_ARG)
+                        .is_some()
+                    && matches!(
+                        workspace.phase,
+                        WorkspacePhase::Ready | WorkspacePhase::SetupReady
+                    )
+                    && pending
+                    && unknown;
+                if manager_identity_unknown {
+                    // A lost identity after verified creation is distinct
+                    // from unknown creation. It cannot reopen setup.
+                    marker["stage"] = json!("identity");
+                } else if !(matches!(
                     workspace.phase,
                     WorkspacePhase::Creating | WorkspacePhase::Unknown
                 ) || ready_resume_unknown)
@@ -1508,6 +1541,14 @@ impl Store {
                             WorkspacePhase::SetupReady
                         };
                         if command.state == CommandState::Unknown {
+                            if command
+                                .command
+                                .args
+                                .get(project_assignment::MANAGER_LAUNCH_ARG)
+                                .is_some()
+                            {
+                                project_assignment::check_dispatch(&tx, &command)?;
+                            }
                             if !core::workspace_preparation_transition_allowed(
                                 command.state,
                                 CommandState::Accepted,

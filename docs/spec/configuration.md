@@ -448,9 +448,11 @@ inventory), so anything else unexpected fails the start.
 
 ## Owner workspace setup
 
-Global profiles accept ordered setup entries only for an explicit `launch --worktree`.
-The router rejects nonempty setup on a shared/existing workspace; profile loading never
-runs a command. The raw owner format is:
+Global profiles can define ordered setup entries. They run when an explicit
+`launch --worktree` or a managed manager launch prepares a new worktree. Workers
+borrowing a parent's workspace and explicit manager adoption reuse the existing
+environment without running setup. Other launches with setup require a new
+worktree. Profile loading performs no setup. The raw owner format is:
 
 ```toml
 [[profiles.codex-luna.setup]]
@@ -727,8 +729,8 @@ sole registration for the common directory. Ambiguous matches refuse discovery.
 Reuse returns that registration's checkout and exact allowlists, preserves the
 Agent's workspace, and adds no settings entry. A launch records the selected
 registration ID independently of its execution workspace and authorization scope.
-Agent-principal launches use the same Git matching with read-only access to existing
-registrations. Workspace inventory is read-only. Daemon startup performs no project
+Child launches inherit the parent's recorded project and authorization scope.
+Workspace inventory is read-only. Daemon startup performs no project
 discovery. Registration runs through an explicit Owner open (`project.discover`),
 an Owner launch in the checkout, or the desktop's workspace checkout.
 `path` names the canonical

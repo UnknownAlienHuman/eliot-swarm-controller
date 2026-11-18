@@ -670,17 +670,14 @@ impl Router {
                     candidate.reason = "native_archive_pending".to_owned();
                     candidate.bytes = None;
                 }
-            } else if candidate.artifact.kind == ArtifactKind::Worktree
-                && self
-                    .inner
-                    .store
-                    .lock()
-                    .await
-                    .workspace_assignment_bound(&candidate.artifact.path)?
+            } else if let Some(reason) = self
+                .inner
+                .store
+                .lock()
+                .await
+                .cleanup_worktree_blocker(&candidate.artifact)?
             {
-                // A worktree bound to a current manager assignment is never
-                // removed, borrowed or not: release the assignment first.
-                candidate.reason = "assignment_bound".to_owned();
+                candidate.reason = reason.to_owned();
             } else if self
                 .inner
                 .store
@@ -971,6 +968,12 @@ impl Router {
                     return Err(Error::new("identity_changed", "worktree identity changed"));
                 }
                 let store = self.inner.store.lock().await;
+                if let Some(reason) = store.cleanup_worktree_blocker(artifact)? {
+                    return Err(Error::new(
+                        reason,
+                        "worktree acquired a binding or borrower",
+                    ));
+                }
                 if !store.cleanup_authorized(principal, artifact)?
                     || !store.cleanup_agent_quiescent(artifact)?
                 {
