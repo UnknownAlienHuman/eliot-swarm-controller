@@ -114,29 +114,40 @@ const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
            AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command AND p.method = 'swarm.switch')
            AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = commands.target AND w.start_command_id = commands.id)))";
 
-/// Chunk bound for retained-id exclusion lists: far below SQLite default variable
-/// limit, so drain-time exclusion of every classified retained unknown never fails
-/// to prepare.
-const UNSETTLED_EXCLUSION_CHUNK: usize = 500;
-
-/// `AND id NOT IN (...)` fragment excluding retained ids before any
-/// `ORDER BY`/`LIMIT`, in `UNSETTLED_EXCLUSION_CHUNK`-sized groups. An empty
-/// exclusion list leaves the predicate unchanged.
-fn unsettled_exclusion_clause(excluded: &[String]) -> (String, Vec<String>) {
-    if excluded.is_empty() {
-        return (String::new(), Vec::new());
-    }
-    let mut values = Vec::with_capacity(excluded.len());
-    let mut groups = Vec::new();
-    for chunk in excluded.chunks(UNSETTLED_EXCLUSION_CHUNK) {
-        groups.push(format!(
-            "id NOT IN ({})",
-            chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",")
-        ));
-        values.extend(chunk.iter().cloned());
-    }
-    (format!(" AND {}", groups.join(" AND ")), values)
-}
+/// Retained-unresolved unknowns as a SQL predicate over durable Store facts
+/// (on the `commands` table, without alias): a stored `unknown` command whose
+/// target Agent generation has no live process, no open turn or reader behind
+/// exactly that generation. Terminal generations (`stopped`/`failed`/`lost`)
+/// retire unconditionally; rows on fenced generations are residue, so an open
+/// source or a live turn only backs the command while the Agent is still on
+/// that generation. Only a recorded turn matching the Agent's live turn
+/// backs the command; an unknown with no turn never reads as turn-backed.
+/// The predicate is exhaustive over all unknowns (no page cap) and
+/// binds no id lists, so excluding it never approaches the SQLite variable
+/// limit no matter how many unknowns are retained.
+const RETAINED_UNKNOWN_PREDICATE: &str = "state = 'unknown'
+    AND target IS NOT NULL AND generation IS NOT NULL
+    AND EXISTS (
+        SELECT 1 FROM agents a WHERE a.id = commands.target
+        AND NOT EXISTS (
+            SELECT 1 FROM processes p
+            WHERE (p.owner = 'agent:a' || commands.target || '#' || commands.generation
+                OR p.owner = 'workspace:a' || commands.target || '#' || commands.generation)
+              AND p.state IN ('running', 'unknown')
+        )
+        AND NOT (commands.turn_id IS NOT NULL AND commands.turn_id IS a.active_turn)
+        AND NOT (a.generation = commands.generation AND a.active_turn IS NOT NULL)
+        AND (
+            a.state IN ('stopped', 'failed', 'lost')
+            OR a.generation != commands.generation
+            OR NOT EXISTS (
+                SELECT 1 FROM source_state s
+                WHERE s.agent = a.id AND s.generation = commands.generation
+                  AND s.source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+                  AND s.state = 'open'
+            )
+        )
+    )";
 
 const LIST_PROCESSES_FIRST_PAGE_SQL: &str =
     "SELECT host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at
@@ -989,17 +1000,7 @@ impl Store {
         }
         let mut losses = Vec::with_capacity(agents.len());
         for (num, generation, row_updated_at) in agents {
-            let seq: Option<i64> = self
-                .connection
-                .query_row(
-                    "SELECT seq FROM events
-                     WHERE kind = 'agent.lost' AND agent = ?1 AND generation = ?2
-                     ORDER BY seq DESC LIMIT 1",
-                    params![num, generation],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(sql_error)?;
+            let seq = latest_lost_seq(&self.connection, num, generation)?;
             losses.push(StartupLoss {
                 agent: format_agent_id(num),
                 agent_num: num,
@@ -1010,6 +1011,17 @@ impl Store {
         }
         enforce_page_bytes(&mut losses)?;
         Ok(losses)
+    }
+
+    /// Latest retained `agent.lost` sequence for one Agent generation, for
+    /// attention checks that meet a lost Agent through a non-loss trigger
+    /// (a sweep must report the same deterministic loss identity as the
+    /// `agent.lost` event path). `None` when the exact evidence was pruned
+    /// or never retained: callers skip that row rather than synthesizing an
+    /// event identity.
+    pub fn latest_lost_event_seq(&self, agent: &str, generation: i64) -> Result<Option<i64>> {
+        let agent_num = parse_agent_id(agent)?;
+        latest_lost_seq(&self.connection, agent_num, generation)
     }
 
     /// Timestamp of one retained event, for deterministic loss-report
@@ -1192,70 +1204,40 @@ impl Store {
         retention::coverage_pruned_through(&self.connection)
     }
 
-    /// Bounded page of stored-`unknown` command ids, newest first, with the
-    /// exact total. Lets drain classification cover unknowns the daemon never
-    /// saw dispatched (for example across a restart, where the in-memory
-    /// unknown cache starts empty) without an unbounded scan. Callers that
-    /// need more than the page must keep the unclassified remainder blocking:
-    /// an unlisted id is never silently excused.
-    pub fn list_unknown_command_ids_page(&self, limit: usize) -> Result<(Vec<String>, usize)> {
-        validate_limit(limit)?;
-        let mut statement = self
-            .connection
-            .prepare("SELECT id FROM commands WHERE state = 'unknown' ORDER BY rowid DESC LIMIT ?1")
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map([limit as i64], |row| row.get(0))
-            .map_err(sql_error)?;
-        let mut ids = Vec::new();
-        for row in rows {
-            ids.push(row.map_err(sql_error)?);
-        }
-        let total: i64 = self
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM commands WHERE state = 'unknown'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
-        Ok((
-            ids,
-            usize::try_from(total.max(0))
-                .map_err(|_| Error::new("internal", "unknown command count is invalid"))?,
-        ))
-    }
-
-    /// Return unsettled commands without letting terminal history consume the limit.
-    pub fn list_unsettled_commands(&self, limit: usize) -> Result<Vec<Command>> {
-        self.list_unsettled_commands_excluding(&[], limit)
-    }
-
-    /// Return unsettled commands with retained ids excluded in SQL before
-    /// `ORDER BY`/`LIMIT`, so classified retained unknowns can never occupy
-    /// the bounded drain prefix and hide a live command behind it. The empty
-    /// exclusion list keeps the plain bounded behavior. Callers compare the
-    /// companion excluding count against the returned page and keep blocking
-    /// while unlisted commands remain: an unlisted id is never excused.
-    pub fn list_unsettled_commands_excluding(
-        &self,
-        excluded: &[String],
-        limit: usize,
-    ) -> Result<Vec<Command>> {
-        validate_limit(limit)?;
-        let (exclusion, values) = unsettled_exclusion_clause(excluded);
+    /// Whether one stored command is a retained-unresolved unknown under the
+    /// drain predicate: `unknown` with no live process, turn or reader behind
+    /// its generation. Single-row check, so per-id classification needs no id
+    /// lists and never approaches the SQLite variable limit.
+    pub fn is_retained_unknown(&self, id: &str) -> Result<bool> {
         let sql = format!(
-            "{LIST_UNSETTLED_COMMANDS_COLUMNS} WHERE {UNSETTLED_COMMANDS_WHERE}{exclusion} ORDER BY created_at, rowid LIMIT ?"
+            "SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?1 AND {RETAINED_UNKNOWN_PREDICATE})"
+        );
+        self.connection
+            .query_row(&sql, [id], |row| row.get(0))
+            .map_err(sql_error)
+    }
+
+    /// Total retained-unresolved unknowns, exhaustive over all stored
+    /// unknowns: no page cap, so an older retained unknown can never hide
+    /// behind the classification bound and block drain forever.
+    pub fn count_retained_unknown_commands(&self) -> Result<i64> {
+        let sql = format!("SELECT COUNT(*) FROM commands WHERE {RETAINED_UNKNOWN_PREDICATE}");
+        self.connection
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(sql_error)
+    }
+
+    /// Bounded retained-unresolved page for the drain receipt, oldest first,
+    /// with the same predicate as the total. The caller marks truncation
+    /// honestly against the total for any omission reason.
+    pub fn list_retained_unknown_commands(&self, limit: usize) -> Result<Vec<Command>> {
+        validate_limit(limit)?;
+        let sql = format!(
+            "{LIST_UNSETTLED_COMMANDS_COLUMNS} WHERE {RETAINED_UNKNOWN_PREDICATE} ORDER BY created_at, rowid LIMIT ?1"
         );
         let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
-        let limit_param = limit as i64;
-        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(values.len() + 1);
-        for value in &values {
-            params.push(value);
-        }
-        params.push(&limit_param);
         let rows = statement
-            .query_map(params.as_slice(), command_record_from_row)
+            .query_map([limit as i64], command_record_from_row)
             .map_err(sql_error)?;
         let mut commands = Vec::new();
         for row in rows {
@@ -1265,21 +1247,59 @@ impl Store {
         Ok(commands)
     }
 
-    /// Total unsettled commands with retained ids excluded in SQL, ignoring
-    /// the drain list bound and the page byte bound. Compare with the
-    /// excluding bounded list to mark truncation honestly for any reason,
-    /// including retained entries that left the list.
-    pub fn count_unsettled_commands_excluding(&self, excluded: &[String]) -> Result<i64> {
-        let (exclusion, values) = unsettled_exclusion_clause(excluded);
-        let sql =
-            format!("SELECT COUNT(*) FROM commands WHERE {UNSETTLED_COMMANDS_WHERE}{exclusion}");
+    /// Return unsettled commands without letting terminal history consume the limit.
+    pub fn list_unsettled_commands(&self, limit: usize) -> Result<Vec<Command>> {
+        validate_limit(limit)?;
+        let sql = format!(
+            "{LIST_UNSETTLED_COMMANDS_COLUMNS} WHERE {UNSETTLED_COMMANDS_WHERE} ORDER BY created_at, rowid LIMIT ?1"
+        );
         let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
-        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(values.len());
-        for value in &values {
-            params.push(value);
+        let rows = statement
+            .query_map([limit as i64], command_record_from_row)
+            .map_err(sql_error)?;
+        let mut commands = Vec::new();
+        for row in rows {
+            commands.push(command_from_raw(row.map_err(sql_error)?)?.command);
         }
-        statement
-            .query_row(params.as_slice(), |row| row.get(0))
+        enforce_page_bytes(&mut commands)?;
+        Ok(commands)
+    }
+
+    /// Return unsettled commands with retained-unresolved unknowns excluded in
+    /// SQL before `ORDER BY`/`LIMIT`, so retained entries can never occupy the
+    /// bounded drain prefix and hide a live command behind it. The predicate
+    /// binds no ids, so the exclusion never approaches the SQLite variable
+    /// limit. Callers compare the companion excluding count against the
+    /// returned page and keep blocking while unlisted commands remain: an
+    /// unlisted id is never excused.
+    pub fn list_unsettled_commands_excluding_retained(&self, limit: usize) -> Result<Vec<Command>> {
+        validate_limit(limit)?;
+        let sql = format!(
+            "{LIST_UNSETTLED_COMMANDS_COLUMNS} WHERE {UNSETTLED_COMMANDS_WHERE} AND NOT ({RETAINED_UNKNOWN_PREDICATE}) ORDER BY created_at, rowid LIMIT ?1"
+        );
+        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        let rows = statement
+            .query_map([limit as i64], command_record_from_row)
+            .map_err(sql_error)?;
+        let mut commands = Vec::new();
+        for row in rows {
+            commands.push(command_from_raw(row.map_err(sql_error)?)?.command);
+        }
+        enforce_page_bytes(&mut commands)?;
+        Ok(commands)
+    }
+
+    /// Total unsettled commands with retained-unresolved unknowns excluded in
+    /// SQL, ignoring the drain list bound and the page byte bound. Compare
+    /// with the excluding bounded list to mark truncation honestly for any
+    /// reason. The predicate binds no ids: at any retained count the query
+    /// still prepares with a single `LIMIT` bind.
+    pub fn count_unsettled_commands_excluding_retained(&self) -> Result<i64> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM commands WHERE {UNSETTLED_COMMANDS_WHERE} AND NOT ({RETAINED_UNKNOWN_PREDICATE})"
+        );
+        self.connection
+            .query_row(&sql, [], |row| row.get(0))
             .map_err(sql_error)
     }
 
@@ -5864,6 +5884,24 @@ fn validate_limit(limit: usize) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Latest retained `agent.lost` sequence for one Agent generation number.
+fn latest_lost_seq(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+) -> Result<Option<i64>> {
+    connection
+        .query_row(
+            "SELECT seq FROM events
+             WHERE kind = 'agent.lost' AND agent = ?1 AND generation = ?2
+             ORDER BY seq DESC LIMIT 1",
+            params![agent_num, generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)
 }
 
 fn enforce_page_bytes<T: serde::Serialize>(items: &mut Vec<T>) -> Result<()> {
