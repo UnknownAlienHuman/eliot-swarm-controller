@@ -2115,18 +2115,21 @@ async fn resolve_send_config(
 
 /// Effective model/effort overrides for a `resume` running under an
 /// inherited `configure` overlay on a sticky-session harness (OpenCode,
-/// Antigravity): the retained native session already runs the overlay's
-/// effective values, so the plugin must realign to them instead of
-/// reverting to the frozen snapshot. `None` on launch, on resumes without
-/// an overlay, and on harnesses that apply overlays per turn at send
-/// time (Codex, Muse). A resolution failure is a typed startup error: starting
-/// with the frozen values would contradict the explicit overlay inheritance,
-/// so the caller fails startup before any native I/O.
+/// Antigravity, Claude, Muse): the retained native session already runs
+/// the overlay's effective values, so the plugin must realign to them
+/// instead of reverting to the frozen snapshot. `None` on launch, on
+/// resumes without an overlay, and on harnesses that apply overlays per
+/// turn at send time (Codex). A resolution failure is a typed startup
+/// error: starting with the frozen values would contradict the explicit
+/// overlay inheritance, so the caller fails startup before any native I/O.
 async fn resolve_resume_config(
     actor: &AgentActorConfig,
 ) -> Result<Option<(Option<String>, Option<String>, i64)>> {
     if actor.start_command.verb != "resume"
-        || !matches!(actor.agent.harness.as_str(), "opencode" | "antigravity")
+        || !matches!(
+            actor.agent.harness.as_str(),
+            "opencode" | "antigravity" | "claude" | "muse"
+        )
     {
         return Ok(None);
     }

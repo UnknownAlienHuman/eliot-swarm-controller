@@ -35,8 +35,8 @@ pub struct AgentStartParams {
     /// launch or a resume without an overlay; the plugin then realigns
     /// the retained native session to the frozen profile exactly as
     /// before. Present only for harnesses with sticky native session
-    /// state (OpenCode, Antigravity); Codex/Muse apply overlays per turn
-    /// at send time and never read these.
+    /// state (OpenCode, Antigravity, Claude, Muse); Codex applies
+    /// overlays per turn at send time and never reads these.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
     /// Effective effort for such a resume, resolved like `model_override`.

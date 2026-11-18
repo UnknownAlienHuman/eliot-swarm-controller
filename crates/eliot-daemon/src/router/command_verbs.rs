@@ -11,7 +11,7 @@ use super::{
 use crate::common::now_ms;
 use eliot_core::{
     Agent, Command, CommandState, ContextItem, Error, FailureOrigin, Result,
-    api::{FrozenGitFetch, ProjectRegistrationView},
+    api::{FrozenGitFetch, ProjectRegistrationView, configure_uses_native_session},
 };
 use serde_json::{Value, json};
 
@@ -615,16 +615,17 @@ impl Router {
 
     /// Apply a dispatched `configure`: store the model/effort overlay, then
     /// settle applied with the requested and effective values, the assigned
-    /// revision and the application point. Codex and Muse stay Store-only
-    /// here (no native I/O runs; the next send carries the effective
-    /// values in its native turn request). OpenCode and Antigravity first
-    /// switch the live native session through the owned plugin and prove
-    /// the switch with the native echo or `GET` before the Router stores
-    /// anything: the outcome carries the native `model_verified` (and
-    /// Antigravity `effort_verified`) flags, set only from that proof, and
-    /// an unverified or refused switch never stores an overlay. Settlement
-    /// happens only after the Store commit, so an applied configure always
-    /// has a retained row to read back.
+    /// revision and the application point. Codex stays Store-only here (no
+    /// native I/O runs; the next send carries the effective values in its
+    /// native turn request), as does a Muse effort-only configure. A model
+    /// switch on OpenCode, Antigravity, Claude or Muse first switches the
+    /// live native session through the owned plugin and proves the switch
+    /// with the native echo or readback before the Router stores anything:
+    /// the outcome carries the native `model_verified` (and, where the
+    /// harness proves it, `effort_verified`) flags, set only from that
+    /// proof, and an unverified or refused switch never stores an overlay.
+    /// Settlement happens only after the Store commit, so an applied
+    /// configure always has a retained row to read back.
     pub(super) async fn execute_configure_command(
         &self,
         id: &str,
@@ -632,7 +633,7 @@ impl Router {
         dispatched: Command,
         dispatch_seq: Option<i64>,
     ) {
-        if matches!(agent.harness.as_str(), "opencode" | "antigravity") {
+        if configure_uses_native_session(&agent.harness, &dispatched.args) {
             self.execute_native_configure_command(id, agent, dispatched, dispatch_seq)
                 .await;
             return;
@@ -792,7 +793,7 @@ impl Router {
                     "harness": agent.harness,
                     "model_verified": model_verified,
                 });
-                if agent.harness == "antigravity" {
+                if matches!(agent.harness.as_str(), "antigravity" | "muse") {
                     outcome["effort_verified"] = json!(effort_verified);
                 }
                 let _ = self.settle(id, CommandState::Applied, Some(outcome)).await;

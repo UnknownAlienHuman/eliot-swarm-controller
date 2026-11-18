@@ -784,8 +784,10 @@ mod tests {
             now + 4,
         );
 
-        // Muse effort is a per-turn override; a Muse model change needs a new
-        // native session, so it is refused as unsupported and stores nothing.
+        // Muse effort is a per-turn override and the Muse model switches
+        // the live session through `session/setModel`, so both admit here;
+        // the model overlay itself is stored by the Router only after
+        // native proof.
         store
             .submit(
                 "owner",
@@ -793,41 +795,41 @@ mod tests {
                 now + 10,
             )
             .expect("admit Muse effort configure");
-        assert_eq!(
-            store
-                .submit(
-                    "owner",
-                    configure_request(&muse, 1, json!({"model": "m9"})),
-                    now + 11
-                )
-                .unwrap_err()
-                .code,
-            "unsupported",
-            "Muse model needs a new native session"
-        );
-        assert_eq!(
-            store
-                .submit(
-                    "owner",
-                    configure_request(&muse, 1, json!({"model": "m9", "effort": "high"})),
-                    now + 12
-                )
-                .unwrap_err()
-                .code,
-            "unsupported",
-            "mixed Muse configure is atomic: nothing applies"
-        );
+        store
+            .submit(
+                "owner",
+                configure_request(&muse, 1, json!({"model": "m9"})),
+                now + 11,
+            )
+            .expect("admit Muse model configure");
+        store
+            .submit(
+                "owner",
+                configure_request(&muse, 1, json!({"model": "m9", "effort": "high"})),
+                now + 12,
+            )
+            .expect("admit mixed Muse configure");
+        // Claude switches the live session model through `set_model`
+        // between turns, so a model configure admits; effort has no live
+        // switch and stays refused.
+        store
+            .submit(
+                "owner",
+                configure_request(&claude, 1, json!({"model": "m9"})),
+                now + 13,
+            )
+            .expect("admit Claude model configure");
         assert_eq!(
             store
                 .submit(
                     "owner",
                     configure_request(&claude, 1, json!({"effort": "high"})),
-                    now + 13
+                    now + 14
                 )
                 .unwrap_err()
                 .code,
             "unsupported",
-            "adapters without a verified mechanism refuse configure"
+            "Claude effort has no live switch (launch_only)"
         );
         // OpenCode model and effort (a native model variant) and Antigravity
         // model/effort ride their proven native setters, so admission accepts
@@ -837,7 +839,7 @@ mod tests {
             .submit(
                 "owner",
                 configure_request(&opencode, 1, json!({"model": "p/m1", "effort": "high"})),
-                now + 14,
+                now + 15,
             )
             .expect("admit OpenCode model and effort configure");
         store
@@ -848,7 +850,7 @@ mod tests {
                     1,
                     json!({"model": "base-low", "effort": "high"}),
                 ),
-                now + 15,
+                now + 16,
             )
             .expect("admit Antigravity model and effort configure");
         assert_eq!(
@@ -856,7 +858,7 @@ mod tests {
                 .get_agent_config_current(&muse, 1)
                 .expect("read Muse overlay"),
             None,
-            "refused Muse model configure stores nothing"
+            "admitted Muse model configure stores nothing before dispatch apply"
         );
 
         // Stale bindings, non-Owner principals and dead sessions are rejected.

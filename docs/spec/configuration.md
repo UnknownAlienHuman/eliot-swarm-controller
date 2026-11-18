@@ -942,15 +942,18 @@ submit it.
 
 Codex carries both values as per-turn `turn/start` overrides
 (`TurnStartParams.model`/`effort`); Muse carries effort through per-turn
-`reasoningEffort`, while a Muse `model` change needs a new native session
-and is refused as `unsupported`, storing nothing. OpenCode switches the
+`reasoningEffort` and switches the live session model at configure time
+(`session/setModel` with `session/read` proof, between turns only), while
+Claude switches the live session model at configure time through the
+stream-json `set_model` control request (between turns only; effort applies
+only at launch and is refused). OpenCode switches the
 retained session model at configure time (`POST /api/session/{id}/model`
 with a `session.get` proof; the requested model must be in the live model
 catalogue or the command rejects before any write, and effort has no native
 knob and is refused). Antigravity switches `model` and `thought_level` at
 configure time (`session/set_config_option` with echo proof; unadvertised
-values reject before any write). Claude has no verified mechanism and
-refuses the command. A catalog or quota failure at the next turn fails that
+values reject before any write). A mid-turn configure refuses before any
+write. A catalog or quota failure at the next turn fails that
 turn honestly; it never selects another model or account. The cached
 readback behind that rule is
 `harness.models` (bounded per-route/account catalogue with freshness and

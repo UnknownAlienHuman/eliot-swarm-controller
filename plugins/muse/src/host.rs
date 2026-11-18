@@ -8,15 +8,18 @@ use crate::{
         types::{
             NativeApprovalListPendingParams, NativeApprovalListPendingResult,
             NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
-            NativeItemCompletedNotification, NativeModelCatalogEntry, NativeModelListParams,
-            NativeModelListResult, NativeSession, NativeSessionReadParams, NativeSessionReadResult,
+            NativeItemCompletedNotification, NativeModelCatalogEntry, NativeModelEffortVariants,
+            NativeModelListParams, NativeModelListResult, NativeModelSelection, NativeSession,
+            NativeSessionReadParams, NativeSessionReadResult,
             NativeSessionReasoningEffortChangedNotification, NativeSessionResumeParams,
-            NativeSessionResumeResult, NativeSessionStartParams, NativeSessionStartResult,
-            NativeTurnCancelParams, NativeTurnCancelResult, NativeTurnCompletedNotification,
-            NativeTurnInputPart, NativeTurnStartParams, NativeTurnStartResult,
-            NativeTurnStartedNotification, NativeTurnSteerParams, NativeTurnSteerResult,
-            NativeTurnTerminal, NativeUnframedViewEvent, NativeViewPageParams,
-            NativeViewPageResult,
+            NativeSessionResumeResult, NativeSessionSetModelParams, NativeSessionSetModelResult,
+            NativeSessionSetReasoningEffortParams, NativeSessionSetReasoningEffortResult,
+            NativeSessionStartParams, NativeSessionStartResult, NativeTurnCancelParams,
+            NativeTurnCancelResult, NativeTurnCompletedNotification, NativeTurnInputPart,
+            NativeTurnStartParams, NativeTurnStartResult, NativeTurnStartedNotification,
+            NativeTurnSteerParams, NativeTurnSteerResult, NativeTurnTerminal,
+            NativeUnframedViewEvent, NativeViewPageParams, NativeViewPageResult,
+            is_reasoning_effort_tier,
         },
     },
 };
@@ -279,6 +282,11 @@ struct AgentSession {
     session_id: Option<String>,
     native_scope: String,
     selected_effort: Option<String>,
+    /// Session-verified model the owned native session currently runs:
+    /// the start/resume readback, refreshed by `configure` after its
+    /// `session/read` proof. Reported on turn association so the readback
+    /// follows a live switch; omitted when never verified.
+    selected_model: Option<String>,
     secrets: Vec<String>,
     native: NativeProcess,
     native_client: NativeClient,
@@ -1014,7 +1022,10 @@ impl MusePlugin {
                 )
             };
         // An omitted request accepts the server-selected model as
-        // effective; an explicit request must match exactly.
+        // effective; an explicit request must match exactly. Retain it as
+        // the session-verified model so later turn associations report the
+        // switch instead of the launch value.
+        session.selected_model = effective_model.clone();
         let model_verified = requested_model
             .as_deref()
             .is_none_or(|requested| effective_model.as_deref() == Some(requested));
@@ -1123,6 +1134,7 @@ impl MusePlugin {
         )?;
         match params.verb.as_str() {
             "send" => self.send_command(params).await,
+            "configure" => self.configure_command(params).await,
             "steer" => self.steer_command(params).await,
             "inject" => self.inject_active_turn(params).await,
             "interrupt" => self.interrupt_command(params).await,
@@ -1136,8 +1148,10 @@ impl MusePlugin {
 
     /// Build one native `turn/start` request from the effective reasoning
     /// effort: the retained `configure` overlay or the frozen session
-    /// value. The installed 1.4 schema carries effort per turn, while the
-    /// model rides the session and can only change with a new one.
+    /// value. The installed 1.4 schema carries effort per turn; the model
+    /// switches live through `session/setModel` at configure time, and the
+    /// association below reports the session-verified model so the readback
+    /// follows the switch.
     fn turn_start_params(
         command_id: String,
         session_id: String,
@@ -1150,6 +1164,313 @@ impl MusePlugin {
             input,
             reasoning_effort,
         }
+    }
+
+    /// Switch the live session model through `session/setModel` (and the
+    /// standing reasoning effort through `session/setReasoningEffort` when
+    /// requested), between turns only. The switch runs only when no turn
+    /// is active, so a mid-turn configure refuses before any write with
+    /// proof of no effect. The session catalogue gates the model: a miss
+    /// refuses honestly with nothing written. Each setter ack is verified
+    /// against its readback (`session/read` for the model, the durable
+    /// `session/reasoningEffortChanged` view event for the effort); a
+    /// refusal or a provably-undispatched write refuses with its reason,
+    /// and a lost or ambiguous outcome settles unknown without a replay,
+    /// storing nothing.
+    async fn configure_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("bad_state", "Muse Agent session has not started"))?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Muse",
+        )?;
+        if session.phase != SessionPhase::Ready {
+            return Err(Error::new(
+                "unknown",
+                "Muse session or event source outcome is unresolved",
+            ));
+        }
+        let session_id = session
+            .session_id
+            .clone()
+            .ok_or_else(|| Error::new("unknown", "Muse session identity is unresolved"))?;
+        let requested = match parse_configure_request(&params.args) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": error.message,
+                }));
+            }
+        };
+        let Some(requested_model) = requested.model else {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": "Muse configure needs a model; an effort-only change applies per turn without a native switch",
+            }));
+        };
+        // Busy gate before any native write: an exact active turn means a
+        // model call is in flight. The native would admit the selection
+        // for the next model-call boundary; Eliot refuses instead so the
+        // outcome stays exact.
+        let event_status = match session.events.view_readback(session_id.clone(), None).await {
+            Ok(status) => status,
+            Err(_) => {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": "Muse native observation is unresolved; session/setModel was not dispatched",
+                }));
+            }
+        };
+        if let Some(reason) = event_status.failure {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": format!("{reason}; session/setModel was not dispatched"),
+            }));
+        }
+        if event_status.active_turn_id.is_some() {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": "Muse already has an active turn; configure the model between turns",
+            }));
+        }
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        // The session catalogue gates the write: a miss proves nothing
+        // was written and refuses honestly.
+        let catalog: NativeModelListResult = match session
+            .native_client
+            .call(
+                "model/list",
+                serde_json::to_value(NativeModelListParams {
+                    session_id: Some(session_id.clone()),
+                })
+                .map_err(|_| {
+                    Error::new("internal", "Muse model/list params could not be encoded")
+                })?,
+                deadline,
+            )
+            .await
+        {
+            Ok(response) => match serde_json::from_value(response) {
+                Ok(catalog) => catalog,
+                Err(_) => {
+                    return Ok(json!({
+                        "state": "rejected",
+                        "reason": "Muse model/list result did not match the installed schema; session/setModel was not dispatched",
+                    }));
+                }
+            },
+            Err(_) => {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": "Muse configure catalogue readback failed; session/setModel was not dispatched",
+                }));
+            }
+        };
+        if !catalog
+            .models
+            .iter()
+            .any(|model| model.model_id == requested_model)
+        {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": format!("Muse model {requested_model} is not in the native catalogue"),
+            }));
+        }
+        if let Some(effort) = requested.effort.as_deref() {
+            if !is_reasoning_effort_tier(effort) {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": format!("Muse effort {effort} is not a supported reasoning tier"),
+                }));
+            }
+            if let Some(entry) = catalog
+                .models
+                .iter()
+                .find(|model| model.model_id == requested_model)
+                && let Some(NativeModelEffortVariants::Known(variants)) = entry.variants.as_ref()
+                && !variants.iter().any(|variant| variant == effort)
+            {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": format!("Muse effort {effort} is not a variant of model {requested_model}"),
+                }));
+            }
+            let effort_command = new_command_id();
+            let effort_response = match session
+                .native_client
+                .call(
+                    "session/setReasoningEffort",
+                    serde_json::to_value(NativeSessionSetReasoningEffortParams {
+                        command_id: effort_command.clone(),
+                        reasoning_effort: effort.to_owned(),
+                        session_id: session_id.clone(),
+                    })
+                    .map_err(|_| {
+                        Error::new(
+                            "internal",
+                            "Muse session/setReasoningEffort params could not be encoded",
+                        )
+                    })?,
+                    deadline,
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(error) if error.code == "native_rejected" => {
+                    return Ok(json!({
+                        "state": "rejected",
+                        "reason": format!(
+                            "Muse session/setReasoningEffort did not admit the effort ({})",
+                            error.message
+                        ),
+                    }));
+                }
+                Err(error) if native_no_write(&error.code) => {
+                    return Ok(json!({
+                        "state": "rejected",
+                        "reason": "Muse session/setReasoningEffort was not dispatched",
+                    }));
+                }
+                Err(error) => {
+                    return Err(contextual_error(
+                        error,
+                        "unknown",
+                        "Muse session/setReasoningEffort may have changed native state; it will not be repeated",
+                    ));
+                }
+            };
+            let effort_ack: NativeSessionSetReasoningEffortResult =
+                serde_json::from_value(effort_response).map_err(|_| {
+                    Error::new(
+                        "unknown",
+                        "Muse session/setReasoningEffort ack did not match the installed schema",
+                    )
+                })?;
+            if effort_ack.command_id != effort_command || effort_ack.status != "accepted" {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": "Muse session/setReasoningEffort did not acknowledge the exact submitted command",
+                }));
+            }
+        }
+        let model_command = new_command_id();
+        let model_response = match session
+            .native_client
+            .call(
+                "session/setModel",
+                serde_json::to_value(NativeSessionSetModelParams {
+                    command_id: model_command.clone(),
+                    session_id: session_id.clone(),
+                    model: NativeModelSelection {
+                        model_id: requested_model.clone(),
+                    },
+                })
+                .map_err(|_| {
+                    Error::new(
+                        "internal",
+                        "Muse session/setModel params could not be encoded",
+                    )
+                })?,
+                deadline,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) if error.code == "native_rejected" => {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": format!(
+                        "Muse session/setModel did not admit the model switch ({})",
+                        error.message
+                    ),
+                }));
+            }
+            Err(error) if native_no_write(&error.code) => {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": "Muse session/setModel was not dispatched",
+                }));
+            }
+            Err(error) => {
+                return Err(contextual_error(
+                    error,
+                    "unknown",
+                    "Muse session/setModel may have changed native state; it will not be repeated",
+                ));
+            }
+        };
+        let model_ack: NativeSessionSetModelResult = serde_json::from_value(model_response)
+            .map_err(|_| {
+                Error::new(
+                    "unknown",
+                    "Muse session/setModel ack did not match the installed schema",
+                )
+            })?;
+        if model_ack.command_id != model_command || model_ack.status != "accepted" {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": "Muse session/setModel did not acknowledge the exact submitted command",
+            }));
+        }
+        // Verify the switch against the owned session before reporting it:
+        // the ack admits the selection for subsequent model calls, and the
+        // readback proves which model the session now carries.
+        let reread = read_owned_session(&session.native_client, &session_id)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "Muse session/read did not prove the model switch ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        if reread.session.model_id.as_deref() != Some(requested_model.as_str()) {
+            return Err(Error::new(
+                "unknown",
+                format!("Muse session/read did not prove the model switch to {requested_model}"),
+            ));
+        }
+        session.selected_model = Some(requested_model.clone());
+        let mut response = json!({
+            "state": "applied",
+            "model": requested_model,
+            "model_verified": true,
+        });
+        if let Some(effort) = requested.effort {
+            let effective_effort = read_effective_reasoning_effort(
+                &session.native_client,
+                &session_id,
+            )
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "Muse reasoning-effort readback did not prove the effort switch ({})",
+                        error.message
+                    ),
+                )
+            })?;
+            if effective_effort.as_deref() != Some(effort.as_str()) {
+                return Err(Error::new(
+                    "unknown",
+                    format!(
+                        "Muse reasoning-effort readback did not prove the effort switch to {effort}"
+                    ),
+                ));
+            }
+            response["effort"] = Value::String(effort);
+            response["effort_verified"] = Value::Bool(true);
+        }
+        Ok(response)
     }
 
     async fn send_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -1266,8 +1587,10 @@ impl MusePlugin {
         // A retained `configure` effort overlay rides the per-turn field
         // the installed schema accepts; without one the frozen session
         // value applies unchanged. A model override never reaches this
-        // path: Muse model changes need a new native session and are
-        // refused as `unsupported` at admission.
+        // path: the model switch runs live through `session/setModel` at
+        // configure time, so the session already carries the retained
+        // revision's model. The association reports that session-verified
+        // model alongside the carried effort.
         let effort = params
             .effort_override
             .clone()
@@ -1376,6 +1699,7 @@ impl MusePlugin {
                 turn_id.clone(),
                 params.context.clone(),
                 sent_effort.clone(),
+                session.selected_model.clone(),
             )
             .await
             .is_err()
@@ -2160,6 +2484,35 @@ async fn discard_unstarted(session: &mut AgentSession) {
 async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error {
     discard_unstarted(session).await;
     session.native_client.diagnostic_error(error)
+}
+
+/// A `configure` model and/or effort request. Admission already gated the
+/// fields against `ConfigureSupport`; this re-checks shape so a malformed
+/// dispatch refuses before any native write.
+#[derive(Debug)]
+struct ConfigureRequest {
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+fn parse_configure_request(args: &Value) -> Result<ConfigureRequest> {
+    let model = args
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .map(str::to_owned);
+    let effort = args
+        .get("effort")
+        .and_then(Value::as_str)
+        .filter(|effort| !effort.trim().is_empty())
+        .map(str::to_owned);
+    if model.is_none() && effort.is_none() {
+        return Err(Error::new(
+            "invalid",
+            "Muse configure needs a model or an effort",
+        ));
+    }
+    Ok(ConfigureRequest { model, effort })
 }
 
 /// Pure catalogue selection: an explicit request matches exactly or fails
@@ -3156,6 +3509,7 @@ fn muse_manifest() -> PluginManifest {
             "launch".to_owned(),
             "resume".to_owned(),
             "send".to_owned(),
+            "configure".to_owned(),
             "steer".to_owned(),
             "interrupt".to_owned(),
             "approve".to_owned(),
@@ -3388,6 +3742,7 @@ mod tests {
                 "launch",
                 "resume",
                 "send",
+                "configure",
                 "steer",
                 "interrupt",
                 "approve",
@@ -3609,6 +3964,32 @@ mod tests {
             Some("agent-1")
         );
         assert_eq!(value.get("generation").and_then(Value::as_i64), Some(1));
+    }
+
+    #[test]
+    fn configure_request_parsing_accepts_model_and_effort() {
+        let request = super::parse_configure_request(&json!({"model": "m1", "effort": "high"}))
+            .expect("model and effort parse");
+        assert_eq!(request.model.as_deref(), Some("m1"));
+        assert_eq!(request.effort.as_deref(), Some("high"));
+        let model_only =
+            super::parse_configure_request(&json!({"model": "m2"})).expect("model parses");
+        assert_eq!(model_only.model.as_deref(), Some("m2"));
+        assert!(model_only.effort.is_none());
+        for args in [
+            json!({}),
+            json!({"model": ""}),
+            json!({"model": "   "}),
+            json!({"model": serde_json::Value::Null}),
+            json!({"model": 7}),
+            json!({"effort": ""}),
+        ] {
+            assert_eq!(
+                super::parse_configure_request(&args).unwrap_err().code,
+                "invalid",
+                "Muse configure needs a model or an effort before any native write"
+            );
+        }
     }
 
     #[test]

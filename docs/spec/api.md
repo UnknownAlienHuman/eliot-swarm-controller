@@ -929,20 +929,24 @@ field is `unsupported`, while authority-adjacent fields (`permissions`,
 catalog/provider/billing siblings) are rejected outright as `not_allowed`.
 Only the Owner principal may submit it. Codex carries both values as per-turn
 `turn/start` overrides and Muse carries effort the same way; a Muse `model`
-change needs a new native session and returns `unsupported`
-(`restart_required`) storing nothing, as does Claude, which has no verified
-mechanism. OpenCode switches the retained session model through the native
+switch runs live through `session/setModel` (durable for subsequent model
+calls) with `session/read` proof, and a Claude `model` switch runs live
+through the stream-json `set_model` control request between turns, each
+refusing before any write while a turn is active. Claude `effort` has no
+live switch and stays `unsupported` (`launch_only`). OpenCode switches the
+retained session model through the native
 `POST /api/session/{id}/model` setter at configure time and proves it with
 a fresh `session.get` (`--effort` stays `unsupported`: the native API has
 no effort knob); Antigravity switches `model` and `thought_level` through
 ACP `session/set_config_option` at configure time and proves each write
-with its echoed current value. On those two harnesses the Router switches
-the live native session through the owned plugin first and stores the
-overlay only after that proof, then settles `applied` with the requested
-and effective values, the monotonically increasing `config_revision` for
-the generation, `application:\"next_turn\"`, provenance `\"configure\"`,
-and the native `model_verified` (plus `effort_verified` on Antigravity)
-flags, each set only from the native echo or `GET`. A refused or unproven
+with its echoed current value. On the natively-switching harnesses the
+Router switches the live native session through the owned plugin first and
+stores the overlay only after that proof, then settles `applied` with the
+requested and effective values, the monotonically increasing
+`config_revision` for the generation, `application:\"next_turn\"`,
+provenance `\"configure\"`, and the native `model_verified` (plus
+`effort_verified` where the harness proves it) flags, each set only from
+the native echo or readback. A refused or unproven
 switch stores nothing and never claims `applied`; it never selects another
 model on failure. A validation failure before the first native write
 (malformed args, an unknown model, an unadvertised value) settles

@@ -921,12 +921,20 @@ impl ClaudePlugin {
         }
         // An omitted model omits `--model` so the CLI default applies; the
         // effective model is read back from initialize/stream. Requested
-        // stays absent separately from the effective readback.
-        let requested_model: Option<String> = profile
-            .get("model")
-            .and_then(Value::as_str)
+        // stays absent separately from the effective readback. A resume
+        // running under an inherited `configure` overlay realigns to the
+        // overlay's effective model instead of the frozen snapshot.
+        let requested_model: Option<String> = params
+            .model_override
+            .clone()
             .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned);
+            .or_else(|| {
+                profile
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+            });
         // The daemon freezes the closed CLI permission-mode vocabulary here;
         // unset means the CLI-default posture.
         let requested_permission_mode =
@@ -1448,6 +1456,7 @@ impl ClaudePlugin {
         }
         match params.verb.as_str() {
             "send" => DispatchOutcome::Ready(self.send_command(params).await),
+            "configure" => DispatchOutcome::Ready(self.configure_command(params).await),
             "steer" => self.steer_command(request.id.clone(), params).await,
             "interrupt" => DispatchOutcome::Ready(self.interrupt_command(params).await),
             "approve" | "deny" => DispatchOutcome::Ready(self.reply_request(params).await),
@@ -1522,6 +1531,105 @@ impl ClaudePlugin {
             .inputs
             .insert(params.command_id.clone(), text.clone());
         dispatch_send(session, &params.command_id, native_content, context).await
+    }
+
+    /// Switch the live session model through the stream-json `set_model`
+    /// control request, between turns only. The switch runs only when no
+    /// turn is active and no input awaits association, so a mid-turn
+    /// configure refuses before any write with proof of no effect. The
+    /// success reply is the application proof (the same proof the resume
+    /// realign relies on); a native refusal or a provably-undispatched
+    /// write refuses with its reason, and a lost or ambiguous reply
+    /// settles unknown without a replay, storing nothing. The effective
+    /// model is reported from the next native `assistant` record by the
+    /// event task, never assumed here.
+    async fn configure_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| Error::new("bad_state", "Claude Agent session has not started"))?;
+        validate_binding(
+            &session.agent_id,
+            session.generation,
+            &params.agent_id,
+            params.generation,
+            "Claude",
+        )?;
+        if session.phase != SessionPhase::Ready {
+            return Err(Error::new(
+                "unknown",
+                "Claude session is not ready for input",
+            ));
+        }
+        if session.session_id.is_none() {
+            return Err(Error::new(
+                "unknown",
+                "Claude session identity is unresolved",
+            ));
+        }
+        if let Some(reason) = session.events.status().failure {
+            return Err(Error::new("unknown", reason));
+        }
+        if session.events.status().active_turn_id.is_some() {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": "Claude already has an active turn; configure the model between turns",
+            }));
+        }
+        if session.sends.pending.is_some() {
+            return Ok(json!({
+                "state": "rejected",
+                "reason": "Claude prior input has no exact native turn association; configure between turns",
+            }));
+        }
+        let model = match Self::parse_configure_model(&params.args) {
+            Ok(model) => model,
+            Err(error) => {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": error.message,
+                }));
+            }
+        };
+        match session
+            .native_client
+            .control(
+                "set_model",
+                json!({"model": model}),
+                Instant::now() + RPC_TIMEOUT,
+            )
+            .await
+        {
+            Ok(_) => Ok(json!({
+                "state": "applied",
+                "model": model,
+                "model_verified": true,
+            })),
+            Err(error) if error.code == "native_rejected" => Ok(json!({
+                "state": "rejected",
+                "reason": format!("Claude refused the model switch ({})", error.message),
+            })),
+            Err(error) if native_no_write(&error.code) => Ok(json!({
+                "state": "rejected",
+                "reason": "Claude set_model was not dispatched",
+            })),
+            Err(error) => Err(contextual_error(
+                error,
+                "unknown",
+                "Claude set_model may have changed native state; it will not be repeated",
+            )),
+        }
+    }
+
+    /// The requested model of a `configure` dispatch. Admission already
+    /// gated the fields; this re-checks shape so a malformed dispatch
+    /// refuses before any native write. Claude has no live effort switch:
+    /// admission refuses effort, so only a model ever reaches this path.
+    fn parse_configure_model(args: &Value) -> Result<String> {
+        match args.get("model").and_then(Value::as_str) {
+            Some(model) if !model.trim().is_empty() => Ok(model.to_owned()),
+            _ => Err(Error::new("invalid", "Claude configure needs a model")),
+        }
     }
 
     /// Steer the exact captured turn through the installed CLI's existing
@@ -2690,6 +2798,7 @@ fn claude_manifest() -> PluginManifest {
             "launch".to_owned(),
             "resume".to_owned(),
             "send".to_owned(),
+            "configure".to_owned(),
             "steer".to_owned(),
             "interrupt".to_owned(),
             "approve".to_owned(),
@@ -3077,6 +3186,31 @@ mod tests {
     }
 
     #[test]
+    fn configure_model_parsing_accepts_only_a_model() {
+        assert_eq!(
+            super::ClaudePlugin::parse_configure_model(&serde_json::json!({"model": "opus"}))
+                .expect("model parses"),
+            "opus"
+        );
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"effort": "high"}),
+            serde_json::json!({"model": ""}),
+            serde_json::json!({"model": "   "}),
+            serde_json::json!({"model": serde_json::Value::Null}),
+            serde_json::json!({"model": 7}),
+        ] {
+            assert_eq!(
+                super::ClaudePlugin::parse_configure_model(&args)
+                    .unwrap_err()
+                    .code,
+                "invalid",
+                "Claude configure needs a model before any native write"
+            );
+        }
+    }
+
+    #[test]
     fn claude_mcp_allow_is_unsupported() {
         assert!(check_mcp_allow_empty(&[]).is_ok());
         let error = check_mcp_allow_empty(&["owner-search".to_owned()]).unwrap_err();
@@ -3094,6 +3228,7 @@ mod tests {
                 "launch".to_owned(),
                 "resume".to_owned(),
                 "send".to_owned(),
+                "configure".to_owned(),
                 "steer".to_owned(),
                 "interrupt".to_owned(),
                 "approve".to_owned(),

@@ -243,15 +243,17 @@ fn configure_value(
 /// turn carries, and the application point. Only `model` and `effort` are
 /// supported; authority fields are rejected outright and anything else is
 /// unsupported. Codex carries both as per-turn `turn/start` overrides;
-/// Muse carries effort per turn while a model change needs a new native
-/// session (`restart_required`, refused with `unsupported`, never
-/// restarted silently); OpenCode switches its retained session model
-/// through the native `POST /api/session/{id}/model` setter at configure
-/// time (effort has no native knob and is refused); Antigravity switches
-/// `model` and `thought_level` through ACP `session/set_config_option` at
-/// configure time; adapters without a verified mechanism (Claude) refuse
-/// the whole command. Shared by admission and by the Router-side apply so
-/// both agree on what was requested and what takes effect.
+/// Muse switches the live session model through `session/setModel` and
+/// carries effort per turn; Claude switches the live session model
+/// through the stream-json `set_model` control request between turns
+/// (effort applies only at launch and is refused); OpenCode switches its
+/// retained session model through the native `POST /api/session/{id}/model`
+/// setter at configure time (effort has no native knob and is refused);
+/// Antigravity switches `model` and `thought_level` through ACP
+/// `session/set_config_option` at configure time; adapters without a
+/// verified mechanism refuse the whole command. Shared by admission and by
+/// the Router-side apply so both agree on what was requested and what
+/// takes effect.
 pub(super) fn resolve_configure(
     args: &Value,
     harness: &str,

@@ -334,20 +334,23 @@ pub struct ConfigureSupport {
 }
 
 impl ConfigureSupport {
-    /// Codex carries model and effort per turn; Muse carries effort per
-    /// turn but a model change needs a new native session; OpenCode sets
-    /// the session model and its `Model.Ref.variant` natively;
+    /// Codex carries model and effort per turn; Muse switches the live
+    /// session model through `session/setModel` and carries effort per
+    /// turn; Claude switches the live session model through the
+    /// stream-json `set_model` control request between turns; OpenCode
+    /// sets the session model and its `Model.Ref.variant` natively;
     /// Antigravity sets `model` and `thought_level` natively. Anything
-    /// else has no verified mechanism.
+    /// else has no verified mechanism. Claude effort applies only at
+    /// launch (`--effort`), with no verified live switch.
     pub fn for_harness(harness: &str) -> Self {
         let refuse = |reason: &str| Some(reason.to_owned());
         match harness {
-            "codex" | "antigravity" | "opencode" => Self::default(),
-            "muse" => Self {
-                model_refusal: refuse(
-                    "Muse model changes require a new native session (restart_required)",
+            "codex" | "antigravity" | "opencode" | "muse" => Self::default(),
+            "claude" => Self {
+                model_refusal: None,
+                effort_refusal: refuse(
+                    "Claude effort applies only at launch and cannot change mid-session (launch_only)",
                 ),
-                effort_refusal: None,
             },
             other => {
                 let reason = format!("configure is not supported for the {other} harness");
@@ -358,6 +361,27 @@ impl ConfigureSupport {
             }
         }
     }
+}
+
+/// Whether a dispatched `configure` must switch the live native session
+/// through the owned plugin with native proof before the Router stores
+/// anything. Mirrors [`ConfigureSupport`]: OpenCode and Antigravity always
+/// switch natively; Claude and Muse switch natively only for a model
+/// change (Muse effort-only stays a Store-only per-turn overlay; Claude
+/// effort has no live switch and is refused at admission). Codex and
+/// harnesses without a verified mechanism never switch natively, even
+/// when a model is named.
+pub fn configure_uses_native_session(harness: &str, args: &serde_json::Value) -> bool {
+    if matches!(harness, "opencode" | "antigravity") {
+        return true;
+    }
+    if matches!(harness, "claude" | "muse") {
+        return args
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|model| !model.trim().is_empty());
+    }
+    false
 }
 
 impl HarnessModelsResponse {
@@ -993,13 +1017,45 @@ mod tests {
             ConfigureSupport::default()
         );
         let muse = ConfigureSupport::for_harness("muse");
-        assert!(muse.model_refusal.unwrap().contains("restart_required"));
+        assert!(muse.model_refusal.is_none());
         assert!(muse.effort_refusal.is_none());
         let opencode = ConfigureSupport::for_harness("opencode");
         assert!(opencode.model_refusal.is_none());
         assert!(opencode.effort_refusal.is_none());
         let claude = ConfigureSupport::for_harness("claude");
-        assert!(claude.model_refusal.is_some() && claude.effort_refusal.is_some());
+        assert!(claude.model_refusal.is_none());
+        assert!(claude.effort_refusal.unwrap().contains("launch_only"));
+    }
+
+    #[test]
+    fn configure_native_path_covers_model_switchers_only() {
+        use serde_json::json;
+        assert!(configure_uses_native_session("opencode", &json!({})));
+        assert!(configure_uses_native_session(
+            "antigravity",
+            &json!({"model": "m"})
+        ));
+        assert!(configure_uses_native_session(
+            "claude",
+            &json!({"model": "m"})
+        ));
+        assert!(configure_uses_native_session(
+            "muse",
+            &json!({"model": "m", "effort": "high"})
+        ));
+        assert!(!configure_uses_native_session(
+            "muse",
+            &json!({"effort": "high"})
+        ));
+        assert!(!configure_uses_native_session(
+            "claude",
+            &json!({"effort": "high"})
+        ));
+        assert!(!configure_uses_native_session(
+            "codex",
+            &json!({"model": "m"})
+        ));
+        assert!(!configure_uses_native_session("fake", &json!({})));
     }
 
     #[test]
