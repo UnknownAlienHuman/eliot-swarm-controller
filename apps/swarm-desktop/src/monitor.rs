@@ -2020,6 +2020,7 @@ mod tests {
                 progress_age_ms: None,
                 last_turn_id: None,
                 last_outcome: None,
+                last_resolution_source: None,
                 activity: None,
                 usage: None,
                 usage_scope: None,
@@ -2079,6 +2080,7 @@ mod tests {
             progress_age_ms: None,
             last_turn_id: None,
             last_outcome: None,
+            last_resolution_source: None,
             activity: None,
             usage,
             usage_scope: usage_scope.map(str::to_owned),
@@ -2262,6 +2264,7 @@ mod tests {
                 progress_age_ms: None,
                 last_turn_id: None,
                 last_outcome: None,
+                last_resolution_source: None,
                 activity: native.then_some(NativeChildActivity {
                     state: NativeChildActivityState::Idle,
                     has_open_turn: false,

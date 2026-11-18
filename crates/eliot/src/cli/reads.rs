@@ -1384,6 +1384,7 @@ mod tests {
             progress_age_ms: None,
             last_turn_id: None,
             last_outcome: None,
+            last_resolution_source: None,
             activity: None,
             usage,
             usage_scope: usage_scope.map(str::to_owned),

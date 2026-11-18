@@ -7,7 +7,7 @@ use super::{
 use crate::{
     Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
     NativeChildActivityState, ProcessIdentity, ProcessRecord, ProcessState, Result, SessionUsage,
-    StderrSnapshot, TurnOutcome, TurnUsage,
+    StderrSnapshot, TurnOutcome, TurnResolutionSource, TurnUsage,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -22,8 +22,8 @@ pub const AGENT_PREVIEW_CHARS: usize = 256;
 /// is the newest native progress timestamp where the Store retains one;
 /// `progress_age_ms` is measured against the read clock and stays absent when
 /// no progress timestamp exists. `last_outcome` is the newest terminal turn's
-/// canonical outcome (legacy rows classify explicitly, never defaulting to
-/// success) with its `last_turn_id` and retained `usage` where available.
+/// outcome with its `last_turn_id`, `last_resolution_source`, and retained
+/// `usage` where available. Success requires native evidence.
 /// When the newest terminal turn carries no native turn usage, `usage` falls
 /// back to the generation's latest retained `session.usage` snapshot
 /// (cumulative input/output/cache counters only, never a derived total) with
@@ -81,6 +81,8 @@ pub struct AgentSummary {
     pub last_turn_id: Option<String>,
     #[serde(deserialize_with = "nullable")]
     pub last_outcome: Option<TurnOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_resolution_source: Option<TurnResolutionSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<NativeChildActivity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

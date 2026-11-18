@@ -4,7 +4,7 @@
 //! never join it. A child being idle is not success; each entry reports the
 //! terminal outcome of its exact captured command or turn.
 
-use crate::{Error, Result};
+use crate::{Error, Result, TurnResolutionSource};
 use serde::{Deserialize, Serialize};
 
 /// Maximum number of entries in one wait (commands plus turns).
@@ -176,6 +176,9 @@ pub struct WaitEntryResult {
     /// `not_found` or `not_visible`.
     #[schemars(description = "Terminal outcome or wait state for this entry.")]
     pub status: String,
+    /// Provenance of a direct turn or a command's bound turn, when qualified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_source: Option<TurnResolutionSource>,
 }
 
 impl WaitEntryResult {
@@ -184,6 +187,7 @@ impl WaitEntryResult {
             kind: kind.into(),
             id: id.into(),
             status: status.into(),
+            resolution_source: None,
         }
     }
 

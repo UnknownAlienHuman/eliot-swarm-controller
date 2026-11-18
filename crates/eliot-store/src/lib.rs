@@ -46,9 +46,10 @@ use eliot_core::{
     Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
     GitSnapshot, InjectPoint, NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity,
     ProcessRecord, ProcessSnapshot, ProcessState, SessionUsage, SourceBatch, SourceGap,
-    SourceGapAck, SubmitCommand, Turn, TurnOutcome, TurnState, TurnUsage, WorkspaceCancelOutcome,
-    WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation, WorkspacePreparationInput,
-    WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome, parse_agent_id,
+    SourceGapAck, SubmitCommand, Turn, TurnOutcome, TurnResolutionSource, TurnState, TurnUsage,
+    WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
+    WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome,
+    parse_agent_id,
 };
 pub use eliot_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -4668,18 +4669,21 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
 fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
     let usage = record.usage.as_deref().map(decode_turn_usage).transpose()?;
     let state: TurnState = parse_enum(&record.state, "turn state")?;
-    // Rows written before canonical outcomes existed carry no stored outcome:
-    // classify them explicitly from the legacy status with the stored
-    // harness (Claude rows carry the raw terminal reason), never as success.
-    let outcome = match record.outcome.as_deref() {
-        Some(value) => Some(
+    let resolution_source = record
+        .resolution_source
+        .as_deref()
+        .map(|value| parse_enum(value, "turn resolution source"))
+        .transpose()?;
+    let outcome = match (resolution_source, record.outcome.as_deref()) {
+        (Some(TurnResolutionSource::Unknown), _) => Some(TurnOutcome::Unknown),
+        (_, Some(value)) => Some(
             TurnOutcome::parse(value)
                 .ok_or_else(|| Error::new("internal", "invalid stored turn outcome"))?,
         ),
-        None if state == TurnState::Completed => Some(
+        (_, None) if state == TurnState::Completed => Some(
             TurnOutcome::classify_legacy_status_for_harness(harness, record.status.as_deref()),
         ),
-        None => None,
+        (_, None) => None,
     };
     let native_status = record.native_status.filter(|value| !value.is_empty());
     Ok(Turn {
@@ -4697,7 +4701,7 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
         config_revision: record.config_revision,
         config: None,
         preceded_by: record.preceded_by.filter(|value| !value.is_empty()),
-        resolution_source: record.resolution_source.filter(|value| !value.is_empty()),
+        resolution_source,
     })
 }
 

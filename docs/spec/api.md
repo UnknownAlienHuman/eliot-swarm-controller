@@ -1313,11 +1313,16 @@ generation resolves without a readback and touches only that exact turn. The
 turn completes with the asserted status, and a `turn.resolved` event carrying
 `resolution_source=owner` is emitted; no native `turn.completed` receipt is
 invented and no command row is touched. The resolved `Turn` row carries
-`resolution_source=owner`. That provenance is kept in every readback.
+`resolution_source=owner`. `turn.get` and `agent.result` return the asserted
+status and outcome with that marker. `swarm.wait` carries `resolution_source`
+for both direct turn entries and command entries bound to that turn.
+`agent.list` carries the newest terminal turn's marker as `last_resolution_source`.
+Wait and list report an Owner-asserted success as `unknown`.
 
-`Turn` readers (`turn.get`, `agent.result`) return it on the row, while `swarm.wait`
-and result readbacks never report an owner-resolved turn as native success: an
-owner-asserted `completed` reads back as `unknown` until native evidence arrives.
+When an upgraded terminal row lacks retained evidence of either native completion
+or an Owner assertion, its source and reported outcome are both `unknown`. The
+stored status is retained on the turn for inspection. Native completions omit the
+source marker.
 
 ## Provider holds
 
@@ -1463,7 +1468,9 @@ children never join it. A child being idle is not success; each entry reports th
 terminal outcome of its exact captured command or turn. Per-entry `status` is one of
 `succeeded`, `failed`, `interrupted` or `unknown` (from the canonical `TurnOutcome`),
 `still_running` at timeout, or `not_found`/`not_visible` for ids outside the caller's
-scope. An Agent caller may wait only on what its frozen control scope permits, the same
+scope. A direct or command-bound turn can also carry its
+[resolution provenance](#input-turn-and-unknown-gates).
+An Agent caller may wait only on what its frozen control scope permits, the same
 rule as `agent.list` and direct reads; the set holds at most 256 entries. The daemon
 reuses existing command/turn readback and its event bus for wakeups; there is no
 scheduler or persistent workflow beyond the digest below. Run and project-rule principals are rejected;

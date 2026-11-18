@@ -3963,8 +3963,14 @@ impl Router {
         }
         for turn in &request.turns {
             results.push(
-                self.wait_entry_for_turn(&turn.agent, turn.generation, &turn.turn_id, principal)
-                    .await?,
+                self.wait_entry_for_bound_turn(
+                    WaitEntryResult::new("turn", turn.canonical_id(), "not_found"),
+                    &turn.agent,
+                    turn.generation,
+                    &turn.turn_id,
+                    principal,
+                )
+                .await?,
             );
         }
         Ok(results)
@@ -3995,18 +4001,29 @@ impl Router {
         };
         // Uncertain commands are terminal unknown, never still running. This
         // mirrors the command readback masking without mutating the row.
-        if command.state == CommandState::Unknown || self.unknown_cause(&command.id).is_some() {
-            return Ok(WaitEntryResult::new("command", id, "unknown"));
-        }
+        let command_unknown =
+            command.state == CommandState::Unknown || self.unknown_cause(&command.id).is_some();
         if let (Some(target), Some(generation), Some(turn_id)) = (
             command.target.as_deref(),
             command.generation,
             command.turn_id.as_deref(),
         ) {
-            let status = self
-                .wait_status_for_bound_turn(target, generation, turn_id, principal)
+            let mut entry = self
+                .wait_entry_for_bound_turn(
+                    WaitEntryResult::new("command", id, "unknown"),
+                    target,
+                    generation,
+                    turn_id,
+                    principal,
+                )
                 .await?;
-            return Ok(WaitEntryResult::new("command", id, status));
+            if command_unknown {
+                entry.status = "unknown".to_owned();
+            }
+            return Ok(entry);
+        }
+        if command_unknown {
+            return Ok(WaitEntryResult::new("command", id, "unknown"));
         }
         let status = match command.state {
             CommandState::Applied => "succeeded",
@@ -4020,44 +4037,14 @@ impl Router {
         Ok(WaitEntryResult::new("command", id, status))
     }
 
-    async fn wait_status_for_bound_turn(
+    async fn wait_entry_for_bound_turn(
         &self,
-        agent: &str,
-        generation: i64,
-        turn_id: &str,
-        principal: &Principal,
-    ) -> Result<&'static str> {
-        let mut turn = {
-            let store = self.inner.store.lock().await;
-            if let Err(error) = crate::router::hierarchy::authorize_agent_read(
-                &store,
-                principal,
-                agent,
-                Some(generation),
-            ) {
-                if error.code == "not_allowed" {
-                    return Ok("not_visible");
-                }
-                return Err(error);
-            }
-            match store.get_turn(agent, generation, turn_id)? {
-                Some(turn) => turn,
-                None => return Ok("unknown"),
-            }
-        };
-        self.mask_unknown_turns(agent, generation, std::slice::from_mut(&mut turn))
-            .await?;
-        Ok(Self::turn_entry_status(&turn))
-    }
-
-    async fn wait_entry_for_turn(
-        &self,
+        mut entry: WaitEntryResult,
         agent: &str,
         generation: i64,
         turn_id: &str,
         principal: &Principal,
     ) -> Result<WaitEntryResult> {
-        let canonical = format!("{agent}/{generation}/{turn_id}");
         let mut turn = {
             let store = self.inner.store.lock().await;
             if let Err(error) = crate::router::hierarchy::authorize_agent_read(
@@ -4067,19 +4054,21 @@ impl Router {
                 Some(generation),
             ) {
                 if error.code == "not_allowed" {
-                    return Ok(WaitEntryResult::new("turn", canonical, "not_visible"));
+                    entry.status = "not_visible".to_owned();
+                    return Ok(entry);
                 }
                 return Err(error);
             }
             match store.get_turn(agent, generation, turn_id)? {
                 Some(turn) => turn,
-                None => return Ok(WaitEntryResult::new("turn", canonical, "not_found")),
+                None => return Ok(entry),
             }
         };
         self.mask_unknown_turns(agent, generation, std::slice::from_mut(&mut turn))
             .await?;
-        let status = Self::turn_entry_status(&turn);
-        Ok(WaitEntryResult::new("turn", canonical, status))
+        entry.status = Self::turn_entry_status(&turn).to_owned();
+        entry.resolution_source = turn.resolution_source;
+        Ok(entry)
     }
 
     fn turn_entry_status(turn: &Turn) -> &'static str {
@@ -4087,19 +4076,12 @@ impl Router {
             TurnState::Running => "still_running",
             TurnState::Unknown => "unknown",
             TurnState::Completed => {
-                // An owner assertion is not native evidence: a resolved turn
-                // keeps its Owner provenance in the turn row, and wait/result
-                // never report it as native success.
-                if turn.resolution_source.as_deref() == Some("owner")
-                    && turn.outcome.unwrap_or_else(|| {
-                        TurnOutcome::classify_legacy_status(turn.status.as_deref())
-                    }) == TurnOutcome::Success
-                {
-                    return "unknown";
-                }
-                match turn
+                let outcome = turn
                     .outcome
-                    .unwrap_or_else(|| TurnOutcome::classify_legacy_status(turn.status.as_deref()))
+                    .unwrap_or_else(|| TurnOutcome::classify_legacy_status(turn.status.as_deref()));
+                match turn
+                    .resolution_source
+                    .map_or(outcome, |source| source.reported_outcome(outcome))
                 {
                     TurnOutcome::Success => "succeeded",
                     TurnOutcome::Failure => "failed",
@@ -13864,7 +13846,7 @@ mod run_authorization_tests {
             response
                 .results
                 .iter()
-                .all(|entry| entry.status == "succeeded")
+                .all(|entry| entry.status == "succeeded" && entry.resolution_source.is_none())
         );
         // Any completes on the first terminal entry.
         let response: SwarmWaitResponse = serde_json::from_value(
@@ -13882,7 +13864,8 @@ mod run_authorization_tests {
     }
 
     #[tokio::test]
-    async fn swarm_wait_never_reports_owner_resolved_turn_as_native_success() {
+    async fn owner_resolved_turn_readbacks_carry_provenance() {
+        use eliot_core::TurnResolutionSource;
         use eliot_core::api::{TurnResolveRequest, TurnResolveStatus};
         let router = router();
         let (agent, send_id) = {
@@ -13927,9 +13910,8 @@ mod run_authorization_tests {
                     .get_turn(&agent, 1, "turn-1")
                     .unwrap()
                     .unwrap()
-                    .resolution_source
-                    .as_deref(),
-                Some("owner")
+                    .resolution_source,
+                Some(TurnResolutionSource::Owner)
             );
         }
         // Both the direct turn entry and the bound send entry read unknown,
@@ -13945,13 +13927,14 @@ mod run_authorization_tests {
         )
         .unwrap();
         assert!(response.completed);
-        assert_eq!(
-            response.results,
-            vec![
-                WaitEntryResult::new("command", &send_id, "unknown"),
-                WaitEntryResult::new("turn", format!("{agent}/1/turn-1"), "unknown"),
-            ]
-        );
+        let mut expected = [
+            WaitEntryResult::new("command", &send_id, "unknown"),
+            WaitEntryResult::new("turn", format!("{agent}/1/turn-1"), "unknown"),
+        ];
+        for entry in &mut expected {
+            entry.resolution_source = Some(TurnResolutionSource::Owner);
+        }
+        assert_eq!(response.results, expected);
         // agent.result keeps the owner provenance on the turn row.
         let result: AgentResultResponse = serde_json::from_value(
             router
@@ -13961,7 +13944,11 @@ mod run_authorization_tests {
         )
         .unwrap();
         assert_eq!(result.turns.len(), 1);
-        assert_eq!(result.turns[0].resolution_source.as_deref(), Some("owner"));
+        assert_eq!(
+            result.turns[0].resolution_source,
+            Some(TurnResolutionSource::Owner)
+        );
+        assert_eq!(result.turns[0].outcome, Some(TurnOutcome::Success));
         // turn.get agrees.
         let turn: Turn = serde_json::from_value(
             router
@@ -13973,7 +13960,24 @@ mod run_authorization_tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(turn.resolution_source.as_deref(), Some("owner"));
+        assert_eq!(turn.resolution_source, Some(TurnResolutionSource::Owner));
+
+        let list: AgentListResponse = serde_json::from_value(
+            router
+                .agent_list(&json!({}), &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(list.agents.len(), 1);
+        let summary = &list.agents[0].summary;
+        assert_eq!(summary.id, agent);
+        assert_eq!(summary.last_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(summary.last_outcome, Some(TurnOutcome::Unknown));
+        assert_eq!(
+            summary.last_resolution_source,
+            Some(TurnResolutionSource::Owner)
+        );
     }
 
     #[tokio::test]

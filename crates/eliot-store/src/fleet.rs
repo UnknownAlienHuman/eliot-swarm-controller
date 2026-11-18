@@ -156,9 +156,11 @@ impl Store {
         // fleet scan never reads heavy session spend as no usage. The
         // fallback keeps only cumulative input/output/cache counters with the
         // session scope marker; it never fabricates a turn total.
-        let (last_turn_id, last_outcome, turn_usage) = match terminal {
-            Some((turn_id, outcome, usage)) => (Some(turn_id), outcome, usage),
-            None => (None, None, None),
+        let (last_turn_id, last_outcome, last_resolution_source, turn_usage) = match terminal {
+            Some((turn_id, outcome, source, usage)) => {
+                (Some(turn_id), Some(outcome), source, usage)
+            }
+            None => (None, None, None, None),
         };
         let (usage, usage_scope) = match turn_usage {
             Some(usage) => (Some(usage), Some("turn".to_owned())),
@@ -207,6 +209,7 @@ impl Store {
                 .filter(|age| *age >= 0),
             last_turn_id,
             last_outcome,
+            last_resolution_source,
             activity: if record.origin == "native" && record.observe_only {
                 Some(native_children::activity(
                     &self.connection,
@@ -262,26 +265,36 @@ impl Store {
         let row: Option<StoredTerminalTurn> = self
             .connection
             .query_row(
-                "SELECT turn_id, outcome, status, usage FROM turns
+                "SELECT turn_id, outcome, status, usage, resolution_source FROM turns
                  WHERE agent = ?1 AND generation = ?2 AND state = 'completed'
                  ORDER BY COALESCE(completed_at, started_at, 0) DESC, rowid DESC LIMIT 1",
                 params![agent, generation],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(sql_error)?;
-        row.map(|(turn_id, outcome, status, usage)| {
+        row.map(|(turn_id, outcome, status, usage, source)| {
+            let source: Option<TurnResolutionSource> = source
+                .as_deref()
+                .map(|value| parse_enum(value, "turn resolution source"))
+                .transpose()?;
             let canonical = match outcome {
-                Some(value) => Some(TurnOutcome::parse(&value).ok_or_else(|| {
+                Some(value) => TurnOutcome::parse(&value).ok_or_else(|| {
                     Error::new("internal", format!("invalid stored turn outcome: {value}"))
-                })?),
-                None => Some(TurnOutcome::classify_legacy_status_for_harness(
-                    harness,
-                    status.as_deref(),
-                )),
+                })?,
+                None => TurnOutcome::classify_legacy_status_for_harness(harness, status.as_deref()),
             };
+            let outcome = source.map_or(canonical, |source| source.reported_outcome(canonical));
             let usage = usage.map(|value| decode_turn_usage(&value)).transpose()?;
-            Ok((turn_id, canonical, usage))
+            Ok((turn_id, outcome, source, usage))
         })
         .transpose()
     }
@@ -350,10 +363,21 @@ pub struct AgentListPage {
 
 /// Newest terminal turn behind one summary row: turn id, canonical outcome,
 /// and retained usage where the Store kept one.
-type LastTerminalTurn = (String, Option<TurnOutcome>, Option<TurnUsage>);
+type LastTerminalTurn = (
+    String,
+    TurnOutcome,
+    Option<TurnResolutionSource>,
+    Option<TurnUsage>,
+);
 
 /// Stored terminal-turn columns before canonical classification.
-type StoredTerminalTurn = (String, Option<String>, Option<String>, Option<String>);
+type StoredTerminalTurn = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Clone, Copy)]
 enum AgentListProjection {
