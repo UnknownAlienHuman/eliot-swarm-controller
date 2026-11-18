@@ -1,12 +1,11 @@
-//! WinUI views for the Settings pages Models and profiles, Automation (its
-//! rules) and Scripts.
+//! WinUI views for the Settings pages Models and profiles and Scripts, and
+//! the plain words the Automations cards use for rules and timers.
 //!
 //! Profiles: one document draft (the `profiles` settings section as
 //! `[profiles.*]` TOML) shown both as a few common form fields for the
 //! selected profile and, on request, as the full source text; both edit the
 //! same text. A form change saves at once through the daemon; typed source
-//! keeps the Settings save bar; an invalid draft stays here. Rules and timers are read-only: no daemon
-//! operation pauses or resumes a rule or timer; assignments stay editable.
+//! keeps the Settings save bar; an invalid draft stays here.
 
 use windows_reactor::*;
 
@@ -275,7 +274,7 @@ fn compact(value: &serde_json::Value) -> String {
 }
 
 /// An interval in words: "10 min", "30 s", "2 h".
-fn duration_words(ms: i64) -> String {
+pub fn duration_words(ms: i64) -> String {
     let seconds = ms / 1000;
     if seconds >= 3600 && seconds % 3600 == 0 {
         format!("{} h", seconds / 3600)
@@ -368,6 +367,27 @@ fn action_words(action: &serde_json::Value) -> String {
                 .unwrap_or_default();
             format!("run {command}{cwd}{timeout}")
         }
+        "var.set" => format!(
+            "set the {} variable {} to {}",
+            text_field(action, "scope").unwrap_or("project"),
+            text_field(action, "key").unwrap_or("?"),
+            action
+                .get("value")
+                .map(|value| match value.as_str() {
+                    Some(text) => format!("“{text}”"),
+                    None => compact(value),
+                })
+                .unwrap_or_default(),
+        ),
+        "mail.send" | "msg.send" => format!(
+            "send mail{} to {}",
+            quoted(action),
+            action
+                .get("to")
+                .and_then(serde_json::Value::as_array)
+                .map(|to| to.iter().map(value_words).collect::<Vec<_>>().join(", "))
+                .unwrap_or_else(|| "its recipients".to_owned()),
+        ),
         "git.fetch" => format!(
             "fetch {} from {} of {}",
             text_field(action, "source_ref").unwrap_or("the default ref"),
@@ -527,30 +547,15 @@ fn capitalized(text: &str) -> String {
     }
 }
 
-/// One rule in words: its name, its state, and what it does when.
+/// What one rule does when, in words (its state and times are the card's).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuleText {
-    pub name: String,
-    /// Enabled or disabled, paused, the revision.
-    pub status: String,
-    /// "Every 10 min: launch …; next at 00:06:45" (local time).
+    /// "Every 10 min: launch …."
     pub sentence: String,
     pub limit: Option<String>,
 }
 
 pub fn rule_text(entry: &RuleListEntry) -> RuleText {
-    let state = &entry.state;
-    let mut status = format!(
-        "{} · revision {}",
-        if state.enabled { "Enabled" } else { "Disabled" },
-        state.revision
-    );
-    if let Some(reason) = &state.paused_reason {
-        status.push_str(&format!(" · paused: {reason}"));
-    }
-    if let Some(revision) = state.retiring_revision {
-        status.push_str(&format!(" · retiring revision {revision}"));
-    }
     let actions: Vec<String> = entry
         .definition
         .get("do")
@@ -566,220 +571,21 @@ pub fn rule_text(entry: &RuleListEntry) -> RuleText {
             actions.join("; then ")
         }
     );
-    if let Some(next) = entry.timer.as_ref().and_then(|timer| timer.next_due_at) {
-        sentence.push_str(&format!("; next at {}", local_time(next)));
-    }
     sentence.push('.');
     RuleText {
-        name: state.id.clone(),
-        status,
         sentence,
         limit: entry.definition.get("limit").map(limit_words),
     }
 }
 
-/// The rules Settings generated for one assignment (`[automation.
-/// assignments.<key>]`): its interval launch rule `assignment-<key>`, whose
-/// launch carries the assignment, and its completion rule
-/// `assignment-<key>.complete` (the daemon's `automation::reload`).
-#[derive(Debug)]
-pub struct AssignmentRules<'a> {
-    pub key: String,
-    pub rules: Vec<&'a RuleListEntry>,
-}
-
-/// A namespace's rules: the assignment groups, then the other rules.
-pub fn group_rules(rules: &[RuleListEntry]) -> (Vec<AssignmentRules<'_>>, Vec<&RuleListEntry>) {
-    let assignment_key = |entry: &RuleListEntry| -> Option<String> {
-        let key = entry
-            .definition
-            .get("do")?
-            .as_array()?
-            .iter()
-            .find(|action| text_field(action, "action") == Some("launch"))?
-            .get("assignment")
-            .and_then(|assignment| text_field(assignment, "key"))?
-            .to_owned();
-        (entry.state.id == format!("assignment-{key}")).then_some(key)
-    };
-    let mut groups: Vec<AssignmentRules<'_>> = rules
-        .iter()
-        .filter_map(|entry| {
-            assignment_key(entry).map(|key| AssignmentRules {
-                key,
-                rules: vec![entry],
-            })
-        })
-        .collect();
-    let mut rest = Vec::new();
-    for entry in rules {
-        if groups
-            .iter()
-            .any(|group| std::ptr::eq(group.rules[0], entry))
-        {
-            continue;
-        }
-        let completion_of = groups.iter_mut().find(|group| {
-            let launcher = format!("assignment-{}", group.key);
-            entry.state.id == format!("{launcher}.complete")
-                && entry
-                    .definition
-                    .pointer("/on/match/event.cause.rule")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(launcher.as_str())
-        });
-        match completion_of {
-            Some(group) => group.rules.push(entry),
-            None => rest.push(entry),
-        }
-    }
-    (groups, rest)
-}
-
-/// One namespace read for the Automation screen.
+/// One rule namespace read for the Automations page.
+#[derive(Clone)]
 pub struct RuleNamespace {
     /// Registered project id; absent for the global namespace.
     pub project: Option<String>,
     pub label: String,
     pub rules: Result<Vec<RuleListEntry>, String>,
     pub more: bool,
-}
-
-/// One rule as a block: its name, its state, the sentence and its limit.
-fn rule_block(entry: &RuleListEntry) -> View {
-    let text = rule_text(entry);
-    StackPanel::new().spacing(tokens::spacing::XS).children((
-        crate::m3::section_title(text.name),
-        small(text.status),
-        crate::m3::body(text.sentence)
-            .text_wrapping(TextWrapping::Wrap)
-            .is_text_selection_enabled(true),
-        match text.limit {
-            Some(limit) => small(limit).into(),
-            None => View::empty(),
-        },
-    ))
-}
-
-/// An assignment's generated rules as one block, in the assignment's words.
-fn assignment_block(group: &AssignmentRules<'_>) -> View {
-    let texts: Vec<RuleText> = group.rules.iter().map(|entry| rule_text(entry)).collect();
-    let enabled = group.rules.iter().all(|entry| entry.state.enabled);
-    let names = texts
-        .iter()
-        .map(|text| text.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut lines: Vec<KeyedView> = vec![
-        KeyedView::new(
-            "title",
-            crate::m3::section_title(format!("Generated by assignment {}", group.key)),
-        ),
-        KeyedView::new(
-            "status",
-            small(format!(
-                "{} · from Settings › Automation · rules {names}",
-                if enabled {
-                    "Enabled"
-                } else {
-                    "Partly disabled"
-                }
-            )),
-        ),
-    ];
-    for (index, text) in texts.into_iter().enumerate() {
-        lines.push(KeyedView::new(
-            index,
-            crate::m3::body(text.sentence)
-                .text_wrapping(TextWrapping::Wrap)
-                .is_text_selection_enabled(true),
-        ));
-    }
-    StackPanel::new()
-        .spacing(tokens::spacing::XS)
-        .keyed_children(lines)
-}
-
-/// Rules and timers of every namespace, read-only, in words: one card per
-/// namespace that grows with its rules (the page scrolls), the rules an
-/// assignment generated grouped under that assignment.
-pub fn automation_screen(
-    namespaces: &[RuleNamespace],
-    refresh: Callback<()>,
-    palette: Palette,
-) -> View {
-    let mut cards: Vec<KeyedView> = Vec::new();
-    for namespace in namespaces {
-        match &namespace.rules {
-            Ok(rules) if rules.is_empty() => {}
-            Ok(rules) => {
-                let (groups, rest) = group_rules(rules);
-                let mut blocks: Vec<KeyedView> = vec![KeyedView::new(
-                    "label",
-                    crate::m3::secondary(namespace.label.clone()),
-                )];
-                for group in &groups {
-                    blocks.push(KeyedView::new(
-                        format!("assignment:{}", group.key),
-                        assignment_block(group),
-                    ));
-                }
-                for entry in rest {
-                    blocks.push(KeyedView::new(
-                        format!("rule:{}", entry.state.id),
-                        rule_block(entry),
-                    ));
-                }
-                if namespace.more {
-                    blocks.push(KeyedView::new(
-                        "more",
-                        small("More rules exist beyond this page."),
-                    ));
-                }
-                cards.push(KeyedView::new(
-                    format!("ns:{}", namespace.label),
-                    crate::m3::card(palette).content(
-                        StackPanel::new()
-                            .spacing(tokens::spacing::MD)
-                            .keyed_children(blocks),
-                    ),
-                ));
-            }
-            Err(error) => cards.push(KeyedView::new(
-                format!("error:{}", namespace.label),
-                error_note(format!("{}: not read ({error})", namespace.label), palette),
-            )),
-        }
-    }
-    if cards.is_empty() {
-        cards.push(KeyedView::new(
-            "none",
-            // Decided by whether a read has landed, not by the status text, so
-            // a background re-read never turns an empty list into "Reading…".
-            small(if namespaces.is_empty() {
-                "Reading…"
-            } else {
-                "No rules or timers."
-            }),
-        ));
-    }
-    let mut parts = vec![KeyedView::new(
-        "heading",
-        crate::m3::section_heading(
-            "Rules and timers",
-            "Read-only here. Rules live in <data_dir>/rules/*.toml and reload when the file changes; assignment rules come from the assignments above.",
-            Some(
-                crate::m3::text_button(palette)
-                    .automation_name("Refresh rules")
-                    .on_click(refresh)
-                    .content(crate::m3::label("Refresh")),
-            ),
-        ),
-    )];
-    parts.extend(cards);
-    StackPanel::new()
-        .spacing(tokens::spacing::SM)
-        .keyed_children(parts)
 }
 
 // State the Scripts card renders.
@@ -1013,6 +819,7 @@ mod tests {
         definition: serde_json::Value,
     ) -> RuleListEntry {
         RuleListEntry {
+            source_present: true,
             state: RuleStateView {
                 id: id.to_owned(),
                 project: None,
@@ -1064,52 +871,12 @@ mod tests {
     }
 
     #[test]
-    fn generated_assignment_rules_group_under_their_assignment() {
-        let mut rules = backlog();
-        rules.push(rule(
-            "nightly",
-            Some(TimerSchedule::Cron {
-                expression: "0 2 * * *".to_owned(),
-                tz: "UTC".to_owned(),
-            }),
-            json!({"on": {"cron": "0 2 * * *"}, "do": [{"action": "git.fetch", "repository": "app", "remote": "origin", "source_ref": "refs/heads/main"}]}),
-        ));
-        let (groups, rest) = group_rules(&rules);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].key, "backlog");
-        let ids: Vec<&str> = groups[0]
-            .rules
-            .iter()
-            .map(|r| r.state.id.as_str())
-            .collect();
-        assert_eq!(ids, ["assignment-backlog", "assignment-backlog.complete"]);
-        assert_eq!(rest.len(), 1);
-        assert_eq!(rest[0].state.id, "nightly");
-    }
-
-    #[test]
-    fn a_rule_named_like_an_assignment_without_its_launch_is_not_grouped() {
-        let rules = vec![rule(
-            "assignment-x.complete",
-            None,
-            json!({"on": {"event": "turn.completed", "match": {"event.cause.rule": "assignment-x"}}, "do": [{"action": "stop", "target": "${event.agent}"}]}),
-        )];
-        let (groups, rest) = group_rules(&rules);
-        assert!(groups.is_empty());
-        assert_eq!(rest.len(), 1);
-    }
-
-    #[test]
     fn rules_read_as_sentences_without_json() {
         let rules = backlog();
         let launch = rule_text(&rules[0]);
-        assert_eq!(launch.status, "Enabled · revision 1");
         assert_eq!(
             launch.sentence,
-            format!(
-                "Every 10 min: launch a worker with the next brief from C:/qa/briefs in C:/qa/ws-alpha, keeping 1 busy; next at {}.",
-                local_time(NEXT_DUE)
-            )
+            "Every 10 min: launch a worker with the next brief from C:/qa/briefs in C:/qa/ws-alpha, keeping 1 busy."
         );
         assert!(!launch.sentence.contains("UTC"), "{}", launch.sentence);
         let stop = rule_text(&rules[1]);
@@ -1134,6 +901,17 @@ mod tests {
         assert_eq!(
             limited.limit.as_deref(),
             Some("At most 3 firings per Agent within 1h.")
+        );
+        let note = rule_text(&rule(
+            "hourly-note",
+            None,
+            json!({"on": {"every": "1h"}, "do": [
+                {"action": "var.set", "scope": "global", "key": "note", "value": "written"},
+                {"action": "mail.send", "to": ["a1"], "text": "tick"}]}),
+        ));
+        assert_eq!(
+            note.sentence,
+            "Every 1h: set the global variable note to “written”; then send mail “tick” to a1."
         );
         // As `rule.list` returns it: the window normalized to milliseconds.
         assert_eq!(

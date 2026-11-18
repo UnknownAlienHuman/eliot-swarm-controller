@@ -63,6 +63,7 @@ mod monitor_ui;
 mod move_ui;
 mod picker_ui;
 mod profiles_ui;
+mod reveal;
 mod scripts_ui;
 mod settings_ui;
 mod shell_ui;
@@ -228,6 +229,8 @@ enum Message {
     Menu(MenuMsg),
     Move(MoveMsg),
     Bulk(BulkMsg),
+    /// Open a path in File Explorer (any path row's click).
+    Reveal(String, String),
 }
 
 /// The input to the single desktop window: the workspace plus the shared
@@ -337,6 +340,9 @@ struct DesktopApp {
     /// The open bulk action (remove projects, archive or delete tasks).
     bulk: Option<bulk_ui::BulkDialog>,
     missing_cleanup: HashMap<String, bulk_ui::MissingCleanup>,
+    /// The path whose last open in Explorer failed, and why (shown under
+    /// that path's row).
+    revealed: Option<(String, String)>,
 }
 
 impl DesktopApp {
@@ -704,13 +710,11 @@ impl Component for DesktopApp {
                 loss: None,
             },
             monitor: monitor_ui::MonitorState::default(),
-            automation: automation_ui::AutomationState {
-                rules: Vec::new(),
-                epoch: 0,
-            },
+            automation: automation_ui::AutomationState::default(),
             menu: menu_ui::MenuState::default(),
             bulk: None,
             missing_cleanup: HashMap::new(),
+            revealed: None,
         };
         // Before the first controls exist (see `app_resources::install`).
         if let Err(error) = crate::app_resources::install(app.palette().scheme()) {
@@ -755,6 +759,7 @@ impl Component for DesktopApp {
             Message::Menu(msg) => self.menu_update(msg, context),
             Message::Move(msg) => self.move_update(msg, context),
             Message::Bulk(msg) => self.bulk_update(msg, context),
+            Message::Reveal(item, path) => self.reveal_path(item, path),
         }
         self.sync_dialog(context);
     }

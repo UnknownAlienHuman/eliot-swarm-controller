@@ -41,7 +41,6 @@ pub(super) enum ChatMsg {
     FollowLatest(u64, u32),
     ToolsToggled(String, bool),
     CopyPart(String),
-    PathOpened(String),
     CopyCode(String, usize),
     /// Send, Steer or Resume with the draft, bound when it was clicked.
     DraftRequested(DraftAction),
@@ -484,26 +483,6 @@ impl DesktopApp {
                     let _ = self.chat.composer_ref.request_focus();
                 } else if tries < FOLLOW_TRIES && !self.chat.items.is_empty() {
                     self.follow_latest(tries + 1, context);
-                }
-            }
-            ChatMsg::PathOpened(path) => {
-                // The callback carries an absolute resolved reference from its own
-                // transcript, so a selection change cannot retarget a stale click.
-                match std::fs::canonicalize(&path) {
-                    Ok(path) if path.is_file() => {
-                        let text = path.to_string_lossy();
-                        let path = nav::display_path(&text);
-                        // Explorer requires the switch outside the quoted path.
-                        // Canonical Windows file names cannot contain a quote.
-                        use std::os::windows::process::CommandExt;
-                        if let Err(error) = std::process::Command::new("explorer.exe")
-                            .raw_arg(format!("/select,\"{path}\""))
-                            .spawn()
-                        {
-                            self.set_status(format!("Could not reveal file: {error}"));
-                        }
-                    }
-                    _ => self.set_status("This file is not available on this computer."),
                 }
             }
             ChatMsg::ToolsToggled(key, expanded) => {

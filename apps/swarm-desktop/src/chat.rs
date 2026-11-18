@@ -1140,8 +1140,10 @@ fn tools_summary(total: usize, done: usize, failed: usize) -> String {
     parts.join(" · ")
 }
 
-/// Bounded file references in prose, Markdown destinations, code and tool details.
-/// Resolution and existence checks belong to the click's native I/O boundary.
+/// Bounded file and folder references in prose, Markdown destinations, code
+/// and tool details: a name with a known extension, or an absolute Windows
+/// path (a folder has no extension). Resolution and existence checks belong
+/// to the click's native I/O boundary.
 pub fn file_references(text: &str) -> Vec<String> {
     let mut paths = Vec::new();
     // Only paired backticks/double quotes preserve spaces. Apostrophes in
@@ -1152,7 +1154,7 @@ pub fn file_references(text: &str) -> Vec<String> {
         let mut marks = text.match_indices(delimiter);
         while let (Some((start, _)), Some((end, _))) = (marks.next(), marks.next()) {
             let span = &text[start + 1..end];
-            if span.contains(' ') && span.contains(['/', '\\']) {
+            if (span.contains(' ') && span.contains(['/', '\\'])) || span.starts_with(r"\\?\") {
                 quoted.push(span);
                 // Do not also offer broken pieces of a quoted path with spaces.
                 prose.replace_range(start..end + 1, &" ".repeat(end + 1 - start));
@@ -1179,10 +1181,32 @@ pub fn file_references(text: &str) -> Vec<String> {
                 break;
             }
         }
-        let path = path.trim_end_matches(['.', ':']);
+        // A period is part of a verbatim filename. Explorer must either
+        // preserve that exact target or show the reveal error for it.
+        let path = if path.starts_with(r"\\?\") {
+            path
+        } else {
+            path.trim_end_matches(['.', ':'])
+        };
+        let unc = path
+            .strip_prefix(r"\\?\UNC\")
+            .or_else(|| {
+                path.strip_prefix(r"\\")
+                    .filter(|rest| !rest.starts_with(['?', '.']))
+            })
+            .and_then(|rest| rest.split_once('\\'))
+            .is_some_and(|(host, remaining)| {
+                !host.is_empty() && !remaining.split('\\').next().unwrap_or_default().is_empty()
+            });
+        let drive = path.strip_prefix(r"\\?\").unwrap_or(path).as_bytes();
+        let absolute = unc
+            || (drive.len() >= 3
+                && drive[0].is_ascii_alphabetic()
+                && drive[1] == b':'
+                && matches!(drive[2], b'\\' | b'/'));
         if path.len() > 2_048
             || path.contains("://")
-            || path.starts_with(['-', '/', '\\'])
+            || (!absolute && path.starts_with(['-', '/', '\\']))
             || path.contains(['=', '|'])
         {
             continue;
@@ -1212,7 +1236,7 @@ pub fn file_references(text: &str) -> Vec<String> {
                         | "log"
                         | "sql"
                 ));
-        if file && path != ".." && !paths.iter().any(|p| p == path) {
+        if (file || absolute) && path != ".." && !paths.iter().any(|p| p == path) {
             paths.push(path.to_owned());
             if paths.len() == 24 {
                 break;
@@ -1704,6 +1728,17 @@ mod file_reference_tests {
         assert!(refs.contains(&"docs/vision.md".to_owned()));
         assert!(refs.contains(&"apps/main.rs".to_owned()));
         assert!(refs.contains(&r"C:\My Project\note.txt".to_owned()));
+        // A folder has no extension: only an absolute drive path names one.
+        let folders = file_references(
+            r"Work in C:\Development\Rust\worktrees\wt-k143, then `C:/briefs/queue 10`. and/or C: a\b",
+        );
+        assert_eq!(
+            folders,
+            [
+                r"C:/briefs/queue 10",
+                r"C:\Development\Rust\worktrees\wt-k143"
+            ]
+        );
         assert!(
             !refs
                 .iter()
@@ -1713,5 +1748,19 @@ mod file_reference_tests {
             .map(|n| format!("src/f{n}.rs "))
             .collect::<String>();
         assert_eq!(file_references(&many).len(), 24);
+    }
+
+    #[test]
+    fn chats_keep_unc_and_verbatim_windows_paths() {
+        assert_eq!(
+            file_references(
+                r#"Read `\\host\share\a b` and `\\?\C:\work\name.`, then \\?\UNC\host\share\dir."#
+            ),
+            [
+                r"\\host\share\a b",
+                r"\\?\C:\work\name.",
+                r"\\?\UNC\host\share\dir."
+            ],
+        );
     }
 }

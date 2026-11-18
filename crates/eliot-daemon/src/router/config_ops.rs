@@ -19,6 +19,28 @@ use eliot_core::{
 use serde_json::Value;
 
 impl Router {
+    fn apply_assignment_pauses_locked(
+        store: &mut eliot_store::Store,
+        config: crate::config::AutomationConfig,
+    ) -> Result<bool> {
+        let rules: Vec<_> = config
+            .assignments
+            .into_iter()
+            .filter(|(_, assignment)| !assignment.enabled)
+            .map(|(key, _)| format!("assignment-{key}"))
+            .collect();
+        store.set_paused_assignment_timers(&rules)
+    }
+
+    pub(crate) async fn refresh_assignment_pauses(&self) -> Result<()> {
+        let mut store = self.inner.store.lock().await;
+        // Invalid source retains the last saved pause state.
+        if let Ok(config) = crate::config::load_automation_config(&self.inner.data_root) {
+            Self::apply_assignment_pauses_locked(&mut store, config)?;
+        }
+        Ok(())
+    }
+
     fn apply_saved_log_level(data_root: &std::path::Path) {
         // Best effort: a read failure keeps the current level; the next
         // save or restart repairs it. Never fails the save itself.
@@ -152,6 +174,30 @@ impl Router {
             projects.as_ref(),
         )?;
         self.publish_locked(&events);
+        let pause_changed = if !request.dry_run
+            && request
+                .sections
+                .contains_key(&eliot_core::api::SettingsSection::Automation)
+        {
+            crate::config::load_automation_config_snapshot(&self.inner.data_root)
+                .and_then(|(revision, config)| {
+                    if revision != reply.revision {
+                        return Err(Error::new(
+                            "conflict",
+                            "settings changed before the pause applied",
+                        ));
+                    }
+                    Self::apply_assignment_pauses_locked(&mut store, config)
+                })
+                .map_err(|_| {
+                    Error::new(
+                        "unknown",
+                        "settings were saved but assignment pause readback is uncertain",
+                    )
+                })?
+        } else {
+            false
+        };
         // `[daemon] log_level` applies live: refresh it from the saved
         // file so standard/debug switches without a restart. Other daemon
         // keys still report through `restart_required`.
@@ -161,7 +207,7 @@ impl Router {
         // Publication and application share the Store writer lock. A later
         // save cannot publish or apply a newer level before this one applies.
         drop(store);
-        if !events.is_empty() {
+        if pause_changed || !events.is_empty() {
             self.signal_progress();
         }
         request.validate_response(&reply)?;
@@ -186,6 +232,7 @@ impl Router {
             let timer = store.get_timer_state(&namespace, &state.view.id)?;
             rules.push(RuleListEntry {
                 state: state.view,
+                source_present: state.source_present,
                 timer,
                 definition,
             });
@@ -336,6 +383,131 @@ mod tests {
     impl Drop for SettingsRoot {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_assignment_pause_fences_a_stale_slot_with_a_malformed_rules_file() {
+        use eliot_core::api::{SettingsSection, TimerRunRequest};
+        let root = SettingsRoot::new();
+        let router = crate::router::tests::router_with_data_root(root.0.clone());
+        let request = |enabled| {
+            let revision = crate::config::settings::current_revision(&root.0).unwrap();
+            serde_json::to_value(SettingsSaveRequest {
+                expected_revision: revision,
+                sections: [(
+                    SettingsSection::Automation,
+                    json!({"assignments":{"queue":{
+                        "folder":root.0, "workspace":root.0,
+                        "interval":"1h", "max_busy":1, "enabled":enabled
+                    }}}),
+                )]
+                .into(),
+                dry_run: false,
+                client: eliot_core::api::SettingsClientSource::Desktop,
+            })
+            .unwrap()
+        };
+        router
+            .settings_save(&request(true), &Principal::Owner)
+            .await
+            .unwrap();
+        crate::automation::initialize_global_rules(&router, &root.0, &SecretPolicy::default())
+            .await
+            .unwrap();
+        let before = router
+            .get_rule_timer("owner", "assignment-queue")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(before.enabled);
+        let assignment = router.assignment_status("queue", 1).await.unwrap();
+        let rules = root.0.join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("unrelated.toml"), "broken [").unwrap();
+
+        let reply = router
+            .settings_save(&request(false), &Principal::Owner)
+            .await
+            .unwrap();
+        assert_eq!(reply["saved"], true);
+        let after = router
+            .get_rule_timer("owner", "assignment-queue")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after,
+            eliot_core::api::TimerStateView {
+                enabled: false,
+                ..before.clone()
+            }
+        );
+
+        let scheduled_at_ms = before.next_due_at.unwrap();
+        let slot = eliot_store::TimerSlotCommit {
+            scheduled_at_ms,
+            next_due_at_ms: Some(scheduled_at_ms + 3_600_000),
+            action: None,
+            skip_code: Some("missed".to_owned()),
+        };
+        let late = router
+            .commit_rule_timer_slot("owner", None, &before, slot, scheduled_at_ms)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(late.parent.is_none() && !late.is_new && late.events.is_empty());
+        assert_eq!(late.state, after);
+        let manual = TimerRunRequest::new(ulid::Ulid::new().to_string(), "assignment-queue");
+        let error = router
+            .timer_run(&serde_json::to_value(manual).unwrap(), &Principal::Owner)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "bad_state");
+        assert!(error.message.contains("disabled or paused"));
+        assert_eq!(
+            router.assignment_status("queue", 1).await.unwrap(),
+            assignment
+        );
+        let list = router
+            .rule_list(&json!({}), &Principal::Owner)
+            .await
+            .unwrap();
+        let list: RuleListResponse = serde_json::from_value(list).unwrap();
+        assert!(list.rules.iter().any(|entry| {
+            entry.state.id == "assignment-queue.complete"
+                && entry.state.enabled
+                && entry.source_present
+        }));
+    }
+
+    #[tokio::test]
+    async fn rule_list_reports_removal_of_an_already_disabled_rule() {
+        let root = SettingsRoot::new();
+        let router = crate::router::tests::router_with_data_root(root.0.clone());
+        let rules = root.0.join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        let path = rules.join("disabled.toml");
+        std::fs::write(&path, "[[rule]]\nid='disabled'\nenabled=false\non={every='1h'}\ndo=[{action='stop',target='a1',expected_generation=1}]\n").unwrap();
+        for present in [true, false] {
+            if !present {
+                std::fs::remove_file(&path).unwrap();
+            }
+            crate::automation::initialize_global_rules(&router, &root.0, &SecretPolicy::default())
+                .await
+                .unwrap();
+            let list = router
+                .rule_list(&json!({}), &Principal::Owner)
+                .await
+                .unwrap();
+            let list: RuleListResponse = serde_json::from_value(list).unwrap();
+            let entry = list
+                .rules
+                .iter()
+                .find(|entry| entry.state.id == "disabled")
+                .unwrap();
+            assert!(!entry.state.enabled);
+            assert_eq!(entry.source_present, present);
         }
     }
 
@@ -648,6 +820,7 @@ mod tests {
 
     fn entry(id: &str, definition: Value) -> RuleListEntry {
         RuleListEntry {
+            source_present: true,
             state: RuleStateView {
                 id: id.to_owned(),
                 project: None,

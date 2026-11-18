@@ -989,20 +989,20 @@ fn new_rule_seeds_once_and_changed_definition_retires_old_revision() {
     let first_event = insert_test_event(&mut store, "fixture", 1);
     let first = definition("r1", true);
     let seeded = store
-        .reconcile_rule_definitions("owner", std::slice::from_ref(&first), &[], 2)
+        .reconcile_rule_definitions("owner", std::slice::from_ref(&first), &[], 2, &[])
         .unwrap();
     let view = seeded.value[0].view.clone();
     assert_eq!(view.current_cursor, first_event);
 
     let later_event = insert_test_event(&mut store, "fixture", 3);
     let unchanged = store
-        .reconcile_rule_definitions("owner", &[first], &[], 4)
+        .reconcile_rule_definitions("owner", &[first], &[], 4, &[])
         .unwrap();
     assert_eq!(unchanged.value[0].view, view);
 
     let changed = definition("r1", false);
     let reconciled = store
-        .reconcile_rule_definitions("owner", std::slice::from_ref(&changed), &[], 5)
+        .reconcile_rule_definitions("owner", std::slice::from_ref(&changed), &[], 5, &[])
         .unwrap();
     let updated = reconciled.value[0].view.clone();
     assert_eq!(updated.revision, view.revision + 1);
@@ -1013,7 +1013,7 @@ fn new_rule_seeds_once_and_changed_definition_retires_old_revision() {
     assert_eq!(reconciled.events[0].kind, "rule.skipped");
     assert_eq!(
         store
-            .reconcile_rule_definitions("owner", &[changed], &[], 6)
+            .reconcile_rule_definitions("owner", &[changed], &[], 6, &[])
             .unwrap()
             .value[0]
             .view,

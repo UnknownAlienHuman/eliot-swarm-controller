@@ -114,13 +114,13 @@ const INDEX: [(Page, &str, &str); 18] = [
     (Page::Projects, "Add a project", "new checkout"),
     (
         Page::Automations,
-        "Assignments",
-        "automation brief busy folder",
+        "Automations",
+        "assignment brief busy folder schedule rule timer pause resume run now",
     ),
     (
         Page::Automations,
-        "Rules and timers",
-        "automation schedule rule timer",
+        "New automation",
+        "add create assignment queue briefs",
     ),
     (Page::Automations, "Scripts", "automation script run"),
     (
@@ -175,7 +175,7 @@ impl Page {
             Self::Routing => "How Auto chooses a preset when a task starts.",
             Self::Usage => "Remaining quota of each agent app, and what Swarm is running.",
             Self::Projects => "The checkouts tasks start in.",
-            Self::Automations => "Assignments, rules, timers and scripts that start work for you.",
+            Self::Automations => "Work Swarm starts for you: briefs from a folder, on a schedule.",
             Self::Worktrees => "Worktrees Swarm created for tasks, by project.",
             Self::CloudMcp => "Reach Swarm's MCP endpoint from the cloud.",
             Self::Advanced => "Every section of config.toml as JSON, and who changed what.",
@@ -278,13 +278,6 @@ pub(super) enum SettingsMsg {
     /// Check every project (true) or none.
     ProjectsSelectAll(bool),
     ProjectBrowse,
-    AssignmentText(String, AssignmentField, String),
-    AssignmentBusy(String, Option<f64>),
-    /// Assignment key and the index picked in its role list.
-    AssignmentRole(String, Option<usize>),
-    AssignmentRemoved(String),
-    NewAssignment(String),
-    AssignmentAdded,
     /// Index into [`model::CLOUD_FIELDS`] and its text.
     CloudField(usize, String),
     /// Configure (true) or remove Cloud MCP.
@@ -296,8 +289,6 @@ pub(super) enum SettingsMsg {
     AccessChosen(Option<usize>),
     /// Open config.toml with its default app.
     OpenConfig,
-    /// Open a folder in File Explorer.
-    OpenFolder(String),
     /// Read every installed harness's quota again.
     UsageRefresh,
     QuotaLoaded(String, Box<Fallible<HarnessQuotaResponse>>),
@@ -453,7 +444,6 @@ pub(super) struct SettingsState {
     project_open: Option<String>,
     /// Projects checked for Remove selected (registration IDs).
     pub(super) project_selected: std::collections::BTreeSet<String>,
-    new_assignment: String,
     history_open: bool,
     /// The navigation's search text.
     pub(super) query: String,
@@ -885,7 +875,34 @@ impl DesktopApp {
                             self.prefs = crate::settings::Preferences::from_reply(&read);
                         }
                         self.take_profiles(&read);
+                        let automation_changed = self.settings.base.get(&Section::Automation)
+                            != read.sections.get(&Section::Automation);
                         self.settings.take(read);
+                        if automation_changed {
+                            self.automation.global_rules_current = false;
+                            self.load_rules(context);
+                        }
+                        if let Some(form) = self.automation.form.as_mut().filter(|form| form.saving)
+                        {
+                            if let Some(note) = self.settings.notes.get(&Page::Automations)
+                                && note.text == CHANGED_ELSEWHERE
+                            {
+                                form.saving = false;
+                                form.error = Some(note.text.clone());
+                            } else if form.error.is_some() {
+                                // An uncertain reply was followed by a fresh settings read.
+                                if self.settings.dirty(Page::Automations) {
+                                    form.saving = false;
+                                    self.settings.discard(Page::Automations);
+                                } else {
+                                    self.automation.form = None;
+                                }
+                            } else if !self.settings.dirty(Page::Automations)
+                                && self.settings.saving != Some(Page::Automations)
+                            {
+                                self.automation.form = None;
+                            }
+                        }
                         // Saves refused as stale go again first, on this
                         // revision, unless this read showed their edited
                         // section changed (then their drafts are the stored
@@ -901,7 +918,23 @@ impl DesktopApp {
                             self.reprime_fields(context);
                         }
                     }
-                    Err(error) => self.settings.error = Some(format!("Settings not read: {error}")),
+                    Err(error) => {
+                        self.settings.error = Some(format!("Settings not read: {error}"));
+                        if let Some(form) = self.automation.form.as_mut().filter(|form| form.saving)
+                            && (form.error.is_some()
+                                || self.settings.retry.contains(&Page::Automations))
+                        {
+                            form.saving = false;
+                            form.error = self.settings.error.clone();
+                            self.settings
+                                .retry
+                                .retain(|page| *page != Page::Automations);
+                            self.settings
+                                .queued
+                                .retain(|page| *page != Page::Automations);
+                            self.settings.discard(Page::Automations);
+                        }
+                    }
                 }
                 self.drain_saves(context);
             }
@@ -924,6 +957,18 @@ impl DesktopApp {
                     self.drain_saves(context);
                     return;
                 }
+                if page == Page::Automations
+                    && let Some(form) = self.automation.form.as_mut().filter(|form| form.saving)
+                {
+                    match &result {
+                        Ok(_) => self.automation.form = None,
+                        Err(error) if error.code == "conflict" => {}
+                        Err(error) => {
+                            form.error = Some(Note::of(false, &result).text);
+                            form.saving = crate::state::uncertain(error);
+                        }
+                    }
+                }
                 match &result {
                     Ok(reply) => {
                         if reply.saved {
@@ -934,6 +979,13 @@ impl DesktopApp {
                                 self.editor.sent = sent_draft;
                                 self.editor.raw_dirty = false;
                             }
+                        }
+                        if page == Page::Automations
+                            || reply.changed_sections.contains(&Section::Automation)
+                        {
+                            self.automation.global_rules_current = false;
+                            self.load_rules(context);
+                            self.reload_rules_soon(context);
                         }
                         self.after_settings_saved(context);
                     }
@@ -1079,60 +1131,6 @@ impl DesktopApp {
                         .insert(Page::Projects, Note::error(error));
                 }
             },
-            SettingsMsg::AssignmentText(key, field, text) => {
-                if nav::display_path(&model::assignment_text(&s.automation, &key, field)) != text {
-                    model::set_assignment_text(&mut s.automation, &key, field, &text);
-                    self.autosave_later(Page::Automations, context);
-                }
-            }
-            SettingsMsg::AssignmentBusy(key, value) => {
-                if let Some(value) = value
-                    .filter(|value| value.is_finite() && *value >= 1.0)
-                    .map(|value| value.round() as u64)
-                    .filter(|value| model::assignment_busy(&s.automation, &key) != Some(*value))
-                {
-                    model::set_assignment_busy(&mut s.automation, &key, value);
-                    self.autosave(Page::Automations, context);
-                }
-            }
-            SettingsMsg::AssignmentRole(key, index) => {
-                let mut roles = model::routing_roles(&s.routing);
-                let current = model::assignment_role(&s.automation, &key);
-                if !roles.contains(&current) {
-                    roles.push(current.clone());
-                }
-                if let Some(role) = index
-                    .and_then(|index| roles.get(index))
-                    .filter(|role| **role != current)
-                {
-                    model::set_assignment_role(&mut s.automation, &key, role);
-                    self.autosave(Page::Automations, context);
-                }
-            }
-            SettingsMsg::AssignmentRemoved(key) => {
-                model::remove_assignment(&mut s.automation, &key);
-                self.autosave(Page::Automations, context);
-            }
-            SettingsMsg::NewAssignment(text) => s.new_assignment = text,
-            SettingsMsg::AssignmentAdded => {
-                let workspace = self
-                    .nav
-                    .projects
-                    .first()
-                    .map(|project| nav::display_path(&project.workspace).to_owned())
-                    .unwrap_or_default();
-                let s = &mut self.settings;
-                let key = s.new_assignment.trim().to_owned();
-                match model::add_assignment(&mut s.automation, &key, &workspace) {
-                    Ok(()) => {
-                        s.new_assignment.clear();
-                        self.autosave(Page::Automations, context);
-                    }
-                    Err(error) => {
-                        s.notes.insert(Page::Automations, Note::error(error));
-                    }
-                }
-            }
             SettingsMsg::CloudField(index, text) => {
                 if let Some((key, _)) = model::CLOUD_FIELDS.get(index)
                     && model::cloud_field(&s.cloud, key) != text
@@ -1179,10 +1177,9 @@ impl DesktopApp {
             SettingsMsg::OpenConfig => {
                 if let Ok(data_dir) = self.data_dir.clone() {
                     let config = data_dir.join("config.toml");
-                    open_with_shell(&config.to_string_lossy());
+                    let _ = super::reveal::open_with_default_app(&config);
                 }
             }
-            SettingsMsg::OpenFolder(path) => open_with_shell(&path),
             SettingsMsg::UsageRefresh => {
                 self.load_quotas(context);
                 self.load_fleet(context);
@@ -1824,15 +1821,6 @@ fn nav_label(text: &str) -> TextBlock {
         0.0,
         tokens::spacing::XS,
     ))
-}
-
-/// Open a file or folder the way File Explorer does (explicit argv; the
-/// shell picks the default app). Nothing is waited for.
-fn open_with_shell(path: &str) {
-    if path.trim().is_empty() {
-        return;
-    }
-    let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
 }
 
 #[cfg(test)]

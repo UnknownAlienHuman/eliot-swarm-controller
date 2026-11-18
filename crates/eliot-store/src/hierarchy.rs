@@ -1689,7 +1689,9 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                    "DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
+                 DELETE FROM schema_migrations WHERE version=54;
+                 DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
                  DELETE FROM schema_migrations WHERE version=53;
                  DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
                      DROP INDEX events_git_hints;

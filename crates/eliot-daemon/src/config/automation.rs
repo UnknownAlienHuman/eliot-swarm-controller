@@ -49,6 +49,10 @@ pub(crate) struct AssignmentConfig {
     /// completion-rule stop path. Off by default; not a second executor.
     #[serde(default)]
     pub(crate) cleanup_on_retire: bool,
+    /// Off pauses the assignment: its launch timer starts no brief, while
+    /// the completion rule still retires the Agents already running.
+    #[serde(default = "default_assignment_enabled")]
+    pub(crate) enabled: bool,
 }
 
 impl Default for AutomationConfig {
@@ -114,18 +118,35 @@ fn default_max_event_backlog() -> i64 {
     100_000
 }
 
+fn default_assignment_enabled() -> bool {
+    true
+}
+
 fn default_assignment_role() -> String {
     "worker".to_owned()
 }
 
 pub(crate) fn load_automation_config(data_root: &Path) -> core::Result<AutomationConfig> {
+    read_automation_config(data_root).map(|(config, _)| config)
+}
+
+pub(crate) fn load_automation_config_snapshot(
+    data_root: &Path,
+) -> core::Result<(Option<String>, AutomationConfig)> {
+    let (config, source) = read_automation_config(data_root)?;
+    let revision = source.as_deref().map(super::profiles_edit::revision_of);
+    Ok((revision, config))
+}
+
+fn read_automation_config(data_root: &Path) -> core::Result<(AutomationConfig, Option<String>)> {
     let Some((config, source)) = read_config(data_root)? else {
-        return Ok(AutomationConfig::default());
+        return Ok((AutomationConfig::default(), None));
     };
     let route_credential_env_names = configured_route_credential_env_names(&config.proxies);
-    config
+    let config = config
         .automation
-        .validate(&source, &route_credential_env_names)
+        .validate(&source, &route_credential_env_names)?;
+    Ok((config, Some(source)))
 }
 
 pub(super) fn normalize_run_grant(

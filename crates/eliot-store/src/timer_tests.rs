@@ -1045,6 +1045,7 @@ fn manual_run_revision_fences_new_admission_but_not_retained_replay() {
             std::slice::from_ref(&new_definition),
             std::slice::from_ref(&timer_definition),
             registration_ms + 1,
+            &[],
         )
         .unwrap();
     let new_revision = reconciled.value[0].view.revision;

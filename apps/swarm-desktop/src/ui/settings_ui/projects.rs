@@ -53,56 +53,67 @@ impl DesktopApp {
                 format!("{} · {summary}", nav::display_path(&path))
             };
             let select_id = id.clone();
+            let checkout_item = format!("settings-project:{id}:{path}");
             rows.push(KeyedView::new(
                 format!("project:{id}:{open}:{checked}:{name}"),
-                Grid::new()
-                    .columns([GridLength::Auto, GridLength::STAR])
-                    .column_spacing(tokens::spacing::XS)
-                    .children((
-                        CheckBox::new()
-                            .is_checked(checked)
-                            .min_width(0.0)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .margin(Thickness::new(tokens::spacing::SM, 0.0, 0.0, 0.0))
-                            .automation_name(format!("Select {name}"))
-                            .on_is_checked_changed(context.callback(move |on: bool| {
-                                Message::Settings(SettingsMsg::ProjectSelected(
-                                    select_id.clone(),
-                                    on,
-                                ))
-                            })),
-                        m3::row(palette, open)
-                            .grid_column(1)
-                            .automation_name(format!("Project {name}: {note}"))
-                            .on_click(
-                                context.message(Message::Settings(SettingsMsg::ProjectOpened(
-                                    id.clone(),
-                                ))),
-                            )
-                            .content(m3::row_content(
-                                Some(if name.contains(" › ") {
-                                    m3::glyph::WORKTREE
-                                } else {
-                                    m3::glyph::FOLDER
-                                }),
-                                &name,
-                                &note,
-                                if missing {
-                                    m3::secondary("missing")
-                                        .foreground(palette.error())
-                                        .vertical_alignment(VerticalAlignment::Center)
-                                        .into()
-                                } else {
-                                    View::empty()
-                                },
-                            )),
-                    )),
+                StackPanel::new().children((
+                    Grid::new()
+                        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                        .column_spacing(tokens::spacing::XS)
+                        .children((
+                            CheckBox::new()
+                                .is_checked(checked)
+                                .min_width(0.0)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .margin(Thickness::new(tokens::spacing::SM, 0.0, 0.0, 0.0))
+                                .automation_name(format!("Select {name}"))
+                                .on_is_checked_changed(context.callback(move |on: bool| {
+                                    Message::Settings(SettingsMsg::ProjectSelected(
+                                        select_id.clone(),
+                                        on,
+                                    ))
+                                })),
+                            m3::row(palette, open)
+                                .grid_column(1)
+                                .automation_name(format!("Project {name}: {note}"))
+                                .on_click(context.message(Message::Settings(
+                                    SettingsMsg::ProjectOpened(id.clone()),
+                                )))
+                                .content(m3::row_content(
+                                    Some(if name.contains(" › ") {
+                                        m3::glyph::WORKTREE
+                                    } else {
+                                        m3::glyph::FOLDER
+                                    }),
+                                    &name,
+                                    &note,
+                                    if missing {
+                                        m3::secondary("missing")
+                                            .foreground(palette.error())
+                                            .vertical_alignment(VerticalAlignment::Center)
+                                            .into()
+                                    } else {
+                                        View::empty()
+                                    },
+                                )),
+                            Border::new()
+                                .grid_column(2)
+                                .vertical_alignment(VerticalAlignment::Center)
+                                .content(super::super::reveal::path_button(
+                                    palette,
+                                    &name,
+                                    self.reveal_item_message(context, &checkout_item, &path),
+                                )),
+                        )),
+                    self.reveal_note(&checkout_item, palette),
+                )),
             ));
             if !open {
                 continue;
             }
             let path_id = id.clone();
             let actions_id = id.clone();
+            let editor_item = format!("settings-project-editor:{id}:{path}");
             let checks: Vec<KeyedView> = profiles
                 .iter()
                 .map(|profile| {
@@ -138,8 +149,13 @@ impl DesktopApp {
                                 Message::Settings(SettingsMsg::ProjectPath(path_id.clone(), text))
                             }))
                             .into(),
-                        None,
+                        Some(super::super::reveal::path_button(
+                            palette,
+                            &name,
+                            self.reveal_item_message(context, &editor_item, &path),
+                        )),
                     ),
+                    self.reveal_note(&editor_item, palette),
                     m3::form_row(
                         "Rule profiles",
                         StackPanel::new()

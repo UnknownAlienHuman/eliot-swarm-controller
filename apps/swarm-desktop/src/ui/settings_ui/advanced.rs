@@ -6,9 +6,16 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let data_dir = match &self.data_dir {
-            Ok(path) => nav::display_path(&path.display().to_string()).to_owned(),
-            Err(error) => format!("unavailable: {error}"),
+        // The settings file, opened selected in Swarm's data folder.
+        let settings_file: View = match &self.data_dir {
+            Ok(path) => self.path_link(
+                context,
+                palette,
+                &path.join("config.toml").to_string_lossy(),
+            ),
+            Err(error) => m3::body(format!("unavailable: {error}"))
+                .text_wrapping(TextWrapping::Wrap)
+                .into(),
         };
         let open = self.settings.history_open;
         let history: Vec<KeyedView> = self
@@ -56,11 +63,8 @@ impl DesktopApp {
                         KeyedView::new(
                             "data",
                             m3::form_row(
-                                "Daemon data",
-                                m3::body(data_dir)
-                                    .text_trimming(TextTrimming::CharacterEllipsis)
-                                    .is_text_selection_enabled(true)
-                                    .into(),
+                                "Settings file",
+                                settings_file,
                                 Some(
                                     m3::outlined(palette)
                                         .automation_name("Reload everything")
@@ -74,7 +78,7 @@ impl DesktopApp {
                         KeyedView::new(
                             "data-help",
                             m3::help(
-                                "Settings live in its config.toml; every change goes through the daemon's checks.",
+                                "Swarm's data folder holds it; every change goes through the daemon's checks.",
                             ),
                         ),
                         KeyedView::new(

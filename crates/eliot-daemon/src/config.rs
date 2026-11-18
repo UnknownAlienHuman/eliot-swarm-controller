@@ -23,7 +23,9 @@ pub(crate) mod profiles_edit;
 mod projects;
 pub(crate) mod settings;
 
-pub(crate) use automation::{AutomationConfig, RunGrantConfig, load_automation_config};
+pub(crate) use automation::{
+    AutomationConfig, RunGrantConfig, load_automation_config, load_automation_config_snapshot,
+};
 use projects::{ProjectEntry, project_registrations_in};
 pub(crate) use projects::{
     ProjectRegistrationConfig, default_chats_root, load_project_registration_config,
