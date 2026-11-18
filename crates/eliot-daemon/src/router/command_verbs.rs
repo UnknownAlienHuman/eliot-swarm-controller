@@ -6,12 +6,11 @@ use super::{
         RunWorkerStart, classify_start_result, coordination_commit_error_state,
         validate_observer_command_result,
     },
-    context,
 };
 use crate::common::now_ms;
 use eliot_core::{
-    Agent, Command, CommandState, ContextItem, Error, FailureOrigin, Result,
-    api::{FrozenGitFetch, ProjectRegistrationView, configure_uses_native_session},
+    Agent, Command, CommandState, Error, FailureOrigin, Result,
+    api::{FrozenGitFetch, ProjectRegistrationView},
 };
 use serde_json::{Value, json};
 
@@ -489,22 +488,8 @@ impl Router {
         &self,
         id: &str,
         agent: &Agent,
-        dispatched: Command,
-        dispatch_seq: Option<i64>,
-        context_items: Vec<ContextItem>,
+        response: Result<Value>,
     ) -> bool {
-        let dispatched = match context::with_next_input(&dispatched, &context_items) {
-            Ok(dispatched) => dispatched,
-            Err(error) => {
-                self.settle_plugin_error(id, &error).await;
-                return false;
-            }
-        };
-        let response = self
-            .inner
-            .plugin_host
-            .command(agent, dispatched.clone(), dispatch_seq)
-            .await;
         match response {
             Ok(value) => {
                 let response_state = value.get("state").and_then(Value::as_str);
@@ -573,15 +558,9 @@ impl Router {
         &self,
         id: &str,
         agent: &Agent,
-        dispatched: Command,
-        dispatch_seq: Option<i64>,
+        response: Result<Value>,
     ) -> bool {
-        match self
-            .inner
-            .plugin_host
-            .command(agent, dispatched.clone(), dispatch_seq)
-            .await
-        {
+        match response {
             Ok(mut value) => {
                 let state = match value.get("state").and_then(Value::as_str) {
                     Some("applied") => CommandState::Applied,
@@ -626,18 +605,7 @@ impl Router {
     /// proof, and an unverified or refused switch never stores an overlay.
     /// Settlement happens only after the Store commit, so an applied
     /// configure always has a retained row to read back.
-    pub(super) async fn execute_configure_command(
-        &self,
-        id: &str,
-        agent: &Agent,
-        dispatched: Command,
-        dispatch_seq: Option<i64>,
-    ) {
-        if configure_uses_native_session(&agent.harness, &dispatched.args) {
-            self.execute_native_configure_command(id, agent, dispatched, dispatch_seq)
-                .await;
-            return;
-        }
+    pub(super) async fn execute_configure_command(&self, id: &str, agent: &Agent) {
         let outcome = {
             let mut store = self.inner.store.lock().await;
             store.apply_agent_config(id, now_ms())
@@ -686,18 +654,12 @@ impl Router {
     /// settles the plugin's verdict and stores nothing; an ambiguous or
     /// unproven outcome settles unknown and stores nothing, so no
     /// unverified application is ever claimed or retained.
-    async fn execute_native_configure_command(
+    pub(super) async fn execute_native_configure_command(
         &self,
         id: &str,
         agent: &Agent,
-        dispatched: Command,
-        dispatch_seq: Option<i64>,
+        response: Result<Value>,
     ) {
-        let response = self
-            .inner
-            .plugin_host
-            .command(agent, dispatched, dispatch_seq)
-            .await;
         let proven = match response {
             Ok(value) => match value.get("state").and_then(Value::as_str) {
                 Some("applied") => Some(value),

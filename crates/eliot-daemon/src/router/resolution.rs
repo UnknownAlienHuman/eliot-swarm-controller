@@ -250,6 +250,9 @@ impl Router {
             .snapshot_turn(agent, command_id, turn_id)
             .await
             .ok()?;
+        if snapshot["command_id"].as_str() != Some(command_id) {
+            return None;
+        }
         turn_inactive_proof(&snapshot, &agent.id, agent.generation, turn_id)
     }
 }

@@ -18,7 +18,7 @@ use eliot_plugin::{
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{AgentModelsParams, ModelListParams, ModelListPart},
     session::{
-        ResumeSubject, TargetEnvironment, decode, known_command, native_no_write, not_initialized,
+        ResumeSubject, TargetEnvironment, decode, native_no_write, not_initialized,
         optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
         split_provider_model, target_environment, unknown_snapshot, validate_binding,
         validate_identity, validate_source_plan, with_claimed_context, with_context_points,
@@ -27,7 +27,7 @@ use eliot_plugin::{
 use reqwest::{redirect, retry};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
 };
@@ -329,26 +329,9 @@ struct AgentSession {
     server: OwnedServer,
     http: crate::native::OpenCodeHttp,
     events: EventHandle,
-    command_inputs: HashMap<String, String>,
-    command_turns: HashMap<String, String>,
-    unknown_commands: HashSet<String>,
-    rejected_commands: HashSet<String>,
     stop_command_id: Option<String>,
     resources_proved_closed: bool,
     stop_end_ack_proved: bool,
-    control_bindings: HashMap<String, ControlBinding>,
-    control_results: HashMap<String, Value>,
-}
-
-/// One retained control (interrupt/reply) command: its exact binding for
-/// replay integrity. Applied and rejected results replay byte-identical;
-/// unknown replays unknown without rewriting; a rebinding is a
-/// source_integrity error, never a second write.
-struct ControlBinding {
-    verb: String,
-    turn_id: Option<String>,
-    request_id: Option<String>,
-    args: Value,
 }
 
 /// A start request that passed admission: decoded params plus the validated
@@ -422,25 +405,6 @@ enum StartAdmission {
 enum CreateOutcome {
     Created(Box<AgentSession>, SessionInfo, Value),
     ProvenFailed(Value),
-}
-
-/// Outcome of send admission: a replayed response, or a new send ready for
-/// its native write.
-enum SendAdmission {
-    Replay(Value),
-    New { command_id: String, text: String },
-}
-
-/// Outcome of control (interrupt/reply) admission: a replayed response, or
-/// a new control ready for its native write.
-enum ControlAdmission {
-    Replay(Value),
-    New {
-        command_id: String,
-        turn_id: Option<String>,
-        request_id: Option<String>,
-        args: Value,
-    },
 }
 
 /// Outcome of the native prompt write: a known rejection, or an admitted
@@ -1197,15 +1161,9 @@ impl OpenCodePlugin {
             server,
             http,
             events,
-            command_inputs: HashMap::new(),
-            command_turns: HashMap::new(),
-            unknown_commands: HashSet::new(),
-            rejected_commands: HashSet::new(),
             stop_command_id: None,
             resources_proved_closed: false,
             stop_end_ack_proved: false,
-            control_bindings: HashMap::new(),
-            control_results: HashMap::new(),
         };
 
         Ok(session)
@@ -3037,10 +2995,8 @@ impl OpenCodePlugin {
                 "OpenCode session or event source outcome is unresolved",
             ));
         }
-        let (command_id, text) = match Self::admit_send_command(session, &params).await? {
-            SendAdmission::Replay(value) => return Ok(value),
-            SendAdmission::New { command_id, text } => (command_id, text),
-        };
+        let text = Self::admit_send_command(session, &params).await?;
+        let command_id = params.command_id;
         // One deadline for admission plus association: the HTTP 200 only
         // proves inbox admission; the send applies at the exact
         // input-to-execution association on the event stream.
@@ -3049,11 +3005,10 @@ impl OpenCodePlugin {
             .session_id
             .clone()
             .ok_or_else(|| Error::new("unknown", "OpenCode session identity is unresolved"))?;
-        let inbox =
-            match Self::prompt_session(session, &command_id, &session_id, &text, deadline).await? {
-                PromptAdmission::Rejected(value) => return Ok(value),
-                PromptAdmission::Admitted(inbox) => inbox,
-            };
+        let inbox = match Self::prompt_session(session, &session_id, &text, deadline).await? {
+            PromptAdmission::Rejected(value) => return Ok(value),
+            PromptAdmission::Admitted(inbox) => inbox,
+        };
         Self::associate_prompt_turn(
             session,
             command_id,
@@ -3064,16 +3019,15 @@ impl OpenCodePlugin {
         .await
     }
 
-    /// Send phase 1, admission: validate the input, replay a retained
-    /// outcome without new native I/O, or record the new command. The
-    /// idle check reads the event task's current status through the
+    /// Send phase 1, admission: validate input and check idle state
+    /// without native writes. Read the event task's status through the
     /// control queue, serialized behind the terminal commit: the watch
     /// snapshot still shows the finished turn when a send follows its
     /// `turn.completed` immediately.
     async fn admit_send_command(
         session: &mut AgentSession,
         params: &AgentCommandParams,
-    ) -> Result<SendAdmission> {
+    ) -> Result<String> {
         let text = params
             .args
             .get("text")
@@ -3083,35 +3037,6 @@ impl OpenCodePlugin {
             return Err(Error::new(
                 "frame_too_large",
                 "OpenCode input exceeds 512 KiB",
-            ));
-        }
-        if let Some(previous) = session.command_inputs.get(&params.command_id) {
-            if previous != text {
-                return Err(Error::new(
-                    "source_integrity",
-                    "OpenCode command id was reused with different input",
-                ));
-            }
-            if let Some(turn_id) = session.command_turns.get(&params.command_id) {
-                return Ok(SendAdmission::Replay(
-                    json!({"state": "applied", "turn_id": turn_id}),
-                ));
-            }
-            if session.unknown_commands.contains(&params.command_id) {
-                return Err(Error::new(
-                    "unknown",
-                    "OpenCode prompt outcome is unresolved and will not be repeated",
-                ));
-            }
-            if session.rejected_commands.contains(&params.command_id) {
-                return Ok(SendAdmission::Replay(json!({
-                    "state": "rejected",
-                    "reason": "OpenCode prompt was known not to apply",
-                })));
-            }
-            return Err(Error::new(
-                "unknown",
-                "OpenCode command was already dispatched without a retained exact outcome",
             ));
         }
         let event_status = session.events.current_status().await.map_err(|_| {
@@ -3126,22 +3051,13 @@ impl OpenCodePlugin {
         if event_status.active_turn_id.is_some() {
             return Err(Error::new("busy", "OpenCode already has an active turn"));
         }
-        let combined = with_claimed_context(text, &params.context, "OpenCode")?;
-        let command_id = params.command_id.clone();
-        session
-            .command_inputs
-            .insert(command_id.clone(), text.to_owned());
-        Ok(SendAdmission::New {
-            command_id,
-            text: combined,
-        })
+        with_claimed_context(text, &params.context, "OpenCode")
     }
 
     /// Send phase 2, prompt write: admit one input natively. A known rejection
     /// settles `rejected`; anything uncertain latches the session unknown.
     async fn prompt_session(
         session: &mut AgentSession,
-        command_id: &str,
         session_id: &str,
         text: &str,
         deadline: Instant,
@@ -3150,13 +3066,11 @@ impl OpenCodePlugin {
             Ok(inbox) => inbox,
             Err(HttpOutcome::Rejected { reason, .. })
             | Err(HttpOutcome::NotDispatched { reason }) => {
-                session.rejected_commands.insert(command_id.to_owned());
                 return Ok(PromptAdmission::Rejected(
                     json!({"state": "rejected", "reason": reason}),
                 ));
             }
             Err(HttpOutcome::Unknown { .. }) => {
-                session.unknown_commands.insert(command_id.to_owned());
                 session.phase = SessionPhase::Unknown;
                 return Err(Error::new(
                     "unknown",
@@ -3165,7 +3079,6 @@ impl OpenCodePlugin {
             }
         };
         if inbox.session_id != session_id || inbox.id.trim().is_empty() {
-            session.unknown_commands.insert(command_id.to_owned());
             session.phase = SessionPhase::Unknown;
             return Err(Error::new(
                 "unknown",
@@ -3201,7 +3114,6 @@ impl OpenCodePlugin {
                 )
             };
             session.events.abandon_association(command_id.clone()).await;
-            session.unknown_commands.insert(command_id);
             session.phase = SessionPhase::Unknown;
             return Err(Error::new("unknown", message));
         }
@@ -3210,15 +3122,9 @@ impl OpenCodePlugin {
             .await_association(&command_id, deadline)
             .await
         {
-            Ok(turn_id) => {
-                session
-                    .command_turns
-                    .insert(command_id.clone(), turn_id.clone());
-                Ok(json!({"state": "applied", "turn_id": turn_id}))
-            }
+            Ok(turn_id) => Ok(json!({"state": "applied", "turn_id": turn_id})),
             Err(_) => {
                 session.events.abandon_association(command_id.clone()).await;
-                session.unknown_commands.insert(command_id);
                 session.phase = SessionPhase::Unknown;
                 Err(Error::new(
                     "unknown",
@@ -3251,17 +3157,9 @@ impl OpenCodePlugin {
                 "OpenCode session or event source outcome is unresolved",
             ));
         }
-        let admitted = match Self::admit_control_command(session, &params, false)? {
-            ControlAdmission::Replay(value) => return Ok(value),
-            ControlAdmission::New {
-                command_id,
-                turn_id,
-                ..
-            } => (command_id, turn_id),
-        };
-        let (command_id, turn_id) = admitted;
+        let command_id = params.command_id;
+        let turn_id = params.turn_id;
         let Some(turn_id) = turn_id else {
-            Self::abandon_control(session, &command_id);
             return Err(Error::new(
                 "stale_turn",
                 "OpenCode interrupt requires the exact turn id",
@@ -3272,7 +3170,6 @@ impl OpenCodePlugin {
             // The gate itself is unresolved (the event task is gone): the
             // turn may still be live, so this is unknown, never stale.
             Err(_) => {
-                Self::abandon_control(session, &command_id);
                 return Err(Error::new(
                     "unknown",
                     "OpenCode interrupt turn check is unresolved",
@@ -3280,9 +3177,8 @@ impl OpenCodePlugin {
             }
         };
         if !live {
-            Self::abandon_control(session, &command_id);
             return Err(Error::new(
-                "stale_turn",
+                "native_not_dispatched",
                 "OpenCode interrupt named a finished turn",
             ));
         }
@@ -3315,7 +3211,6 @@ impl OpenCodePlugin {
                     "command_id": command_id,
                     "turn_id": turn_id,
                 });
-                Self::settle_control(session, command_id, result.clone());
                 Ok(result)
             }
             Ok(false) => {
@@ -3324,8 +3219,6 @@ impl OpenCodePlugin {
                     // The write went out but the gate is unresolved (the
                     // event task is gone): unknown, never stale.
                     Err(_) => {
-                        session.unknown_commands.insert(command_id.to_owned());
-                        Self::abandon_control(session, command_id);
                         return Err(Error::new(
                             "unknown",
                             "OpenCode interrupt turn check is unresolved",
@@ -3333,39 +3226,32 @@ impl OpenCodePlugin {
                     }
                 };
                 if live {
-                    session.unknown_commands.insert(command_id.to_owned());
-                    Self::abandon_control(session, command_id);
                     Err(Error::new(
                         "unknown",
                         "OpenCode server reports no running execution but the turn is still active",
                     ))
                 } else {
-                    Self::abandon_control(session, command_id);
-                    Err(Error::new(
-                        "stale_turn",
-                        "OpenCode interrupt named a finished turn",
-                    ))
+                    Ok(json!({
+                        "state": "rejected",
+                        "command_id": command_id,
+                        "turn_id": turn_id,
+                        "reason": "OpenCode interrupt named a finished turn",
+                    }))
                 }
             }
-            Err(HttpOutcome::Rejected { reason, .. }) => {
+            Err(HttpOutcome::Rejected { reason, .. } | HttpOutcome::NotDispatched { reason }) => {
                 let result = json!({
                     "state": "rejected",
                     "command_id": command_id,
                     "turn_id": turn_id,
                     "reason": reason,
                 });
-                Self::settle_control(session, command_id, result.clone());
                 Ok(result)
             }
-            Err(HttpOutcome::Unknown { reason } | HttpOutcome::NotDispatched { reason }) => {
-                // The binding stays: an exact retry is answered `unknown` and
-                // never re-sends `/interrupt` (decision D-14).
-                session.unknown_commands.insert(command_id.to_owned());
-                Err(Error::new(
-                    "unknown",
-                    format!("OpenCode interrupt outcome is unresolved ({reason})"),
-                ))
-            }
+            Err(HttpOutcome::Unknown { reason }) => Err(Error::new(
+                "unknown",
+                format!("OpenCode interrupt outcome is unresolved ({reason})"),
+            )),
         }
     }
 
@@ -3373,8 +3259,8 @@ impl OpenCodePlugin {
     /// explicit `delivery: steer`, then the event task proves the input
     /// was delivered while the exact turn stayed active. Native joins
     /// such an input to the running turn at a step boundary; the write
-    /// never opens a turn here (`command_turns` untouched, no send-lane
-    /// association) and never emulates interruption. A finished turn is
+    /// never opens a turn here (no send-lane association) and never emulates
+    /// interruption. A finished turn is
     /// stale without a write; anything that cannot prove consumption is
     /// unknown, and a missed input is cancelled by exact id with removal
     /// proven by inbox-list absence plus a stream-observed cancel —
@@ -3398,31 +3284,21 @@ impl OpenCodePlugin {
                 "OpenCode session or event source outcome is unresolved",
             ));
         }
-        let admitted = match Self::admit_control_command(session, &params, false)? {
-            ControlAdmission::Replay(value) => return Ok(value),
-            ControlAdmission::New {
-                command_id,
-                turn_id,
-                ..
-            } => (command_id, turn_id),
-        };
-        let (command_id, turn_id) = admitted;
+        let command_id = params.command_id;
+        let turn_id = params.turn_id;
         let text = match params.args.get("text").and_then(Value::as_str) {
             Some(text) => text.to_owned(),
             None => {
-                Self::abandon_control(session, &command_id);
                 return Err(Error::new("invalid", "OpenCode steer requires args.text"));
             }
         };
         if text.len() > MAX_TEXT_BYTES {
-            Self::abandon_control(session, &command_id);
             return Err(Error::new(
                 "frame_too_large",
                 "OpenCode input exceeds 512 KiB",
             ));
         }
         let Some(turn_id) = turn_id else {
-            Self::abandon_control(session, &command_id);
             return Err(Error::new(
                 "stale_turn",
                 "OpenCode steer requires the exact turn id",
@@ -3433,7 +3309,6 @@ impl OpenCodePlugin {
             // The gate itself is unresolved (the event task is gone): the
             // turn may still be live, so this is unknown, never stale.
             Err(_) => {
-                Self::abandon_control(session, &command_id);
                 return Err(Error::new(
                     "unknown",
                     "OpenCode steer turn check is unresolved",
@@ -3441,9 +3316,8 @@ impl OpenCodePlugin {
             }
         };
         if !live {
-            Self::abandon_control(session, &command_id);
             return Err(Error::new(
-                "stale_turn",
+                "native_not_dispatched",
                 "OpenCode steer named a finished turn",
             ));
         }
@@ -3459,7 +3333,6 @@ impl OpenCodePlugin {
         {
             Ok(inbox) => {
                 if inbox.session_id != session_id || inbox.id.trim().is_empty() {
-                    session.unknown_commands.insert(command_id.clone());
                     session.phase = SessionPhase::Unknown;
                     return Err(Error::new(
                         "unknown",
@@ -3476,14 +3349,12 @@ impl OpenCodePlugin {
                     "turn_id": turn_id,
                     "reason": reason,
                 });
-                Self::settle_control(session, &command_id, result.clone());
                 return Ok(result);
             }
             Err(HttpOutcome::Unknown { reason }) => {
                 // The input may have been admitted without an inbox id to
                 // watch or cancel: latch unknown like the send path and
                 // never re-send (the control binding stays).
-                session.unknown_commands.insert(command_id.clone());
                 session.phase = SessionPhase::Unknown;
                 return Err(Error::new(
                     "unknown",
@@ -3502,7 +3373,6 @@ impl OpenCodePlugin {
                     session,
                     &session_id,
                     &inbox.id,
-                    &command_id,
                     "OpenCode steer was admitted but its consumption cannot be proven",
                 )
                 .await);
@@ -3515,14 +3385,12 @@ impl OpenCodePlugin {
                     "command_id": command_id,
                     "turn_id": turn_id,
                 });
-                Self::settle_control(session, &command_id, result.clone());
                 Ok(result)
             }
             Ok(Ok(SteerVerdict::Missed)) => Err(Self::settle_steer_unproven(
                 session,
                 &session_id,
                 &inbox.id,
-                &command_id,
                 "OpenCode steer missed its turn; the input did not join the exact turn",
             )
             .await),
@@ -3532,7 +3400,6 @@ impl OpenCodePlugin {
                     session,
                     &session_id,
                     &inbox.id,
-                    &command_id,
                     "OpenCode steer consumption is unproven",
                 )
                 .await)
@@ -3553,7 +3420,6 @@ impl OpenCodePlugin {
         session: &mut AgentSession,
         session_id: &str,
         inbox_id: &str,
-        command_id: &str,
         message: &str,
     ) -> Error {
         let deadline = Instant::now() + RPC_TIMEOUT;
@@ -3562,7 +3428,6 @@ impl OpenCodePlugin {
             .cancel_inbox(session_id, inbox_id, deadline)
             .await;
         let removed = Self::steer_input_removed(session, session_id, inbox_id).await;
-        session.unknown_commands.insert(command_id.to_owned());
         if removed {
             Error::new("unknown", message.to_owned())
         } else {
@@ -3602,8 +3467,7 @@ impl OpenCodePlugin {
     }
 
     /// Reply to one exact retained native request. The event task stages
-    /// the choice against the current offer and performs the one write;
-    /// this side only retains the outcome for replay.
+    /// the choice against the current offer and performs the native write.
     async fn reply_command(&mut self, params: AgentCommandParams) -> Result<Value> {
         let session = self
             .session
@@ -3622,136 +3486,46 @@ impl OpenCodePlugin {
                 "OpenCode session or event source outcome is unresolved",
             ));
         }
-        let admitted = match Self::admit_control_command(session, &params, true)? {
-            ControlAdmission::Replay(value) => return Ok(value),
-            ControlAdmission::New {
-                command_id,
-                turn_id,
-                request_id,
-                args,
-            } => (command_id, turn_id, request_id, args),
-        };
-        let (command_id, turn_id, request_id, args) = admitted;
-        let (Some(turn_id), Some(request_id)) = (turn_id, request_id) else {
-            Self::abandon_control(session, &command_id);
+        let (Some(turn_id), Some(request_id)) = (
+            params.turn_id,
+            params.request_id.filter(|id| !id.is_empty()),
+        ) else {
             return Err(Error::new(
                 "not_found",
                 "OpenCode reply requires the exact turn and request ids",
             ));
         };
-        let verb = params.verb.clone();
         match session
             .events
-            .reply_request(command_id.clone(), request_id, turn_id, verb, args)
+            .reply_request(
+                params.command_id,
+                request_id,
+                turn_id,
+                params.verb,
+                params.args,
+            )
             .await
         {
-            Ok(result) => {
-                if result.get("state").and_then(Value::as_str) == Some("unknown") {
-                    session.unknown_commands.insert(command_id.clone());
-                }
-                Self::settle_control(session, &command_id, result.clone());
-                Ok(result)
-            }
+            Ok(result) => Ok(result),
             Err(error) => {
-                // Guard failures (stale, missing, already decided, busy)
-                // ran no write and pass through; only a lost control is
-                // unknown.
+                // These native offer guards ran before the reply write.
                 if matches!(
                     error.code.as_str(),
                     "not_found" | "stale_turn" | "rejected" | "busy"
                 ) || native_no_write(&error.code)
                 {
-                    Self::abandon_control(session, &command_id);
-                    return Err(error);
+                    return Ok(json!({
+                        "state": "rejected",
+                        "reason": error.code,
+                        "message": error.message,
+                    }));
                 }
-                // The binding stays so an exact retry is answered `unknown`.
-                session.unknown_commands.insert(command_id.clone());
                 Err(Error::new(
                     "unknown",
                     format!("OpenCode reply outcome is unresolved ({})", error.message),
                 ))
             }
         }
-    }
-
-    /// Control admission: replay a retained outcome without new native I/O,
-    /// refuse a rebinding, or record the new control. Replies additionally
-    /// require their request id here; the exact offer binding happens on
-    /// the event task.
-    fn admit_control_command(
-        session: &mut AgentSession,
-        params: &AgentCommandParams,
-        needs_request: bool,
-    ) -> Result<ControlAdmission> {
-        if session.unknown_commands.contains(&params.command_id)
-            && !session.control_bindings.contains_key(&params.command_id)
-        {
-            return Err(Error::new(
-                "unknown",
-                "OpenCode control outcome is unresolved and will not be repeated",
-            ));
-        }
-        if let Some(binding) = session.control_bindings.get(&params.command_id) {
-            if binding.verb != params.verb
-                || binding.turn_id != params.turn_id
-                || binding.request_id != params.request_id
-                || binding.args != params.args
-            {
-                return Err(Error::new(
-                    "source_integrity",
-                    "OpenCode command id was reused with a different control",
-                ));
-            }
-            if let Some(result) = session.control_results.get(&params.command_id) {
-                return Ok(ControlAdmission::Replay(result.clone()));
-            }
-            if session.unknown_commands.contains(&params.command_id) {
-                return Err(Error::new(
-                    "unknown",
-                    "OpenCode control outcome is unresolved and will not be repeated",
-                ));
-            }
-            return Err(Error::new(
-                "unknown",
-                "OpenCode command was already dispatched without a retained exact outcome",
-            ));
-        }
-        if needs_request && params.request_id.as_deref().is_none_or(str::is_empty) {
-            return Err(Error::new(
-                "not_found",
-                "OpenCode reply requires the exact request id",
-            ));
-        }
-        session.control_bindings.insert(
-            params.command_id.clone(),
-            ControlBinding {
-                verb: params.verb.clone(),
-                turn_id: params.turn_id.clone(),
-                request_id: params.request_id.clone(),
-                args: params.args.clone(),
-            },
-        );
-        Ok(ControlAdmission::New {
-            command_id: params.command_id.clone(),
-            turn_id: params.turn_id.clone(),
-            request_id: params.request_id.clone(),
-            args: params.args.clone(),
-        })
-    }
-
-    /// Retain an applied or rejected control result for byte-identical
-    /// replay.
-    fn settle_control(session: &mut AgentSession, command_id: &str, result: Value) {
-        session
-            .control_results
-            .insert(command_id.to_owned(), result);
-    }
-
-    /// Forget a control binding whose outcome left no result (stale,
-    /// unknown): nothing may replay from it.
-    fn abandon_control(session: &mut AgentSession, command_id: &str) {
-        session.control_bindings.remove(command_id);
-        session.control_results.remove(command_id);
     }
 
     async fn snapshot(&mut self, raw: &Value) -> Result<Value> {
@@ -3796,6 +3570,16 @@ impl OpenCodePlugin {
             Ok(request) => request,
             Err(reason) => return unknown_snapshot(&params, reason),
         };
+        let last_turn = match Self::snapshot_turn_facts(
+            &event_status,
+            &params,
+            request.turn_id.as_deref(),
+            &session.start_command_id,
+            session.stop_command_id.as_deref(),
+        ) {
+            Ok(last_turn) => last_turn,
+            Err(reason) => return unknown_snapshot(&params, reason),
+        };
         // The session readback proves the exact owned session is alive; turn
         // facts come from the committed stream fold.
         if !Self::session_readback_proven(&session.http, &request.session_id).await {
@@ -3804,17 +3588,6 @@ impl OpenCodePlugin {
                 "OpenCode session readback did not prove the exact owned session",
             );
         }
-        if session.command_inputs.contains_key(&params.command_id) && request.turn_id.is_none() {
-            return unknown_snapshot(
-                &params,
-                "OpenCode command has no exact native turn association",
-            );
-        }
-        let last_turn =
-            match Self::snapshot_turn_facts(&event_status, &params, request.turn_id.as_deref()) {
-                Ok(last_turn) => last_turn,
-                Err(reason) => return unknown_snapshot(&params, reason),
-            };
         let state = if event_status.active_turn_id.is_some() {
             "busy"
         } else {
@@ -3876,28 +3649,7 @@ impl OpenCodePlugin {
         params: &AgentSnapshotParams,
         event_status: &EventStatus,
     ) -> std::result::Result<SnapshotRequest, &'static str> {
-        let turn_id = match params.turn_id.as_deref() {
-            Some(turn_id) => Some(turn_id.to_owned()),
-            None => session.command_turns.get(&params.command_id).cloned(),
-        };
-        if let Some(requested_turn) = turn_id.as_deref()
-            && session
-                .command_turns
-                .get(&params.command_id)
-                .map(String::as_str)
-                != Some(requested_turn)
-        {
-            return Err("OpenCode command has no proof for the requested native turn");
-        }
-        if !known_command(
-            &session.start_command_id,
-            &session.command_inputs,
-            &session.stop_command_id,
-            &params.command_id,
-        ) && !session.control_bindings.contains_key(&params.command_id)
-        {
-            return Err("OpenCode command identity is not retained");
-        }
+        let turn_id = params.turn_id.as_deref().map(str::to_owned);
         if session.phase == SessionPhase::Stopped {
             return Err("OpenCode native server is stopped; native readback is unavailable");
         }
@@ -3921,12 +3673,14 @@ impl OpenCodePlugin {
             .is_ok()
     }
 
-    /// Snapshot phase 4, facts: the requested turn from the committed stream
-    /// fold. `Err(reason)` renders as an unknown snapshot with that reason.
+    /// The requested turn from the committed stream fold. Only the native
+    /// session's start and stop commands can request session-level facts.
     fn snapshot_turn_facts(
         event_status: &EventStatus,
         params: &AgentSnapshotParams,
         turn_id: Option<&str>,
+        start_command_id: &str,
+        stop_command_id: Option<&str>,
     ) -> std::result::Result<Option<TurnFacts>, &'static str> {
         match turn_id {
             Some(requested) => {
@@ -3948,7 +3702,12 @@ impl OpenCodePlugin {
                     Err("OpenCode readback did not prove the exact requested turn")
                 }
             }
-            None => Ok(event_status.last_turn.clone()),
+            None if params.command_id == start_command_id
+                || stop_command_id == Some(params.command_id.as_str()) =>
+            {
+                Ok(event_status.last_turn.clone())
+            }
+            None => Err("OpenCode command has no exact native turn association"),
         }
     }
 
@@ -5415,6 +5174,41 @@ mod tests {
         ResumeSubject, optional_profile_text, parse_resume_subject, validate_source_plan,
     };
     use serde_json::json;
+
+    #[test]
+    fn turnless_snapshot_binds_start_and_stop_commands_only() {
+        use super::{AgentSnapshotParams, EventStatus, TurnFacts};
+
+        let status = EventStatus {
+            last_turn: Some(TurnFacts {
+                command_id: "send-1".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                status: None,
+                final_text: None,
+                terminal: true,
+            }),
+            ..Default::default()
+        };
+        let mut params = AgentSnapshotParams {
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            command_id: "start".to_owned(),
+            turn_id: None,
+        };
+        for command_id in ["start", "stop"] {
+            params.command_id = command_id.to_owned();
+            let turn =
+                OpenCodePlugin::snapshot_turn_facts(&status, &params, None, "start", Some("stop"))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(turn.turn_id, "turn-1");
+        }
+        params.command_id = "send-1".to_owned();
+        assert!(
+            OpenCodePlugin::snapshot_turn_facts(&status, &params, None, "start", Some("stop"))
+                .is_err()
+        );
+    }
 
     fn mcp_fixture(name: &str, status: &str) -> McpServerReadback {
         McpServerReadback {

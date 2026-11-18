@@ -31,7 +31,7 @@ use eliot_plugin::{
     ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{MAX_CREDENTIAL_BYTES, ProfileStoreParams},
     session::{
-        decode, is_passed_env, is_secret_name, known_command, native_no_write, not_initialized,
+        decode, is_passed_env, is_secret_name, native_no_write, not_initialized,
         optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
         rejected_control, target_environment as shared_target_environment, unknown_control,
         unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
@@ -41,7 +41,7 @@ use eliot_plugin::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     ffi::OsString,
     path::{Path, PathBuf},
     time::Duration,
@@ -163,27 +163,8 @@ struct AgentSession {
     native: NativeProcess,
     native_client: NativeClient,
     events: EventHandle,
-    command_inputs: HashMap<String, String>,
-    command_turns: HashMap<String, String>,
-    unknown_commands: HashSet<String>,
-    rejected_commands: HashSet<String>,
-    control_commands: HashMap<String, ControlCommand>,
+    current_turn: Option<(String, String)>,
     stop_command_id: Option<String>,
-}
-
-struct ControlCommand {
-    verb: String,
-    turn_id: Option<String>,
-    request_id: Option<String>,
-    args: Value,
-    outcome: ControlOutcome,
-}
-
-enum ControlOutcome {
-    Pending,
-    Applied(Value),
-    Rejected(Value),
-    Unknown,
 }
 
 struct TargetEnvironment {
@@ -1254,11 +1235,7 @@ impl CodexPlugin {
             native,
             native_client,
             events,
-            command_inputs: HashMap::new(),
-            command_turns: HashMap::new(),
-            unknown_commands: HashSet::new(),
-            rejected_commands: HashSet::new(),
-            control_commands: HashMap::new(),
+            current_turn: None,
             stop_command_id: None,
         };
 
@@ -2102,33 +2079,6 @@ impl CodexPlugin {
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new("frame_too_large", "Codex input exceeds 512 KiB"));
         }
-        if let Some(previous) = session.command_inputs.get(&params.command_id) {
-            if previous != text {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Codex command id was reused with different input",
-                ));
-            }
-            if let Some(turn_id) = session.command_turns.get(&params.command_id) {
-                return Ok(json!({"state": "applied", "turn_id": turn_id}));
-            }
-            if session.unknown_commands.contains(&params.command_id) {
-                return Err(Error::new(
-                    "unknown",
-                    "Codex turn/start outcome is unresolved and will not be repeated",
-                ));
-            }
-            if session.rejected_commands.contains(&params.command_id) {
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": "Codex turn/start was known not to apply",
-                }));
-            }
-            return Err(Error::new(
-                "unknown",
-                "Codex command was already dispatched without a retained exact outcome",
-            ));
-        }
         let event_status = session.events.status();
         if let Some(reason) = event_status.failure {
             return Err(Error::new("unknown", reason)
@@ -2148,9 +2098,6 @@ impl CodexPlugin {
         }
         let combined = with_claimed_context(text, &params.context, "Codex")?;
         let command_id = params.command_id.clone();
-        session
-            .command_inputs
-            .insert(command_id.clone(), text.to_owned());
         // A retained `configure` overlay rides the per-turn fields the
         // installed schema accepts; without one the frozen session values
         // apply unchanged.
@@ -2193,25 +2140,21 @@ impl CodexPlugin {
         let response = match response {
             Ok(value) => value,
             Err(error) if native_no_write(&error.code) => {
-                session.rejected_commands.insert(command_id);
                 return Ok(json!({
                     "state": "rejected",
                     "reason": "Codex turn/start was not dispatched",
                 }));
             }
             Err(error) if error.code == "native_rejected" => {
-                session.rejected_commands.insert(command_id);
                 return Ok(json!({"state": "rejected", "reason": "Codex rejected turn/start"}));
             }
             Err(error) if error.code == "frame_too_large" => {
-                session.rejected_commands.insert(command_id);
                 return Ok(json!({
                     "state": "rejected",
                     "reason": "Codex turn/start frame exceeded the native transport bound before dispatch",
                 }));
             }
             Err(_) => {
-                session.unknown_commands.insert(command_id);
                 session.phase = SessionPhase::Unknown;
                 return Err(Error::new(
                     "unknown",
@@ -2223,7 +2166,6 @@ impl CodexPlugin {
             match serde_json::from_value::<NativeTurnStartResponse>(response) {
                 Ok(started) if !started.turn.id.trim().is_empty() => started,
                 _ => {
-                    session.unknown_commands.insert(command_id);
                     session.phase = SessionPhase::Unknown;
                     return Err(Error::new(
                         "unknown",
@@ -2232,9 +2174,7 @@ impl CodexPlugin {
                 }
             };
         let turn_id = started.turn.id;
-        session
-            .command_turns
-            .insert(command_id.clone(), turn_id.clone());
+        session.current_turn = Some((command_id.clone(), turn_id.clone()));
         if session
             .events
             .associate_turn(
@@ -2247,7 +2187,6 @@ impl CodexPlugin {
             .await
             .is_err()
         {
-            session.unknown_commands.insert(command_id);
             session.phase = SessionPhase::Unknown;
             return Err(Error::new(
                 "unknown",
@@ -2303,23 +2242,14 @@ impl CodexPlugin {
                 "Codex steer contains a known credential",
             ));
         }
-        if let Some(result) = control_replay(session, &params)? {
-            return Ok(result);
-        }
         if session.phase != SessionPhase::Ready
             || session.events.status().active_turn_id.as_deref() != Some(turn_id)
         {
             let result = rejected_control("Codex steer does not match a healthy active turn");
-            settle_control(
-                session,
-                &params.command_id,
-                ControlOutcome::Rejected(result.clone()),
-            );
             return Ok(result);
         }
         let Some(thread_id) = session.thread_id.clone() else {
             let result = unknown_control("Codex thread identity is unresolved");
-            settle_control(session, &params.command_id, ControlOutcome::Unknown);
             return Ok(result);
         };
         let turn_params = NativeTurnSteerParams {
@@ -2343,16 +2273,10 @@ impl CodexPlugin {
                 ) =>
             {
                 let result = rejected_control("Codex turn/steer was not applied");
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Rejected(result.clone()),
-                );
                 Ok(result)
             }
             Err(_) => {
                 let result = unknown_control("Codex turn/steer outcome is unknown");
-                settle_control(session, &params.command_id, ControlOutcome::Unknown);
                 Ok(result)
             }
             Ok(response) => {
@@ -2363,7 +2287,6 @@ impl CodexPlugin {
                             let result = unknown_control(
                                 "Codex turn/steer did not confirm the captured turn id",
                             );
-                            settle_control(session, &params.command_id, ControlOutcome::Unknown);
                             return Ok(result);
                         }
                     };
@@ -2372,11 +2295,6 @@ impl CodexPlugin {
                     "command_id": params.command_id,
                     "turn_id": steer.turn_id,
                 });
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Applied(result.clone()),
-                );
                 Ok(result)
             }
         }
@@ -2435,17 +2353,12 @@ impl CodexPlugin {
         if session.phase == SessionPhase::Stopped
             || session.events.status().active_turn_id.as_deref() != Some(turn_id)
         {
-            return Err(Error::new(
-                "stale_turn",
+            return Ok(rejected_control(
                 "turn/interrupt does not match the exact active native turn",
             ));
         }
-        if let Some(result) = control_replay(session, &params)? {
-            return Ok(result);
-        }
         let Some(thread_id) = session.thread_id.clone() else {
             let result = unknown_control("Codex thread identity is unresolved");
-            settle_control(session, &params.command_id, ControlOutcome::Unknown);
             return Ok(result);
         };
         let interrupt_params = NativeTurnInterruptParams {
@@ -2473,16 +2386,10 @@ impl CodexPlugin {
                     "Codex turn/interrupt was not applied: {}",
                     error.message
                 ));
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Rejected(result.clone()),
-                );
                 Ok(result)
             }
             Err(_) => {
                 let result = unknown_control("Codex turn/interrupt outcome is unknown");
-                settle_control(session, &params.command_id, ControlOutcome::Unknown);
                 Ok(result)
             }
             Ok(_) => {
@@ -2491,11 +2398,6 @@ impl CodexPlugin {
                     "command_id": params.command_id,
                     "turn_id": turn_id,
                 });
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Applied(result.clone()),
-                );
                 Ok(result)
             }
         }
@@ -2533,9 +2435,6 @@ impl CodexPlugin {
                     "Codex request reply needs its captured request id",
                 )
             })?;
-        if let Some(result) = control_replay(session, &params)? {
-            return Ok(result);
-        }
         match session
             .events
             .reply_request(
@@ -2547,31 +2446,12 @@ impl CodexPlugin {
             )
             .await
         {
-            Ok(result) => {
-                let outcome = match result.get("state").and_then(Value::as_str) {
-                    Some("applied") => ControlOutcome::Applied(result.clone()),
-                    Some("rejected") => ControlOutcome::Rejected(result.clone()),
-                    Some("unknown") => ControlOutcome::Unknown,
-                    _ => {
-                        let result = unknown_control("Codex request reply omitted its outcome");
-                        settle_control(session, &params.command_id, ControlOutcome::Unknown);
-                        return Ok(result);
-                    }
-                };
-                settle_control(session, &params.command_id, outcome);
-                Ok(result)
-            }
+            Ok(result) => Ok(result),
             Err(error) if native_no_write(&error.code) => {
                 let result = rejected_control("Codex request reply was not dispatched");
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Rejected(result.clone()),
-                );
                 Ok(result)
             }
             Err(error) if error.code == "unknown" => {
-                settle_control(session, &params.command_id, ControlOutcome::Unknown);
                 Ok(unknown_control("Codex request reply outcome is unknown"))
             }
             Err(error)
@@ -2581,11 +2461,6 @@ impl CodexPlugin {
                 ) =>
             {
                 let result = rejected_control(&error.message);
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Rejected(result.clone()),
-                );
                 Ok(result)
             }
             Err(error) => Err(error),
@@ -2647,28 +2522,20 @@ impl CodexPlugin {
             }));
         }
         let event_status = session.events.status();
-        let turn_id = match params.turn_id.as_deref() {
-            Some(turn_id) => Some(turn_id.to_owned()),
-            None => session.command_turns.get(&params.command_id).cloned(),
-        };
-        if let Some(requested_turn) = turn_id.as_deref()
-            && session
-                .command_turns
-                .get(&params.command_id)
-                .map(String::as_str)
-                != Some(requested_turn)
+        // The daemon binds an explicit requested turn in Store. If the
+        // association acknowledgement was lost, the adapter can still
+        // translate its one current native turn for the exact command.
+        let turn_id = params.turn_id.clone().or_else(|| {
+            session
+                .current_turn
+                .as_ref()
+                .filter(|(command, _)| command == &params.command_id)
+                .map(|(_, turn)| turn.clone())
+        });
+        if turn_id.is_none()
+            && session.start_command_id != params.command_id
+            && session.stop_command_id.as_deref() != Some(params.command_id.as_str())
         {
-            return unknown_snapshot(
-                &params,
-                "Codex command has no proof for the requested native turn",
-            );
-        }
-        if !known_command(
-            &session.start_command_id,
-            &session.command_inputs,
-            &session.stop_command_id,
-            &params.command_id,
-        ) {
             return unknown_snapshot(&params, "Codex command identity is not retained");
         }
         if session.phase == SessionPhase::Stopped {
@@ -2694,12 +2561,6 @@ impl CodexPlugin {
             }
         };
         let native_state = thread_state(&thread);
-        if session.command_inputs.contains_key(&params.command_id) && turn_id.is_none() {
-            return unknown_snapshot(
-                &params,
-                "Codex command has no exact native turn association",
-            );
-        }
         let last_turn = if let Some(turn_id) = turn_id.as_deref() {
             match read_owned_turn(
                 &session.native_client,
@@ -3215,50 +3076,6 @@ fn readback_approval_matches(actual: &Value, requested: &str) -> bool {
     actual.as_str() == Some(requested)
 }
 
-fn control_replay(
-    session: &mut AgentSession,
-    params: &AgentCommandParams,
-) -> Result<Option<Value>> {
-    if let Some(previous) = session.control_commands.get(&params.command_id) {
-        if previous.verb != params.verb
-            || previous.turn_id != params.turn_id
-            || previous.request_id != params.request_id
-            || previous.args != params.args
-        {
-            return Err(Error::new(
-                "source_integrity",
-                "Codex control command id was reused with different binding",
-            ));
-        }
-        return Ok(Some(match &previous.outcome {
-            ControlOutcome::Applied(result) | ControlOutcome::Rejected(result) => result.clone(),
-            ControlOutcome::Pending => {
-                unknown_control("Codex control command is already in flight")
-            }
-            ControlOutcome::Unknown => {
-                unknown_control("Codex control command outcome is unresolved")
-            }
-        }));
-    }
-    session.control_commands.insert(
-        params.command_id.clone(),
-        ControlCommand {
-            verb: params.verb.clone(),
-            turn_id: params.turn_id.clone(),
-            request_id: params.request_id.clone(),
-            args: params.args.clone(),
-            outcome: ControlOutcome::Pending,
-        },
-    );
-    Ok(None)
-}
-
-fn settle_control(session: &mut AgentSession, command_id: &str, outcome: ControlOutcome) {
-    if let Some(command) = session.control_commands.get_mut(command_id) {
-        command.outcome = outcome;
-    }
-}
-
 async fn verify_resume_preflight(
     client: &NativeClient,
     thread_id: &str,
@@ -3540,11 +3357,7 @@ mod tests {
             }
         }
     }
-    use std::{
-        collections::{HashMap, HashSet},
-        ffi::OsString,
-        path::PathBuf,
-    };
+    use std::{ffi::OsString, path::PathBuf};
 
     #[test]
     fn failed_observer_attach_replays_only_exact_binding_and_only_proven_start_errors() {
@@ -4055,11 +3868,7 @@ mod tests {
             native,
             native_client,
             events,
-            command_inputs: HashMap::new(),
-            command_turns: HashMap::new(),
-            unknown_commands: HashSet::new(),
-            rejected_commands: HashSet::new(),
-            control_commands: HashMap::new(),
+            current_turn: None,
             stop_command_id: None,
         };
         let mut plugin = CodexPlugin::default();

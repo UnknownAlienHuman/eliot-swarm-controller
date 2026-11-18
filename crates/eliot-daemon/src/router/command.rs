@@ -10,10 +10,11 @@ use super::{
     validate_project_rule_resume_command, validate_retained_resume_agent,
 };
 use crate::common::now_ms;
+use crate::plugin_host::PendingCommand;
 use eliot_core::{
     Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FailureOrigin,
     FrozenScriptRun, InjectArgs, InjectPoint, Result, SecretPolicy,
-    api::{FrozenGitFetch, ProjectRegistrationView},
+    api::{FrozenGitFetch, ProjectRegistrationView, configure_uses_native_session},
     classify_dispatched_error,
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -93,6 +94,11 @@ struct PreparedCommand {
     resume_source_state: Option<Value>,
 }
 
+struct DispatchedCommand {
+    command: Command,
+    plugin: Option<Result<(Agent, PendingCommand)>>,
+}
+
 /// Launch/resume start inputs captured before dispatch: the native Store
 /// binding for a Codex launch and the retained source state for a resume.
 struct StartInputs {
@@ -143,7 +149,7 @@ impl Router {
                     .min(u128::from(u64::MAX)) as u64,
             )],
         );
-        let Some((dispatched, dispatch_seq, context_items)) = self
+        let Some(dispatched) = self
             .dispatch_and_wait_for_effect(
                 &id,
                 &mut receiver,
@@ -159,8 +165,6 @@ impl Router {
             prepared.git_fetch_registration,
             prepared.resume_source_state,
             linked_id,
-            dispatch_seq,
-            context_items,
         )
         .await;
     }
@@ -589,8 +593,8 @@ impl Router {
         receiver: &mut broadcast::Receiver<Event>,
         command: &Command,
         launch_binding: &Option<(Agent, eliot_plugin::protocol::ProfileStoreResult)>,
-    ) -> Option<(Command, i64, Vec<ContextItem>)> {
-        let (dispatched, dispatch_seq, context_items) = loop {
+    ) -> Option<DispatchedCommand> {
+        loop {
             let change = {
                 let mut store = self.inner.store.lock().await;
                 let dispatched = match launch_binding {
@@ -651,18 +655,27 @@ impl Router {
                         .map(|change| (change.value, Vec::new(), change.events)),
                 };
                 let result = match dispatched {
-                    Ok((command, context_items, events)) => {
+                    Ok((command, context, events)) => {
+                        // A retained Dispatched row carries no new commit event.
+                        // Only the worker that made this transition may enqueue.
+                        let fresh = command.state == CommandState::Dispatched
+                            && capture_dispatch_seq(&command, &events).is_some();
                         self.publish_locked(&events);
-                        Ok((command, context_items, events))
+                        let plugin = if fresh {
+                            self.enqueue_plugin_command(&store, &command, context)
+                        } else {
+                            None
+                        };
+                        Ok((DispatchedCommand { command, plugin }, fresh))
                     }
                     Err(error) => Err(error),
                 };
                 (result, store.is_write_faulted())
             };
             match change.0 {
-                Ok((command, _, _)) if command.state == CommandState::Queued => {
-                    let target = command.target.clone();
-                    let generation = command.generation;
+                Ok((dispatched, _)) if dispatched.command.state == CommandState::Queued => {
+                    let target = dispatched.command.target;
+                    let generation = dispatched.command.generation;
                     if !self
                         .wait_for_queue_release(id, receiver, target, generation)
                         .await
@@ -670,37 +683,54 @@ impl Router {
                         return None;
                     }
                 }
-                Ok((command, _, _)) if command.state.is_terminal() => {
-                    // Store may durably cancel a terminal predecessor's
-                    // successor at this dispatch gate; never pass it to a native
-                    // plugin after that result.
+                Ok((dispatched, true)) => return Some(dispatched),
+                Ok((_, false)) => {
                     self.signal_progress();
                     return None;
-                }
-                Ok((command, context_items, events)) => {
-                    let seq = match capture_dispatch_seq(&command, &events) {
-                        Some(seq) => seq,
-                        None => {
-                            self.signal_progress();
-                            return None;
-                        }
-                    };
-                    break (command, seq, context_items);
                 }
                 Err(error) => {
                     self.settle_dispatch_error(id, &error, change.1).await;
                     return None;
                 }
             }
-        };
+        }
+    }
 
-        // Only a Store-confirmed dispatch may reach a plugin. Queued/held,
-        // terminal, unknown, and any future non-dispatched state are not effects.
-        if dispatched.state != CommandState::Dispatched {
-            self.signal_progress();
+    fn enqueue_plugin_command(
+        &self,
+        store: &eliot_store::Store,
+        command: &Command,
+        context: Vec<ContextItem>,
+    ) -> Option<Result<(Agent, PendingCommand)>> {
+        if !matches!(
+            command.verb.as_str(),
+            "send" | "steer" | "interrupt" | "approve" | "deny" | "answer" | "inject" | "configure"
+        ) {
             return None;
         }
-        Some((dispatched, dispatch_seq, context_items))
+        let agent = match command
+            .target
+            .as_deref()
+            .map(|target| store.get_agent(target))
+        {
+            Some(Ok(Some(agent))) => agent,
+            _ => {
+                return Some(Err(Error::new(
+                    "native_not_dispatched",
+                    "the command's Agent was unavailable for plugin handoff",
+                )));
+            }
+        };
+        if command.verb == "configure"
+            && !configure_uses_native_session(&agent.harness, &command.args)
+        {
+            return None;
+        }
+        let pending = self
+            .inner
+            .plugin_host
+            .enqueue_command(&agent, command.clone(), context);
+        Some(pending.map(|pending| (agent, pending)))
     }
 
     /// Wait for one bus event that can release a queued dispatch: provider
@@ -764,14 +794,39 @@ impl Router {
     /// Agent and runs one verb-family helper.
     async fn execute_dispatched_command(
         &self,
-        dispatched: Command,
+        dispatched: DispatchedCommand,
         git_fetch_registration: Option<ProjectRegistrationView>,
         resume_source_state: Option<Value>,
         linked_id: Option<String>,
-        dispatch_seq: i64,
-        context_items: Vec<ContextItem>,
     ) {
+        let DispatchedCommand {
+            command: dispatched,
+            plugin,
+        } = dispatched;
         let id = dispatched.id.clone();
+        if let Some(plugin) = plugin {
+            let (agent, pending) = match plugin {
+                Ok(dispatched) => dispatched,
+                Err(error) => {
+                    self.settle_plugin_error(&id, &error).await;
+                    return;
+                }
+            };
+            let response = pending.wait().await;
+            let trailing_signal = match dispatched.verb.as_str() {
+                "send" => self.execute_send_command(&id, &agent, response).await,
+                "configure" => {
+                    self.execute_native_configure_command(&id, &agent, response)
+                        .await;
+                    true
+                }
+                _ => self.execute_control_command(&id, &agent, response).await,
+            };
+            if trailing_signal {
+                self.signal_progress();
+            }
+            return;
+        }
         if dispatched.verb == "run" {
             self.execute_run_command(dispatched).await;
             return;
@@ -823,24 +878,9 @@ impl Router {
                     .await;
                 true
             }
-            "send" => {
-                self.execute_send_command(
-                    &id,
-                    &agent,
-                    dispatched,
-                    Some(dispatch_seq),
-                    context_items,
-                )
-                .await
-            }
-            "steer" | "interrupt" | "approve" | "deny" | "answer" | "inject" => {
-                self.execute_control_command(&id, &agent, dispatched, Some(dispatch_seq))
-                    .await
-            }
             "stop" => self.execute_stop_command(&id, &agent, dispatched).await,
             "configure" => {
-                self.execute_configure_command(&id, &agent, dispatched, Some(dispatch_seq))
-                    .await;
+                self.execute_configure_command(&id, &agent).await;
                 true
             }
             "detach" => {
@@ -1901,10 +1941,180 @@ pub(super) fn coordination_commit_error_state(code: &str) -> CommandState {
 mod tests {
     use super::{Command, capture_dispatch_seq, validate_retained_resume_agent};
     use crate::common::now_ms;
+    use crate::router::{
+        Principal,
+        tests::{result_fixture, router},
+    };
     use eliot_core::{Agent, AgentState, CommandState, Error, Event, FailureOrigin, SubmitCommand};
     use eliot_plugin::sync::LockExt;
     use serde_json::json;
     use ulid::Ulid;
+
+    fn steer(agent: &str) -> SubmitCommand {
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "steer");
+        request.target = Some(agent.to_owned());
+        request.expected_generation = Some(1);
+        request.expected_turn_id = Some("turn-1".to_owned());
+        request.args = json!({"text": "continue"});
+        request
+    }
+
+    #[tokio::test]
+    async fn settled_retry_returns_the_store_outcome_without_plugin_delivery() {
+        let router = router();
+        let (agent, id, stored) = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, id) = result_fixture(&mut store);
+            let stored = store.get_command(&id).unwrap().unwrap();
+            (agent, id, stored)
+        };
+        let mut mailbox = router.inner.plugin_host.test_command_queue(&agent);
+        let retry = router
+            .submit(
+                &json!({"id":id,"verb":"send","target":agent,"expected_generation":1,
+                "args":{"text":"fixture input"}}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry["state"], "applied");
+        assert_eq!(retry["outcome"], stored.outcome.unwrap());
+        assert_eq!(mailbox(), None);
+    }
+
+    #[tokio::test]
+    async fn uncertain_dispatched_retry_never_enqueues_a_second_write() {
+        let router = router();
+        let (request, command) = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, _) = result_fixture(&mut store);
+            let request = steer(&agent);
+            let admission = store.submit("owner", request.clone(), now_ms()).unwrap();
+            (request, admission.command)
+        };
+        let mut mailbox = router
+            .inner
+            .plugin_host
+            .test_command_queue(command.target.as_deref().unwrap());
+        let mut events = router.inner.bus.subscribe();
+        let handed_off = router
+            .dispatch_and_wait_for_effect(&command.id, &mut events, &command, &None)
+            .await
+            .unwrap();
+        assert!(handed_off.plugin.as_ref().is_some_and(Result::is_ok));
+        assert_eq!(mailbox().as_deref(), Some(command.id.as_str()));
+        let retry = serde_json::to_value(&request).unwrap();
+        let dispatched = router.submit(&retry, &Principal::Owner).await.unwrap();
+        assert_eq!(dispatched["state"], "dispatched");
+        assert!(
+            router
+                .dispatch_and_wait_for_effect(&command.id, &mut events, &command, &None,)
+                .await
+                .is_none()
+        );
+        router
+            .settle(
+                &command.id,
+                CommandState::Unknown,
+                Some(json!({"cause":"lost_ack"})),
+            )
+            .await;
+        let unknown = router.submit(&retry, &Principal::Owner).await.unwrap();
+        assert_eq!(unknown["state"], "unknown");
+        assert_eq!(unknown["outcome"]["cause"], "lost_ack");
+        assert_eq!(mailbox(), None);
+    }
+
+    #[tokio::test]
+    async fn missing_owned_runtime_rejects_before_native_dispatch() {
+        let router = router();
+        let command = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, _) = result_fixture(&mut store);
+            store
+                .submit("owner", steer(&agent), now_ms())
+                .unwrap()
+                .command
+        };
+        router
+            .clone()
+            .process_command_inner(command.id.clone(), None)
+            .await;
+        let settled = router
+            .inner
+            .store
+            .lock()
+            .await
+            .get_command(&command.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.state, CommandState::Rejected);
+        assert_eq!(settled.outcome.unwrap()["code"], "native_not_dispatched");
+    }
+
+    #[tokio::test]
+    async fn first_plugin_deliveries_follow_committed_dispatch_sequence() {
+        let router = router();
+        let (agent, first, configure, second, before) = {
+            let mut store = router.inner.store.lock().await;
+            let (agent, _) = result_fixture(&mut store);
+            let mut configure = SubmitCommand::new(Ulid::new().to_string(), "configure");
+            configure.target = Some(agent.clone());
+            configure.expected_generation = Some(1);
+            configure.args = json!({"effort":"low"});
+            let first = store
+                .submit("owner", steer(&agent), now_ms())
+                .unwrap()
+                .command;
+            let configure = store.submit("owner", configure, now_ms()).unwrap().command;
+            let second = store
+                .submit("owner", steer(&agent), now_ms())
+                .unwrap()
+                .command;
+            let before = store.high_water().unwrap();
+            (agent, first, configure, second, before)
+        };
+        let mut mailbox = router.inner.plugin_host.test_command_queue(&agent);
+        let (mut first_rx, mut configure_rx, mut second_rx) = (
+            router.inner.bus.subscribe(),
+            router.inner.bus.subscribe(),
+            router.inner.bus.subscribe(),
+        );
+        let (first, configure, second) = tokio::join!(
+            router.dispatch_and_wait_for_effect(&first.id, &mut first_rx, &first, &None),
+            router.dispatch_and_wait_for_effect(
+                &configure.id,
+                &mut configure_rx,
+                &configure,
+                &None
+            ),
+            router.dispatch_and_wait_for_effect(&second.id, &mut second_rx, &second, &None),
+        );
+        assert!(first.unwrap().plugin.is_some_and(|pending| pending.is_ok()));
+        assert!(configure.unwrap().plugin.is_none());
+        assert!(
+            second
+                .unwrap()
+                .plugin
+                .is_some_and(|pending| pending.is_ok())
+        );
+        let committed = router
+            .inner
+            .store
+            .lock()
+            .await
+            .read_events(before, 20, None)
+            .unwrap();
+        let expected = committed
+            .iter()
+            .filter(|event| event.kind == "command.dispatched" && event.data["verb"] == "steer")
+            .map(|event| event.data["command_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), 2);
+        assert_eq!(mailbox().as_deref(), Some(expected[0]));
+        assert_eq!(mailbox().as_deref(), Some(expected[1]));
+        assert_eq!(mailbox(), None);
+    }
 
     #[tokio::test]
     async fn busy_rejection_retains_redacted_bound_in_command_and_event() {

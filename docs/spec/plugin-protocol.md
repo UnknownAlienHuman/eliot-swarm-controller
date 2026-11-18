@@ -105,7 +105,7 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | --- | --- | --- |
 | `initialize` | protocol, frozen plugin config, private instance directory, optional `store_root` (required by OpenCode) | return actual manifest |
 | `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately; a proven-no-effect failure returns `"state": "failed"` with a short non-secret `reason` instead of an error, and the launch settles failed, never unknown |
-| `agent.command` | agent/generation, command id, verb/args, exact turn/request where required, optional dispatch_seq | applied/rejected/failed/unknown, native mechanism and application point |
+| `agent.command` | agent/generation, command id, verb/args, exact turn/request where required | applied/rejected/failed/unknown, native mechanism and application point |
 | `agent.stop` | agent/generation, command id, force | success means the bound controlled session/generation ended, not merely that observation detached |
 | `agent.snapshot` | controlled command/turn binding, or exact subject plus `observation` page query | bounded readback; private history never acknowledges controlled effects |
 | `agent.models` | exact Agent and generation ([`AgentModelsParams`](../../crates/eliot-plugin/src/protocol.rs)) | read the owned session's model catalogue; OpenCode advertises `models` in its manifest and echoes the exact binding. A control request can preempt this bounded read |
@@ -149,14 +149,25 @@ must check the complete encoded request, including its actual id and NDJSON newl
 after filling those fields and before enqueueing the request. Admission preflight is
 not proof that the completed runtime frame fits.
 
-`eliot_plugin::AgentCommandParams` carries optional `dispatch_seq` (positive integer).
-When present, it binds the exact committed `command.dispatched` Event sequence in
-Store for that command execution. Missing or null decodes as `None` for compatibility;
-existing adapters ignore it. The host checks the complete encoded `agent.command` request,
-including its actual id, arguments, optional sequence and NDJSON newline, against the 1 MiB
-frame bound before enqueueing. Retained command retry retains the original committed sequence
-rather than allocating a fresh sequence; initial send linked to launch/resume follows
-ordinary send dispatch.
+The router enqueues first `agent.command` deliveries at the Store dispatch boundary.
+It appends to the bounded runtime mailbox under the Store writer lock after commit, so
+deliveries to a plugin follow dispatch sequence order. A missing owned runtime or a
+full mailbox rejects the command with proof that no native write was dispatched.
+The actor checks the complete encoded request, including its actual id, arguments and
+NDJSON newline, against the 1 MiB frame bound before writing the plugin RPC.
+
+Each command ID is delivered through `agent.command` at most once per plugin generation.
+Store answers exact settled retries. An unresolved dispatch can settle from exact
+read-only native evidence through `agent.snapshot` or from later authoritative source
+facts. Without such evidence its outcome remains `unknown` and the router never
+redelivers the write. A plugin retains only native handles bounded by live state, such
+as the current native turn binding. Store owns command identity, history and settlement.
+An initial send linked to launch or resume follows ordinary send dispatch.
+
+A controlled snapshot using the session's start or stop command ID may omit the turn
+ID to request session state. Other command snapshots need an exact turn, supplied by
+the caller or proven by the adapter's current native binding. A read that cannot prove
+the requested binding returns an unknown snapshot.
 
 For SEND, the same `agent.command` effect carries the FIFO `next_input` items claimed
 from existing command rows, plus the effective configuration overlay when one

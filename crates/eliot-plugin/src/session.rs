@@ -12,7 +12,7 @@
 //! `"claude"`). No trait: the shared state is passed by reference through
 //! [`StreamSource`].
 
-use std::{collections::HashMap, ffi::OsString, path::Path, time::Duration};
+use std::{ffi::OsString, path::Path, time::Duration};
 
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, ProcessRecord, ProcessState,
@@ -566,20 +566,6 @@ pub fn parse_resume_subject(
         native_ref,
         retained_turn,
     })
-}
-
-/// Whether `command_id` is a retained command of this generation: the start,
-/// a dispatched input, or the stop. The session fields are passed by
-/// reference because each plugin owns its own `AgentSession` type.
-pub fn known_command(
-    start_command_id: &str,
-    command_inputs: &HashMap<String, String>,
-    stop_command_id: &Option<String>,
-    command_id: &str,
-) -> bool {
-    start_command_id == command_id
-        || command_inputs.contains_key(command_id)
-        || stop_command_id.as_deref() == Some(command_id)
 }
 
 /// Canonicalizing path comparison shared by the server readiness proofs:

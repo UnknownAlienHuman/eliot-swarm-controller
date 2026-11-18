@@ -30,14 +30,14 @@ use eliot_plugin::{
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::MAX_CREDENTIAL_BYTES,
     session::{
-        decode, known_command, native_no_write, not_initialized, paths_equal,
-        register_native_process, rejected_control, unknown_control, unknown_snapshot,
-        validate_binding, validate_identity, with_claimed_context, with_context_points,
+        decode, native_no_write, not_initialized, paths_equal, register_native_process,
+        rejected_control, unknown_control, unknown_snapshot, validate_binding, validate_identity,
+        with_claimed_context, with_context_points,
     },
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     ffi::OsString,
     path::Path,
 };
@@ -299,15 +299,7 @@ struct AgentSession {
     native: NativeProcess,
     native_client: NativeClient,
     events: EventHandle,
-    command_inputs: HashMap<String, String>,
-    command_turns: HashMap<String, String>,
-    unknown_commands: HashSet<String>,
-    rejected_commands: HashSet<String>,
-    /// Original rejection reason per rejected command (k167b): a repeated
-    /// command ID replays this reason so the caller still gets the
-    /// recovery action without redispatch, instead of a generic refusal.
-    rejected_reasons: HashMap<String, String>,
-    control_commands: HashMap<String, ControlCommand>,
+    current_turn: Option<(String, String)>,
     stop_command_id: Option<String>,
     /// Bundled skill text read at start; prepended once to the first
     /// accepted turn (see `skill_pending`).
@@ -318,21 +310,7 @@ struct AgentSession {
     skill_pending: bool,
 }
 
-struct ControlCommand {
-    verb: String,
-    turn_id: Option<String>,
-    request_id: Option<String>,
-    args: Value,
-    outcome: ControlOutcome,
-}
-
-enum ControlOutcome {
-    Pending,
-    Applied(Value),
-    Rejected(Value),
-    Unknown,
-}
-
+#[allow(dead_code)]
 struct InitializedNative {
     effort: Option<String>,
     scope: String,
@@ -1419,37 +1397,6 @@ impl MusePlugin {
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new("frame_too_large", "Muse input exceeds 512 KiB"));
         }
-        if let Some(previous) = session.command_inputs.get(&params.command_id) {
-            if previous != text {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Muse command id was reused with different input",
-                ));
-            }
-            if let Some(turn_id) = session.command_turns.get(&params.command_id) {
-                return Ok(json!({"state": "applied", "turn_id": turn_id}));
-            }
-            if session.unknown_commands.contains(&params.command_id) {
-                return Err(Error::new(
-                    "unknown",
-                    "Muse turn/start outcome is unresolved and will not be repeated",
-                ));
-            }
-            if session.rejected_commands.contains(&params.command_id) {
-                // k167b: replay the originally retained rejection so the
-                // caller still gets the recovery action without redispatch.
-                let reason = session
-                    .rejected_reasons
-                    .get(&params.command_id)
-                    .cloned()
-                    .unwrap_or_else(|| "Muse turn/start was known not to apply".to_owned());
-                return Ok(json!({"state": "rejected", "reason": reason}));
-            }
-            return Err(Error::new(
-                "unknown",
-                "Muse command was already dispatched without a retained exact outcome",
-            ));
-        }
         // One request budget (k167b): every proof read below shares the
         // dispatch `deadline`, and proof reads stop at `proof_deadline`
         // so the typed rejection still returns before any native write.
@@ -1461,12 +1408,7 @@ impl MusePlugin {
         // Reject before any readback or dispatch; only a fresh host (an
         // Agent restart) clears the latch.
         if session.events.status().mcp_startup_audit_failed {
-            return Ok(reject_send(
-                session,
-                &params.command_id,
-                text,
-                MCP_AUDIT_DISABLED_REJECTION,
-            ));
+            return Ok(rejected_control(MCP_AUDIT_DISABLED_REJECTION));
         }
         // A fresh send has no native effect yet. Serialize this check behind
         // the event actor's queued facts/terminal commit, rather than using
@@ -1485,10 +1427,7 @@ impl MusePlugin {
             Err(_) => match Self::reprove_idle_send_gate(session, proof_deadline).await {
                 Some(status) => status,
                 None => {
-                    return Ok(reject_send(
-                        session,
-                        &params.command_id,
-                        text,
+                    return Ok(rejected_control(
                         "Muse native observation is unresolved; turn/start was not dispatched. Restart the Agent on the same worktree to continue.",
                     ));
                 }
@@ -1507,10 +1446,7 @@ impl MusePlugin {
                     event_status = fresh;
                 }
                 _ => {
-                    return Ok(reject_send(
-                        session,
-                        &params.command_id,
-                        text,
+                    return Ok(rejected_control(
                         "Muse native observation is unresolved after a recovered terminal; turn/start was not dispatched. Restart the Agent on the same worktree to continue.",
                     ));
                 }
@@ -1518,14 +1454,9 @@ impl MusePlugin {
         }
         if let Some(reason) = event_status.failure.clone() {
             if !crate::events::is_view_related_failure(&reason) {
-                return Ok(reject_send(
-                    session,
-                    &params.command_id,
-                    text,
-                    &format!(
-                        "{reason}; turn/start was not dispatched. Restart the Agent on the same worktree to continue when the source stays unresolved."
-                    ),
-                ));
+                return Ok(rejected_control(&format!(
+                    "{reason}; turn/start was not dispatched. Restart the Agent on the same worktree to continue when the source stays unresolved."
+                )));
             }
             match Self::reprove_idle_send_gate(session, proof_deadline).await {
                 Some(fresh)
@@ -1536,14 +1467,9 @@ impl MusePlugin {
                     event_status = fresh;
                 }
                 _ => {
-                    return Ok(reject_send(
-                        session,
-                        &params.command_id,
-                        text,
-                        &format!(
-                            "{reason}; turn/start was not dispatched. Restart the Agent on the same worktree to continue when the source stays unresolved."
-                        ),
-                    ));
+                    return Ok(rejected_control(&format!(
+                        "{reason}; turn/start was not dispatched. Restart the Agent on the same worktree to continue when the source stays unresolved."
+                    )));
                 }
             }
         }
@@ -1554,10 +1480,7 @@ impl MusePlugin {
         // to return the outcome the caller settles `unknown` past a
         // dispatch it cannot observe.
         if Instant::now() >= proof_deadline {
-            return Ok(reject_send(
-                session,
-                &params.command_id,
-                text,
+            return Ok(rejected_control(
                 "Muse send budget elapsed before turn/start; turn/start was not dispatched. Retry the send.",
             ));
         }
@@ -1573,9 +1496,6 @@ impl MusePlugin {
         };
         let combined = with_claimed_context(&send_text, &params.context, "Muse")?;
         let command_id = params.command_id.clone();
-        session
-            .command_inputs
-            .insert(command_id.clone(), text.to_owned());
         // Mint the caller-selected idempotency handle before the write: for a
         // fresh turn this derives the turn id, and the ack authoritatively
         // confirms it. A lost reply leaves the outcome unknown; the input is
@@ -1623,31 +1543,17 @@ impl MusePlugin {
         let response = match response {
             Ok(value) => value,
             Err(error) if native_no_write(&error.code) => {
-                return Ok(reject_send(
-                    session,
-                    &command_id,
-                    text,
-                    "Muse turn/start was not dispatched",
-                ));
+                return Ok(rejected_control("Muse turn/start was not dispatched"));
             }
             Err(error) if error.code == "native_rejected" => {
-                return Ok(reject_send(
-                    session,
-                    &command_id,
-                    text,
-                    "Muse rejected turn/start",
-                ));
+                return Ok(rejected_control("Muse rejected turn/start"));
             }
             Err(error) if error.code == "frame_too_large" => {
-                return Ok(reject_send(
-                    session,
-                    &command_id,
-                    text,
+                return Ok(rejected_control(
                     "Muse turn/start frame exceeded the native transport bound before dispatch",
                 ));
             }
             Err(error) => {
-                session.unknown_commands.insert(command_id);
                 session.phase = SessionPhase::Unknown;
                 return Err(contextual_error(
                     error,
@@ -1677,7 +1583,6 @@ impl MusePlugin {
                     // it did not create. PR1 holds single-flight and cannot
                     // associate that input exactly, so the command and the
                     // session latch unknown; the input is never resubmitted.
-                    session.unknown_commands.insert(command_id);
                     session.phase = SessionPhase::Unknown;
                     return Err(Error::new(
                         "unknown",
@@ -1685,7 +1590,6 @@ impl MusePlugin {
                     ));
                 }
                 _ => {
-                    session.unknown_commands.insert(command_id);
                     session.phase = SessionPhase::Unknown;
                     return Err(Error::new(
                         "unknown",
@@ -1694,9 +1598,7 @@ impl MusePlugin {
                 }
             };
         let turn_id = started.turn_id;
-        session
-            .command_turns
-            .insert(command_id.clone(), turn_id.clone());
+        session.current_turn = Some((command_id.clone(), turn_id.clone()));
         if session
             .events
             .associate_turn(
@@ -1709,7 +1611,6 @@ impl MusePlugin {
             .await
             .is_err()
         {
-            session.unknown_commands.insert(command_id);
             session.phase = SessionPhase::Unknown;
             return Err(Error::new(
                 "unknown",
@@ -1767,28 +1668,15 @@ impl MusePlugin {
                 "Muse steer contains a known credential",
             ));
         }
-        if let Some(result) = control_replay(session, &params)? {
-            return Ok(result);
-        }
         if session.phase != SessionPhase::Ready || session.events.status().source_unknown {
             let result = rejected_control(
                 "Muse steer refused before dispatch: native source is unavailable; no turn/steer was sent",
-            );
-            settle_control(
-                session,
-                &params.command_id,
-                ControlOutcome::Rejected(result.clone()),
             );
             return Ok(result);
         }
         let Some(native_session) = session.session_id.clone() else {
             let result = rejected_control(
                 "Muse steer refused before dispatch: session identity is unresolved",
-            );
-            settle_control(
-                session,
-                &params.command_id,
-                ControlOutcome::Rejected(result.clone()),
             );
             return Ok(result);
         };
@@ -1822,11 +1710,6 @@ impl MusePlugin {
         }
         if let Err(error) = validate_steer_readback(readback, &native_session, turn_id) {
             let result = rejected_control(&error.message);
-            settle_control(
-                session,
-                &params.command_id,
-                ControlOutcome::Rejected(result.clone()),
-            );
             return Ok(result);
         }
         // The turn itself is gated authoritatively: the event task owns the
@@ -1836,25 +1719,17 @@ impl MusePlugin {
             Ok(live) => live,
             Err(error) => {
                 let result = unknown_control(&error.message);
-                settle_control(session, &params.command_id, ControlOutcome::Unknown);
                 return Ok(result);
             }
         };
         if !live {
-            abandon_control(session, &params.command_id);
-            return Err(Error::new(
-                "stale_turn",
+            return Ok(rejected_control(
                 "Muse turn/steer does not match the exact active turn",
             ));
         }
         if session.events.status().source_unknown {
             let result = rejected_control(
                 "Muse steer refused before dispatch: native source became unavailable during readback",
-            );
-            settle_control(
-                session,
-                &params.command_id,
-                ControlOutcome::Rejected(result.clone()),
             );
             return Ok(result);
         }
@@ -1875,7 +1750,6 @@ impl MusePlugin {
             Ok(encoded) => encoded,
             Err(_) => {
                 let result = unknown_control("Muse turn/steer params could not be encoded");
-                settle_control(session, &params.command_id, ControlOutcome::Unknown);
                 return Ok(result);
             }
         };
@@ -1900,16 +1774,10 @@ impl MusePlugin {
                         .unwrap_or("native refusal lacks an origin signal"),
                     &eliot_core::SecretPolicy::new(session.secrets.iter()),
                 );
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Rejected(result.clone()),
-                );
                 Ok(result)
             }
             Err(_) => {
                 let result = unknown_control("Muse turn/steer outcome is unknown");
-                settle_control(session, &params.command_id, ControlOutcome::Unknown);
                 Ok(result)
             }
             Ok(value) => {
@@ -1924,7 +1792,6 @@ impl MusePlugin {
                             "docs/harnesses/muse.md#native-mapping: turn/steer response violates the installed result schema",
                             &eliot_core::SecretPolicy::new(session.secrets.iter()),
                         );
-                        settle_control(session, &params.command_id, ControlOutcome::Unknown);
                         return Ok(result);
                     }
                 };
@@ -1941,7 +1808,6 @@ impl MusePlugin {
                         "docs/harnesses/muse.md#native-mapping: turn/steer result contradicts the submitted command, expected turn or accepted status",
                         &eliot_core::SecretPolicy::new(session.secrets.iter()),
                     );
-                    settle_control(session, &params.command_id, ControlOutcome::Unknown);
                     return Ok(result);
                 }
                 let result = json!({
@@ -1949,11 +1815,6 @@ impl MusePlugin {
                     "command_id": params.command_id,
                     "turn_id": turn_id,
                 });
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Applied(result.clone()),
-                );
                 Ok(result)
             }
         }
@@ -2007,11 +1868,7 @@ impl MusePlugin {
                 "turn/cancel does not accept request_id",
             ));
         }
-        if let Some(result) = control_replay(session, &params)? {
-            return Ok(result);
-        }
         if session.phase == SessionPhase::Stopped {
-            abandon_control(session, &params.command_id);
             return Err(Error::new(
                 "bad_state",
                 "Muse plugin is stopping; no further input is accepted",
@@ -2031,11 +1888,6 @@ impl MusePlugin {
                 "Muse interrupt does not match a healthy active turn".to_owned()
             };
             let result = rejected_control(&reason);
-            settle_control(
-                session,
-                &params.command_id,
-                ControlOutcome::Rejected(result.clone()),
-            );
             return Ok(result);
         }
         // The turn itself is gated authoritatively: the event task owns the
@@ -2046,20 +1898,16 @@ impl MusePlugin {
             Ok(live) => live,
             Err(error) => {
                 let result = unknown_control(&error.message);
-                settle_control(session, &params.command_id, ControlOutcome::Unknown);
                 return Ok(result);
             }
         };
         if !live {
-            abandon_control(session, &params.command_id);
-            return Err(Error::new(
-                "stale_turn",
+            return Ok(rejected_control(
                 "Muse turn/cancel does not match the exact active turn",
             ));
         }
         let Some(native_session) = session.session_id.clone() else {
             let result = unknown_control("Muse session identity is unresolved");
-            settle_control(session, &params.command_id, ControlOutcome::Unknown);
             return Ok(result);
         };
         // The exact active turn is always named explicitly: halt running,
@@ -2077,7 +1925,6 @@ impl MusePlugin {
             Ok(encoded) => encoded,
             Err(_) => {
                 let result = unknown_control("Muse turn/cancel params could not be encoded");
-                settle_control(session, &params.command_id, ControlOutcome::Unknown);
                 return Ok(result);
             }
         };
@@ -2092,16 +1939,10 @@ impl MusePlugin {
                     || error.code == "frame_too_large" =>
             {
                 let result = rejected_control("Muse turn/cancel was not applied");
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Rejected(result.clone()),
-                );
                 Ok(result)
             }
             Err(_) => {
                 let result = unknown_control("Muse turn/cancel outcome is unknown");
-                settle_control(session, &params.command_id, ControlOutcome::Unknown);
                 Ok(result)
             }
             Ok(value) => {
@@ -2109,7 +1950,6 @@ impl MusePlugin {
                     Ok(cancelled) => cancelled,
                     Err(_) => {
                         let result = unknown_control("Muse turn/cancel response was invalid");
-                        settle_control(session, &params.command_id, ControlOutcome::Unknown);
                         return Ok(result);
                     }
                 };
@@ -2118,7 +1958,6 @@ impl MusePlugin {
                     || cancelled.turn_id != turn_id
                 {
                     let result = unknown_control("Muse turn/cancel did not stop its exact turn");
-                    settle_control(session, &params.command_id, ControlOutcome::Unknown);
                     return Ok(result);
                 }
                 let result = json!({
@@ -2126,11 +1965,6 @@ impl MusePlugin {
                     "command_id": params.command_id,
                     "turn_id": turn_id,
                 });
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Applied(result.clone()),
-                );
                 Ok(result)
             }
         }
@@ -2168,9 +2002,6 @@ impl MusePlugin {
                     "Muse request reply needs its captured request id",
                 )
             })?;
-        if let Some(result) = control_replay(session, &params)? {
-            return Ok(result);
-        }
         match session
             .events
             .reply_request(
@@ -2182,31 +2013,12 @@ impl MusePlugin {
             )
             .await
         {
-            Ok(result) => {
-                let outcome = match result.get("state").and_then(Value::as_str) {
-                    Some("applied") => ControlOutcome::Applied(result.clone()),
-                    Some("rejected") => ControlOutcome::Rejected(result.clone()),
-                    Some("unknown") => ControlOutcome::Unknown,
-                    _ => {
-                        let result = unknown_control("Muse request reply omitted its outcome");
-                        settle_control(session, &params.command_id, ControlOutcome::Unknown);
-                        return Ok(result);
-                    }
-                };
-                settle_control(session, &params.command_id, outcome);
-                Ok(result)
-            }
+            Ok(result) => Ok(result),
             Err(error) if native_no_write(&error.code) => {
                 let result = rejected_control("Muse request reply was not dispatched");
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Rejected(result.clone()),
-                );
                 Ok(result)
             }
             Err(error) if error.code == "unknown" => {
-                settle_control(session, &params.command_id, ControlOutcome::Unknown);
                 Ok(unknown_control("Muse request reply outcome is unknown"))
             }
             Err(error)
@@ -2216,11 +2028,6 @@ impl MusePlugin {
                 ) =>
             {
                 let result = rejected_control(&error.message);
-                settle_control(
-                    session,
-                    &params.command_id,
-                    ControlOutcome::Rejected(result.clone()),
-                );
                 Ok(result)
             }
             Err(error) => Err(error),
@@ -2269,28 +2076,19 @@ impl MusePlugin {
             }));
         }
         let event_status = session.events.status();
-        let turn_id = match params.turn_id.as_deref() {
-            Some(turn_id) => Some(turn_id.to_owned()),
-            None => session.command_turns.get(&params.command_id).cloned(),
-        };
-        if let Some(requested_turn) = turn_id.as_deref()
-            && session
-                .command_turns
-                .get(&params.command_id)
-                .map(String::as_str)
-                != Some(requested_turn)
+        // Store binds an explicit turn. The one current native binding
+        // covers readback if the association acknowledgement was lost.
+        let turn_id = params.turn_id.clone().or_else(|| {
+            session
+                .current_turn
+                .as_ref()
+                .filter(|(command, _)| command == &params.command_id)
+                .map(|(_, turn)| turn.clone())
+        });
+        if turn_id.is_none()
+            && session.start_command_id != params.command_id
+            && session.stop_command_id.as_deref() != Some(params.command_id.as_str())
         {
-            return unknown_snapshot(
-                &params,
-                "Muse command has no proof for the requested native turn",
-            );
-        }
-        if !known_command(
-            &session.start_command_id,
-            &session.command_inputs,
-            &session.stop_command_id,
-            &params.command_id,
-        ) {
             return unknown_snapshot(&params, "Muse command identity is not retained");
         }
         if session.phase == SessionPhase::Stopped {
@@ -2905,9 +2703,7 @@ async fn read_live_snapshot(
             .await;
         return view_unknown_snapshot(session, params, "Muse native view readback is unavailable");
     }
-    if session.command_inputs.contains_key(&params.command_id) && turn_id.is_none() {
-        return unknown_snapshot(params, "Muse command has no exact native turn association");
-    }
+
     let turn_readback = if let Some(turn_id) = turn_id.as_deref() {
         Some(
             read_owned_turn(
@@ -3022,20 +2818,6 @@ fn view_unknown_snapshot(
     snapshot["native_exit"] = json!(session.events.status().native_exit);
     snapshot["batch_unknown"] = json!(session.events.status().batch_unknown);
     Ok(snapshot)
-}
-
-/// Record a typed send rejection and retain its reason (k167b): a repeated
-/// command ID replays the retained reason so the caller still gets the
-/// recovery action without redispatch.
-fn reject_send(session: &mut AgentSession, command_id: &str, text: &str, reason: &str) -> Value {
-    session
-        .command_inputs
-        .insert(command_id.to_owned(), text.to_owned());
-    session.rejected_commands.insert(command_id.to_owned());
-    session
-        .rejected_reasons
-        .insert(command_id.to_owned(), reason.to_owned());
-    rejected_control(reason)
 }
 
 /// Fresh exact idle proof for the send gate (k167b): one raw
@@ -3530,57 +3312,6 @@ async fn adopt_resume_snapshot(
         .adopt_pulled(entries, expected, capture, snapshot_had_undecodable)
         .await;
     true
-}
-
-fn control_replay(
-    session: &mut AgentSession,
-    params: &AgentCommandParams,
-) -> Result<Option<Value>> {
-    if let Some(previous) = session.control_commands.get(&params.command_id) {
-        if previous.verb != params.verb
-            || previous.turn_id != params.turn_id
-            || previous.request_id != params.request_id
-            || previous.args != params.args
-        {
-            return Err(Error::new(
-                "source_integrity",
-                "Muse control command id was reused with different binding",
-            ));
-        }
-        return Ok(Some(match &previous.outcome {
-            ControlOutcome::Applied(result) | ControlOutcome::Rejected(result) => result.clone(),
-            ControlOutcome::Pending => unknown_control("Muse control command is already in flight"),
-            ControlOutcome::Unknown => {
-                unknown_control("Muse control command outcome is unresolved")
-            }
-        }));
-    }
-    session.control_commands.insert(
-        params.command_id.clone(),
-        ControlCommand {
-            verb: params.verb.clone(),
-            turn_id: params.turn_id.clone(),
-            request_id: params.request_id.clone(),
-            args: params.args.clone(),
-            outcome: ControlOutcome::Pending,
-        },
-    );
-    Ok(None)
-}
-
-fn settle_control(session: &mut AgentSession, command_id: &str, outcome: ControlOutcome) {
-    if let Some(command) = session.control_commands.get_mut(command_id) {
-        command.outcome = outcome;
-    }
-}
-
-/// Drop a control entry `control_replay` inserted before any native write.
-/// A deterministic pre-write refusal (stale turn, stopping host) proves no
-/// write happened, so the entry is removed instead of settled: the exact
-/// command re-evaluates on retry (no stale `Pending` "already in flight"),
-/// and refusals consume none of the 32 per-generation slots.
-fn abandon_control(session: &mut AgentSession, command_id: &str) {
-    session.control_commands.remove(command_id);
 }
 
 /// Shared contextual error, kept under the local path for the

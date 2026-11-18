@@ -230,8 +230,6 @@ pub struct AgentCommandParams {
     pub turn_id: Option<String>,
     #[serde(default)]
     pub request_id: Option<String>,
-    #[serde(default)]
-    pub dispatch_seq: Option<i64>,
     /// FIFO `next_input` items claimed for this send. Empty (omitted) when none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<ContextItem>,
@@ -302,7 +300,6 @@ impl AgentStopParams {
             args: empty_object(),
             turn_id: Some(turn_id.clone()),
             request_id: None,
-            dispatch_seq: None,
             context: Vec::new(),
             model_override: None,
             effort_override: None,

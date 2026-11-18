@@ -228,7 +228,6 @@ pub(super) async fn run_agent_inner(
         stderr,
         ..
     } = actor;
-    let mut last_command_id = start_command.id.clone();
     let mut pending_steers: FuturesUnordered<PendingSteerFuture> = FuturesUnordered::new();
     let mut pending_snapshots: FuturesUnordered<PendingSnapshotFuture> = FuturesUnordered::new();
     let planned_exit = drive_agent_dispatch(AgentDispatch {
@@ -245,7 +244,7 @@ pub(super) async fn run_agent_inner(
         pending_steers: &mut pending_steers,
         pending_snapshots: &mut pending_snapshots,
         pending_failure,
-        last_command_id: &mut last_command_id,
+        start_command_id: &start_command.id,
     })
     .await;
     settle_agent_actor(
@@ -281,7 +280,7 @@ struct AgentDispatch<'a> {
     pending_steers: &'a mut FuturesUnordered<PendingSteerFuture>,
     pending_snapshots: &'a mut FuturesUnordered<PendingSnapshotFuture>,
     pending_failure: &'a mut Option<PendingFailure>,
-    last_command_id: &'a mut String,
+    start_command_id: &'a str,
 }
 
 /// Start sequencing: initialize the native source, resolve resume overlays,
@@ -478,7 +477,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
         pending_steers,
         pending_snapshots,
         pending_failure,
-        last_command_id,
+        start_command_id,
     } = dispatch;
     let mut planned_exit = false;
     // while_let_loop does not apply: the child borrow must end before
@@ -564,10 +563,9 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                 match message {
                     RuntimeMessage::Command {
                         command,
-                        dispatch_seq,
+                        context,
                         reply,
                     } => {
-                        *last_command_id = command.id.clone();
                         let config = match resolve_send_config(state, &command).await {
                             Ok(config) => config,
                             Err(error) => {
@@ -586,7 +584,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                 continue;
                             }
                         };
-                        match agent_command_params(agent, &command, dispatch_seq, config.as_ref()) {
+                        match agent_command_params(agent, &command, context, config.as_ref()) {
                             Err(error) => complete_plugin_command(
                                 PluginCommandCompletion {
                                     command,
@@ -701,8 +699,6 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                 continue;
                             }
                         };
-                        let snapshot_command_id = last_command_id.clone();
-                        *last_command_id = command.id.clone();
                         let cooperative = stop_call
                             .await
                             .map_err(|error| redact_native_error(error, source_credentials))
@@ -759,13 +755,12 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                 break;
                             }
                             Err(_) if force => {
-                                let snapshot_command = snapshot_command_id.clone();
                                 let snapshot = if Instant::now() < deadlines.rpc_until { client.call(
                                     "agent.snapshot",
                                     json!({
                                         "agent_id": agent.id,
                                         "generation": agent.generation,
-                                        "command_id": snapshot_command,
+                                        "command_id": start_command_id,
                                     }),
                                     deadlines.rpc_deadline(STOP_GRACE),
                                 ).await.ok() } else { None };
@@ -826,7 +821,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                         json!({
                                             "agent_id": agent.id,
                                             "generation": agent.generation,
-                                            "command_id": snapshot_command_id,
+                                            "command_id": start_command_id,
                                         }),
                                         deadlines.rpc_deadline(STOP_GRACE),
                                     ).await;

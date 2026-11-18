@@ -29,11 +29,7 @@ use eliot_plugin::{
     skill,
 };
 use serde_json::Value;
-use std::{
-    collections::{HashMap, HashSet},
-    ffi::OsString,
-    path::PathBuf,
-};
+use std::{ffi::OsString, path::PathBuf};
 use tokio::time::Instant;
 
 pub(super) struct PreparedStart {
@@ -256,12 +252,7 @@ pub(super) async fn spawn_owned_session(
         native,
         native_client,
         events,
-        command_inputs: HashMap::new(),
-        command_turns: HashMap::new(),
-        unknown_commands: HashSet::new(),
-        rejected_commands: HashSet::new(),
-        rejected_reasons: HashMap::new(),
-        control_commands: HashMap::new(),
+        current_turn: None,
         stop_command_id: None,
         skill_text,
         skill_pending: true,
