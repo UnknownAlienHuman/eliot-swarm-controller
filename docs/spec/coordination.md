@@ -28,9 +28,23 @@ directories are recorded only by the Agent that created them through
 Existing worktree and native-subject facts are also reconciled
 when planning, without scanning arbitrary filesystem roots.
 
-`cleanup.plan {scope:self_tree|project|all,project?,older_than?}` changes no
-filesystem objects. It retains a bounded snapshot with per-item size, reason and
+`cleanup.plan {scope:self_tree|project|all,project?,older_than?,continuation?}` changes
+no filesystem objects. It retains a bounded snapshot with per-item size, reason and
 `safe`/`keep` verdict. The cutoff is an exclusive Unix-millisecond creation time.
+Only `registered` rows are candidates: settled rows (`removed`, `unknown`,
+`skipped(...)`) are attempt history read back from retained plans, and filtering
+them before the page cap keeps a settled prefix from starving later eligible
+rows. The Store pages the final candidate order once (ordinary rows, then
+worktrees, then branches and native sessions, each oldest insertion first), and a
+truncated plan returns an opaque `continuation` token: the last shown artifact, the
+consumed project-row offsets, the settings revision those offsets were read at, the
+ordered project IDs and verdict bands those offsets were computed against, the
+agent-backfill position, and the ledger snapshot the pages are pinned to. Rows
+inserted after the snapshot surface on a fresh listing, never inside a page; a moved
+settings revision, a reclassified project (a checkout appearing or disappearing moves
+it between kept and safe without moving the revision), or an unresolvable
+cursor rejects the continued page as stale. Automatic retirement filters the exact Agent,
+generation and kind before the same cap.
 Agents are restricted to their frozen and current subtree; Owner selects project
 or all. Terminal means Stopped or Failed with no open native source, pending
 command or retained non-exited owned process. Lost remains conservative.
@@ -436,6 +450,9 @@ The [Store migrations](../../crates/eliot-store/src/schema.rs) own the
 dirty, Git dirty files in a singly owned worktree, branch differences from frozen base,
 advisory claims and optionally bounded recent history. Git history is provenance, not
 current ownership. Unattributed dirty bytes in a shared checkout stay unattributed.
+A private chat Agent is a current worker with `chat: true` and no project; it never
+fails roster validation and never widens scope (an Agent caller still reads only its
+own project, the empty chat scope included).
 
 [Monitoring](monitoring.md#git-and-filesystem-monitor) owns `agent_edits`; coordination
 does not declare a duplicate table. Git-clean paths remove edit rows. Old generations

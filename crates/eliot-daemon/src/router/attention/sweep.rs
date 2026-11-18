@@ -682,7 +682,7 @@ async fn scan_all_agents(
     loop {
         let page = {
             let store = router.inner.store.lock().await;
-            store.list_agents(after.as_deref(), PAGE_SIZE)?
+            store.list_agents(after.as_deref(), PAGE_SIZE)?.0
         };
         if page.is_empty() {
             break;

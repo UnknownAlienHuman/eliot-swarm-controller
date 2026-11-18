@@ -284,6 +284,7 @@ fn build_who_worker(
         generation: row.generation,
         is_self: false,
         state: row.state,
+        chat: row.chat,
         project: row.project.clone(),
         workspace: row.workspace.clone(),
         singly_owned,

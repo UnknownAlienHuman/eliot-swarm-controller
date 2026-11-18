@@ -122,7 +122,12 @@ impl Store {
         if count >= 4096 {
             return Err(Error::new("unavailable", "artifact ledger is full"));
         }
-        let changed = tx.execute("INSERT OR IGNORE INTO artifacts(id,agent,generation,path,body) VALUES (?1,?2,?3,?4,?5)",params![artifact.id,parse_agent_id(&artifact.agent)?,artifact.generation,artifact.path,encode_json(&artifact)?]).map_err(sql_error)?;
+        let seq: i64 = tx
+            .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM artifacts", [], |r| {
+                r.get(0)
+            })
+            .map_err(sql_error)?;
+        let changed = tx.execute("INSERT OR IGNORE INTO artifacts(id,agent,generation,path,body,seq) VALUES (?1,?2,?3,?4,?5,?6)",params![artifact.id,parse_agent_id(&artifact.agent)?,artifact.generation,artifact.path,encode_json(&artifact)?,seq]).map_err(sql_error)?;
         if changed == 0 && artifact.kind == ArtifactKind::Branch {
             // Branches move as their agent commits: refresh the tracked tip
             // so the plan snapshot anchors exactly what apply re-verifies.
@@ -179,6 +184,39 @@ impl Store {
         }
         Ok(out)
     }
+    /// Frozen and live subtree membership without consulting the project
+    /// assignment gate. Mirrors the membership half of
+    /// `cleanup_authorized` so the inventory scan can skip unrelated rows
+    /// before their gate is allowed to fail the whole page.
+    fn cleanup_subtree_member(&self, caller: &Sender, artifact: &ArtifactView) -> Result<bool> {
+        let Sender::Agent { id, generation, .. } = caller else {
+            return Ok(true);
+        };
+        if artifact
+            .tree
+            .iter()
+            .any(|entry| entry == &format!("{id}:{generation}"))
+        {
+            return Ok(true);
+        }
+        let mut current = self.get_agent(&artifact.agent)?;
+        for _ in 0..64 {
+            let Some(row) = current else {
+                return Ok(false);
+            };
+            if row.id == *id {
+                return Ok(true);
+            }
+            current = row
+                .parent
+                .as_deref()
+                .map(|p| self.get_agent(p))
+                .transpose()?
+                .flatten();
+        }
+        Ok(false)
+    }
+
     pub fn cleanup_authorized(&self, principal: &str, artifact: &ArtifactView) -> Result<bool> {
         match parse_sender(principal, "cleanup")? {
             Sender::Owner => Ok(true),
@@ -220,11 +258,22 @@ impl Store {
         }
     }
 
+    /// Eligible cleanup candidates in final candidate order: ordinary rows
+    /// first, then worktrees, then branches and native sessions, each oldest
+    /// insertion first. Only `registered` rows paginate: settled rows
+    /// (`removed`, `unknown`, `skipped(...)`) are attempt history, not
+    /// candidates, and their readback lives in the retained plans. Filtering
+    /// them before the page cap keeps a settled prefix from starving later
+    /// eligible rows. The page is pinned to a ledger snapshot: rows inserted
+    /// after the snapshot land on a fresh listing, never inside a page, and
+    /// the cursor resolves against the same snapshot, so a concurrent
+    /// registration can neither hide behind nor repeat a candidate. Returns
+    /// the page, whether eligible rows remain, and the snapshot to echo.
     pub fn cleanup_inventory(
         &self,
         principal: &str,
         request: &CleanupPlanRequest,
-    ) -> Result<(Vec<ArtifactView>, bool)> {
+    ) -> Result<(Vec<ArtifactView>, bool, i64)> {
         request.validate()?;
         let caller = parse_sender(principal, "cleanup")?;
         if !matches!(caller, Sender::Owner) && request.scope != CleanupScope::SelfTree {
@@ -236,19 +285,72 @@ impl Store {
         if matches!(caller, Sender::Owner) && request.scope == CleanupScope::SelfTree {
             return Err(Error::new("invalid", "Owner must select project or all"));
         }
+        let page = request
+            .continuation
+            .as_deref()
+            .map(PlanContinuation::decode)
+            .transpose()?
+            .unwrap_or(PlanContinuation {
+                artifact_after: None,
+                safe_skipped: 0,
+                kept_skipped: 0,
+                regs_revision: None,
+                snapshot_seq: None,
+                safe_ids: None,
+                kept_ids: None,
+                backfill_after: None,
+            });
+        let snapshot: i64 = match page.snapshot_seq {
+            Some(snapshot) => snapshot,
+            None => self
+                .connection
+                .query_row("SELECT COALESCE(MAX(seq), 0) FROM artifacts", [], |r| {
+                    r.get(0)
+                })
+                .map_err(sql_error)?,
+        };
+        let cursor: Option<(u8, i64)> = match &page.artifact_after {
+            None => None,
+            Some(id) => {
+                let (kind, seq): (String, i64) = self
+                    .connection
+                    .query_row(
+                        "SELECT json_extract(body, '$.kind'), seq FROM artifacts WHERE id = ?1",
+                        [id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(|error| match error {
+                        rusqlite::Error::QueryReturnedNoRows => {
+                            Error::new("invalid", "cleanup continuation is stale")
+                        }
+                        other => sql_error(other),
+                    })?;
+                let kind: ArtifactKind = serde_json::from_value(Value::String(kind))
+                    .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
+                Some((kind.cleanup_rank(), seq))
+            }
+        };
         let mut statement = self
             .connection
-            .prepare("SELECT body FROM artifacts ORDER BY id LIMIT 4096")
+            .prepare("SELECT body, seq FROM artifacts WHERE seq <= ?1 ORDER BY seq ASC LIMIT 4097")
             .map_err(sql_error)?;
         let bodies = statement
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([snapshot], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
             .map_err(sql_error)?;
-        let mut items = Vec::new();
-        let mut truncated = false;
+        let mut scanned = 0_usize;
+        let mut eligible: Vec<(u8, i64, ArtifactView)> = Vec::new();
         for body in bodies {
-            let artifact: ArtifactView = serde_json::from_str(&body.map_err(sql_error)?)
+            scanned += 1;
+            let (body, seq) = body.map_err(sql_error)?;
+            let artifact: ArtifactView = serde_json::from_str(&body)
                 .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
-            if artifact.state == "ownership_root" {
+            let rank = artifact.kind.cleanup_rank();
+            if artifact.state != "registered"
+                || cursor
+                    .is_some_and(|(rank_after, seq_after)| (rank, seq) <= (rank_after, seq_after))
+            {
                 continue;
             }
             if request
@@ -256,10 +358,63 @@ impl Store {
                 .as_ref()
                 .is_some_and(|p| p != &artifact.project)
                 || request.older_than.is_some_and(|t| artifact.created_at >= t)
-                || !self.cleanup_authorized(principal, &artifact)?
             {
                 continue;
             }
+            // Frozen and live subtree membership is checked before the
+            // target's assignment gate: a later row from another managed
+            // project must skip, never abort the page with `not_allowed`.
+            // Only rows in the caller's own subtree reach the gate in
+            // `cleanup_authorized`, where a real assignment refusal aborts.
+            if !self.cleanup_subtree_member(&caller, &artifact)? {
+                continue;
+            }
+            if !self.cleanup_authorized(principal, &artifact)? {
+                continue;
+            }
+            eligible.push((rank, seq, artifact));
+        }
+        eligible.sort_by_key(|item| (item.0, item.1));
+        let mut truncated = scanned > 4096;
+        let items = if eligible.len() > MAX_CLEANUP_ITEMS {
+            truncated = true;
+            eligible.truncate(MAX_CLEANUP_ITEMS);
+            eligible
+        } else {
+            eligible
+        }
+        .into_iter()
+        .map(|(_, _, artifact)| artifact)
+        .collect();
+        Ok((items, truncated, snapshot))
+    }
+
+    /// Retirement candidates for one exact Agent generation. The Agent,
+    /// generation, settled-state and kind filters all apply before the page
+    /// cap, so a retired Agent's own rows cannot be starved by the
+    /// project-wide prefix the way the shared inventory page could be.
+    /// Unknown attempt fences are untouched: this only selects rows.
+    pub fn cleanup_retirement_inventory(&self, agent: &Agent) -> Result<(Vec<ArtifactView>, bool)> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT body FROM artifacts WHERE agent = ?1 AND generation = ?2
+                 AND json_extract(body, '$.state') = 'registered'
+                 AND json_extract(body, '$.kind') IN ('build', 'temp', 'worktree')
+                 ORDER BY seq ASC LIMIT 65",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![parse_agent_id(&agent.id)?, agent.generation],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(sql_error)?;
+        let mut items = Vec::with_capacity(MAX_CLEANUP_ITEMS);
+        let mut truncated = false;
+        for body in rows {
+            let artifact: ArtifactView = serde_json::from_str(&body.map_err(sql_error)?)
+                .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
             if items.len() == MAX_CLEANUP_ITEMS {
                 truncated = true;
                 break;
@@ -487,9 +642,14 @@ impl Store {
             ));
         }
         let body = encode_json(&artifact)?;
+        let seq: i64 = tx
+            .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM artifacts", [], |r| {
+                r.get(0)
+            })
+            .map_err(sql_error)?;
         tx.execute(
-            "INSERT INTO artifacts(id,agent,generation,path,body) VALUES (?1,?2,?3,?4,?5)",
-            params![artifact.id, num, generation, artifact.path, body],
+            "INSERT INTO artifacts(id,agent,generation,path,body,seq) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![artifact.id, num, generation, artifact.path, body, seq],
         )
         .map_err(sql_error)?;
         retain_write_tx(
@@ -612,6 +772,7 @@ impl Store {
                     created_at: 0,
                     items: Vec::new(),
                     truncated: false,
+                    continuation: None,
                 },
                 Err(error) => return Err(error),
             };
@@ -768,6 +929,20 @@ impl Store {
         )?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok((plan, response, true))
+    }
+
+    /// Retirement planning gate for one artifact: quiescence first, then
+    /// the bound-worktree blocker. `None` means planning may proceed to
+    /// preflight; `Some(reason)` keeps the row with that reason and
+    /// reserves no attempt, so a borrowed worktree is never fenced
+    /// `unknown` across a restart. Retirement planning must consult this
+    /// before any preflight; the apply-time recheck stays as the second
+    /// gate.
+    pub fn retirement_plan_gate(&self, artifact: &ArtifactView) -> Result<Option<&'static str>> {
+        if !self.cleanup_agent_quiescent(artifact)? {
+            return Ok(Some("agent_not_quiescent"));
+        }
+        self.cleanup_worktree_blocker(artifact)
     }
 
     pub fn cleanup_worktree_blocker(
@@ -1123,6 +1298,7 @@ mod tests {
                     reason: "project_path_missing".to_owned(),
                 }],
                 truncated: false,
+                continuation: None,
             };
             store.retain_cleanup_plan("owner", &plan, now).unwrap();
             let request = CleanupApplyRequest {
@@ -1225,6 +1401,7 @@ mod tests {
                 reason: "terminal".to_owned(),
             }],
             truncated: false,
+            continuation: None,
         };
         let mut other_plan = plan.clone();
         other_plan.plan_id = Ulid::new().to_string();
@@ -1312,6 +1489,7 @@ mod tests {
             created_at: now,
             items: vec![candidate(&artifact)],
             truncated: false,
+            continuation: None,
         };
         store.retain_cleanup_plan("owner", &settled, now).unwrap();
         let settle_apply = CleanupApplyRequest {
@@ -1337,6 +1515,7 @@ mod tests {
             created_at: now,
             items: vec![candidate(&artifact)],
             truncated: false,
+            continuation: None,
         };
         store.retain_cleanup_plan("owner", &unknown, now).unwrap();
         let unknown_apply = CleanupApplyRequest {
@@ -1356,6 +1535,7 @@ mod tests {
             created_at: now,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         store.retain_cleanup_plan("owner", &fresh, now).unwrap();
         // Fill the rest of the ledger with abandoned never-consumed previews.
@@ -1365,6 +1545,7 @@ mod tests {
             created_at: stale_at,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         for _ in 0..(MAX_CLEANUP_PLANS - 3) {
             let mut preview = stale.clone();
@@ -1389,6 +1570,7 @@ mod tests {
             created_at: now,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         store
             .retain_cleanup_plan("owner", &admitted, now)
@@ -1461,6 +1643,7 @@ mod tests {
                 reason: "terminal".to_owned(),
             }],
             truncated: false,
+            continuation: None,
         };
         store.retain_cleanup_plan("owner", &plan, now).unwrap();
         let apply = CleanupApplyRequest {
@@ -1497,6 +1680,7 @@ mod tests {
                 created_at: stale_at,
                 items: vec![],
                 truncated: false,
+                continuation: None,
             };
             store
                 .connection
@@ -1511,6 +1695,7 @@ mod tests {
             created_at: now,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         store
             .retain_cleanup_plan("owner", &admitted, now)
@@ -1566,6 +1751,7 @@ mod tests {
             created_at: now,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         let err = store
             .retain_cleanup_plan("owner", &admitted, now)
@@ -1611,6 +1797,7 @@ mod tests {
                 reason: "terminal".to_owned(),
             }],
             truncated: false,
+            continuation: None,
         };
         store.retain_cleanup_plan("owner", &plan, now).unwrap();
         let apply = CleanupApplyRequest {
@@ -1641,6 +1828,7 @@ mod tests {
                 created_at: stale_at,
                 items: vec![],
                 truncated: false,
+                continuation: None,
             };
             store
                 .connection
@@ -1655,6 +1843,7 @@ mod tests {
             created_at: now,
             items: vec![],
             truncated: false,
+            continuation: None,
         };
         store
             .retain_cleanup_plan("owner", &admitted, now)
@@ -1704,6 +1893,7 @@ mod tests {
             created_at: now,
             items: vec![candidate(&build), candidate(&temp)],
             truncated: false,
+            continuation: None,
         };
         store.retain_cleanup_plan("owner", &plan, now).unwrap();
         let foreign = CleanupApplyRequest {
@@ -1777,11 +1967,491 @@ mod tests {
             scope: CleanupScope::All,
             project: None,
             older_than: None,
+            continuation: None,
         };
-        let (items, truncated) = store.cleanup_inventory("owner", &request).unwrap();
+        let (items, truncated, _) = store.cleanup_inventory("owner", &request).unwrap();
         assert!(!truncated);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].identity, "tip");
         assert_eq!(items[0].state, "registered");
+    }
+
+    fn inventory_artifact(
+        id: &str,
+        agent: &str,
+        kind: ArtifactKind,
+        created_at: i64,
+    ) -> ArtifactView {
+        ArtifactView {
+            id: id.to_owned(),
+            agent: agent.to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: vec![format!("{agent}:1")],
+            path: format!("C:/artifacts/{id}"),
+            kind,
+            purpose: "test artifact".to_owned(),
+            identity: format!("identity-{id}"),
+            created_at,
+            state: "registered".to_owned(),
+            git: None,
+        }
+    }
+
+    fn settle_inventory_artifact(store: &Store, id: &str) {
+        store
+            .connection
+            .execute(
+                "UPDATE artifacts SET body = replace(body, '\"state\":\"registered\"', '\"state\":\"removed\"') WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+    }
+
+    fn inventory_agent(store: &mut Store, base_ms: u64) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','idle',1,?1,?1)",
+                [base_ms as i64],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn settled_rows_do_not_starve_eligible_candidates() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let base = Ulid::new().timestamp_ms();
+        inventory_agent(&mut store, base);
+        for i in 0..MAX_CLEANUP_ITEMS {
+            let id = Ulid::from_parts(base + i as u64, 0).to_string();
+            store
+                .record_known_artifact(inventory_artifact(
+                    &id,
+                    "a1",
+                    ArtifactKind::Build,
+                    base as i64 + i as i64,
+                ))
+                .unwrap();
+            settle_inventory_artifact(&store, &id);
+        }
+        let live = Ulid::from_parts(base + MAX_CLEANUP_ITEMS as u64, 0).to_string();
+        store
+            .record_known_artifact(inventory_artifact(
+                &live,
+                "a1",
+                ArtifactKind::Build,
+                base as i64 + MAX_CLEANUP_ITEMS as i64,
+            ))
+            .unwrap();
+        let request = CleanupPlanRequest {
+            scope: CleanupScope::All,
+            project: None,
+            older_than: None,
+            continuation: None,
+        };
+        let (items, truncated, _) = store.cleanup_inventory("owner", &request).unwrap();
+        assert!(!truncated);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, live);
+        assert_eq!(items[0].state, "registered");
+    }
+
+    #[test]
+    fn inventory_pages_past_blocked_rows_with_continuation() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let base = Ulid::new().timestamp_ms();
+        inventory_agent(&mut store, base);
+        let mut ids = Vec::new();
+        for i in 0..=MAX_CLEANUP_ITEMS {
+            let id = Ulid::from_parts(base + i as u64, 0).to_string();
+            store
+                .record_known_artifact(inventory_artifact(
+                    &id,
+                    "a1",
+                    ArtifactKind::Build,
+                    base as i64 + i as i64,
+                ))
+                .unwrap();
+            ids.push(id);
+        }
+        let first = CleanupPlanRequest {
+            scope: CleanupScope::All,
+            project: None,
+            older_than: None,
+            continuation: None,
+        };
+        let (page, truncated, snapshot) = store.cleanup_inventory("owner", &first).unwrap();
+        assert!(truncated);
+        assert_eq!(page.len(), MAX_CLEANUP_ITEMS);
+        assert_eq!(page[MAX_CLEANUP_ITEMS - 1].id, ids[MAX_CLEANUP_ITEMS - 1]);
+        let second = CleanupPlanRequest {
+            scope: CleanupScope::All,
+            project: None,
+            older_than: None,
+            continuation: Some(
+                PlanContinuation {
+                    artifact_after: Some(page[MAX_CLEANUP_ITEMS - 1].id.clone()),
+                    safe_skipped: 0,
+                    kept_skipped: 0,
+                    regs_revision: None,
+                    snapshot_seq: Some(snapshot),
+                    safe_ids: None,
+                    kept_ids: None,
+                    backfill_after: None,
+                }
+                .encode()
+                .unwrap(),
+            ),
+        };
+        let (rest, truncated, _) = store.cleanup_inventory("owner", &second).unwrap();
+        assert!(!truncated);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, ids[MAX_CLEANUP_ITEMS]);
+    }
+
+    #[test]
+    fn retirement_inventory_is_scoped_before_the_cap() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let base = Ulid::new().timestamp_ms();
+        inventory_agent(&mut store, base);
+        inventory_agent(&mut store, base);
+        for i in 0..70 {
+            let id = Ulid::from_parts(base + i as u64, 0).to_string();
+            store
+                .record_known_artifact(inventory_artifact(
+                    &id,
+                    "a1",
+                    ArtifactKind::Build,
+                    base as i64 + i as i64,
+                ))
+                .unwrap();
+        }
+        let other = Ulid::from_parts(base + 70, 0).to_string();
+        store
+            .record_known_artifact(inventory_artifact(
+                &other,
+                "a2",
+                ArtifactKind::Build,
+                base as i64 + 70,
+            ))
+            .unwrap();
+        let one = store.get_agent("a1").unwrap().unwrap();
+        let (items, truncated) = store.cleanup_retirement_inventory(&one).unwrap();
+        assert!(truncated);
+        assert_eq!(items.len(), MAX_CLEANUP_ITEMS);
+        assert!(items.iter().all(|item| item.agent == "a1"));
+        let two = store.get_agent("a2").unwrap().unwrap();
+        let (items, truncated) = store.cleanup_retirement_inventory(&two).unwrap();
+        assert!(!truncated);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, other);
+    }
+
+    fn managed_inventory_agent(
+        store: &Store,
+        project: &str,
+        token: Option<&str>,
+        state: &str,
+        base_ms: i64,
+    ) {
+        let token: Option<String> = token.map(str::to_owned);
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project,harness,profile,token,observe_only,state,generation,created_at,updated_at) VALUES (?1,'codex','p',?2,0,?3,1,?4,?4)",
+                params![project, token, state, base_ms],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn unrelated_managed_project_does_not_abort_subtree_page() {
+        // Review #661: after 65 eligible rows for a manager, a later row
+        // from another managed project must skip, never raise `not_allowed`
+        // and discard the page. Frozen and live subtree membership is
+        // checked before the target's assignment gate; only rows in the
+        // caller's own subtree reach the gate.
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let base = Ulid::new().timestamp_ms();
+        managed_inventory_agent(&store, "p1", Some("tok-a1"), "idle", base as i64);
+        managed_inventory_agent(&store, "p2", Some("tok-a2"), "idle", base as i64);
+        managed_inventory_agent(&store, "p2", None, "idle", base as i64);
+        store
+            .connection
+            .execute_batch(
+                "INSERT INTO project_registrations(id,checkout,repo_common_dir,profiles,actions)
+                 VALUES ('p2','/chk','/common','[]','[\"stop\"]');
+                 INSERT INTO project_assignments(project,manager,manager_generation,epoch,revision)
+                 VALUES ('p2',2,1,1,1);",
+            )
+            .unwrap();
+        let mut project_artifact = |id: &str, agent: &str, project: &str| {
+            let mut artifact = inventory_artifact(id, agent, ArtifactKind::Build, base as i64);
+            artifact.project = project.to_owned();
+            store.record_known_artifact(artifact).unwrap();
+        };
+        for i in 0..65 {
+            let id = Ulid::from_parts(base + i as u64, 0).to_string();
+            project_artifact(&id, "a1", "p1");
+        }
+        let foreign = Ulid::from_parts(base + 65, 0).to_string();
+        project_artifact(&foreign, "a3", "p2");
+        let request = CleanupPlanRequest {
+            scope: CleanupScope::SelfTree,
+            project: None,
+            older_than: None,
+            continuation: None,
+        };
+        let (items, truncated, _) = store.cleanup_inventory("agent:a1:1", &request).unwrap();
+        assert!(truncated);
+        assert_eq!(items.len(), MAX_CLEANUP_ITEMS);
+        assert!(items.iter().all(|item| item.agent == "a1"));
+    }
+
+    #[test]
+    fn retirement_gate_names_a_live_borrower_before_any_attempt() {
+        // Review #698: a stopped manager's clean worktree can still have a
+        // live borrower. The planning gate must name the blocker before an
+        // attempt is reserved instead of letting the row go safe and fence
+        // it `unknown` across a restart.
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let base = Ulid::new().timestamp_ms();
+        managed_inventory_agent(&store, "mp", None, "stopped", base as i64);
+        let path = "C:/borrowed/wt";
+        let borrower: Option<String> = Some(path.to_owned());
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project,harness,profile,workspace,state,generation,created_at,updated_at) VALUES ('other','codex','p',?1,'idle',1,?2,?2)",
+                params![borrower, base as i64],
+            )
+            .unwrap();
+        let id = Ulid::new().to_string();
+        let mut artifact = inventory_artifact(&id, "a1", ArtifactKind::Worktree, base as i64);
+        artifact.project = "mp".to_owned();
+        artifact.path = path.to_owned();
+        artifact.purpose = "managed worktree".to_owned();
+        store.record_known_artifact(artifact.clone()).unwrap();
+        assert_eq!(
+            store.retirement_plan_gate(&artifact).unwrap(),
+            Some("workspace_borrowed")
+        );
+        // Without the borrower the same quiescent worktree may proceed to
+        // preflight instead of being kept.
+        store
+            .connection
+            .execute("UPDATE agents SET workspace = NULL WHERE id = 2", [])
+            .unwrap();
+        assert_eq!(store.retirement_plan_gate(&artifact).unwrap(), None);
+        // A live manager is never a retirement candidate, borrower or not.
+        store
+            .connection
+            .execute("UPDATE agents SET state = 'idle' WHERE id = 1", [])
+            .unwrap();
+        assert_eq!(
+            store.retirement_plan_gate(&artifact).unwrap(),
+            Some("agent_not_quiescent")
+        );
+    }
+}
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+
+    fn page_artifact(id: &str, kind: ArtifactKind, created_at: i64) -> ArtifactView {
+        ArtifactView {
+            id: id.to_owned(),
+            agent: "a1".to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: vec!["a1:1".to_owned()],
+            path: format!("C:/artifacts/{id}"),
+            kind,
+            purpose: "test artifact".to_owned(),
+            identity: format!("identity-{id}"),
+            created_at,
+            state: "registered".to_owned(),
+            git: None,
+        }
+    }
+
+    fn owner_store() -> (Store, u64) {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let base = Ulid::new().timestamp_ms();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','idle',1,?1,?1)",
+                [base as i64],
+            )
+            .unwrap();
+        (store, base)
+    }
+
+    fn fresh_request() -> CleanupPlanRequest {
+        CleanupPlanRequest {
+            scope: CleanupScope::All,
+            project: None,
+            older_than: None,
+            continuation: None,
+        }
+    }
+
+    fn continue_after(last_id: &str, snapshot: i64) -> CleanupPlanRequest {
+        CleanupPlanRequest {
+            scope: CleanupScope::All,
+            project: None,
+            older_than: None,
+            continuation: Some(
+                PlanContinuation {
+                    artifact_after: Some(last_id.to_owned()),
+                    safe_skipped: 0,
+                    kept_skipped: 0,
+                    regs_revision: None,
+                    snapshot_seq: Some(snapshot),
+                    safe_ids: None,
+                    kept_ids: None,
+                    backfill_after: None,
+                }
+                .encode()
+                .unwrap(),
+            ),
+        }
+    }
+
+    #[test]
+    fn cleanup_final_order_pages_without_skip_or_repeat() {
+        // Review #661: one lower-ID worktree plus 63 ordinary artifacts in
+        // the Store page. Final candidate order puts ordinary rows first,
+        // so page one holds the builds and the worktree closes page two.
+        let (mut store, base) = owner_store();
+        let worktree = Ulid::from_parts(base, 0).to_string();
+        store
+            .record_known_artifact(page_artifact(
+                &worktree,
+                ArtifactKind::Worktree,
+                base as i64,
+            ))
+            .unwrap();
+        let mut ids = vec![worktree.clone()];
+        for i in 1..=u64::try_from(MAX_CLEANUP_ITEMS).unwrap() {
+            let id = Ulid::from_parts(base + i, 0).to_string();
+            store
+                .record_known_artifact(page_artifact(
+                    &id,
+                    ArtifactKind::Build,
+                    base as i64 + i as i64,
+                ))
+                .unwrap();
+            ids.push(id);
+        }
+        let (page, truncated, snapshot) =
+            store.cleanup_inventory("owner", &fresh_request()).unwrap();
+        assert!(truncated);
+        assert_eq!(page.len(), MAX_CLEANUP_ITEMS);
+        assert!(page.iter().all(|item| item.kind == ArtifactKind::Build));
+        for window in page.windows(2) {
+            assert!(window[0].created_at <= window[1].created_at);
+        }
+        let (rest, truncated, _) = store
+            .cleanup_inventory(
+                "owner",
+                &continue_after(&page[MAX_CLEANUP_ITEMS - 1].id, snapshot),
+            )
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, worktree);
+        // Every registered row surfaces exactly once across the two pages.
+        let mut seen: Vec<String> = page
+            .iter()
+            .chain(rest.iter())
+            .map(|item| item.id.clone())
+            .collect();
+        seen.sort();
+        ids.sort();
+        assert_eq!(seen, ids);
+    }
+
+    #[test]
+    fn cleanup_continuation_pins_snapshot_against_late_inserts() {
+        // Review #661: a registration whose caller ID sorts earlier can
+        // finish after page one. The snapshot pins it past the page; a
+        // fresh listing surfaces it instead.
+        let (mut store, base) = owner_store();
+        let mut ids = Vec::new();
+        for i in 0..=u64::try_from(MAX_CLEANUP_ITEMS).unwrap() {
+            let id = Ulid::from_parts(base + 100 + i, 0).to_string();
+            store
+                .record_known_artifact(page_artifact(
+                    &id,
+                    ArtifactKind::Build,
+                    base as i64 + i as i64,
+                ))
+                .unwrap();
+            ids.push(id);
+        }
+        let (page, truncated, snapshot) =
+            store.cleanup_inventory("owner", &fresh_request()).unwrap();
+        assert!(truncated);
+        assert_eq!(page.len(), MAX_CLEANUP_ITEMS);
+        let late = Ulid::from_parts(base, 0).to_string();
+        store
+            .record_known_artifact(page_artifact(&late, ArtifactKind::Build, base as i64 + 1))
+            .unwrap();
+        let (rest, truncated, _) = store
+            .cleanup_inventory(
+                "owner",
+                &continue_after(&page[MAX_CLEANUP_ITEMS - 1].id, snapshot),
+            )
+            .unwrap();
+        assert!(!truncated);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, ids[MAX_CLEANUP_ITEMS]);
+        // A fresh listing sees the late row on its own page boundary.
+        let mut fresh_ids = Vec::new();
+        let (first, truncated, snapshot) =
+            store.cleanup_inventory("owner", &fresh_request()).unwrap();
+        assert!(truncated);
+        fresh_ids.extend(first.iter().map(|item| item.id.clone()));
+        let (second, truncated, _) = store
+            .cleanup_inventory(
+                "owner",
+                &continue_after(&first[MAX_CLEANUP_ITEMS - 1].id, snapshot),
+            )
+            .unwrap();
+        assert!(!truncated);
+        fresh_ids.extend(second.iter().map(|item| item.id.clone()));
+        assert!(fresh_ids.contains(&late));
+        assert_eq!(fresh_ids.len(), ids.len() + 1);
+    }
+
+    #[test]
+    fn cleanup_continuation_rejects_a_missing_cursor() {
+        let (store, _) = owner_store();
+        let request = CleanupPlanRequest {
+            scope: CleanupScope::All,
+            project: None,
+            older_than: None,
+            continuation: Some(
+                PlanContinuation {
+                    artifact_after: Some(Ulid::new().to_string()),
+                    safe_skipped: 0,
+                    kept_skipped: 0,
+                    regs_revision: None,
+                    snapshot_seq: Some(0),
+                    safe_ids: None,
+                    kept_ids: None,
+                    backfill_after: None,
+                }
+                .encode()
+                .unwrap(),
+            ),
+        };
+        assert_eq!(
+            store.cleanup_inventory("owner", &request).unwrap_err().code,
+            "invalid"
+        );
     }
 }

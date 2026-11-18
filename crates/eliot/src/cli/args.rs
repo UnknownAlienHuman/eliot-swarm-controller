@@ -196,6 +196,10 @@ pub(crate) enum CleanupCommand {
         project: Option<String>,
         #[arg(long)]
         older_than: Option<i64>,
+        /// Continue a truncated listing with the opaque token from the
+        /// previous plan response.
+        #[arg(long)]
+        continuation: Option<String>,
     },
     Apply {
         plan_id: String,

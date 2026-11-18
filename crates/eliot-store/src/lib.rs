@@ -40,16 +40,16 @@ pub use scripts::ScriptRunAdmission;
 pub use usage::ResolvedUsageScope;
 
 use eliot_core::api::{HeavySummaryView, SessionGrowthView, agent_state_name};
-use eliot_core::limits::{MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES};
+use eliot_core::limits::{MAX_COMMAND_ID_BYTES, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES};
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
-    Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
-    GitSnapshot, InjectPoint, NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity,
-    ProcessRecord, ProcessSnapshot, ProcessState, SessionUsage, SourceBatch, SourceGap,
-    SourceGapAck, SubmitCommand, Turn, TurnOutcome, TurnResolutionSource, TurnState, TurnUsage,
-    WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
-    WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome,
-    parse_agent_id,
+    Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitCommit,
+    GitHintPage, GitPathStatus, GitSnapshot, InjectPoint, NativeEvent, NativeStoreBinding,
+    PendingRequest, ProcessIdentity, ProcessRecord, ProcessSnapshot, ProcessState, SessionUsage,
+    SourceBatch, SourceGap, SourceGapAck, SubmitCommand, Turn, TurnOutcome, TurnResolutionSource,
+    TurnState, TurnUsage, WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase,
+    WorkspacePreparation, WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg,
+    WorkspaceSetupOutcome, parse_agent_id,
 };
 pub use eliot_core::{Error, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -942,7 +942,11 @@ impl Store {
         Ok(token.flatten())
     }
 
-    pub fn list_agents(&self, after: Option<&str>, limit: usize) -> Result<Vec<Agent>> {
+    /// All agents after the cursor, oldest first, with an explicit
+    /// truncation flag: the byte cap can cut the page below `limit`, so
+    /// callers must carry the flag forward instead of treating a short page
+    /// as complete.
+    pub fn list_agents(&self, after: Option<&str>, limit: usize) -> Result<(Vec<Agent>, bool)> {
         validate_limit(limit)?;
         let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
         let mut statement = self
@@ -965,8 +969,10 @@ impl Store {
                 row.map_err(sql_error)?,
             )?);
         }
+        let fetched = agents.len();
         enforce_page_bytes(&mut agents)?;
-        Ok(agents)
+        let truncated = agents.len() < fetched;
+        Ok((agents, truncated))
     }
 
     /// Page routed attention candidates. Registration existence is an indexed

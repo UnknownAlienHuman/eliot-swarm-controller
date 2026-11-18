@@ -2379,7 +2379,7 @@ mod tests {
         let mut store = store();
         let now = now_ms();
         let a = ready_agent(&mut store, "app", now);
-        let before = store.list_agents(None, 100).unwrap().len();
+        let before = store.list_agents(None, 100).unwrap().0.len();
         let error = store
             .mail_send(
                 "owner",
@@ -2389,7 +2389,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, "not_found");
-        assert_eq!(store.list_agents(None, 100).unwrap().len(), before);
+        assert_eq!(store.list_agents(None, 100).unwrap().0.len(), before);
 
         let error = store
             .mail_send(

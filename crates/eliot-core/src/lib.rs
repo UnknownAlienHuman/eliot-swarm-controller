@@ -36,7 +36,7 @@ pub use command::{
     is_deterministic_pre_admission_rejection, validate_command_id,
     workspace_preparation_transition_allowed,
 };
-pub use context::{ContextItem, ContextOutcome, InjectArgs, InjectPoint};
+pub use context::{ContextItem, ContextOutcome, InjectArgs, InjectPoint, turn_started_data};
 pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
     bound_stderr_diagnostics,

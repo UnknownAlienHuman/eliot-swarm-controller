@@ -293,6 +293,7 @@ fn delete_supersedes_only_the_tree_items_in_an_unapplied_plan() {
             candidate("a3", "safe"),
         ],
         truncated: false,
+        continuation: None,
     };
     store.retain_cleanup_plan("owner", &plan, now).unwrap();
     let delete_id = Ulid::new().to_string();

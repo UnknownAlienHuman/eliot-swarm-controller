@@ -733,7 +733,7 @@ fn native_children_keep_immediate_parent_and_visibility_above_every_launch_limit
     );
     assert_eq!(nested.agent.root, root);
     assert_eq!(nested.agent.depth, 2);
-    assert_eq!(store.list_agents(None, 100).unwrap().len(), 5);
+    assert_eq!(store.list_agents(None, 100).unwrap().0.len(), 5);
     let mut moved = request(&second.agent.id, "second", "nested");
     moved.registration_id = "attempted-reparent".to_owned();
     assert_eq!(

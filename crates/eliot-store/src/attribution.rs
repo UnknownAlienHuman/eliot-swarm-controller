@@ -47,6 +47,7 @@ pub struct WhoWorkerRow {
     pub state: AgentState,
     pub project: String,
     pub workspace: Option<String>,
+    pub chat: bool,
 }
 
 impl Store {
@@ -119,7 +120,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, generation, state, COALESCE(project_scope, project), workspace FROM agents
+                "SELECT id, generation, state, COALESCE(project_scope, project), workspace, chat FROM agents
                  WHERE state NOT IN ('stopped','failed','lost')
                    AND (?1 IS NULL OR COALESCE(project_scope, project) = ?1)
                  ORDER BY id ASC LIMIT ?2",
@@ -130,14 +131,23 @@ impl Store {
             .query_map(params![scope, limit], |row| {
                 let num: i64 = row.get(0)?;
                 let state: String = row.get(2)?;
-                Ok((num, row.get(1)?, state, row.get(3)?, row.get(4)?))
+                Ok((
+                    num,
+                    row.get(1)?,
+                    state,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
             })
             .map_err(sql_error)?
-            .collect::<rusqlite::Result<Vec<(i64, i64, String, String, Option<String>)>>>()
+            .collect::<rusqlite::Result<Vec<(i64, i64, String, String, Option<String>, bool)>>>()
             .map_err(sql_error)?;
         let truncated = rows.len() > MAX_WHO_WORKERS;
         let mut workers = Vec::with_capacity(rows.len().min(MAX_WHO_WORKERS));
-        for (num, generation, state, project, workspace) in rows.into_iter().take(MAX_WHO_WORKERS) {
+        for (num, generation, state, project, workspace, chat) in
+            rows.into_iter().take(MAX_WHO_WORKERS)
+        {
             workers.push(WhoWorkerRow {
                 id: format!("a{num}"),
                 num,
@@ -145,6 +155,7 @@ impl Store {
                 state: parse_enum(&state, "Agent state")?,
                 project,
                 workspace,
+                chat,
             });
         }
         Ok((workers, truncated))
@@ -1666,5 +1677,50 @@ mod tests {
         let counts = store.workspace_owner_counts().expect("counts after stops");
         assert_eq!(counts.get("ws-shared"), Some(&1));
         assert!(!counts.contains_key("ws-c"));
+    }
+
+    #[test]
+    fn who_workers_keeps_a_projectless_chat() {
+        let mut store = store();
+        let now = now_ms();
+        let worker = ready_agent(&mut store, "app", "ws-app", now);
+        // A private chat launched by the owner carries no project by contract.
+        let launch_id = Ulid::new().to_string();
+        let admission = store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: launch_id.clone(),
+                    target: None,
+                    selector: None,
+                    verb: "launch".to_owned(),
+                    args: json!({"chat": true, "workspace": "ws-chat", "harness": "codex", "profile": "fake", "profile_snapshot": {}}),
+                    expected_generation: Some(0),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .expect("admit chat launch");
+        let chat = admission.command.target.expect("chat launch target");
+        store
+            .dispatch(&launch_id, now)
+            .expect("dispatch chat launch");
+        let (workers, truncated) = store.who_workers("owner", None).expect("owner reads all");
+        assert!(!truncated);
+        assert_eq!(workers.len(), 2);
+        let row = workers
+            .iter()
+            .find(|row| row.id == chat)
+            .expect("chat row is listed");
+        assert!(row.chat);
+        assert!(row.project.is_empty());
+        let row = workers
+            .iter()
+            .find(|row| row.id == worker)
+            .expect("worker row is listed");
+        assert!(!row.chat);
+        assert_eq!(row.project, "app");
     }
 }

@@ -1129,13 +1129,38 @@ mod tests {
             let agent = store.get_agent(id).unwrap().expect("visible row");
             assert_eq!(agent.control, AgentControl::Slf);
         }
-        let listed = store.list_agents(None, 100).unwrap();
+        let listed = store.list_agents(None, 100).unwrap().0;
         assert_eq!(listed.len(), 3);
         let overflow = launch_request("visible", Some(&parent));
         assert_eq!(
             store.submit("owner", overflow, now + 3).unwrap_err().code,
             "fanout_limit"
         );
+    }
+
+    #[test]
+    fn list_agents_reports_byte_cap_truncation() {
+        let store = store();
+        let now = now_ms();
+        let pad = "x".repeat(1024);
+        for i in 0..1000 {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at,effective) VALUES ('p','codex','p','idle',1,?1,?1,?2)",
+                    rusqlite::params![now + i as i64, format!("{{\"pad\":\"{pad}\"}}")],
+                )
+                .unwrap();
+        }
+        // ~1 KiB per row pushes the 1,000-row page past the 900 KiB bound:
+        // the flag (not a short page) tells the caller inventory is partial.
+        let (agents, truncated) = store.list_agents(None, 1000).unwrap();
+        assert!(truncated);
+        assert!(agents.len() < 1000);
+        assert!(!agents.is_empty());
+        let (one, cut) = store.list_agents(None, 1).unwrap();
+        assert!(!cut);
+        assert_eq!(one.len(), 1);
     }
 
     #[test]
@@ -1690,7 +1715,7 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "ALTER TABLE turns DROP COLUMN effective_model;
+                    "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;

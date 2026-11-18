@@ -2011,7 +2011,8 @@ filtered by project and Agent; an Agent caller reads only its own project.
 
 `who` composes existing L3 projections per current worker: the roster
 holds every non-terminal Agent in scope (at most 100, oldest first, with
-a `truncated` flag instead of a cursor). Each worker carries its
+a `truncated` flag instead of a cursor), including private chats, which
+carry `chat: true` and no project. Each worker carries its
 current-generation verified edits whose paths are still dirty in the
 cached Git view, the dirty files of its worktree when exactly one
 non-terminal Agent admits that checkout (counted across projects),
