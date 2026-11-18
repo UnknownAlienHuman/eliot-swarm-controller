@@ -842,15 +842,21 @@ impl Conversation {
     /// A command submitted from this window: shown at once, linked to its turn
     /// when `turn.started` names it.
     pub fn note_local_input(&mut self, command: &str, text: &str) {
+        // A Send acknowledgement can land after `turn.started` already
+        // linked the command: a linked command keeps no exact text, and
+        // nothing is retained for it at all.
+        if self
+            .turns
+            .values()
+            .any(|turn| turn.command_id.as_deref() == Some(command))
+        {
+            return;
+        }
         self.inputs
             .insert(command.to_owned(), InputText::Loaded(bound_text(text)));
         self.pending_exact
             .insert(command.to_owned(), text.to_owned());
-        let linked = self
-            .turns
-            .values()
-            .any(|turn| turn.command_id.as_deref() == Some(command));
-        if !linked && !self.local.iter().any(|known| known == command) {
+        if !self.local.iter().any(|known| known == command) {
             self.local.push(command.to_owned());
         }
         // A local prompt counts from insertion: evict old turns to fit it.
@@ -900,19 +906,14 @@ impl Conversation {
         }
     }
 
-    /// The exact submitted text of a local input, for Retry: never the
-    /// bounded display preview and never its truncation marker (#643).
+    /// The exact submitted text of a local input, for Retry: only the
+    /// retained exact payload ever resubmits, never the bounded display
+    /// preview or its truncation marker (#643).
     pub fn local_text(&self, command: &str) -> Option<String> {
         if !self.local.iter().any(|known| known == command) {
             return None;
         }
-        match self.pending_exact.get(command) {
-            Some(exact) => Some(exact.clone()),
-            None => match self.inputs.get(command) {
-                Some(InputText::Loaded(text)) => Some(text.clone()),
-                _ => None,
-            },
-        }
+        self.pending_exact.get(command).cloned()
     }
 
     /// Commands linked to resident turns whose input text is not loaded.
@@ -1772,6 +1773,27 @@ mod tests {
             },
         );
         assert_eq!(chat.items().len(), 1);
+    }
+
+    #[test]
+    fn a_late_send_acknowledgement_retains_nothing_for_a_linked_command() {
+        // Finding 4: the ack landing after `turn.started` linked the
+        // command retains nothing and revives no retry; the turn's
+        // bounded display copy still stands.
+        let mut chat = Conversation::new("a1");
+        chat.note_local_input("c1", "hello");
+        assert_eq!(chat.local_text("c1").as_deref(), Some("hello"));
+        chat.apply_events(&[event(
+            2,
+            "turn.started",
+            json!({"turn_id": "t1", "command_id": "c1"}),
+        )]);
+        assert_eq!(chat.local_text("c1"), None);
+        chat.note_local_input("c1", "hello");
+        assert_eq!(chat.local_text("c1"), None);
+        assert!(!chat.pending_exact.contains_key("c1"));
+        assert!(!chat.local.contains(&"c1".to_owned()));
+        assert!(chat.inputs.contains_key("c1"));
     }
 
     #[test]
