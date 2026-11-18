@@ -266,8 +266,72 @@ pub(super) async fn spawn_owned_session(
         skill_pending: true,
     })
 }
+/// Dispatched session start or resume with its owned session: the dispatch
+/// either proves a reply or settles the failure with the session retained
+/// exactly as the start path requires (dropped when proven-no-effect,
+/// kept unknown when a native effect may have happened).
+pub(super) struct DispatchedStart {
+    pub(super) session: AgentSession,
+    pub(super) response: Value,
+}
 
 impl MusePlugin {
+    /// Dispatch session start (or session resume) and classify the reply.
+    /// A rejection or a proven-undispatched write discards the child and
+    /// retains the failure; any other transport loss keeps the session
+    /// unknown instead of retrying the dispatch.
+    pub(super) async fn dispatch_session_start(
+        &mut self,
+        params: &AgentStartParams,
+        mut session: AgentSession,
+        session_method: &str,
+        params_value: Value,
+        resuming: bool,
+    ) -> Result<DispatchedStart> {
+        match session
+            .native_client
+            .call(session_method, params_value, Instant::now() + RPC_TIMEOUT)
+            .await
+        {
+            Ok(response) => Ok(DispatchedStart { session, response }),
+            Err(error) if error.code == "native_rejected" => {
+                let (code, message) = if resuming {
+                    (
+                        "not_found",
+                        "Muse rejected resume of the exact retained session",
+                    )
+                } else {
+                    (
+                        "profile_error",
+                        "Muse rejected session/start for the selected profile",
+                    )
+                };
+                let error = contextual_error(error, code, message);
+                let error = discard_failed_start(&mut session, error).await;
+                Err(self.retain_failed_start(params, error))
+            }
+            Err(error) if native_no_write(&error.code) => {
+                let message = format!("Muse {session_method} was not dispatched");
+                let code = error.code.clone();
+                let error = contextual_error(error, code, message);
+                let error = discard_failed_start(&mut session, error).await;
+                Err(self.retain_failed_start(params, error))
+            }
+            Err(error) => {
+                let error = contextual_error(
+                    error,
+                    "unknown",
+                    format!(
+                        "Muse {session_method} may have changed native state; it will not be repeated"
+                    ),
+                );
+                let error = self.retain_failed_start(params, error);
+                self.session = Some(session);
+                Err(error)
+            }
+        }
+    }
+
     pub(super) async fn initialize_native(
         client: &NativeClient,
         requested_model: Option<&str>,

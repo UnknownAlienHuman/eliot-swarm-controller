@@ -198,6 +198,249 @@ struct NativeStartContext<'a> {
     metadata_secrets: &'a [String],
 }
 
+/// Validated Codex start plan: every frozen-profile, workspace and launch
+/// input the native-effect phases need, checked before any native I/O.
+/// A refusal here is proven-no-effect: no child was spawned.
+struct ValidatedStartPlan {
+    resume_subject: Option<eliot_plugin::session::ResumeSubject>,
+    route: CodexRoute,
+    frozen_store: NativeStoreBinding,
+    requested_model: Option<String>,
+    requested_effort: Option<String>,
+    collaboration_mode: Option<NativeCollaborationModeKind>,
+    permissions: String,
+    approval_policy: String,
+    sandbox_mode: NativeSandboxMode,
+    mcp_policy: McpPolicy,
+    mcp_allow: Vec<String>,
+    mcp_cloud_hostname: Option<String>,
+    workspace: PathBuf,
+    program: OsString,
+    environment: Vec<(OsString, OsString)>,
+    secrets: Vec<String>,
+    metadata_secrets: Vec<String>,
+    data_dir: PathBuf,
+    swarm_executable: PathBuf,
+    mcp_cwd: PathBuf,
+    mcp_server_name: String,
+    native_subagents: Option<String>,
+    credential: String,
+    profile: serde_json::Map<String, Value>,
+}
+
+/// Dispatched Codex thread with its owned session: the native effect has
+/// happened exactly once and its identity is proven; readiness settlement
+/// takes over from here.
+struct DispatchedThread {
+    session: AgentSession,
+    selected_model: String,
+    selected_effort: Option<String>,
+    readback: ThreadStartReadback,
+}
+
+/// Outcome of the dispatch phase: either a live dispatched thread ready for
+/// readiness settlement, or a settled pre-dispatch report when the worker
+/// never reached thread dispatch.
+enum DispatchOutcome {
+    Dispatched(Box<DispatchedThread>),
+    Settled(Value),
+}
+
+/// Validate the frozen Codex start plan before any native I/O: resume
+/// subject, source plan, profile, route, store binding, workspace, program
+/// and launch environment. No child is spawned on this path.
+fn validate_start_plan(
+    params: &AgentStartParams,
+    initialized: &Initialized,
+) -> Result<ValidatedStartPlan> {
+    if params.initial.is_some() {
+        return Err(Error::new(
+            "unsupported",
+            "Codex start does not accept input; send it as a separate command",
+        ));
+    }
+    let resume_subject = params
+        .resume_from
+        .as_ref()
+        .map(|resume| {
+            parse_resume_subject(
+                resume,
+                params.source_state.as_ref(),
+                &params.agent_id,
+                params.generation,
+                "Codex",
+            )
+        })
+        .transpose()
+        .map_err(|mut error| {
+            if error.code == "unknown" {
+                error.code = "native_readback".to_owned();
+            }
+            error
+        })?;
+    validate_source_plan(
+        "Codex",
+        &["session", "turn", "message", "tool", "request"],
+        params.source_plan.as_ref(),
+    )?;
+    let frozen_profile = params
+        .profile
+        .as_ref()
+        .ok_or_else(|| Error::new("profile_error", "Codex requires a frozen profile object"))?;
+    let profile = frozen_profile
+        .as_object()
+        .ok_or_else(|| Error::new("profile_error", "Codex requires a frozen profile object"))?;
+    if profile.get("harness").and_then(Value::as_str) != Some("codex") {
+        return Err(Error::new(
+            "profile_error",
+            "Codex plugin received a profile for another harness",
+        ));
+    }
+    let route = CodexRoute::from_profile(frozen_profile)?;
+    let frozen_store = frozen_store_binding(profile)?;
+    let native_subagents = profile
+        .get("native_subagents")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    // An omitted model selects the harness native default (`isDefault`)
+    // at start; an explicit model must match exactly or fail honestly
+    // with no substitution. Requested-absent stays null in readback.
+    let requested_model: Option<String> = profile
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let requested_effort = optional_profile_text(profile, "effort", "Codex")?;
+    let collaboration_mode =
+        match optional_profile_text(profile, "collaboration_mode", "Codex")?.as_deref() {
+            None => None,
+            Some("default") => Some(NativeCollaborationModeKind::Default),
+            Some("plan") => Some(NativeCollaborationModeKind::Plan),
+            Some(_) => {
+                return Err(Error::new(
+                    "profile_error",
+                    "Codex collaboration_mode must be default or plan",
+                ));
+            }
+        };
+    let permissions = profile
+        .get("permissions")
+        .and_then(Value::as_str)
+        .unwrap_or("workspace-write")
+        .to_owned();
+    if !matches!(
+        permissions.as_str(),
+        "read-only" | "workspace-write" | "danger-full-access"
+    ) {
+        return Err(Error::new(
+            "profile_error",
+            "Codex profile permissions must be read-only, workspace-write, or danger-full-access",
+        ));
+    }
+    let sandbox_mode = native_sandbox_mode(&permissions)?;
+    let approval_policy = optional_profile_text(profile, "approval_policy", "Codex")?
+        .unwrap_or_else(|| "never".to_owned());
+    if !matches!(approval_policy.as_str(), "never" | "on-request") {
+        return Err(Error::new(
+            "profile_error",
+            "Codex approval_policy must be never or on-request",
+        ));
+    }
+    let (mcp_policy, mcp_allow) = policy_from_profile(profile)?;
+    let mcp_cloud_hostname = cloud_hostname_from_profile(profile);
+    let workspace = params
+        .workspace
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new("profile_error", "Codex requires an existing workspace"))?;
+    if !workspace.is_dir() {
+        return Err(Error::new(
+            "profile_error",
+            "Codex workspace must be an existing directory",
+        ));
+    }
+    let program = profile
+        .get("cmd")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|program| !program.trim().is_empty())
+                .map(OsString::from)
+                .ok_or_else(|| {
+                    Error::new(
+                        "profile_error",
+                        "Codex profile cmd must be one executable path",
+                    )
+                })
+        })
+        .transpose()?
+        .unwrap_or_else(|| OsString::from("codex"));
+    let TargetEnvironment {
+        variables: environment,
+        mut secrets,
+        mut metadata_secrets,
+    } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
+    route.capture_client_secret(&environment, &mut secrets, &mut metadata_secrets, true)?;
+    secrets.push(initialized.credential.clone());
+    metadata_secrets.push(initialized.credential.clone());
+    let data_dir = environment
+        .iter()
+        .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("ELIOT_HOME"))
+        .map(|(_, value)| PathBuf::from(value))
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                "Codex Agent MCP requires an absolute owned Eliot data directory",
+            )
+        })?;
+    let swarm_executable = std::env::current_exe().map_err(|_| {
+        Error::new(
+            "platform_io",
+            "active Swarm executable could not be resolved for the Codex Agent MCP",
+        )
+    })?;
+    let mcp_cwd = std::fs::canonicalize(&workspace).map_err(|_| {
+        Error::new(
+            "profile_error",
+            "Codex Agent workspace could not be resolved for its MCP cwd",
+        )
+    })?;
+    let start_command = ulid::Ulid::from_string(&params.command_id)
+        .map_err(|_| Error::new("invalid", "Codex start command id is not a ULID"))?
+        .to_string()
+        .to_ascii_lowercase();
+    let mcp_server_name = format!("eliot_swarm_{start_command}");
+    Ok(ValidatedStartPlan {
+        resume_subject,
+        route,
+        frozen_store,
+        requested_model,
+        requested_effort,
+        collaboration_mode,
+        permissions,
+        approval_policy,
+        sandbox_mode,
+        mcp_policy,
+        mcp_allow,
+        mcp_cloud_hostname,
+        workspace,
+        program,
+        environment,
+        secrets,
+        metadata_secrets,
+        data_dir,
+        swarm_executable,
+        mcp_cwd,
+
+        mcp_server_name,
+        native_subagents,
+        credential: initialized.credential.clone(),
+        profile: profile.clone(),
+    })
+}
+
 pub(crate) async fn run() -> Result<()> {
     let mut peer = Peer::stdio();
     let client = peer.client();
@@ -825,162 +1068,38 @@ impl CodexPlugin {
             .initialized
             .as_ref()
             .ok_or_else(|| not_initialized("Codex"))?;
-        if params.initial.is_some() {
-            return Err(Error::new(
-                "unsupported",
-                "Codex start does not accept input; send it as a separate command",
-            ));
-        }
-        let resume_subject = params
-            .resume_from
-            .as_ref()
-            .map(|resume| {
-                parse_resume_subject(
-                    resume,
-                    params.source_state.as_ref(),
-                    &params.agent_id,
-                    params.generation,
-                    "Codex",
+        let plan = validate_start_plan(&params, initialized)?;
+        let session = self.spawn_owned_session(&plan, &params, peer).await?;
+
+        let dispatched = self.dispatch_thread_start(session, &params, &plan).await?;
+        // Readiness and input settlement live in settle_start_readiness, unless
+        // dispatch settled a pre-thread report: effective readback,
+        // frozen-profile match, ready commitment, result.
+        match dispatched {
+            DispatchOutcome::Dispatched(thread) => {
+                self.settle_start_readiness(
+                    thread.session,
+                    &params,
+                    &plan,
+                    thread.readback,
+                    thread.selected_model,
+                    thread.selected_effort,
                 )
-            })
-            .transpose()
-            .map_err(|mut error| {
-                if error.code == "unknown" {
-                    error.code = "native_readback".to_owned();
-                }
-                error
-            })?;
-        validate_source_plan(
-            "Codex",
-            &["session", "turn", "message", "tool", "request"],
-            params.source_plan.as_ref(),
-        )?;
-        let frozen_profile = params
-            .profile
-            .as_ref()
-            .ok_or_else(|| Error::new("profile_error", "Codex requires a frozen profile object"))?;
-        let profile = frozen_profile
-            .as_object()
-            .ok_or_else(|| Error::new("profile_error", "Codex requires a frozen profile object"))?;
-        if profile.get("harness").and_then(Value::as_str) != Some("codex") {
-            return Err(Error::new(
-                "profile_error",
-                "Codex plugin received a profile for another harness",
-            ));
+                .await
+            }
+            DispatchOutcome::Settled(value) => Ok(value),
         }
-        let route = CodexRoute::from_profile(frozen_profile)?;
-        let frozen_store = frozen_store_binding(profile)?;
-        let native_subagents = profile.get("native_subagents").and_then(Value::as_str);
-        // An omitted model selects the harness native default (`isDefault`)
-        // at start; an explicit model must match exactly or fail honestly
-        // with no substitution. Requested-absent stays null in readback.
-        let requested_model: Option<String> = profile
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned);
-        let requested_effort = optional_profile_text(profile, "effort", "Codex")?;
-        let collaboration_mode =
-            match optional_profile_text(profile, "collaboration_mode", "Codex")?.as_deref() {
-                None => None,
-                Some("default") => Some(NativeCollaborationModeKind::Default),
-                Some("plan") => Some(NativeCollaborationModeKind::Plan),
-                Some(_) => {
-                    return Err(Error::new(
-                        "profile_error",
-                        "Codex collaboration_mode must be default or plan",
-                    ));
-                }
-            };
-        let permissions = profile
-            .get("permissions")
-            .and_then(Value::as_str)
-            .unwrap_or("workspace-write")
-            .to_owned();
-        if !matches!(
-            permissions.as_str(),
-            "read-only" | "workspace-write" | "danger-full-access"
-        ) {
-            return Err(Error::new(
-                "profile_error",
-                "Codex profile permissions must be read-only, workspace-write, or danger-full-access",
-            ));
-        }
-        let sandbox_mode = native_sandbox_mode(&permissions)?;
-        let approval_policy = optional_profile_text(profile, "approval_policy", "Codex")?
-            .unwrap_or_else(|| "never".to_owned());
-        if !matches!(approval_policy.as_str(), "never" | "on-request") {
-            return Err(Error::new(
-                "profile_error",
-                "Codex approval_policy must be never or on-request",
-            ));
-        }
-        let (mcp_policy, mcp_allow) = policy_from_profile(profile)?;
-        let mcp_cloud_hostname = cloud_hostname_from_profile(profile);
-        let workspace = params
-            .workspace
-            .as_deref()
-            .filter(|path| !path.trim().is_empty())
-            .map(PathBuf::from)
-            .ok_or_else(|| Error::new("profile_error", "Codex requires an existing workspace"))?;
-        if !workspace.is_dir() {
-            return Err(Error::new(
-                "profile_error",
-                "Codex workspace must be an existing directory",
-            ));
-        }
-        let program = profile
-            .get("cmd")
-            .map(|value| {
-                value
-                    .as_str()
-                    .filter(|program| !program.trim().is_empty())
-                    .map(OsString::from)
-                    .ok_or_else(|| {
-                        Error::new(
-                            "profile_error",
-                            "Codex profile cmd must be one executable path",
-                        )
-                    })
-            })
-            .transpose()?
-            .unwrap_or_else(|| OsString::from("codex"));
-        let TargetEnvironment {
-            variables: environment,
-            mut secrets,
-            mut metadata_secrets,
-        } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
-        route.capture_client_secret(&environment, &mut secrets, &mut metadata_secrets, true)?;
-        secrets.push(initialized.credential.clone());
-        metadata_secrets.push(initialized.credential.clone());
-        let data_dir = environment
-            .iter()
-            .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("ELIOT_HOME"))
-            .map(|(_, value)| PathBuf::from(value))
-            .filter(|path| path.is_absolute() && path.is_dir())
-            .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
-                    "Codex Agent MCP requires an absolute owned Eliot data directory",
-                )
-            })?;
-        let swarm_executable = std::env::current_exe().map_err(|_| {
-            Error::new(
-                "platform_io",
-                "active Swarm executable could not be resolved for the Codex Agent MCP",
-            )
-        })?;
-        let mcp_cwd = std::fs::canonicalize(&workspace).map_err(|_| {
-            Error::new(
-                "profile_error",
-                "Codex Agent workspace could not be resolved for its MCP cwd",
-            )
-        })?;
-        let start_command = ulid::Ulid::from_string(&params.command_id)
-            .map_err(|_| Error::new("invalid", "Codex start command id is not a ULID"))?
-            .to_string()
-            .to_ascii_lowercase();
-        let mcp_server_name = format!("eliot_swarm_{start_command}");
+    }
+    /// Spawn the owned Codex worker from the validated plan: enumerate the
+    /// worker-visible MCP surface, compute transport-carrying disables,
+    /// launch, spawn and register the native process. The returned session
+    /// owns its child; a registration failure retains the settled outcome.
+    async fn spawn_owned_session(
+        &mut self,
+        plan: &ValidatedStartPlan,
+        params: &AgentStartParams,
+        peer: &PeerClient,
+    ) -> Result<AgentSession> {
         // Both policies enumerate the worker-visible native MCP surface,
         // then suppress with transport-carrying `enabled=false` overrides.
         // A bare `enabled=false` breaks the native bootstrap for
@@ -1001,22 +1120,24 @@ impl CodexPlugin {
         // daemon with the owner's identity in either policy, whatever the
         // entry is named. An allow-listed name that matches the identity
         // is rejected at launch instead of re-admitted.
-        let controller_executable = swarm_executable.to_str();
-        let (mcp_disables, plugin_disables) = if mcp_policy == McpPolicy::Minimal {
-            let surface = if resume_subject.is_none() {
-                crate::discovery::frozen_mcp_surface(profile, &params.command_id)?
+        let controller_executable = plan.swarm_executable.to_str();
+        let (mcp_disables, plugin_disables) = if plan.mcp_policy == McpPolicy::Minimal {
+            let surface = if plan.resume_subject.is_none() {
+                crate::discovery::frozen_mcp_surface(&plan.profile, &params.command_id)?
             } else {
                 let probe = NativeLaunch {
-                    program: program.clone(),
-                    args: route.args_with_native_subagents(native_subagents)?,
-                    cwd: workspace.clone(),
-                    environment: environment.clone(),
+                    program: plan.program.clone(),
+                    args: plan
+                        .route
+                        .args_with_native_subagents(plan.native_subagents.as_deref())?,
+                    cwd: plan.workspace.clone(),
+                    environment: plan.environment.clone(),
                 };
                 crate::discovery::read_effective_mcp_surface(
                     &probe,
-                    &frozen_store,
-                    &metadata_secrets,
-                    &secrets,
+                    &plan.frozen_store,
+                    &plan.metadata_secrets,
+                    &plan.secrets,
                     Instant::now() + RPC_TIMEOUT,
                 )
                 .await
@@ -1030,16 +1151,16 @@ impl CodexPlugin {
             };
             let mut disables = compute_disables(
                 &surface.servers,
-                &mcp_allow,
-                &mcp_server_name,
-                &metadata_secrets,
+                &plan.mcp_allow,
+                &plan.mcp_server_name,
+                &plan.metadata_secrets,
                 controller_executable,
-                mcp_cloud_hostname.as_deref(),
+                plan.mcp_cloud_hostname.as_deref(),
             )?;
-            if let Some(apps) = synthetic_apps_disable(&mcp_allow) {
+            if let Some(apps) = synthetic_apps_disable(&plan.mcp_allow) {
                 disables.push(apps);
             }
-            let plugins = compute_plugin_disables(&surface.plugins, &mcp_allow)?;
+            let plugins = compute_plugin_disables(&surface.plugins, &plan.mcp_allow)?;
             for stub in synthetic_swarm_owner_disables() {
                 if !disables.iter().any(|kept| kept.name == stub.name) {
                     disables.push(stub);
@@ -1048,16 +1169,18 @@ impl CodexPlugin {
             (disables, plugins)
         } else {
             let probe = NativeLaunch {
-                program: program.clone(),
-                args: route.args_with_native_subagents(native_subagents)?,
-                cwd: workspace.clone(),
-                environment: environment.clone(),
+                program: plan.program.clone(),
+                args: plan
+                    .route
+                    .args_with_native_subagents(plan.native_subagents.as_deref())?,
+                cwd: plan.workspace.clone(),
+                environment: plan.environment.clone(),
             };
             let surface = crate::discovery::read_effective_mcp_surface(
                 &probe,
-                &frozen_store,
-                &metadata_secrets,
-                &secrets,
+                &plan.frozen_store,
+                &plan.metadata_secrets,
+                &plan.secrets,
                 Instant::now() + RPC_TIMEOUT,
             )
             .await
@@ -1070,10 +1193,10 @@ impl CodexPlugin {
             })?;
             let mut disables = compute_owner_disables(
                 &surface.servers,
-                &mcp_server_name,
+                &plan.mcp_server_name,
                 controller_executable,
-                mcp_cloud_hostname.as_deref(),
-                &metadata_secrets,
+                plan.mcp_cloud_hostname.as_deref(),
+                &plan.metadata_secrets,
             )?;
             for stub in synthetic_swarm_owner_disables() {
                 if !disables.iter().any(|kept| kept.name == stub.name) {
@@ -1083,22 +1206,22 @@ impl CodexPlugin {
             (disables, Vec::new())
         };
         let launch = NativeLaunch {
-            program,
-            args: route.args_with_agent_mcp(
-                &mcp_server_name,
-                &swarm_executable,
-                &data_dir,
-                &mcp_cwd,
+            program: plan.program.clone(),
+            args: plan.route.args_with_agent_mcp(
+                &plan.mcp_server_name,
+                &plan.swarm_executable,
+                &plan.data_dir,
+                &plan.mcp_cwd,
                 &mcp_disables,
                 &plugin_disables,
-                native_subagents,
+                plan.native_subagents.as_deref(),
             )?,
-            cwd: workspace.clone(),
-            environment,
+            cwd: plan.workspace.clone(),
+            environment: plan.environment.clone(),
         };
-        let launch = crate::discovery::pinned_launch_for_binding(&launch, &frozen_store)?;
+        let launch = crate::discovery::pinned_launch_for_binding(&launch, &plan.frozen_store)?;
         let mut native =
-            NativeProcess::spawn(launch, SecretPolicy::new(secrets.iter().cloned())).await?;
+            NativeProcess::spawn(launch, SecretPolicy::new(plan.secrets.iter().cloned())).await?;
         let frames = native.take_frames()?;
         let stream = native.stream_state();
         let native_client = native.client();
@@ -1108,10 +1231,10 @@ impl CodexPlugin {
             native_client.clone(),
             peer.clone(),
             EventConfig {
-                credential: initialized.credential.clone(),
+                credential: plan.credential.clone(),
                 agent_id: params.agent_id.clone(),
                 generation: params.generation,
-                secrets: secrets.clone(),
+                secrets: plan.secrets.clone(),
                 native_scope: String::new(),
             },
         );
@@ -1126,8 +1249,8 @@ impl CodexPlugin {
             selected_model: String::new(),
             selected_effort: None,
             native_effort: None,
-            collaboration_mode,
-            secrets,
+            collaboration_mode: plan.collaboration_mode,
+            secrets: plan.secrets.clone(),
             native,
             native_client,
             events,
@@ -1141,7 +1264,7 @@ impl CodexPlugin {
 
         if let Err(error) = register_native_process(
             peer,
-            &initialized.credential,
+            &plan.credential,
             &session.agent_id,
             session.generation,
             session.native.pid(),
@@ -1168,24 +1291,36 @@ impl CodexPlugin {
             }
             let error = session.native_client.diagnostic_error(error);
             self.failed_start = Some(FailedStart {
-                agent_id: params.agent_id,
+                agent_id: params.agent_id.clone(),
                 generation: params.generation,
-                command_id: params.command_id,
+                command_id: params.command_id.clone(),
                 outcome: SettledStartFailure::Uncertain(error.clone()),
             });
             return Err(error);
         }
+        Ok(session)
+    }
 
+    /// Dispatch thread start or resume on the spawned worker: native
+    /// initialize, resume scope and preflight, thread dispatch and exact
+    /// thread-identity readback. Uncertain native effects are kept
+    /// unknown and never replayed.
+    async fn dispatch_thread_start(
+        &mut self,
+        mut session: AgentSession,
+        params: &AgentStartParams,
+        plan: &ValidatedStartPlan,
+    ) -> Result<DispatchOutcome> {
         let (selected_model, selected_effort, native_scope) = match Self::initialize_native(
             &session.native_client,
-            &workspace,
-            requested_model.as_deref(),
-            requested_effort.as_deref(),
-            collaboration_mode.is_some(),
+            &plan.workspace,
+            plan.requested_model.as_deref(),
+            plan.requested_effort.as_deref(),
+            plan.collaboration_mode.is_some(),
             NativeStartContext {
-                route: &route,
-                store: &frozen_store,
-                metadata_secrets: &metadata_secrets,
+                route: &plan.route,
+                store: &plan.frozen_store,
+                metadata_secrets: &plan.metadata_secrets,
             },
         )
         .await
@@ -1193,19 +1328,21 @@ impl CodexPlugin {
             Ok((model, effort, scope)) => (model, effort, scope),
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
-                return self.settle_pre_dispatch_outcome(
-                    session,
-                    &params,
-                    error,
-                    "owned app-server cleanup is unconfirmed; no thread or input was sent",
-                );
+                return self
+                    .settle_pre_dispatch_outcome(
+                        session,
+                        params,
+                        error,
+                        "owned app-server cleanup is unconfirmed; no thread or input was sent",
+                    )
+                    .map(DispatchOutcome::Settled);
             }
         };
         session.selected_model = selected_model.clone();
         session.selected_effort = selected_effort.clone();
         session.native_scope = native_scope;
 
-        if let Some(subject) = &resume_subject {
+        if let Some(subject) = &plan.resume_subject {
             if subject.native_scope != session.native_scope {
                 let error = discard_failed_start(
                     &mut session,
@@ -1215,12 +1352,14 @@ impl CodexPlugin {
                     ),
                 )
                 .await;
-                return self.settle_pre_dispatch_outcome(
-                    session,
-                    &params,
-                    error,
+                return self
+                    .settle_pre_dispatch_outcome(
+                        session,
+                        params,
+                        error,
                     "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
-                );
+                    )
+                    .map(DispatchOutcome::Settled);
             }
             session.thread_id = Some(subject.native_ref.clone());
             if let Err(error) = verify_resume_preflight(
@@ -1237,12 +1376,14 @@ impl CodexPlugin {
                 // Only prerequisite reads ran; native thread effects were not dispatched.
                 let error = pre_dispatch_read_error(error, "native_readback", &message);
                 let error = discard_failed_start(&mut session, error).await;
-                return self.settle_pre_dispatch_outcome(
-                    session,
-                    &params,
-                    error,
+                return self
+                    .settle_pre_dispatch_outcome(
+                        session,
+                        params,
+                        error,
                     "owned app-server cleanup is unconfirmed; no thread/resume or input was sent",
-                );
+                    )
+                    .map(DispatchOutcome::Settled);
             }
         }
 
@@ -1250,17 +1391,19 @@ impl CodexPlugin {
         // and multi_agent_v2=false: model metadata can bypass multi_agent=false alone.
         // Apply the documented dotted config overrides to every start and resume,
         // including profiles that preserve the native reasoning-effort default.
-        let thread_config =
-            NativeThreadConfigOverrides::from_profile(selected_effort.clone(), native_subagents);
-        let (thread_method, params_value) = if let Some(subject) = &resume_subject {
+        let thread_config = NativeThreadConfigOverrides::from_profile(
+            selected_effort.clone(),
+            plan.native_subagents.as_deref(),
+        );
+        let (thread_method, params_value) = if let Some(subject) = &plan.resume_subject {
             let params = NativeThreadResumeParams {
                 thread_id: subject.native_ref.clone(),
                 exclude_turns: true,
                 model: Some(selected_model.clone()),
-                model_provider: Some(route.provider().to_owned()),
-                cwd: Some(workspace.to_string_lossy().into_owned()),
-                sandbox: Some(sandbox_mode),
-                approval_policy: Some(json!(approval_policy.clone())),
+                model_provider: Some(plan.route.provider().to_owned()),
+                cwd: Some(plan.workspace.to_string_lossy().into_owned()),
+                sandbox: Some(plan.sandbox_mode),
+                approval_policy: Some(json!(plan.approval_policy.clone())),
                 config: thread_config,
             };
             (
@@ -1274,11 +1417,11 @@ impl CodexPlugin {
             )
         } else {
             let params = NativeThreadStartParams {
-                cwd: Some(workspace.to_string_lossy().into_owned()),
+                cwd: Some(plan.workspace.to_string_lossy().into_owned()),
                 model: Some(selected_model.clone()),
-                model_provider: Some(route.provider().to_owned()),
-                sandbox: Some(sandbox_mode),
-                approval_policy: Some(json!(approval_policy.clone())),
+                model_provider: Some(plan.route.provider().to_owned()),
+                sandbox: Some(plan.sandbox_mode),
+                approval_policy: Some(json!(plan.approval_policy.clone())),
                 config: thread_config,
                 service_tier: None,
                 ephemeral: None,
@@ -1297,7 +1440,7 @@ impl CodexPlugin {
         {
             Ok(value) => value,
             Err(error) if error.code == "native_rejected" => {
-                let (code, message) = if resume_subject.is_some() {
+                let (code, message) = if plan.resume_subject.is_some() {
                     (
                         "not_found",
                         "Codex rejected resume of the exact retained thread",
@@ -1311,9 +1454,9 @@ impl CodexPlugin {
                 let error = contextual_error(error, code, message);
                 let error = discard_failed_start(&mut session, error).await;
                 self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
+                    agent_id: params.agent_id.clone(),
                     generation: params.generation,
-                    command_id: params.command_id,
+                    command_id: params.command_id.clone(),
                     outcome: SettledStartFailure::Uncertain(error.clone()),
                 });
                 return Err(error);
@@ -1324,9 +1467,9 @@ impl CodexPlugin {
                 let error = contextual_error(error, code, message);
                 let error = discard_failed_start(&mut session, error).await;
                 self.failed_start = Some(FailedStart {
-                    agent_id: params.agent_id,
+                    agent_id: params.agent_id.clone(),
                     generation: params.generation,
-                    command_id: params.command_id,
+                    command_id: params.command_id.clone(),
                     outcome: SettledStartFailure::Uncertain(error.clone()),
                 });
                 return Err(error);
@@ -1347,7 +1490,8 @@ impl CodexPlugin {
         ) {
             Ok(readback)
                 if !readback.thread.id.trim().is_empty()
-                    && resume_subject
+                    && plan
+                        .resume_subject
                         .as_ref()
                         .is_none_or(|subject| subject.native_ref == readback.thread.id) =>
             {
@@ -1375,7 +1519,7 @@ impl CodexPlugin {
         // replacement (see send_command); effective reporting uses this
         // same readback value, never a fabricated effort.
         session.native_effort = readback.reasoning_effort.clone();
-        if resume_subject.is_some()
+        if plan.resume_subject.is_some()
             && response_value
                 .get("thread")
                 .is_none_or(|thread| thread_state(thread) != "idle")
@@ -1386,11 +1530,31 @@ impl CodexPlugin {
                 "Codex thread/resume did not prove the resumed thread idle; no input was sent",
             ));
         }
+        Ok(DispatchOutcome::Dispatched(Box::new(DispatchedThread {
+            session,
+            selected_model,
+            selected_effort,
+            readback,
+        })))
+    }
+
+    /// Settle start readiness for the dispatched thread: deliver the
+    /// coordination skill, read back the MCP inventory, verify the
+    /// effective profile against the frozen plan, commit ready and report.
+    async fn settle_start_readiness(
+        &mut self,
+        mut session: AgentSession,
+        params: &AgentStartParams,
+        plan: &ValidatedStartPlan,
+        readback: ThreadStartReadback,
+        selected_model: String,
+        selected_effort: Option<String>,
+    ) -> Result<Value> {
         // Expose the daemon-materialized coordination skill before any
         // input is sent: without it the Agent would start believing it has
         // no skill. The roots replace nothing on disk; a failed delivery
         // fails the start like any rejected dispatch.
-        if let Err(error) = deliver_swarm_skill(&session.native_client, &data_dir).await {
+        if let Err(error) = deliver_swarm_skill(&session.native_client, &plan.data_dir).await {
             let error = discard_failed_start(&mut session, error).await;
             self.failed_start = Some(FailedStart {
                 agent_id: params.agent_id.clone(),
@@ -1410,13 +1574,13 @@ impl CodexPlugin {
         // instead of echoing the requested set. No input has been sent: the
         // thread is empty, and a failed start settles deterministically
         // like any rejected dispatch.
-        let mcp_readback = if mcp_policy == McpPolicy::Minimal {
+        let mcp_readback = if plan.mcp_policy == McpPolicy::Minimal {
             match Self::read_mcp_status(
                 &session.native_client,
                 &readback.thread.id,
-                &mcp_allow,
-                &mcp_server_name,
-                &metadata_secrets,
+                &plan.mcp_allow,
+                &plan.mcp_server_name,
+                &plan.metadata_secrets,
             )
             .await
             {
@@ -1442,7 +1606,7 @@ impl CodexPlugin {
         // Only a requested effort is verified/enforced. An omitted effort
         // leaves the native default in `effective.effort`, reported
         // separately from `requested.effort` (null).
-        let effort_verified = route.requires_chatgpt()
+        let effort_verified = plan.route.requires_chatgpt()
             && selected_effort.is_some()
             && readback
                 .reasoning_effort
@@ -1467,7 +1631,7 @@ impl CodexPlugin {
             "effort": readback.reasoning_effort.clone(),
             "model_verified": model_verified,
             "effort_verified": effort_verified,
-            "mcp_policy": mcp_policy.as_str(),
+            "mcp_policy": plan.mcp_policy.as_str(),
             "mcp_servers": mcp_servers,
             "mcp_servers_verified": mcp_readback.verified,
         });
@@ -1477,14 +1641,14 @@ impl CodexPlugin {
         );
         // An omitted request accepts the native-selected model as
         // effective; an explicit request must match exactly.
-        let settings_match = requested_model
+        let settings_match = plan.requested_model
             .as_deref()
             .is_none_or(|requested| readback.model == requested)
             && readback.model == selected_model
-            && readback.model_provider == route.provider()
-            && paths_equal(Path::new(&readback.cwd), &workspace)
-            && sandbox_matches(&readback.sandbox, &permissions, &workspace)
-            && readback_approval_matches(&readback.approval_policy, &approval_policy)
+            && readback.model_provider == plan.route.provider()
+            && paths_equal(Path::new(&readback.cwd), &plan.workspace)
+            && sandbox_matches(&readback.sandbox, &plan.permissions, &plan.workspace)
+            && readback_approval_matches(&readback.approval_policy, &plan.approval_policy)
             // Enforce the exact effective effort only if one was requested;
             // an omitted effort accepts and reports the native readback.
             && (selected_effort.is_none()
@@ -1534,13 +1698,13 @@ impl CodexPlugin {
             "native_scope": session.native_scope.clone(),
             "native_ref": readback.thread.id,
             "requested": {
-                "model": requested_model,
+                "model": plan.requested_model.clone(),
                 "effort": selected_effort,
-                "cwd": workspace.to_string_lossy(),
-                "permissions": permissions,
-                "approval_policy": approval_policy,
-                "mcp_policy": mcp_policy.as_str(),
-                "mcp_allow": mcp_allow,
+                "cwd": plan.workspace.to_string_lossy(),
+                "permissions": plan.permissions.clone(),
+                "approval_policy": plan.approval_policy.clone(),
+                "mcp_policy": plan.mcp_policy.as_str(),
+                "mcp_allow": plan.mcp_allow.clone(),
             },
             "effective": effective,
         });

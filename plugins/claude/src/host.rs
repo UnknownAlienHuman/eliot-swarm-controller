@@ -321,6 +321,41 @@ struct StartPlan {
     resume_ref: Option<String>,
 }
 
+/// One unconfirmed stage of the shared uncommitted-session rollback.
+/// The event consumer stays alive through termination and drain while
+/// suppressed, then closes: closing first drops the frame queue and a
+/// late trailing record overflows even with a confirmed child exit.
+struct RollbackCleanup {
+    stage: &'static str,
+    error: Error,
+}
+
+/// Pure stage selection for the shared rollback: the first unconfirmed
+/// stage wins, in execution order. Callers keep their own failure
+/// classification and retained session state.
+fn select_rollback_failure(
+    begin_error: Option<Error>,
+    exit_error: Option<Error>,
+    drain_error: Option<Error>,
+) -> Option<RollbackCleanup> {
+    if let Some(error) = begin_error {
+        Some(RollbackCleanup {
+            stage: "begin_stop",
+            error,
+        })
+    } else if let Some(error) = exit_error {
+        Some(RollbackCleanup {
+            stage: "terminate",
+            error,
+        })
+    } else {
+        drain_error.map(|error| RollbackCleanup {
+            stage: "drain",
+            error,
+        })
+    }
+}
+
 /// Retained approve/deny outcome for exact command-id replay. The stored
 /// value is returned verbatim; a reused id with another binding is an
 /// integrity error.
@@ -1064,18 +1099,10 @@ impl ClaudePlugin {
         })
     }
 
-    /// Settle a start whose native process the host would not register. No
-    /// session or input was sent; if the owned CLI's cleanup is unconfirmed
-    /// the session is kept unknown instead of dropped. The event consumer
-    /// stays alive through termination+drain (suppressed, so no readiness or
-    /// input can commit), then closes: closing first drops the frame queue
-    /// and a late trailing record overflows even with a confirmed child exit.
-    async fn fail_unregistered_start(
-        &mut self,
-        mut session: AgentSession,
-        params: &AgentStartParams,
-        error: Error,
-    ) -> Error {
+    /// Shared rollback for a session whose readiness never committed: begin
+    /// stop, terminate the owned CLI, drain its output, then close the event
+    /// consumer. Returns the first unconfirmed cleanup stage, if any.
+    async fn rollback_uncommitted_session(session: &mut AgentSession) -> Option<RollbackCleanup> {
         let begin_error = session.events.begin_stop().await.err();
         let exit_error = session
             .native
@@ -1088,18 +1115,26 @@ impl ClaudePlugin {
             .await
             .err();
         session.events.close().await;
-        if begin_error.is_some() || exit_error.is_some() || drain_error.is_some() {
-            let (stage, cleanup) = if let Some(cleanup) = begin_error {
-                ("begin_stop", cleanup)
-            } else if let Some(cleanup) = exit_error {
-                ("terminate", cleanup)
-            } else {
-                ("drain", drain_error.expect("drain failure"))
-            };
+        select_rollback_failure(begin_error, exit_error, drain_error)
+    }
+
+    /// Settle a start whose native process the host would not register. No
+    /// session or input was sent; if the owned CLI's cleanup is unconfirmed
+    /// the session is kept unknown instead of dropped. The event consumer
+    /// stays alive through termination+drain (suppressed, so no readiness or
+    /// input can commit), then closes: closing first drops the frame queue
+    /// and a late trailing record overflows even with a confirmed child exit.
+    async fn fail_unregistered_start(
+        &mut self,
+        mut session: AgentSession,
+        params: &AgentStartParams,
+        error: Error,
+    ) -> Error {
+        if let Some(cleanup) = Self::rollback_uncommitted_session(&mut session).await {
             self.session = Some(session);
             let message = format!(
                 "{}; owned CLI cleanup is unconfirmed at {} ({}): {}; no session or input was sent",
-                error.message, stage, cleanup.code, cleanup.message
+                error.message, cleanup.stage, cleanup.error.code, cleanup.error.message
             );
             return contextual_error(error, "unknown", message);
         }
@@ -1120,31 +1155,12 @@ impl ClaudePlugin {
         params: &AgentStartParams,
         error: Error,
     ) -> Error {
-        let begin_error = session.events.begin_stop().await.err();
-        let exit_error = session
-            .native
-            .terminate(false, Instant::now() + RPC_TIMEOUT)
-            .await
-            .err();
-        let drain_error = session
-            .native
-            .await_output_drained(Instant::now() + RPC_TIMEOUT)
-            .await
-            .err();
-        session.events.close().await;
-        if begin_error.is_some() || exit_error.is_some() || drain_error.is_some() {
-            let (stage, cleanup) = if let Some(cleanup) = begin_error {
-                ("begin_stop", cleanup)
-            } else if let Some(cleanup) = exit_error {
-                ("terminate", cleanup)
-            } else {
-                ("drain", drain_error.expect("drain failure"))
-            };
+        if let Some(cleanup) = Self::rollback_uncommitted_session(&mut session).await {
             session.phase = SessionPhase::Unknown;
             self.session = Some(session);
             let message = format!(
                 "{}; owned CLI cleanup is unconfirmed at {} ({}): {}; session.ready was never committed",
-                error.message, stage, cleanup.code, cleanup.message
+                error.message, cleanup.stage, cleanup.error.code, cleanup.error.message
             );
             return contextual_error(error, "unknown", message);
         }
@@ -1313,19 +1329,10 @@ impl ClaudePlugin {
             // `Unknown`. Clean up the spawned CLI first; unconfirmed cleanup
             // stays unknown.
             if eliot_plugin::is_definite_batch_rejection(&error.code) {
-                let begin_error = session.events.begin_stop().await.err();
-                let exit_error = session
-                    .native
-                    .terminate(false, Instant::now() + RPC_TIMEOUT)
+                if Self::rollback_uncommitted_session(&mut session)
                     .await
-                    .err();
-                let drain_error = session
-                    .native
-                    .await_output_drained(Instant::now() + RPC_TIMEOUT)
-                    .await
-                    .err();
-                session.events.close().await;
-                if begin_error.is_some() || exit_error.is_some() || drain_error.is_some() {
+                    .is_some()
+                {
                     session.phase = SessionPhase::Unknown;
                     self.session = Some(session);
                     return Err(Error::new(
@@ -3701,5 +3708,33 @@ mod tests {
         assert!(eliot_plugin::start_classification::is_proven_no_effect(
             eliot_plugin::start_classification::StartPoint::BeforeSpawn
         ));
+    }
+    #[test]
+    fn rollback_reports_the_first_unconfirmed_stage() {
+        // The three start-failure paths share one rollback: the first
+        // unconfirmed stage in execution order wins.
+        let begin = super::select_rollback_failure(
+            Some(Error::new("begin_stop_failed", "begin")),
+            Some(Error::new("terminate_failed", "exit")),
+            Some(Error::new("drain_failed", "drain")),
+        )
+        .expect("a failure is reported");
+        assert_eq!(begin.stage, "begin_stop");
+        let exit = super::select_rollback_failure(
+            None,
+            Some(Error::new("terminate_failed", "exit")),
+            Some(Error::new("drain_failed", "drain")),
+        )
+        .expect("a failure is reported");
+        assert_eq!(exit.stage, "terminate");
+        assert_eq!(exit.error.code, "terminate_failed");
+        let drain =
+            super::select_rollback_failure(None, None, Some(Error::new("drain_failed", "drain")))
+                .expect("a failure is reported");
+        assert_eq!(drain.stage, "drain");
+        assert!(
+            super::select_rollback_failure(None, None, None).is_none(),
+            "confirmed cleanup reports no failure"
+        );
     }
 }
