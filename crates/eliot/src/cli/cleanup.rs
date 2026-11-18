@@ -25,6 +25,7 @@ pub(crate) async fn run_cleanup(
                 },
                 project,
                 older_than,
+                after: None,
             };
             request.validate().map_err(Failure::for_read)?;
             eliot_daemon::client_call_typed::<_, CleanupPlan>(&data, "cleanup.plan", &request)

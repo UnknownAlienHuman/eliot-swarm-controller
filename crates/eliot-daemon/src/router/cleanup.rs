@@ -1863,15 +1863,14 @@ impl Router {
         if self.record_agent_artifacts(&agent).await.is_err() {
             // Backfill is best effort; registered artifacts still clean up.
         }
-        let inventory = match self.inner.store.lock().await.cleanup_inventory(
-            "owner",
-            &CleanupPlanRequest {
-                scope: CleanupScope::Project,
-                project: Some(agent.project.clone()),
-                older_than: None,
-            },
-        ) {
-            Ok((artifacts, _)) => artifacts,
+        let (inventory, retirement_truncated) = match self
+            .inner
+            .store
+            .lock()
+            .await
+            .cleanup_retirement_inventory(&agent)
+        {
+            Ok((artifacts, truncated)) => (artifacts, truncated),
             Err(_) => return,
         };
         let mut plan = CleanupPlan {
@@ -1880,17 +1879,8 @@ impl Router {
             items: Vec::new(),
             truncated: false,
         };
+        plan.truncated |= retirement_truncated;
         for artifact in inventory {
-            if artifact.agent != agent.id
-                || artifact.generation != agent.generation
-                || artifact.state != "registered"
-                || !matches!(
-                    artifact.kind,
-                    ArtifactKind::Build | ArtifactKind::Temp | ArtifactKind::Worktree
-                )
-            {
-                continue;
-            }
             if plan.items.len() >= MAX_CLEANUP_ITEMS {
                 plan.truncated = true;
                 break;

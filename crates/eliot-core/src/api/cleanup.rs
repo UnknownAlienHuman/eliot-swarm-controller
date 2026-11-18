@@ -96,6 +96,11 @@ pub struct CleanupPlanRequest {
     /// Unix epoch milliseconds, exclusive creation cutoff.
     #[serde(default)]
     pub older_than: Option<i64>,
+    /// Stable page cursor: the greatest artifact id of the previous page.
+    /// Rows at or below the cursor are skipped before the page cap, so a
+    /// blocked-but-registered prefix cannot pin later rows forever.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 impl CleanupPlanRequest {
     pub fn validate(&self) -> Result<()> {
@@ -106,8 +111,15 @@ impl CleanupPlanRequest {
                     .as_ref()
                     .is_none_or(|p| p.is_empty() || p.len() > 4096))
             || (self.scope != CleanupScope::Project && self.project.is_some())
+            || self
+                .after
+                .as_deref()
+                .is_some_and(|after| cleanup_id(after).is_err())
         {
-            return Err(Error::new("invalid", "cleanup scope or cutoff is invalid"));
+            return Err(Error::new(
+                "invalid",
+                "cleanup scope, cutoff or cursor is invalid",
+            ));
         }
         Ok(())
     }

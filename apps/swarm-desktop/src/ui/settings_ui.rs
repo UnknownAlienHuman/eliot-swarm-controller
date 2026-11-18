@@ -688,6 +688,7 @@ impl DesktopApp {
                         scope: eliot_core::api::CleanupScope::All,
                         project: None,
                         older_than: None,
+                        after: None,
                     };
                     let result = client::block_on(async {
                         let plan: eliot_core::api::CleanupPlan =

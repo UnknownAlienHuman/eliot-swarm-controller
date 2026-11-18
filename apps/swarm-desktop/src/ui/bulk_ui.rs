@@ -412,6 +412,7 @@ fn plan_missing_project(
             scope: CleanupScope::Project,
             project: Some(project.to_owned()),
             older_than: None,
+            after: None,
         };
         let reply: CleanupPlan = client::block_on(eliot_daemon::client_call_typed(
             data_dir,

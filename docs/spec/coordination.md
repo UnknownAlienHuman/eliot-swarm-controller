@@ -28,9 +28,16 @@ directories are recorded only by the Agent that created them through
 Existing worktree and native-subject facts are also reconciled
 when planning, without scanning arbitrary filesystem roots.
 
-`cleanup.plan {scope:self_tree|project|all,project?,older_than?}` changes no
+`cleanup.plan {scope:self_tree|project|all,project?,older_than?,after?}` changes no
 filesystem objects. It retains a bounded snapshot with per-item size, reason and
 `safe`/`keep` verdict. The cutoff is an exclusive Unix-millisecond creation time.
+Only `registered` rows are candidates: settled rows (`removed`, `unknown`,
+`skipped(...)`) are attempt history read back from retained plans, and filtering
+them before the page cap keeps a settled prefix from starving later eligible
+rows. `after` is a stable page cursor (the greatest artifact id of the previous
+page); rows at or below it are skipped before the cap, so blocked-but-registered
+rows cannot pin later rows either. Automatic retirement filters the exact Agent,
+generation and kind before the same cap.
 Agents are restricted to their frozen and current subtree; Owner selects project
 or all. Terminal means Stopped or Failed with no open native source, pending
 command or retained non-exited owned process. Lost remains conservative.

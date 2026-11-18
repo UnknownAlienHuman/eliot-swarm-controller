@@ -220,6 +220,15 @@ impl Store {
         }
     }
 
+    /// Eligible cleanup candidates in stable id order. Only `registered`
+    /// rows paginate: settled rows (`removed`, `unknown`, `skipped(...)`)
+    /// are attempt history, not candidates, and their readback lives in the
+    /// retained plans. Filtering them before the page cap keeps a settled
+    /// prefix from starving later eligible rows. `after` pages past
+    /// registered rows that stay blocked: pass the greatest artifact id of
+    /// the previous page; rows at or below the cursor are skipped before
+    /// the cap. `truncated` is set only when an eligible row was actually
+    /// left out: a further page exists, or the ledger scan bound engaged.
     pub fn cleanup_inventory(
         &self,
         principal: &str,
@@ -238,17 +247,24 @@ impl Store {
         }
         let mut statement = self
             .connection
-            .prepare("SELECT body FROM artifacts ORDER BY id LIMIT 4096")
+            .prepare("SELECT body FROM artifacts ORDER BY id ASC LIMIT 4097")
             .map_err(sql_error)?;
         let bodies = statement
             .query_map([], |r| r.get::<_, String>(0))
             .map_err(sql_error)?;
+        let mut scanned = 0_usize;
         let mut items = Vec::new();
         let mut truncated = false;
         for body in bodies {
+            scanned += 1;
             let artifact: ArtifactView = serde_json::from_str(&body.map_err(sql_error)?)
                 .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
-            if artifact.state == "ownership_root" {
+            if artifact.state != "registered"
+                || request
+                    .after
+                    .as_deref()
+                    .is_some_and(|after| artifact.id.as_str() <= after)
+            {
                 continue;
             }
             if request
@@ -260,6 +276,44 @@ impl Store {
             {
                 continue;
             }
+            if items.len() == MAX_CLEANUP_ITEMS {
+                truncated = true;
+                break;
+            }
+            items.push(artifact);
+        }
+        if scanned > 4096 {
+            truncated = true;
+        }
+        Ok((items, truncated))
+    }
+
+    /// Retirement candidates for one exact Agent generation. The Agent,
+    /// generation, settled-state and kind filters all apply before the page
+    /// cap, so a retired Agent's own rows cannot be starved by the
+    /// project-wide prefix the way the shared inventory page could be.
+    /// Unknown attempt fences are untouched: this only selects rows.
+    pub fn cleanup_retirement_inventory(&self, agent: &Agent) -> Result<(Vec<ArtifactView>, bool)> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT body FROM artifacts WHERE agent = ?1 AND generation = ?2
+                 AND json_extract(body, '$.state') = 'registered'
+                 AND json_extract(body, '$.kind') IN ('build', 'temp', 'worktree')
+                 ORDER BY id ASC LIMIT 65",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![parse_agent_id(&agent.id)?, agent.generation],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(sql_error)?;
+        let mut items = Vec::with_capacity(MAX_CLEANUP_ITEMS);
+        let mut truncated = false;
+        for body in rows {
+            let artifact: ArtifactView = serde_json::from_str(&body.map_err(sql_error)?)
+                .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
             if items.len() == MAX_CLEANUP_ITEMS {
                 truncated = true;
                 break;
@@ -1777,11 +1831,171 @@ mod tests {
             scope: CleanupScope::All,
             project: None,
             older_than: None,
+            after: None,
         };
         let (items, truncated) = store.cleanup_inventory("owner", &request).unwrap();
         assert!(!truncated);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].identity, "tip");
         assert_eq!(items[0].state, "registered");
+    }
+
+    fn inventory_artifact(
+        id: &str,
+        agent: &str,
+        kind: ArtifactKind,
+        created_at: i64,
+    ) -> ArtifactView {
+        ArtifactView {
+            id: id.to_owned(),
+            agent: agent.to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: vec![format!("{agent}:1")],
+            path: format!("C:/artifacts/{id}"),
+            kind,
+            purpose: "test artifact".to_owned(),
+            identity: format!("identity-{id}"),
+            created_at,
+            state: "registered".to_owned(),
+            git: None,
+        }
+    }
+
+    fn settle_inventory_artifact(store: &Store, id: &str) {
+        store
+            .connection
+            .execute(
+                "UPDATE artifacts SET body = replace(body, '\"state\":\"registered\"', '\"state\":\"removed\"') WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+    }
+
+    fn inventory_agent(store: &mut Store, base_ms: u64) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','idle',1,?1,?1)",
+                [base_ms as i64],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn settled_rows_do_not_starve_eligible_candidates() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let base = u64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        inventory_agent(&mut store, base);
+        for i in 0..MAX_CLEANUP_ITEMS {
+            let id = Ulid::from_parts(base + i as u64, 0).to_string();
+            store
+                .record_known_artifact(inventory_artifact(
+                    &id,
+                    "a1",
+                    ArtifactKind::Build,
+                    base as i64 + i as i64,
+                ))
+                .unwrap();
+            settle_inventory_artifact(&store, &id);
+        }
+        let live = Ulid::from_parts(base + MAX_CLEANUP_ITEMS as u64, 0).to_string();
+        store
+            .record_known_artifact(inventory_artifact(
+                &live,
+                "a1",
+                ArtifactKind::Build,
+                base as i64 + MAX_CLEANUP_ITEMS as i64,
+            ))
+            .unwrap();
+        let request = CleanupPlanRequest {
+            scope: CleanupScope::All,
+            project: None,
+            older_than: None,
+            after: None,
+        };
+        let (items, truncated) = store.cleanup_inventory("owner", &request).unwrap();
+        assert!(!truncated);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, live);
+        assert_eq!(items[0].state, "registered");
+    }
+
+    #[test]
+    fn inventory_pages_past_blocked_rows_with_after() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let base = u64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        inventory_agent(&mut store, base);
+        let mut ids = Vec::new();
+        for i in 0..=MAX_CLEANUP_ITEMS {
+            let id = Ulid::from_parts(base + i as u64, 0).to_string();
+            store
+                .record_known_artifact(inventory_artifact(
+                    &id,
+                    "a1",
+                    ArtifactKind::Build,
+                    base as i64 + i as i64,
+                ))
+                .unwrap();
+            ids.push(id);
+        }
+        let first = CleanupPlanRequest {
+            scope: CleanupScope::All,
+            project: None,
+            older_than: None,
+            after: None,
+        };
+        let (page, truncated) = store.cleanup_inventory("owner", &first).unwrap();
+        assert!(truncated);
+        assert_eq!(page.len(), MAX_CLEANUP_ITEMS);
+        assert_eq!(page[MAX_CLEANUP_ITEMS - 1].id, ids[MAX_CLEANUP_ITEMS - 1]);
+        let second = CleanupPlanRequest {
+            scope: CleanupScope::All,
+            project: None,
+            older_than: None,
+            after: Some(page[MAX_CLEANUP_ITEMS - 1].id.clone()),
+        };
+        let (rest, truncated) = store.cleanup_inventory("owner", &second).unwrap();
+        assert!(!truncated);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, ids[MAX_CLEANUP_ITEMS]);
+    }
+
+    #[test]
+    fn retirement_inventory_is_scoped_before_the_cap() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let base = u64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        inventory_agent(&mut store, base);
+        inventory_agent(&mut store, base);
+        for i in 0..70 {
+            let id = Ulid::from_parts(base + i as u64, 0).to_string();
+            store
+                .record_known_artifact(inventory_artifact(
+                    &id,
+                    "a1",
+                    ArtifactKind::Build,
+                    base as i64 + i as i64,
+                ))
+                .unwrap();
+        }
+        let other = Ulid::from_parts(base + 70, 0).to_string();
+        store
+            .record_known_artifact(inventory_artifact(
+                &other,
+                "a2",
+                ArtifactKind::Build,
+                base as i64 + 70,
+            ))
+            .unwrap();
+        let one = store.get_agent("a1").unwrap().unwrap();
+        let (items, truncated) = store.cleanup_retirement_inventory(&one).unwrap();
+        assert!(truncated);
+        assert_eq!(items.len(), MAX_CLEANUP_ITEMS);
+        assert!(items.iter().all(|item| item.agent == "a1"));
+        let two = store.get_agent("a2").unwrap().unwrap();
+        let (items, truncated) = store.cleanup_retirement_inventory(&two).unwrap();
+        assert!(!truncated);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, other);
     }
 }
