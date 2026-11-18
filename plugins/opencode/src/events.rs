@@ -1864,7 +1864,9 @@ impl EventProcessor {
     /// Terminal readback: page the newest-first message list (bounded) and
     /// find our user message plus the newest `idle` message after it. Final
     /// text is the concatenated assistant text parts strictly between the
-    /// two in newest-first page order, in ascending time order. Usage is the
+    /// two in newest-first page order, reversed to chronological order
+    /// with each message's native `content` array order preserved (page
+    /// position decides; timestamps never reorder it). Usage is the
     /// final assistant message's native token usage in that same exact
     /// user-to-selected-idle slice, attributed at message scope. Anything
     /// else (missing user message, missing idle, contradictory outcome) is
@@ -2607,28 +2609,26 @@ struct TerminalReadback {
 /// `(newest-first message position, intra-message content index, created,
 /// body)`. Positions are newest-first page order strictly between the
 /// selected idle and our input; the projection returns chronological text
-/// with each message's native `content` array order preserved. The part
-/// index joins the sort key because parts of one message share `created`,
-/// which previously made the text body the tiebreaker and reordered the
-/// response alphabetically.
+/// by reversing that page order while preserving each message's native
+/// `content` array order. Page position alone decides message order:
+/// `created` never outranks it, because timestamps can disagree with the
+/// native sequence across pages. The part index orders parts within one
+/// message (parts of one message share `created`, which previously made
+/// the text body the tiebreaker and reordered the response
+/// alphabetically).
 fn project_terminal_text(
     texts: Vec<(usize, usize, i64, String)>,
     idle_position: usize,
     user_position: usize,
 ) -> Option<String> {
-    let mut selected: Vec<(i64, usize, usize, String)> = texts
+    let mut selected: Vec<(usize, usize, String)> = texts
         .into_iter()
         .filter(|(position, _, _, _)| *position > idle_position && *position < user_position)
-        .map(|(position, part, created, body)| (created, position, part, body))
+        .map(|(position, part, _, body)| (position, part, body))
         .collect();
-    selected.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then(right.1.cmp(&left.1))
-            .then(left.2.cmp(&right.2))
-    });
+    selected.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
     let mut final_text = String::new();
-    for (_, _, _, body) in selected {
+    for (_, _, body) in selected {
         if !final_text.is_empty() {
             final_text.push('\n');
         }
@@ -2987,7 +2987,8 @@ mod tests {
             super::project_terminal_text(texts, 0, 3).as_deref(),
             Some("older\nnewer")
         );
-        // Distinct timestamps stay chronological regardless of page order.
+        // Page position decides across messages: the larger newest-first
+        // position is the earlier message, in timestamp order here.
         let texts = vec![
             (1, 0, 9, "second".to_owned()),
             (2, 0, 7, "first".to_owned()),
@@ -2995,6 +2996,16 @@ mod tests {
         assert_eq!(
             super::project_terminal_text(texts, 0, 3).as_deref(),
             Some("first\nsecond")
+        );
+        // Page position wins even when timestamps disagree with the native
+        // sequence: the earlier message carries the newer timestamp.
+        let texts = vec![
+            (1, 0, 7, "later".to_owned()),
+            (2, 0, 9, "earlier".to_owned()),
+        ];
+        assert_eq!(
+            super::project_terminal_text(texts, 0, 3).as_deref(),
+            Some("earlier\nlater")
         );
         // Slice bounds and emptiness project to no text.
         assert_eq!(super::project_terminal_text(Vec::new(), 0, 2), None);
