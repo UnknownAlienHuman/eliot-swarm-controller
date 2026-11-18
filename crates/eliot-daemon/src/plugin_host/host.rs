@@ -1510,7 +1510,7 @@ async fn run_agent(
     let mut failure = None;
     run_agent_inner(
         actor,
-        child,
+        Some(child),
         client,
         event_task,
         messages,

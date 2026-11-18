@@ -59,18 +59,30 @@ async fn spontaneous_root_wait(
 
 pub(super) async fn run_agent_inner(
     actor: AgentActorConfig,
-    child: OwnedChild,
+    mut child: Option<OwnedChild>,
     client: PluginClient,
-    event_task: tokio::task::JoinHandle<()>,
-    messages: mpsc::Receiver<RuntimeMessage>,
+    mut event_task: tokio::task::JoinHandle<()>,
+    mut messages: mpsc::Receiver<RuntimeMessage>,
     started: oneshot::Sender<Result<Value>>,
     pending_failure: &mut Option<PendingFailure>,
 ) {
-    let Some((child, event_task)) =
-        run_agent_startup(&actor, &client, child, event_task, started, pending_failure).await
-    else {
+    // Drop order is load-bearing: every handle stays owned by this frame and
+    // the phase helpers only borrow it. Locals drop in reverse declaration
+    // order, so a surviving child drops after the command receiver, event
+    // task, monitor and client, exactly as before the split. The child is
+    // taken only where the inline code moved or dropped it.
+    if !run_agent_startup(
+        &actor,
+        &client,
+        &mut child,
+        &mut event_task,
+        started,
+        pending_failure,
+    )
+    .await
+    {
         return;
-    };
+    }
     let AgentActorConfig {
         state,
         monitoring,
@@ -82,89 +94,76 @@ pub(super) async fn run_agent_inner(
         stderr,
         ..
     } = actor;
-    let dispatch = AgentDispatch {
-        state,
-        monitoring,
-        key,
-        agent,
-        start_command,
-        plugin_credential,
-        source_credentials,
-        stderr,
-        child: Some(child),
-        event_task,
-        client,
-        messages,
+    let mut last_command_id = start_command.id.clone();
+    let mut pending_steers: FuturesUnordered<PendingSteerFuture> = FuturesUnordered::new();
+    let mut pending_snapshots: FuturesUnordered<PendingSnapshotFuture> = FuturesUnordered::new();
+    let planned_exit = drive_agent_dispatch(AgentDispatch {
+        state: &state,
+        monitoring: &monitoring,
+        key: &key,
+        agent: &agent,
+        source_credentials: &source_credentials,
+        stderr: &stderr,
+        client: &client,
+        child: &mut child,
+        event_task: &mut event_task,
+        messages: &mut messages,
+        pending_steers: &mut pending_steers,
+        pending_snapshots: &mut pending_snapshots,
         pending_failure,
-    };
-    let (settlement, remainder) = drive_agent_dispatch(dispatch).await;
-    settle_agent_actor(settlement).await;
-    // Remainder drops here: a surviving child still owns family termination
-    // after settlement, matching the previous inline drop order.
-    let _remainder = remainder;
+        last_command_id: &mut last_command_id,
+    })
+    .await;
+    settle_agent_actor(
+        &state,
+        &key,
+        &plugin_credential,
+        planned_exit,
+        &mut pending_steers,
+        pending_snapshots,
+        &client,
+        &agent,
+        &stderr,
+        &source_credentials,
+        pending_failure,
+    )
+    .await;
 }
 
-/// Live dispatch inputs owned by the typed process/source/control message
-/// loop. The startup handshake produces the child and event task; the loop
-/// owns every handle until settlement, and the remainder keeps the survivors
-/// alive past it so family termination timing never moves.
+/// Borrowed dispatch-loop handles. Every handle stays owned by
+/// `run_agent_inner` so the drop order there never moves; the loop only
+/// borrows, and takes `child` exactly where the inline code dropped it.
 struct AgentDispatch<'a> {
-    state: Weak<super::HostState>,
-    monitoring: super::Monitoring,
-    key: super::AgentKey,
-    agent: super::Agent,
-    start_command: super::Command,
-    plugin_credential: String,
-    source_credentials: Arc<[String]>,
-    stderr: super::StderrView,
-    child: Option<OwnedChild>,
-    event_task: tokio::task::JoinHandle<()>,
-    client: PluginClient,
-    messages: mpsc::Receiver<RuntimeMessage>,
+    state: &'a Weak<super::HostState>,
+    monitoring: &'a super::Monitoring,
+    key: &'a super::AgentKey,
+    agent: &'a super::Agent,
+    source_credentials: &'a Arc<[String]>,
+    stderr: &'a super::StderrView,
+    client: &'a PluginClient,
+    child: &'a mut Option<OwnedChild>,
+    event_task: &'a mut tokio::task::JoinHandle<()>,
+    messages: &'a mut mpsc::Receiver<RuntimeMessage>,
+    pending_steers: &'a mut FuturesUnordered<PendingSteerFuture>,
+    pending_snapshots: &'a mut FuturesUnordered<PendingSnapshotFuture>,
     pending_failure: &'a mut Option<PendingFailure>,
-}
-
-/// Ordered teardown facts handed from the dispatch loop to final settlement:
-/// the loop has exited, pending snapshots drop first, then the actor is
-/// cleaned up and retained steer responses are drained.
-struct AgentSettlement<'a> {
-    state: Weak<super::HostState>,
-    key: super::AgentKey,
-    plugin_credential: String,
-    planned_exit: bool,
-    pending_steers: FuturesUnordered<PendingSteerFuture>,
-    pending_snapshots: FuturesUnordered<PendingSnapshotFuture>,
-    client: PluginClient,
-    agent: super::Agent,
-    stderr: super::StderrView,
-    source_credentials: Arc<[String]>,
-    pending_failure: &'a mut Option<PendingFailure>,
-}
-
-/// Loop handles that stay alive past settlement and drop with
-/// `run_agent_inner`, preserving the previous inline drop order. A surviving
-/// child still owns family termination at that point.
-/// Held only for post-settlement drop timing; never polled.
-#[allow(dead_code)]
-struct AgentRemainder {
-    child: Option<OwnedChild>,
-    event_task: tokio::task::JoinHandle<()>,
-    messages: mpsc::Receiver<RuntimeMessage>,
-    monitoring: super::Monitoring,
+    last_command_id: &'a mut String,
 }
 
 /// Start sequencing: initialize the native source, resolve resume overlays,
-/// and run the `agent.start` handshake. Success hands the live child and
-/// event task to the dispatch loop; every failure path answers `started` and
-/// cleans up exactly as before, returning `None`.
+/// and run the `agent.start` handshake. Every handle is borrowed: the child
+/// is taken only where the inline code moved it into cleanup, so a cancelled
+/// startup drops the handles in the actor frame's original order. Success
+/// leaves the live child and event task in place; every failure path answers
+/// `started` and cleans up exactly as before, returning `false`.
 async fn run_agent_startup(
     actor: &AgentActorConfig,
     client: &PluginClient,
-    mut child: OwnedChild,
-    mut event_task: tokio::task::JoinHandle<()>,
+    child: &mut Option<OwnedChild>,
+    event_task: &mut tokio::task::JoinHandle<()>,
     started: oneshot::Sender<Result<Value>>,
     pending_failure: &mut Option<PendingFailure>,
-) -> Option<(OwnedChild, tokio::task::JoinHandle<()>)> {
+) -> bool {
     let initialize_started = Instant::now();
     let source_plan = match initialize_agent(actor, client).await {
         Ok(source_plan) => source_plan,
@@ -173,13 +172,15 @@ async fn run_agent_startup(
             let _ = started.send(Err(error));
             cleanup_startup(
                 actor,
-                child,
-                &mut event_task,
+                child
+                    .take()
+                    .expect("actor owns the starting child until cleanup"),
+                &mut *event_task,
                 pending_failure,
                 proven_no_dispatch,
             )
             .await;
-            return None;
+            return false;
         }
     };
     let initialized_at = Instant::now();
@@ -191,8 +192,17 @@ async fn run_agent_startup(
         Ok(resume_config) => resume_config,
         Err(error) => {
             let _ = started.send(Err(error));
-            cleanup_startup(actor, child, &mut event_task, pending_failure, true).await;
-            return None;
+            cleanup_startup(
+                actor,
+                child
+                    .take()
+                    .expect("actor owns the starting child until cleanup"),
+                &mut *event_task,
+                pending_failure,
+                true,
+            )
+            .await;
+            return false;
         }
     };
     let (model_override, effort_override, config_revision) = match resume_config {
@@ -263,10 +273,18 @@ async fn run_agent_startup(
                 // generation's processes exit and the owned-exit proof path
                 // releases the capacity reservation, then deliver the
                 // authoritative Failed outcome. No re-dispatch.
-                retire_failed_start(client, &mut child, &mut event_task, actor, pending_failure)
-                    .await;
+                retire_failed_start(
+                    client,
+                    child
+                        .as_mut()
+                        .expect("actor owns the starting child until retire"),
+                    &mut *event_task,
+                    actor,
+                    pending_failure,
+                )
+                .await;
                 let _ = started.send(Ok(value));
-                return None;
+                return false;
             }
             let _ = started.send(Ok(value));
         }
@@ -291,64 +309,65 @@ async fn run_agent_startup(
             if !uncertain || native_endpoint_exited {
                 cleanup_startup(
                     actor,
-                    child,
-                    &mut event_task,
+                    child
+                        .take()
+                        .expect("actor owns the starting child until cleanup"),
+                    &mut *event_task,
                     pending_failure,
                     proven_no_dispatch,
                 )
                 .await;
-                return None;
+                return false;
             }
         }
     }
-    Some((child, event_task))
+    true
 }
 
 /// Typed process/source/control message handling: supervise the plugin child,
 /// source stream, and queued commands, stops, snapshots, and daemon force
-/// until the loop exits, then hand settlement facts and surviving handles out
-/// in loop order.
-async fn drive_agent_dispatch(
-    mut dispatch: AgentDispatch<'_>,
-) -> (AgentSettlement<'_>, AgentRemainder) {
+/// until the loop exits, then report whether the exit was planned. Every
+/// handle is borrowed from the actor frame; `child` is taken only where the
+/// inline code dropped it.
+async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
     let AgentDispatch {
         state,
+        monitoring,
         key,
         agent,
-        plugin_credential,
         source_credentials,
         stderr,
         client,
-        mut event_task,
-        mut messages,
+        child: child_slot,
+        event_task,
+        messages,
+        pending_steers,
+        pending_snapshots,
         pending_failure,
-        ..
+        last_command_id,
     } = dispatch;
-    let mut last_command_id = dispatch.start_command.id.clone();
     let mut planned_exit = false;
-    let mut pending_steers: FuturesUnordered<PendingSteerFuture> = FuturesUnordered::new();
-    let mut pending_snapshots: FuturesUnordered<PendingSnapshotFuture> = FuturesUnordered::new();
     // while_let_loop does not apply: the child borrow must end before
     // take() on break paths, which a while-let condition cannot express.
     #[allow(clippy::while_let_loop)]
     loop {
-        let Some(child) = dispatch.child.as_mut() else {
+        let Some(child) = child_slot.as_mut() else {
             // take() below only runs on break paths; the loop never re-enters
             // without a child.
             break;
         };
         tokio::select! {
-            root_exit = spontaneous_root_wait(&mut child, &monitoring, &agent) => {
+            root_exit = spontaneous_root_wait(child, monitoring, agent) => {
                 // The exit observation alone won the select. Fence routing
                 // before the bounded cleanup so no racing dispatch enters.
                 #[cfg(target_os = "linux")]
                 if let Some(state) = state.upgrade() {
-                    fence_command_routing(&state, &key);
+                    fence_command_routing(&state, key);
                 }
                 #[cfg(target_os = "linux")]
                 let (status, _group_drained) = {
                     let observed = root_exit;
-                    let _ = monitoring.sample_generation(&agent).await;
+                    let _ = monitoring.sample_generation(agent).await;
                     // A failed observation proves nothing about the group:
                     // still terminate and drain before reaping so surviving
                     // descendants get a signal, then report unknown via the
@@ -361,7 +380,7 @@ async fn drive_agent_dispatch(
                         super::linux_drain_owned_group(&mut child, STOP_GRACE).await
                     };
                     if group_drained {
-                        let _ = monitoring.sample_generation(&agent).await;
+                        let _ = monitoring.sample_generation(agent).await;
                     }
                     // Reap only after the bounded cleanup: the numeric PGID
                     // cannot be reused between the final observation and this
@@ -385,15 +404,15 @@ async fn drive_agent_dispatch(
                 );
                 let stderr_tail = stderr.snapshot().text;
                 if let Some(state) = state.upgrade() {
-                    fence_command_routing(&state, &key);
+                    fence_command_routing(&state, key);
                 }
                 if status.is_ok() {
-                    let _ = dispatch.monitoring.sample_generation(&agent).await;
+                    let _ = monitoring.sample_generation(agent).await;
                 }
                 // Keep source authorization intact throughout the bounded drain.
                 let (gap_reason, drained) = match timeout_at(
                     Instant::now() + STOP_GRACE,
-                    &mut event_task,
+                    &mut *event_task,
                 ).await {
                     Ok(Ok(())) => ("root_exit_without_session_terminal", true),
                     Ok(Err(_)) => ("root_exit_source_failed", true),
@@ -401,7 +420,7 @@ async fn drive_agent_dispatch(
                         event_task.abort();
                         let drained = timeout_at(
                             Instant::now() + RPC_GRACE,
-                            &mut event_task,
+                            &mut *event_task,
                         ).await.is_ok();
                         ("root_exit_drain_timeout", drained)
                     }
@@ -422,15 +441,15 @@ async fn drive_agent_dispatch(
                 #[cfg(target_os = "linux")]
                 let control_gone = status.is_ok() && _group_drained;
                 if control_gone {
-                    let _ = dispatch.monitoring.sample_generation(&agent).await;
+                    let _ = monitoring.sample_generation(agent).await;
                 }
                 let source_settled = settle_drained_source_exit(
-                    &state, &key, drained, control_gone, gap_reason,
+                    state, key, drained, control_gone, gap_reason,
                 ).await.is_ok();
                 if source_settled && control_gone && !planned_exit {
                     mark_lost_state_with_exit(
-                        &state,
-                        &key,
+                        state,
+                        key,
                         Some(exit),
                         Some(stderr_tail),
                     )
@@ -438,9 +457,9 @@ async fn drive_agent_dispatch(
                 }
                 break;
             }
-            event_result = &mut event_task => {
+            event_result = &mut *event_task => {
                 if let Some(state) = state.upgrade() {
-                    fence_command_routing(&state, &key);
+                    fence_command_routing(&state, key);
                 }
                 let gap_reason = if event_result.is_ok() {
                     "stream_eof_without_session_terminal"
@@ -448,12 +467,12 @@ async fn drive_agent_dispatch(
                     "stream_task_failed"
                 };
                 let control_gone = child.terminate().is_ok()
-                    && wait_child(&mut *child, STOP_GRACE, &dispatch.monitoring, &agent).await;
+                    && wait_child(&mut *child, STOP_GRACE, monitoring, agent).await;
                 let source_settled = settle_drained_source_exit(
-                    &state, &key, true, control_gone, gap_reason,
+                    state, key, true, control_gone, gap_reason,
                 ).await.is_ok();
                 if source_settled && control_gone {
-                    mark_lost_state(&state, &key).await;
+                    mark_lost_state(state, key).await;
                 }
                 planned_exit = true;
                 break;
@@ -466,7 +485,7 @@ async fn drive_agent_dispatch(
                             &completion.agent_id,
                             completion.generation,
                             &completion.command_id,
-                            &source_credentials,
+                            source_credentials,
                         );
                     }
                     let _ = completion.reply.send(completion.result);
@@ -476,9 +495,9 @@ async fn drive_agent_dispatch(
                 if let Some(completion) = completion {
                     complete_plugin_command(
                         completion,
-                        &agent,
-                        &stderr,
-                        &source_credentials,
+                        agent,
+                        stderr,
+                        source_credentials,
                         pending_failure,
                         client.reader_closed(),
                     );
@@ -487,12 +506,12 @@ async fn drive_agent_dispatch(
             message = messages.recv() => {
                 let Some(message) = message else {
                     let exited = child.terminate().is_ok()
-                        && wait_child(&mut *child, STOP_GRACE, &dispatch.monitoring, &agent).await;
+                        && wait_child(&mut *child, STOP_GRACE, monitoring, agent).await;
                     if settle_owned_source_exit(
-                        &state, &key, Some(&mut event_task), exited,
+                        state, key, Some(&mut *event_task), exited,
                         "plugin_owner_closed_without_session_terminal",
                     ).await.is_ok() {
-                        mark_lost_state(&state, &key).await;
+                        mark_lost_state(state, key).await;
                     }
                     break;
                 };
@@ -502,8 +521,8 @@ async fn drive_agent_dispatch(
                         dispatch_seq,
                         reply,
                     } => {
-                        last_command_id = command.id.clone();
-                        let config = match resolve_send_config(&state, &command).await {
+                        *last_command_id = command.id.clone();
+                        let config = match resolve_send_config(state, &command).await {
                             Ok(config) => config,
                             Err(error) => {
                                 complete_plugin_command(
@@ -512,25 +531,25 @@ async fn drive_agent_dispatch(
                                         reply,
                                         result: Err(error),
                                     },
-                                    &agent,
-                                    &stderr,
-                                    &source_credentials,
+                                    agent,
+                                    stderr,
+                                    source_credentials,
                                     pending_failure,
                                     client.reader_closed(),
                                 );
                                 continue;
                             }
                         };
-                        match agent_command_params(&agent, &command, dispatch_seq, config.as_ref()) {
+                        match agent_command_params(agent, &command, dispatch_seq, config.as_ref()) {
                             Err(error) => complete_plugin_command(
                                 PluginCommandCompletion {
                                     command,
                                     reply,
                                     result: Err(error),
                                 },
-                                &agent,
-                                &stderr,
-                                &source_credentials,
+                                agent,
+                                stderr,
+                                source_credentials,
                                 pending_failure,
                                 client.reader_closed(),
                             ),
@@ -547,9 +566,9 @@ async fn drive_agent_dispatch(
                                                 "plugin has reached its bounded in-flight request limit",
                                             )),
                                         },
-                                        &agent,
-                                        &stderr,
-                                        &source_credentials,
+                                        agent,
+                                        stderr,
+                                        source_credentials,
                                         pending_failure,
                                         client.reader_closed(),
                                     );
@@ -571,9 +590,9 @@ async fn drive_agent_dispatch(
                                                 reply,
                                                 result: Err(error),
                                             },
-                                            &agent,
-                                            &stderr,
-                                            &source_credentials,
+                                            agent,
+                                            stderr,
+                                            source_credentials,
                                             pending_failure,
                                             client.reader_closed(),
                                         ),
@@ -588,9 +607,9 @@ async fn drive_agent_dispatch(
                                         reply,
                                         result,
                                     },
-                                    &agent,
-                                    &stderr,
-                                    &source_credentials,
+                                    agent,
+                                    stderr,
+                                    source_credentials,
                                     pending_failure,
                                     client.reader_closed(),
                                 );
@@ -608,7 +627,7 @@ async fn drive_agent_dispatch(
                                 client.clone(),
                                 turn_id,
                                 stderr.clone(),
-                                Arc::clone(&source_credentials),
+                                Arc::clone(source_credentials),
                                 PluginSnapshotCompletion {
                                     agent_id,
                                     generation,
@@ -629,7 +648,7 @@ async fn drive_agent_dispatch(
                             "force": force,
                             "turn_id": turn_id,
                         });
-                        let stop_call = match prepare_queued_stop_call(&client, params, deadlines) {
+                        let stop_call = match prepare_queued_stop_call(client, params, deadlines) {
                             Ok(call) => call,
                             Err(error) => {
                                 let _ = reply.send(Err(error));
@@ -637,30 +656,30 @@ async fn drive_agent_dispatch(
                             }
                         };
                         let snapshot_command_id = last_command_id.clone();
-                        last_command_id = command.id.clone();
+                        *last_command_id = command.id.clone();
                         let cooperative = stop_call
                             .await
-                            .map_err(|error| redact_native_error(error, &source_credentials))
+                            .map_err(|error| redact_native_error(error, source_credentials))
                             .and_then(validate_applied);
                         match cooperative {
                             Ok(result) => {
                                 let guarantee = child.guarantee();
                                 let (graceful, exited) = shutdown_and_wait_child(
-                                    &client,
+                                    client,
                                     &mut *child,
-                                    &dispatch.monitoring,
-                                    &agent,
+                                    monitoring,
+                                    agent,
                                     deadlines,
                                 )
                                 .await;
                                 if !exited {
-                                    drop(dispatch.child.take());
+                                    drop(child_slot.take());
                                     let _ = settle_owned_source_exit(
-                                        &state, &key, Some(&mut event_task), false,
+                                        state, key, Some(&mut *event_task), false,
                                         "stop_exit_without_session_terminal",
                                     ).await;
                                     if let Some(state) = state.upgrade() {
-                                        fence_runtime_generation(&state, &key);
+                                        fence_runtime_generation(&state, key);
                                     }
                                     planned_exit = true;
                                     let _ = reply.send(Err(Error::new(
@@ -670,11 +689,11 @@ async fn drive_agent_dispatch(
                                     break;
                                 }
                                 let source_exit = settle_owned_source_exit(
-                                    &state, &key, Some(&mut event_task), true,
+                                    state, key, Some(&mut *event_task), true,
                                     "stop_exit_without_session_terminal",
                                 ).await;
                                 if let Some(state) = state.upgrade() {
-                                    fence_runtime_generation(&state, &key);
+                                    fence_runtime_generation(&state, key);
                                 }
                                 planned_exit = true;
                                 if let Err(error) = source_exit {
@@ -706,15 +725,15 @@ async fn drive_agent_dispatch(
                                 ).await.ok() } else { None };
                                 let guarantee = child.guarantee();
                                 let terminated = child.terminate().is_ok();
-                                let exited = wait_stop_child(&mut *child, &dispatch.monitoring, &agent, deadlines.custody_until).await;
+                                let exited = wait_stop_child(&mut *child, monitoring, agent, deadlines.custody_until).await;
                                 if !terminated || !exited {
-                                    drop(dispatch.child.take());
+                                    drop(child_slot.take());
                                     let _ = settle_owned_source_exit(
-                                        &state, &key, Some(&mut event_task), false,
+                                        state, key, Some(&mut *event_task), false,
                                         "force_stop_exit_without_session_terminal",
                                     ).await;
                                     if let Some(state) = state.upgrade() {
-                                        fence_runtime_generation(&state, &key);
+                                        fence_runtime_generation(&state, key);
                                     }
                                     planned_exit = true;
                                     let _ = reply.send(Err(Error::new(
@@ -727,11 +746,11 @@ async fn drive_agent_dispatch(
                                     break;
                                 }
                                 let source_exit = settle_owned_source_exit(
-                                    &state, &key, Some(&mut event_task), true,
+                                    state, key, Some(&mut *event_task), true,
                                     "force_stop_exit_without_session_terminal",
                                 ).await;
                                 if let Some(state) = state.upgrade() {
-                                    fence_runtime_generation(&state, &key);
+                                    fence_runtime_generation(&state, key);
                                 }
                                 planned_exit = true;
                                 if let Err(error) = source_exit {
@@ -767,7 +786,7 @@ async fn drive_agent_dispatch(
                                     ).await;
                                 }
                                 if error.code == "unknown"
-                                    && has_committed_session_ended(&state, &key, deadlines.custody_until).await
+                                    && has_committed_session_ended(state, key, deadlines.custody_until).await
                                 {
                                     // Durable logical End is committed but the stop RPC
                                     // outcome is unknown. Run the Applied physical
@@ -776,32 +795,32 @@ async fn drive_agent_dispatch(
                                     // ack uncertainty is separate from physical closure
                                     // and no Applied is invented.
                                     let (_, exited) = shutdown_and_wait_child(
-                                        &client,
+                                        client,
                                         &mut *child,
-                                        &dispatch.monitoring,
-                                        &agent,
+                                        monitoring,
+                                        agent,
                                         deadlines,
                                     )
                                     .await;
                                     if !exited {
-                                        drop(dispatch.child.take());
+                                        drop(child_slot.take());
                                         let _ = settle_owned_source_exit(
-                                            &state, &key, Some(&mut event_task), false,
+                                            state, key, Some(&mut *event_task), false,
                                             "unknown_stop_exit_with_session_terminal",
                                         ).await;
                                         if let Some(state) = state.upgrade() {
-                                            fence_runtime_generation(&state, &key);
+                                            fence_runtime_generation(&state, key);
                                         }
                                         planned_exit = true;
                                         let _ = reply.send(Err(error));
                                         break;
                                     }
                                     let _ = settle_owned_source_exit(
-                                        &state, &key, Some(&mut event_task), true,
+                                        state, key, Some(&mut *event_task), true,
                                         "unknown_stop_exit_with_session_terminal",
                                     ).await;
                                     if let Some(state) = state.upgrade() {
-                                        fence_runtime_generation(&state, &key);
+                                        fence_runtime_generation(&state, key);
                                     }
                                     planned_exit = true;
                                     let _ = reply.send(Err(error));
@@ -814,15 +833,15 @@ async fn drive_agent_dispatch(
                     RuntimeMessage::DaemonForce { reply } => {
                         let guarantee = child.guarantee();
                         let terminated = child.terminate().is_ok();
-                        let exited = wait_child(&mut *child, STOP_GRACE, &dispatch.monitoring, &agent).await;
+                        let exited = wait_child(&mut *child, STOP_GRACE, monitoring, agent).await;
                         if !terminated || !exited {
-                            drop(dispatch.child.take());
+                            drop(child_slot.take());
                             let _ = settle_owned_source_exit(
-                                &state, &key, Some(&mut event_task), false,
+                                state, key, Some(&mut *event_task), false,
                                 "daemon_force_exit_without_session_terminal",
                             ).await;
                             if let Some(state) = state.upgrade() {
-                                fence_runtime_generation(&state, &key);
+                                fence_runtime_generation(&state, key);
                             }
                             planned_exit = true;
                             let _ = reply.send(Err(Error::new(
@@ -835,18 +854,18 @@ async fn drive_agent_dispatch(
                             break;
                         }
                         let source_exit = settle_owned_source_exit(
-                            &state, &key, Some(&mut event_task), true,
+                            state, key, Some(&mut *event_task), true,
                             "daemon_force_exit_without_session_terminal",
                         ).await;
                         if let Err(error) = source_exit {
                             if let Some(state) = state.upgrade() {
-                                fence_runtime_generation(&state, &key);
+                                fence_runtime_generation(&state, key);
                             }
                             planned_exit = true;
                             let _ = reply.send(Err(error));
                             break;
                         }
-                        mark_lost_state(&state, &key).await;
+                        mark_lost_state(state, key).await;
                         planned_exit = true;
                         let _ = reply.send(Ok(()));
                         break;
@@ -855,49 +874,31 @@ async fn drive_agent_dispatch(
             }
         }
     }
-    let settlement = AgentSettlement {
-        state,
-        key,
-        plugin_credential,
-        planned_exit,
-        pending_steers,
-        pending_snapshots,
-        client,
-        agent,
-        stderr,
-        source_credentials,
-        pending_failure,
-    };
-    let remainder = AgentRemainder {
-        child: dispatch.child,
-        event_task,
-        messages,
-        monitoring: dispatch.monitoring,
-    };
-    (settlement, remainder)
+    planned_exit
 }
 
 /// Final family settlement: drop pending snapshot reads, clean up the actor,
-/// then drain retained steer responses within bounded waits. Runs before the
-/// surviving child is released by the remainder.
-async fn settle_agent_actor(settlement: AgentSettlement<'_>) {
-    let AgentSettlement {
-        state,
-        key,
-        plugin_credential,
-        planned_exit,
-        mut pending_steers,
-        pending_snapshots,
-        client,
-        agent,
-        stderr,
-        source_credentials,
-        pending_failure,
-    } = settlement;
+/// then drain retained steer responses within bounded waits. Every handle is
+/// borrowed from the actor frame, so the drop order there never moves; the
+/// snapshot set moves in only to be dropped first, exactly as before.
+#[allow(clippy::too_many_arguments)]
+async fn settle_agent_actor(
+    state: &Weak<super::HostState>,
+    key: &super::AgentKey,
+    plugin_credential: &str,
+    planned_exit: bool,
+    pending_steers: &mut FuturesUnordered<PendingSteerFuture>,
+    pending_snapshots: FuturesUnordered<PendingSnapshotFuture>,
+    client: &PluginClient,
+    agent: &super::Agent,
+    stderr: &super::StderrView,
+    source_credentials: &Arc<[String]>,
+    pending_failure: &mut Option<PendingFailure>,
+) {
     // These read-only futures are actor-owned. Dropping them cancels every
     // pending snapshot RPC before actor cleanup; they cannot outlive the child.
     drop(pending_snapshots);
-    cleanup_actor(&state, &key, &plugin_credential, planned_exit).await;
+    cleanup_actor(state, key, plugin_credential, planned_exit).await;
     if !pending_steers.is_empty() {
         // Stop/force/source custody above owns teardown. Only then wait for the
         // transport to close and settle the retained correlated responses.
@@ -912,9 +913,9 @@ async fn settle_agent_actor(settlement: AgentSettlement<'_>) {
             };
             complete_plugin_command(
                 completion,
-                &agent,
-                &stderr,
-                &source_credentials,
+                agent,
+                stderr,
+                source_credentials,
                 pending_failure,
                 client.reader_closed(),
             );

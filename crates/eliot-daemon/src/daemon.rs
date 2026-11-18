@@ -137,30 +137,33 @@ struct DaemonRuntime {
 }
 
 /// Live workers and channels owned by the supervision loop and released by the
-/// shutdown drain. Task sets abort when this drops after the drain, matching
-/// the previous inline drop at the end of `run_owned`.
+/// shutdown drain. Fields are declared in the previous inline reverse
+/// declaration order, because struct fields drop in declaration order: the
+/// capacity recheck aborts before the IPC listener closes, and every
+/// shutdown sender drops after its task set, exactly as before the split.
 struct DaemonSupervision {
-    router: Router,
-    policy: Arc<SecretPolicy>,
-    listener: IpcListener,
-    monitor_stop: watch::Sender<bool>,
-    background: JoinSet<Result<()>>,
-    monitoring: crate::monitor::Monitoring,
-    attention_stop: watch::Sender<bool>,
-    attention_tasks: JoinSet<Result<()>>,
-    recovery: JoinSet<(&'static str, Result<()>)>,
-    // Held only for drop-after-drain abort timing; never polled.
+    connections: JoinSet<()>,
+    progress: watch::Receiver<u64>,
+    maintenance_tasks: JoinSet<Result<()>>,
+    maintenance_stop: watch::Sender<bool>,
+    automation_task_names: Vec<(tokio::task::Id, &'static str)>,
+    automation_tasks: JoinSet<(&'static str, Result<automation::RuleWorkerExit>)>,
+    automation_stop: watch::Sender<bool>,
+    // Aborts a still-waiting recheck when supervision drops, before the IPC
+    // listener below closes; never polled.
     #[allow(dead_code)]
     capacity_recheck: JoinSet<()>,
-    automation_stop: watch::Sender<bool>,
-    automation_tasks: JoinSet<(&'static str, Result<automation::RuleWorkerExit>)>,
-    automation_task_names: Vec<(tokio::task::Id, &'static str)>,
-    maintenance_stop: watch::Sender<bool>,
-    maintenance_tasks: JoinSet<Result<()>>,
-    cloud_mcp_shutdown: CancellationToken,
+    recovery: JoinSet<(&'static str, Result<()>)>,
+    attention_tasks: JoinSet<Result<()>>,
+    attention_stop: watch::Sender<bool>,
+    monitoring: crate::monitor::Monitoring,
+    background: JoinSet<Result<()>>,
+    monitor_stop: watch::Sender<bool>,
     cloud_mcp_tasks: JoinSet<Result<()>>,
-    progress: watch::Receiver<u64>,
-    connections: JoinSet<()>,
+    cloud_mcp_shutdown: CancellationToken,
+    listener: IpcListener,
+    router: Router,
+    policy: Arc<SecretPolicy>,
 }
 
 /// Validate configuration, recover durable state without replaying external
@@ -371,7 +374,8 @@ async fn spawn_workers(
     recovery.spawn(async move { ("workspace", recovery_router.recover_workspaces().await) });
     let recovery_router = router.clone();
     recovery.spawn(async move { ("command", recovery_router.recover_accepted_commands().await) });
-    // Owned by supervision and aborted when it drops after the shutdown drain.
+    // Owned by supervision; its abort-on-drop runs before the IPC listener
+    // closes because the struct declares this field ahead of the listener.
     let mut capacity_recheck = JoinSet::new();
     if capacity_retained > 0 {
         capacity_recheck.spawn(restart_capacity::recheck(capacity));
@@ -443,25 +447,25 @@ async fn spawn_workers(
     let progress = router.progress_receiver();
     let connections = JoinSet::new();
     Ok(DaemonSupervision {
+        connections,
+        progress,
+        maintenance_tasks,
+        maintenance_stop,
+        automation_task_names,
+        automation_tasks,
+        automation_stop,
+        capacity_recheck,
+        recovery,
+        attention_tasks,
+        attention_stop,
+        monitoring,
+        background,
+        monitor_stop,
+        cloud_mcp_tasks,
+        cloud_mcp_shutdown,
+        listener,
         router,
         policy,
-        listener,
-        monitor_stop,
-        background,
-        monitoring,
-        attention_stop,
-        attention_tasks,
-        recovery,
-        capacity_recheck,
-        automation_stop,
-        automation_tasks,
-        automation_task_names,
-        maintenance_stop,
-        maintenance_tasks,
-        cloud_mcp_shutdown,
-        cloud_mcp_tasks,
-        progress,
-        connections,
     })
 }
 
