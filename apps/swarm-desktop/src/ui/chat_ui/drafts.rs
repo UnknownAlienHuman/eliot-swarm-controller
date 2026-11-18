@@ -8,6 +8,7 @@ impl DesktopApp {
         &self,
         action: DraftAction,
         mutation_id: String,
+        ledger_key: String,
         text: String,
         revision: u64,
         blank: bool,
@@ -58,7 +59,15 @@ impl DesktopApp {
                             })
                             .await
                             .map_err(|_| {
-                                SendFailure::new(&error, &mutation_id, &text, revision, &action)
+                                SendFailure::new(
+                                    &error,
+                                    &mutation_id,
+                                    &ledger_key,
+                                    &text,
+                                    revision,
+                                    &action,
+                                    fallback,
+                                )
                             })?;
                         (command_id, state, linked, true)
                     }
@@ -66,9 +75,11 @@ impl DesktopApp {
                         return Err(SendFailure::new(
                             &error,
                             &mutation_id,
+                            &ledger_key,
                             &text,
                             revision,
                             &action,
+                            fallback,
                         ));
                     }
                 };
@@ -97,6 +108,8 @@ impl DesktopApp {
         self.settle_mutation(settles(&outcome));
         match outcome {
             Ok(outcome) => {
+                // The submission settled: its snapshot (if any) is resolved.
+                self.chat.pending_retry.remove(&outcome.agent);
                 // Bound to the submitting Agent and draft revision, not
                 // to whatever conversation is open now.
                 self.chat.drafts.ack(&outcome.agent, outcome.draft_rev);
@@ -147,7 +160,10 @@ impl DesktopApp {
                     };
                     let key = format!("{}:after-steer", action.key(failure.revision));
                     let mutation_id = self.ledger.id_for(&key);
-                    self.in_flight_key = Some(key);
+                    self.in_flight_key = Some(key.clone());
+                    // The steer is definitely settled; its snapshot (if any)
+                    // is superseded by the fallback submission below.
+                    self.chat.pending_retry.remove(&bound.agent);
                     if let Some(convo) = self.chat.convo.as_mut()
                         && convo.agent() == bound.agent
                     {
@@ -158,6 +174,7 @@ impl DesktopApp {
                     self.spawn_draft(
                         action,
                         mutation_id,
+                        key,
                         failure.text,
                         failure.revision,
                         false,
@@ -167,16 +184,44 @@ impl DesktopApp {
                     return;
                 }
                 let agent = failure.action.agent().to_owned();
-                self.chat
-                    .drafts
-                    .restore(&agent, failure.text.clone(), failure.revision);
+                let restored =
+                    self.chat
+                        .drafts
+                        .restore(&agent, failure.text.clone(), failure.revision);
                 self.rebuild_items();
                 if crate::state::uncertain(&failure.error) {
+                    // Keep the exact unresolved identity with the draft so
+                    // the next identical Send retries this snapshot (same
+                    // mutation id and ledger key) instead of rederiving a
+                    // fresh id that could admit a duplicate effect.
+                    if restored {
+                        self.chat.pending_retry.insert(
+                            agent.clone(),
+                            PendingRetry {
+                                action: failure.action.clone(),
+                                text: failure.text.clone(),
+                                revision: failure.revision,
+                                mutation_id: failure.mutation_id.clone(),
+                                ledger_key: failure.ledger_key.clone(),
+                                fallback: failure.fallback,
+                            },
+                        );
+                    }
                     self.alert(format!(
                         "Not confirmed (sending again reuses the same id): {}",
                         failure.error.user_message()
                     ));
                 } else {
+                    // A definite refusal settles the action: drop its
+                    // snapshot so a later Send mints fresh identity.
+                    if self
+                        .chat
+                        .pending_retry
+                        .get(&agent)
+                        .is_some_and(|pending| pending.revision == failure.revision)
+                    {
+                        self.chat.pending_retry.remove(&agent);
+                    }
                     self.alert(format!("Not sent: {}", failure.error.user_message()));
                 }
             }
@@ -357,7 +402,7 @@ mod tests {
         ));
         assert_eq!(read.unwrap_err().code, "not_found");
         let lost = eliot_core::Error::new("unknown", "transport: reply missing");
-        let failure = SendFailure::new(&lost, "r1", "hello", 3, &resume());
+        let failure = SendFailure::new(&lost, "r1", "resume:a2:1:3", "hello", 3, &resume(), false);
         assert!(!settles(&Err::<(), _>(failure)));
         // A resume admitted without a known linked SEND keeps its copy.
         let mut convo = sending("r1");

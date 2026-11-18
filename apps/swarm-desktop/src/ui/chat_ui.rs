@@ -139,25 +139,31 @@ pub(super) fn enter_send_text(previous: &str, text: &str) -> Option<String> {
 pub(super) struct SendFailure {
     pub(super) error: eliot_core::Error,
     pub(super) mutation_id: String,
+    pub(super) ledger_key: String,
     pub(super) text: String,
     pub(super) revision: u64,
     pub(super) action: DraftAction,
+    pub(super) fallback: bool,
 }
 
 impl SendFailure {
     fn new(
         error: &eliot_core::Error,
         mutation_id: &str,
+        ledger_key: &str,
         text: &str,
         revision: u64,
         action: &DraftAction,
+        fallback: bool,
     ) -> Self {
         Self {
             error: error.clone(),
             mutation_id: mutation_id.to_owned(),
+            ledger_key: ledger_key.to_owned(),
             text: text.to_owned(),
             revision,
             action: action.clone(),
+            fallback,
         }
     }
 }
@@ -212,6 +218,35 @@ impl DraftAction {
     }
 }
 
+/// An unconfirmed submission kept with the draft: the exact action, body,
+/// mutation id and ledger key to retry. The next identical Send reuses this
+/// snapshot instead of rederiving identity, which could admit a second
+/// effect after a fallback `send:...:after-steer` submission whose response
+/// was lost.
+#[derive(Clone, Debug)]
+pub(super) struct PendingRetry {
+    pub(super) action: DraftAction,
+    pub(super) text: String,
+    pub(super) revision: u64,
+    pub(super) mutation_id: String,
+    pub(super) ledger_key: String,
+    pub(super) fallback: bool,
+}
+
+/// Reuse the unresolved snapshot when this Send repeats its exact action,
+/// body and revision; anything else is a genuinely new action with fresh
+/// identity (current generation/turn conflict handling is unchanged).
+pub(super) fn retry_snapshot(
+    pending: Option<&PendingRetry>,
+    action: &DraftAction,
+    text: &str,
+    revision: u64,
+) -> Option<PendingRetry> {
+    let snapshot = pending?;
+    (snapshot.action == *action && snapshot.text == text && snapshot.revision == revision)
+        .then(|| snapshot.clone())
+}
+
 /// The selected Agent's conversation, its delivery chain and per-Agent drafts.
 pub(super) struct ChatState {
     // Conversation of the selected Agent.
@@ -251,6 +286,9 @@ pub(super) struct ChatState {
     pub(super) opened_from_search: bool,
     // Mutations.
     pub(super) drafts: DraftStore,
+    /// Unconfirmed submission identity per Agent, retried verbatim by the
+    /// next identical Send instead of rederiving a fresh mutation id.
+    pub(super) pending_retry: HashMap<String, PendingRetry>,
     pub(super) answers: HashMap<String, eliot_core::requests::Answers>,
     /// The Force stop awaiting confirmation, bound at its menu click, with
     /// the title shown in the question.
@@ -572,9 +610,44 @@ impl DesktopApp {
                     return;
                 }
                 let revision = self.chat.drafts.revision(&agent_id);
-                let key = action.key(revision);
-                let mutation_id = self.ledger.id_for(&key);
-                self.in_flight_key = Some(key);
+                // A retry of an unconfirmed submission reuses its exact
+                // identity (action, mutation id and ledger key), never a
+                // rederived id that could admit a second effect. Anything
+                // else is a genuinely new action: drop only a dead snapshot
+                // (its revision can never recur) and mint fresh identity.
+                if self
+                    .chat
+                    .pending_retry
+                    .get(&agent_id)
+                    .is_some_and(|pending| pending.revision != revision)
+                {
+                    self.chat.pending_retry.remove(&agent_id);
+                }
+                let retry = retry_snapshot(
+                    self.chat.pending_retry.get(&agent_id),
+                    &action,
+                    &text,
+                    revision,
+                );
+                let (action, key, mutation_id, fallback) = match retry {
+                    Some(snapshot) => {
+                        // The ledger still holds this key (an uncertain
+                        // outcome never releases it), so the snapshot id is
+                        // the key's id: no new mutation id is minted.
+                        (
+                            snapshot.action,
+                            snapshot.ledger_key,
+                            snapshot.mutation_id,
+                            snapshot.fallback,
+                        )
+                    }
+                    None => {
+                        let key = action.key(revision);
+                        let mutation_id = self.ledger.id_for(&key);
+                        (action, key, mutation_id, false)
+                    }
+                };
+                self.in_flight_key = Some(key.clone());
                 let what = action.label();
                 self.alert = None;
                 self.set_status(format!("{what} ({mutation_id})…"));
@@ -600,7 +673,16 @@ impl DesktopApp {
                 }
                 self.rebuild_items();
                 self.follow_latest(0, context);
-                self.spawn_draft(action, mutation_id, text, revision, blank, false, context);
+                self.spawn_draft(
+                    action,
+                    mutation_id,
+                    key,
+                    text,
+                    revision,
+                    blank,
+                    fallback,
+                    context,
+                );
             }
             ChatMsg::SendSubmitted(outcome) => self.send_submitted(outcome, context),
             ChatMsg::InterruptRequested(bound) => {
@@ -920,9 +1002,11 @@ mod tests {
             let failure = super::SendFailure::new(
                 &eliot_core::Error::new(code, "transport: reply missing"),
                 &id,
+                &key,
                 "hello",
                 7,
                 &action,
+                false,
             );
             let result: Result<(), _> = Err(failure);
             if super::settles(&result) {
@@ -933,13 +1017,52 @@ mod tests {
         let refused = super::SendFailure::new(
             &eliot_core::Error::new("invalid", "unknown: quoted model prose"),
             "id",
+            "send:a2:7",
             "hello",
             7,
             &super::DraftAction::Send {
                 agent: "a2".to_owned(),
             },
+            false,
         );
         assert!(super::settles(&Err::<(), _>(refused)));
+    }
+
+    #[test]
+    fn retry_reuses_the_fallback_snapshot_verbatim() {
+        use super::{PendingRetry, retry_snapshot};
+        let send = || super::DraftAction::Send {
+            agent: "a2".to_owned(),
+        };
+        // An unconfirmed fallback SEND keeps its `:after-steer` ledger key
+        // and id; the next identical Send must reuse that snapshot instead
+        // of rederiving `send:a2:3`, whose fresh id could admit a duplicate
+        // turn if the fallback SEND was already admitted.
+        let pending = PendingRetry {
+            action: send(),
+            text: "hello".to_owned(),
+            revision: 3,
+            mutation_id: "B".to_owned(),
+            ledger_key: "send:a2:3:after-steer".to_owned(),
+            fallback: true,
+        };
+        let retry =
+            retry_snapshot(Some(&pending), &send(), "hello", 3).expect("identical retry reuses");
+        assert_eq!(retry.mutation_id, "B");
+        assert_eq!(retry.ledger_key, "send:a2:3:after-steer");
+        assert!(retry.fallback);
+        let mut ledger = crate::state::MutationLedger::default();
+        let fallback_id = ledger.id_for("send:a2:3:after-steer");
+        let fresh_id = ledger.id_for("send:a2:3");
+        assert_ne!(fallback_id, fresh_id, "rederiving would mint a second id");
+        assert_eq!(ledger.id_for("send:a2:3:after-steer"), fallback_id);
+        // A new action, an edited body or a moved-on revision never reuses.
+        let steer =
+            super::DraftAction::Steer(crate::state::BoundAction::turn_control("a2", 1, "t1"));
+        assert!(retry_snapshot(Some(&pending), &steer, "hello", 3).is_none());
+        assert!(retry_snapshot(Some(&pending), &send(), "hello!", 3).is_none());
+        assert!(retry_snapshot(Some(&pending), &send(), "hello", 4).is_none());
+        assert!(retry_snapshot(None, &send(), "hello", 3).is_none());
     }
 
     #[test]
