@@ -512,6 +512,11 @@ finish. A linked send that is `rejected`, `failed` or `cancelled` cancels undisp
 successors under the existing sibling semantics. `unknown` remains blocking and is never
 replayed.
 
+When [Agent deletion](api.md#agent-and-daemon-read-views) removes the full command set of a rule
+or timer launch, the rule cursor and timer schedule state stay durable. A consumed
+slot stays consumed, and a deleted manual firing ID remains bound through the retry
+window.
+
 The emitted command has `target = null`, `expected_generation = 0`, and no turn or request
 binding. Event Agent/generation fields do not select or retarget the new Agent. The rule
 worker and Store retain the authoritative triggering event identity and verified cause

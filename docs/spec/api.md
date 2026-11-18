@@ -675,10 +675,10 @@ CLI: `swarm archive aN`, `swarm unarchive aN`, `swarm ls --archived include`.
 `agent.delete {id, agent:"aN"}` is Owner-only and removes a tree whose Agents are
 stopped or failed, using retention's leaf-first command cleanup. A failed launch
 can be removed after its sources and custody drain; an already-terminal `stop`
-does not need to rewrite its failure state. Delete removes a retained tree-selector
-parent with its full member command set in the same transaction. Each member must
-pass the ordinary deletion checks, and a selector set spanning Agents outside the
-requested tree returns `busy`. A `busy` refusal names the blocking
+does not need to rewrite its failure state. Delete removes a retained tree-selector,
+rule, or timer admission parent with its full member command set in the same
+transaction. Each member must pass the ordinary deletion checks. A set with commands
+outside the requested Agent tree returns `busy`. A `busy` refusal names the blocking
 Agent and its actual state, pending requests, command, turn (including generation
 and retained state) or undrained process, source or artifact, rather than treating stopped lifecycle as proof of drained
 history. A retained `unknown` turn still blocks deletion after stop. Live custody, open

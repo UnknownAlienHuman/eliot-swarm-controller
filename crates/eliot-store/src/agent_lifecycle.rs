@@ -263,14 +263,15 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
         [MAX_DELETE_COMMANDS as i64 + 1],
     ));
     if command_count <= MAX_DELETE_COMMANDS {
-        // A selector parent records the expansion, with no Agent target. Its
-        // concrete members have already passed the per-Agent settlement checks.
+        // Selector and automation admission parents have no Agent target. The
+        // link check below still requires every member of each included set.
         command_count += db!(tx.execute(
             "INSERT INTO deleted_commands
              SELECT DISTINCT p.id FROM deleted_commands d
              JOIN commands c ON c.id=d.id JOIN commands p ON p.id=c.parent_command
-             WHERE c.link_kind=?1 AND p.target IS NULL AND p.selector IS NOT NULL
-               AND p.parent_command IS NULL AND p.state='applied'
+             WHERE p.target IS NULL AND p.parent_command IS NULL AND p.state='applied'
+               AND ((c.link_kind=?1 AND p.selector IS NOT NULL)
+                 OR (c.link_kind='rule_action' AND p.verb IN ('rule','timer.run','rule.catch_up')))
              LIMIT ?2",
             params![
                 hierarchy::SELECTOR_LINK_KIND,
