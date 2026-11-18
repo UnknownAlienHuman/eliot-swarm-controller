@@ -334,34 +334,17 @@ pub(crate) fn result_session_tokens(record: &Value) -> Option<SessionTokenTotals
     })
 }
 
-/// Context occupancy sample from a terminal `result` record's `usage`: the
-/// turn's input-side counters (input plus cache creation/read) approximate
-/// the context read for that turn, so the latest sample is the retained
-/// occupancy. Missing or malformed counters leave the sample absent; a
-/// result without any input-side counter contributes no occupancy (the
-/// cumulative `modelUsage` below still maps).
-pub(crate) fn result_context_used(record: &Value) -> Option<i64> {
-    let usage = record.get("usage")?.as_object()?;
-    let mut sum: i128 = 0;
-    let mut supplied = 0;
-    for key in [
-        "input_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens",
-    ] {
-        if let Some(value) = usage
-            .get(key)
-            .and_then(Value::as_i64)
-            .filter(|value| *value >= 0)
-        {
-            sum += i128::from(value);
-            supplied += 1;
-        }
-    }
-    if supplied == 0 || sum > i128::from(i64::MAX) {
-        return None;
-    }
-    Some(sum as i64)
+/// Context occupancy sample from a terminal `result` record: there is no
+/// native occupancy snapshot in the installed stream-json `result` shape.
+/// `result.usage` is cumulative spend across model calls (per-step spend
+/// lives on `assistant` messages), so summing its input-side counters
+/// would report accumulated expenditure as live occupancy and can exceed
+/// the model capacity. Occupancy therefore stays null here; cumulative
+/// spend below still maps from `modelUsage` with provenance
+/// `claude:result`, and capacity still maps from `context_window`.
+/// See Agent SDK cost-tracking and `sdkcontrol/getContextUsage`.
+pub(crate) fn result_context_used(_record: &Value) -> Option<i64> {
+    None
 }
 
 /// Model context window from an init or result frame: the installed
@@ -433,8 +416,9 @@ pub(crate) fn transcript_bytes_in(roots: &[PathBuf], session_id: &str) -> Option
 
 /// Extract the session-scoped fact from a terminal `result` record:
 /// cumulative token counters from `modelUsage` plus the cumulative cost
-/// from `total_cost_usd`, the occupancy sample from `usage`, and the model
-/// context window where the frame reports it. With persistent streaming input
+/// from `total_cost_usd` and the model context window where the frame
+/// reports it. Occupancy is never derived from `usage` (no native
+/// snapshot; see `result_context_used`). With persistent streaming input
 /// the cumulative halves are cumulative for the session (resumed cost
 /// included) and estimated, so they map to a session-scoped snapshot with
 /// source `claude:result`, never to turn expenditure and never converted.
@@ -765,7 +749,10 @@ mod tests {
     }
 
     #[test]
-    fn result_occupancy_samples_input_side_counters() {
+    fn result_occupancy_stays_null_without_native_snapshot() {
+        // Audit #627: `result.usage` is cumulative spend, not occupancy.
+        // No native occupancy snapshot exists in `result`, so occupancy
+        // stays null even for large cumulative input-side counters.
         assert_eq!(
             result_context_used(&json!({"usage": {
                 "input_tokens": 100,
@@ -773,9 +760,8 @@ mod tests {
                 "cache_read_input_tokens": 1000,
                 "output_tokens": 20,
             }})),
-            Some(1150)
+            None
         );
-        // Output alone is not occupancy.
         assert_eq!(
             result_context_used(&json!({"usage": {"output_tokens": 20}})),
             None
@@ -796,10 +782,18 @@ mod tests {
         );
         assert_eq!(frame_context_window(&json!({})), None);
         assert_eq!(frame_context_window(&json!({"context_window": 0})), None);
-        // Occupancy alone yields a session fact.
-        let usage =
-            result_session_usage(&json!({"usage": {"input_tokens": 7}})).expect("occupancy maps");
-        assert_eq!(usage.context_used_tokens, Some(7));
+        // Usage alone yields no session fact; cumulative spend still maps.
+        assert_eq!(
+            result_session_usage(&json!({"usage": {"input_tokens": 7}})),
+            None,
+            "cumulative spend is not occupancy"
+        );
+        let usage = result_session_usage(&json!({
+            "usage": {"input_tokens": 7},
+            "modelUsage": {"m": {"inputTokens": 7}},
+        }))
+        .expect("cumulative maps");
+        assert_eq!(usage.context_used_tokens, None);
         assert_eq!(usage.context_window_tokens, None);
     }
 
