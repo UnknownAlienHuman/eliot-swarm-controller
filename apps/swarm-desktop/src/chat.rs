@@ -506,6 +506,11 @@ pub struct Conversation {
     agent: String,
     turns: HashMap<String, TurnEntry>,
     inputs: HashMap<String, InputText>,
+    /// Exact pending text of unlinked local inputs, for Retry: the bounded
+    /// `inputs` copy is the display preview only (#643). One entry per
+    /// still-waiting local input (each at most the 512 KiB submission
+    /// limit), dropped when the input links, is forgotten or leaves.
+    pending_exact: HashMap<String, String>,
     local: Vec<String>,
     /// What each local input waits for ("Sending…", "Starting Codex…"),
     /// shown under it until its turn starts.
@@ -558,11 +563,13 @@ impl Conversation {
     pub fn reset(&mut self, coverage: Coverage, turns: &[Turn], events: &[Event]) -> Invalidation {
         let local = std::mem::take(&mut self.local);
         let inputs = std::mem::take(&mut self.inputs);
+        let pending_exact = std::mem::take(&mut self.pending_exact);
         let notes = std::mem::take(&mut self.local_notes);
         let failures = std::mem::take(&mut self.local_failures);
         *self = Self::new(&self.agent);
         self.coverage = coverage;
         self.inputs = inputs;
+        self.pending_exact = pending_exact;
         self.local = local;
         self.local_notes = notes;
         self.local_failures = failures;
@@ -577,6 +584,8 @@ impl Conversation {
                     .values()
                     .any(|turn| turn.command_id.as_deref() == Some(command))
         });
+        self.pending_exact
+            .retain(|command, _| self.local.iter().any(|known| known == command));
         invalidation.inputs = self.missing_inputs();
         invalidation.turns = false;
         invalidation.detail = false;
@@ -694,6 +703,8 @@ impl Conversation {
                 .values()
                 .any(|turn| turn.command_id.as_deref() == Some(command))
         });
+        self.pending_exact
+            .retain(|command, _| self.local.iter().any(|known| known == command));
         self.enforce_bounds();
         invalidation
     }
@@ -756,6 +767,8 @@ impl Conversation {
     pub fn note_local_input(&mut self, command: &str, text: &str) {
         self.inputs
             .insert(command.to_owned(), InputText::Loaded(bound_text(text)));
+        self.pending_exact
+            .insert(command.to_owned(), text.to_owned());
         let linked = self
             .turns
             .values()
@@ -783,6 +796,7 @@ impl Conversation {
         self.local_notes.remove(command);
         self.local_failures.remove(command);
         self.inputs.remove(command);
+        self.pending_exact.remove(command);
     }
 
     /// Local inputs still shown as waiting (a note, no failure yet): the
@@ -807,13 +821,18 @@ impl Conversation {
         }
     }
 
-    /// The submitted text of a local input, for Retry.
+    /// The exact submitted text of a local input, for Retry: never the
+    /// bounded display preview and never its truncation marker (#643).
     pub fn local_text(&self, command: &str) -> Option<String> {
-        match self.inputs.get(command) {
-            Some(InputText::Loaded(text)) if self.local.iter().any(|known| known == command) => {
-                Some(text.clone())
-            }
-            _ => None,
+        if !self.local.iter().any(|known| known == command) {
+            return None;
+        }
+        match self.pending_exact.get(command) {
+            Some(exact) => Some(exact.clone()),
+            None => match self.inputs.get(command) {
+                Some(InputText::Loaded(text)) => Some(text.clone()),
+                _ => None,
+            },
         }
     }
 
@@ -1636,6 +1655,29 @@ mod tests {
             },
         );
         assert_eq!(chat.items().len(), 1);
+    }
+
+    #[test]
+    fn retry_uses_the_exact_submitted_text_not_the_bounded_preview() {
+        // #643: a prompt past the 256 KiB display bound keeps its exact
+        // text for Retry; the conversation still shows the bounded preview.
+        let mut chat = Conversation::new("a1");
+        let big = "x".repeat(300 * 1024);
+        chat.note_local_input("c-big", &big);
+        assert_eq!(chat.local_text("c-big").as_deref(), Some(big.as_str()));
+        let preview = match chat.inputs.get("c-big") {
+            Some(InputText::Loaded(text)) => text.clone(),
+            other => panic!("unexpected input {other:?}"),
+        };
+        assert!(preview.len() < big.len());
+        assert!(preview.contains("retained text truncated"));
+        // Once its turn links, the pending exact copy leaves with it.
+        chat.apply_events(&[event(
+            10,
+            "turn.started",
+            json!({"turn_id": "t9", "command_id": "c-big"}),
+        )]);
+        assert_eq!(chat.local_text("c-big"), None);
     }
 
     #[test]
