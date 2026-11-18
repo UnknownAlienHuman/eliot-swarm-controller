@@ -18,7 +18,7 @@
 //! retained (its events are read from there), the retention floor, evictions
 //! and inputs whose text could not be read.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use eliot_core::{Event, Turn, TurnOutcome, TurnState};
 
@@ -36,6 +36,12 @@ pub const MAX_TEXT_BYTES: usize = 256 * 1024;
 pub const MAX_RENDER_CHARS: usize = 12_000;
 /// Tool rows kept per collapsed group; counters stay exact.
 pub const MAX_TOOL_ROWS: usize = 40;
+/// Tool identities indexed per turn; older ones leave the index (their rows
+/// stay, bounded, with exact counters) instead of growing it forever.
+pub const MAX_TOOL_IDS_PER_TURN: usize = 256;
+/// Evicted turn ids remembered so late events never resurrect them; the
+/// exact eviction count lives in coverage and survives snapshot rebuilds.
+const MAX_EVICTED_IDS: usize = 1_024;
 /// Progress messages kept per turn.
 pub const MAX_MESSAGES_PER_TURN: usize = 200;
 /// Progress text bytes kept per turn; later messages are counted, not kept.
@@ -156,6 +162,8 @@ struct TurnEntry {
     messages_dropped: usize,
     /// Tool item id to the index of the activity group that started it.
     item_groups: HashMap<String, usize>,
+    /// Insertion order of the indexed tool ids, for bounded eviction.
+    item_order: VecDeque<String>,
 }
 
 impl TurnEntry {
@@ -176,6 +184,7 @@ impl TurnEntry {
             message_bytes: 0,
             messages_dropped: 0,
             item_groups: HashMap::new(),
+            item_order: VecDeque::new(),
         }
     }
 
@@ -207,6 +216,7 @@ impl TurnEntry {
         activity
             + self.final_text.as_ref().map_or(0, String::len)
             + self.event_final.as_ref().map_or(0, String::len)
+            + self.item_groups.keys().map(String::len).sum::<usize>()
     }
 
     fn tool_event(
@@ -317,6 +327,21 @@ impl TurnEntry {
             *failed += usize::from(failed_now);
         }
         self.item_groups.insert(item_id.to_owned(), group);
+        if self.item_order.back().is_none_or(|last| last != item_id) {
+            self.item_order.push_back(item_id.to_owned());
+        }
+        // The tool identity index stays bounded: drop the least recently
+        // started identities. Their rows stay (bounded) with exact
+        // counters, and a late completion for a dropped identity opens a
+        // fresh done row instead of updating the old one.
+        while self.item_order.len() > MAX_TOOL_IDS_PER_TURN {
+            let Some(old) = self.item_order.pop_front() else {
+                break;
+            };
+            if !self.item_order.contains(&old) {
+                self.item_groups.remove(&old);
+            }
+        }
     }
 }
 
@@ -521,6 +546,8 @@ pub struct Conversation {
     coverage: Coverage,
     /// Turns evicted by the resident bounds; late events never resurrect them.
     evicted: HashSet<String>,
+    /// Eviction order of `evicted`, so the no-resurrection index stays bounded.
+    evicted_order: VecDeque<String>,
 }
 
 fn data_str<'a>(event: &'a Event, field: &str) -> Option<&'a str> {
@@ -864,9 +891,47 @@ impl Conversation {
             .count()
     }
 
+    /// Input texts no resident turn and no waiting local input references.
+    /// Auxiliary indexes leave with their owner instead of lingering.
+    fn prune_inputs(&mut self) {
+        let mut keep: HashSet<&str> = self.local.iter().map(String::as_str).collect();
+        keep.extend(
+            self.turns
+                .values()
+                .filter_map(|turn| turn.command_id.as_deref()),
+        );
+        self.inputs
+            .retain(|command, _| keep.contains(command.as_str()));
+    }
+
+    /// Remember an evicted turn so late events never resurrect it. The
+    /// index is bounded: the exact count lives in `coverage.evicted_turns`,
+    /// and a snapshot rebuild starts a fresh window from retained history.
+    fn remember_evicted(&mut self, turn_id: String) {
+        if self.evicted.insert(turn_id.clone()) {
+            self.evicted_order.push_back(turn_id);
+            while self.evicted_order.len() > MAX_EVICTED_IDS {
+                let Some(old) = self.evicted_order.pop_front() else {
+                    break;
+                };
+                self.evicted.remove(&old);
+            }
+        }
+    }
+
     fn enforce_bounds(&mut self) {
         loop {
-            let bytes: usize = self.turns.values().map(TurnEntry::bytes).sum();
+            self.prune_inputs();
+            let bytes: usize = self.turns.values().map(TurnEntry::bytes).sum::<usize>()
+                + self
+                    .inputs
+                    .values()
+                    .map(|text| match text {
+                        InputText::Loaded(text) => text.len(),
+                        InputText::Unavailable(reason) => reason.len(),
+                    })
+                    .sum::<usize>()
+                + self.pending_exact.values().map(String::len).sum::<usize>();
             if self.turns.len() <= 1
                 || (self.turns.len() <= MAX_RESIDENT_TURNS && bytes <= MAX_RESIDENT_BYTES)
             {
@@ -883,7 +948,7 @@ impl Conversation {
                 return;
             };
             self.turns.remove(&oldest);
-            self.evicted.insert(oldest);
+            self.remember_evicted(oldest);
             self.coverage.evicted_turns += 1;
         }
     }
@@ -1757,6 +1822,100 @@ mod tests {
         assert_eq!(chat.items().len(), MAX_RESIDENT_TURNS);
         assert_eq!(chat.coverage().evicted_turns, 5);
         assert_eq!(chat.items()[0].key, "turn:t0005");
+    }
+
+    #[test]
+    fn resident_input_texts_count_and_leave_with_their_turn() {
+        // #642: input texts count toward the resident budget, an input
+        // nobody references never loads it, and eviction takes the
+        // departed turn's text with it.
+        let mut chat = Conversation::new("a1");
+        let events: Vec<Event> = (0..40)
+            .map(|index| {
+                event(
+                    index + 1,
+                    "turn.started",
+                    json!({
+                        "turn_id": format!("t{index:02}"),
+                        "command_id": format!("c{index:02}"),
+                    }),
+                )
+            })
+            .collect();
+        chat.apply_events(&events);
+        chat.apply_inputs(
+            (0..40)
+                .map(|index| {
+                    (
+                        format!("c{index:02}"),
+                        InputText::Loaded("y".repeat(256 * 1024)),
+                    )
+                })
+                .collect(),
+        );
+        chat.apply_inputs(vec![("stray".to_owned(), InputText::Loaded("z".repeat(1_024)))]);
+        chat.apply_turns(&[]);
+        assert!(chat.coverage().evicted_turns > 0);
+        assert!(!chat.inputs.contains_key("stray"));
+        for command in chat.inputs.keys() {
+            assert!(
+                chat.turns
+                    .values()
+                    .any(|turn| turn.command_id.as_deref() == Some(command.as_str())),
+                "kept input {command} nobody references"
+            );
+        }
+        let bytes: usize = chat.turns.values().map(TurnEntry::bytes).sum::<usize>()
+            + chat
+                .inputs
+                .values()
+                .map(|text| match text {
+                    InputText::Loaded(text) => text.len(),
+                    InputText::Unavailable(reason) => reason.len(),
+                })
+                .sum::<usize>();
+        assert!(bytes <= MAX_RESIDENT_BYTES);
+    }
+
+    #[test]
+    fn tool_identity_index_stays_bounded_with_exact_counters() {
+        // #642: one long turn keeps at most MAX_TOOL_IDS_PER_TURN tool
+        // identities; its rows stay bounded and total/done stay exact.
+        let mut chat = Conversation::new("a1");
+        chat.apply_events(&[event(1, "turn.started", json!({"turn_id": "t0"}))]);
+        let tools: Vec<Event> = (0..300)
+            .map(|index| {
+                event(
+                    index + 2,
+                    "tool.completed",
+                    json!({
+                        "turn_id": "t0",
+                        "item_id": format!("item{index:03}"),
+                        "tool": "run",
+                        "status": "completed",
+                    }),
+                )
+            })
+            .collect();
+        chat.apply_events(&tools);
+        let turn = chat.turns.get("t0").expect("resident turn");
+        assert!(turn.item_groups.len() <= MAX_TOOL_IDS_PER_TURN);
+        let (mut total, mut done) = (0, 0);
+        for entry in &turn.activity {
+            if let Activity::Tools {
+                rows,
+                total: group_total,
+                done: group_done,
+                ..
+            } = entry
+            {
+                assert!(rows.len() <= MAX_TOOL_ROWS);
+                total += group_total;
+                done += group_done;
+            }
+        }
+        assert_eq!(total, 300);
+        assert_eq!(done, 300);
     }
 
     #[test]
