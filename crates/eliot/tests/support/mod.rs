@@ -457,6 +457,24 @@ impl Fixture {
         file_stderr_tail(&self.daemon_stderr, 8192)
     }
 
+    /// Startup stderr with every injected daemon credential redacted, so a
+    /// startup panic never prints the secret the selector redaction
+    /// regression asserts is absent from persisted output.
+    fn redacted_stderr_tail(&self) -> String {
+        let mut tail = self
+            .daemon
+            .as_ref()
+            .map(|daemon| daemon.stderr_tail())
+            .unwrap_or_else(|| file_stderr_tail(&self.daemon_stderr, 8192));
+        for (_, value) in &self.daemon_env {
+            let secret = value.to_string_lossy();
+            if !secret.is_empty() {
+                tail = tail.replace(secret.as_ref(), "[redacted]");
+            }
+        }
+        tail
+    }
+
     /// Exact PID of the owned daemon child (the guard's handle, never a
     /// re-resolved PID, so the proof test cannot observe a recycled process).
     pub fn daemon_pid(&self) -> u32 {
@@ -496,14 +514,16 @@ impl Fixture {
                 // last words come from its files: the published endpoint
                 // record, the timestamped phase codes in its log, and the
                 // bounded stderr tail (the only evidence when startup fails
-                // before logging starts).
+                // before logging starts). Injected credentials are redacted
+                // before formatting so a startup panic cannot print the
+                // secret the redaction regression asserts is absent.
                 panic!(
                     "foreground daemon exited during startup (status={status:?}, per_process currently_starting={}, per_process peak_starting={}); daemon.json={}; log={}; stderr={}",
                     CURRENTLY_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
                     PEAK_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
                     daemon_info_snippet(&self.data),
                     daemon_log_phases(&self.data),
-                    self.daemon.as_ref().unwrap().stderr_tail(),
+                    self.redacted_stderr_tail(),
                 );
             }
             let response = cli(&self.data, &["status"]);
@@ -536,7 +556,7 @@ impl Fixture {
                 first_error.as_deref().unwrap_or("none"),
                 error_snippet(&response.stderr),
                 daemon_log_phases(&self.data),
-                self.daemon.as_ref().unwrap().stderr_tail(),
+                self.redacted_stderr_tail(),
             );
             thread::sleep(Duration::from_millis(50));
         }

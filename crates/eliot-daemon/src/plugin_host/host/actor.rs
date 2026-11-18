@@ -89,6 +89,7 @@ pub(super) async fn settle_observed_root_exit(
     monitoring: &Monitoring,
     agent: &Agent,
     event_task: &mut tokio::task::JoinHandle<()>,
+    completed_reader: Option<std::result::Result<(), tokio::task::JoinError>>,
     stderr: &StderrView,
 ) {
     // Fence routing before the bounded cleanup so no racing dispatch enters.
@@ -138,17 +139,24 @@ pub(super) async fn settle_observed_root_exit(
     if status.is_ok() {
         let _ = monitoring.sample_generation(agent).await;
     }
-    // Keep source authorization intact throughout the bounded drain.
-    let (gap_reason, drained) = match timeout_at(Instant::now() + STOP_GRACE, &mut *event_task).await {
-        Ok(Ok(())) => ("root_exit_without_session_terminal", true),
-        Ok(Err(_)) => ("root_exit_source_failed", true),
-        Err(_) => {
-            event_task.abort();
-            let drained = timeout_at(Instant::now() + RPC_GRACE, event_task)
-                .await
-                .is_ok();
-            ("root_exit_drain_timeout", drained)
-        }
+    // Keep source authorization intact throughout the bounded drain. A reader
+    // arm that already consumed the JoinHandle result passes it here so this
+    // path never polls the completed handle a second time (Tokio panics on
+    // poll-after-completion). Only a still-pending reader is awaited.
+    let (gap_reason, drained) = match completed_reader {
+        Some(Ok(())) => ("root_exit_without_session_terminal", true),
+        Some(Err(_)) => ("root_exit_source_failed", true),
+        None => match timeout_at(Instant::now() + STOP_GRACE, &mut *event_task).await {
+            Ok(Ok(())) => ("root_exit_without_session_terminal", true),
+            Ok(Err(_)) => ("root_exit_source_failed", true),
+            Err(_) => {
+                event_task.abort();
+                let drained = timeout_at(Instant::now() + RPC_GRACE, event_task)
+                    .await
+                    .is_ok();
+                ("root_exit_drain_timeout", drained)
+            }
+        },
     };
     #[cfg(windows)]
     let control_gone = match child.wait_family_empty(Duration::ZERO).await {
@@ -484,10 +492,9 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
         };
         tokio::select! {
             _ = spontaneous_root_wait(child, monitoring, agent) => {
-                // The exit observation alone won the select. The shared
-                // settlement below re-checks without reaping on Linux,
-                // preserving the drain-before-reap order.
-                settle_observed_root_exit(state, key, child, monitoring, agent, event_task, stderr).await;
+                // The exit observation alone won the select. The reader is
+                // still pending, so settlement awaits it below.
+                settle_observed_root_exit(state, key, child, monitoring, agent, event_task, None, stderr).await;
                 break;
             }
             event_result = &mut *event_task => {
@@ -496,11 +503,13 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                 }
                 // Arbitration: a root exit the OS already reported wins over
                 // EOF or task failure, so this arm never masks
-                // spontaneous-exit evidence with a stream gap reason.
+                // spontaneous-exit evidence with a stream gap reason. The
+                // select already consumed the JoinHandle result; passing it
+                // avoids polling the completed handle again inside settlement.
                 let (gap_reason, is_root_exit) =
                     arbitrate_reader_close(child.try_observe_root_exit(), event_result.is_ok());
                 if is_root_exit {
-                    settle_observed_root_exit(state, key, child, monitoring, agent, event_task, stderr).await;
+                    settle_observed_root_exit(state, key, child, monitoring, agent, event_task, Some(event_result), stderr).await;
                     break;
                 }
                 let control_gone = child.terminate().is_ok()

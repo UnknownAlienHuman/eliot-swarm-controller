@@ -1223,6 +1223,11 @@ fn background_startup_releases_capture_before_daemon_exit() {
     let mut fixture = Fixture::new("background capture");
     // Until the birth-bound background handle proves exit, never remove its data.
     fixture.retain_data = true;
+    // Test-owned kill-on-close custody established at spawn: the starter (and,
+    // by inheritance, its detached daemon child) joins this Job immediately
+    // after spawn, so a stall before `daemon.json` appears still leaves a
+    // handle that kills the live daemon on unwind.
+    let custody = windows_process::CustodyJob::new_kill_on_close().expect("custody Job");
     let mut data_argument = fixture.data.as_os_str().to_os_string();
     data_argument.push(std::path::MAIN_SEPARATOR_STR);
     let mut command = Command::new(CLI);
@@ -1232,6 +1237,9 @@ fn background_startup_releases_capture_before_daemon_exit() {
         .arg(data_argument)
         .args(["--json", "daemon"]);
     let mut starter = Captured::spawn(command);
+    custody
+        .assign(starter.child.id())
+        .expect("assign starter to custody Job at spawn");
     // Claim the detached daemon the moment its metadata appears, while the
     // starter still runs: custody is established at creation, not after the
     // starter exits. Under load the starter may spawn the daemon and then
@@ -1271,6 +1279,13 @@ fn background_startup_releases_capture_before_daemon_exit() {
         std::thread::sleep(Duration::from_millis(25));
     };
     let held = held.unwrap_or_else(|| windows_process::Daemon::open(&fixture.data, &info));
+    // Join the claimed daemon to the same test-owned Job: if the daemon won
+    // the spawn race (spawned before the starter assignment above), this
+    // second assignment still brings it under kill-on-close custody for
+    // unwind. If it already inherited the Job, this is a harmless duplicate.
+    if let Some(pid) = info["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()) {
+        let _ = custody.assign(pid);
+    }
     let status = fixture.json(&["status"]);
     assert_eq!(status["state"], "running");
     assert_eq!(
@@ -1572,26 +1587,51 @@ fn daemon_birth_ticks(data: &Path) -> u64 {
 }
 
 /// Start time of a Unix daemon PID from `/proc/<pid>/stat` field 22, the
-/// birth identity the liveness proof compares. None when procfs is missing or
-/// the PID is gone.
+/// birth identity the liveness proof compares. `Ok(None)` only when the PID
+/// is gone; a missing procfs or an unparsable stat is an explicit error, so
+/// the panic regression cannot mistake an inconclusive probe for exit.
 #[cfg(not(windows))]
-fn proc_start_time(pid: u32) -> Option<String> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+fn proc_start_time(pid: u32) -> std::io::Result<Option<String>> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Distinguish a reaped PID from a host without procfs.
+            if std::path::Path::new("/proc").is_dir() {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     // The comm field may contain spaces and parens; start time is field 22,
     // counted from the state field right after the last `)`.
-    let after = stat.rfind(')')?;
+    let after = stat.rfind(')').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "proc stat missing comm close",
+        )
+    })?;
     let fields: Vec<&str> = stat[after + 1..].split_whitespace().collect();
-    fields.get(19).map(|ticks| ticks.to_string())
+    fields
+        .get(19)
+        .map(|ticks| ticks.to_string())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "proc stat missing start time",
+            )
+        })
+        .map(Some)
 }
 
 /// True only when the exact Unix daemon is still running: the PID must exist
-/// in procfs with the start time captured before unwinding. A missing PID, a
-/// missing procfs, or a recycled PID with a different start time all report
-/// not-live, so neither a procfs gap nor PID reuse can mistake another
+/// in procfs with the start time captured before unwinding. A missing PID or
+/// a recycled PID with a different start time reports not-live; a procfs gap
+/// is an explicit error, so neither it nor PID reuse can mistake another
 /// process for the daemon.
 #[cfg(not(windows))]
-fn exact_daemon_is_live(pid: u32, birth: &str) -> bool {
-    proc_start_time(pid).is_some_and(|start| start == birth)
+fn exact_daemon_is_live(pid: u32, birth: &str) -> std::io::Result<bool> {
+    Ok(proc_start_time(pid)?.is_some_and(|start| start == birth))
 }
 
 /// E43: a panic after spawning a daemon must not leak it. The fixture's guard
@@ -1625,7 +1665,9 @@ fn panicking_after_spawn_leaves_no_live_daemon() {
             #[cfg(windows)]
             birth: daemon_birth_ticks(&fixture.data),
             #[cfg(not(windows))]
-            birth: proc_start_time(pid).expect("daemon start time"),
+            birth: proc_start_time(pid)
+                .expect("daemon proc probe")
+                .expect("daemon start time present"),
         });
         panic!("intentional panic after spawning the owned daemon");
     }));
@@ -1633,21 +1675,37 @@ fn panicking_after_spawn_leaves_no_live_daemon() {
     let probe = probe.borrow().clone().expect("probe recorded before panic");
     // The fixture dropped during unwinding, so the guard already killed and
     // reaped the exact child; poll briefly only to stay honest about async
-    // process teardown.
+    // process teardown. Probe failures are explicit unknowns that keep
+    // waiting, never silent not-live, so an inconclusive probe cannot pass
+    // for a reaped daemon.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut last_probe_error: Option<String> = None;
     loop {
         #[cfg(windows)]
-        let live = windows_process::exact_process_is_live(probe.pid, probe.birth);
+        let live = match windows_process::exact_process_is_live(probe.pid, probe.birth) {
+            Ok(live) => live,
+            Err(error) => {
+                last_probe_error = Some(error.to_string());
+                true
+            }
+        };
         #[cfg(not(windows))]
-        let live = exact_daemon_is_live(probe.pid, &probe.birth);
+        let live = match exact_daemon_is_live(probe.pid, &probe.birth) {
+            Ok(live) => live,
+            Err(error) => {
+                last_probe_error = Some(error.to_string());
+                true
+            }
+        };
         let status = cli(&probe.data, &["status"]);
         if !live && !status.status.success() {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "leaked live daemon pid={}",
-            probe.pid
+            "leaked live daemon pid={} probe_error={}",
+            probe.pid,
+            last_probe_error.as_deref().unwrap_or("none"),
         );
         std::thread::sleep(Duration::from_millis(100));
     }

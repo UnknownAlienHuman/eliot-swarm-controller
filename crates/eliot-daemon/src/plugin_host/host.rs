@@ -5458,7 +5458,8 @@ mod tests {
         // finished reader reach the settlement with both facts true, and the
         // observed exit (not the EOF) decides the cause and exit evidence.
         // Nothing here injects `root_exited`; a recycled or live child would
-        // take the reader-loss path instead.
+        // take the reader-loss path instead. The reader is still pending from
+        // settlement's view (spontaneous arm), so None awaits it once.
         let (host, key, _) = force_stop_fixture().await;
         let mut child =
             OwnedChild::spawn(exiting_test_command()).expect("spawn exiting test child");
@@ -5493,6 +5494,7 @@ mod tests {
             &host.state.monitoring,
             &agent,
             &mut event_task,
+            None,
             &stderr,
         )
         .await;
@@ -5528,6 +5530,90 @@ mod tests {
             unknown.data["reason"],
             json!(eliot_core::PLUGIN_ROOT_EXITED_REASON)
         );
+    }
+
+    #[cfg(any(windows, unix))]
+    #[tokio::test]
+    async fn reader_wins_arm_with_consumed_handle_settles_without_second_poll() {
+        // The real reader-wins arm: select! consumes the JoinHandle result,
+        // then settlement must use that completed result without polling the
+        // handle again. Polling a completed JoinHandle a second time panics
+        // in Tokio, which previously hid the source gap and agent.lost.
+        let (host, key, _) = force_stop_fixture().await;
+        let mut child =
+            OwnedChild::spawn(exiting_test_command()).expect("spawn exiting test child");
+        timeout_at(deadline(), async {
+            while !child.try_observe_root_exit() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test child exit is observed");
+        let mut event_task = tokio::spawn(async {});
+        // Drive the select arm exactly: consume the handle once, as
+        // `event_result = &mut event_task` does when that arm wins.
+        let reader_result = (&mut event_task).await;
+        assert!(
+            reader_result.is_ok(),
+            "the consumed reader result must be Ok"
+        );
+        let (gap_reason, is_root_exit) = super::actor::arbitrate_reader_close(
+            child.try_observe_root_exit(),
+            reader_result.is_ok(),
+        );
+        assert!(is_root_exit, "observed exit must win over EOF");
+        assert_eq!(gap_reason, "root_exit_without_session_terminal");
+        let capture = eliot_plugin::spawn_stderr(
+            std::io::Cursor::new(b"root farewell\n".to_vec()),
+            Arc::new(SecretPolicy::default()),
+        );
+        let stderr = capture.view();
+        capture
+            .finish(Instant::now() + Duration::from_secs(5))
+            .await;
+        let agent = host
+            .state
+            .store
+            .lock()
+            .await
+            .get_agent(&key.id)
+            .unwrap()
+            .unwrap();
+        // Must not panic on the already-consumed handle.
+        super::actor::settle_observed_root_exit(
+            &Arc::downgrade(&host.state),
+            &key,
+            &mut child,
+            &host.state.monitoring,
+            &agent,
+            &mut event_task,
+            Some(reader_result),
+            &stderr,
+        )
+        .await;
+        let store = host.state.store.lock().await;
+        assert_eq!(
+            store.get_agent(&key.id).unwrap().unwrap().state,
+            AgentState::Lost
+        );
+        let events = store.read_events(0, 1000, None).unwrap();
+        let gap = events
+            .iter()
+            .find(|event| event.kind == "source.gap")
+            .expect("root exit gap");
+        assert_eq!(
+            gap.data["reason"],
+            json!("root_exit_without_session_terminal")
+        );
+        let lost = events
+            .iter()
+            .find(|event| event.kind == "agent.lost")
+            .expect("agent loss");
+        assert_eq!(
+            lost.data["reason"],
+            json!(eliot_core::PLUGIN_ROOT_EXITED_REASON)
+        );
+        assert_eq!(lost.data["exit_code"], json!(0));
     }
 
     async fn assert_force_loss(host: &PluginHost, key: &AgentKey, stop_id: &str) {
