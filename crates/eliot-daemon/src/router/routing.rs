@@ -271,7 +271,11 @@ fn native_installed(harness: &str, snapshot: &Value) -> bool {
 }
 
 /// Only the installed, projected native schemas establish exhaustion. No
-/// generic numeric search or model inference probe is used.
+/// generic numeric search or model inference probe is used. For Codex the
+/// explicit backend limit state (`spendControlReached`, `rateLimitReachedType`,
+/// a depleted `individualLimit`) settles exhaustion before window math, and
+/// metered `rateLimitsByLimitId` buckets map through their limit id or
+/// `normalModelSlug`, never by assuming the bucket key is a model slug.
 fn quota_exhausted(harness: &str, details: &Value, model: Option<&str>) -> bool {
     let full = |window: &Value| {
         window
@@ -294,7 +298,21 @@ fn quota_exhausted(harness: &str, details: &Value, model: Option<&str>) -> bool 
         return ["window", "weekly"].iter().any(|key| full(&usage[key]));
     }
     if harness == "codex" {
+        let limit_state_exhausted = |rates: &Value| {
+            rates.get("spendControlReached").and_then(Value::as_bool) == Some(true)
+                || rates
+                    .get("rateLimitReachedType")
+                    .is_some_and(|reached| !reached.is_null())
+                || rates
+                    .get("individualLimit")
+                    .and_then(|limit| limit.get("remainingPercent"))
+                    .and_then(Value::as_i64)
+                    .is_some_and(|remaining| remaining <= 0)
+        };
         let exhausted = |rates: &Value| {
+            if limit_state_exhausted(rates) {
+                return true;
+            }
             let credits = &rates["credits"];
             let credit_available = credits["unlimited"].as_bool() == Some(true)
                 || credits["hasCredits"].as_bool() == Some(true);
@@ -303,11 +321,24 @@ fn quota_exhausted(harness: &str, details: &Value, model: Option<&str>) -> bool 
         if exhausted(&details["rateLimits"]) {
             return true;
         }
-        // Per-limit windows are relevant only when their id is the exact
-        // requested model. An unrelated exhausted model never blocks this one.
-        return model
-            .and_then(|model| details["rateLimitsByLimitId"].get(model))
-            .is_some_and(exhausted);
+        // Metered buckets are keyed by limit_id, never model slugs: a bucket
+        // is relevant only when its key, `limitId`, or `normalModelSlug`
+        // names the requested model. An unrelated exhausted bucket never
+        // blocks this model.
+        let Some(buckets) = details
+            .get("rateLimitsByLimitId")
+            .and_then(Value::as_object)
+        else {
+            return false;
+        };
+        return buckets.iter().any(|(limit_id, snapshot)| {
+            let relevant = model.is_some_and(|model| {
+                limit_id.as_str() == model
+                    || snapshot.get("limitId").and_then(Value::as_str) == Some(model)
+                    || snapshot.get("normalModelSlug").and_then(Value::as_str) == Some(model)
+            });
+            relevant && exhausted(snapshot)
+        });
     }
     false
 }
@@ -428,5 +459,45 @@ mod tests {
             &json!({"rateLimitsByLimitId":{"other":{"primary":{"usedPercent":100}}}}),
             Some("mine")
         ));
+    }
+    #[test]
+    fn codex_quota_uses_limit_state_and_metered_mapping() {
+        // Audit #630: explicit backend limit state exhausts even with
+        // healthy windows.
+        assert!(quota_exhausted(
+            "codex",
+            &json!({"rateLimits":{"primary":{"usedPercent":10},"spendControlReached":true}}),
+            None
+        ));
+        assert!(quota_exhausted(
+            "codex",
+            &json!({"rateLimits":{"primary":{"usedPercent":10},"rateLimitReachedType":"rate_limit_reached"}}),
+            None
+        ));
+        assert!(quota_exhausted(
+            "codex",
+            &json!({"rateLimits":{"primary":{"usedPercent":10},"individualLimit":{"remainingPercent":0}}}),
+            None
+        ));
+        // Healthy limit state with healthy windows is not exhausted.
+        assert!(!quota_exhausted(
+            "codex",
+            &json!({"rateLimits":{"primary":{"usedPercent":10},"spendControlReached":false,"individualLimit":{"remainingPercent":40}}}),
+            None
+        ));
+        // Metered buckets map through normalModelSlug, never the key: the
+        // exhausted `codex` bucket blocks its normal model but not others.
+        let details = json!({"rateLimits":{"primary":{"usedPercent":1}},
+            "rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":100},"normalModelSlug":"gpt-5.4"}}});
+        assert!(quota_exhausted("codex", &details, Some("gpt-5.4")));
+        assert!(!quota_exhausted("codex", &details, Some("other-model")));
+        // A request naming the limit id itself still matches by key.
+        let by_key = json!({"rateLimits":{"primary":{"usedPercent":1}},
+            "rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":100}}}});
+        assert!(quota_exhausted("codex", &by_key, Some("codex")));
+        // An exhausted bucket whose limit state is unknown but whose mapping
+        // is unknown never blocks: relevance needs the key, limitId, or
+        // normalModelSlug to name the request.
+        assert!(!quota_exhausted("codex", &by_key, Some("gpt-5.4")));
     }
 }

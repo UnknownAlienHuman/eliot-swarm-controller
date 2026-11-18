@@ -738,9 +738,9 @@ fn project_spend_control_limit(limit: &Value) -> Result<Value> {
         .get("remainingPercent")
         .and_then(Value::as_i64)
         .ok_or_else(invalid_page)?;
-    if !(0..=100).contains(&remaining) {
-        return Err(invalid_page());
-    }
+    // The installed schema types `remainingPercent` as a plain integer with
+    // no range bound: retain the verbatim measurement and let routing
+    // interpret depletion (<= 0) explicitly.
     out.insert("remainingPercent".to_owned(), Value::from(remaining));
     let resets = limit
         .get("resetsAt")
@@ -2788,5 +2788,30 @@ mod tests {
                 .and_then(|snap| snap.get("normalModelSlug"))
                 .is_none()
         );
+    }
+    #[test]
+    fn spend_control_remaining_percent_has_no_range_bound() {
+        // Audit #630: the installed GetAccountRateLimits schema types
+        // remainingPercent as a plain integer, so out-of-range measurements
+        // project verbatim instead of rejecting the whole read. Routing
+        // interprets depletion (<= 0) explicitly.
+        for remaining in [-5i64, 160i64] {
+            let snapshot = serde_json::json!({
+                "individualLimit": {
+                    "limit": "100",
+                    "used": "60",
+                    "remainingPercent": remaining,
+                    "resetsAt": 1700000000
+                }
+            });
+            let projected = project_rate_limit_snapshot(&snapshot).expect("limit state projects");
+            assert_eq!(
+                projected
+                    .get("individualLimit")
+                    .and_then(|limit| limit.get("remainingPercent"))
+                    .and_then(|value| value.as_i64()),
+                Some(remaining)
+            );
+        }
     }
 }
