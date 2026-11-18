@@ -1473,6 +1473,16 @@ fn snapshot_from_entry(
             "profile_error",
         ));
     }
+    if entry.approval.is_some() {
+        return Err(profile_field_error(
+            source,
+            table_offset,
+            name,
+            "approval",
+            "the Codex slice has no approval mapping; use approval_policy",
+            "unsupported",
+        ));
+    }
     if entry.mode.is_some() || entry.dangerously_skip_permissions.is_some() {
         return Err(profile_field_error(
             source,
@@ -4338,6 +4348,26 @@ permissions = "workspace-write"
         let source = "[profiles.codex-luna]\nharness='codex'\nmodel='gpt-6-luna'\ncmd='C:/Tools/Codex/codex.exe'\n";
         let snapshot = resolve_text_profile(source, "codex-luna").unwrap();
         assert_eq!(snapshot["cmd"], "C:/Tools/Codex/codex.exe");
+    }
+
+    #[test]
+    fn codex_rejects_shared_approval_field() {
+        // The shared approval field has no Codex mapping: it must fail at
+        // freeze instead of passing validation while the native start silently
+        // uses approval_policy.
+        for approval in ["onRequest", "allowAll", "promptUnmatched"] {
+            let source =
+                format!("[profiles.c]\nharness=\"codex\"\nmodel=\"m1\"\napproval=\"{approval}\"\n");
+            let error = resolve_text_profile(&source, "c").expect_err("Codex must reject approval");
+            assert_eq!(error.code, "unsupported", "{source}");
+            assert!(error.message.contains("approval"), "{source}");
+        }
+        // approval_policy still freezes verbatim; no approval key appears.
+        let source =
+            "[profiles.c]\nharness=\"codex\"\nmodel=\"m1\"\napproval_policy=\"on-request\"\n";
+        let snapshot = resolve_text_profile(source, "c").unwrap();
+        assert_eq!(snapshot["approval_policy"], "on-request");
+        assert!(snapshot.get("approval").is_none());
     }
 
     #[test]
