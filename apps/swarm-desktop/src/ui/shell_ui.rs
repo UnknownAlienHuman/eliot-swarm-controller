@@ -2377,10 +2377,20 @@ impl DesktopApp {
     }
 
     /// Show a short notice above the composer (refusals, uncertain
-    /// outcomes, failed reads); it stays until dismissed or replaced.
+    /// outcomes, failed reads); it stays until dismissed or replaced. An
+    /// open queue offer keeps its notice, with Queue it (the same-id
+    /// retry), on screen: other messages go to the status line meanwhile.
     pub(super) fn alert(&mut self, text: impl Into<String>) {
         let text = text.into();
         self.set_status(text.clone());
+        if self
+            .launch
+            .queue_offer
+            .as_ref()
+            .is_some_and(|offer| offer.alert != text)
+        {
+            return;
+        }
         self.alert = Some(text);
     }
 
