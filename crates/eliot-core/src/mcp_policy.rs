@@ -212,11 +212,7 @@ pub fn is_swarm_executable_command(command: &str, controller_executable: Option<
         return false;
     }
     let file = command_file_name(command);
-    let is_swarm_name = file.eq_ignore_ascii_case("swarm")
-        || (file.len() > 4
-            && file[..file.len() - 4].eq_ignore_ascii_case("swarm")
-            && file[file.len() - 4..].eq_ignore_ascii_case(".exe"));
-    if is_swarm_name {
+    if file.eq_ignore_ascii_case("swarm") || file.eq_ignore_ascii_case("swarm.exe") {
         return true;
     }
     match controller_executable {
@@ -523,6 +519,18 @@ mod tests {
         let non_strings = serde_json::json!({"mcp_allow": [1]});
         assert!(parse_snapshot_allow_list(non_strings.as_object().unwrap()).is_err());
     }
+    #[test]
+    fn unicode_mcp_basename_is_classified_without_slicing() {
+        let command = "/tools/命令行";
+        let args = ["mcp".to_owned()];
+        assert!(!is_owner_swarm_stdio(Some(command), Some(&args), None));
+        assert!(is_owner_swarm_stdio(
+            Some(command),
+            Some(&args),
+            Some(command)
+        ));
+    }
+
     #[test]
     fn swarm_executable_matches_by_file_name_or_controller_path() {
         // File-name matches: bare, pathed, quoted, verbatim, any case.
