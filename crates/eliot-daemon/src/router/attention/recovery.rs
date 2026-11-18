@@ -1,5 +1,6 @@
 use super::{CapturedAgent, Router};
 use crate::common::now_ms;
+use eliot_core::api::SourceState;
 use eliot_core::{Agent, Result, TurnOutcome};
 use eliot_store::ActiveTurnRecovery;
 use serde_json::{Value, json};
@@ -12,10 +13,11 @@ const RETRY_DELAYS: [Duration; 4] = [
     Duration::from_secs(4),
 ];
 
-pub(super) async fn recover_active_turn(router: &Router, captured: &CapturedAgent) -> Result<bool> {
-    let agent = &captured.agent;
-    if agent.active_turn.is_none()
-        || !captured.source_states.iter().any(|source| {
+fn can_recover_active_turn(agent: &Agent, sources: &[SourceState]) -> bool {
+    // These adapters implement exact native turn evidence in agent.snapshot.
+    matches!(agent.harness.as_str(), "codex" | "muse" | "opencode")
+        && agent.active_turn.is_some()
+        && sources.iter().any(|source| {
             (source.state == "closed"
                 || source.gap_seq.is_some()
                 || matches!(source.health.as_str(), "stale" | "error"))
@@ -26,7 +28,11 @@ pub(super) async fn recover_active_turn(router: &Router, captured: &CapturedAgen
                     )
                 })
         })
-    {
+}
+
+pub(super) async fn recover_active_turn(router: &Router, captured: &CapturedAgent) -> Result<bool> {
+    let agent = &captured.agent;
+    if !can_recover_active_turn(agent, &captured.source_states) {
         return Ok(false);
     }
     let mut binding = None;
@@ -162,4 +168,48 @@ fn readback(agent: &Agent, binding: &ActiveTurnRecovery, snapshot: &Value) -> Re
         data["native_error"] = json!({"message": message});
     }
     Readback::Terminal(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_live_source_gap_only_enters_recovery_with_native_turn_readback() {
+        let sources = [SourceState {
+            agent_id: "a1".to_owned(),
+            generation: 1,
+            source: "stream".to_owned(),
+            families: vec!["turn".to_owned()],
+            owners: Vec::new(),
+            state: "open".to_owned(),
+            health: "stale".to_owned(),
+            cursor: None,
+            last_store_seq: None,
+            last_batch_id: None,
+            last_batch_first_seq: None,
+            last_batch_last_seq: None,
+            gap_id: Some("tool-gap".to_owned()),
+            gap_from: None,
+            gap_to: None,
+            gap_seq: Some(3),
+        }];
+        for (harness, expected) in [
+            ("claude", false),
+            ("antigravity", false),
+            ("codex", true),
+            ("muse", true),
+            ("opencode", true),
+        ] {
+            let mut agent = Agent::new("a1", "project", harness, "profile", 0);
+            agent.generation = 1;
+            agent.state = eliot_core::AgentState::Busy;
+            agent.active_turn = Some("turn-1".to_owned());
+            assert_eq!(
+                can_recover_active_turn(&agent, &sources),
+                expected,
+                "{harness}"
+            );
+        }
+    }
 }

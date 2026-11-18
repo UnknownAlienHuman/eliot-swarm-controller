@@ -1814,7 +1814,7 @@ impl EventProcessor {
                 Error::new("unknown", "OpenCode turn has no exact input association")
             })?;
         let readback = optional_terminal_readback(
-            read_terminal_messages(
+            read_turn_messages(
                 &self.http,
                 &terminal.session_id,
                 &input.inbox_id,
@@ -2487,11 +2487,13 @@ impl EventProcessor {
     }
 }
 
-fn optional_terminal_readback(
-    result: Result<TerminalReadback>,
-) -> Result<Option<TerminalReadback>> {
+fn optional_terminal_readback(result: Result<TurnReadback>) -> Result<Option<TerminalReadback>> {
     match result {
-        Ok(readback) => Ok(Some(readback)),
+        Ok(TurnReadback::Terminal(readback)) => Ok(Some(*readback)),
+        Ok(TurnReadback::Running) => Err(Error::new(
+            "unknown",
+            "OpenCode terminal readback found no terminal idle message",
+        )),
         Err(error) if error.code == "native_readback" => Ok(None),
         Err(error) => Err(error),
     }
@@ -2558,16 +2560,16 @@ fn terminal_turn_data(
 /// with each message's native `content` array order preserved (page
 /// position decides; timestamps never reorder it). Usage is the
 /// final assistant message's native token usage in that same exact
-/// user-to-selected-idle slice, attributed at message scope. Anything
-/// else (missing user message, missing idle, contradictory outcome) is
-/// a gap, never an inference. Only HTTP `native_readback` unavailability
-/// permits status-only settlement from the exactly associated SSE terminal.
-pub(crate) async fn read_terminal_messages(
+/// user-to-selected-idle slice, attributed at message scope.
+/// A healthy read with the exact user message and no newer idle proves
+/// running. A missing user message, invalid history or HTTP failure does
+/// not establish either state.
+pub(crate) async fn read_turn_messages(
     http: &OpenCodeHttp,
     session_id: &str,
     inbox_id: &str,
     deadline: Instant,
-) -> Result<TerminalReadback> {
+) -> Result<TurnReadback> {
     let mut cursor: Option<String> = None;
     let mut seen_cursors = HashSet::new();
     let mut user_position: Option<usize> = None;
@@ -2645,17 +2647,14 @@ pub(crate) async fn read_terminal_messages(
         ));
     };
     let Some((idle_id, outcome, idle_error, idle_position)) = idle else {
-        return Err(Error::new(
-            "unknown",
-            "OpenCode terminal readback found no terminal idle message",
-        ));
+        return Ok(TurnReadback::Running);
     };
     // Assistant text strictly between our input and the selected idle in
     // newest-first page order: positions after the idle, before our user.
     // Both text and usage share this exact slice, so assistants newer
     // than the selected idle never leak into either.
     let final_text = project_terminal_text(texts, idle_position, user_position);
-    Ok(TerminalReadback {
+    Ok(TurnReadback::Terminal(Box::new(TerminalReadback {
         idle_id,
         outcome: match outcome.as_str() {
             "succeeded" => "completed".to_owned(),
@@ -2671,7 +2670,12 @@ pub(crate) async fn read_terminal_messages(
         idle_error,
         final_text,
         usage: final_message_usage(&usages, idle_position, user_position),
-    })
+    })))
+}
+
+pub(crate) enum TurnReadback {
+    Running,
+    Terminal(Box<TerminalReadback>),
 }
 
 pub(crate) struct TerminalReadback {
@@ -2991,6 +2995,67 @@ mod tests {
     };
     use tokio::time::Instant;
 
+    #[tokio::test]
+    async fn bound_user_without_newer_idle_proves_running_only_on_a_healthy_read() {
+        use super::{TurnReadback, read_turn_messages};
+        use crate::native::client::OpenCodeHttp;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http = OpenCodeHttp::new(
+            listener.local_addr().unwrap().port(),
+            "test-password".to_owned(),
+            &std::env::current_dir().unwrap(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for (status, body) in [
+                (
+                    "200 OK",
+                    r#"{"data":[{"type":"user","id":"msg_bound","time":{"created":2}},{"type":"idle","id":"msg_old","time":{"created":1},"outcome":"succeeded"}]}"#,
+                ),
+                (
+                    "200 OK",
+                    r#"{"data":[{"type":"user","id":"msg_foreign","time":{"created":2}}]}"#,
+                ),
+                ("503 Service Unavailable", "{}"),
+            ] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("GET /api/session/ses_bound/message?"));
+                loop {
+                    line.clear();
+                    assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                socket.get_mut().write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let read = || {
+            read_turn_messages(
+                &http,
+                "ses_bound",
+                "msg_bound",
+                Instant::now() + Duration::from_secs(5),
+            )
+        };
+        assert!(matches!(read().await, Ok(TurnReadback::Running)));
+        assert!(matches!(read().await, Err(error) if error.code == "unknown"));
+        assert!(matches!(read().await, Err(error) if error.code == "native_readback"));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn unavailable_terminal_enrichment_preserves_bound_status_without_text_or_usage() {
         for status in ["completed", "failed", "interrupted"] {
@@ -3029,13 +3094,16 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(error.code, "unknown");
-        let readback = super::optional_terminal_readback(Ok(super::TerminalReadback {
-            idle_id: "idle-1".to_owned(),
-            outcome: "failed".to_owned(),
-            idle_error: None,
-            final_text: None,
-            usage: None,
-        }))
+        assert!(super::optional_terminal_readback(Ok(super::TurnReadback::Running)).is_err());
+        let readback = super::optional_terminal_readback(Ok(super::TurnReadback::Terminal(
+            Box::new(super::TerminalReadback {
+                idle_id: "idle-1".to_owned(),
+                outcome: "failed".to_owned(),
+                idle_error: None,
+                final_text: None,
+                usage: None,
+            }),
+        )))
         .unwrap()
         .unwrap();
         // Successful conflicting evidence is retained for complete_turn's

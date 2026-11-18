@@ -167,6 +167,11 @@ Agent epoch. No guaranteed exclusive native history cursor means no historical r
 If a selected API supplies one, use its exact continuation contract. List absence,
 update time or silence never proves terminal execution.
 
+For an active turn, `agent.snapshot` verifies the exact session and reads its native
+message list. Finding the bound user message without a newer native `idle` message
+proves the turn is in progress. A failed read or missing bound user message leaves
+the outcome inconclusive.
+
 A restart of the externally owned service while input is queued or running is decided
 when this harness is implemented: either proven continuation of that input on the same
 store, or proven final interruption. Until one is shown, the input stays unknown and is

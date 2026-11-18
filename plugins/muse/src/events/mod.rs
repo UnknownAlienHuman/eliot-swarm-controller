@@ -3017,6 +3017,21 @@ impl EventProcessor {
                 .record_gap("Muse terminal notification did not match the exact active turn")
                 .await;
         }
+        if self.status.view_unavailable
+            || (notification.terminal == NativeTurnTerminal::Failed && notification.error.is_none())
+        {
+            self.status.needs_idle_proof = true;
+            if !self.status.view_unavailable {
+                self.view_unavailable(&notification.session_id, NativeHistoryNoneReason::Unknown)
+                    .await?;
+            }
+            // Leave the cursor and active turn in place until the daemon has
+            // command-plane evidence. A projection can synthesize this frame.
+            return Err(Error::new(
+                "native_readback",
+                "Muse native view is unavailable; terminal requires command-plane confirmation",
+            ));
+        }
         let Some(status_text) = turn_status(&notification.terminal) else {
             return self
                 .record_gap("Muse turn/completed carried an unknown terminal")
@@ -4610,6 +4625,104 @@ fn terminal_provider_restriction(
 mod tests {
     use super::*;
     use eliot_plugin::protocol::MAX_COMMAND_ID_BYTES;
+
+    #[tokio::test]
+    async fn unproven_terminal_keeps_the_turn_and_cursor_fenced() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (host_io, plugin_io) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(plugin_io);
+        let mut peer = eliot_plugin::Peer::from_io(read, write);
+        let client = peer.client();
+        let peer_task = tokio::spawn(async move { while peer.next_request().await.is_some() {} });
+        let mut native = crate::native::NativeProcess::spawn(
+            crate::native::NativeLaunch {
+                program: std::env::current_exe().unwrap().into_os_string(),
+                args: vec!["--list".into()],
+                cwd: std::env::current_dir().unwrap(),
+                environment: Vec::new(),
+            },
+            SecretPolicy::default(),
+        )
+        .await
+        .unwrap();
+        let mut processor = EventProcessor::new(
+            native.client(),
+            client,
+            EventConfig {
+                credential: "test-credential".into(),
+                agent_id: "a1".into(),
+                generation: 1,
+                secrets: Vec::new(),
+            },
+        );
+        processor.status.ready = true;
+        processor.status.session_id = Some("session-1".into());
+        processor.status.active_command_id = Some("send-1".into());
+        processor.status.active_turn_id = Some("turn-1".into());
+
+        let terminal = |outcome, cursor| NativeFrame::Notification {
+            method: "turn/completed".to_owned(),
+            params: json!({"sessionId":"session-1", "turnId":"turn-1",
+                "viewCursor":cursor, "terminal":outcome}),
+        };
+        let (read, mut write) = tokio::io::split(host_io);
+        let mut read = BufReader::new(read);
+        let (kept_running, ()) = tokio::join!(
+            processor.handle_frame(Some(terminal("failed", "rev-1"))),
+            async {
+                let mut line = String::new();
+                read.read_line(&mut line).await.unwrap();
+                let gap: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(gap.method, "source.gap");
+                assert!(
+                    gap.params["reason"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(MUSE_VIEW_UNAVAILABLE_REASON_PREFIX)
+                );
+                let reply = json!({"jsonrpc":"2.0", "id":gap.id,
+                "result":{"gap_id":gap.params["gap_id"], "seq":1}});
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+
+                line.clear();
+                read.read_line(&mut line).await.unwrap();
+                let health: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(health.method, "source.health");
+                assert_eq!(health.params["health"], "stale");
+                let mut result = health.params;
+                result.as_object_mut().unwrap().remove("credential");
+                let reply = json!({"jsonrpc":"2.0", "id":health.id, "result":result});
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        );
+        assert!(kept_running && processor.status.view_unavailable);
+
+        // Even a completed frame needs idle proof while the view is unavailable.
+        assert!(
+            processor
+                .handle_frame(Some(terminal("completed", "rev-2")))
+                .await
+        );
+        assert_eq!(processor.status.active_turn_id.as_deref(), Some("turn-1"));
+        assert!(processor.status.last_turn.is_none());
+        assert!(processor.applied_view_cursors.seen.is_empty());
+        assert!(processor.status.needs_idle_proof);
+        assert!(processor.reestablish_idle("session-1").unwrap());
+        assert!(!processor.status.needs_idle_proof && processor.status.failure.is_none());
+
+        native
+            .terminate(true, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        peer_task.abort();
+    }
 
     #[tokio::test]
     async fn busy_stop_without_native_terminal_keeps_exact_turn_unknown() {

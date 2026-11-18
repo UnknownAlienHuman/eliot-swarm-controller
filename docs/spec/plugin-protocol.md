@@ -172,6 +172,9 @@ obtains fresh native evidence, it reports the Agent, generation, command, native
 scope/reference, session state, active native turn, and the exact turn's
 status and terminal flag. `turn_evidence` names the native read that established the
 facts. An idle session alone does not establish the turn's outcome.
+The attention monitor applies its bounded active-turn recovery only to adapters
+that return native `turn_evidence` for these snapshots (currently Codex, Muse, and
+OpenCode).
 
 For SEND, the same `agent.command` effect carries the FIFO `next_input` items claimed
 from existing command rows, plus the effective configuration overlay when one

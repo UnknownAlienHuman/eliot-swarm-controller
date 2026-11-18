@@ -3535,16 +3535,15 @@ impl OpenCodePlugin {
                 "OpenCode session readback did not prove the exact owned session",
             );
         }
-        let native_terminal = if let Some(input) =
-            event_status.turn_input.as_ref().filter(|input| {
-                request.turn_id.as_deref() == Some(input.turn_id.as_str())
-                    && params.command_id == input.command_id
-                    && event_status
-                        .active_turn_id
-                        .as_ref()
-                        .is_none_or(|active| active == &input.turn_id)
-            }) {
-            events::read_terminal_messages(
+        let native_turn = if let Some(input) = event_status.turn_input.as_ref().filter(|input| {
+            request.turn_id.as_deref() == Some(input.turn_id.as_str())
+                && params.command_id == input.command_id
+                && event_status
+                    .active_turn_id
+                    .as_ref()
+                    .is_none_or(|active| active == &input.turn_id)
+        }) {
+            events::read_turn_messages(
                 &session.http,
                 &request.session_id,
                 &input.inbox_id,
@@ -3552,19 +3551,29 @@ impl OpenCodePlugin {
             )
             .await
             .ok()
+            .filter(|readback| {
+                !matches!(readback, events::TurnReadback::Running)
+                    || event_status.active_turn_id.as_deref() == Some(input.turn_id.as_str())
+            })
         } else {
             None
         };
-        let turn_evidence = native_terminal
+        let turn_evidence = native_turn
             .as_ref()
-            .map(|_| "GET /api/session/{id}/message");
-        let active_turn = if native_terminal.is_some() {
+            .map(|_| "GET /api/session/{id}+GET /api/session/{id}/message");
+        let active_turn = if matches!(&native_turn, Some(events::TurnReadback::Terminal(_))) {
             None
         } else {
             event_status.active_turn_id.clone()
         };
-        let last_turn = match native_terminal {
-            Some(terminal) => {
+        let last_turn = match native_turn {
+            Some(events::TurnReadback::Running) => json!({
+                "command_id": params.command_id,
+                "turn_id": request.turn_id,
+                "status": "inProgress",
+                "terminal": false,
+            }),
+            Some(events::TurnReadback::Terminal(terminal)) => {
                 json!({
                     "command_id": params.command_id,
                     "turn_id": request.turn_id,

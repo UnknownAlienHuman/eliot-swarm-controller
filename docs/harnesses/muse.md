@@ -143,6 +143,9 @@ Only explicit idle with a present-null `activeTurnId` permits a bounded
 backward `view/page` scan for the exact durable terminal and optional final
 `agentMessage`. A projection reconstructed from an unfinished source prefix
 can contain a synthetic failed terminal while the native run continues.
+The stream adapter holds `turn/completed` when the view is unavailable or when
+the frame reports failure without a structured error. It marks the view unavailable
+for monitor readback and keeps the next send gated on fresh explicit idle proof.
 
 The daemon commits the proven terminal and available final text, or commits
 `turn.unknown` after its bounded inconclusive reads. It retains the recorded
