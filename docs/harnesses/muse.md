@@ -688,9 +688,11 @@ effective id is read back from the session. An unavailable requested model
 fails without substitution. `cmd` is discovered from the launcher dir version
 the launcher marks current (`muse.cmd` wrappers are never frozen); `--cmd`
 pins one explicit binary version instead (e.g. the 1.4.0 binary while the
-launcher marks 1.4.20). `swarm models --harness muse` returns the live native
-catalogue; its note names the `isDefault`-marked row when the server marks
-one, and an omitted `--model` still launches with the server default. An empty native read
+launcher marks 1.4.20). On Linux the native payload installs directly (`muse`
+on `PATH`, `/usr/local/bin/muse`) with no launcher selection.
+`swarm models --harness muse` returns the live native catalogue; its note
+names the `isDefault`-marked row when the server marks one, and an omitted
+`--model` still launches with the server default. An empty native read
 reports
 `catalogue: "empty"` with a note naming the binary and the `--cmd` / profile
 remedy.

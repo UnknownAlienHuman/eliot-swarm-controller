@@ -358,7 +358,10 @@ launch). `cmd` is discovered by following the npm shim to the native
 `<shim-dir>/node_modules/@opencode/cli/bin/opencode.exe`, then the known
 package-local paths under every roaming root including the
 `USERPROFILE`-derived default when `APPDATA` is stripped); `--cmd` pins one
-explicit install instead. `swarm models --harness opencode` lists the native
+explicit install instead. On Linux the bare `opencode` binary is used instead
+(`opencode` on `PATH`, `/usr/local/bin/opencode`, `~/.opencode/bin/opencode`,
+`/opt/opencode/.opencode/bin/opencode`); the npm `.cmd` shim layout does not
+exist there and is never consulted. `swarm models --harness opencode` lists the native
 `opencode models --standalone` catalogue (`provider/model` ids verbatim) with each
 model's installed `Model.Variant` ids overlaid as `efforts` from the
 read-only `opencode api model.list --standalone` operation (`model.list`, the same

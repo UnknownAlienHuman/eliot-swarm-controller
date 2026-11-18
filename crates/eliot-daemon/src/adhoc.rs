@@ -641,6 +641,8 @@ pub(crate) fn is_script_wrapper(path: &str) -> bool {
 /// name (`codex`) through the existing PATH lookup at spawn, so this returns
 /// `None`. Every other harness returns an absolute native path, or a
 /// deterministic `unsupported`/`profile_error` naming what was searched.
+/// Executable names follow the platform: `*.exe` on Windows, bare names
+/// plus the documented `/usr/local/bin` install paths on Linux.
 pub(crate) fn discover_cmd_for_harness(harness: &str) -> core::Result<Option<String>> {
     let harness = validate_adhoc_harness(harness)?;
     match harness.as_str() {
@@ -658,6 +660,18 @@ pub(crate) fn discover_cmd_for_harness(harness: &str) -> core::Result<Option<Str
 
 fn path_search_dirs() -> Vec<PathBuf> {
     std::env::var_os("PATH").map_or_else(Vec::new, |paths| std::env::split_paths(&paths).collect())
+}
+
+/// Native executable file name for `stem` on this platform: `stem.exe` on
+/// Windows, the bare stem on Unix. The supported Linux image installs the
+/// vendors' binaries under `/usr/local/bin` (see docker/Dockerfile), so no
+/// `.exe`/`.cmd` wrapper name is ever probed there.
+fn native_exe_name(stem: &str) -> String {
+    if cfg!(windows) {
+        format!("{stem}.exe")
+    } else {
+        stem.to_owned()
+    }
 }
 
 pub(crate) fn find_on_path(file: &str) -> Option<PathBuf> {
@@ -774,40 +788,92 @@ fn parse_cli_version(text: &str) -> Option<(u64, u64, u64)> {
 /// `PATH` (stable order), the standard user locations, then the desktop-app
 /// bundles. Each entry carries its own bounded `--version`.
 pub(crate) fn discover_claude_candidates() -> Vec<core::api::HarnessCandidate> {
+    probe_candidate_paths(claude_candidate_paths())
+}
+
+/// Filesystem hits in priority order, before versioning: `claude` hits on
+/// `PATH` (stable order), the standard user locations, then (Windows only)
+/// the desktop-app bundles. Unix layouts follow the vendors' installers:
+/// the supported Linux image symlinks `/usr/local/bin/claude` at the
+/// official installer root (see docker/Dockerfile).
+fn claude_candidate_paths() -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut push = |path: PathBuf| {
         if !paths.contains(&path) {
             paths.push(path);
         }
     };
-    for dir in path_search_dirs() {
-        let exe = dir.join("claude.exe");
-        if exe.is_file() {
-            push(exe);
+    if cfg!(windows) {
+        for dir in path_search_dirs() {
+            let exe = dir.join(native_exe_name("claude"));
+            if exe.is_file() {
+                push(exe);
+            }
+        }
+        if let Some(home) = user_profile() {
+            push(
+                home.join(".local")
+                    .join("bin")
+                    .join(native_exe_name("claude")),
+            );
+        }
+        for roaming in roaming_roots() {
+            push(roaming.join("npm").join(native_exe_name("claude")));
+        }
+        for local in local_roots() {
+            push(
+                local
+                    .join("Programs")
+                    .join("claude")
+                    .join(native_exe_name("claude")),
+            );
+        }
+        for roaming in roaming_roots() {
+            for exe in claude_bundle_exes(&roaming) {
+                push(exe);
+            }
+        }
+    } else {
+        for dir in path_search_dirs() {
+            let exe = dir.join("claude");
+            if exe.is_file() {
+                push(exe);
+            }
+        }
+        let fixed = Path::new("/usr/local/bin/claude");
+        if fixed.is_file() {
+            push(fixed.to_path_buf());
+        }
+        if let Some(home) = user_profile() {
+            push(home.join(".local").join("bin").join("claude"));
         }
     }
-    if let Some(home) = user_profile() {
-        push(home.join(".local").join("bin").join("claude.exe"));
-    }
-    for roaming in roaming_roots() {
-        push(roaming.join("npm").join("claude.exe"));
-    }
-    for local in local_roots() {
-        push(local.join("Programs").join("claude").join("claude.exe"));
-    }
-    for roaming in roaming_roots() {
-        for exe in claude_bundle_exes(&roaming) {
-            push(exe);
-        }
-    }
+    paths
+}
+
+/// Version candidate paths, newest first, probing at most
+/// [`MAX_DISCOVERY_CANDIDATE_PROBES`] native executables: filesystem hits
+/// are cheap, process launches are not. Paths past the cap stay listed
+/// without a version so inventory stays complete while launches stay
+/// bounded. The stable sort keeps versioned newest-first; unversioned paths
+/// keep discovery order at the end.
+fn probe_candidate_paths(paths: Vec<PathBuf>) -> Vec<core::api::HarnessCandidate> {
+    probe_candidate_paths_with(paths, native_version_string)
+}
+
+fn probe_candidate_paths_with(
+    paths: Vec<PathBuf>,
+    mut probe: impl FnMut(&str) -> Option<String>,
+) -> Vec<core::api::HarnessCandidate> {
     /// One discovered install plus its parsed `--version` triple, if any.
     type VersionedCandidate = (core::api::HarnessCandidate, Option<(u64, u64, u64)>);
-    let mut candidates: Vec<VersionedCandidate> = paths
-        .into_iter()
-        .filter(|path| path.is_file())
+    let existing: Vec<PathBuf> = paths.into_iter().filter(|path| path.is_file()).collect();
+    let mut candidates: Vec<VersionedCandidate> = existing
+        .iter()
+        .take(MAX_DISCOVERY_CANDIDATE_PROBES)
         .map(|path| {
             let cmd = path.to_string_lossy().into_owned();
-            let version = native_version_string(&cmd);
+            let version = probe(&cmd);
             (
                 core::api::HarnessCandidate {
                     cmd,
@@ -816,10 +882,24 @@ pub(crate) fn discover_claude_candidates() -> Vec<core::api::HarnessCandidate> {
                 version.as_deref().and_then(parse_cli_version),
             )
         })
-        .filter(|(candidate, _)| {
-            Path::new(&candidate.cmd).is_absolute() && !is_script_wrapper(&candidate.cmd)
+        .collect();
+    let mut unversioned: Vec<VersionedCandidate> = existing
+        .iter()
+        .skip(MAX_DISCOVERY_CANDIDATE_PROBES)
+        .map(|path| {
+            (
+                core::api::HarnessCandidate {
+                    cmd: path.to_string_lossy().into_owned(),
+                    version: None,
+                },
+                None,
+            )
         })
         .collect();
+    candidates.append(&mut unversioned);
+    candidates.retain(|(candidate, _)| {
+        Path::new(&candidate.cmd).is_absolute() && !is_script_wrapper(&candidate.cmd)
+    });
     // Stable sort: versioned newest-first, unversioned last in discovery
     // order. Ties keep the stable priority order above.
     candidates.sort_by(|left, right| match (&left.1, &right.1) {
@@ -835,6 +915,23 @@ pub(crate) fn discover_claude_candidates() -> Vec<core::api::HarnessCandidate> {
 }
 
 fn claude_search_locations() -> Vec<String> {
+    if cfg!(not(windows)) {
+        let mut searched = vec![
+            "claude on PATH".to_owned(),
+            "/usr/local/bin/claude".to_owned(),
+        ];
+        if let Some(home) = user_profile() {
+            searched.push(
+                home.join(".local")
+                    .join("bin")
+                    .join("claude")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        searched.dedup();
+        return searched;
+    }
     let mut searched = vec!["claude.exe on PATH".to_owned()];
     if let Some(home) = user_profile() {
         searched.push(
@@ -946,6 +1043,59 @@ fn opencode_shim_dirs() -> Vec<PathBuf> {
 }
 
 fn discover_opencode_cmd() -> core::Result<String> {
+    if cfg!(windows) {
+        return discover_opencode_cmd_windows();
+    }
+    discover_opencode_cmd_unix()
+}
+
+/// Unix OpenCode: the bare `opencode` binary. The supported Linux image
+/// symlinks `/usr/local/bin/opencode` at the official 2.2.7 install root
+/// (see docker/Dockerfile); the Windows npm `.cmd` shim layout does not
+/// exist here and is never consulted.
+fn discover_opencode_cmd_unix() -> core::Result<String> {
+    let mut searched = vec!["opencode on PATH".to_owned()];
+    let mut candidates = Vec::new();
+    for dir in path_search_dirs() {
+        let exe = dir.join("opencode");
+        if exe.is_file() {
+            candidates.push(exe);
+        }
+    }
+    for fixed in [
+        Path::new("/usr/local/bin/opencode").to_path_buf(),
+        Path::new("/opt/opencode/.opencode/bin/opencode").to_path_buf(),
+    ] {
+        searched.push(fixed.to_string_lossy().into_owned());
+        if fixed.is_file() && !candidates.contains(&fixed) {
+            candidates.push(fixed);
+        }
+    }
+    if let Some(home) = user_profile() {
+        let exe = home.join(".opencode").join("bin").join("opencode");
+        searched.push(exe.to_string_lossy().into_owned());
+        if exe.is_file() && !candidates.contains(&exe) {
+            candidates.push(exe);
+        }
+    }
+    for candidate in &candidates {
+        if candidate.is_file() {
+            let path = candidate.to_string_lossy().into_owned();
+            if !is_script_wrapper(&path) && Path::new(&path).is_absolute() {
+                return Ok(path);
+            }
+        }
+    }
+    Err(core::Error::new(
+        "unsupported",
+        format!(
+            "opencode native executable was not found; searched {}",
+            searched.join(", ")
+        ),
+    ))
+}
+
+fn discover_opencode_cmd_windows() -> core::Result<String> {
     // Follow the npm shim to the native exe inside the package: the shim
     // itself (opencode.cmd) must never be frozen.
     let roaming = roaming_roots();
@@ -998,6 +1148,41 @@ fn current_muse_version(launcher_dir: &Path) -> Option<String> {
 }
 
 fn discover_muse_cmd(launcher_dir: &Path) -> core::Result<String> {
+    if cfg!(windows) {
+        return discover_muse_cmd_windows(launcher_dir);
+    }
+    let _ = launcher_dir;
+    discover_muse_cmd_unix()
+}
+
+/// Unix Muse: the native payload installs directly (the supported Linux
+/// image puts the official release-manifest binary at `/usr/local/bin/muse`
+/// with no launcher selection, see docker/Dockerfile), so `PATH` plus the
+/// documented absolute path win. No `--version` probe runs here; the binary
+/// is validated on use.
+fn discover_muse_cmd_unix() -> core::Result<String> {
+    let mut searched = vec!["muse on PATH".to_owned(), "/usr/local/bin/muse".to_owned()];
+    if let Some(found) = find_on_path("muse") {
+        let path = found.to_string_lossy().into_owned();
+        if !is_script_wrapper(&path) && Path::new(&path).is_absolute() {
+            return Ok(path);
+        }
+        searched.push(format!("muse on PATH (wrapper or non-absolute: {path})"));
+    }
+    let fixed = Path::new("/usr/local/bin/muse");
+    if fixed.is_file() {
+        return Ok(fixed.to_string_lossy().into_owned());
+    }
+    Err(core::Error::new(
+        "profile_error",
+        format!(
+            "muse native executable was not found; searched {}",
+            searched.join(", ")
+        ),
+    ))
+}
+
+fn discover_muse_cmd_windows(launcher_dir: &Path) -> core::Result<String> {
     let version = current_muse_version(launcher_dir).ok_or_else(|| {
         core::Error::new(
             "profile_error",
@@ -1174,11 +1359,31 @@ async fn muse_probe_catalogue(
 }
 
 pub(crate) async fn select_muse_hot_start_cmd() -> (Option<String>, Vec<String>, bool) {
-    let candidates = discover_muse_candidates(&default_muse_launcher_dir());
+    let candidates = muse_hot_start_candidates();
     select_muse_with_probe(&candidates, MUSE_SELECTION_BUDGET, |cmd| async move {
         probe_muse_catalogue_nonempty(&cmd).await
     })
     .await
+}
+
+/// Hot-start candidate binaries in priority order: the Windows launcher
+/// payloads, or on Unix the `PATH` binary plus the documented absolute
+/// install path (no launcher selection there).
+fn muse_hot_start_candidates() -> Vec<String> {
+    if cfg!(windows) {
+        return discover_muse_candidates(&default_muse_launcher_dir());
+    }
+    let mut cmds = Vec::new();
+    if let Some(found) = find_on_path("muse") {
+        cmds.push(found.to_string_lossy().into_owned());
+    }
+    let fixed = Path::new("/usr/local/bin/muse")
+        .to_string_lossy()
+        .into_owned();
+    if Path::new(&fixed).is_file() && !cmds.contains(&fixed) {
+        cmds.push(fixed);
+    }
+    cmds
 }
 
 async fn select_muse_with_probe<F, Fut>(
@@ -1559,6 +1764,52 @@ mod tests {
         let error =
             adhoc_snapshot("fake", None, None, None, AdhocAuth::Resolve(None), None).unwrap_err();
         assert_eq!(error.code, "unsupported");
+    }
+
+    #[test]
+    fn native_exe_names_follow_the_platform() {
+        if cfg!(windows) {
+            assert_eq!(native_exe_name("claude"), "claude.exe");
+            assert!(
+                claude_search_locations()
+                    .iter()
+                    .any(|s| s.contains("claude.exe"))
+            );
+        } else {
+            assert_eq!(native_exe_name("claude"), "claude");
+            let searched = claude_search_locations();
+            assert!(
+                searched.iter().any(|s| s.contains("claude on PATH")),
+                "{searched:?}"
+            );
+            assert!(
+                searched.iter().any(|s| s.contains("/usr/local/bin/claude")),
+                "{searched:?}"
+            );
+            assert!(!searched.iter().any(|s| s.contains(".exe")), "{searched:?}");
+        }
+    }
+
+    #[test]
+    fn unix_discovery_reports_documented_paths_without_wrapper_names() {
+        if cfg!(windows) {
+            return;
+        }
+        let error = discover_muse_cmd_unix().map(|_| ()).unwrap_err();
+        assert!(
+            error.message.contains("/usr/local/bin/muse"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains(".exe"), "{}", error.message);
+        let error = discover_opencode_cmd_unix().map(|_| ()).unwrap_err();
+        assert!(
+            error.message.contains("/usr/local/bin/opencode"),
+            "{}",
+            error.message
+        );
+        assert!(!error.message.contains(".exe"), "{}", error.message);
+        assert!(!error.message.contains(".cmd"), "{}", error.message);
     }
 
     #[test]
