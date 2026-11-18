@@ -1957,6 +1957,28 @@ fn timer_wake_delay(timer: &ActiveTimer, now: i64) -> Option<Duration> {
     ))
 }
 
+/// Agent-bound project verbs whose catch-up preparation must verify the
+/// frozen Agent target and generation before admission. This mirrors the
+/// closed project-rule verb classification enforced by `authorize_command`
+/// (router/auth.rs): targetless coordination actions (`run`, `launch`,
+/// `notify`, `emit`, `mail.send`, `var.set`) and project Git actions
+/// (`git.fetch`) skip Agent scope checks here exactly as they do on the live
+/// path. Unknown verbs stay fail-closed at ordinary admission.
+fn project_rule_catch_up_binds_agent(verb: &str) -> bool {
+    matches!(
+        verb,
+        "resume"
+            | "stop"
+            | "send"
+            | "steer"
+            | "inject"
+            | "interrupt"
+            | "approve"
+            | "deny"
+            | "answer"
+    )
+}
+
 pub(crate) async fn prepare_rule_catch_up_actions(
     router: &Router,
     definition: &RuleDefinition,
@@ -1996,7 +2018,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     for (event, request) in rendered {
         let event_seq = event.seq;
         if let Some(project) = project
-            && !matches!(request.verb.as_str(), "run" | "launch")
+            && project_rule_catch_up_binds_agent(request.verb.as_str())
         {
             let target = request
                 .target
@@ -2930,6 +2952,105 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
                 "revoked project Run approval fails request-wide before admission"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn project_catch_up_prepares_targetless_var_set_without_agent_target() {
+        use eliot_core::{AgentState, EventSubject};
+        use std::{fs, io::Cursor, path::Path};
+
+        let root =
+            std::env::temp_dir().join(format!("eliot-project-var-catch-up-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        let checkout = root.join("checkout");
+        let data_root = root.join("owner-data");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&data_root).unwrap();
+        let git_init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(git_init.success(), "initialize project fixture repository");
+
+        fs::write(
+            data_root.join("config.toml"),
+            format!(
+                concat!(
+                    "[profiles.fixture]\n",
+                    "harness = \"codex\"\n",
+                    "model = \"fixture-model\"\n",
+                    "[projects.var-catch-up]\n",
+                    "path = {checkout:?}\n",
+                    "profiles = [\"fixture\"]\n",
+                    "actions = [\"var.set\"]\n",
+                    "run_env = [\"CI\"]\n",
+                ),
+                checkout = checkout.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let store = std::sync::Arc::new(tokio::sync::Mutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let router = Router::new(
+            data_root.clone(),
+            "catch-up-var-fixture-owner".to_owned(),
+            store,
+            crate::bus::Bus::new(16),
+        );
+        let (_, loaded) = projects::load_registrations(&data_root).await.unwrap();
+        let input = project_registration_input(&loaded[0]);
+        let registration = router
+            .reconcile_project_registrations(&[input])
+            .await
+            .unwrap()
+            .remove(0);
+
+        let definition = definition::load(Cursor::new(
+            "[[rule]]\nid = 'project-catch-up-var'\non = { event = 'turn.completed' }\ndo = [{ action = 'var.set', scope = 'project:app', key = 'k', value = 'v' }]\n",
+        ))
+        .unwrap()
+        .remove(0);
+        let event = Event {
+            seq: 41,
+            ts: 100,
+            kind: "turn.completed".to_owned(),
+            agent: Some("a1".to_owned()),
+            subject: Some(EventSubject {
+                project: registration.id.clone(),
+                harness: "fake".to_owned(),
+                profile: "fake".to_owned(),
+                state: AgentState::Busy,
+                workspace: Some(registration.checkout.clone()),
+            }),
+            generation: Some(3),
+            source: "stream".to_owned(),
+            native_id: Some("fixture:turn.completed".to_owned()),
+            data: serde_json::json!({"status": "complete"}),
+            cause: None,
+        };
+
+        let actions = prepare_rule_catch_up_actions(
+            &router,
+            &definition,
+            17,
+            std::slice::from_ref(&event),
+            Some(&registration),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].event_seq, event.seq);
+        let request = match &actions[0].outcome {
+            eliot_store::RuleCatchUpActionOutcome::Command(request) => request,
+            outcome => panic!("expected prepared var.set command, got {outcome:?}"),
+        };
+        assert_eq!(request.verb, "var.set");
+        assert_eq!(request.target, None);
+        assert_eq!(request.expected_generation, None);
     }
 
     #[tokio::test]
