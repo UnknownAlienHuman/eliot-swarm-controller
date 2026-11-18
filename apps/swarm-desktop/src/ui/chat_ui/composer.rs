@@ -342,9 +342,7 @@ impl DesktopApp {
                     .text_wrapping(TextWrapping::Wrap),
                     m3::text_button(palette)
                         .automation_name("Retry reading effort levels")
-                        .on_click(
-                            context.message(Message::Configure(ConfigureMsg::CatalogRetry)),
-                        )
+                        .on_click(context.message(Message::Configure(ConfigureMsg::CatalogRetry)))
                         .content(m3::label("Retry")),
                 ))
                 .into(),

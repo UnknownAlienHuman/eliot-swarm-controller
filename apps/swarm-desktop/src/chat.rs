@@ -1853,7 +1853,10 @@ mod tests {
                 })
                 .collect(),
         );
-        chat.apply_inputs(vec![("stray".to_owned(), InputText::Loaded("z".repeat(1_024)))]);
+        chat.apply_inputs(vec![(
+            "stray".to_owned(),
+            InputText::Loaded("z".repeat(1_024)),
+        )]);
         chat.apply_turns(&[]);
         assert!(chat.coverage().evicted_turns > 0);
         assert!(!chat.inputs.contains_key("stray"));

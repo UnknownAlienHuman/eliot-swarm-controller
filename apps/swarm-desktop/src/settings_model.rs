@@ -964,7 +964,10 @@ mod tests {
         // #678: the send gate for a Cloud MCP draft.
         let mut template = cloud_template();
         let missing = cloud_missing(&template).expect("empty template is incomplete");
-        assert_eq!(missing, "cloudflared executable, Tunnel id, Tunnel credentials file, Public hostname, Access team name, Access audience tag");
+        assert_eq!(
+            missing,
+            "cloudflared executable, Tunnel id, Tunnel credentials file, Public hostname, Access team name, Access audience tag"
+        );
         set_cloud_field(&mut template, "hostname", "example.com");
         let missing = cloud_missing(&template).expect("still incomplete");
         assert!(!missing.contains("Public hostname"));

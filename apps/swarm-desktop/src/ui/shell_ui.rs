@@ -591,9 +591,7 @@ impl DesktopApp {
                             PopoverKey::Escape | PopoverKey::Tab => self.close_menu(),
                             // Arrows reach clipped actions from the
                             // keyboard; Enter chooses the highlighted row.
-                            PopoverKey::Up => {
-                                self.menu_update(MenuMsg::HighlightMove(-1), context)
-                            }
+                            PopoverKey::Up => self.menu_update(MenuMsg::HighlightMove(-1), context),
                             PopoverKey::Down => {
                                 self.menu_update(MenuMsg::HighlightMove(1), context)
                             }

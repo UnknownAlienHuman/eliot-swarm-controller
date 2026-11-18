@@ -703,10 +703,7 @@ impl DesktopApp {
                     } else {
                         let items = dialog.plan.items.clone();
                         let _task = context.spawn_background(move |_| {
-                            Message::Bulk(BulkMsg::Removed(
-                                seq,
-                                remove_checked(&data_dir, &items),
-                            ))
+                            Message::Bulk(BulkMsg::Removed(seq, remove_checked(&data_dir, &items)))
                         });
                     }
                 } else {
@@ -1295,7 +1292,12 @@ mod tests {
             Some("p2".to_owned())
         );
         // A late Selected plan for another project carries no cleanup.
-        let foreign = dialog(7, missing.clone(), missing_plan("p1", false), Phase::Confirm);
+        let foreign = dialog(
+            7,
+            missing.clone(),
+            missing_plan("p1", false),
+            Phase::Confirm,
+        );
         assert!(missing_bound(&foreign).is_none());
         // Right shape, wrong registration.
         let mismatched = dialog(7, missing.clone(), missing_plan("p9", true), Phase::Confirm);

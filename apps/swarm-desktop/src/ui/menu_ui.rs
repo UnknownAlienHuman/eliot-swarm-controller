@@ -1057,9 +1057,7 @@ impl DesktopApp {
             return View::empty();
         };
         let width = self.window_width.unwrap_or(tokens::layout::WINDOW_WIDTH);
-        let height = self
-            .window_height
-            .unwrap_or(tokens::layout::WINDOW_HEIGHT);
+        let height = self.window_height.unwrap_or(tokens::layout::WINDOW_HEIGHT);
         let left = x.min(width - MENU_WIDTH - tokens::spacing::SM).max(0.0);
         let entries = self.menu_entries(target);
         let (top, max_height) = menu_placement(*y, entries.len(), height);

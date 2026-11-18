@@ -232,9 +232,11 @@ impl DesktopApp {
             return;
         };
         let key = (agent, detail.generation);
-        let success = self.configure.catalog.as_ref().is_some_and(|catalog| {
-            catalog.is_for(&key.0, key.1) && catalog.reply.is_ok()
-        });
+        let success = self
+            .configure
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.is_for(&key.0, key.1) && catalog.reply.is_ok());
         let loading = self.configure.loading.as_ref() == Some(&key);
         let failed_here = self
             .configure
@@ -285,7 +287,13 @@ mod tests {
         assert!(!catalog_read_allowed(false, true, false, 0, false));
         assert!(catalog_read_allowed(false, false, false, 0, false));
         assert!(catalog_read_allowed(false, false, true, 0, false));
-        assert!(catalog_read_allowed(false, false, true, MAX_CATALOG_ATTEMPTS - 1, false));
+        assert!(catalog_read_allowed(
+            false,
+            false,
+            true,
+            MAX_CATALOG_ATTEMPTS - 1,
+            false
+        ));
         assert!(!catalog_read_allowed(
             false,
             false,
@@ -293,6 +301,12 @@ mod tests {
             MAX_CATALOG_ATTEMPTS,
             false
         ));
-        assert!(catalog_read_allowed(false, false, true, MAX_CATALOG_ATTEMPTS, true));
+        assert!(catalog_read_allowed(
+            false,
+            false,
+            true,
+            MAX_CATALOG_ATTEMPTS,
+            true
+        ));
     }
 }
