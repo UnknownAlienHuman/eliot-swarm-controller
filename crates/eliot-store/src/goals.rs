@@ -644,11 +644,11 @@ impl Store {
     /// generation. The Router applies the same enablement checks as the
     /// event path before reserving a round on the retained idle subject.
     pub fn goal_reconcile_candidates(&self) -> Result<Vec<GoalReconcileCandidate>> {
-        let rows: Vec<(i64, i64, i64)> = {
+        let agents: Vec<i64> = {
             let mut statement = self
                 .connection
                 .prepare(
-                    "SELECT g.agent, g.generation, g.revision
+                    "SELECT g.agent
                      FROM goals g JOIN agents a ON a.id = g.agent
                      WHERE g.mode = 'eliot'
                        AND json_extract(g.state, '$.status') = 'active'
@@ -659,50 +659,46 @@ impl Store {
                 )
                 .map_err(sql_error)?;
             statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .query_map([], |row| row.get(0))
                 .map_err(sql_error)?
-                .collect::<rusqlite::Result<Vec<(i64, i64, i64)>>>()
+                .collect::<rusqlite::Result<Vec<i64>>>()
                 .map_err(sql_error)?
         };
-        let mut candidates = Vec::with_capacity(rows.len());
-        for (agent_num, generation, revision) in rows {
+        let mut candidates = Vec::with_capacity(agents.len());
+        for agent_num in agents {
+            let goal = load_goal_row(&self.connection, agent_num, "eliot")?
+                .ok_or_else(|| Error::new("internal", "reconcile goal disappeared"))?;
+            let generation = goal.generation;
             let agent_row = load_agent_by_num(&self.connection, agent_num)?
                 .ok_or_else(|| Error::new("internal", "reconcile goal lost its Agent"))?;
             let max_seq = max_agent_seq(&self.connection, agent_num, generation)?;
-            let idle_seq = if max_seq > 0
-                && round_key_names_generation_event(
-                    &self.connection,
-                    agent_num,
-                    generation,
-                    max_seq,
-                )? {
-                Some(max_seq)
-            } else {
-                None
-            };
+            let idle_seq =
+                if max_seq > 0 && round_key_names_idle_event(&self.connection, &goal, max_seq)? {
+                    Some(max_seq)
+                } else {
+                    None
+                };
             // Name the burn the probe and claim enforce, so the Router
             // skips spent subjects before taking a scheduler slot.
             let mut key_consumed = false;
             if let Some(seq) = idle_seq {
                 let key = GoalRoundKey::Idle(seq);
-                if let Some(row) = load_goal_row(&self.connection, agent_num, "eliot")? {
-                    if row.last_round_key.as_deref() == Some(&key.text()) {
-                        key_consumed = true;
-                    } else {
-                        let markers = load_goal_markers(&self.connection, agent_num, "eliot")?;
-                        key_consumed = markers.iter().any(|marker| {
-                            marker.round_key == key.value()
-                                && marker.kind == key.kind()
-                                && marker.generation == generation
-                                && !marker.is_live(&self.goal_holder)
-                        });
-                    }
+                if goal.last_round_key.as_deref() == Some(&key.text()) {
+                    key_consumed = true;
+                } else {
+                    let markers = load_goal_markers(&self.connection, agent_num, "eliot")?;
+                    key_consumed = markers.iter().any(|marker| {
+                        marker.round_key == key.value()
+                            && marker.kind == key.kind()
+                            && marker.generation == generation
+                            && !marker.is_live(&self.goal_holder)
+                    });
                 }
             }
             candidates.push(GoalReconcileCandidate {
                 agent: format_agent_id(agent_num),
                 generation,
-                revision,
+                revision: goal.revision,
                 agent_state: agent_row.state,
                 idle_seq,
                 key_consumed,
@@ -784,12 +780,7 @@ impl Store {
         require_key_form(&row, key)?;
         match key {
             GoalRoundKey::Idle(idle_seq) => {
-                if !round_key_names_generation_event(
-                    &self.connection,
-                    agent_num,
-                    row.generation,
-                    idle_seq,
-                )? {
+                if !round_key_names_idle_event(&self.connection, &row, idle_seq)? {
                     return Err(Error::new(
                         "stale_round",
                         "round key does not name an idle event of this Agent generation",
@@ -1474,7 +1465,7 @@ impl Store {
         let claim_seq = max_agent_seq(&tx, agent_num, row.generation)?;
         match key {
             GoalRoundKey::Idle(idle_seq) => {
-                if !round_key_names_generation_event(&tx, agent_num, row.generation, idle_seq)? {
+                if !round_key_names_idle_event(&tx, &row, idle_seq)? {
                     return Err(Error::new(
                         "stale_round",
                         "round key does not name an idle event of this Agent generation",
@@ -1682,7 +1673,7 @@ impl Store {
         }
         match commit.round_key {
             GoalRoundKey::Idle(idle_seq) => {
-                if !round_key_names_generation_event(&tx, agent_num, row.generation, idle_seq)? {
+                if !round_key_names_idle_event(&tx, &row, idle_seq)? {
                     return Err(Error::new(
                         "stale_round",
                         "round key does not name an idle event of this Agent generation",
@@ -2293,16 +2284,23 @@ fn load_goal_marker_tx(
 /// The round key must name an idle event of this Agent generation: the
 /// event-time subject snapshot shows the Agent idle. A missing row, a row
 /// of another Agent/generation, or a non-idle subject is a stale key.
-fn round_key_names_generation_event(
-    connection: &Connection,
-    agent_num: i64,
-    generation: i64,
-    seq: i64,
-) -> Result<bool> {
+fn round_key_names_idle_event(connection: &Connection, goal: &GoalRow, seq: i64) -> Result<bool> {
+    // A rejected continuation leaves the Agent idle without native progress.
+    // Its rejection and the rejection of its claimed context cannot rearm
+    // the same Goal. Use the retained event so this also holds after restart.
     connection
         .query_row(
-            "SELECT agent, generation, subject FROM events WHERE seq = ?1",
-            params![seq],
+            "SELECT agent, generation, subject FROM events
+             WHERE seq = ?1 AND (
+                 ?2 IS NULL OR source <> 'daemon' OR kind <> 'command.rejected'
+                 OR CASE
+                     WHEN json_extract(data, '$.outcome.code') = 'native_not_dispatched'
+                         THEN json_extract(data, '$.command_id')
+                     WHEN json_extract(data, '$.outcome.reason') = 'consumer_input_unconfirmed'
+                         THEN json_extract(data, '$.outcome.claim.consumer_id')
+                 END IS NOT ?2
+             )",
+            params![seq, goal.state.last_continuation_command_id],
             |row| {
                 Ok((
                     row.get::<_, Option<i64>>(0)?,
@@ -2315,8 +2313,8 @@ fn round_key_names_generation_event(
         .map_err(sql_error)
         .map(|found| {
             found.is_some_and(|(agent, row_generation, subject)| {
-                agent == Some(agent_num)
-                    && row_generation == Some(generation)
+                agent == Some(goal.agent_num)
+                    && row_generation == Some(goal.generation)
                     && subject_is_idle(subject.as_deref())
             })
         })

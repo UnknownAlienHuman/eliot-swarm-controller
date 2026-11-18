@@ -1175,6 +1175,9 @@ unknown command, no active turn, no pending request — together with an
 optional ordinary `send` continuation admitted by the same transaction:
 completion on check exit 0, `round_budget`, `turn_limit` or `no_progress`
 block, or one continuation. Success always completes, even on a spent budget.
+If the Goal's own continuation is rejected before native dispatch, that
+rejection and any resulting context rejections cannot supply a new idle key
+for the same Goal. A later eligible Agent event can still drive a round.
 An unknown check outcome (spawn/timeout/custody failure, or a check with no
 exit code such as a signal kill) commits no Goal progress or continuation, and
 neither does a commit that finds the Agent left idle during the check: the marker goes `unknown`
