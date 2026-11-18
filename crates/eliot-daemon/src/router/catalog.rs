@@ -38,37 +38,51 @@ impl Router {
         let request: eliot_core::api::HarnessListRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        let mut harnesses = Vec::new();
-        for harness in crate::adhoc::SUPPORTED_HARNESSES {
-            let entry = crate::adhoc::harness_installation(harness);
-            // Claude keeps several native installs (PATH, user locations,
-            // desktop-app bundles): report every candidate newest first so
-            // the controller can see which install was preferred and why.
-            let candidates = if *harness == "claude" {
-                let candidates = crate::adhoc::discover_claude_candidates();
-                (!candidates.is_empty()).then_some(candidates)
-            } else {
-                None
-            };
-            harnesses.push(eliot_core::api::HarnessEntry {
-                harness: (*harness).to_owned(),
-                installed: entry
-                    .get("installed")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                cmd: entry.get("cmd").and_then(Value::as_str).map(str::to_owned),
-                version: entry
-                    .get("version")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                code: entry.get("code").and_then(Value::as_str).map(str::to_owned),
-                error: entry
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                candidates,
-            });
-        }
+        // Filesystem presence plus bounded `--version` probes is blocking
+        // work: run it on the blocking pool so slow native CLIs never stall
+        // async command/event service. Claude candidates are enumerated once
+        // and reused for both the entry and the candidate list instead of
+        // versioning every install twice per inventory pass.
+        let harnesses: Vec<eliot_core::api::HarnessEntry> = tokio::task::spawn_blocking(|| {
+            let claude_candidates = crate::adhoc::discover_claude_candidates();
+            let mut harnesses = Vec::new();
+            for harness in crate::adhoc::SUPPORTED_HARNESSES {
+                let entry = if *harness == "claude" {
+                    crate::adhoc::claude_installation(&claude_candidates)
+                } else {
+                    crate::adhoc::harness_installation(harness)
+                };
+                // Claude keeps several native installs (PATH, user locations,
+                // desktop-app bundles): report every candidate newest first so
+                // the controller can see which install was preferred and why.
+                let candidates = if *harness == "claude" {
+                    (!claude_candidates.is_empty()).then(|| claude_candidates.clone())
+                } else {
+                    None
+                };
+                harnesses.push(eliot_core::api::HarnessEntry {
+                    harness: (*harness).to_owned(),
+                    installed: entry
+                        .get("installed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    cmd: entry.get("cmd").and_then(Value::as_str).map(str::to_owned),
+                    version: entry
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    code: entry.get("code").and_then(Value::as_str).map(str::to_owned),
+                    error: entry
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    candidates,
+                });
+            }
+            harnesses
+        })
+        .await
+        .map_err(|_| Error::new("internal", "harness inventory was interrupted"))?;
         let response = eliot_core::api::HarnessListResponse { harnesses };
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "harness list could not be encoded"))
@@ -199,7 +213,9 @@ impl Router {
         let version = if harness == "claude" {
             Some("static-aliases".to_owned())
         } else {
-            crate::adhoc::native_version_string(&cmd)
+            // The blocking probe (and its memoized reuse across catalogue
+            // pages) runs on the blocking pool, never on a Tokio worker.
+            crate::adhoc::native_version_string_async(&cmd).await
         };
         let cache_key = catalog::models_key(&cache_scope, &cmd, version.as_deref());
         let now = now_ms();
@@ -594,8 +610,19 @@ impl Router {
         };
         let mut models: Vec<ModelsCatalogEntry> = Vec::new();
         let mut failures: Vec<ModelsCatalogFailure> = Vec::new();
+        let discovery_deadline = tokio::time::Instant::now() + MODELS_CATALOG_DISCOVERY_BUDGET;
         for entry in &harnesses {
             let harness = entry.harness.as_str();
+            if tokio::time::Instant::now() >= discovery_deadline {
+                failures.push(ModelsCatalogFailure::from_error(
+                    harness,
+                    &Error::new(
+                        "unavailable",
+                        "catalogue discovery budget elapsed; harness skipped",
+                    ),
+                ));
+                continue;
+            }
             if !entry.installed {
                 continue;
             }
@@ -755,6 +782,13 @@ fn muse_catalog_note(default: Option<&str>) -> String {
     }
 }
 
+/// Outer bound for one `models.catalog` aggregate rebuild across all
+/// installed harnesses. Version probes, reader slots and native processes
+/// are each bounded, but a full pass over five harnesses still needs an
+/// outer deadline so one listing cannot hold the coalescing lock
+/// indefinitely. Harness reads past the deadline fail open into the partial
+/// aggregate, which the next first-page listing rebuilds.
+const MODELS_CATALOG_DISCOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 pub(super) fn quota_read_error(response: &mut HarnessQuotaResponse, error: eliot_core::Error) {
     if error.code == "unsupported" {
         response.status = "unsupported".to_owned();
@@ -1434,6 +1468,36 @@ mod tests {
         assert_eq!(built.display_name, "Native Display Name");
         assert_eq!(built.provider, "openrouter");
         assert!(eliot_core::api::catalog_matches(&built, "Display Name"));
+    }
+
+    #[tokio::test]
+    async fn harness_list_entry_matches_its_candidate_pass() {
+        // The Claude entry must name the preferred candidate of the same
+        // enumeration pass: entry and list never diverge across passes.
+        let value = router()
+            .harness_list(&json!({}), &Principal::Owner)
+            .await
+            .unwrap();
+        let response: eliot_core::api::HarnessListResponse = serde_json::from_value(value).unwrap();
+        let Some(claude) = response.harnesses.iter().find(|h| h.harness == "claude") else {
+            return;
+        };
+        if claude.installed {
+            let cmd = claude
+                .cmd
+                .as_deref()
+                .expect("installed claude names its cmd");
+            let candidates = claude
+                .candidates
+                .as_ref()
+                .expect("installed claude lists candidates");
+            assert!(
+                candidates.iter().any(|candidate| candidate.cmd == cmd),
+                "entry {cmd} is the preferred candidate of its own pass"
+            );
+        } else {
+            assert_eq!(claude.cmd, None);
+        }
     }
 
     #[test]

@@ -978,7 +978,10 @@ fn claude_search_locations() -> Vec<String> {
 }
 
 fn discover_claude_cmd() -> core::Result<String> {
-    let candidates = discover_claude_candidates();
+    claude_cmd_from_candidates(&discover_claude_candidates())
+}
+
+fn claude_cmd_from_candidates(candidates: &[core::api::HarnessCandidate]) -> core::Result<String> {
     if let Some(best) = candidates.first() {
         return Ok(best.cmd.clone());
     }
@@ -989,6 +992,33 @@ fn discover_claude_cmd() -> core::Result<String> {
             claude_search_locations().join(", ")
         ),
     ))
+}
+
+/// Inventory entry for Claude from one candidate pass, so `harness.list`
+/// does not enumerate and version every install twice.
+pub(crate) fn claude_installation(candidates: &[core::api::HarnessCandidate]) -> Value {
+    match claude_cmd_from_candidates(candidates) {
+        Ok(cmd) => {
+            let version = candidates
+                .first()
+                .and_then(|best| best.version.clone())
+                .map_or(Value::Null, Value::String);
+            json!({
+                "harness": "claude",
+                "installed": true,
+                "cmd": cmd,
+                "version": version,
+            })
+        }
+        Err(error) => json!({
+            "harness": "claude",
+            "installed": false,
+            "cmd": Value::Null,
+            "version": Value::Null,
+            "error": error.message,
+            "code": error.code,
+        }),
+    }
 }
 
 /// Candidate native executables for an npm-installed OpenCode, in priority
@@ -1503,13 +1533,68 @@ pub(crate) fn harness_installation(harness: &str) -> Value {
 /// stall `harness.list` for every harness.
 const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Cap on version probes per candidate enumeration: filesystem hits are
+/// cheap, process launches are not; see [`probe_candidate_paths`].
+pub(crate) const MAX_DISCOVERY_CANDIDATE_PROBES: usize = 8;
+
+/// Memoized `<exe> --version` first lines: one passive discovery pass
+/// (harness list, catalogue pages, routing checks) reuses the same
+/// executable identity instead of relaunching every native CLI per page.
+/// Entries expire after `VERSION_CACHE_TTL`; a changed installation is
+/// re-probed on the next miss, so the refresh path stays deliberate without
+/// starting native CLIs on every cached read.
+const VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// Bound on memoized executable identities.
+const VERSION_CACHE_MAX: usize = 64;
+
+type VersionCache = std::collections::HashMap<String, (Option<String>, std::time::Instant)>;
+
+static VERSION_CACHE: std::sync::LazyLock<std::sync::Mutex<VersionCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(VersionCache::new()));
+
 /// Bounded `<exe> --version` first line, or `None` when the probe fails.
 /// The existing scoped process runner bounds output and owns the whole family.
+/// Results are memoized per executable (see `VERSION_CACHE_TTL`).
 pub(crate) fn native_version_string(program: &str) -> Option<String> {
+    if let Ok(cache) = VERSION_CACHE.lock()
+        && let Some((version, at)) = cache.get(program)
+        && at.elapsed() < VERSION_CACHE_TTL
+    {
+        return version.clone();
+    }
+    let version = native_version_string_uncached(program);
+    if let Ok(mut cache) = VERSION_CACHE.lock() {
+        if cache.len() >= VERSION_CACHE_MAX {
+            cache.retain(|_, (_, at)| at.elapsed() < VERSION_CACHE_TTL);
+            if cache.len() >= VERSION_CACHE_MAX {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            program.to_owned(),
+            (version.clone(), std::time::Instant::now()),
+        );
+    }
+    version
+}
+
+fn native_version_string_uncached(program: &str) -> Option<String> {
     let bytes = native_read(program, &["--version"], VERSION_PROBE_TIMEOUT)?;
     let stdout = std::str::from_utf8(&bytes).ok()?;
     let text = stdout.lines().next()?.trim();
     (!text.is_empty() && text.len() <= 256).then(|| text.to_owned())
+}
+
+/// Async `<exe> --version` for Tokio handlers: the blocking probe (a new
+/// thread plus a bounded process) runs on the blocking pool, so slow native
+/// CLIs never stall async command/event service while cached catalogue data
+/// already exists.
+pub(crate) async fn native_version_string_async(program: &str) -> Option<String> {
+    let program = program.to_owned();
+    tokio::task::spawn_blocking(move || native_version_string(&program))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Bridge synchronous installation/profile resolution to the same bounded
@@ -2243,6 +2328,61 @@ mod tests {
             "Roaming",
         );
         assert_eq!(roots, vec![PathBuf::from(r"C:\Users\qa\AppData\Roaming")]);
+    }
+
+    #[test]
+    fn candidate_probing_is_capped_but_inventory_stays_complete() {
+        let root = std::env::temp_dir().join(format!("eliot-probe-cap-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut paths = Vec::new();
+        for index in 0..(MAX_DISCOVERY_CANDIDATE_PROBES + 3) {
+            let path = root.join(format!("candidate-{index:02}"));
+            std::fs::write(&path, b"probe me").unwrap();
+            paths.push(path);
+        }
+        let mut calls = 0;
+        let found = probe_candidate_paths_with(paths.clone(), |_| {
+            calls += 1;
+            Some("9.9.9 (probe)".to_owned())
+        });
+        assert_eq!(calls, MAX_DISCOVERY_CANDIDATE_PROBES);
+        // Every filesystem hit is still listed; only the cap tail is unversioned.
+        assert_eq!(found.len(), paths.len());
+        for (index, candidate) in found.iter().enumerate() {
+            if index < MAX_DISCOVERY_CANDIDATE_PROBES {
+                assert_eq!(candidate.version.as_deref(), Some("9.9.9 (probe)"));
+            } else {
+                assert_eq!(candidate.version, None);
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn claude_installation_reuses_one_candidate_pass() {
+        let best = core::api::HarnessCandidate {
+            cmd: if cfg!(windows) {
+                r"C:\Tools\claude.exe".to_owned()
+            } else {
+                "/usr/local/bin/claude".to_owned()
+            },
+            version: Some("2.1.325".to_owned()),
+        };
+        let entry = claude_installation(std::slice::from_ref(&best));
+        assert_eq!(entry["installed"], serde_json::Value::Bool(true));
+        assert_eq!(entry["cmd"], serde_json::Value::String(best.cmd.clone()));
+        assert_eq!(
+            entry["version"],
+            serde_json::Value::String("2.1.325".to_owned())
+        );
+        let missing = claude_installation(&[]);
+        assert_eq!(missing["installed"], serde_json::Value::Bool(false));
+        assert!(
+            missing["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("was not found")
+        );
     }
 
     #[test]
