@@ -70,11 +70,24 @@ async fn wait_for_association(
 ) -> Result<Value> {
     match timeout_at(deadline, association).await {
         Ok(Ok(Ok(()))) => Ok(json!({"state": "applied", "turn_id": turn})),
+        Ok(Ok(Err(error))) if error.code == "native_rejected" => Ok(json!({
+            "state": "rejected",
+            "code": error.code,
+            "message": "Antigravity rejected the prompt before admission",
+            "where": error.failure_where,
+            "origin": "harness",
+        })),
         _ => Err(Error::new(
             "unknown",
             "Antigravity input association is unconfirmed; input will not be resent",
         )),
     }
+}
+
+fn send_preparation_error(error: Error) -> Error {
+    error
+        .with_code("native_not_dispatched")
+        .with_where("plugin.antigravity.send.prepare")
 }
 
 struct RetainedCommand {
@@ -840,24 +853,30 @@ impl Session {
         }
         if self.native.transport.process_exit_observed() {
             return Err(Error::new(
-                "unknown",
+                "native_not_dispatched",
                 "Antigravity process exited; new input was not dispatched",
-            ));
+            )
+            .with_where("plugin.antigravity.send.prepare"));
         }
         if !self.ready {
             return Err(Error::new(
-                "unknown",
+                "native_not_dispatched",
                 "Antigravity session readiness is unresolved",
-            ));
+            )
+            .with_where("plugin.antigravity.send.prepare"));
         }
-        let combined = with_claimed_context(text, &params.context, "Antigravity")?;
+        let combined = with_claimed_context(text, &params.context, "Antigravity")
+            .map_err(send_preparation_error)?;
         let turn = format!("agy-{}", ulid::Ulid::new());
         let deadline = Instant::now() + SEND_TIMEOUT;
-        let prepared = self.client.prepare_fenced(
-            "session/prompt",
-            prompt_params(&self.conversation, &combined),
-            FencedKind::Prompt,
-        )?;
+        let prepared = self
+            .client
+            .prepare_fenced(
+                "session/prompt",
+                prompt_params(&self.conversation, &combined),
+                FencedKind::Prompt,
+            )
+            .map_err(send_preparation_error)?;
         let (write, registration) = prepared.split();
         let association = {
             let mut state = timeout_at(deadline, self.state.lock()).await.map_err(|_| {
@@ -865,8 +884,11 @@ impl Session {
                     "native_not_dispatched",
                     "Antigravity input preparation timed out",
                 )
+                .with_where("plugin.antigravity.send.prepare")
             })?;
-            let association = state.prepare(params.command_id.clone(), turn.clone())?;
+            let association = state
+                .prepare(params.command_id.clone(), turn.clone())
+                .map_err(send_preparation_error)?;
             state.attach_context(&params.command_id, params.context.clone())?;
             // Transfer the fence before I/O. A slow event commit must not
             // hold the send RPC open or drop a still-live native call.
@@ -893,9 +915,7 @@ impl Session {
             Err(error) if native_no_write(&error.code) => {
                 match timeout_at(deadline, self.state.lock()).await {
                     Ok(mut state) => match state.withdraw_unwritten(&params.command_id) {
-                        Ok(()) => Ok(
-                            json!({"state": "rejected", "reason": "Antigravity input was not dispatched"}),
-                        ),
+                        Ok(()) => Err(error.with_where("plugin.antigravity.send.dispatch")),
                         Err(_) => unknown,
                     },
                     _ => unknown,
@@ -1925,6 +1945,23 @@ mod tests {
         let result = wait_for_association(association, Instant::now(), "turn-1").await;
         assert_eq!(result.unwrap_err().code, "unknown");
         assert!(reply.is_closed());
+    }
+
+    #[tokio::test]
+    async fn validation_refusal_returns_a_typed_send_rejection() {
+        let (reply, association) = oneshot::channel();
+        reply
+            .send(Err(Error::new("native_rejected", "private native detail")
+                .with_where("plugin.antigravity.native.response")))
+            .unwrap();
+        let result = wait_for_association(association, Instant::now() + SEND_TIMEOUT, "turn-1")
+            .await
+            .unwrap();
+        assert_eq!(result["state"], "rejected");
+        assert_eq!(result["code"], "native_rejected");
+        assert_eq!(result["where"], "plugin.antigravity.native.response");
+        assert!(result.get("turn_id").is_none());
+        assert!(!result.to_string().contains("private native detail"));
     }
 
     #[tokio::test]

@@ -145,14 +145,26 @@ native `stopReason` but carries
 `final_text_unavailable:"empty_native_response"` (see Facts and recovery),
 so silence is never presented as a normal answer. Send uses one 25 s
 deadline for preparation, the native write and committed association,
-inside the daemon's 30 s plugin RPC. With no confirmed association by
-that deadline it returns retained `unknown`, never `applied` or an RPC
-timeout. The pending input and terminal fence remain live; neither the
-deadline nor an exact command retry resends input. Tool calls map from `tool_call`/`tool_call_update` with the
-vendor `toolCallId` as the item id. Tool updates are partial deltas:
-title and status merge into the known per-id state before any event is
-derived, so an omitted field inherits the last known value and only a
-delta with no known status at all is a protocol gap.
+inside the daemon's 30 s plugin RPC. Proven local no-write failures settle
+as `rejected` (`native_not_dispatched`). A correlated ACP validation refusal
+before any committed association also settles as `rejected` (`native_rejected`).
+If the deadline elapses after a possible write, the send returns retained
+`unknown` and the pending input and terminal fence remain live. An ambiguous
+native response opens a stream gap. Neither case resends input.
+
+Tool calls map from `tool_call` and `tool_call_update` using the native
+`toolCallId`. A delta can change only a tool introduced by a `tool_call` or
+validated permission ask in the current prompt. Omitted title and status
+inherit the last value for that call. AGY can finish an asynchronous tool
+after its prompt has completed and emit unsolicited assistant or tool output.
+Once session identity is verified, assistant chunks and tool notifications
+received without a pending prompt record a `source.gap` scoped to `message` or
+`tool`. This applies before the first turn and after a fenced terminal reply.
+Each family reports at most one gap per idle episode. An unmatched tool delta
+during a later prompt records at most one `tool` gap for that prompt. These
+gaps leave the output unattributed. A confirmed coverage gap preserves stream
+health and permits the next send on the same live ACP session. An unresolved
+gap acknowledgement fences the stream.
 
 **Interrupt** is the ACP `session/cancel` notification scoped to the exact
 active Eliot turn (turn id required, stale turns reject). The command

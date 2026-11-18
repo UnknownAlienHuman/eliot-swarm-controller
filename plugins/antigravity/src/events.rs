@@ -72,6 +72,7 @@ struct Pending {
     opened_at: u64,
     context: Vec<ContextItem>,
     associated: bool,
+    tool_gap_reported: bool,
     reply: Option<oneshot::Sender<Result<()>>>,
 }
 
@@ -204,6 +205,8 @@ pub(crate) struct State {
     unbound_update_bytes: usize,
     text_accum: String,
     text_truncated: bool,
+    idle_message_gap_reported: bool,
+    idle_tool_gap_reported: bool,
     writes_blocked: bool,
     gap_reported: bool,
     gap_number: u64,
@@ -270,6 +273,8 @@ impl State {
             unbound_update_bytes: 0,
             text_accum: String::new(),
             text_truncated: false,
+            idle_message_gap_reported: false,
+            idle_tool_gap_reported: false,
             writes_blocked: false,
             gap_reported: false,
             gap_number: 0,
@@ -569,8 +574,11 @@ impl State {
             opened_at,
             context: Vec::new(),
             associated: false,
+            tool_gap_reported: false,
             reply: Some(reply),
         });
+        self.idle_message_gap_reported = false;
+        self.idle_tool_gap_reported = false;
         self.cancellation = None;
         self.tool_emitted.clear();
         self.tools.clear();
@@ -805,6 +813,9 @@ impl State {
                 .await;
         }
         publication?;
+        self.tools
+            .entry(ask.tool_call_id)
+            .or_insert((ask.title, "pending".to_owned()));
         if let Some(command_id) = self.cancellation_for_pending().map(str::to_owned) {
             self.answer_pending_cancelled(client, &command_id, Some(&turn_id))
                 .await;
@@ -1344,6 +1355,19 @@ impl State {
             return Ok(());
         }
         match update {
+            // AGY can continue natively when an asynchronous tool finishes
+            // after the fenced terminal reply. An idle update has no Eliot turn.
+            AcpUpdate::MessageChunk { .. } if self.pending.is_none() => {
+                if !self.idle_message_gap_reported {
+                    self.record_coverage_gap(
+                        "Antigravity assistant output arrived outside an Eliot prompt",
+                        &["message"],
+                    )
+                    .await?;
+                    self.idle_message_gap_reported = true;
+                }
+                Ok(())
+            }
             AcpUpdate::MessageChunk { text } => {
                 self.associate().await?;
                 if !self.text_truncated {
@@ -1386,6 +1410,9 @@ impl State {
                 }
                 Ok(())
             }
+            AcpUpdate::ToolCall { .. } if self.pending.is_none() => {
+                self.record_unattributed_tool().await
+            }
             AcpUpdate::ToolCall {
                 tool_call_id,
                 title,
@@ -1400,9 +1427,21 @@ impl State {
                 title,
                 status,
             } => {
+                if tool_call_id.trim().is_empty() {
+                    return Err(Error::new(
+                        "native_protocol",
+                        "Antigravity tool call id is absent",
+                    ));
+                }
+                // ACP deltas update an existing call. AGY can finish an
+                // asynchronous tool after its prompt has already ended.
+                // Only calls introduced in the current prompt can receive
+                // turn events or establish its association.
+                if self.pending.is_none() || !self.tools.contains_key(&tool_call_id) {
+                    return self.record_unattributed_tool().await;
+                }
                 self.merge_tool(&tool_call_id, title.as_deref().unwrap_or(""), &status);
-                let (_, merged_status) = self.tools.get(&tool_call_id).cloned().unwrap_or_default();
-                match merged_status.as_str() {
+                match self.tools[&tool_call_id].1.as_str() {
                     "pending" => Ok(()),
                     "in_progress" => {
                         self.tool_event(&tool_call_id, "tool.started", "running")
@@ -1427,6 +1466,29 @@ impl State {
                 format!("Antigravity session update is unconnected: {kind}"),
             )),
         }
+    }
+
+    async fn record_unattributed_tool(&mut self) -> Result<()> {
+        if self
+            .pending
+            .as_ref()
+            .map_or(self.idle_tool_gap_reported, |pending| {
+                pending.tool_gap_reported
+            })
+        {
+            return Ok(());
+        }
+        self.record_coverage_gap(
+            "Antigravity tool output did not match a tool in the current Eliot prompt",
+            &["tool"],
+        )
+        .await?;
+        if let Some(pending) = self.pending.as_mut() {
+            pending.tool_gap_reported = true;
+        } else {
+            self.idle_tool_gap_reported = true;
+        }
+        Ok(())
     }
 
     /// Commit one accepted session snapshot as its own `session.usage` fact,
@@ -1645,37 +1707,36 @@ impl State {
         Ok(())
     }
 
-    /// Settle a failed `session/prompt` call. An unassociated dispatch
-    /// failure (e.g. rejected before admission) withdraws the pending turn
-    /// and reports that exact error; anything after association loses the
-    /// stream honestly instead of inventing a terminal fact.
+    /// A correlated ACP validation refusal can withdraw an unassociated
+    /// prompt. All other errors leave delivery or settlement unproven.
     pub async fn fail_prompt(&mut self, error: Error) {
         if self.failure.is_some() {
             return;
         }
-        self.clear_fenced();
-        let unassociated = self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| !pending.associated);
-        self.fail_pending_steer(Error::new(
-            if unassociated {
-                "stale_turn"
-            } else {
-                "unknown"
-            },
-            "Antigravity prompt ended before PreInvocation confirmed steer",
-        ));
-        if unassociated {
+        if error.code == "native_rejected"
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| !pending.associated)
+        {
+            self.clear_fenced();
+            self.fail_pending_steer(Error::new(
+                "stale_turn",
+                "Antigravity prompt was rejected before admission",
+            ));
             if let Some(mut pending) = self.pending.take()
                 && let Some(reply) = pending.reply.take()
             {
-                self.settlement = Some((pending.turn.clone(), "unknown".to_owned()));
                 let _ = reply.send(Err(error));
             }
             return;
         }
-        self.lose(&error.message).await;
+        let reason = if error.code == "native_rejected" {
+            "Antigravity refused a prompt with committed progress"
+        } else {
+            &error.message
+        };
+        self.lose(reason).await;
     }
 
     pub async fn ended(&mut self) -> Result<()> {
@@ -1797,6 +1858,12 @@ impl State {
         });
         self.source_health_stale = confirmed;
         self.source_health_unknown = !confirmed;
+    }
+
+    async fn record_coverage_gap(&mut self, reason: &str, families: &[&str]) -> Result<()> {
+        let mut source = self.source();
+        source.families = families;
+        source.record_coverage_gap(reason).await
     }
 
     fn source(&mut self) -> StreamSource<'_> {
@@ -2178,29 +2245,29 @@ mod tests {
                     break;
                 }
                 let request: eliot_plugin::RpcRequest = serde_json::from_str(&line).unwrap();
-                if matches!(request.method.as_str(), "source.gap" | "source.health") {
-                    let result = if request.method == "source.gap" {
-                        json!({"gap_id":request.params["gap_id"], "seq":1})
-                    } else {
-                        let mut health = request.params.clone();
-                        health.as_object_mut().unwrap().remove("credential");
-                        health
-                    };
-                    let response = json!({"jsonrpc":"2.0", "id":request.id, "result":result});
-                    write
-                        .write_all(format!("{response}\n").as_bytes())
-                        .await
-                        .unwrap();
-                    continue;
-                }
-                assert_eq!(request.method, "events.put");
-                let event = request.params["events"][0].clone();
-                let (ack, acknowledged) = oneshot::channel();
-                tx.send((event, ack)).await.unwrap();
-                acknowledged.await.unwrap();
-                seq += 1;
-                let response = json!({"jsonrpc": "2.0", "id": request.id,
-                    "result": {"first_seq": seq, "last_seq": seq, "cursor": null}});
+                let mut data = request.params;
+                data.as_object_mut().unwrap().remove("credential");
+                let result = match request.method.as_str() {
+                    "source.health" => data,
+                    "events.put" | "source.gap" => {
+                        seq += 1;
+                        let (record, result) = if request.method == "source.gap" {
+                            let result = json!({"gap_id":data["gap_id"], "seq":seq});
+                            (json!({"kind":"source.gap", "data":data}), result)
+                        } else {
+                            (
+                                data["events"][0].clone(),
+                                json!({"first_seq":seq,"last_seq":seq,"cursor":null}),
+                            )
+                        };
+                        let (ack, acknowledged) = oneshot::channel();
+                        tx.send((record, ack)).await.unwrap();
+                        acknowledged.await.unwrap();
+                        result
+                    }
+                    method => panic!("unexpected request: {method}"),
+                };
+                let response = json!({"jsonrpc":"2.0", "id":request.id, "result":result});
                 write
                     .write_all(format!("{response}\n").as_bytes())
                     .await
@@ -2217,6 +2284,13 @@ mod tests {
             .unwrap();
         assert_eq!(event["kind"], kind);
         (event, ack)
+    }
+
+    async fn ack_gap(commits: &mut mpsc::Receiver<CommitRecord>, families: &[&str]) {
+        let (record, ack) = next_commit(commits, "source.gap").await;
+        assert_eq!(record["data"]["source"], "stream");
+        assert_eq!(record["data"]["families"], json!(families));
+        ack.send(()).unwrap();
     }
 
     async fn finish(tasks: [JoinHandle<()>; 2]) {
@@ -2249,6 +2323,7 @@ mod tests {
         .await;
         assert!(state.last_turn.is_none());
         let (ended, ()) = tokio::join!(state.ended(), async {
+            ack_gap(&mut commits, FAMILIES).await;
             next_commit(&mut commits, "session.ended")
                 .await
                 .1
@@ -2356,6 +2431,138 @@ mod tests {
         result.unwrap();
         association.await.unwrap().unwrap();
         assert!(state.text_accum.is_empty());
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn unsolicited_startup_chunks_record_one_message_gap_without_fencing() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        state.conversation.clear();
+        let chunk = json!({"sessionId":"session-1", "update": {
+            "sessionUpdate":"agent_message_chunk", "content":{"type":"text", "text":"Unsolicited"}}});
+        state.update(&chunk).await.unwrap();
+        state.update(&chunk).await.unwrap();
+        assert!(commits.try_recv().is_err());
+
+        let (bound, ()) = tokio::join!(state.bind_conversation("session-1"), async {
+            ack_gap(&mut commits, &["message"]).await;
+        });
+        bound.unwrap();
+        assert!(commits.try_recv().is_err());
+        assert!(state.pending.is_none());
+        assert!(state.last_turn.is_none());
+        assert!(state.text_accum.is_empty());
+        assert!(!state.source_unknown);
+        assert!(state.failure.is_none());
+        state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn post_turn_gaps_do_not_associate_or_contaminate_the_follow_up() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let first = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        let tool = json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "tool_call", "toolCallId": "async-1", "status": "in_progress"}});
+        let late = json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "tool_call_update", "toolCallId": "async-1", "status": "completed"}});
+        let prompt: PromptResult =
+            serde_json::from_value(json!({"stopReason":"end_turn"})).unwrap();
+        let (result, ()) = tokio::join!(
+            async {
+                state.update(&tool).await?;
+                state.settle_prompt(&prompt).await
+            },
+            async {
+                for kind in ["turn.started", "tool.started", "turn.completed"] {
+                    let (event, ack) = next_commit(&mut commits, kind).await;
+                    assert_eq!(event["data"]["turn_id"], "turn-1");
+                    ack.send(()).unwrap();
+                }
+            }
+        );
+        result.unwrap();
+        first.await.unwrap().unwrap();
+
+        let idle_chunk = json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Async tool finished"}}});
+        let idle_tool = json!({"sessionId": "session-1", "update": {
+            "sessionUpdate": "tool_call", "toolCallId": "background", "status": "in_progress"}});
+        let (idle, ()) = tokio::join!(
+            async {
+                for update in [&idle_chunk, &idle_chunk, &idle_tool, &late, &late] {
+                    state.update(update).await?;
+                }
+                Result::Ok(())
+            },
+            async {
+                ack_gap(&mut commits, &["message"]).await;
+                ack_gap(&mut commits, &["tool"]).await;
+            }
+        );
+        idle.unwrap();
+        let mut second = state.prepare("command-2".into(), "turn-2".into()).unwrap();
+        let (late_delta, ()) = tokio::join!(state.update(&late), async {
+            ack_gap(&mut commits, &["tool"]).await;
+        });
+        late_delta.unwrap();
+        state.update(&late).await.unwrap();
+        assert!(matches!(
+            second.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(commits.try_recv().is_err());
+
+        let second_chunk = json!({"sessionId":"session-1", "update": {
+            "sessionUpdate":"agent_message_chunk", "content":{"type":"text", "text":"50"}}});
+        let (result, ()) = tokio::join!(
+            async {
+                state.update(&second_chunk).await?;
+                state.settle_prompt(&prompt).await
+            },
+            async {
+                for kind in ["turn.started", "message.completed", "turn.completed"] {
+                    let (event, ack) = next_commit(&mut commits, kind).await;
+                    assert_eq!(event["data"]["turn_id"], "turn-2");
+                    assert_eq!(event["data"]["command_id"], "command-2");
+                    if kind == "message.completed" {
+                        assert_eq!(event["data"]["text"], "50");
+                    }
+                    ack.send(()).unwrap();
+                }
+            }
+        );
+        result.unwrap();
+        second.await.unwrap().unwrap();
+        let (next_idle, ()) = tokio::join!(state.update(&idle_chunk), async {
+            ack_gap(&mut commits, &["message"]).await;
+        });
+        next_idle.unwrap();
+        assert!(commits.try_recv().is_err());
+        assert!(!state.source_unknown);
+        assert!(state.failure.is_none());
+        finish(tasks).await;
+    }
+
+    #[tokio::test]
+    async fn only_pre_admission_validation_refusal_withdraws_a_prompt() {
+        let (mut state, mut commits, tasks) = state_with_commits();
+        let rejected = state.prepare("command-1".into(), "turn-1".into()).unwrap();
+        state
+            .fail_prompt(Error::new("native_rejected", "invalid params"))
+            .await;
+        assert_eq!(rejected.await.unwrap().unwrap_err().code, "native_rejected");
+        assert!(state.pending.is_none());
+        assert!(!state.source_unknown);
+
+        let uncertain = state.prepare("command-2".into(), "turn-2".into()).unwrap();
+        tokio::join!(
+            state.fail_prompt(Error::new("unknown", "unclassified ACP error")),
+            ack_gap(&mut commits, FAMILIES)
+        );
+        assert_eq!(uncertain.await.unwrap().unwrap_err().code, "unknown");
+        assert_eq!(state.active_turn(), Some("turn-2"));
+        assert!(state.source_unknown);
         finish(tasks).await;
     }
 
