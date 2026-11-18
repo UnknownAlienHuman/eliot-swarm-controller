@@ -344,8 +344,7 @@ impl DesktopApp {
                         .automation_name("Retry reading effort levels")
                         .on_click(context.message(Message::Configure(ConfigureMsg::CatalogRetry)))
                         .content(m3::label("Retry")),
-                ))
-                .into(),
+                )),
             _ if effort_locked || (!ready && efforts.is_empty()) => View::empty(),
             _ => {
                 if efforts.is_empty() {
