@@ -279,14 +279,15 @@ A conversation association links an existing Agent or chat to a project or
 display group. It leaves native session, execution workspace, permissions and
 historical command attribution intact: association is placement, never
 authority. The headless association API stores the overlay beside the
-existing Agent or chat identity (schema v62).
+existing Agent or chat identity (schema v63).
 
 - `chat.organization` returns the grouped projection: teams by project
-  assignment, manager, repository or worktree, and ancestry, with revision
-  and readback. Clients never repeat Git discovery or grouping.
+  assignment, manager, repository or worktree, and ancestry, with
+  event-watermark readback. Clients never repeat Git discovery or grouping.
 - `chat.attach` moves chats under a retained project; `chat.detach` returns
   them to the no-project bucket. `chat.tag` replaces tag groups. Each
-  mutation returns the committed revision and per-Agent readback.
+  mutation returns the committed per-Agent links; change readback rides the
+  projection's event watermark.
 - Continuing work in another project is a separate, authorized execution
   operation: `chat.continue` starts a new project session through the normal
   launch pipeline with a prepared workspace and a reference to the source
@@ -297,8 +298,8 @@ existing Agent or chat identity (schema v62).
 
 Migration keeps every ID and all history. Links are derived only from
 unambiguous retained facts (registration, common directory, parent); never
-from names or the last message. Several root managers of one project are
-shown as needing assignment and are never auto-reassigned. Rename and
+from names or the last message. Competing roots of one project surface as
+an explicit ambiguity and are never auto-reassigned. Rename and
 archive reuse their existing paths; presentation preferences stay in the
 existing settings. The wire contract is [Chat organization](api.md#chat-organization).
 

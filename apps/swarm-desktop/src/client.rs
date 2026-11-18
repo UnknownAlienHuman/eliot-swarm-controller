@@ -13,14 +13,13 @@ use std::path::{Path, PathBuf};
 use eliot_core::api::{
     AgentArchiveRequest, AgentDeleteRequest, AgentGetRequest, AgentGetResponse, AgentListRequest,
     AgentListResponse, AgentResultRequest, AgentResultResponse, AgentTreeResponse, ArchivedFilter,
-    ChatAttachRequest, ChatContinueRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
-    ChatTagRequest, CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest,
-    CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
-    CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest,
-    DiagnoseResponse, EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest,
-    EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest,
-    HandoffResponse, HarnessModelsRequest, HarnessModelsResponse, ReparentRequest,
-    ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
+    CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest, CommandChildrenResponse,
+    CommandGetRequest, CommandResolution, CommandResolveRequest, CommandResolveResponse,
+    CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest, DiagnoseResponse,
+    EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
+    EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest, HandoffResponse,
+    HarnessModelsRequest, HarnessModelsResponse, ReparentRequest, ReparentResponse, SwitchRequest,
+    SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -947,99 +946,6 @@ pub async fn submit_stop(
     )?;
     request.expected_generation = Some(generation);
     submit(data_dir, &request).await
-}
-
-/// `chat.attach` (Owner only): place chats under a retained project.
-/// Placement only: execution scope, workspace and history are untouched.
-/// Durable, idempotent by mutation id.
-pub async fn org_attach(
-    data_dir: &Path,
-    mutation_id: String,
-    agent: &str,
-    project: &str,
-) -> Result<ChatOrganizationMutationResponse> {
-    let request = ChatAttachRequest {
-        id: mutation_id,
-        agents: vec![agent.to_owned()],
-        project: project.to_owned(),
-    };
-    request.validate()?;
-    let reply: ChatOrganizationMutationResponse =
-        typed_call(data_dir, "chat.attach", &request).await?;
-    request.validate_response(&reply).map_err(unverified)?;
-    Ok(reply)
-}
-
-/// `chat.detach` (Owner only): return chats to the no-project bucket.
-/// Placement only. Durable, idempotent by mutation id.
-pub async fn org_detach(
-    data_dir: &Path,
-    mutation_id: String,
-    agent: &str,
-) -> Result<ChatOrganizationMutationResponse> {
-    let request = ChatDetachRequest {
-        id: mutation_id,
-        agents: vec![agent.to_owned()],
-    };
-    request.validate()?;
-    let reply: ChatOrganizationMutationResponse =
-        typed_call(data_dir, "chat.detach", &request).await?;
-    request.validate_response(&reply).map_err(unverified)?;
-    Ok(reply)
-}
-
-/// `chat.tag` (Owner only): replace the tag groups of an Agent or chat.
-/// Durable, idempotent by mutation id.
-pub async fn org_tag(
-    data_dir: &Path,
-    mutation_id: String,
-    agent: &str,
-    tags: Vec<String>,
-) -> Result<ChatOrganizationMutationResponse> {
-    let request = ChatTagRequest {
-        id: mutation_id,
-        agents: vec![agent.to_owned()],
-        tags,
-    };
-    request.validate()?;
-    let reply: ChatOrganizationMutationResponse =
-        typed_call(data_dir, "chat.tag", &request).await?;
-    request.validate_response(&reply).map_err(unverified)?;
-    Ok(reply)
-}
-
-/// `chat.continue` (Owner only): start an authorized project session for a
-/// chat and record the source reference. The first reply is the reservation;
-/// the same request again reads the session back and never starts another.
-pub async fn org_continue(
-    data_dir: &Path,
-    mutation_id: String,
-    agent: &str,
-    project: &str,
-) -> Result<eliot_core::api::ChatContinueResponse> {
-    let request = ChatContinueRequest {
-        id: mutation_id,
-        chat: agent.to_owned(),
-        project: project.to_owned(),
-        launch: eliot_core::api::SwitchLaunch {
-            profile: None,
-            harness: None,
-            model: None,
-            effort: None,
-            auth: None,
-            cmd: None,
-            access: None,
-            workspace: None,
-            worktree: None,
-            base: None,
-        },
-        text: None,
-    };
-    request.validate()?;
-    let reply: eliot_core::api::ChatContinueResponse =
-        typed_call(data_dir, "chat.continue", &request).await?;
-    request.validate_response(&reply).map_err(unverified)?;
-    Ok(reply)
 }
 
 #[cfg(test)]

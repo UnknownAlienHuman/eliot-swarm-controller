@@ -6,15 +6,15 @@
 //! tags group Agents and chats. Execution project, scope, workspace and
 //! history are never edited here. `chat.continue` starts a new authorized
 //! project session and records a source reference; the source keeps its
-//! history and usage attribution.
+//! history and usage attribution. Change readback rides the existing event
+//! watermark; there is no organization revision.
 
 use super::*;
 use eliot_core::api::{
     ArchivedFilter, ChatAttachRequest, ChatContinueRequest, ChatContinueResponse,
     ChatDetachRequest, ChatOrganizationMutationResponse, ChatOrganizationRequest,
     ChatOrganizationResponse, ChatTagRequest, MAX_ORG_MEMBERS_PER_GROUP, MAX_ORG_MEMBERS_TOTAL,
-    OrgGroupView, OrgLinkView, OrgMemberView, OrgSourceRef, ProjectAssignment,
-    ProjectManagerIdentity, SwitchAgent,
+    OrgGroupView, OrgLinkView, OrgMemberView, OrgSourceRef, SwitchAgent,
 };
 use std::collections::BTreeMap;
 
@@ -23,27 +23,17 @@ pub(super) const CHAT_DETACH_METHOD: &str = "chat.detach";
 pub(super) const CHAT_TAG_METHOD: &str = "chat.tag";
 pub(super) const CHAT_CONTINUE_METHOD: &str = "chat.continue";
 
+/// Most retained roots read back for one project group: the first roots the
+/// team, the rest surface as the ambiguity. Roots are parentless Agents, so
+/// one project never holds many.
+const MAX_ORG_ROOTS_PER_GROUP: usize = 65;
+
 fn owner_only(principal: &str, what: &str) -> Result<()> {
     if principal == "owner" {
         Ok(())
     } else {
         Err(Error::new("not_allowed", format!("only Owner may {what}")))
     }
-}
-
-fn organization_revision(conn: &Connection) -> Result<i64> {
-    conn.query_row("SELECT revision FROM organization_state", [], |row| {
-        row.get(0)
-    })
-    .map_err(sql_error)
-}
-
-fn bump_organization_revision(tx: &Transaction<'_>) -> Result<i64> {
-    db!(tx.execute("UPDATE organization_state SET revision = revision + 1", []));
-    tx.query_row("SELECT revision FROM organization_state", [], |row| {
-        row.get(0)
-    })
-    .map_err(sql_error)
 }
 
 fn organization_watermark(conn: &Connection) -> Result<i64> {
@@ -79,11 +69,14 @@ fn decode_tags(raw: &str) -> Result<Vec<String>> {
 struct OrgRow {
     link: Option<String>,
     tags: Vec<String>,
+    source: Option<(i64, i64)>,
 }
 
 fn load_org_rows(conn: &Connection) -> Result<BTreeMap<i64, OrgRow>> {
     let mut statement = conn
-        .prepare("SELECT agent, project_link, tags FROM chat_organization")
+        .prepare(
+            "SELECT agent, project_link, tags, source, source_generation FROM chat_organization",
+        )
         .map_err(sql_error)?;
     let rows = statement
         .query_map([], |row| {
@@ -91,75 +84,25 @@ fn load_org_rows(conn: &Connection) -> Result<BTreeMap<i64, OrgRow>> {
                 row.get::<_, i64>(0)?,
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
             ))
         })
         .map_err(sql_error)?;
     let mut map = BTreeMap::new();
     for row in rows {
-        let (agent, link, tags) = row.map_err(sql_error)?;
+        let (agent, link, tags, source, source_generation) = row.map_err(sql_error)?;
+        let source = source.zip(source_generation);
         map.insert(
             agent,
             OrgRow {
                 link,
                 tags: decode_tags(&tags)?,
+                source,
             },
         );
     }
     Ok(map)
-}
-
-fn load_continuations(conn: &Connection) -> Result<BTreeMap<i64, (i64, i64)>> {
-    let mut statement = conn
-        .prepare("SELECT session, source, source_generation FROM chat_continuations")
-        .map_err(sql_error)?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
-        .map_err(sql_error)?;
-    let mut map = BTreeMap::new();
-    for row in rows {
-        let (session, source, generation) = row.map_err(sql_error)?;
-        map.insert(session, (source, generation));
-    }
-    Ok(map)
-}
-
-fn manager_view(
-    conn: &Connection,
-    assignment: &ProjectAssignment,
-) -> Result<Option<eliot_core::api::OverviewManagerView>> {
-    let Some(ProjectManagerIdentity::Local { agent, generation }) = assignment.manager.as_ref()
-    else {
-        return Ok(None);
-    };
-    let state = load_agent_by_num(conn, parse_agent_id(agent)?)?
-        .filter(|row| {
-            row.generation == *generation
-                || (row.generation == 0
-                    && *generation == 1
-                    && matches!(
-                        assignment.state,
-                        eliot_core::api::ProjectAssignmentState::Starting
-                    ))
-        })
-        .map_or(AgentState::Unknown, |row| row.state);
-    Ok(Some(eliot_core::api::OverviewManagerView {
-        agent: agent.clone(),
-        generation: *generation,
-        state,
-        assignment_revision: assignment.revision,
-        workspace: assignment.workspace.clone(),
-    }))
-}
-
-struct ScannedMember {
-    key: Option<String>,
-    view: OrgMemberView,
 }
 
 enum LinkChange {
@@ -213,68 +156,80 @@ impl LinkRequest<'_> {
     }
 }
 
-impl Store {
-    /// Grouped work projection: one group per project in the retained union
-    /// (registrations, assignments, execution labels) plus the unplaced
-    /// bucket. Groups follow project assignment, manager,
-    /// repository/worktree and ancestry; chats additionally follow their
-    /// placement link. Owner only. The caller gets a ready projection with
-    /// the organization revision and readback, so no client repeats Git
-    /// discovery or grouping.
-    pub fn chat_organization(
-        &self,
-        principal: &str,
-        request: &ChatOrganizationRequest,
-        now: i64,
-    ) -> Result<ChatOrganizationResponse> {
-        request.validate()?;
-        owner_only(principal, "read organization")?;
-        self.ensure_committed_reads()?;
-        let conn = &self.connection;
-        let revision = organization_revision(conn)?;
-        let watermark = organization_watermark(conn)?;
-        let union: Vec<String> = conn
-            .prepare(
-                "SELECT project FROM (
-                     SELECT id AS project FROM project_registrations
-                     UNION SELECT project FROM project_assignments
-                     UNION SELECT project FROM agents WHERE project <> ''
-                 ) WHERE (?1 IS NULL OR project = ?1) ORDER BY project",
-            )
-            .map_err(sql_error)?
-            .query_map(params![request.project.as_deref()], |row| row.get(0))
-            .map_err(sql_error)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(sql_error)?;
-        if let Some(project) = request.project.as_deref()
-            && !union.iter().any(|entry| entry == project)
-        {
-            return Err(Error::new(
-                "not_found",
-                format!("project {project} was not found"),
-            ));
-        }
-        let registered: BTreeMap<String, ()> = conn
-            .prepare("SELECT id FROM project_registrations")
-            .map_err(sql_error)?
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(sql_error)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(sql_error)?
-            .into_iter()
-            .map(|id| (id, ()))
-            .collect();
-        let org_rows = load_org_rows(conn)?;
-        let continuations = load_continuations(conn)?;
-        let mut statement = conn
-            .prepare(
-                "SELECT id, generation, state, harness, parent, root, project,
-                        chat, archived, observe_only, workspace
-                 FROM agents ORDER BY id",
-            )
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map([], |row| {
+/// Retained roots of one execution project: parentless, live-scope,
+/// non-chat Agents in id order. The caller picks the archived predicate, so
+/// assignment need stays display-scoped while ambiguity counts every
+/// retained root independently of the archived filter.
+fn organization_roots(conn: &Connection, project: &str, archived: &str) -> Result<Vec<i64>> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT a.id FROM agents a WHERE a.parent IS NULL AND a.observe_only = 0
+             AND a.chat = 0 AND a.project = ?1 AND {archived}
+             ORDER BY a.id LIMIT {}",
+            MAX_ORG_ROOTS_PER_GROUP as i64,
+        ))
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([project], |row| row.get::<_, i64>(0))
+        .map_err(sql_error)?;
+    rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
+}
+
+/// Bounded member rows for one group: execution members plus chats placed
+/// here by the overlay for a project, or the unplaced bucket when `project`
+/// is absent. The rowid-ordered scan stops after the group's share, so a
+/// single-project read never materializes the fleet.
+fn organization_members(
+    conn: &Connection,
+    project: Option<&str>,
+    archived: &str,
+    take: usize,
+    org_rows: &BTreeMap<i64, OrgRow>,
+    members: &mut Vec<OrgMemberView>,
+) -> Result<()> {
+    let take = i64::try_from(take)
+        .map_err(|_| Error::new("internal", "organization page bound is invalid"))?;
+    let mut statement = match project {
+        Some(_) => conn
+            .prepare(&format!(
+                "SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
+                        a.chat, a.archived, a.observe_only, a.workspace
+                 FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
+                 WHERE ((a.project = ?1 AND (a.chat = 0 OR o.project_link IS NULL
+                        OR NOT EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link)))
+                       OR (a.chat = 1 AND o.project_link = ?1))
+                   AND {archived}
+                 ORDER BY a.id LIMIT ?2",
+            ))
+            .map_err(sql_error)?,
+        None => conn
+            .prepare(&format!(
+                "SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
+                        a.chat, a.archived, a.observe_only, a.workspace
+                 FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
+                 WHERE NOT ((a.chat = 1 AND o.project_link IS NOT NULL
+                            AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link))
+                           OR EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project))
+                   AND {archived}
+                 ORDER BY a.id LIMIT ?1",
+            ))
+            .map_err(sql_error)?,
+    };
+    let rows: Vec<(
+        i64,
+        i64,
+        String,
+        String,
+        Option<i64>,
+        i64,
+        String,
+        bool,
+        bool,
+        bool,
+        Option<String>,
+    )> = match project {
+        Some(name) => statement
+            .query_map(params![name, take], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
@@ -289,102 +244,143 @@ impl Store {
                     row.get::<_, Option<String>>(10)?,
                 ))
             })
-            .map_err(sql_error)?;
-        // One ordered scan; rows stay in memory so totals are exact while
-        // returned rows truncate per group and across the projection.
-        // Roots are tracked beside the rows: a project with no manager but
-        // root members reads as needing assignment, never auto-assigned.
-        let mut scanned: Vec<ScannedMember> = Vec::new();
-        let mut counts: BTreeMap<Option<String>, usize> = BTreeMap::new();
-        let mut has_root: BTreeMap<Option<String>, bool> = BTreeMap::new();
-        for row in rows {
-            let (
-                num,
-                generation,
-                state,
-                harness,
-                parent,
-                root,
-                project,
-                chat,
-                archived,
-                observe_only,
-                workspace,
-            ) = row.map_err(sql_error)?;
-            if match request.archived {
-                ArchivedFilter::Exclude => archived,
-                ArchivedFilter::Only => !archived,
-                ArchivedFilter::Include => false,
-            } {
-                continue;
-            }
-            let org = org_rows.get(&num);
-            let link = org.and_then(|entry| entry.link.clone());
-            let placed_project = link
-                .clone()
-                .filter(|target| registered.contains_key(target));
-            let key = if chat {
-                placed_project.or_else(|| {
-                    if registered.contains_key(&project) {
-                        Some(project.clone())
-                    } else {
-                        None
-                    }
-                })
-            } else if registered.contains_key(&project) {
-                Some(project.clone())
-            } else {
-                None
-            };
-            if request
-                .project
-                .as_deref()
-                .is_some_and(|filter| key.as_deref() != Some(filter))
-            {
-                continue;
-            }
-            *counts.entry(key.clone()).or_default() += 1;
-            if parent.is_none() && !observe_only && !chat {
-                has_root.insert(key.clone(), true);
-            }
-            scanned.push(ScannedMember {
-                key,
-                view: OrgMemberView {
-                    agent: format_agent_id(num),
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sql_error)?,
+        None => statement
+            .query_map(params![take], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, bool>(7)?,
+                    row.get::<_, bool>(8)?,
+                    row.get::<_, bool>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            })
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sql_error)?,
+    };
+    for (
+        num,
+        generation,
+        state,
+        harness,
+        parent,
+        root,
+        execution,
+        chat,
+        archived,
+        _observe_only,
+        workspace,
+    ) in rows
+    {
+        let org = org_rows.get(&num);
+        let link = org.and_then(|entry| entry.link.clone());
+        members.push(OrgMemberView {
+            agent: format_agent_id(num),
+            generation,
+            state: parse_enum(&state, "Agent state")?,
+            harness,
+            parent: parent.map(format_agent_id),
+            root: format_agent_id(root),
+            project: execution,
+            chat,
+            archived,
+            project_link: link.clone(),
+            tags: org.map(|entry| entry.tags.clone()).unwrap_or_default(),
+            placed: chat && link.is_some(),
+            continued_from: org.and_then(|entry| {
+                entry.source.map(|(source, generation)| OrgSourceRef {
+                    agent: format_agent_id(source),
                     generation,
-                    state: parse_enum(&state, "Agent state")?,
-                    harness,
-                    parent: parent.map(format_agent_id),
-                    root: format_agent_id(root),
-                    project,
-                    chat,
-                    archived,
-                    project_link: link.clone(),
-                    tags: org.map(|entry| entry.tags.clone()).unwrap_or_default(),
-                    placed: chat && link.is_some(),
-                    continued_from: continuations.get(&num).map(|(source, generation)| {
-                        OrgSourceRef {
-                            agent: format_agent_id(*source),
-                            generation: *generation,
-                        }
-                    }),
-                    workspace,
-                },
-            });
+                })
+            }),
+            workspace,
+        });
+    }
+    Ok(())
+}
+
+impl Store {
+    /// Grouped work projection: one group per project in the retained union
+    /// (registrations, assignments, execution labels) plus the unplaced
+    /// bucket. Groups follow project assignment, manager,
+    /// repository/worktree and ancestry; chats additionally follow their
+    /// placement link. Owner only. Totals come from one aggregate pass and
+    /// member rows from index-scoped bounded queries, so a single-project
+    /// read never materializes the fleet; the overlay supplies placement,
+    /// tags and source references on those bounded rows.
+    pub fn chat_organization(
+        &self,
+        principal: &str,
+        request: &ChatOrganizationRequest,
+        now: i64,
+    ) -> Result<ChatOrganizationResponse> {
+        request.validate()?;
+        owner_only(principal, "read organization")?;
+        self.ensure_committed_reads()?;
+        let conn = &self.connection;
+        let watermark = organization_watermark(conn)?;
+        let union = overview::list_overview_projects(conn, request.project.as_deref(), None)?;
+        if request.project.is_some() && union.is_empty() {
+            return Err(Error::new(
+                "not_found",
+                format!(
+                    "project {} was not found",
+                    request.project.as_deref().unwrap_or_default()
+                ),
+            ));
         }
-        let grand_total: usize = scanned.len();
+        let archived = match request.archived {
+            ArchivedFilter::Exclude => "a.archived = 0",
+            ArchivedFilter::Only => "a.archived = 1",
+            ArchivedFilter::Include => "1 = 1",
+        };
+        // Exact per-group totals without materializing rows: the key
+        // expression mirrors the member queries below.
+        let mut counts: BTreeMap<Option<String>, usize> = BTreeMap::new();
+        {
+            let mut totals = conn
+                .prepare(&format!(
+                    "SELECT CASE WHEN (a.chat = 1 AND o.project_link IS NOT NULL
+                                 AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link))
+                            THEN o.project_link
+                            WHEN EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project)
+                            THEN a.project ELSE NULL END,
+                        COUNT(*)
+                     FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
+                     WHERE {archived} GROUP BY 1",
+                ))
+                .map_err(sql_error)?;
+            let rows = totals
+                .query_map([], |row| {
+                    Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sql_error)?;
+            for row in rows {
+                let (key, total) = row.map_err(sql_error)?;
+                counts.insert(key, total as usize);
+            }
+        }
+        let org_rows = load_org_rows(conn)?;
+        let mut response = ChatOrganizationResponse {
+            event_watermark: watermark,
+            as_of: now,
+            groups: Vec::new(),
+            member_total: counts.values().sum(),
+            truncated: false,
+        };
         // Fill in response order (projects first, unplaced last) until the
         // projection cap; totals stay exact and truncation stays explicit.
         let mut budget = MAX_ORG_MEMBERS_TOTAL;
         let mut kept = 0_usize;
-        let mut response = ChatOrganizationResponse {
-            revision,
-            event_watermark: watermark,
-            as_of: now,
-            groups: Vec::new(),
-            member_total: grand_total,
-            truncated: false,
-        };
         let mut order: Vec<Option<String>> =
             union.iter().map(|project| Some(project.clone())).collect();
         if request.project.is_none() {
@@ -401,7 +397,7 @@ impl Store {
                         Vec::new(),
                         full,
                         false,
-                        false,
+                        archived,
                     )?);
                 }
                 continue;
@@ -410,20 +406,24 @@ impl Store {
             budget -= take;
             kept += take;
             let mut members = Vec::with_capacity(take);
-            for member in scanned.iter().filter(|member| member.key == key).take(take) {
-                members.push(member.view.clone());
-            }
-            let needs_assignment = has_root.get(&key).copied().unwrap_or(false);
+            organization_members(
+                conn,
+                key.as_deref(),
+                archived,
+                take,
+                &org_rows,
+                &mut members,
+            )?;
             response.groups.push(self.organization_group(
                 conn,
                 key,
                 members,
                 full,
                 full > take,
-                needs_assignment,
+                archived,
             )?);
         }
-        response.truncated = grand_total > kept;
+        response.truncated = response.member_total > kept;
         Ok(response)
     }
 
@@ -434,39 +434,57 @@ impl Store {
         members: Vec<OrgMemberView>,
         member_total: usize,
         members_truncated: bool,
-        has_root: bool,
+        archived: &str,
     ) -> Result<OrgGroupView> {
-        let (registration, assignment, manager, needs_assignment) = match project.as_deref() {
-            Some(project) => {
-                let registration = projects::project_registration_tx(conn, project)?;
-                if registration.is_none() {
-                    // Execution labels and assignments without a retained
-                    // registration group by label but carry no team detail.
-                    (None, None, None, false)
-                } else {
-                    let assignment = project_assignment::read_assignment(conn, project)?;
-                    let manager = manager_view(conn, &assignment)?;
-                    let needs_assignment = assignment.manager.is_none() && has_root;
-                    (registration, Some(assignment), manager, needs_assignment)
+        let (registration, assignment, manager, needs_assignment, conflicting_roots) =
+            match project.as_deref() {
+                Some(project) => {
+                    let registration = projects::project_registration_tx(conn, project)?;
+                    if registration.is_none() {
+                        // Execution labels and assignments without a retained
+                        // registration group by label but carry no team detail.
+                        (None, None, None, false, Vec::new())
+                    } else {
+                        let assignment = project_assignment::read_assignment(conn, project)?;
+                        let manager = overview::overview_manager_view(conn, Some(&assignment))?;
+                        let needs_assignment = assignment.manager.is_none()
+                            && !organization_roots(conn, project, archived)?.is_empty();
+                        // Competing roots surface without reassigning either
+                        // root, counted independently of the display filter.
+                        let conflicting_roots = organization_roots(conn, project, "1 = 1")?
+                            .into_iter()
+                            .skip(1)
+                            .map(format_agent_id)
+                            .collect();
+                        (
+                            registration,
+                            Some(assignment),
+                            manager,
+                            needs_assignment,
+                            conflicting_roots,
+                        )
+                    }
                 }
-            }
-            None => (None, None, None, false),
-        };
+                None => (None, None, None, false, Vec::new()),
+            };
         Ok(OrgGroupView {
             project,
             registration,
             assignment,
             needs_assignment,
+            conflicting_roots,
             manager,
             members,
             member_total,
             members_truncated,
         })
     }
+
     /// Shared attach/detach/tag transaction: validate everything, then
-    /// apply link rows and the global revision atomically. Placement only:
-    /// execution project, scope, workspace and history are untouched.
-    /// Attach and detach place chats; tags group any Agent or chat.
+    /// apply link rows atomically. Placement only: execution project,
+    /// scope, workspace and history are untouched. Attach and detach place
+    /// chats; tags group any Agent or chat. Replay returns the retained
+    /// row; the event watermark is the change readback.
     fn mutate_links(
         &mut self,
         principal: &str,
@@ -536,7 +554,6 @@ impl Store {
                     format!("project {project} was not found"),
                 ));
             }
-            let revision = bump_organization_revision(&tx)?;
             let mut links = Vec::with_capacity(nums.len());
             for (agent, num) in nums {
                 let current: Option<(Option<String>, String)> = tx
@@ -566,22 +583,20 @@ impl Store {
                     }
                 };
                 db!(tx.execute(
-                    "INSERT INTO chat_organization(agent, project_link, tags, revision, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
+                    "INSERT INTO chat_organization(agent, project_link, tags, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(agent) DO UPDATE SET project_link = excluded.project_link,
-                         tags = excluded.tags, revision = excluded.revision, updated_at = excluded.updated_at",
-                    params![num, link, tags, revision, now],
+                         tags = excluded.tags, updated_at = excluded.updated_at",
+                    params![num, link, tags, now],
                 ));
                 links.push(OrgLinkView {
                     agent,
                     project_link: link,
                     tags: decode_tags(&tags)?,
-                    revision,
                 });
             }
             let value = ChatOrganizationMutationResponse {
                 id: id.to_owned(),
-                revision,
                 links,
             };
             coordination::retain_write_tx(
@@ -837,6 +852,8 @@ impl Store {
     /// Admit the reserved launch in the same transaction as launch admission,
     /// capacity and workspace reservation. The first input is the source
     /// reference brief: pointers to the retained source, never a transcript.
+    /// The admitted preparation must still belong to the reserved project's
+    /// repository; the registration revision binds the dispatch.
     pub fn admit_continue_launch(
         &mut self,
         id: &str,
@@ -889,6 +906,14 @@ impl Store {
                     "continue registration changed during preparation",
                 ));
             }
+            if let Some(preparation) = &preparation
+                && preparation.repo_common_dir != registration.repo_common_dir
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "continue preparation left the project repository",
+                ));
+            }
             if load_command(&tx, &request.id)?.is_some()
                 && continue_component(&tx, id, &request.id, 0)?.is_none()
             {
@@ -920,7 +945,9 @@ impl Store {
 
     /// Record the source reference beside the new session and settle the
     /// parent once its launch applied. The source keeps its history and
-    /// usage attribution; only pointers are retained here.
+    /// usage attribution; only pointers are retained here, in the Agent's
+    /// organization metadata. The readback carries the admitted workspace
+    /// and the linked brief's actual outcome.
     pub fn finish_chat_continue(
         &mut self,
         id: &str,
@@ -943,11 +970,14 @@ impl Store {
             let plan = continue_result_on(&tx, id)?;
             let launch = continue_component(&tx, id, &plan.launch_command, 0)?
                 .ok_or_else(|| Error::new("bad_state", "continue launch not admitted"))?;
+            let brief = load_command(&tx, &plan.brief_command)?
+                .ok_or_else(|| Error::new("bad_state", "continue brief not admitted"))?;
             let mut events = Vec::new();
             let state: CommandState;
             let mut error = None;
             let mut created = None;
-            if launch.state == CommandState::Applied {
+            let mut workspace = plan.workspace.clone();
+            if launch.state == CommandState::Applied && brief.state == CommandState::Applied {
                 let target = launch.target.clone().ok_or_else(|| {
                     Error::new("source_integrity", "continue launch has no session")
                 })?;
@@ -957,10 +987,16 @@ impl Store {
                 })?;
                 let source = parse_agent_id(&plan.source.agent)?;
                 db!(tx.execute(
-                    "INSERT INTO chat_continuations(session, source, source_generation, brief_command, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![session, source, plan.source.generation, plan.brief_command, now],
+                    "INSERT INTO chat_organization(agent, project_link, tags, source, source_generation, updated_at)
+                     VALUES (?1, NULL, '[]', ?2, ?3, ?4)
+                     ON CONFLICT(agent) DO UPDATE SET source = excluded.source,
+                         source_generation = excluded.source_generation, updated_at = excluded.updated_at",
+                    params![session, source, plan.source.generation, now],
                 ));
+                workspace = agent
+                    .workspace
+                    .clone()
+                    .unwrap_or_else(|| plan.workspace.clone());
                 created = Some(SwitchAgent {
                     agent: agent.id,
                     generation: agent.generation,
@@ -973,15 +1009,32 @@ impl Store {
                         | CommandState::Queued
                         | CommandState::Dispatched
                         | CommandState::Unknown
-                ) {
+                ) || (launch.state == CommandState::Applied
+                    && matches!(
+                        brief.state,
+                        CommandState::Accepted
+                            | CommandState::Queued
+                            | CommandState::Dispatched
+                            | CommandState::Unknown
+                    )) {
                     CommandState::Unknown
                 } else {
                     CommandState::Failed
                 };
-                error = Some(Error::new(
-                    "launch_not_ready",
-                    "launch has no proven readiness",
-                ));
+                let code = if launch.state != CommandState::Applied {
+                    "launch_not_ready"
+                } else if matches!(
+                    brief.state,
+                    CommandState::Accepted
+                        | CommandState::Queued
+                        | CommandState::Dispatched
+                        | CommandState::Unknown
+                ) {
+                    "brief_not_ready"
+                } else {
+                    "brief_failed"
+                };
+                error = Some(Error::new(code, "continue brief has no applied outcome"));
             }
             if error.as_ref().is_some_and(|error| error.code == "internal") {
                 return Err(error.unwrap());
@@ -990,6 +1043,7 @@ impl Store {
             value.error = error.map(|error| error.code);
             value.state = state;
             value.created = created;
+            value.workspace = workspace;
             let outcome = serde_json::to_value(&value)
                 .map_err(|_| Error::new("internal", "cannot encode continue result"))?;
             update_command_state(&tx, id, state, Some(&outcome), None, now)?;
@@ -1034,13 +1088,21 @@ impl Store {
         continue_result_on(&self.connection, id)
     }
 
+    /// The new session is ready when its launch applied and the linked
+    /// source-reference brief applied: the readback exposes both outcomes.
     pub fn continue_launch_ready(&self, id: &str) -> Result<bool> {
         self.ensure_committed_reads()?;
         let value = continue_result_on(&self.connection, id)?;
         let Some(launch) = load_command(&self.connection, &value.launch_command)? else {
             return Ok(false);
         };
-        Ok(launch.state == CommandState::Applied)
+        if launch.state != CommandState::Applied {
+            return Ok(false);
+        }
+        let Some(brief) = load_command(&self.connection, &value.brief_command)? else {
+            return Ok(false);
+        };
+        Ok(brief.state == CommandState::Applied)
     }
 }
 
@@ -1188,8 +1250,19 @@ mod tests {
         }
     }
 
+    fn project_group<'a>(
+        projection: &'a ChatOrganizationResponse,
+        project: &str,
+    ) -> &'a OrgGroupView {
+        projection
+            .groups
+            .iter()
+            .find(|group| group.project.as_deref() == Some(project))
+            .unwrap_or_else(|| panic!("missing group for project {project}"))
+    }
+
     #[test]
-    fn attach_detach_round_trip_with_revision_and_replay() {
+    fn attach_detach_round_trip_with_replay() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         register(&mut store, "alpha", "/managed/alpha");
         let chat = launch_chat(&mut store, &Ulid::new().to_string(), "/tmp/wt-k175-chat");
@@ -1230,12 +1303,10 @@ mod tests {
         let first = attach_request(&Ulid::new().to_string(), &[&chat], "alpha");
         let attached = store.attach_chats("owner", &first, now()).unwrap().value;
         first.validate_response(&attached).unwrap();
-        assert_eq!(attached.revision, 1);
-        assert_eq!(attached.links[0].revision, 1);
-        // Same id and payload replays instead of bumping the revision.
+        assert_eq!(attached.links.len(), 1);
+        // Same id and payload replays instead of writing again.
         let replayed = store.attach_chats("owner", &first, now()).unwrap().value;
         assert_eq!(replayed, attached);
-        assert_eq!(organization_revision(&store.connection).unwrap(), 1);
 
         let detach = ChatDetachRequest {
             id: Ulid::new().to_string(),
@@ -1243,7 +1314,6 @@ mod tests {
         };
         let detached = store.detach_chats("owner", &detach, now()).unwrap().value;
         detach.validate_response(&detached).unwrap();
-        assert_eq!(detached.revision, 2);
 
         // Execution facts are untouched by placement.
         let row = load_agent_by_num(&store.connection, parse_agent_id(&chat).unwrap())
@@ -1251,7 +1321,8 @@ mod tests {
             .unwrap();
         assert!(row.project.is_empty());
 
-        // The grouped projection reads the placement back.
+        // The grouped projection reads the placement back with the event
+        // watermark as its change readback.
         let projection = store
             .chat_organization(
                 "owner",
@@ -1262,7 +1333,6 @@ mod tests {
                 now(),
             )
             .unwrap();
-        assert_eq!(projection.revision, 2);
         assert!(projection.event_watermark >= 0);
         let unplaced = projection
             .groups
@@ -1358,6 +1428,73 @@ mod tests {
     }
 
     #[test]
+    fn competing_roots_surface_without_reassignment() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        register(&mut store, "alpha", "/managed/alpha");
+        let first = launch(
+            &mut store,
+            &Ulid::new().to_string(),
+            "alpha",
+            "/managed/alpha",
+        );
+        let second = launch(
+            &mut store,
+            &Ulid::new().to_string(),
+            "alpha",
+            "/managed/alpha",
+        );
+        let first_num = parse_agent_id(&first).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO project_assignments(project, manager, manager_generation, epoch, revision, start_command)
+                 VALUES ('alpha', ?1, 0, 1, 1, NULL)",
+                [first_num],
+            )
+            .unwrap();
+        let projection = store
+            .chat_organization(
+                "owner",
+                &ChatOrganizationRequest {
+                    project: Some("alpha".to_owned()),
+                    archived: ArchivedFilter::Exclude,
+                },
+                now(),
+            )
+            .unwrap();
+        let alpha = project_group(&projection, "alpha");
+        // The assignment stands, so nothing reads as needing assignment, but
+        // the second independent root is surfaced explicitly.
+        assert!(!alpha.needs_assignment);
+        assert_eq!(alpha.conflicting_roots, vec![second.clone()]);
+        // Neither root moved: both still group under their execution project.
+        assert!(alpha.members.iter().any(|member| member.agent == first));
+        assert!(alpha.members.iter().any(|member| member.agent == second));
+
+        // The ambiguity ignores the archived display filter.
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET archived = 1 WHERE id = ?1",
+                [parse_agent_id(&second).unwrap()],
+            )
+            .unwrap();
+        let projection = store
+            .chat_organization(
+                "owner",
+                &ChatOrganizationRequest {
+                    project: Some("alpha".to_owned()),
+                    archived: ArchivedFilter::Exclude,
+                },
+                now(),
+            )
+            .unwrap();
+        let alpha = project_group(&projection, "alpha");
+        assert_eq!(alpha.conflicting_roots, vec![second.clone()]);
+        assert!(alpha.members.iter().all(|member| member.agent != second));
+    }
+
+    #[test]
     fn continue_reserve_names_project_and_source_without_touching_either() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         register(&mut store, "alpha", "/managed/alpha");
@@ -1413,5 +1550,195 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(source.project.is_empty());
+    }
+
+    #[test]
+    fn restart_preserves_typed_continue_outcome_for_replay() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        register(&mut store, "alpha", "/managed/alpha");
+        let chat = launch_chat(&mut store, &Ulid::new().to_string(), "/tmp/wt-k175-chat-e");
+        let request = continue_request(&Ulid::new().to_string(), &chat, "alpha");
+        let reserved = store
+            .reserve_chat_continue("owner", &request, &core::SecretPolicy::default(), now())
+            .unwrap()
+            .value;
+        store.start_chat_continue(&request.id, now()).unwrap();
+        store.recover_on_restart(now()).unwrap();
+        // The restart marks the parent unknown but keeps the typed launch,
+        // brief and source bindings, so same-ID replay still decodes.
+        let readback = store.continue_result(&request.id).unwrap();
+        assert_eq!(readback.launch_command, reserved.launch_command);
+        assert_eq!(readback.brief_command, reserved.brief_command);
+        assert_eq!(readback.source.agent, chat);
+        let replayed = store
+            .replay_chat_continue("owner", &request)
+            .unwrap()
+            .expect("restarted continue replays");
+        assert_eq!(replayed.launch_command, reserved.launch_command);
+        assert_eq!(replayed.state, CommandState::Unknown);
+    }
+
+    #[test]
+    fn source_reference_reads_back_on_the_overlay() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        register(&mut store, "alpha", "/managed/alpha");
+        let worker = launch(
+            &mut store,
+            &Ulid::new().to_string(),
+            "alpha",
+            "/managed/alpha",
+        );
+        let session = launch(
+            &mut store,
+            &Ulid::new().to_string(),
+            "alpha",
+            "/managed/alpha",
+        );
+        let worker_num = parse_agent_id(&worker).unwrap();
+        let session_num = parse_agent_id(&session).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO chat_organization(agent, project_link, tags, source, source_generation, updated_at)
+                 VALUES (?1, NULL, '[]', ?2, 1, 0)",
+                params![session_num, worker_num],
+            )
+            .unwrap();
+        let projection = store
+            .chat_organization(
+                "owner",
+                &ChatOrganizationRequest {
+                    project: Some("alpha".to_owned()),
+                    archived: ArchivedFilter::Exclude,
+                },
+                now(),
+            )
+            .unwrap();
+        let member = project_group(&projection, "alpha")
+            .members
+            .iter()
+            .find(|member| member.agent == session)
+            .expect("continued session");
+        assert_eq!(
+            member.continued_from,
+            Some(OrgSourceRef {
+                agent: worker.clone(),
+                generation: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn migration_links_only_unambiguous_projectless_chats() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        register(&mut store, "alpha", "/managed/alpha");
+        register(&mut store, "beta", "/managed/beta");
+        let alpha_worker = launch(
+            &mut store,
+            &Ulid::new().to_string(),
+            "alpha",
+            "/managed/alpha",
+        );
+        let beta_worker = launch(
+            &mut store,
+            &Ulid::new().to_string(),
+            "beta",
+            "/managed/beta",
+        );
+        // A projectless chat under a single retained project links to it.
+        let lone = launch_chat(&mut store, &Ulid::new().to_string(), "/tmp/wt-k175-lone");
+        // Competing ancestry (beta parent under an alpha grandparent) links nowhere.
+        let tangled = launch_chat(&mut store, &Ulid::new().to_string(), "/tmp/wt-k175-tangled");
+        // A projectless chat whose retained worktree belongs to alpha links to it.
+        let worktree_chat = launch_chat(
+            &mut store,
+            &Ulid::new().to_string(),
+            "/tmp/wt-k175-branched",
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET parent = ?1 WHERE id = ?2",
+                params![
+                    parse_agent_id(&alpha_worker).unwrap(),
+                    parse_agent_id(&lone).unwrap()
+                ],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET parent = ?1 WHERE id = ?2",
+                params![
+                    parse_agent_id(&beta_worker).unwrap(),
+                    parse_agent_id(&tangled).unwrap()
+                ],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET parent = ?1 WHERE id = ?2",
+                params![
+                    parse_agent_id(&alpha_worker).unwrap(),
+                    parse_agent_id(&beta_worker).unwrap()
+                ],
+            )
+            .unwrap();
+        let command: String = store
+            .connection
+            .query_row("SELECT id FROM commands LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO workspaces(agent, target_generation, start_command_id, project, repo_path,
+                     repo_common_dir, requested_branch, base_ref, base_oid, worktree_path, frozen_setup,
+                     phase, setup_index, outcome, updated_at)
+                 VALUES (?1, 1, ?2, '', '/managed/alpha', '/managed/alpha/.git', 'branch',
+                     NULL, 'oid', '/tmp/wt-k175-branched', '[]', 'ready', 0, NULL, 0)",
+                params![parse_agent_id(&worktree_chat).unwrap(), command],
+            )
+            .unwrap();
+        // Re-run the v63 migration over the populated store.
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE chat_organization; DELETE FROM schema_migrations WHERE version = 63;",
+            )
+            .unwrap();
+        store.migrate().unwrap();
+        let link: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT project_link FROM chat_organization WHERE agent = ?1",
+                [parse_agent_id(&lone).unwrap()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(link.as_deref(), Some("alpha"));
+        let tangled_link: Option<Option<String>> = store
+            .connection
+            .query_row(
+                "SELECT project_link FROM chat_organization WHERE agent = ?1",
+                [parse_agent_id(&tangled).unwrap()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(tangled_link.is_none());
+        let branched: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT project_link FROM chat_organization WHERE agent = ?1",
+                [parse_agent_id(&worktree_chat).unwrap()],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(branched.as_deref(), Some("alpha"));
     }
 }

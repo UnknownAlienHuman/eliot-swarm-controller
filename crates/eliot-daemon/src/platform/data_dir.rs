@@ -337,7 +337,7 @@ fn resolve_data_dir_with(
     default()
 }
 
-fn default_data_dir() -> Result<PathBuf> {
+pub(crate) fn default_data_dir() -> Result<PathBuf> {
     #[cfg(windows)]
     let path = std::env::var_os("LOCALAPPDATA")
         .filter(|value| !value.is_empty())

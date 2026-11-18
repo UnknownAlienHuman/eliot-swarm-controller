@@ -143,12 +143,42 @@ impl Router {
             return;
         };
         let prepared = async {
+            // Resolve the selected project's canonical checkout and Git
+            // common directory BEFORE preparation: a workspace in another
+            // repository is refused here and never launches.
+            let registration = {
+                let store = self.inner.store.lock().await;
+                store
+                    .get_project_registration("owner", &request.project)?
+                    .ok_or_else(|| {
+                        Error::new(
+                            "not_found",
+                            "continue project is not a retained registration",
+                        )
+                    })?
+            };
+            let git = crate::workspace_git::WorkspaceGit::new()?;
+            let (checkout, common_dir) = git.repository_identity(&registration.checkout).await?;
+            if checkout != registration.checkout || common_dir != registration.repo_common_dir {
+                return Err(Error::new(
+                    "not_allowed",
+                    "registered repository identity changed",
+                ));
+            }
             let mut launch = SubmitCommand::new(&plan.launch_command, "launch");
-            let workspace = request
-                .launch
-                .workspace
-                .as_deref()
-                .unwrap_or(plan.workspace.as_str());
+            let workspace = request.launch.workspace.as_deref().unwrap_or(&checkout);
+            let (_, workspace_common) = git.repository_identity(workspace).await.map_err(|_| {
+                Error::new(
+                    "not_allowed",
+                    "continue workspace is outside the project repository",
+                )
+            })?;
+            if workspace_common != common_dir {
+                return Err(Error::new(
+                    "not_allowed",
+                    "continue workspace is outside the project repository",
+                ));
+            }
             launch.args = request.launch.args(workspace)?;
             launch.args["text"] = json!(continue_brief(&request, &plan)?);
             let mut prepared = self
@@ -157,6 +187,16 @@ impl Router {
             // The replacement joins the reserved authorization namespace.
             prepared.request.args["project"] = json!(request.project);
             prepared.request.args["registered_project"] = json!(request.project);
+            // The admitted preparation must still belong to the selected
+            // project's repository; anything else fails before dispatch.
+            if let Some(workspace) = &prepared.workspace
+                && (workspace.project != request.project || workspace.repo_common_dir != common_dir)
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "continue preparation left the project repository",
+                ));
+            }
             let policy = self.secret_policy_snapshot();
             if policy.contains_value(&prepared.request.args) {
                 return Err(Error::new(
@@ -185,10 +225,16 @@ impl Router {
             }
         };
         // The launch's linked first input is the source reference brief; no
-        // other input is admitted for the new session here.
+        // other input is admitted for the new session here. The linked
+        // brief rides ordinary launch scheduling, so its actual outcome is
+        // visible in the readback instead of staying accepted.
+        let brief = admission
+            .linked_command
+            .as_ref()
+            .map(|command| command.id.clone());
         let mut progress = self.inner.progress.subscribe();
         self.clone()
-            .process_command(admission.command.id, None)
+            .process_command(admission.command.id, brief)
             .await;
         // Native ready batches can race the start reply. Wait on committed progress,
         // never infer readiness from Applied alone or from an Owner assertion.

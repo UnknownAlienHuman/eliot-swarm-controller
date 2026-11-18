@@ -65,7 +65,7 @@ const METHODS: &[Method] = &[
         ChatOrganizationResponse,
         true,
         false,
-        "Grouped work projection by assignment, manager, repo and ancestry with revision.",
+        "Grouped work projection by assignment, manager, repo and ancestry with event-watermark readback.",
         {}
     ),
     method!("chat.attach", ChatAttachRequest, ChatOrganizationMutationResponse, true, true, "Place chats under a retained project; execution scope is untouched.", {"id":EXAMPLE_ID,"agents":["a1"],"project":"app"}),
@@ -839,7 +839,7 @@ fn method_limits(name: &str) -> &'static str {
             "Owner only. Placement and tags only; execution scope is untouched. At most 64 Agents per call. Retry the same id for the retained readback."
         }
         "chat.organization" => {
-            "Owner only. Ready grouped projection with the organization revision; no client-side Git discovery."
+            "Owner only. Ready grouped projection with event-watermark readback; no client-side Git discovery."
         }
         "swarm.switch" => {
             "Owner only. Exact source generation; at most 64 selected plain SENDs. Reserve child IDs before launch preparation. Choose profile or ad-hoc harness/model/effort/auth/cmd. No launch prompt. Exact session readiness precedes atomic H2 handoff. Failure retains created B; stop separately. Same-ID replay never launches again. Finish an untransferred ready B with ordinary swarm.handoff."

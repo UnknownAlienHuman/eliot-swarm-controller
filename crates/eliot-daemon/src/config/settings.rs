@@ -172,7 +172,8 @@ pub(crate) fn read_internal(
     for section in &sections {
         let mut value = section_json(&source, section_name(*section))?;
         if *section == SettingsSection::Daemon && value.get("chats_root").is_none() {
-            value["chats_root"] = serde_json::json!(super::default_chats_root()?.to_string_lossy());
+            value["chats_root"] =
+                serde_json::json!(super::default_chats_root(data_root)?.to_string_lossy());
         }
         if policy.contains_value(&value) {
             return Err(core::Error::new(

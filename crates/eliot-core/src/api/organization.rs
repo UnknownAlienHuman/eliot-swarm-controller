@@ -116,8 +116,8 @@ impl OrgSourceRef {
     }
 }
 
-/// One Agent's organizational link readback: placement, tags and the row
-/// revision the mutation committed.
+/// One Agent's organizational link readback: placement and tags. Change
+/// readback rides the projection's event watermark, not a revision.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrgLinkView {
@@ -126,7 +126,6 @@ pub struct OrgLinkView {
     pub project_link: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    pub revision: i64,
 }
 
 impl OrgLinkView {
@@ -135,11 +134,7 @@ impl OrgLinkView {
         if let Some(project) = &self.project_link {
             validate_project_name(project, "organization link project")?;
         }
-        validate_tags(&self.tags)?;
-        if self.revision < 0 {
-            return Err(Error::new("invalid", "organization revision is invalid"));
-        }
-        Ok(())
+        validate_tags(&self.tags)
     }
 }
 
@@ -240,6 +235,11 @@ pub struct OrgGroupView {
     /// shown as needing assignment, never auto-assigned.
     #[serde(default)]
     pub needs_assignment: bool,
+    /// Independent roots beyond the first, by Agent id: competing execution
+    /// roots surface here without reassigning any of them. Counts every
+    /// retained root independently of the archived display filter.
+    #[serde(default)]
+    pub conflicting_roots: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager: Option<OverviewManagerView>,
     #[serde(default)]
@@ -283,6 +283,20 @@ impl OrgGroupView {
                 .validate()
                 .map_err(|_| Error::new("unknown", "organization response manager is invalid"))?;
         }
+        {
+            let mut seen = std::collections::HashSet::new();
+            for root in &self.conflicting_roots {
+                parse_agent_id(root).map_err(|_| {
+                    Error::new("unknown", "organization conflicting root is invalid")
+                })?;
+                if !seen.insert(root) {
+                    return Err(Error::new(
+                        "unknown",
+                        "organization conflicting roots repeat",
+                    ));
+                }
+            }
+        }
         for member in &self.members {
             member.validate()?;
         }
@@ -299,8 +313,8 @@ impl OrgGroupView {
 
 /// `chat.organization`: the grouped work projection. Groups follow project
 /// assignment, manager, repository/worktree and ancestry; the caller gets a
-/// ready projection with the organization revision and readback, so no
-/// client repeats Git discovery or grouping.
+/// ready projection with event-watermark readback, so no client repeats
+/// Git discovery or grouping.
 #[derive(Clone, Debug, Default, JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatOrganizationRequest {
@@ -338,13 +352,12 @@ impl ChatOrganizationRequest {
     }
 }
 
-/// The grouped projection readback: every group plus the organization
-/// revision the read observed.
+/// The grouped projection readback: every group plus the event watermark
+/// the committed snapshot observed. There is no organization revision;
+/// mutation readback replays the retained row.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatOrganizationResponse {
-    /// Global organization revision observed by this read.
-    pub revision: i64,
     /// Store event sequence at the committed snapshot used for this reply.
     #[serde(default)]
     pub event_watermark: i64,
@@ -358,10 +371,10 @@ pub struct ChatOrganizationResponse {
 
 impl ChatOrganizationResponse {
     pub fn validate(&self) -> Result<()> {
-        if self.revision < 0 || self.event_watermark < 0 {
+        if self.event_watermark < 0 {
             return Err(Error::new(
                 "unknown",
-                "organization response revision is invalid",
+                "organization response watermark is invalid",
             ));
         }
         let mut previous: Option<&str> = None;
@@ -489,23 +502,22 @@ impl ChatTagRequest {
     }
 }
 
-/// The attach/detach/tag readback: the global revision plus one link row
-/// per selected Agent, in request order.
+/// The attach/detach/tag readback: one link row per selected Agent, in
+/// request order. Change readback rides the projection's event watermark.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatOrganizationMutationResponse {
     pub id: String,
-    pub revision: i64,
     pub links: Vec<OrgLinkView>,
 }
 
 impl ChatOrganizationMutationResponse {
     pub fn validate(&self) -> Result<()> {
         validate_mutation_id(&self.id)?;
-        if self.revision < 1 {
+        if self.links.is_empty() || self.links.len() > MAX_ORG_AGENTS {
             return Err(Error::new(
                 "unknown",
-                "organization mutation revision is invalid",
+                "organization mutation link bound differs",
             ));
         }
         for link in &self.links {
@@ -644,18 +656,16 @@ mod tests {
         request.validate().unwrap();
         let reply = ChatOrganizationMutationResponse {
             id: request.id.clone(),
-            revision: 1,
             links: vec![OrgLinkView {
                 agent: agent(),
                 project_link: Some("app".to_owned()),
                 tags: Vec::new(),
-                revision: 1,
             }],
         };
         request.validate_response(&reply).unwrap();
         let wrong = ChatOrganizationMutationResponse {
-            revision: 0,
-            ..reply.clone()
+            id: request.id.clone(),
+            links: Vec::new(),
         };
         assert!(wrong.validate().is_err());
         let mut detached = reply.clone();
@@ -688,12 +698,10 @@ mod tests {
         request.validate().unwrap();
         let reply = ChatOrganizationMutationResponse {
             id: request.id.clone(),
-            revision: 2,
             links: vec![OrgLinkView {
                 agent: agent(),
                 project_link: None,
                 tags: vec!["inbox".to_owned()],
-                revision: 2,
             }],
         };
         request.validate_response(&reply).unwrap();
@@ -735,7 +743,6 @@ mod tests {
             continued_from: None,
         };
         let reply = ChatOrganizationResponse {
-            revision: 1,
             event_watermark: 7,
             as_of: 7,
             groups: vec![OrgGroupView {
@@ -743,6 +750,7 @@ mod tests {
                 registration: None,
                 assignment: None,
                 needs_assignment: false,
+                conflicting_roots: Vec::new(),
                 manager: None,
                 members: vec![member],
                 member_total: 1,

@@ -1509,6 +1509,7 @@ impl Store {
                      brief_command TEXT,
                      updated_at INTEGER NOT NULL
                  );
+                 CREATE INDEX chat_organization_link ON chat_organization(project_link);
                  INSERT INTO chat_organization(agent, project_link, tags, updated_at)
                      SELECT a.id, a.project, '[]',
                          COALESCE((SELECT MAX(updated_at) FROM agents), 0)

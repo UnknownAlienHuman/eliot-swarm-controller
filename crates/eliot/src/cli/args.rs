@@ -874,7 +874,7 @@ pub(crate) struct ChatArgs {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum ChatCommand {
     /// Read the grouped work projection: teams by project assignment,
-    /// manager, repository/worktree and ancestry, with revision.
+    /// manager, repository/worktree and ancestry, with event-watermark readback.
     Organization(ChatOrganizationArgs),
     /// Place chats under a retained project. Placement only: execution
     /// scope, workspace and history are untouched.
@@ -933,7 +933,7 @@ pub(crate) struct ChatContinueArgs {
     /// Retained project the new session joins.
     #[arg(long, value_name = "PROJECT")]
     pub(crate) project: String,
-    /// Named profile. Omit profile/harness to use the configured default.
+    /// Named profile (exactly one of --profile or --harness is required).
     #[arg(long, value_name = "PROFILE", conflicts_with = "harness")]
     pub(crate) profile: Option<String>,
     /// Ad-hoc Owner launch harness (codex|claude|muse|opencode|antigravity).
