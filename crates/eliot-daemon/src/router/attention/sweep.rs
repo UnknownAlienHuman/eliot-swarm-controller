@@ -16,10 +16,10 @@ const PAGE_SIZE: usize = 128;
 const MAX_CHECKS_IN_FLIGHT: usize = 32;
 const MAX_SWEEP_CHECKS: usize = 8;
 const MAX_RETAINED_INCIDENTS: usize = 512;
-const MAX_PENDING_CHECKS: usize = 512;
+pub(super) const MAX_PENDING_CHECKS: usize = 512;
 /// Bound for overflowed loss identities parked outside the check map.
-const MAX_PENDING_LOSSES: usize = 512;
-const MAX_STARTUP_LOSSES: usize = 32;
+pub(super) const MAX_PENDING_LOSSES: usize = 512;
+pub(super) const MAX_STARTUP_LOSSES: usize = 32;
 
 pub(super) fn launch_sweep(
     router: &Router,
@@ -108,14 +108,45 @@ fn queue_check(state: &Arc<Mutex<AttentionState>>, key: AgentKey, trigger: Trigg
     } else if state.pending_checks.len() < MAX_PENDING_CHECKS {
         state.pending_checks.insert(key, trigger);
     } else if let Trigger::AgentLost { event_seq } = trigger {
-        // A full check map must never silently drop a loss identity: the
-        // fallback full scan would only revisit the Agent as a generic
-        // sweep and derive a different incident id. Park the exact
-        // Agent/generation/sequence in the bounded loss queue instead.
-        push_pending_loss(&mut state, key, event_seq);
+        // A full check map must never silently drop a loss identity: park
+        // the exact Agent/generation/sequence in the bounded loss queue
+        // instead. (Sweeps also route lost Agents through the loss
+        // pipeline now, but the queued identity must still survive a full
+        // map exactly.)
+        try_queue_loss_inner(&mut state, key, event_seq);
     } else {
         state.reconcile_all = true;
     }
+}
+
+/// Park or merge one loss under the check-map lock. Returns whether the
+/// exact identity is queued (check map or loss queue) rather than dropped:
+/// only double saturation (map and queue both full) drops, and the retained
+/// Store evidence re-pages the drop on the next reconcile.
+fn try_queue_loss_inner(state: &mut AttentionState, key: AgentKey, event_seq: i64) -> bool {
+    if let Some(pending) = state.pending_checks.get_mut(&key) {
+        *pending = merge_trigger(*pending, Trigger::AgentLost { event_seq });
+        return true;
+    }
+    if state.pending_checks.len() < MAX_PENDING_CHECKS {
+        state
+            .pending_checks
+            .insert(key, Trigger::AgentLost { event_seq });
+        return true;
+    }
+    push_pending_loss(state, key.clone(), event_seq);
+    state
+        .pending_losses
+        .iter()
+        .any(|(pending, _)| *pending == key)
+}
+
+/// Queue one retained loss with its exact `AgentLost` trigger, reporting
+/// whether it was retained. Used by Store re-paging, which resumes at the
+/// first unqueued row instead of restarting at the newest.
+fn try_queue_loss(state: &Arc<Mutex<AttentionState>>, key: AgentKey, event_seq: i64) -> bool {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    try_queue_loss_inner(&mut state, key, event_seq)
 }
 
 /// Park one overflowed loss in the bounded resumable queue. A repeat loss
@@ -141,7 +172,7 @@ fn push_pending_loss(state: &mut AttentionState, key: AgentKey, event_seq: i64) 
 /// the bound still holds. A loss moves only once its key is retained in the
 /// map; when the map holds nothing evictable the remainder waits for the
 /// next reconcile instead of degrading to a sweep.
-fn promote_pending_losses(state: &Arc<Mutex<AttentionState>>) {
+pub(super) fn promote_pending_losses(state: &Arc<Mutex<AttentionState>>) {
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     while let Some((key, event_seq)) = state.pending_losses.front().cloned() {
         let loss = Trigger::AgentLost { event_seq };
@@ -216,9 +247,20 @@ pub(super) fn request_full_reconcile(state: &Arc<Mutex<AttentionState>>) {
 /// evidence was pruned carry no sequence and are skipped here, never
 /// synthesized. A lost Agent whose evidence went stale before commit is
 /// classified and dropped there, never mailed.
+///
+/// Paging resumes from the retained cursor instead of restarting at the
+/// newest row: when saturation drops a row, the cursor stays at the last
+/// fully-queued row and the next reconcile retries the first unqueued row
+/// first, so the oldest loss cannot starve while newer rows refill freed
+/// slots. Queued rows re-merge idempotently on retry.
 pub(super) async fn queue_startup_losses(router: &Router, state: &Arc<Mutex<AttentionState>>) {
-    let mut after: Option<(i64, i64)> = None;
     loop {
+        let after = {
+            state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .loss_page_cursor
+        };
         let page = {
             let store = router.inner.store.lock().await;
             store.startup_lost_agents(MAX_STARTUP_LOSSES, after)
@@ -236,23 +278,50 @@ pub(super) async fn queue_startup_losses(router: &Router, state: &Arc<Mutex<Atte
             }
         };
         if page.is_empty() {
+            state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .loss_page_cursor = None;
             return;
         }
-        after = page.last().map(|loss| (loss.updated_at, loss.agent_num));
+        let mut queued_through = after;
         for loss in &page {
             let Some(event_seq) = loss.event_seq else {
+                queued_through = Some((loss.updated_at, loss.agent_num));
                 continue;
             };
-            queue_check(
+            if !try_queue_loss(
                 state,
                 AgentKey {
                     agent: loss.agent.clone(),
                     generation: loss.generation,
                 },
-                Trigger::AgentLost { event_seq },
-            );
+                event_seq,
+            ) {
+                break;
+            }
+            queued_through = Some((loss.updated_at, loss.agent_num));
         }
-        if page.len() < MAX_STARTUP_LOSSES {
+        {
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            // A drop leaves the cursor at the last fully-queued row, so the
+            // next pass refetches this page and retries the first unqueued
+            // row (already-queued rows re-merge idempotently). A full page
+            // advances to its last row; a short page ends the pass.
+            state.loss_page_cursor = queued_through;
+        }
+        if page.len() < MAX_STARTUP_LOSSES
+            && queued_through == page.last().map(|loss| (loss.updated_at, loss.agent_num))
+        {
+            state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .loss_page_cursor = None;
+            return;
+        }
+        if queued_through == after {
+            // No progress on this page (the head row itself was dropped):
+            // retry it next reconcile rather than spinning on it here.
             return;
         }
     }

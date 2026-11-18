@@ -6,6 +6,10 @@ mod incidents;
 mod observe;
 mod sweep;
 
+#[cfg(test)]
+#[path = "attention/tests.rs"]
+mod tests;
+
 use super::{Router, StoreHandle};
 use crate::common::now_ms;
 use eliot_core::api::SourceState;
@@ -88,6 +92,12 @@ struct AttentionState {
     /// saturated. The next reconcile re-pages retained loss evidence from
     /// the Store instead of synthesizing an identity.
     losses_overflow: bool,
+    /// Resume cursor for retained loss re-paging: the last fully-queued
+    /// `(updated_at, agent_num)` of `startup_lost_agents` order, or `None`
+    /// to start at the newest. An interrupted pass resumes at the first
+    /// unqueued row instead of restarting at the newest, so the oldest loss
+    /// cannot starve behind saturation while newer rows refill freed slots.
+    loss_page_cursor: Option<(i64, i64)>,
     reconcile_all: bool,
     active_reconcile_cursor: usize,
     reserved_incidents: usize,
@@ -374,9 +384,26 @@ async fn inspect_agent(
     if captured.agent.observe_only {
         return Ok(());
     }
-    if let Trigger::AgentLost { event_seq } = trigger
+    // A lost Agent always reports under its deterministic loss identity, no
+    // matter which trigger found it: a sweep that minted a random incident
+    // id would fork the identity, and a later restart re-report would mint
+    // the loss id again. Non-loss triggers re-page the retained `agent.lost`
+    // sequence; rows whose evidence was pruned are skipped, never
+    // synthesized. A lost manager with unfinished children still takes the
+    // generic child-cohort path below, matching the `AgentLost` trigger.
+    if captured.agent.state == AgentState::Lost
         && child_attention_activity(&captured, suspicion_window).is_none()
     {
+        let event_seq = match trigger {
+            Trigger::AgentLost { event_seq } => Some(event_seq),
+            Trigger::Sweep | Trigger::SourceEvent { .. } => {
+                let store = router.inner.store.lock().await;
+                store.latest_lost_event_seq(&captured.agent.id, captured.agent.generation)?
+            }
+        };
+        let Some(event_seq) = event_seq else {
+            return Ok(());
+        };
         return inspect_lost_agent(
             router,
             state,
