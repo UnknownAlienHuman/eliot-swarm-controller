@@ -1369,6 +1369,67 @@ mod tests {
     }
 
     #[test]
+    fn custody_held_archived_rows_count_where_the_default_list_shows_them() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        register(&mut store, "alpha", "/managed/alpha");
+        let held = launch(
+            &mut store,
+            &Ulid::new().to_string(),
+            "alpha",
+            "/managed/alpha",
+        );
+        let num = parse_agent_id(&held).unwrap();
+        // Archived and ended, but an owned process is still running: the
+        // default `agent.list` keeps it visible.
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET archived = 1, state = 'stopped' WHERE id = ?1",
+                [num],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO processes(host_boot_id,pid,start_time,owner,role,state,updated_at)
+                 VALUES ('boot', 4242, 1, ?1, 'native', 'running', 1)",
+                [format!("agent:a{num}#1")],
+            )
+            .unwrap();
+        let rows = store
+            .list_agent_summaries(
+                &crate::AgentListFilter::default(),
+                None,
+                100,
+                now(),
+                &eliot_core::SessionGrowthThresholds::default(),
+            )
+            .unwrap();
+        let row = rows
+            .summaries
+            .iter()
+            .find(|row| row.id == held)
+            .expect("custody-held archived row listed by default");
+        assert_eq!(row.organization.as_deref(), Some("alpha"));
+        // The projection counts and lists it in the same group.
+        let projection = store
+            .chat_organization(
+                "owner",
+                &ChatOrganizationRequest {
+                    project: None,
+                    after: None,
+                    archived: ArchivedFilter::Exclude,
+                },
+                &ScopeLimits::default(),
+                now(),
+            )
+            .unwrap();
+        let alpha = project_group(&projection, "alpha");
+        assert_eq!(alpha.member_total, 1);
+        assert!(alpha.members.iter().any(|member| member.agent == held));
+    }
+
+    #[test]
     fn competing_roots_need_a_manager() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         register(&mut store, "alpha", "/managed/alpha");
