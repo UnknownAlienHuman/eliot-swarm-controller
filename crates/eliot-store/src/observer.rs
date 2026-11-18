@@ -456,7 +456,7 @@ pub(super) fn dispatch(
             .ok_or_else(|| Error::new("invalid", "frozen observer profile is missing"))?;
         db!(tx.execute(
             "UPDATE agents SET generation = ?1, profile = ?2, profile_snapshot = ?3, state = 'unknown',
-             token = NULL, active_turn = NULL, pending = '[]', updated_at = ?4
+             token = NULL, active_turn = NULL, pending = '[]', archived = 0, updated_at = ?4
              WHERE id = ?5 AND generation = ?6 AND observe_only = 1",
             params![next, profile, encode_json(snapshot)?, now, id, agent.generation],
         ));

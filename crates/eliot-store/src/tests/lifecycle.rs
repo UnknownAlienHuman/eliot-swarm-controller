@@ -1096,3 +1096,106 @@ fn detached_external_observer_retires_but_attached_observer_stays_blocked() {
         blocked.message
     );
 }
+
+#[test]
+fn reattached_archived_observer_clears_archived_and_lists_its_live_reader() {
+    // #651: reattaching an archived observer opens a new `observe` source,
+    // which clears the archive flag so the live reader is never hidden from
+    // the default fleet filter.
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let attach = |store: &mut Store, now: i64| -> (String, String) {
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), "attach");
+        request.args = json!({
+            "profile": "reader", "harness": "codex",
+            "native_scope": "scope-651-reattach", "native_ref": "ref-651-reattach",
+            "mode": "observe", "profile_snapshot": {},
+            "project": "observed",
+        });
+        let admitted = store.submit("owner", request, now).unwrap();
+        let agent = admitted
+            .command
+            .target
+            .expect("attach creates the observer");
+        let attach_id = admitted.command.id.clone();
+        store.dispatch(&attach_id, now).unwrap();
+        let agent_row = store.get_agent(&agent).unwrap().unwrap();
+        store
+            .settle_observe_attach(
+                &attach_id,
+                json!({
+                    "agent_id": agent, "generation": agent_row.generation,
+                    "command_id": attach_id,
+                    "native_scope": "scope-651-reattach", "native_ref": "ref-651-reattach",
+                    "state": "attached", "observation_state": "unknown",
+                    "metadata": {}, "coverage": {},
+                }),
+                now,
+            )
+            .unwrap();
+        (agent, attach_id)
+    };
+    let list_default = |store: &Store| {
+        store
+            .list_agent_summaries(
+                &crate::AgentListFilter::default(),
+                None,
+                20,
+                now,
+                &SessionGrowthThresholds::default(),
+            )
+            .unwrap()
+    };
+
+    let (observer, _) = attach(&mut store, now);
+    let generation = store.get_agent(&observer).unwrap().unwrap().generation;
+    let mut detach = SubmitCommand::new(Ulid::new().to_string(), "detach");
+    detach.target = Some(observer.clone());
+    detach.args = json!({"mode": "observe"});
+    detach.expected_generation = Some(generation);
+    let admitted = store.submit("owner", detach, now).unwrap();
+    let detach_id = admitted.command.id.clone();
+    store.dispatch(&detach_id, now).unwrap();
+    let detached_row = store.get_agent(&observer).unwrap().unwrap();
+    store
+        .settle_observe_detach(
+            &detach_id,
+            json!({
+                "agent_id": observer, "generation": detached_row.generation,
+                "command_id": detach_id,
+                "native_scope": "scope-651-reattach", "native_ref": "ref-651-reattach",
+                "state": "detached", "observation_state": "unknown",
+            }),
+            now,
+        )
+        .unwrap();
+    store
+        .change_agent_tree(&Ulid::new().to_string(), &observer, Some(true), now)
+        .expect("detached observer archives");
+    assert!(store.get_agent(&observer).unwrap().unwrap().archived);
+    assert!(
+        list_default(&store)
+            .summaries
+            .iter()
+            .all(|row| row.id != observer)
+    );
+
+    // Reattaching the same native subject reuses the archived row and opens a
+    // new `observe` source, which clears the flag before the reader settles.
+    let (same, _) = attach(&mut store, now + 1);
+    assert_eq!(same, observer);
+    let reattached = store.get_agent(&observer).unwrap().unwrap();
+    assert!(!reattached.archived);
+    assert!(
+        store
+            .observer_active(&observer, reattached.generation)
+            .unwrap()
+    );
+    assert!(
+        list_default(&store)
+            .summaries
+            .iter()
+            .any(|row| row.id == observer)
+    );
+    assert!(!store.is_write_faulted());
+}
