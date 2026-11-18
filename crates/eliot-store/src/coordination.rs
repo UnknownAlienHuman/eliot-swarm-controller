@@ -979,6 +979,17 @@ impl Store {
             .is_some_and(|thread| thread.starts_with("attention-"));
         if attention_write {
             validate_ulid(&request.id)?;
+        } else if allow_digest_id
+            && let Some(parent) = Self::pending_digest_recipient(&tx, &request.id)?
+            && request.to == [parent]
+        {
+            // Authorized digest-delivery conversion: the id is already an
+            // admitted durable digest whose first delivery is still pending,
+            // and the mail targets exactly the frozen parent recipient, so
+            // its age is the registration's age rather than a new write's.
+            // The format rule still applies; the retained mail binding plus
+            // `mark_digest_delivered` keep a duplicate delivery a no-op.
+            validate_ulid(&request.id)?;
         } else {
             validate_id_age(&request.id, now)?;
         }

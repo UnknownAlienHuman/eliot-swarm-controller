@@ -334,9 +334,14 @@ the existing mail stable effect identity makes the retry a no-op. The thread is
 `completion-<id-prefix>` (never `attention-*`, never `-advisory`), the body lists
 every frozen entry outcome, and no attention event is emitted: a successful
 completion stays distinct from an attention incident. Registration ids share the
-public write-id namespace: `mail.send` with an id bound to a completion digest
-rejects `id_conflict`, symmetric to the command/write checks at registration;
-only digest delivery itself reuses the id. Delivered digests are pruned under
+public write-id namespace: `mail.send`, command submission, and generic writes
+with an id bound to a completion digest all reject `id_conflict`, symmetric to
+the command/write checks at registration. Only the exact registered
+digest-delivery conversion reuses the id: the Store verifies the pending
+registration and the frozen parent recipient in the delivery transaction, and
+that conversion is exempt from the new-write age gate (its age is the
+registration's age), so a digest stays deliverable however long its child set
+takes. Delivered digests are pruned under
 the commands retention window (see [core](core.md#retention)), oldest delivery
 first; pending digests are never pruned.
 

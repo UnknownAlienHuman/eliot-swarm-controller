@@ -13,7 +13,7 @@ use super::{
     sql_error, validate_id_age, write_binding,
 };
 use eliot_core::{Error, Result, api::SwarmDigestRequest, parse_agent_id};
-use rusqlite::{OptionalExtension, TransactionBehavior, params};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -265,6 +265,31 @@ impl Store {
     /// One stored digest registration, or `None` when absent.
     pub fn get_completion_digest(&self, id: &str) -> Result<Option<DigestRow>> {
         self.digest_row(id)
+    }
+
+    /// Frozen parent recipient of a still-pending digest registration, or
+    /// `None` when the id is not a digest or its first delivery already
+    /// committed. The digest driver proves the exact registered conversion
+    /// with this: a pending registration plus the frozen recipient exempt the
+    /// delivery mail from the new-write age gate (its age is the
+    /// registration's age, not a new write's). Delivered or absent ids keep
+    /// the ordinary write-id rules.
+    pub(super) fn pending_digest_recipient(
+        tx: &Transaction<'_>,
+        id: &str,
+    ) -> Result<Option<String>> {
+        let row: Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT parent, delivered_at FROM completion_digests WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        match row {
+            Some((parent, None)) => Ok(Some(format!("a{parent}"))),
+            _ => Ok(None),
+        }
     }
 
     /// Bounded pending registrations, oldest first.
@@ -552,6 +577,54 @@ mod tests {
             .expect("second mail");
         assert_eq!(second.outcome, crate::MailSendOutcome::Retained);
         assert_eq!(first.value, second.value);
+    }
+
+    #[test]
+    fn digest_delivery_survives_the_write_id_age_window() {
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let other = ready_agent(&mut store, "q", now);
+        let id = ulid::Ulid::new().to_string();
+        let req = digest_request(&id, &parent);
+        store
+            .digest_register("owner", &req, &[false], now)
+            .expect("register");
+        // Past the 24-hour new-write window the pending digest is still an
+        // authorized conversion of its durable registration, not a new
+        // write: the first delivery succeeds under the registration id.
+        let late = now + 25 * 60 * 60 * 1000;
+        let mail = MailSendRequest {
+            id: id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "digest body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&id)),
+            reply_to_delivery: None,
+        };
+        let delivered = store
+            .mail_send_digest_delivery("owner", &mail, MailLimits::default(), late)
+            .expect("late digest delivery");
+        assert_eq!(delivered.outcome, crate::MailSendOutcome::Fresh);
+        // A digest-path mail to anyone but the frozen parent recipient is
+        // not the registered conversion: it keeps the ordinary age rule.
+        let other_id = ulid::Ulid::new().to_string();
+        let other_req = digest_request(&other_id, &parent);
+        store
+            .digest_register("owner", &other_req, &[false], now)
+            .expect("register");
+        let diverted = MailSendRequest {
+            id: other_id.clone(),
+            to: vec![other.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "diverted digest body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&other_id)),
+            reply_to_delivery: None,
+        };
+        let err = store
+            .mail_send_digest_delivery("owner", &diverted, MailLimits::default(), late)
+            .unwrap_err();
+        assert_eq!(err.code, "id_expired");
     }
 
     #[test]
