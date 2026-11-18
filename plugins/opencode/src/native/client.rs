@@ -218,24 +218,55 @@ impl OpenCodeHttp {
         Err(map_write_error("session/create", &response))
     }
 
-    /// A stored session carries the deny rule exactly when the native side
-    /// persisted the launch path's per-session ruleset. The rule must name
-    /// the installed `subagent` action with a wildcard resource: narrower
-    /// resources would leave other agents callable, and the legacy `task`
-    /// key is not evaluated by the installed tool check.
+    /// A stored session carries the deny rule exactly when the last matching
+    /// `subagent` entry is the launch path's wildcard deny. The installed
+    /// server merges session rules after every agent/project rule with
+    /// last-match-wins evaluation, so a later `subagent` allow for one agent
+    /// would beat an earlier wildcard deny. The deny must therefore be the
+    /// final `subagent` entry; unrelated actions never satisfy the check.
+    /// The rule must name the installed `subagent` action with a wildcard
+    /// resource: narrower resources would leave other agents callable, and
+    /// the legacy `task` key is not evaluated by the installed tool check.
     pub fn session_subagent_deny_verified(info: &SessionInfo) -> bool {
-        info.permissions.as_deref().is_some_and(|rules| {
-            rules.iter().any(|rule| {
-                rule.action == "subagent" && rule.resource == "*" && rule.effect == "deny"
-            })
-        })
+        let mut last: Option<&PermissionRule> = None;
+        for rule in info.permissions.as_deref().unwrap_or(&[]) {
+            if rule.action == "subagent" {
+                last = Some(rule);
+            }
+        }
+        last.is_some_and(|rule| rule.resource == "*" && rule.effect == "deny")
     }
 
-    /// `PATCH /api/session/{id}` (`session.update`): replace the stored
-    /// per-session ruleset. 204 applies; the caller proves the effective
-    /// value with `session.get`. Used only to repair a resumed session that
-    /// predates the launch path's deny ruleset; sessions the launch path
-    /// creates already carry it.
+    /// Preserve the stored session rules and append the wildcard subagent
+    /// deny as the final entry. An already-correct ruleset (last `subagent`
+    /// entry is the wildcard deny) is returned unchanged so a repair never
+    /// duplicates it or drops unrelated session restrictions.
+    pub fn with_subagent_deny(existing: &[PermissionRule]) -> Vec<PermissionRule> {
+        let mut last: Option<&PermissionRule> = None;
+        for rule in existing {
+            if rule.action == "subagent" {
+                last = Some(rule);
+            }
+        }
+        if last.is_some_and(|rule| rule.resource == "*" && rule.effect == "deny") {
+            return existing.to_vec();
+        }
+        let mut rules = existing.to_vec();
+        rules.push(PermissionRule {
+            action: "subagent".to_owned(),
+            resource: "*".to_owned(),
+            effect: "deny".to_owned(),
+        });
+        rules
+    }
+
+    /// `PATCH /api/session/{id}` (`session.update`): store the per-session
+    /// ruleset. 204 applies; the caller proves the effective value with
+    /// `session.get`. Used only to repair a resumed session that predates
+    /// the launch path's deny ruleset: the caller passes the preserved
+    /// stored rules with the wildcard deny appended as the final entry, so
+    /// unrelated session restrictions survive. Sessions the launch path
+    /// creates already carry the deny.
     pub async fn update_session_permissions(
         &self,
         session_id: &str,
@@ -1203,7 +1234,8 @@ mod tests {
                 effect: "deny".to_owned(),
             }])
         )));
-        // A server echo with extra rules still verifies when the deny is present.
+        // A server echo with extra unrelated rules still verifies when the
+        // deny is the last `subagent` entry.
         let mut rules = deny_ruleset();
         rules.push(PermissionRule {
             action: "edit".to_owned(),
@@ -1213,6 +1245,64 @@ mod tests {
         assert!(OpenCodeHttp::session_subagent_deny_verified(&info_with(
             Some(rules)
         )));
+        // A later `subagent` allow beats the earlier wildcard deny under
+        // last-match-wins evaluation, so it must not verify.
+        let mut shadowed = deny_ruleset();
+        shadowed.push(PermissionRule {
+            action: "subagent".to_owned(),
+            resource: "build".to_owned(),
+            effect: "allow".to_owned(),
+        });
+        assert!(!OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            Some(shadowed)
+        )));
+        // A trailing wildcard deny after that allow wins again.
+        let mut repaired = vec![PermissionRule {
+            action: "subagent".to_owned(),
+            resource: "build".to_owned(),
+            effect: "allow".to_owned(),
+        }];
+        repaired.push(PermissionRule {
+            action: "subagent".to_owned(),
+            resource: "*".to_owned(),
+            effect: "deny".to_owned(),
+        });
+        assert!(OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            Some(repaired)
+        )));
+    }
+
+    #[test]
+    fn subagent_deny_append_preserves_existing_rules() {
+        let existing = vec![
+            PermissionRule {
+                action: "edit".to_owned(),
+                resource: "*".to_owned(),
+                effect: "ask".to_owned(),
+            },
+            PermissionRule {
+                action: "subagent".to_owned(),
+                resource: "build".to_owned(),
+                effect: "allow".to_owned(),
+            },
+        ];
+        let repaired = OpenCodeHttp::with_subagent_deny(&existing);
+        assert_eq!(repaired.len(), existing.len() + 1);
+        assert_eq!(&repaired[..existing.len()], existing.as_slice());
+        assert_eq!(
+            repaired.last().expect("appended deny"),
+            &PermissionRule {
+                action: "subagent".to_owned(),
+                resource: "*".to_owned(),
+                effect: "deny".to_owned(),
+            }
+        );
+        assert!(OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            Some(repaired)
+        )));
+        // An already-correct ruleset is returned unchanged: no duplicate.
+        let correct = deny_ruleset();
+        assert_eq!(OpenCodeHttp::with_subagent_deny(&correct), correct);
     }
 
     /// Owned workspace fixture: removed on unwind so a failed

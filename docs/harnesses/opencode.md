@@ -407,17 +407,24 @@ tool-deferral surface, so deferred loading is unsupported.
 
 Per-session mapping, verified on the installed OpenCode v2.2.7 server
 (`opencode --version` reports v2.2.7): the agent docs allow per-agent
-`tools` / `permission` control with `task` as the subagent tool. The plugin
-owns an isolated per-Agent config root (`XDG_CONFIG_HOME` /
-`XDG_DATA_HOME` under the instance directory; see
+`tools` / `permission` control, and the installed tool check evaluates the
+`subagent` action with session rules merged after every agent/project rule
+(last-match-wins). The authoritative enforcement is the verified per-session
+`subagent` wildcard deny stored as the final `subagent` entry on the session
+itself and proven by readback of that exact session before readiness; the
+isolated global `permission.task` deny is only a secondary layer (a project
+`subagent` allow beats it). The plugin owns an isolated per-Agent config root
+(`XDG_CONFIG_HOME` / `XDG_DATA_HOME` under the instance directory; see
 `plugins/opencode/src/native/server.rs`). When the frozen profile carries
 `native_subagents = "deny"` (the default for profiles with a non-empty
-`child_profiles`), the generated isolated `opencode.jsonc` sets
-`permission.task` to `deny`, disabling the task tool for the session.
-`allow` omits the key and preserves today's behavior. Implementation:
+`child_profiles`), the launch stores that final session deny (preserving
+existing session rules) and keeps the generated isolated `opencode.jsonc`
+`permission.task: deny` as the second layer. `allow` sends no session ruleset
+and omits the key, preserving today's behavior. Implementation:
 `plugins/opencode/src/native/server.rs` (`native_subagents_permission`,
 `agent_config_json`, `ServerLaunch::native_subagents`) and
-`plugins/opencode/src/host.rs` (`ParsedStart::native_subagents`).
+`plugins/opencode/src/host.rs` (`ParsedStart::native_subagents`,
+`session_subagent_deny_verified`, `with_subagent_deny`).
 
 ## Access levels (`--access ask|auto`)
 

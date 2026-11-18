@@ -88,6 +88,19 @@ fn phase_budget(envelope: Instant, budget: std::time::Duration) -> std::time::Du
     phase_deadline(envelope, budget).saturating_duration_since(Instant::now())
 }
 
+/// Read deadline that reserves the start-failure cleanup budget inside the
+/// dispatch envelope: a verification readback must never consume the time
+/// the created-session delete plus event close and server terminate need.
+/// Without the reserve the readback can exhaust the envelope and hand the
+/// delete the same expired deadline, then the server stops while the stable
+/// store silently retains the session.
+fn cleanup_reserved_deadline(envelope: Instant, budget: std::time::Duration) -> Instant {
+    let reserved = envelope
+        .checked_sub(START_CLEANUP_BUDGET)
+        .unwrap_or_else(Instant::now);
+    phase_deadline(reserved, budget)
+}
+
 /// Where a start failure happened relative to the first native session or
 /// prompt write. Everything up to (but excluding) an admitted session/create
 /// proves no native session or prompt could exist yet: the owned server may
@@ -1478,29 +1491,67 @@ impl OpenCodePlugin {
         effective["mcp_policy"] = json!(parsed.requested_mcp_policy.as_str());
         // A project `subagent` allow would beat the isolated global config
         // under last-match-wins evaluation, so `deny` profiles prove the
-        // stored session carries the per-session denial with a fresh
-        // readback. An unreadable or missing denial removes the created
-        // session and fails the start: an installed version that cannot
-        // store the ruleset can never serve a `deny` profile.
+        // stored session carries the wildcard deny as its final `subagent`
+        // entry with a fresh readback on this exact session. The readback
+        // reserves the start-failure cleanup budget inside the envelope so
+        // the delete below never inherits an expired deadline. A missing or
+        // unreadable denial goes to cleanup before hooks bind: a proved
+        // removal fails the start (an installed version that cannot store
+        // the ruleset can never serve a `deny` profile), while an unproved
+        // removal retains the exact native identity as unknown and keeps
+        // the live server instead of stopping it while the stable store
+        // silently retains the session. The same readback sets the
+        // verification flag.
         let subagents_verified = if deny_native_subagents {
             match Self::readback_subagent_deny(
                 &session.http,
                 &created.id,
-                phase_deadline(envelope, RPC_TIMEOUT),
+                cleanup_reserved_deadline(envelope, RPC_TIMEOUT),
             )
             .await
             {
-                Ok(verified) => verified,
+                Ok(true) => true,
+                Ok(false) => {
+                    let (proved, kill_note) =
+                        delete_created_session_proved(&mut session, &created.id, envelope).await;
+                    if proved {
+                        let error = discard_failed_start(
+                            &mut session,
+                            Error::new(
+                                "profile_error",
+                                format!("OpenCode session deny ruleset is missing; {kill_note}"),
+                            ),
+                            envelope,
+                        )
+                        .await;
+                        return Err(self.retain_failed_start(&parsed.params, error));
+                    }
+                    return Err(self.stash_created_unknown(
+                        session,
+                        &created.id,
+                        format!("OpenCode session deny ruleset is missing; {kill_note}"),
+                    ));
+                }
                 Err(error) => {
-                    let kill_note =
-                        delete_created_session(&mut session, &created.id, envelope).await;
-                    let error = discard_failed_start(
-                        &mut session,
-                        Error::new("native_readback", format!("{}; {kill_note}", error.message)),
-                        envelope,
-                    )
-                    .await;
-                    return Err(self.retain_failed_start(&parsed.params, error));
+                    let (proved, kill_note) =
+                        delete_created_session_proved(&mut session, &created.id, envelope).await;
+                    if proved {
+                        let error = discard_failed_start(
+                            &mut session,
+                            Error::new(
+                                "native_readback",
+                                format!("{}; {kill_note}", error.message),
+                            ),
+                            envelope,
+                        )
+                        .await;
+                        return Err(self.retain_failed_start(&parsed.params, error));
+                    }
+                    return Err(self.stash_created_unknown(
+                        session,
+                        &created.id,
+                        format!("{}; {kill_note}", error.message),
+                    ));
                 }
             }
         } else {
@@ -2121,15 +2172,20 @@ impl OpenCodePlugin {
             ));
         }
         // `deny` profiles prove the retained session still carries the
-        // per-session subagent denial: a location reload never clears stored
-        // session rules, but a session created before the launch path set
-        // them is repaired here and re-read. An unrepairable, unreadable or
+        // wildcard deny as its final `subagent` entry: a location reload
+        // never clears stored session rules, but a session created before
+        // the launch path set them is repaired here by preserving the
+        // stored rules and appending the deny as the final entry, then
+        // re-read. The verification flag below comes from the exact
+        // session's final readback, so an already-correct retained session
+        // reports true without a repair. An unrepairable, unreadable or
         // contradicted denial fails the resume: the session must not run
         // without it.
         let deny_native_subagents = parsed.native_subagents.as_deref() == Some("deny");
-        let mut subagents_verified = !deny_native_subagents;
         if deny_native_subagents && !OpenCodeHttp::session_subagent_deny_verified(&current) {
-            Self::resume_repair_subagent_deny(&session.http, session_id, deadline).await?;
+            let existing = current.permissions.clone().unwrap_or_default();
+            Self::resume_repair_subagent_deny(&session.http, session_id, &existing, deadline)
+                .await?;
             let repaired = session
                 .http
                 .get_session(session_id, deadline)
@@ -2149,7 +2205,6 @@ impl OpenCodePlugin {
                     "OpenCode retained session contradicts the applied subagent denial",
                 ));
             }
-            subagents_verified = true;
         }
         // The realignment target is the inherited overlay's effective
         // model and effort when a resume carries them (the retained
@@ -2298,6 +2353,22 @@ impl OpenCodePlugin {
                 "OpenCode effective effort contradicts the applied configuration",
             ));
         }
+        // The verification flag comes from this exact session's final
+        // readback: the switches above never clear stored permissions, so a
+        // repaired or already-correct denial still verifies here, and a
+        // denial the switches somehow lost fails closed before readiness.
+        let subagents_verified = if deny_native_subagents {
+            let verified = OpenCodeHttp::session_subagent_deny_verified(&effective);
+            if !verified {
+                return Err(Error::new(
+                    "unknown",
+                    "OpenCode retained session contradicts the applied subagent denial",
+                ));
+            }
+            true
+        } else {
+            true
+        };
         let mut effective_value = json!({
             "model": effective.model.as_ref().map(|model| format!("{}/{}", model.provider_id, model.id)),
             "model_verified": model_verified,
@@ -2392,11 +2463,12 @@ impl OpenCodePlugin {
     }
 
     /// The frozen `deny` switch as a per-session ruleset: one wildcard
-    /// `subagent` deny. The installed server merges session rules after every
-    /// agent/project rule with last-match-wins evaluation, so this survives a
-    /// project `subagent` allow that would beat the isolated global config
-    /// under the same ordering. Denies are checked before saved allow rules,
-    /// so a user-saved allow cannot lift it either.
+    /// `subagent` deny as the final entry. The installed server merges
+    /// session rules after every agent/project rule with last-match-wins
+    /// evaluation, so this survives a project `subagent` allow that would
+    /// beat the isolated global config under the same ordering. Denies are
+    /// checked before saved allow rules, so a user-saved allow cannot lift
+    /// it either.
     fn subagent_deny_permissions() -> Vec<PermissionRule> {
         vec![PermissionRule {
             action: "subagent".to_owned(),
@@ -2429,16 +2501,20 @@ impl OpenCodePlugin {
     }
 
     /// Repair a retained session that predates the per-session deny ruleset:
-    /// `PATCH` the ruleset, then the caller re-reads. A refusal proves the
-    /// installed server cannot establish the denial, so `deny` profiles fail
-    /// closed; anything ambiguous after the write is `unknown` (the ruleset
-    /// may have been stored).
+    /// `PATCH` the preserved stored rules with the wildcard deny appended as
+    /// the final entry, then the caller re-reads. Preserving keeps unrelated
+    /// session restrictions; appending as final keeps the deny winning under
+    /// last-match-wins evaluation. A refusal proves the installed server
+    /// cannot establish the denial, so `deny` profiles fail closed; anything
+    /// ambiguous after the write is `unknown` (the ruleset may have been
+    /// stored).
     async fn resume_repair_subagent_deny(
         http: &OpenCodeHttp,
         session_id: &str,
+        existing: &[PermissionRule],
         deadline: Instant,
     ) -> Result<()> {
-        let deny = Self::subagent_deny_permissions();
+        let deny = OpenCodeHttp::with_subagent_deny(existing);
         match http
             .update_session_permissions(session_id, &deny, deadline)
             .await
@@ -2507,6 +2583,30 @@ impl OpenCodePlugin {
         .with_origin(
             FailureOrigin::Harness,
             "retained native session state unresolved after resume readback",
+        )
+    }
+
+    /// Stash a created session whose removal is unproved as unknown: the
+    /// exact native identity stays with its live server and stream for the
+    /// snapshot instead of stopping the server while the stable store
+    /// silently retains the session. The create is never repeated.
+    fn stash_created_unknown(
+        &mut self,
+        mut session: AgentSession,
+        native_ref: &str,
+        message: String,
+    ) -> Error {
+        session.session_id = Some(native_ref.to_owned());
+        session.phase = SessionPhase::Unknown;
+        self.session = Some(session);
+        Error::new(
+            "unknown",
+            format!("OpenCode session {native_ref} is unresolved ({message})"),
+        )
+        .with_where("plugin.opencode.start.create")
+        .with_origin(
+            FailureOrigin::Harness,
+            "created native session state unresolved after start readback",
         )
     }
 
@@ -4934,19 +5034,40 @@ async fn delete_created_session(
     session_id: &str,
     envelope: Instant,
 ) -> String {
+    let (proved, note) = delete_created_session_proved(session, session_id, envelope).await;
+    let _ = proved;
+    note
+}
+
+/// Proved variant of the created-session delete: `Ok` means the native side
+/// proved the session gone (removed or already gone) and the caller may stop
+/// the server and settle failed. `Err` means removal is unproved (refused
+/// or unconfirmed): the stable store may still retain the session, so the
+/// caller must retain the exact native identity as unknown and must not stop
+/// the server while silently leaving that session behind.
+async fn delete_created_session_proved(
+    session: &mut AgentSession,
+    session_id: &str,
+    envelope: Instant,
+) -> (bool, String) {
     match session
         .http
         .delete_session(session_id, phase_deadline(envelope, START_CLEANUP_BUDGET))
         .await
     {
-        Ok(true) => "the created native session was removed".to_owned(),
-        Ok(false) => "the created native session was already gone".to_owned(),
-        Err(HttpOutcome::Rejected { reason, .. }) => {
-            format!("the created native session kill was refused ({reason})")
-        }
-        Err(HttpOutcome::Unknown { reason }) | Err(HttpOutcome::NotDispatched { reason }) => {
-            format!("the created native session kill is unconfirmed ({reason})")
-        }
+        Ok(true) => (true, "the created native session was removed".to_owned()),
+        Ok(false) => (
+            true,
+            "the created native session was already gone".to_owned(),
+        ),
+        Err(HttpOutcome::Rejected { reason, .. }) => (
+            false,
+            format!("the created native session kill was refused ({reason})"),
+        ),
+        Err(HttpOutcome::Unknown { reason } | HttpOutcome::NotDispatched { reason }) => (
+            false,
+            format!("the created native session kill is unconfirmed ({reason})"),
+        ),
     }
 }
 
