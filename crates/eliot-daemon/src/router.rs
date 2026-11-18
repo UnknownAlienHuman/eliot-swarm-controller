@@ -2175,6 +2175,51 @@ impl Router {
         Ok(Some(input))
     }
 
+    /// Freeze the daemon-owned launch default for a Codex or Muse snapshot
+    /// that omits its model: resolve the native default from the daemon's
+    /// own cached catalogue entry (refusing honestly when none names one),
+    /// so the plugins translate an already-decided launch. Muse defers to
+    /// the server default, so only an empty catalogue refuses there. Only a
+    /// fresh cache entry decides; a miss leaves the snapshot untouched for
+    /// the plugin's native read, so passive freeze work can never fail a
+    /// launch its readers could serve. Explicit models, routed Codex
+    /// profiles (the Responses route requires an explicit model id) and
+    /// other harnesses pass through untouched; the plugins keep validating
+    /// those against their native entries.
+    fn resolve_launch_default(
+        &self,
+        harness: &str,
+        profile_label: &str,
+        snapshot: &mut Value,
+    ) -> Result<()> {
+        if !matches!(harness, "codex" | "muse") {
+            return Ok(());
+        }
+        // Routed Codex profiles keep their own rule: the Responses route
+        // requires an explicit model id, enforced by the plugin at launch.
+        if snapshot.get("route_binding").is_some_and(Value::is_object) {
+            return Ok(());
+        }
+        let omitted = snapshot
+            .get("model")
+            .and_then(Value::as_str)
+            .is_none_or(|model| model.trim().is_empty());
+        if !omitted {
+            return Ok(());
+        }
+        let (scope, _) = catalog::describe_snapshot(profile_label, harness, Some(snapshot));
+        let cache = self.inner.catalog_cache.lock_recover();
+        let Some(response) = cache.find_models_by_scope(harness, &scope, crate::common::now_ms())
+        else {
+            return Ok(());
+        };
+        drop(cache);
+        if let Some(model) = catalog::launch_model_default(harness, &response)? {
+            snapshot["model"] = Value::String(model);
+        }
+        Ok(())
+    }
+
     async fn freeze_launch_profile(
         &self,
         principal: &Principal,
@@ -2288,8 +2333,9 @@ impl Router {
             // payload (a changed model is id_conflict), while the frozen
             // snapshot stays the replay-stable source for dispatch.
             if let Some(args) = request.args.as_object_mut() {
-                args.insert("profile".to_owned(), Value::String(profile_name));
+                args.insert("profile".to_owned(), Value::String(profile_name.clone()));
             }
+            self.resolve_launch_default(&harness, &profile_name, &mut snapshot)?;
             install_frozen_profile(request, &harness, snapshot, true)?;
             {
                 let store = self.inner.store.lock().await;
@@ -2299,10 +2345,11 @@ impl Router {
         }
 
         if request.args.get("profile").is_none() {
-            let (name, harness, snapshot) = self
+            let (name, harness, mut snapshot) = self
                 .route_launch_profile(principal, request, arbitrated)
                 .await?;
-            request.args["profile"] = Value::String(name);
+            request.args["profile"] = Value::String(name.clone());
+            self.resolve_launch_default(&harness, &name, &mut snapshot)?;
             install_frozen_profile(request, &harness, snapshot, true)?;
             let store = self.inner.store.lock().await;
             hierarchy::check_agent_launch_authority(&store, principal, request)?;
@@ -2382,7 +2429,7 @@ impl Router {
         } else {
             None
         };
-        let (profile_name, snapshot, harness) = match agent_child_snapshot {
+        let (profile_name, mut snapshot, harness) = match agent_child_snapshot {
             Some((name, harness, snapshot)) => (name, snapshot, harness),
             None => {
                 let profile_name = match request.args.get("profile") {
@@ -2407,8 +2454,9 @@ impl Router {
         // The retained wire shape keeps the named profile so Store admission
         // can bind the child row to the parent's profile without guessing.
         if let Some(args) = request.args.as_object_mut() {
-            args.insert("profile".to_owned(), Value::String(profile_name));
+            args.insert("profile".to_owned(), Value::String(profile_name.clone()));
         }
+        self.resolve_launch_default(&harness, &profile_name, &mut snapshot)?;
         install_frozen_profile(request, &harness, snapshot, true)?;
         {
             let store = self.inner.store.lock().await;

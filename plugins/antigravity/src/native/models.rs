@@ -17,10 +17,11 @@ use std::{
 
 use eliot_core::api::{HarnessModelEntry, harness::native_model_display_name};
 use eliot_core::{Error, Result};
+use eliot_plugin::native_lifecycle::kill_and_reap;
 use tokio::{
     io::AsyncReadExt,
     process::Command,
-    time::{Instant, timeout, timeout_at},
+    time::{Instant, timeout_at},
 };
 
 /// Exact argv for the catalogue child: `models`, nothing else.
@@ -40,9 +41,6 @@ pub(crate) const MAX_MODELS: usize = 1024;
 
 /// Maximum model id bytes, mirroring `MAX_HARNESS_MODEL_ID_BYTES` in Core.
 pub(crate) const MAX_MODEL_ID_BYTES: usize = 256;
-
-/// Grace for reaping a catalogue child after the kill signal.
-const KILL_GRACE: Duration = Duration::from_secs(2);
 
 /// Run the frozen native exe with exact argv `models` and return its entries
 /// in wire order. Bounded by `deadline` and [`MAX_MODELS_BYTES`];
@@ -166,16 +164,6 @@ pub(crate) fn parse_models_output(text: &str) -> Result<Vec<HarnessModelEntry>> 
         }
     }
     Ok(models)
-}
-
-async fn kill_and_reap(child: &mut tokio::process::Child) -> bool {
-    // `start_kill` signals only; `kill` would already wait unboundedly for
-    // exit (tokio `Child::kill` awaits `wait`), so the single bounded wait
-    // below is the only blocking call in cleanup.
-    let _ = child.start_kill();
-    timeout(KILL_GRACE, child.wait())
-        .await
-        .is_ok_and(|wait| wait.is_ok())
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use eliot_core::{Error, Result};
 use tokio::{
     io::AsyncWriteExt,
     sync::watch,
-    time::{Instant, timeout_at},
+    time::{Instant, timeout, timeout_at},
 };
 
 use crate::{native_transport::NativeChild, session::EVENT_DEADLINE};
@@ -91,6 +91,22 @@ pub async fn wait_for_native_tail<S>(
             };
         }
     }
+}
+
+/// Grace for reaping a metadata reader child after the kill signal.
+const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Best-effort kill plus bounded reap, reporting positive exit proof: true
+/// only when the child's exit was actually reaped. `kill_on_drop` remains
+/// the backstop if this future is itself cancelled.
+pub async fn kill_and_reap(child: &mut tokio::process::Child) -> bool {
+    // `start_kill` signals only; `kill` would already wait unboundedly for
+    // exit (tokio `Child::kill` awaits `wait`), so the single bounded wait
+    // below is the only blocking call in cleanup.
+    let _ = child.start_kill();
+    timeout(KILL_GRACE, child.wait())
+        .await
+        .is_ok_and(|wait| wait.is_ok())
 }
 
 /// Called only after the same session's confirmed exit. Give the existing pump

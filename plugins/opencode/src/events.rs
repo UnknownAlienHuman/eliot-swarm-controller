@@ -19,7 +19,7 @@ use eliot_plugin::{
     protocol::{HookEvent, HookResponse},
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id,
-        next_input_outcomes, with_claimed_context,
+        next_input_outcomes, redact_request_details_for_commit, with_claimed_context,
     },
 };
 
@@ -35,7 +35,7 @@ use crate::native::{
     client::{HttpOutcome, OpenCodeHttp},
     requests::{
         CorePending, ReplyRoute, StagedReply, describe_form, describe_permission,
-        public_request_view, redact_details_for_commit, reply_for,
+        public_request_view, reply_for,
     },
     sse::SseFrame,
     types::{
@@ -2142,7 +2142,7 @@ impl EventProcessor {
             ));
         };
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
-        let committed = redact_details_for_commit(&public_details, &secrets);
+        let committed = redact_request_details_for_commit(&public_details, &secrets);
         self.commit_event(
             "request.opened",
             native_id,

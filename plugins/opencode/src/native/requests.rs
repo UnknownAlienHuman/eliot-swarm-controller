@@ -15,7 +15,7 @@ use eliot_core::requests::{
     AnswerArgs, ApprovalChoice, ApprovalDecision, ApprovalRequest, Question, QuestionKind,
     QuestionOption, QuestionRequest,
 };
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{Error, Result};
 use serde_json::{Map, Value};
 
 use crate::native::types::{FormInfo, PermissionRequest};
@@ -480,26 +480,11 @@ fn require_nonempty(value: &str, what: &str) -> Result<()> {
     eliot_plugin::session::require_nonempty(value, "OpenCode", what)
 }
 
-/// Redact the committed public request.opened details with the session
-/// secret policy. Approval summary fields and question prompts/options
-/// mask known secrets; opaque identifiers and keys pass through. Only
-/// known secrets mask — ordinary offers pass through byte-identical — and
-/// the in-memory offer stays raw so choice matching keeps working.
-pub(crate) fn redact_details_for_commit(details: &Value, policy: &SecretPolicy) -> Value {
-    let mut redacted = details.clone();
-    if let Some(fields) = redacted.as_object_mut() {
-        for key in ["summary", "questions", "choices"] {
-            if let Some(field) = fields.get_mut(key) {
-                policy.redact_values(field);
-            }
-        }
-    }
-    redacted
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eliot_core::SecretPolicy;
+    use eliot_plugin::session::redact_request_details_for_commit;
     use serde_json::json;
 
     fn asked() -> PermissionRequest {
@@ -678,7 +663,7 @@ mod tests {
         let pending = describe_permission(&tainted, "ses_test", "turn-1").expect("described");
         let (kind, details) = public_request_view(&pending).expect("view");
         assert_eq!(kind, "approval");
-        let committed = redact_details_for_commit(&details, &policy);
+        let committed = redact_request_details_for_commit(&details, &policy);
         let encoded = serde_json::to_string(&committed).expect("encode");
         assert!(!encoded.contains("hunter2"), "{encoded}");
         assert!(committed.get("choices").is_some(), "choices stay");
@@ -694,7 +679,7 @@ mod tests {
         let pending = describe_form(&tainted_form, "ses_test", "turn-1").expect("described");
         let (kind, details) = public_request_view(&pending).expect("view");
         assert_eq!(kind, "question");
-        let committed = redact_details_for_commit(&details, &policy);
+        let committed = redact_request_details_for_commit(&details, &policy);
         let encoded = serde_json::to_string(&committed).expect("encode");
         assert!(!encoded.contains("hunter2"), "{encoded}");
         assert_eq!(

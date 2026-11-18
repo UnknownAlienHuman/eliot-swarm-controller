@@ -11,7 +11,8 @@ use eliot_plugin::{
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error,
         attach_provider_restriction, event_id as shared_event_id, native_no_write,
-        next_input_outcomes, rejected_control, request_event_id, unknown_control,
+        next_input_outcomes, redact_request_details_for_commit, rejected_control, request_event_id,
+        unknown_control,
     },
 };
 use serde::Serialize;
@@ -4183,23 +4184,6 @@ fn orphan_request_id(method: &str, params: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
-}
-
-/// Redact the free-text offer fields of a normalized public request view for
-/// the committed `request.opened` event: the approval `summary`, `questions`
-/// and approval `choices`. The in-memory offer stays raw so choice/
-/// requirement matching and re-issue comparison keep working on exact native
-/// values; only the persisted copy is redacted.
-fn redact_request_details_for_commit(details: &Value, policy: &SecretPolicy) -> Value {
-    let mut redacted = details.clone();
-    if let Some(fields) = redacted.as_object_mut() {
-        for key in ["summary", "questions", "choices"] {
-            if let Some(field) = fields.get_mut(key) {
-                policy.redact_values(field);
-            }
-        }
-    }
-    redacted
 }
 
 /// The native approval/user-input id a described request answers to.

@@ -5,7 +5,10 @@ use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{MAX_CREDENTIAL_BYTES, ManifestFeatures},
-    session::{decode, not_initialized, validate_binding, validate_identity},
+    session::{
+        decode, ensure_dedicated_reader, ensure_reader_harness, not_initialized, validate_binding,
+        validate_identity,
+    },
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -327,20 +330,16 @@ impl Plugin {
     /// session, no turn, no input and no inference. Ids are returned verbatim;
     /// `agy models` names no default, so `default` stays null.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
-        if self.session.is_some() || self.start.is_some() {
-            return Err(Error::new(
-                "bad_state",
-                "Antigravity model.list requires a dedicated reader plugin instance",
-            ));
-        }
+        ensure_dedicated_reader(
+            self.session.is_some(),
+            self.start.is_some(),
+            false,
+            "Antigravity",
+            "model.list",
+        )?;
         let profile: Value = decode(raw, "Antigravity model.list params are invalid")?;
         let snapshot = profile.get("profile").unwrap_or(&profile);
-        if snapshot.get("harness").and_then(Value::as_str) != Some("antigravity") {
-            return Err(Error::new(
-                "profile_error",
-                "Antigravity model.list received another harness",
-            ));
-        }
+        ensure_reader_harness(snapshot, "antigravity", "Antigravity", "model.list")?;
         let program = snapshot
             .get("cmd")
             .and_then(Value::as_str)

@@ -18,11 +18,13 @@ use eliot_plugin::{
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{AgentModelsParams, ModelListParams, ModelListPart},
     session::{
-        ResumeSubject, TargetEnvironment, decode, native_no_write, not_initialized,
-        optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
-        split_provider_model, target_environment, unknown_snapshot, validate_binding,
-        validate_identity, validate_source_plan, with_claimed_context, with_context_points,
+        ResumeSubject, TargetEnvironment, decode, ensure_dedicated_reader, ensure_reader_harness,
+        native_no_write, not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
+        register_native_process, split_provider_model, target_environment, unknown_snapshot,
+        validate_binding, validate_identity, validate_source_plan, with_claimed_context,
+        with_context_points,
     },
+    start_classification::SettledStartFailure,
 };
 use reqwest::{redirect, retry};
 use serde_json::{Value, json};
@@ -259,17 +261,6 @@ struct FailedStart {
     generation: i64,
     command_id: String,
     outcome: SettledStartFailure,
-}
-
-/// How one retained start failure replays. `Uncertain` keeps the historical
-/// error replay (the daemon settles by error code, and a native effect may
-/// have happened). `ProvenNoEffect` carries the failed-state result value:
-/// no native session or prompt was ever dispatched, so the launch is
-/// definitely failed and the daemon retires the plugin and releases capacity
-/// on proven exit instead of pinning an unknown Agent.
-enum SettledStartFailure {
-    Uncertain(Error),
-    ProvenNoEffect(Value),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -642,20 +633,16 @@ impl OpenCodePlugin {
     /// `api model.list --standalone` metadata. The daemon gives each phase
     /// its own reader Job and proves family closure before overlaying results.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
-        if self.session.is_some() || self.failed_start.is_some() {
-            return Err(Error::new(
-                "bad_state",
-                "OpenCode model.list requires a dedicated reader plugin instance",
-            ));
-        }
+        ensure_dedicated_reader(
+            self.session.is_some(),
+            self.failed_start.is_some(),
+            false,
+            "OpenCode",
+            "model.list",
+        )?;
         let params: ModelListParams = decode(raw, "OpenCode model.list params are invalid")?;
         let snapshot = &params.profile;
-        if snapshot.get("harness").and_then(Value::as_str) != Some("opencode") {
-            return Err(Error::new(
-                "profile_error",
-                "OpenCode model.list received another harness",
-            ));
-        }
+        ensure_reader_harness(snapshot, "opencode", "OpenCode", "model.list")?;
         let program = snapshot
             .get("cmd")
             .and_then(Value::as_str)
@@ -1019,10 +1006,7 @@ impl OpenCodePlugin {
                 && failed.generation == params.generation
                 && failed.command_id == params.command_id
             {
-                return Ok(Some(StartAdmission::Replay(match &failed.outcome {
-                    SettledStartFailure::Uncertain(error) => Err(error.clone()),
-                    SettledStartFailure::ProvenNoEffect(value) => Ok(value.clone()),
-                })));
+                return Ok(Some(StartAdmission::Replay(failed.outcome.replay())));
             }
             return Err(Error::new(
                 "bad_state",

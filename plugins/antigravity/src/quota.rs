@@ -45,24 +45,10 @@ fn reset_delay_ms(mut text: &str) -> Option<i64> {
     (found && text.is_empty()).then_some(delay)
 }
 pub(crate) async fn read(raw: &Value) -> Result<Value> {
-    let params = q::decode(raw)?;
-    if [
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "GOOGLE_APPLICATION_CREDENTIALS",
-    ]
-    .iter()
-    .any(|key| {
-        params
-            .environment
-            .get(*key)
-            .and_then(Value::as_str)
-            .is_some_and(|v| !v.is_empty())
-    }) {
-        return Err(q::environment(
-            "Antigravity profile selects external auth; native keyring quota would describe another route",
-        ));
-    }
+    q::decode(raw)?;
+    // External provider routes never reach this reader: the daemon refuses
+    // them in `router::catalog::external_quota_route` before spawning any
+    // reader, so only the native keyring route is reported here.
     let credential = q::antigravity_credential()?;
     let token = credential
         .pointer("/token/access_token")

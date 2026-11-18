@@ -12,12 +12,13 @@ use eliot_plugin::{
     native_transport::NativeLaunch,
     protocol::MAX_CREDENTIAL_BYTES,
     session::{
-        self, contextual_error, decode, native_no_write, not_initialized, optional_profile_text,
-        parse_resume_subject, register_native_process, rejected_control, unknown_control,
-        unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
-        with_claimed_context, with_context_points,
+        self, contextual_error, decode, ensure_dedicated_reader, native_no_write, not_initialized,
+        optional_profile_text, parse_resume_subject, register_native_process, rejected_control,
+        unknown_control, unknown_snapshot, validate_binding, validate_identity,
+        validate_source_plan, with_claimed_context, with_context_points,
     },
     skill,
+    start_classification::SettledStartFailure,
 };
 use serde_json::{Value, json};
 use std::{
@@ -64,17 +65,6 @@ struct FailedStart {
     /// Proven-no-effect starts never spawn, so this stays false for them:
     /// the daemon retires the plugin on the failed value instead.
     endpoint_exited: bool,
-}
-
-/// How one retained start failure replays. `Uncertain` keeps the historical
-/// error replay (the daemon settles by error code, and a native effect may
-/// have happened). `ProvenNoEffect` carries the failed-state result value:
-/// no native process was spawned by this generation, so the launch is
-/// definitely failed and the daemon retires the plugin and releases capacity
-/// on proven exit instead of pinning an unknown Agent that blocks drain.
-enum SettledStartFailure {
-    Uncertain(Error),
-    ProvenNoEffect(Value),
 }
 
 /// Where a start failure happened relative to the first native CLI spawn.
@@ -761,12 +751,13 @@ impl ClaudePlugin {
             .initialized
             .as_ref()
             .ok_or_else(|| not_initialized("Claude"))?;
-        if self.session.is_some() || self.failed_start.is_some() {
-            return Err(Error::new(
-                "bad_state",
-                "Claude model.list requires a dedicated reader plugin instance",
-            ));
-        }
+        ensure_dedicated_reader(
+            self.session.is_some(),
+            self.failed_start.is_some(),
+            false,
+            "Claude",
+            "model.list",
+        )?;
         crate::native::models::read(raw, Path::new(&initialized.instance_dir)).await
     }
 
@@ -833,10 +824,7 @@ impl ClaudePlugin {
                 && failed.generation == params.generation
                 && failed.command_id == params.command_id
             {
-                return Some(match &failed.outcome {
-                    SettledStartFailure::Uncertain(error) => Err(error.clone()),
-                    SettledStartFailure::ProvenNoEffect(value) => Ok(value.clone()),
-                });
+                return Some(failed.outcome.replay());
             }
             return Some(Err(Error::new(
                 "bad_state",

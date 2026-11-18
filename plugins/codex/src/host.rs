@@ -10,8 +10,7 @@ use crate::{
         types::{
             NativeClientInfo, NativeCollaborationMode, NativeCollaborationModeKind,
             NativeCollaborationSettings, NativeInitializeCapabilities, NativeInitializeParams,
-            NativeInitializeResponse, NativeModelEntry, NativeModelListParams,
-            NativeModelListResponse, NativeSandboxMode, NativeTextUserInput,
+            NativeInitializeResponse, NativeModelEntry, NativeSandboxMode, NativeTextUserInput,
             NativeThreadConfigOverrides, NativeThreadResumeParams, NativeThreadStartParams,
             NativeTurnInterruptParams, NativeTurnStartParams, NativeTurnStartResponse,
             NativeTurnSteerParams, NativeTurnSteerResponse, NativeUserInput, ThreadReadback,
@@ -31,13 +30,14 @@ use eliot_plugin::{
     ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{MAX_CREDENTIAL_BYTES, ProfileStoreParams},
     session::{
-        decode, is_passed_env, is_secret_name, native_no_write, not_initialized,
-        optional_profile_text, parse_resume_subject, paths_equal, register_native_process,
-        rejected_control, target_environment as shared_target_environment, unknown_control,
-        unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
-        with_claimed_context, with_context_points,
+        decode, ensure_dedicated_reader, ensure_reader_harness, is_passed_env, is_secret_name,
+        native_no_write, not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
+        register_native_process, rejected_control, target_environment as shared_target_environment,
+        unknown_control, unknown_snapshot, validate_binding, validate_identity,
+        validate_source_plan, with_claimed_context, with_context_points,
     },
     skill,
+    start_classification::SettledStartFailure,
 };
 use serde_json::{Value, json};
 use std::{
@@ -54,8 +54,6 @@ use tokio::{
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_POLL_DEADLINE: Duration = Duration::from_secs(2);
-const MODEL_PAGE_SIZE: u32 = 100;
-const MAX_MODEL_PAGES: usize = 100;
 const TURN_PAGE_SIZE: u32 = 1000;
 const MAX_TURN_PAGES: usize = 16;
 const ITEM_PAGE_SIZE: u32 = 1000;
@@ -73,11 +71,6 @@ struct CodexPlugin {
 struct Initialized {
     credential: String,
     instance_dir: String,
-}
-
-enum SettledStartFailure {
-    Uncertain(Error),
-    ProvenNoEffect(Value),
 }
 
 struct FailedStart {
@@ -627,16 +620,13 @@ impl CodexPlugin {
     }
 
     async fn discover(&self, raw: &Value) -> Result<Value> {
-        if self.session.is_some()
-            || self.failed_start.is_some()
-            || self.failed_attach.is_some()
-            || self.observer.is_some()
-        {
-            return Err(Error::new(
-                "bad_state",
-                "Codex discovery requires a dedicated reader plugin instance",
-            ));
-        }
+        ensure_dedicated_reader(
+            self.session.is_some(),
+            self.failed_start.is_some() || self.failed_attach.is_some(),
+            self.observer.is_some(),
+            "Codex",
+            "discovery",
+        )?;
         let params: DiscoverParams = decode(raw, "Codex discover params are invalid")?;
         let (launch, secrets, metadata_secrets) =
             self.reader_launch(&params.profile, &params.target_environment)?;
@@ -647,20 +637,16 @@ impl CodexPlugin {
     /// reader plugin instance pages `model/list` with no thread, no input
     /// and no inference; the default entry is the native `isDefault`.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
-        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
-            return Err(Error::new(
-                "bad_state",
-                "Codex model.list requires a dedicated reader plugin instance",
-            ));
-        }
+        ensure_dedicated_reader(
+            self.session.is_some(),
+            self.failed_start.is_some(),
+            self.observer.is_some(),
+            "Codex",
+            "model.list",
+        )?;
         let profile: Value = decode(raw, "Codex model.list params are invalid")?;
         let snapshot = profile.get("profile").unwrap_or(&profile);
-        if snapshot.get("harness").and_then(Value::as_str) != Some("codex") {
-            return Err(Error::new(
-                "profile_error",
-                "Codex model.list received another harness",
-            ));
-        }
+        ensure_reader_harness(snapshot, "codex", "Codex", "model.list")?;
         let (launch, secrets, metadata_secrets) = self.reader_launch(snapshot, &json!({}))?;
         let entries = crate::discovery::list_models(
             launch,
@@ -694,20 +680,16 @@ impl CodexPlugin {
     /// inference. Only quota signals are projected into `details`; account
     /// identity (including any email) is never read or returned.
     async fn quota_read(&self, raw: &Value) -> Result<Value> {
-        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
-            return Err(Error::new(
-                "bad_state",
-                "Codex quota.read requires a dedicated reader plugin instance",
-            ));
-        }
+        ensure_dedicated_reader(
+            self.session.is_some(),
+            self.failed_start.is_some(),
+            self.observer.is_some(),
+            "Codex",
+            "quota.read",
+        )?;
         let params = eliot_plugin::quota::decode(raw)?;
         let snapshot = &params.profile;
-        if snapshot.get("harness").and_then(Value::as_str) != Some("codex") {
-            return Err(Error::new(
-                "profile_error",
-                "Codex quota.read received another harness",
-            ));
-        }
+        ensure_reader_harness(snapshot, "codex", "Codex", "quota.read")?;
         let (launch, secrets, metadata_secrets) =
             self.reader_launch(snapshot, &params.environment)?;
         let details = crate::discovery::read_quota(
@@ -726,19 +708,15 @@ impl CodexPlugin {
     /// cleanup for terminal Codex Agents; every other harness reports no
     /// native archive surface and keeps its sessions.
     async fn native_archive(&self, raw: &Value) -> Result<Value> {
-        if self.session.is_some() || self.failed_start.is_some() || self.observer.is_some() {
-            return Err(Error::new(
-                "bad_state",
-                "Codex native.archive requires a dedicated reader plugin instance",
-            ));
-        }
+        ensure_dedicated_reader(
+            self.session.is_some(),
+            self.failed_start.is_some(),
+            self.observer.is_some(),
+            "Codex",
+            "native.archive",
+        )?;
         let profile = raw.get("profile").unwrap_or(raw);
-        if profile.get("harness").and_then(Value::as_str) != Some("codex") {
-            return Err(Error::new(
-                "profile_error",
-                "Codex native.archive received another harness",
-            ));
-        }
+        ensure_reader_harness(profile, "codex", "Codex", "native.archive")?;
         let native_ref = raw
             .get("native_ref")
             .and_then(Value::as_str)
@@ -1027,10 +1005,7 @@ impl CodexPlugin {
                 && failed.generation == params.generation
                 && failed.command_id == params.command_id
             {
-                return match &failed.outcome {
-                    SettledStartFailure::Uncertain(error) => Err(error.clone()),
-                    SettledStartFailure::ProvenNoEffect(value) => Ok(value.clone()),
-                };
+                return failed.outcome.replay();
             }
             return Err(Error::new(
                 "bad_state",
@@ -1887,6 +1862,10 @@ impl CodexPlugin {
             ));
         }
 
+        // The daemon freezes the native default into warm snapshots before
+        // any session spawns; an omitted model here means a cold daemon
+        // cache left the snapshot untouched, so fall back to the native
+        // `isDefault` entry exactly as a daemon freeze would.
         let model = discover_model(client, requested_model).await?;
         let effort = match requested_effort {
             Some(effort)
@@ -2769,7 +2748,8 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
 /// An explicit request matches exactly or fails honestly with no
 /// substitution; an omitted request uses the native `isDefault` entry or
 /// fails honestly when the catalogue names none (e.g. an empty catalogue
-/// serves no default to fall back to).
+/// serves no default to fall back to, or a cold daemon cache left the
+/// snapshot without its daemon-resolved default).
 fn select_launch_model(
     entries: &[NativeModelEntry],
     requested_model: Option<&str>,
@@ -2805,59 +2785,42 @@ async fn discover_model(
     client: &NativeClient,
     requested_model: Option<&str>,
 ) -> Result<NativeModelEntry> {
-    let mut entries: Vec<NativeModelEntry> = Vec::new();
-    let mut cursor: Option<String> = None;
-    let mut seen_cursors = HashSet::new();
-    for _ in 0..MAX_MODEL_PAGES {
-        let response = client
-            .call(
-                "model/list",
-                serde_json::to_value(NativeModelListParams {
-                    cursor: cursor.clone(),
-                    include_hidden: Some(true),
-                    limit: Some(MODEL_PAGE_SIZE),
-                })
-                .map_err(|_| {
-                    Error::new("internal", "Codex model/list params could not be encoded")
-                })?,
-                Instant::now() + RPC_TIMEOUT,
+    // Only prerequisite reads ran; no thread or input was dispatched.
+    let (entries, truncated) = crate::discovery::collect_model_pages(
+        client,
+        Instant::now() + RPC_TIMEOUT,
+        || Error::new("internal", "Codex model/list params could not be encoded"),
+        |error| {
+            pre_dispatch_read_error(
+                error,
+                "profile_error",
+                "Codex model/list did not return a catalogue page",
             )
-            .await
-            .map_err(|error| {
-                // Only prerequisite reads ran; no thread or input was dispatched.
-                pre_dispatch_read_error(
-                    error,
-                    "profile_error",
-                    "Codex model/list did not return a catalogue page",
-                )
-            })?;
-        let page: NativeModelListResponse = serde_json::from_value(response).map_err(|_| {
+        },
+        || {
             Error::new(
                 "profile_error",
                 "Codex model/list page did not match the installed schema",
             )
-        })?;
-        entries.extend(page.data);
-        match page.next_cursor {
-            Some(next) if !next.is_empty() && seen_cursors.insert(next.clone()) => {
-                cursor = Some(next)
-            }
-            Some(_) => {
-                return Err(Error::new(
-                    "profile_error",
-                    "Codex model/list returned a repeated or invalid cursor",
-                ));
-            }
-            // End of catalogue: select from all pages at once so an omitted
-            // request sees the default wherever it is paged. Requested
-            // selection still fails honestly with no substitution.
-            None => return select_launch_model(&entries, requested_model),
-        }
+        },
+        || {
+            Error::new(
+                "profile_error",
+                "Codex model/list returned a repeated or invalid cursor",
+            )
+        },
+    )
+    .await?;
+    if truncated {
+        return Err(Error::new(
+            "profile_error",
+            "Codex model/list exceeded the bounded pagination limit",
+        ));
     }
-    Err(Error::new(
-        "profile_error",
-        "Codex model/list exceeded the bounded pagination limit",
-    ))
+    // End of catalogue: select from all pages at once so an omitted
+    // request sees the default wherever it is paged. Requested
+    // selection still fails honestly with no substitution.
+    select_launch_model(&entries, requested_model)
 }
 
 async fn read_owned_thread(client: &NativeClient, thread_id: &str) -> Result<Value> {
@@ -4034,6 +3997,9 @@ mod tests {
 
     #[test]
     fn absent_model_selects_the_native_default_without_substitution() {
+        // Cold daemon cache path: the freeze left the snapshot untouched, so
+        // the plugin falls back to the native `isDefault` entry exactly as a
+        // daemon freeze would.
         let entries = recorded_catalogue();
         let selected = super::select_launch_model(&entries, None).expect("default selected");
         assert_eq!(selected.id, "gpt-6-luna");
@@ -4053,9 +4019,6 @@ mod tests {
 
     #[test]
     fn empty_catalogue_names_no_default_and_fails_honestly() {
-        // The installed Muse 1.4.20 shape: an empty catalogue serves no
-        // default to fall back to, so an omitted request fails instead of
-        // substituting another model.
         let error = super::select_launch_model(&[], None).unwrap_err();
         assert_eq!(error.code, "native_model_unavailable");
     }

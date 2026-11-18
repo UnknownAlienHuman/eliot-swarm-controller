@@ -1109,6 +1109,63 @@ pub fn require_nonempty(value: &str, harness: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Redact the free-text offer fields of a normalized public request view for
+/// the committed `request.opened` event: the approval `summary`, `questions`
+/// and approval `choices`. The in-memory offer stays raw so choice matching
+/// and re-issue comparison keep working on exact native values; only the
+/// persisted copy is redacted.
+pub fn redact_request_details_for_commit(details: &Value, policy: &SecretPolicy) -> Value {
+    let mut redacted = details.clone();
+    if let Some(fields) = redacted.as_object_mut() {
+        for key in ["summary", "questions", "choices"] {
+            if let Some(field) = fields.get_mut(key) {
+                policy.redact_values(field);
+            }
+        }
+    }
+    redacted
+}
+
+/// Refuse a `model.list` or `quota.read` call on a session-bound plugin
+/// instance. Catalogue and quota reads run on a dedicated reader instance
+/// with no session, no retained start outcome and no observer; anything else
+/// is caller error, never a native fact.
+pub fn ensure_dedicated_reader(
+    has_session: bool,
+    has_failed_start: bool,
+    has_observer: bool,
+    harness: &str,
+    method: &str,
+) -> Result<()> {
+    if has_session || has_failed_start || has_observer {
+        return Err(Error::new(
+            "bad_state",
+            format!("{harness} {method} requires a dedicated reader plugin instance"),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a `model.list` or `quota.read` call addressed to another harness.
+/// The daemon routes each harness read to its own plugin; a mismatch is a
+/// routing error, never a native fact about this harness. `harness_id` is the
+/// snapshot id (`"codex"`) while `harness` is the display name (`"Codex"`)
+/// used in diagnostics.
+pub fn ensure_reader_harness(
+    snapshot: &Value,
+    harness_id: &str,
+    harness: &str,
+    method: &str,
+) -> Result<()> {
+    if snapshot.get("harness").and_then(Value::as_str) != Some(harness_id) {
+        return Err(Error::new(
+            "profile_error",
+            format!("{harness} {method} received another harness"),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{contextual_error, optional_profile_text, request_event_id, validate_source_plan};
@@ -1172,6 +1229,59 @@ mod tests {
                 format!("{harness} start requires stream ownership for {joined}").as_str()
             );
         }
+    }
+
+    /// The shared reader guards spell every harness exactly as the
+    /// per-plugin copies did (pure move).
+    #[test]
+    fn reader_guards_match_the_per_harness_originals() {
+        for (id, display) in [
+            ("codex", "Codex"),
+            ("muse", "Muse"),
+            ("opencode", "OpenCode"),
+            ("antigravity", "Antigravity"),
+            ("claude", "Claude"),
+        ] {
+            for method in ["model.list", "quota.read"] {
+                super::ensure_dedicated_reader(false, false, false, display, method)
+                    .expect("dedicated reader");
+                let error = super::ensure_dedicated_reader(true, false, false, display, method)
+                    .expect_err("session-bound reader");
+                assert_eq!(error.code, "bad_state");
+                assert_eq!(
+                    error.message.as_ref(),
+                    format!("{display} {method} requires a dedicated reader plugin instance")
+                        .as_str()
+                );
+                let snapshot = json!({"harness": id});
+                super::ensure_reader_harness(&snapshot, id, display, method).expect("own harness");
+                let error =
+                    super::ensure_reader_harness(&json!({"harness": "other"}), id, display, method)
+                        .expect_err("another harness");
+                assert_eq!(error.code, "profile_error");
+                assert_eq!(
+                    error.message.as_ref(),
+                    format!("{display} {method} received another harness").as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn commit_redaction_masks_only_offer_fields() {
+        use eliot_core::SecretPolicy;
+        let policy = SecretPolicy::new(["s3cr3t".to_owned()]);
+        let details = json!({
+            "summary": "run s3cr3t now",
+            "questions": ["reveal s3cr3t?"],
+            "choices": [{"label": "s3cr3t"}],
+            "approval_id": "ap_1",
+        });
+        let redacted = super::redact_request_details_for_commit(&details, &policy);
+        assert_eq!(redacted["approval_id"], json!("ap_1"));
+        assert!(!redacted["summary"].to_string().contains("s3cr3t"));
+        // The in-memory offer is untouched: the caller clones before commit.
+        assert!(details["summary"].to_string().contains("s3cr3t"));
     }
 
     /// The shared request ids and profile texts spell every harness exactly

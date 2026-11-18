@@ -30,10 +30,11 @@ use eliot_plugin::{
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::MAX_CREDENTIAL_BYTES,
     session::{
-        decode, native_no_write, not_initialized, paths_equal, register_native_process,
-        rejected_control, unknown_control, unknown_snapshot, validate_binding, validate_identity,
-        with_claimed_context, with_context_points,
+        decode, ensure_dedicated_reader, ensure_reader_harness, native_no_write, not_initialized,
+        paths_equal, register_native_process, rejected_control, unknown_control, unknown_snapshot,
+        validate_binding, validate_identity, with_claimed_context, with_context_points,
     },
+    start_classification::SettledStartFailure,
 };
 use serde_json::{Value, json};
 use std::{
@@ -241,17 +242,6 @@ enum HostLoopEvent {
 struct Initialized {
     credential: String,
     instance_dir: String,
-}
-
-/// How a settled start failure replays: an uncertain failure replays its
-/// error (the daemon settles unknown), while a proven-no-effect failure
-/// replays its failed-state result value (the daemon settles failed).
-/// Only checks before any `session/start|resume` dispatch may settle the
-/// proven variant: nothing bound to this generation can exist yet.
-#[derive(Clone)]
-enum SettledStartFailure {
-    Uncertain(Error),
-    ProvenNoEffect(Value),
 }
 
 struct FailedStart {
@@ -588,10 +578,7 @@ impl MusePlugin {
                 && failed.generation == params.generation
                 && failed.command_id == params.command_id
             {
-                return match &failed.outcome {
-                    SettledStartFailure::Uncertain(error) => Err(error.clone()),
-                    SettledStartFailure::ProvenNoEffect(value) => Ok(value.clone()),
-                };
+                return failed.outcome.replay();
             }
             return Err(Error::new(
                 "bad_state",
@@ -2305,9 +2292,9 @@ fn parse_configure_request(args: &Value) -> Result<ConfigureRequest> {
 
 /// Pure catalogue selection: an explicit request matches exactly or fails
 /// honestly with no substitution; an omitted request proves the catalogue
-/// reachable and non-empty (an empty catalogue, e.g. Muse 1.4.20's
-/// `bundledCatalog` with zero models, serves no default) and defers to the
-/// server default, whose effective id is read back from the session.
+/// reachable and non-empty (e.g. a cold daemon cache left the freeze without
+/// its resolved default) and otherwise defers to the server default, whose
+/// effective id is read back from the session.
 fn select_launch_model(
     catalog: NativeModelListResult,
     requested_model: Option<&str>,
@@ -2350,20 +2337,16 @@ impl MusePlugin {
     /// host supplies it) projects as the catalogue default; absent or
     /// all-false stays unknown and is never invented by list order.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
-        if self.session.is_some() || self.failed_start.is_some() {
-            return Err(Error::new(
-                "bad_state",
-                "Muse model.list requires a dedicated reader plugin instance",
-            ));
-        }
+        ensure_dedicated_reader(
+            self.session.is_some(),
+            self.failed_start.is_some(),
+            false,
+            "Muse",
+            "model.list",
+        )?;
         let profile: Value = decode(raw, "Muse model.list params are invalid")?;
         let snapshot = profile.get("profile").unwrap_or(&profile);
-        if snapshot.get("harness").and_then(Value::as_str) != Some("muse") {
-            return Err(Error::new(
-                "profile_error",
-                "Muse model.list received another harness",
-            ));
-        }
+        ensure_reader_harness(snapshot, "muse", "Muse", "model.list")?;
         let program = snapshot
             .get("cmd")
             .and_then(Value::as_str)
@@ -2459,20 +2442,16 @@ impl MusePlugin {
     /// `account/read` is never called, so no email, label or avatar ever
     /// enters the response, logs or Store.
     async fn quota_read(&self, raw: &Value) -> Result<Value> {
-        if self.session.is_some() || self.failed_start.is_some() {
-            return Err(Error::new(
-                "bad_state",
-                "Muse quota.read requires a dedicated reader plugin instance",
-            ));
-        }
+        ensure_dedicated_reader(
+            self.session.is_some(),
+            self.failed_start.is_some(),
+            false,
+            "Muse",
+            "quota.read",
+        )?;
         let params = eliot_plugin::quota::decode(raw)?;
         let snapshot = &params.profile;
-        if snapshot.get("harness").and_then(Value::as_str) != Some("muse") {
-            return Err(Error::new(
-                "profile_error",
-                "Muse quota.read received another harness",
-            ));
-        }
+        ensure_reader_harness(snapshot, "muse", "Muse", "quota.read")?;
         let program = snapshot
             .get("cmd")
             .and_then(Value::as_str)
