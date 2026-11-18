@@ -2057,6 +2057,17 @@ impl Router {
         {
             return retained_preparation(&request.args);
         }
+        // A switch that requests neither a workspace nor a branch keeps its
+        // source checkout: reuse was selected before preparation, so no
+        // worktree is minted even under the automatic policy.
+        if request
+            .args
+            .as_object_mut()
+            .and_then(|args| args.remove("switch_reuse_source_checkout"))
+            .is_some()
+        {
+            return Ok(None);
+        }
         if resolve_project {
             let workspace = std::path::Path::new(required_text(&request.args, "workspace")?);
             let project = if matches!(principal, Principal::Owner) {
@@ -2088,7 +2099,15 @@ impl Router {
             .and_then(Value::as_str)
             .filter(|branch| !branch.is_empty())
             .map(str::to_owned);
-        if requested.is_none()
+        // A bare `--worktree` carries an empty value and still counts as an
+        // explicit preparation request: even a `shared` project prepares a
+        // standard worktree when the flag is present.
+        let explicit_worktree = request
+            .args
+            .get("worktree")
+            .and_then(Value::as_str)
+            .is_some();
+        if !explicit_worktree
             && request.args.get("auto_worktree").is_none()
             && !self.auto_worktree_for_top_level(principal, request).await?
         {
@@ -2107,7 +2126,7 @@ impl Router {
             }
             return Ok(None);
         }
-        let (project_slug, task_slug) = generated_naming(request)?;
+        let (project_slug, task_slug) = generated_naming(&self.inner.data_root, request).await?;
         if contains_known_secret(&request.args, &self.inner.secrets) {
             return Err(Error::new(
                 "secret_in_payload",
@@ -5468,8 +5487,8 @@ fn validate_project_rule_resume_command(
 }
 
 /// Whether a registration id was minted by project auto-discovery
-/// (`project-<sha256>`): such ids are opaque, so the standard name uses the
-/// checkout's logical folder name instead.
+/// (`project-<sha256>`): such ids are opaque and never name the standard
+/// directory.
 fn is_auto_project_id(id: &str) -> bool {
     id.len() == "project-".len() + 64
         && id.starts_with("project-")
@@ -5486,12 +5505,114 @@ fn workspace_folder_name(workspace: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Naming parts for a standard worktree directory: the registration's
-/// logical name (the checkout folder for auto-discovered registrations,
-/// whose hashed ids are opaque, and for unregistered checkouts) and the
+/// A path as the daemon's Git identity compares it: no verbatim prefix, one
+/// separator, no trailing separator, case-insensitive on Windows. This is
+/// the same spelling the desktop sidebar uses for `project:repo:*` keys.
+fn display_path_key(path: &str) -> String {
+    let path = if path.starts_with(r"\\?\UNC\") {
+        path.to_owned()
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_owned()
+    };
+    let unified = path.replace('\\', "/");
+    let trimmed = unified.trim_end_matches('/');
+    if cfg!(windows) {
+        trimmed.to_lowercase()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// The repository folder implied by a Git common directory:
+/// `<folder>/.git` is checked out at `folder`; any other common directory
+/// names itself without a trailing `.git`. Mirrors the desktop sidebar.
+fn repository_folder(common_dir: &str) -> Option<String> {
+    let shown = if common_dir.starts_with(r"\\?\UNC\") {
+        common_dir.to_owned()
+    } else {
+        common_dir
+            .strip_prefix(r"\\?\")
+            .unwrap_or(common_dir)
+            .to_owned()
+    };
+    let shown = shown.trim_end_matches(['\\', '/']);
+    let mut parts = shown.rsplitn(2, ['\\', '/']);
+    let last = parts.next().unwrap_or(shown);
+    if last.eq_ignore_ascii_case(".git")
+        && let Some(main) = parts.next().filter(|main| !main.is_empty())
+    {
+        return workspace_folder_name(main);
+    }
+    let name = last
+        .strip_suffix(".git")
+        .filter(|name| !name.is_empty())
+        .unwrap_or(last);
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// The project's logical name for a standard worktree directory
+/// (docs/spec/configuration.md): the owner's `[desktop] display_names`
+/// entry first, else the `origin` repository name read live from Git without
+/// credentials, else the main checkout's folder. A registration ID names
+/// nothing a person reads and is never used.
+async fn project_logical_name(
+    data_root: &std::path::Path,
+    registration_id: Option<&str>,
+    workspace: &str,
+) -> Result<String> {
+    let git = crate::workspace_git::WorkspaceGit::new().ok();
+    let mut common_dir: Option<String> = None;
+    if let Some(git) = git.as_ref()
+        && let Ok((_, common)) = git.repository_identity(workspace).await
+    {
+        common_dir = Some(common);
+    }
+    // The owner's display name wins when one names this project.
+    {
+        let mut keys = Vec::new();
+        if let Some(common) = common_dir.as_deref() {
+            keys.push(format!("project:repo:{}", display_path_key(common)));
+        }
+        if let Some(id) = registration_id.filter(|id| !id.trim().is_empty()) {
+            keys.push(format!("project:{id}"));
+        }
+        keys.push(format!("project:folder:{}", display_path_key(workspace)));
+        if let Some(name) = crate::config::load_project_display_name(data_root, &keys)
+            && !name.trim().is_empty()
+        {
+            return Ok(name);
+        }
+    }
+    // Else the repository name of the `origin` remote.
+    if let (Some(git), Some(common)) = (git.as_ref(), common_dir.as_deref()) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+        if let Some(origin) = git.origin_name(common, deadline).await
+            && !origin.trim().is_empty()
+        {
+            return Ok(origin);
+        }
+    }
+    // Else the main checkout's folder: registration IDs (including
+    // configured ones) never name the directory.
+    if let Some(common) = common_dir.as_deref()
+        && let Some(folder) = repository_folder(common)
+        && !folder.trim().is_empty()
+    {
+        return Ok(folder);
+    }
+    workspace_folder_name(workspace)
+        .filter(|folder| !folder.trim().is_empty())
+        .ok_or_else(|| Error::new("invalid", "launch workspace has no project name"))
+}
+
+/// Naming parts for a standard worktree directory: the project's logical
+/// name (display name, else origin, else main checkout folder) and the
 /// prompt text the Store slugs into `<project>/<agent>-<task-slug>`.
 /// A daemon-set `auto_worktree` hint (manager launches) wins when present.
-fn generated_naming(request: &SubmitCommand) -> Result<(String, String)> {
+async fn generated_naming(
+    data_root: &std::path::Path,
+    request: &SubmitCommand,
+) -> Result<(String, String)> {
     if let Some(hint) = request.args.get("auto_worktree") {
         let project = hint
             .get("project")
@@ -5502,8 +5623,9 @@ fn generated_naming(request: &SubmitCommand) -> Result<(String, String)> {
             .get("task")
             .and_then(Value::as_str)
             .unwrap_or("manager");
-        // Auto-discovered registrations carry an opaque hashed id; the
-        // standard directory uses the checkout's logical folder name.
+        // A hint already carries the resolved logical name (manager
+        // launches resolve it before hinting). An opaque auto-discovered id
+        // that reaches here anyway falls back to the checkout folder.
         if is_auto_project_id(project)
             && let Some(folder) = request
                 .args
@@ -5515,22 +5637,16 @@ fn generated_naming(request: &SubmitCommand) -> Result<(String, String)> {
         }
         return Ok((project.to_owned(), task.to_owned()));
     }
+    let workspace = request
+        .args
+        .get("workspace")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let registered = request
         .args
         .get("registered_project")
-        .and_then(Value::as_str)
-        .filter(|project| !is_auto_project_id(project));
-    let project = registered
-        .map(str::to_owned)
-        .or_else(|| {
-            request
-                .args
-                .get("workspace")
-                .and_then(Value::as_str)
-                .and_then(workspace_folder_name)
-        })
-        .filter(|project| !project.trim().is_empty())
-        .ok_or_else(|| Error::new("invalid", "launch workspace has no project name"))?;
+        .and_then(Value::as_str);
+    let project = project_logical_name(data_root, registered, workspace).await?;
     let task = request
         .args
         .get("text")
@@ -6436,14 +6552,17 @@ mod tests {
         )
     }
 
-    #[test]
-    fn generated_naming_prefers_hint_then_registration_then_folder() {
+    #[tokio::test]
+    async fn generated_naming_prefers_hint_then_display_origin_folder() {
+        let data_root = PathBuf::from("synthetic-data-root");
         let mut hinted = SubmitCommand::new("id-hint", "launch");
         hinted.args = json!({"auto_worktree": {"project": "Atlas", "task": "manager"}});
         assert_eq!(
-            generated_naming(&hinted).unwrap(),
+            generated_naming(&data_root, &hinted).await.unwrap(),
             ("Atlas".to_owned(), "manager".to_owned())
         );
+        // A configured registration ID names nothing a person reads: the
+        // standard directory falls back to the checkout folder.
         let mut registered = SubmitCommand::new("id-reg", "launch");
         registered.args = json!({
             "workspace": "C:/src/atlas",
@@ -6451,19 +6570,20 @@ mod tests {
             "text": "Fix login bug\nsecond line",
         });
         assert_eq!(
-            generated_naming(&registered).unwrap(),
-            ("Atlas".to_owned(), "Fix login bug\nsecond line".to_owned())
+            generated_naming(&data_root, &registered).await.unwrap(),
+            ("atlas".to_owned(), "Fix login bug\nsecond line".to_owned())
         );
         let mut folder = SubmitCommand::new("id-folder", "launch");
         folder.args = json!({"workspace": "C:/src/atlas"});
         assert_eq!(
-            generated_naming(&folder).unwrap(),
+            generated_naming(&data_root, &folder).await.unwrap(),
             ("atlas".to_owned(), String::new())
         );
     }
 
-    #[test]
-    fn generated_naming_uses_the_logical_name_for_auto_discovered_projects() {
+    #[tokio::test]
+    async fn generated_naming_uses_the_logical_name_for_auto_discovered_projects() {
+        let data_root = PathBuf::from("synthetic-data-root");
         let auto = format!("project-{}", "ab".repeat(32));
         assert!(is_auto_project_id(&auto));
         assert!(!is_auto_project_id("Atlas"));
@@ -6475,18 +6595,19 @@ mod tests {
             "text": "Fix login bug",
         });
         assert_eq!(
-            generated_naming(&registered).unwrap(),
+            generated_naming(&data_root, &registered).await.unwrap(),
             ("atlas".to_owned(), "Fix login bug".to_owned())
         );
-        // Manager hint with an auto-discovered id also falls back to the
-        // checkout folder; configured ids keep their logical name.
+        // A manager hint already carries the resolved logical name; an
+        // opaque auto-discovered id that reaches here anyway falls back to
+        // the checkout folder.
         let mut hinted = SubmitCommand::new("id-auto-hint", "launch");
         hinted.args = json!({
             "workspace": "C:/src/atlas",
             "auto_worktree": {"project": auto, "task": "manager"},
         });
         assert_eq!(
-            generated_naming(&hinted).unwrap(),
+            generated_naming(&data_root, &hinted).await.unwrap(),
             ("atlas".to_owned(), "manager".to_owned())
         );
         let mut named = SubmitCommand::new("id-named-hint", "launch");
@@ -6495,8 +6616,32 @@ mod tests {
             "auto_worktree": {"project": "Atlas", "task": "manager"},
         });
         assert_eq!(
-            generated_naming(&named).unwrap(),
+            generated_naming(&data_root, &named).await.unwrap(),
             ("Atlas".to_owned(), "manager".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn generated_naming_prefers_the_owner_display_name() {
+        let root = std::env::temp_dir().join(format!("naming-display-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        let workspace = "C:/src/atlas";
+        let key = format!("project:folder:{}", display_path_key(workspace));
+        std::fs::write(
+            root.join("config.toml"),
+            format!("[desktop]\ndisplay_names = [{{key = '{key}', name = 'Atlas'}}]\n"),
+        )
+        .unwrap();
+        let mut request = SubmitCommand::new("id-display", "launch");
+        request.args = json!({
+            "workspace": workspace,
+            "registered_project": "Atlas",
+            "text": "Fix login bug",
+        });
+        assert_eq!(
+            generated_naming(&root, &request).await.unwrap(),
+            ("Atlas".to_owned(), "Fix login bug".to_owned())
         );
     }
 

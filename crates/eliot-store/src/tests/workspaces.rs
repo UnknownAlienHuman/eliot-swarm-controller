@@ -1711,3 +1711,140 @@ fn explicit_branch_finalize_keeps_the_branch_in_the_standard_directory() {
         Some(workspace.worktree_path.as_str())
     );
 }
+
+#[test]
+fn generated_finalization_budgets_the_windows_length_limit() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let checkout = "/synthetic-budget";
+    // A long worktrees parent passes the placeholder but the finalized
+    // `<agent>-<task>` leaf must still fit the Windows budget.
+    let parent = format!("/{}/worktrees/atlas", "d".repeat(200));
+    let input = WorkspacePreparationInput {
+        project: checkout.to_owned(),
+        repo_path: checkout.to_owned(),
+        repo_common_dir: format!("{checkout}/.git"),
+        requested_branch: "atlas/pending-01k178placeholder".to_owned(),
+        base_ref: None,
+        base_oid: "d".repeat(40),
+        worktree_path: format!("{parent}/pending-01k178placeholder"),
+        frozen_setup: Vec::new(),
+        generated: Some(eliot_core::GeneratedWorktreeNaming {
+            project_slug: "atlas".to_owned(),
+            task_slug: "w".repeat(48),
+            branch: None,
+        }),
+    };
+    let start_id = Ulid::new().to_string();
+    let error = store
+        .submit_with_workspace(
+            "owner",
+            SubmitCommand {
+                id: start_id,
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({
+                    "project": checkout,
+                    "workspace": checkout,
+                    "worktree": "",
+                    "harness": "codex",
+                    "profile": "fake",
+                    "profile_snapshot": {}
+                }),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            input,
+            now,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "invalid");
+}
+
+#[test]
+fn generated_finalization_refuses_branch_namespace_collisions() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let checkout = "/synthetic-namespace";
+    let launch_args = || {
+        json!({
+            "project": checkout,
+            "workspace": checkout,
+            "harness": "codex",
+            "profile": "fake",
+            "profile_snapshot": {}
+        })
+    };
+    // An explicitly requested `atlas` branch is admitted first.
+    let first = WorkspacePreparationInput {
+        project: checkout.to_owned(),
+        repo_path: checkout.to_owned(),
+        repo_common_dir: format!("{checkout}/.git"),
+        requested_branch: "atlas".to_owned(),
+        base_ref: None,
+        base_oid: "d".repeat(40),
+        worktree_path: "/synthetic-data/worktrees/atlas/pending-first".to_owned(),
+        frozen_setup: Vec::new(),
+        generated: Some(eliot_core::GeneratedWorktreeNaming {
+            project_slug: "atlas".to_owned(),
+            task_slug: "first".to_owned(),
+            branch: Some("atlas".to_owned()),
+        }),
+    };
+    store
+        .submit_with_workspace(
+            "owner",
+            SubmitCommand {
+                id: Ulid::new().to_string(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: launch_args(),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            first,
+            now,
+        )
+        .expect("admit atlas branch");
+    // A generated `atlas/<agent>-task` branch collides with it at admission.
+    let second = WorkspacePreparationInput {
+        project: checkout.to_owned(),
+        repo_path: checkout.to_owned(),
+        repo_common_dir: format!("{checkout}/.git"),
+        requested_branch: "atlas/pending-01k178second".to_owned(),
+        base_ref: None,
+        base_oid: "d".repeat(40),
+        worktree_path: "/synthetic-data/worktrees/atlas/pending-01k178second".to_owned(),
+        frozen_setup: Vec::new(),
+        generated: Some(eliot_core::GeneratedWorktreeNaming {
+            project_slug: "atlas".to_owned(),
+            task_slug: "second".to_owned(),
+            branch: None,
+        }),
+    };
+    let error = store
+        .submit_with_workspace(
+            "owner",
+            SubmitCommand {
+                id: Ulid::new().to_string(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: launch_args(),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            second,
+            now,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, "already_exists");
+}

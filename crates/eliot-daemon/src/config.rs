@@ -27,7 +27,7 @@ pub(crate) use automation::{
 };
 use projects::{ProjectEntry, project_registrations_in};
 pub(crate) use projects::{
-    ProjectRegistrationConfig, ProjectWorkspaceMode, default_chats_root,
+    ProjectRegistrationConfig, ProjectWorkspaceMode, default_chats_root, load_project_display_name,
     load_project_registration_config, validate_chats_location,
 };
 
@@ -464,6 +464,26 @@ struct DesktopModelVisibility {
 struct DesktopDisplayName {
     key: String,
     name: String,
+}
+
+impl FileConfig {
+    /// The owner's display name for a project: the first `[desktop]
+    /// display_names` `project:*` entry matching `candidate_keys` in order.
+    /// Empty names never match.
+    pub(crate) fn desktop_project_name(&self, candidate_keys: &[String]) -> Option<String> {
+        for key in candidate_keys {
+            if let Some(name) = self.desktop.display_names.iter().find_map(|entry| {
+                entry
+                    .key
+                    .eq_ignore_ascii_case(key)
+                    .then(|| entry.name.clone())
+            }) && !name.trim().is_empty()
+            {
+                return Some(name);
+            }
+        }
+        None
+    }
 }
 
 /// Bounded desktop preferences for the new-task picker: favorite models,

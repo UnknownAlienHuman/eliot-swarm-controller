@@ -173,8 +173,17 @@ impl Router {
             } else {
                 launch.args = json!({"workspace": registration.checkout, "profile": request.profile, "worktree": ""});
                 normalize_launch(&mut launch, principal)?;
+                // The hint carries the resolved logical name (display name,
+                // else origin, else main checkout folder), never the
+                // registration ID.
+                let logical = super::project_logical_name(
+                    &self.inner.data_root,
+                    Some(request.project.as_str()),
+                    registration.checkout.as_str(),
+                )
+                .await?;
                 launch.args["auto_worktree"] =
-                    json!({"project": request.project, "task": "manager"});
+                    json!({"project": logical, "task": "manager"});
                 let input = self
                     .freeze_launch_admission(principal, &mut launch, false, false, false)
                     .await?;

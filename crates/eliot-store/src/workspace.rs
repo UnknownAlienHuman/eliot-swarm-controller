@@ -230,13 +230,20 @@ pub(super) fn validate_setup_file(file: &FrozenSetupFile) -> Result<()> {
     Ok(())
 }
 
+/// Windows length budget for a managed destination: the complete path,
+/// including the trailing NUL, stays under 260 characters so generated
+/// names are always launchable. Mirrors the daemon freeze gate.
+const MAX_FINAL_PATH_LEN: usize = 260;
+
 /// Finalize a daemon-prepared standard directory with the admitted Agent
 /// ID: `<project>/<agent>-<task-slug>` under the frozen worktrees parent.
 /// The Store is the only place that knows both the worktrees root (from the
 /// frozen placeholder's parent) and the admitted Agent ID, so the standard
 /// is implemented once here and never derives from caller command-id syntax.
 /// An explicitly requested branch always wins and is preserved; a `None`
-/// branch mints the standard branch.
+/// branch mints the standard branch. The finalized branch and path are
+/// validated here, not the frozen placeholder: the placeholder is short by
+/// construction while the finalized leaf carries the task slug.
 fn finalize_generated_naming(
     connection: &Connection,
     input: &WorkspacePreparationInput,
@@ -255,6 +262,10 @@ fn finalize_generated_naming(
         }
         None => core::standard_branch(&naming.project_slug, agent_id, &naming.task_slug),
     };
+    if branch.starts_with('-') || branch.contains('\0') {
+        return Err(Error::new("invalid", "invalid generated workspace branch"));
+    }
+    require_branch_namespace_free(connection, &branch)?;
     let parent = std::path::Path::new(&input.worktree_path)
         .parent()
         .ok_or_else(|| Error::new("invalid", "generated worktree path has no parent"))?;
@@ -263,6 +274,29 @@ fn finalize_generated_naming(
         .to_str()
         .ok_or_else(|| Error::new("invalid", "generated worktree path is not valid UTF-8"))?;
     require_absolute_workspace_path(path)?;
+    // The finalized leaf is longer than the frozen placeholder, so the
+    // complete destination is budgeted here; device names (such as `aux`)
+    // are refused even though the slugs escape them by construction.
+    if path.len() >= MAX_FINAL_PATH_LEN {
+        return Err(Error::new(
+            "invalid",
+            "generated worktree path exceeds the Windows length limit",
+        ));
+    }
+    if path
+        .replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .any(|part| {
+            let stem = part.split('.').next().unwrap_or(part);
+            core::is_windows_device_slug(stem)
+        })
+    {
+        return Err(Error::new(
+            "invalid",
+            "generated worktree path carries a Windows device name",
+        ));
+    }
     if path == input.repo_path {
         return Err(Error::new(
             "invalid",
@@ -276,6 +310,46 @@ fn finalize_generated_naming(
         ));
     }
     Ok((branch, path.to_owned()))
+}
+
+/// The finalized branch must not collide with the managed branch namespace:
+/// an existing managed `atlas` blocks a new `atlas/a1-task`, and an existing
+/// managed `atlas/a1-task` blocks a new `atlas`. Git-level collisions were
+/// already refused at freeze time for the placeholder prefix; this guards
+/// the finalized leaf admitted here.
+fn require_branch_namespace_free(connection: &Connection, branch: &str) -> Result<()> {
+    let mut statement = connection
+        .prepare("SELECT requested_branch FROM workspaces")
+        .map_err(sql_error)?;
+    let mut rows = statement.query([]).map_err(sql_error)?;
+    let mut existing: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().map_err(sql_error)? {
+        existing.push(row.get(0).map_err(sql_error)?);
+    }
+    let mut prefix = String::new();
+    for component in branch.split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        if prefix.len() == branch.len() {
+            break;
+        }
+        if existing.iter().any(|other| other == &prefix) {
+            return Err(Error::new(
+                "already_exists",
+                "generated worktree branch conflicts with an existing branch",
+            ));
+        }
+    }
+    let nested = format!("{branch}/");
+    if existing.iter().any(|other| other.starts_with(&nested)) {
+        return Err(Error::new(
+            "already_exists",
+            "generated worktree branch conflicts with an existing branch namespace",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn validate_workspace_input(input: &WorkspacePreparationInput) -> Result<()> {

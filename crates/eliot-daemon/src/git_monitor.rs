@@ -315,7 +315,6 @@ impl GitProbe {
                 &[],
                 deadline,
                 binding,
-                true,
             )
             .await?;
         if !matches!(output.code, 0 | 1) {
@@ -570,32 +569,7 @@ impl GitProbe {
                 "bound workspace command preparation deadline elapsed",
             ));
         }
-        self.run_scoped(root, args, &overrides, &[], deadline, Some(binding), true)
-            .await
-    }
-
-    /// Run an explicitly authorized workspace mutation under ordinary
-    /// custody. Reads use the single-process leaf fence; a mutation such as
-    /// `git worktree remove` may spawn helpers, so it runs unfenced with the
-    /// same safe overrides. Only callers that already hold the mutation's
-    /// authority (cleanup apply after its final checks, `worktree.remove`
-    /// after its gate) may use this.
-    pub(crate) async fn workspace_mutation(
-        &self,
-        root: &Path,
-        args: &[&str],
-        binding: GitBinding<'_>,
-        deadline: Instant,
-    ) -> Result<Captured> {
-        let overrides = self
-            .safe_overrides_for(root, deadline, Some(binding))
-            .await?;
-        if Instant::now() >= deadline {
-            return Err(unavailable(
-                "workspace mutation preparation deadline elapsed",
-            ));
-        }
-        self.run_scoped(root, args, &overrides, &[], deadline, Some(binding), false)
+        self.run_scoped(root, args, &overrides, &[], deadline, Some(binding))
             .await
     }
 
@@ -641,7 +615,7 @@ impl GitProbe {
         input: &[u8],
         deadline: Instant,
     ) -> Result<Captured> {
-        self.run_scoped(root, args, overrides, input, deadline, None, true)
+        self.run_scoped(root, args, overrides, input, deadline, None)
             .await
     }
 
@@ -740,9 +714,6 @@ impl GitProbe {
         Ok(command)
     }
 
-    // Reads and one authorized mutation share this runner; the leaf flag
-    // selects the single-process fence (reads) or ordinary custody.
-    #[allow(clippy::too_many_arguments)]
     async fn run_scoped(
         &self,
         root: &Path,
@@ -751,25 +722,18 @@ impl GitProbe {
         input: &[u8],
         deadline: Instant,
         binding: Option<GitBinding<'_>>,
-        leaf: bool,
     ) -> Result<Captured> {
         if Instant::now() >= deadline {
             return Err(unavailable("Git observation deadline elapsed"));
         }
         let command = self.build_command(root, args, overrides, binding)?;
-        let mut child = if leaf {
-            OwnedChild::spawn_leaf(command).map_err(|error| {
-                if error.code == "unavailable" {
-                    Error::new("git_leaf_fence_unavailable", *error.message)
-                } else {
-                    error
-                }
-            })?
-        } else {
-            // Ordinary custody for an authorized mutation: a later spawn
-            // failure keeps the true OS error instead of blaming a fence.
-            OwnedChild::spawn(command)?
-        };
+        let mut child = OwnedChild::spawn_leaf(command).map_err(|error| {
+            if error.code == "unavailable" {
+                Error::new("git_leaf_fence_unavailable", *error.message)
+            } else {
+                error
+            }
+        })?;
         let stdout = child
             .take_stdout()
             .ok_or_else(|| unavailable("Git stdout is unavailable"))?;

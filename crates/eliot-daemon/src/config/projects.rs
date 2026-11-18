@@ -210,6 +210,18 @@ pub(crate) fn load_project_registration_config(
     project_registrations_in(&config, &source)
 }
 
+/// Owner display name for a project launch: the first `[desktop]
+/// display_names` entry matching `candidate_keys` in order
+/// (`project:repo:<common-dir>`, `project:<registration-id>`,
+/// `project:folder:<workspace>`). Absent config or no match reads `None`.
+pub(crate) fn load_project_display_name(
+    data_root: &Path,
+    candidate_keys: &[String],
+) -> Option<String> {
+    let (config, _) = read_config(data_root).ok()??;
+    config.desktop_project_name(candidate_keys)
+}
+
 /// Project registration validation over already parsed source text (also
 /// run on an edited profile draft: a project may not keep naming a profile
 /// the draft removed).

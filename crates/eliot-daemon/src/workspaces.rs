@@ -236,7 +236,7 @@ impl WorkspaceManager {
             repo_path: frozen.repo_path,
             repo_common_dir: frozen.repo_common_dir,
             requested_branch: frozen.requested_branch,
-            base_ref: Some(frozen.base_ref),
+            base_ref: base_ref.map(str::to_owned),
             base_oid: frozen.base_oid,
             worktree_path: frozen.worktree_path,
             frozen_setup,
@@ -288,7 +288,7 @@ impl WorkspaceManager {
             repo_path: frozen.repo_path,
             repo_common_dir: frozen.repo_common_dir,
             requested_branch: frozen.requested_branch,
-            base_ref: Some(frozen.base_ref),
+            base_ref: base_ref.map(str::to_owned),
             base_oid: frozen.base_oid,
             worktree_path: frozen.worktree_path,
             frozen_setup,
@@ -637,12 +637,6 @@ impl WorkspaceManager {
         slot: &Arc<Slot>,
         git: &WorkspaceGit,
     ) -> WorkspaceRemovalOutcome {
-        // The shared merge and strict-clean gate runs before the first
-        // mutation: an unmerged, dirty or unreadable worktree is refused
-        // before any scratch file is touched, exactly like cleanup.
-        if let Err(error) = git.preflight_remove(preparation).await {
-            return removal_gate_error(&error);
-        }
         loop {
             let deadline = Instant::now() + GIT_TIME;
             if self
@@ -1817,16 +1811,6 @@ fn removal_refused() -> WorkspaceRemovalOutcome {
     WorkspaceRemovalOutcome::Failed {
         code: "workspace_remove_refused".to_owned(),
         message: "worktree removal was refused before destructive effects".to_owned(),
-    }
-}
-
-/// Map the shared pre-removal gate: unknown Git state stays unknown, every
-/// other refusal (unmerged, dirty, unreadable) settles before any mutation.
-fn removal_gate_error(error: &Error) -> WorkspaceRemovalOutcome {
-    if error.code.as_str() == "unknown" {
-        removal_unknown("workspace_remove_gate_unknown")
-    } else {
-        removal_refused()
     }
 }
 

@@ -289,20 +289,16 @@ It also freezes each note/setup file as bounded bytes or canonical allowed
 The current opt-in creates a new branch; an existing branch is rejected rather than
 reset or renamed, as is a branch that collides with the branch namespace (an
 existing `atlas` blocks `atlas/a1-task`, and vice versa). An explicit `--base`
-wins; an omitted `--base` resolves to the local default branch when one exists
-(the local counterpart of `refs/remotes/origin/HEAD`, else `main`, else
-`master`), else the launch-time branch, and the resolved ref is retained at
-admission: cleanup compares against the retained ref, never a freshly resolved
-default. Rows admitted without a retained base are kept, never removed.
-Repository common-directory identity is frozen alongside the
-source checkout.
+wins; an omitted `--base` means local `HEAD`. Repository common-directory
+identity is frozen alongside the source checkout.
 
 One naming standard, implemented once in the shared core and finalized in the
 Store with the admitted Agent ID:
 
-- `project`: the registration's logical name as a slug (the checkout folder
-  slug for auto-discovered registrations, whose hashed ids are opaque, and
-  for unregistered checkouts);
+- `project`: the project's logical name as a slug (the owner's `[desktop]
+  display_names` entry, else the repository name of its `origin` remote,
+  else the folder of the repository's main checkout); registration IDs name
+  nothing a person reads and are never used;
 - `branch`: `<project>/<agent>-<task-slug>`, where the task slug is an ASCII,
   bounded slug of the launch prompt's first line (`task` when empty);
 - `worktree path`: `<data_dir>/worktrees/<project>/<agent>-<task-slug>`.
@@ -381,11 +377,6 @@ assignment is independent of that receipt. Workers share the manager's prepared
 worktree through the parent link. Cleanup planning, cleanup apply and worktree
 removal respect the current binding and nonterminal borrowers. Releasing the
 assignment preserves the preparation receipt and any existing borrowers.
-
-A managed worktree is offered for removal only when its branch is merged into
-its base, its tree is clean, and no live borrowers remain. Cleanup apply
-re-verifies the merge before removing; dirty, unmerged or unknown worktrees
-are never removed. The branch itself is retained.
 
 ## Git and filesystem monitor
 

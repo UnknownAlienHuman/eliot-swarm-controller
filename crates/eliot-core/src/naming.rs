@@ -23,7 +23,7 @@ pub const FALLBACK_SLUG: &str = "task";
 /// reserved device name (`con`, `prn`, `aux`, `nul`, `com1`-`com9`,
 /// `lpt1`-`lpt9`), matched case-insensitively on the whole slug. Slugs
 /// carry no dots or colons, so the stem is the whole value.
-fn is_windows_device_slug(slug: &str) -> bool {
+pub fn is_windows_device_slug(slug: &str) -> bool {
     let upper = slug.to_ascii_uppercase();
     matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || (upper.len() == 4

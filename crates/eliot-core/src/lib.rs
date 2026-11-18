@@ -51,8 +51,8 @@ pub use mcp_policy::{
     strip_jsonc_trailing_commas, url_host_equals, validate_allow_list,
 };
 pub use naming::{
-    FALLBACK_SLUG, MAX_PROJECT_SLUG_LEN, MAX_TASK_SLUG_LEN, project_slug, standard_branch,
-    standard_leaf, task_slug,
+    FALLBACK_SLUG, MAX_PROJECT_SLUG_LEN, MAX_TASK_SLUG_LEN, is_windows_device_slug, project_slug,
+    standard_branch, standard_leaf, task_slug,
 };
 pub use native_child::{
     CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,

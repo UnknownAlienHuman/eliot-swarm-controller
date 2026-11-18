@@ -33,9 +33,6 @@ pub(crate) struct FrozenWorkspaceGit {
     pub repo_path: String,
     pub repo_common_dir: String,
     pub requested_branch: String,
-    /// The resolved base ref retained at admission. Cleanup compares the
-    /// branch against this ref, never against a freshly resolved default.
-    pub base_ref: String,
     pub base_oid: String,
     pub worktree_path: String,
 }
@@ -88,7 +85,7 @@ impl WorkspaceGit {
     /// the probe's sanitized environment (no inherited `GIT_*`). `None`
     /// without an origin, for a missing directory, or when Git cannot read
     /// it. The URL itself, which may embed credentials, never leaves here.
-    async fn origin_name(&self, common_dir: &str, deadline: Instant) -> Option<String> {
+    pub(crate) async fn origin_name(&self, common_dir: &str, deadline: Instant) -> Option<String> {
         let root = canonical_root(common_dir).ok()?;
         let output = self
             .git
@@ -181,31 +178,13 @@ impl WorkspaceGit {
                 "workspace path or branch is already registered",
             ));
         }
-        let reference = match base_ref {
-            Some(reference) if !reference.is_empty() && !reference.contains('\0') => {
-                reference.to_owned()
-            }
-            Some(_) => {
-                return Err(problem(
-                    "invalid",
-                    "workspace base reference is empty or malformed",
-                ));
-            }
-            // No explicit base: the local default branch when one exists.
-            // Without a readable default the launch-time branch is retained
-            // instead of a moving HEAD, so cleanup compares against the
-            // checkout the worktree was actually cut from.
-            None => {
-                let resolved = self.default_base_ref(&source.root, deadline).await?;
-                if resolved != "HEAD" {
-                    resolved
-                } else {
-                    self.current_branch_name(&source.root, deadline)
-                        .await?
-                        .unwrap_or(resolved)
-                }
-            }
-        };
+        let reference = base_ref.unwrap_or("HEAD");
+        if reference.is_empty() || reference.contains('\0') {
+            return Err(problem(
+                "invalid",
+                "workspace base reference is empty or malformed",
+            ));
+        }
         let commit = format!("{reference}^{{commit}}");
         let base_oid = self
             .read_line(
@@ -234,7 +213,6 @@ impl WorkspaceGit {
             repo_path: path_text(&source.root)?,
             repo_common_dir: path_text(&source.common_dir)?,
             requested_branch: branch.to_owned(),
-            base_ref: reference,
             base_oid,
             worktree_path: path_text(&destination)?,
         })
@@ -288,79 +266,6 @@ impl WorkspaceGit {
             ));
         }
         Ok(())
-    }
-
-    /// Final removal for a retained, clean worktree. The only mutation is a
-    /// plain `git worktree remove` (never `--force`): Git itself performs
-    /// the final clean check, so a file dirtied after the last probe refuses
-    /// instead of being deleted. Only handles held for identity proof are
-    /// read; tracked files are never deleted through them.
-    pub(crate) async fn remove_managed_worktree(
-        &self,
-        repo: &str,
-        worktree_path: &str,
-        branch: &str,
-    ) -> Result<()> {
-        if branch.is_empty() || branch.starts_with('-') || branch.contains('\0') {
-            return Err(problem("invalid", "managed branch is malformed"));
-        }
-        let deadline = Instant::now() + READ_TIME;
-        let source = self.repository(repo, deadline).await?;
-        let target = destination_path(worktree_path)?;
-        separate_target(&source, &target)?;
-        let target_text = git_path_argument(&target)?;
-        // An authorized mutation runs under ordinary custody, not the
-        // single-process leaf fence: `worktree remove` spawns helpers.
-        let output = self
-            .git
-            .workspace_mutation(
-                &source.root,
-                &["worktree", "remove", "--", &target_text],
-                GitBinding {
-                    git_dir: &source.git_dir,
-                    common_dir: &source.common_dir,
-                },
-                deadline,
-            )
-            .await?;
-        if output.code != 0 {
-            // Git refuses a dirty checkout itself, but a nonzero exit can
-            // also be a fatal (bad path, lock, I/O). Re-probe strict
-            // cleanliness so only real dirt reads `dirty_worktree`; anything
-            // else stays unknown instead of being mislabeled.
-            let probe = self
-                .git
-                .workspace_command(
-                    &target,
-                    &[
-                        "status",
-                        "--porcelain=v1",
-                        "-z",
-                        "--untracked-files=all",
-                        "--ignored=matching",
-                    ],
-                    deadline,
-                )
-                .await?;
-            if probe.code == 0 && !probe.stdout.is_empty() {
-                return Err(problem(
-                    "dirty_worktree",
-                    "worktree removal refused: the checkout is not clean",
-                ));
-            }
-            return Err(problem(
-                "unknown",
-                "worktree removal did not complete and was not retried",
-            ));
-        }
-        if absent(&target)? {
-            Ok(())
-        } else {
-            Err(problem(
-                "unknown",
-                "worktree removal is incomplete and was not retried",
-            ))
-        }
     }
 
     /// Requires the manager's durable `creating` intent. This never spawns the
@@ -683,33 +588,6 @@ impl WorkspaceGit {
         Ok(())
     }
 
-    /// The shared merge and strict-clean gate before the first removal
-    /// mutation. An unmerged, dirty or unreadable worktree is refused here,
-    /// before any scratch file is touched; unknown Git state stays unknown.
-    /// `worktree.remove` and cleanup apply run this same gate.
-    pub(crate) async fn preflight_remove(&self, preparation: &WorkspacePreparation) -> Result<()> {
-        let deadline = Instant::now() + READ_TIME;
-        let subject = self.subject(preparation, deadline).await?;
-        self.require_clean(&subject, true, deadline).await?;
-        if !self
-            .branch_merged_into_base(
-                &subject.source.root,
-                &preparation.requested_branch,
-                preparation.base_ref.as_deref(),
-                deadline,
-            )
-            .await?
-        {
-            return Err(problem(
-                "unmerged",
-                "worktree branch is not merged into its base",
-            ));
-        }
-        self.confirm_subject(preparation, &subject, deadline)
-            .await?;
-        Ok(())
-    }
-
     /// Only prepares ordinary, non-force removal. The manager removes explicitly
     /// allowed scratch after committing `removing`, before calling this method.
     pub(crate) async fn prepare_remove(
@@ -987,181 +865,6 @@ impl WorkspaceGit {
             ));
         }
         Ok(())
-    }
-
-    /// The project's default branch as it is locally. A local default
-    /// branch wins when one exists: the retained base must not track a
-    /// moving remote HEAD or the current checkout. Else the short form of
-    /// `refs/remotes/origin/HEAD` when it resolves to a commit, else HEAD.
-    /// Read-only; a missing or unreadable default is not an error.
-    pub(crate) async fn default_base_ref(&self, root: &Path, deadline: Instant) -> Result<String> {
-        if let Some(local) = self.local_default_branch(root, deadline).await? {
-            return Ok(local);
-        }
-        if let Some(remote) = self.origin_head_short(root, deadline).await? {
-            return Ok(remote);
-        }
-        Ok("HEAD".to_owned())
-    }
-
-    /// The local counterpart of the `origin/HEAD` target when it exists
-    /// locally, else a conventional local default (`main`, then `master`).
-    async fn local_default_branch(&self, root: &Path, deadline: Instant) -> Result<Option<String>> {
-        let mut candidates = Vec::new();
-        if let Some(short) = self.origin_head_short(root, deadline).await?
-            && let Some(local) = short.strip_prefix("origin/")
-            && !local.is_empty()
-            && !candidates.iter().any(|name| name == local)
-        {
-            candidates.push(local.to_owned());
-        }
-        for name in ["main", "master"] {
-            if !candidates.iter().any(|candidate| candidate == name) {
-                candidates.push(name.to_owned());
-            }
-        }
-        for candidate in candidates {
-            if self.branch_oid(root, &candidate, deadline).await?.is_some() {
-                return Ok(Some(candidate));
-            }
-        }
-        Ok(None)
-    }
-
-    /// The current checkout branch when HEAD is attached, else `None`.
-    async fn current_branch_name(&self, root: &Path, deadline: Instant) -> Result<Option<String>> {
-        let output = self
-            .git
-            .workspace_command(
-                root,
-                &["symbolic-ref", "--short", "--quiet", "HEAD"],
-                deadline,
-            )
-            .await?;
-        if output.code == 0
-            && let Ok(name) = std::str::from_utf8(&output.stdout)
-            && let name = name.trim_end_matches(['\r', '\n'])
-            && !name.is_empty()
-            && name != "HEAD"
-            && !name.contains('\0')
-            && !name.starts_with('-')
-        {
-            return Ok(Some(name.to_owned()));
-        }
-        Ok(None)
-    }
-
-    /// The short form of `refs/remotes/origin/HEAD` when it resolves to a
-    /// commit, else `None`.
-    async fn origin_head_short(&self, root: &Path, deadline: Instant) -> Result<Option<String>> {
-        let output = self
-            .git
-            .workspace_command(
-                root,
-                &[
-                    "symbolic-ref",
-                    "--short",
-                    "--quiet",
-                    "refs/remotes/origin/HEAD",
-                ],
-                deadline,
-            )
-            .await?;
-        if output.code == 0
-            && let Ok(name) = std::str::from_utf8(&output.stdout)
-            && let name = name.trim_end_matches(['\r', '\n'])
-            && !name.is_empty()
-            && !name.contains('\0')
-        {
-            let commit = format!("{name}^{{commit}}");
-            if let Ok(oid) = self
-                .read_line(root, &["rev-parse", "--verify", &commit], deadline)
-                .await
-                && is_oid(&oid)
-            {
-                return Ok(Some(name.to_owned()));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Whether `branch` is merged into its base: the branch tip is an
-    /// ancestor of the base tip. The base is the ref retained at admission;
-    /// legacy rows without one resolve the local default, and rows whose
-    /// base cannot be established are an error (kept, never removed).
-    /// Any unreadable identity is an error, never a silent unmerged verdict.
-    pub(crate) async fn branch_merged_into_base(
-        &self,
-        repo_root: &Path,
-        branch: &str,
-        base_ref: Option<&str>,
-        deadline: Instant,
-    ) -> Result<bool> {
-        let tip = self
-            .read_line(
-                repo_root,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--end-of-options",
-                    &branch_ref(branch),
-                ],
-                deadline,
-            )
-            .await?;
-        if !is_oid(&tip) {
-            return Err(problem(
-                "source_integrity",
-                "managed branch tip is not a commit id",
-            ));
-        }
-        let base = match base_ref.filter(|base| !base.is_empty()) {
-            Some(base) => base.to_owned(),
-            None => {
-                let resolved = self.default_base_ref(repo_root, deadline).await?;
-                if resolved == "HEAD" {
-                    return Err(problem(
-                        "unknown",
-                        "managed base cannot be established; the worktree is kept",
-                    ));
-                }
-                resolved
-            }
-        };
-        if base.contains('\0') {
-            return Err(problem("invalid", "managed base reference is malformed"));
-        }
-        let base_tip = self
-            .read_line(
-                repo_root,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--end-of-options",
-                    &format!("{base}^{{commit}}"),
-                ],
-                deadline,
-            )
-            .await?;
-        if !is_oid(&base_tip) {
-            return Err(problem(
-                "source_integrity",
-                "managed base tip is not a commit id",
-            ));
-        }
-        let ancestor = self
-            .git
-            .workspace_command(
-                repo_root,
-                &["merge-base", "--is-ancestor", &tip, &base_tip],
-                deadline,
-            )
-            .await?;
-        match ancestor.code {
-            0 => Ok(true),
-            1 => Ok(false),
-            _ => Err(problem("unknown", "branch merge check did not complete")),
-        }
     }
 
     async fn validate_branch(&self, root: &Path, branch: &str, deadline: Instant) -> Result<()> {
@@ -1691,7 +1394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn freeze_resolves_namespace_conflicts_and_retains_the_local_base() {
+    async fn freeze_resolves_namespace_conflicts() {
         let fixture = WorkspaceGit::new().expect("resolve installed Git");
         let root = TestRoot::new("naming-gate");
         init_repo(&root.0);
@@ -1726,12 +1429,11 @@ mod tests {
             "already_exists"
         );
         git(&root.0, &["branch", "-D", "topic/sub"]);
-        // A free branch freezes with the local default retained as the base.
+        // A free branch freezes with the requested branch.
         let frozen = fixture
             .freeze(&repo, "atlas/a9-task", None, &target("pending-free"))
             .await
             .expect("free branch freezes");
-        assert_eq!(frozen.base_ref, "main");
         assert_eq!(frozen.requested_branch, "atlas/a9-task");
     }
 

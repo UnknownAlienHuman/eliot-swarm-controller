@@ -2,6 +2,14 @@
 use super::*;
 use eliot_core::api::SwitchRequest;
 
+/// Whether a switch keeps its source checkout: it requests neither a
+/// workspace override nor a new branch. Reuse is selected before any
+/// preparation so the automatic worktree policy never mints (or fails to
+/// mint) a fresh worktree the replacement would drop anyway.
+fn reuse_source_checkout(launch: &eliot_core::api::SwitchLaunch) -> bool {
+    launch.workspace.is_none() && launch.worktree.is_none()
+}
+
 /// Whether a switch with no workspace override reuses the retained
 /// checkout: a freshly prepared worktree would leave the source's
 /// uncommitted edits behind in the old directory. Only an automatically
@@ -88,6 +96,11 @@ impl Router {
                 })?;
             launch.args = request.launch.args(workspace)?;
             let scope = source.project_scope();
+            // A switch that requests neither a workspace nor a branch keeps
+            // the source checkout: reuse is selected before any preparation.
+            if reuse_source_checkout(&request.launch) {
+                launch.args["switch_reuse_source_checkout"] = json!(true);
+            }
             let mut prepared = self
                 .prepare_submission_after_authorization(launch, &Principal::Owner, false, false)
                 .await?;
@@ -196,6 +209,33 @@ mod tests {
             frozen_setup: Vec::new(),
             generated,
         }
+    }
+
+    #[test]
+    fn switch_without_a_workspace_or_branch_request_reuses_before_preparation() {
+        let bare = eliot_core::api::SwitchLaunch {
+            profile: Some("worker".to_owned()),
+            harness: None,
+            model: None,
+            effort: None,
+            auth: None,
+            cmd: None,
+            access: None,
+            workspace: None,
+            worktree: None,
+            base: None,
+        };
+        assert!(reuse_source_checkout(&bare));
+        let branched = eliot_core::api::SwitchLaunch {
+            worktree: Some("feature/manual".to_owned()),
+            ..bare.clone()
+        };
+        assert!(!reuse_source_checkout(&branched));
+        let moved = eliot_core::api::SwitchLaunch {
+            workspace: Some("/elsewhere".to_owned()),
+            ..bare.clone()
+        };
+        assert!(!reuse_source_checkout(&moved));
     }
 
     #[test]
