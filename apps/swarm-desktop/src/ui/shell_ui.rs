@@ -1784,7 +1784,10 @@ impl DesktopApp {
                 .automation_name(format!("Remove missing {kind} {name}"))
                 .on_click(context.message(Message::Bulk(BulkMsg::Start(
                     super::bulk_ui::BulkOp::RemoveProjects,
-                    super::bulk_ui::Pick::Missing(registered.unwrap_or_default()),
+                    super::bulk_ui::Pick::Missing {
+                        project: registered.unwrap_or_default(),
+                        checkout: place.checkout.to_owned(),
+                    },
                     name.to_owned(),
                 ))))
                 .content(m3::icon(m3::glyph::DELETE))
