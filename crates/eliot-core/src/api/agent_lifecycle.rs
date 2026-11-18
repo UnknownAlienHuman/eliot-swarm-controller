@@ -24,6 +24,19 @@ pub enum ArchivedFilter {
     Include,
 }
 
+/// Explicit `agent.list` order: `id` is the stable Agent-ID order every
+/// existing caller reads, `recent` is newest activity first (last progress
+/// or update, then ID descending) for human surfaces.
+#[derive(
+    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentListOrder {
+    #[default]
+    Id,
+    Recent,
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentArchiveRequest {

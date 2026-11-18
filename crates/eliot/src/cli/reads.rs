@@ -788,12 +788,18 @@ pub(crate) fn list_params(
             })
         })
         .transpose()?;
+    let order = match filter.order.as_str() {
+        "recent" => eliot_core::api::AgentListOrder::Recent,
+        "id" => eliot_core::api::AgentListOrder::Id,
+        _ => return Err(Failure::new(2, "order must be recent or id")),
+    };
     Ok(AgentListRequest {
         archived: serde_json::from_value(Value::String(filter.archived))
             .map_err(|_| Failure::new(2, "invalid archived filter"))?,
         after,
         limit,
         observations,
+        order,
         state,
         states: None,
         project: filter.project,
@@ -1324,7 +1330,7 @@ mod tests {
     fn list_params_rejects_unknown_state_before_any_call() {
         let filter = |state: Option<&str>| ListFilterArgs {
             archived: "exclude".to_owned(),
-
+            order: "recent".to_owned(),
             state: state.map(str::to_owned),
             project: None,
             harness: None,

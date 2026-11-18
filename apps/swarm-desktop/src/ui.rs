@@ -46,8 +46,9 @@ use std::sync::{Arc, Mutex};
 
 use eliot_core::Command;
 use eliot_core::api::{
-    AgentGetResponse, AgentListRequest, CommandSubmitResponse, ProfileListResponse, ProfileSummary,
-    ReparentResponse, RuleListEntry, ScriptListResponse, ScriptReadResponse, ScriptSaveResponse,
+    AgentGetResponse, AgentListOrder, AgentListRequest, CommandSubmitResponse, ProfileListResponse,
+    ProfileSummary, ReparentResponse, RuleListEntry, ScriptListResponse, ScriptReadResponse,
+    ScriptSaveResponse,
 };
 use windows_reactor::*;
 

@@ -311,10 +311,34 @@ impl DesktopApp {
                 }
                 self.nav.agents_loading = false;
                 match page {
-                    Ok(page) => {
+                    Ok(mut page) => {
                         if append {
+                            let seen: std::collections::HashSet<&str> = self
+                                .nav
+                                .agents
+                                .iter()
+                                .map(|agent| agent.id.as_str())
+                                .collect();
+                            page.rows.retain(|agent| !seen.contains(agent.id.as_str()));
                             self.nav.agents.extend(page.rows);
                         } else {
+                            // The open Agent stays on the first screen even when it
+                            // aged out of the newest page: keep its last known row
+                            // at the top until a later read returns it fresh.
+                            // Busy, waiting, starting and needs-attention rows sort
+                            // first by recency, so the newest page already carries
+                            // them; only the selected row needs pinning.
+                            if let Some(selected) = self.nav.selection.agent.clone()
+                                && !page.rows.iter().any(|agent| agent.id == selected)
+                                && let Some(known) = self
+                                    .nav
+                                    .agents
+                                    .iter()
+                                    .find(|agent| agent.id == selected)
+                                    .cloned()
+                            {
+                                page.rows.insert(0, known);
+                            }
                             self.nav.agents = page.rows;
                         }
                         self.nav.agents_next = page.next;
@@ -1100,6 +1124,7 @@ impl DesktopApp {
         let request = AgentListRequest {
             limit: AGENT_PAGE,
             parent: Some(id.to_owned()),
+            order: AgentListOrder::Recent,
             ..Default::default()
         };
         let (epoch, id) = (self.nav.tree_epoch, id.to_owned());
@@ -1123,6 +1148,7 @@ impl DesktopApp {
         let request = AgentListRequest {
             after,
             limit: AGENT_PAGE,
+            order: AgentListOrder::Recent,
             ..Default::default()
         };
         self.nav.agents_loading = true;
