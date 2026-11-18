@@ -345,6 +345,9 @@ struct DesktopApp {
     menu: menu_ui::MenuState,
     /// The open bulk action (remove projects, archive or delete tasks).
     bulk: Option<bulk_ui::BulkDialog>,
+    /// Dialog epochs handed out by [`Self::start_bulk`]: each dialog's
+    /// replies carry the epoch of the dialog that started them (#682).
+    bulk_seq: u64,
     missing_cleanup: HashMap<String, bulk_ui::MissingCleanup>,
     /// The path whose last open in Explorer failed, and why (shown under
     /// that path's row).
@@ -720,6 +723,7 @@ impl Component for DesktopApp {
             automation: automation_ui::AutomationState::default(),
             menu: menu_ui::MenuState::default(),
             bulk: None,
+            bulk_seq: 0,
             missing_cleanup: HashMap::new(),
             revealed: None,
         };
