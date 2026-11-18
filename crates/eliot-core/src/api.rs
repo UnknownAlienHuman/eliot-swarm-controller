@@ -139,7 +139,8 @@ pub use organization::{
     ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
     ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, MAX_ORG_AGENTS,
     MAX_ORG_MEMBERS_PER_GROUP, MAX_ORG_MEMBERS_TOTAL, MAX_ORG_TAG_BYTES, MAX_ORG_TAGS,
-    OrgGroupView, OrgLinkView, OrgMemberView,
+    ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgLinkView, OrgMemberView, OrgRowChange,
+    OrganizationChangedEvent,
 };
 pub use overview::{
     FleetTotals, HarnessCount, LifecycleTotals, NativeChildView, OverviewCoverage,

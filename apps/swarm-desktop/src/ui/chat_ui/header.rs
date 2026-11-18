@@ -47,6 +47,7 @@ impl DesktopApp {
                         pending: false,
                         organization: None,
                         tags: Vec::new(),
+                        organization_revision: None,
                     })
                 });
                 if let Some(mut agent) = agent {

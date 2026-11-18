@@ -29,8 +29,8 @@
 use std::collections::{HashMap, HashSet};
 
 use eliot_core::api::{
-    AgentSummary, LaunchIntentState, LaunchQueueView, LaunchWaitReason, OrgGroupView,
-    ProjectAssignmentState, ProjectManagerIdentity, ProjectOverviewEntry,
+    AgentSummary, LaunchIntentState, LaunchQueueView, LaunchWaitReason, OrgGroupView, OrgRowChange,
+    ProjectAssignmentState, ProjectManagerIdentity,
 };
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
@@ -77,6 +77,9 @@ pub struct UiAgent {
     pub organization: Option<String>,
     /// Organization tags (`chat.tag`).
     pub tags: Vec<String>,
+    /// The overlay link revision the row's placement and tags were read
+    /// with (`None` for no overlay row); a menu write carries it back.
+    pub organization_revision: Option<i64>,
 }
 
 impl UiAgent {
@@ -102,6 +105,7 @@ impl UiAgent {
             pending: false,
             organization: summary.organization.clone(),
             tags: summary.tags.clone(),
+            organization_revision: summary.organization_revision,
         }
     }
 
@@ -499,25 +503,37 @@ pub fn subproject_key(label: &str, checkouts: &[Checkout]) -> Option<String> {
 }
 
 /// The organization readbacks the sidebar shows, as the daemon returned
-/// them: groups from `chat.organization`, exact team totals from
-/// `project.overview`, and waits from `launch.queue`. A failed read keeps
-/// its error line; nothing here is regrouped or recounted.
+/// them: groups with their headers and exact totals from
+/// `chat.organization`, and waits from `launch.queue`. A failed read keeps
+/// the last server grouping with a stale marker; nothing here is regrouped
+/// or recounted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Organization {
     pub groups: Vec<OrgGroupView>,
-    pub overview: Vec<ProjectOverviewEntry>,
     pub queue: Option<LaunchQueueView>,
     /// The current state of the intents this window queued
     /// (`launch.intent.get`), so an admission or refusal is reported.
     pub intents: Vec<eliot_core::api::LaunchIntentView>,
+    /// Watched intents the daemon does not know (`not_found`): an
+    /// unconfirmed Queue it that never committed.
+    pub missing_intents: Vec<String>,
+    /// The grouping read's error lines (the stale marker among them).
     pub errors: Vec<String>,
+    /// The queue read's error lines, replaced on every queue read.
+    pub queue_errors: Vec<String>,
+    /// The grouping read failed: headers show the last server grouping
+    /// with a stale indicator, never a synthesized one.
+    pub stale: bool,
+    /// The exclusive `organization.changed` cursor: rows committed after
+    /// it refresh the loaded Agents by id. Starts at the first projection
+    /// read's event watermark.
+    pub changes_after: Option<i64>,
+    /// The `organization.changed` rows the last read returned, applied to
+    /// the loaded Agents once ([`apply_changes`]).
+    pub changes: Vec<OrgRowChange>,
 }
 
 impl Organization {
-    fn overview_of(&self, project: &str) -> Option<&ProjectOverviewEntry> {
-        self.overview.iter().find(|entry| entry.project == project)
-    }
-
     /// The retained registered projects, in the daemon's order: where a
     /// chat can be attached.
     pub fn registered(&self) -> impl Iterator<Item = &OrgGroupView> {
@@ -558,8 +574,8 @@ pub struct Section {
     pub waits: Vec<String>,
     /// Visible task rows, newest work first.
     pub rows: Vec<Row>,
-    /// Working now by the server's team totals (busy and starting); 0
-    /// without a team readback.
+    /// Busy now by the server's team totals, as returned; 0 without a
+    /// team readback.
     pub running: usize,
     /// Whether the project is collapsed (it then has no rows).
     pub collapsed: bool,
@@ -670,14 +686,10 @@ const ROOTS_NAMED: usize = 3;
 /// manager with its state and standard worktree branch, a remote manager,
 /// "Needs assignment" or "No manager", plus a starting or blocked
 /// assignment and an open transfer), the competing roots, and the exact
-/// totals (`member_total` from `chat.organization`; live, working,
-/// waiting, queued, unknown and the project slot use from
-/// `project.overview`).
-pub fn group_detail(
-    group: &OrgGroupView,
-    overview: Option<&ProjectOverviewEntry>,
-    checkouts: &[Checkout],
-) -> Vec<String> {
+/// totals of the same `chat.organization` group: its member total, each
+/// lifecycle count under its own word as returned, queued, unknown and the
+/// project slot use.
+pub fn group_detail(group: &OrgGroupView, checkouts: &[Checkout]) -> Vec<String> {
     let mut lines = Vec::new();
     if group.registration.is_some() {
         let assignment = group.assignment.as_ref();
@@ -692,8 +704,8 @@ pub fn group_detail(
                     .workspace
                     .as_deref()
                     .or_else(|| assignment.and_then(|a| a.workspace.as_deref()));
-                if let Some(place) =
-                    workspace.map(|path| worktree_branch(path, overview, checkouts))
+                if let Some(place) = workspace
+                    .map(|path| worktree_branch(path, manager.branch.as_deref(), checkouts))
                 {
                     line.push_str(" · ");
                     line.push_str(&place);
@@ -743,22 +755,27 @@ pub fn group_detail(
         "task",
         "tasks",
     )];
-    if let Some(entry) = overview {
-        let lifecycle = &entry.totals.lifecycle;
+    if let Some(team) = &group.totals {
+        let lifecycle = &team.lifecycle;
         for (count, words) in [
-            (entry.totals.live, "live"),
-            (lifecycle.busy + lifecycle.starting, "working"),
+            (team.live, "live"),
+            (lifecycle.idle, "idle"),
+            (lifecycle.busy, "busy"),
             (lifecycle.waiting, "waiting"),
-            (entry.totals.queued, "queued"),
-            (entry.totals.retained_unknown, "unknown"),
+            (lifecycle.starting, "starting"),
+            (lifecycle.stopping, "stopping"),
+            (team.queued, "queued"),
+            (team.retained_unknown, "unknown"),
         ] {
             if count > 0 {
                 totals.push(format!("{count} {words}"));
             }
         }
-        if let Some(limit) = entry.capacity.first().and_then(|scope| scope.limit) {
-            totals.push(format!("{}/{limit} slots", entry.capacity[0].usage));
-        }
+    }
+    if let Some(capacity) = &group.capacity
+        && let Some(limit) = capacity.limit
+    {
+        totals.push(format!("{}/{limit} slots", capacity.usage));
     }
     let totals = totals.join(" · ");
     // A vacant project with no roots says so on one line.
@@ -773,22 +790,12 @@ pub fn group_detail(
 const NO_MANAGER: &str = "No manager";
 
 /// A manager workspace as the header names it: the branch of its managed
-/// worktree (`project.overview` workspaces), else of its verified checkout
-/// (`project.list`), else its folder.
-fn worktree_branch(
-    workspace: &str,
-    overview: Option<&ProjectOverviewEntry>,
-    checkouts: &[Checkout],
-) -> String {
+/// worktree (the manager readback's `branch`), else of its verified
+/// checkout (`project.list`), else its folder.
+fn worktree_branch(workspace: &str, branch: Option<&str>, checkouts: &[Checkout]) -> String {
     let path = path_key(workspace);
-    overview
-        .and_then(|entry| {
-            entry
-                .workspaces
-                .iter()
-                .find(|row| path_key(&row.worktree_path) == path)
-                .map(|row| row.branch.clone())
-        })
+    branch
+        .map(str::to_owned)
         .or_else(|| {
             checkouts
                 .iter()
@@ -798,35 +805,65 @@ fn worktree_branch(
         .unwrap_or_else(|| folder_name(workspace).to_owned())
 }
 
-/// The waits of one group, from `launch.queue`: queued interactive launches
-/// and automation assignment waits with the wait reason and who can change
-/// it. A project group shows its own; the no-project bucket shows chats and
-/// launches of unregistered folders.
+/// The waits of one group, from `launch.queue` plus this window's watched
+/// intents: queued interactive launches and automation assignment waits
+/// with the wait reason and who can change it. A watched intent's reason
+/// renders even beyond the first queue page. A project group shows its
+/// own; the no-project bucket shows chats and launches of unregistered
+/// folders.
 pub fn waits(
     queue: Option<&LaunchQueueView>,
+    intents: &[eliot_core::api::LaunchIntentView],
     project: Option<&str>,
     registered: &HashSet<&str>,
 ) -> Vec<String> {
-    let Some(queue) = queue else {
-        return Vec::new();
-    };
     let here = |candidate: &str| match project {
         Some(project) => candidate == project,
         None => !registered.contains(candidate),
     };
     let mut lines: Vec<String> = queue
-        .interactive
-        .iter()
-        .filter(|intent| intent.state == LaunchIntentState::Queued && here(&intent.project))
-        .map(|intent| match &intent.reason {
-            Some(reason) => format!("Queued launch: {}", wait_reason_words(reason)),
-            None => "Queued launch: waiting for its turn".to_owned(),
+        .map(|queue| {
+            queue
+                .interactive
+                .iter()
+                .filter(|intent| intent.state == LaunchIntentState::Queued && here(&intent.project))
+                .map(|intent| match &intent.reason {
+                    Some(reason) => format!("Queued launch: {}", wait_reason_words(reason)),
+                    None => "Queued launch: waiting for its turn".to_owned(),
+                })
+                .collect::<Vec<_>>()
         })
-        .collect();
+        .unwrap_or_default();
+    let seen: HashSet<&str> = queue
+        .map(|queue| {
+            queue
+                .interactive
+                .iter()
+                .map(|intent| intent.id.as_str())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    // Watched intents this window queued: their wait reason shows even
+    // when the queue page carrying them was never read.
+    lines.extend(
+        intents
+            .iter()
+            .filter(|intent| {
+                intent.state == LaunchIntentState::Queued
+                    && here(&intent.project)
+                    && !seen.contains(intent.id.as_str())
+            })
+            .map(|intent| match &intent.reason {
+                Some(reason) => {
+                    format!("Queued launch {}: {}", intent.id, wait_reason_words(reason))
+                }
+                None => format!("Queued launch {}: waiting for its turn", intent.id),
+            }),
+    );
     lines.extend(
         queue
-            .assignments
-            .iter()
+            .into_iter()
+            .flat_map(|queue| &queue.assignments)
             .filter(|wait| here(&wait.project))
             .map(|wait| {
                 format!(
@@ -871,9 +908,11 @@ pub fn wait_reason_words(reason: &LaunchWaitReason) -> String {
 /// The sidebar's projects: the `chat.organization` groups in the daemon's
 /// order (registered projects, even with no row yet; an unregistered label
 /// or the no-project bucket only with members), each with the listed rows
-/// the daemon placed in it. A row whose group this read did not return
-/// lists under that group anyway, before the bucket. Nothing is grouped by
-/// path, repository or name here.
+/// the daemon placed in it. Empty linked worktree registrations sort below
+/// the populated projects and stay selectable. A row whose group a fresh
+/// read did not return lists under that group anyway, before the bucket;
+/// on a stale read nothing is synthesized and such rows list in the
+/// bucket. Nothing is grouped by path, repository or name here.
 pub fn sections(
     listed: &[UiAgent],
     organization: &Organization,
@@ -886,10 +925,9 @@ pub fn sections(
         .collect();
     let section = |project: Option<&str>, group: Option<&OrgGroupView>| {
         let (name, checkout, missing) = group_place(project, group, checkouts);
-        let overview = project.and_then(|project| organization.overview_of(project));
-        let running = overview.map_or(0, |entry| {
-            entry.totals.lifecycle.busy + entry.totals.lifecycle.starting
-        });
+        let running = group
+            .and_then(|group| group.totals.as_ref())
+            .map_or(0, |team| team.lifecycle.busy);
         Section {
             key: group_key(project),
             project: project.map(str::to_owned),
@@ -900,8 +938,13 @@ pub fn sections(
                 vec![checkout.clone()]
             },
             checkout,
-            detail: group.map_or_else(Vec::new, |group| group_detail(group, overview, checkouts)),
-            waits: waits(organization.queue.as_ref(), project, &registered),
+            detail: group.map_or_else(Vec::new, |group| group_detail(group, checkouts)),
+            waits: waits(
+                organization.queue.as_ref(),
+                &organization.intents,
+                project,
+                &registered,
+            ),
             rows: Vec::new(),
             running,
             collapsed: false,
@@ -922,18 +965,37 @@ pub fn sections(
             top: Vec::new(),
         });
     }
-    let placements: HashMap<&str, String> = listed
+    let mut placements: HashMap<&str, String> = listed
         .iter()
         .map(|agent| (agent.id.as_str(), group_key(agent.organization.as_deref())))
         .collect();
-    for agent in listed.iter().filter(|agent| !agent.native_child) {
-        let key = &placements[agent.id.as_str()];
-        if !groups.iter().any(|group| group.section.key == *key) {
+    // On a stale read nothing is synthesized: rows whose group the last
+    // server grouping did not return list in the bucket instead.
+    let stale = organization.stale;
+    if stale {
+        if !groups.iter().any(|group| group.section.project.is_none()) {
             groups.push(Group {
-                section: section(agent.organization.as_deref(), None),
+                section: section(None, None),
                 members: 0,
                 top: Vec::new(),
             });
+        }
+        let bucket = group_key(None);
+        for key in placements.values_mut() {
+            if !groups.iter().any(|group| group.section.key == *key) {
+                *key = bucket.clone();
+            }
+        }
+    } else {
+        for agent in listed.iter().filter(|agent| !agent.native_child) {
+            let key = &placements[agent.id.as_str()];
+            if !groups.iter().any(|group| group.section.key == *key) {
+                groups.push(Group {
+                    section: section(agent.organization.as_deref(), None),
+                    members: 0,
+                    top: Vec::new(),
+                });
+            }
         }
     }
     // The daemon leaves an empty bucket out; its queued launches still show.
@@ -947,8 +1009,24 @@ pub fn sections(
             });
         }
     }
-    // The no-project bucket closes the list, as the daemon orders it.
-    groups.sort_by_key(|group| group.section.project.is_none());
+    // Empty linked worktree registrations sort below the populated
+    // projects (and any group with listed rows); the no-project bucket
+    // closes the list, as the daemon orders it.
+    let empty_registration = |key: &str, project: Option<&str>| {
+        project.is_some_and(|_| {
+            organization
+                .groups
+                .iter()
+                .find(|group| group_key(group.project.as_deref()) == key)
+                .is_some_and(|group| group.registration.is_some() && group.member_total == 0)
+        })
+    };
+    groups.sort_by_key(|group| {
+        (
+            group.section.project.is_none(),
+            empty_registration(&group.section.key, group.section.project.as_deref()),
+        )
+    });
     for agent in listed {
         let key = &placements[agent.id.as_str()];
         let Some(group) = groups.iter_mut().find(|group| group.section.key == *key) else {
@@ -1016,6 +1094,40 @@ pub fn sections(
         out.push(group.section);
     }
     out
+}
+
+/// Apply `organization.changed` rows to the loaded Agents (the list and
+/// expanded branches) by id: a retag, attach or detach refreshes a loaded
+/// row even when it sits beyond the recent and attention pages. A row
+/// already read at the same or a newer link revision stays as it is.
+/// Returns how many rows changed.
+pub fn apply_changes(
+    agents: &mut [UiAgent],
+    branches: &mut HashMap<String, Branch>,
+    changes: &[OrgRowChange],
+) -> usize {
+    let mut changed = 0;
+    let mut merge = |agent: &mut UiAgent| {
+        for change in changes.iter().filter(|change| change.agent == agent.id) {
+            if agent.organization_revision.unwrap_or(0) < change.revision {
+                agent.organization = change.organization.clone();
+                agent.tags = change.tags.clone();
+                agent.organization_revision = Some(change.revision);
+                changed += 1;
+            }
+        }
+    };
+    for agent in agents.iter_mut() {
+        merge(agent);
+    }
+    for branch in branches.values_mut() {
+        if let Branch::Loaded { children, .. } = branch {
+            for agent in children.iter_mut() {
+                merge(agent);
+            }
+        }
+    }
+    changed
 }
 
 /// Tasks using a project registration: `(live, all)`, top-level or not.
@@ -1179,11 +1291,14 @@ pub fn sidebar_recents<'a>(
     })
 }
 
-/// Tags typed as one comma-separated line, trimmed, empty ones dropped;
-/// the daemon validates the rest (`chat.tag`).
-pub fn parse_tags(text: &str) -> Vec<String> {
-    text.split(',')
-        .map(str::trim)
+/// The tag editor's fields as the tag set, one tag per field: each field
+/// trimmed and blank ones dropped, nothing split, so an existing tag such
+/// as `ops, EU` saves back unchanged. The daemon validates the rest
+/// (`chat.tag`).
+pub fn field_tags(fields: &[String]) -> Vec<String> {
+    fields
+        .iter()
+        .map(|field| field.trim())
         .filter(|tag| !tag.is_empty())
         .map(str::to_owned)
         .collect()
@@ -1563,6 +1678,7 @@ mod tests {
             pending: false,
             organization: None,
             tags: Vec::new(),
+            organization_revision: None,
         }
     }
 
@@ -1962,8 +2078,7 @@ mod tests {
         }
         let mut view = View {
             organization: Organization {
-                groups: vec![group("app", 3)],
-                overview: vec![overview("app", 2, 1)],
+                groups: vec![with_totals(group("app", 3), 2, 1)],
                 ..Organization::default()
             },
             ..View::default()
@@ -1974,8 +2089,9 @@ mod tests {
         let section = &view.sections(&listed, &[])[0];
         assert!(section.collapsed);
         assert!(section.rows.is_empty());
-        // busy + starting from `project.overview`, not the listed rows.
-        assert_eq!(section.running, 3);
+        // The group's busy count as the server returned it, not the
+        // listed rows and not busy plus starting.
+        assert_eq!(section.running, 2);
     }
 
     #[test]
@@ -2253,6 +2369,8 @@ mod tests {
             members: Vec::new(),
             member_total: members,
             members_truncated: false,
+            totals: None,
+            capacity: None,
         }
     }
 
@@ -2268,34 +2386,23 @@ mod tests {
             members: Vec::new(),
             member_total: members,
             members_truncated: false,
+            totals: None,
+            capacity: None,
         }
     }
 
-    fn overview(project: &str, busy: usize, starting: usize) -> ProjectOverviewEntry {
-        ProjectOverviewEntry {
-            project: project.to_owned(),
-            detail: true,
-            manager: None,
-            assignment: None,
-            native_child_total: 0,
-            workers: Vec::new(),
-            worker_total: 0,
-            workers_truncated: false,
-            workspaces: Vec::new(),
-            workspace_total: 0,
-            workspaces_truncated: false,
-            queue: 0,
-            totals: eliot_core::api::ProjectTotals {
+    fn with_totals(mut group: OrgGroupView, busy: usize, starting: usize) -> OrgGroupView {
+        group.totals = Some(eliot_core::api::ProjectTotals {
+            live: busy,
+            lifecycle: eliot_core::api::LifecycleTotals {
                 live: busy,
-                lifecycle: eliot_core::api::LifecycleTotals {
-                    busy,
-                    starting,
-                    ..Default::default()
-                },
+                busy,
+                starting,
                 ..Default::default()
             },
-            capacity: Vec::new(),
-        }
+            ..Default::default()
+        });
+        group
     }
 
     #[test]
@@ -2328,18 +2435,45 @@ mod tests {
         };
         let sections = view.sections(&listed, &[]);
         let keys: Vec<&str> = sections.iter().map(|s| s.key.as_str()).collect();
+        // The empty linked registration sorts below the groups with rows;
+        // the bucket closes the list.
         assert_eq!(
             keys,
-            ["org:alpha", "org:beta", "org:gamma", OTHER_LOCATIONS]
+            ["org:alpha", "org:gamma", "org:beta", OTHER_LOCATIONS]
         );
         assert_eq!(ids(&sections[0]), [("a1", 0), ("a2", 0)]);
-        assert!(sections[1].rows.is_empty());
-        assert_eq!(ids(&sections[2]), [("a5", 0)]);
+        assert_eq!(ids(&sections[1]), [("a5", 0)]);
+        assert!(sections[2].rows.is_empty());
+        assert_eq!(sections[2].name, "beta");
         assert_eq!(ids(&sections[3]), [("a3", 0), ("a4", 0)]);
         assert_eq!(sections[3].name, "No project");
         // Exact server totals, not the listed rows.
         assert_eq!(sections[0].detail, ["No manager · 2 tasks"]);
         assert_eq!(sections[3].detail, ["2 tasks"]);
+    }
+
+    #[test]
+    fn stale_grouping_synthesizes_nothing_and_routes_rows_to_the_bucket() {
+        let organization = Organization {
+            groups: vec![group("alpha", 2)],
+            stale: true,
+            ..Organization::default()
+        };
+        let mut placed = with(agent("a2", "alpha", None), "idle", 20);
+        placed.organization = Some("alpha".to_owned());
+        // A row of a group the last server grouping did not return lists
+        // in the bucket, never under a synthesized header.
+        let mut unknown = with(agent("a5", "gamma", None), "idle", 1);
+        unknown.organization = Some("gamma".to_owned());
+        let listed = vec![placed, unknown];
+        let view = View {
+            organization,
+            ..View::default()
+        };
+        let sections = view.sections(&listed, &[]);
+        let keys: Vec<&str> = sections.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(keys, ["org:alpha", OTHER_LOCATIONS]);
+        assert_eq!(ids(&sections[1]), [("a5", 0)]);
     }
 
     #[test]
@@ -2356,36 +2490,23 @@ mod tests {
             state: AgentState::Busy,
             assignment_revision: 2,
             workspace: Some("/wt/app-k1".to_owned()),
+            branch: Some("feat/k1-standard".to_owned()),
         });
         team.transfer = Some("01JTRANSFER".to_owned());
-        let mut entry = overview("app", 2, 0);
-        entry.totals.queued = 1;
-        entry.workspaces = vec![eliot_core::api::ManagedWorkspaceView {
-            agent: "a10".to_owned(),
-            project: "app".to_owned(),
-            repo_path: "/src/app".to_owned(),
-            branch: "feat/k1-standard".to_owned(),
-            worktree_path: "/wt/app-k1".to_owned(),
-            phase: eliot_core::WorkspacePhase::Ready,
-            updated_at: 0,
-        }];
-        entry.capacity = vec![
-            eliot_core::api::ScopeUsage {
-                scope: "project:app".to_owned(),
-                usage: 2,
-                limit: Some(4),
-            },
-            eliot_core::api::ScopeUsage {
-                scope: "manager_assignment:app".to_owned(),
-                usage: 2,
-                limit: None,
-            },
-        ];
+        let mut team = with_totals(team, 2, 1);
+        team.totals.as_mut().unwrap().queued = 1;
+        team.capacity = Some(eliot_core::api::ScopeUsage {
+            scope: "project:app".to_owned(),
+            usage: 2,
+            limit: Some(4),
+        });
+        // Every lifecycle count under its own word, as the server returned
+        // it: busy and starting are never added together.
         assert_eq!(
-            group_detail(&team, Some(&entry), &[]),
+            group_detail(&team, &[]),
             [
                 "Manager a10 · busy · feat/k1-standard · transfer in progress",
-                "7 tasks · 2 live · 2 working · 1 queued · 2/4 slots",
+                "7 tasks · 2 live · 2 busy · 1 starting · 1 queued · 2/4 slots",
             ]
         );
         // No manager and several roots: shown plainly, never auto-assigned.
@@ -2393,7 +2514,7 @@ mod tests {
         vacant.needs_assignment = true;
         vacant.conflicting_roots = ["a2", "a3", "a4", "a5"].map(str::to_owned).to_vec();
         assert_eq!(
-            group_detail(&vacant, None, &[]),
+            group_detail(&vacant, &[]),
             [
                 "Needs assignment",
                 "Competing roots: a2, a3, a4 +1",
@@ -2403,7 +2524,7 @@ mod tests {
         vacant.assignment.as_mut().unwrap().state = ProjectAssignmentState::Blocked;
         vacant.conflicting_roots.truncate(1);
         assert_eq!(
-            group_detail(&vacant, None, &[])[..2],
+            group_detail(&vacant, &[])[..2],
             ["Needs assignment · blocked", "Competing root: a2"]
         );
     }
@@ -2447,7 +2568,7 @@ mod tests {
         };
         let registered: HashSet<&str> = ["app"].into_iter().collect();
         assert_eq!(
-            waits(Some(&queue), Some("app"), &registered),
+            waits(Some(&queue), &[], Some("app"), &registered),
             [
                 "Queued launch: Swarm capacity is full; the Owner can change the limit",
                 "Automation nightly waits: the manager budget is full; the Owner or the \
@@ -2455,8 +2576,29 @@ mod tests {
             ]
         );
         assert_eq!(
-            waits(Some(&queue), None, &registered),
+            waits(Some(&queue), &[], None, &registered),
             ["Queued launch: waiting for its turn"]
+        );
+        // A watched intent's reason renders even when no queue page
+        // carries it; one already in the queue page renders once.
+        let watched = vec![
+            intent(
+                "i9",
+                "app",
+                LaunchIntentState::Queued,
+                Some(reason("transfer_in_progress", "project:app", "owner")),
+            ),
+            intent("i1", "app", LaunchIntentState::Queued, None),
+        ];
+        assert_eq!(
+            waits(Some(&queue), &watched, Some("app"), &registered),
+            [
+                "Queued launch: Swarm capacity is full; the Owner can change the limit",
+                "Queued launch i9: a project transfer is in progress; the Owner can \
+                 change this",
+                "Automation nightly waits: the manager budget is full; the Owner or the \
+                 project manager can change the limit",
+            ]
         );
         // The daemon omits an empty bucket; its queued launch still lists.
         let view = View {
@@ -2478,9 +2620,70 @@ mod tests {
     }
 
     #[test]
-    fn tags_are_trimmed_and_empty_ones_dropped() {
-        assert_eq!(parse_tags(" inbox, k175 ,, "), ["inbox", "k175"]);
-        assert!(parse_tags(" , ").is_empty());
+    fn tag_fields_round_trip_one_tag_each() {
+        // A CLI tag with a comma stays one tag when saved unedited.
+        let fields = ["ops, EU".to_owned(), "inbox".to_owned()];
+        assert_eq!(field_tags(&fields), ["ops, EU", "inbox"]);
+        // Blank fields drop and each field is trimmed.
+        let typed = [" k175 ".to_owned(), "  ".to_owned(), String::new()];
+        assert_eq!(field_tags(&typed), ["k175"]);
+    }
+
+    #[test]
+    fn organization_changes_refresh_loaded_rows_by_id() {
+        // An older stopped row loaded long ago, and a branch child.
+        let mut old = with(agent("a3", "", None), "stopped", 1);
+        old.organization = Some("alpha".to_owned());
+        old.tags = vec!["inbox".to_owned()];
+        old.organization_revision = Some(2);
+        let mut agents = vec![old];
+        let mut branches = HashMap::new();
+        branches.insert(
+            "a1".to_owned(),
+            Branch::Loaded {
+                children: vec![with(agent("a4", "", Some("a1")), "idle", 1)],
+                more: false,
+            },
+        );
+        let changes = vec![
+            // A retag of a3 at a newer revision applies.
+            OrgRowChange {
+                agent: "a3".to_owned(),
+                organization: Some("alpha".to_owned()),
+                tags: vec!["ops, EU".to_owned()],
+                revision: 3,
+            },
+            // a4 had no overlay row: its first attach applies.
+            OrgRowChange {
+                agent: "a4".to_owned(),
+                organization: Some("beta".to_owned()),
+                tags: Vec::new(),
+                revision: 1,
+            },
+            // A row nobody loaded changes nothing.
+            OrgRowChange {
+                agent: "a9".to_owned(),
+                organization: None,
+                tags: Vec::new(),
+                revision: 1,
+            },
+        ];
+        assert_eq!(apply_changes(&mut agents, &mut branches, &changes), 2);
+        assert_eq!(agents[0].tags, ["ops, EU"]);
+        assert_eq!(agents[0].organization_revision, Some(3));
+        let Some(Branch::Loaded { children, .. }) = branches.get("a1") else {
+            panic!("loaded branch");
+        };
+        assert_eq!(children[0].organization.as_deref(), Some("beta"));
+        // Replaying the same rows (or older ones) changes nothing.
+        assert_eq!(apply_changes(&mut agents, &mut branches, &changes), 0);
+        let older = [OrgRowChange {
+            revision: 2,
+            tags: Vec::new(),
+            ..changes[0].clone()
+        }];
+        assert_eq!(apply_changes(&mut agents, &mut branches, &older), 0);
+        assert_eq!(agents[0].tags, ["ops, EU"]);
     }
 
     #[test]
@@ -2564,6 +2767,7 @@ mod tests {
             session_growth: None,
             organization: None,
             tags: Vec::new(),
+            organization_revision: None,
         }
     }
 

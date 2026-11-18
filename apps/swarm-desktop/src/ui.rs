@@ -409,54 +409,100 @@ fn load_projects_blocking(data_dir: &Path) -> Fallible<Vec<UiProject>> {
     })
 }
 
-/// The sidebar's organization readbacks on a worker: `chat.organization`
-/// groups, each registered project's `project.overview` team totals (an
-/// index-scoped read per project; the whole-fleet read is far heavier on a
-/// large store), the `launch.queue` waits and this window's queued intents.
-/// Every poll reads them all: an arbiter's intent decision moves no event
-/// watermark, so no earlier read is reused. A failed read becomes an error
-/// line; the others still show.
+/// The sidebar's grouping readback on a worker: every `chat.organization`
+/// group with its header and exact totals in one bounded server read (no
+/// per-project polling), plus the `organization.changed` rows committed
+/// after `changes_after`, so loaded rows refresh by id. Every poll reads
+/// it: an assignment or transfer decision moves no list watermark. Only
+/// the grouping fields are set; a failed read sets `stale` and its error
+/// lines, and the caller keeps the last server grouping (nothing is
+/// synthesized) and the cursor. Queue state is polled independently
+/// ([`load_queue_blocking`]).
 fn load_organization_blocking(
     data_dir: &Path,
     archived: eliot_core::api::ArchivedFilter,
-    watched: Vec<String>,
+    changes_after: Option<i64>,
 ) -> nav::Organization {
     client::block_on(async {
-        let mut organization = nav::Organization::default();
-        match client::chat_organization(data_dir, archived).await {
-            Ok(groups) => organization.groups = groups,
-            Err(error) => organization
-                .errors
-                .push(format!("Projects not read: {}", error.user_message())),
-        }
-        let projects: Vec<String> = organization
-            .registered()
-            .filter_map(|group| group.project.clone())
-            .collect();
-        for project in projects {
-            match client::project_overview(data_dir, &project).await {
-                Ok(entries) => organization.overview.extend(entries),
-                Err(error) => {
-                    organization
-                        .errors
-                        .push(format!("Team totals not read: {}", error.user_message()));
-                    break;
+        let changes = match changes_after {
+            Some(after) => Some(client::organization_changes(data_dir, after).await),
+            None => None,
+        };
+        let groups = client::chat_organization(data_dir, archived).await;
+        match (groups, changes) {
+            (Ok((groups, watermark)), None) => nav::Organization {
+                groups,
+                changes_after: Some(watermark),
+                ..nav::Organization::default()
+            },
+            (Ok((groups, _)), Some(Ok((changes, next)))) => nav::Organization {
+                groups,
+                changes_after: Some(next),
+                changes,
+                ..nav::Organization::default()
+            },
+            (groups, changes) => {
+                let mut errors = Vec::new();
+                if let Err(error) = &groups {
+                    errors.push(format!("Projects not read: {}", error.user_message()));
+                }
+                if let Some(Err(error)) = &changes {
+                    errors.push(format!(
+                        "Project changes not read: {}",
+                        error.user_message()
+                    ));
+                }
+                errors.push("Project list stale: showing the last server grouping.".to_owned());
+                nav::Organization {
+                    stale: true,
+                    errors,
+                    changes_after,
+                    ..nav::Organization::default()
                 }
             }
         }
+    })
+}
+
+/// One queue-state read: the `launch.queue` waits (`None` when the read
+/// failed), the watched intents read back, the watched intents the daemon
+/// does not know, and the error lines.
+#[derive(Clone, Debug)]
+pub(super) struct QueueRead {
+    pub(super) queue: Option<eliot_core::api::LaunchQueueView>,
+    pub(super) intents: Vec<eliot_core::api::LaunchIntentView>,
+    pub(super) missing: Vec<String>,
+    pub(super) errors: Vec<String>,
+}
+
+/// The sidebar's queue state on a worker, polled independently of the
+/// grouping read: every `launch.queue` page and this window's watched
+/// intents (`launch.intent.get`), so an arbiter's decision reports without
+/// waiting on the project read. A watched intent the daemon does not know
+/// is reported missing; any other failed intent read keeps it watched and
+/// the next read retries.
+fn load_queue_blocking(data_dir: &Path, watched: Vec<String>) -> QueueRead {
+    client::block_on(async {
+        let mut read = QueueRead {
+            queue: None,
+            intents: Vec::new(),
+            missing: Vec::new(),
+            errors: Vec::new(),
+        };
         match client::launch_queue(data_dir).await {
-            Ok(queue) => organization.queue = Some(queue),
-            Err(error) => organization
+            Ok(queue) => read.queue = Some(queue),
+            Err(error) => read
                 .errors
                 .push(format!("Launch queue not read: {}", error.user_message())),
         }
-        // A failed read keeps the intent watched; the next read retries.
         for id in watched {
-            if let Ok(intent) = client::launch_intent(data_dir, &id).await {
-                organization.intents.push(intent);
+            match client::launch_intent(data_dir, &id).await {
+                Ok(intent) => read.intents.push(intent),
+                Err(error) if error.code == "not_found" => read.missing.push(id),
+                Err(_) => {}
             }
         }
-        organization
+        read
     })
 }
 
@@ -739,6 +785,7 @@ impl Component for DesktopApp {
                 projects: Vec::new(),
                 organization: nav::Organization::default(),
                 organization_loading: false,
+                queue_loading: false,
                 agents: Vec::new(),
                 branches: HashMap::new(),
                 expanded: HashSet::new(),

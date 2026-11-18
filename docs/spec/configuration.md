@@ -773,11 +773,16 @@ main checkout. The daemon readback identifies the main checkout even when Git me
 lives in a separate directory. A registered linked worktree reads as its repository's
 name and its branch from the daemon's verified checkout readback when available.
 The sidebar's projects are the daemon's [`chat.organization`](api.md#chat-organization)
-groups in the daemon's order: each registered project with its manager, the manager's
-standard worktree branch, the assignment and transfer state, "Needs assignment" and
-competing roots, and the exact server totals (`chat.organization` member totals,
-`project.overview` team totals), plus its queued launches and automation waits with
-the wait reason and who can change it (`launch.queue`); then the no-project bucket.
+groups in the daemon's order, read in one bounded `chat.organization` read: each
+registered project with its manager, the manager's standard worktree branch, the
+assignment and transfer state, "Needs assignment" or roots competing with an
+assigned manager, and the group's exact server totals (member total, each lifecycle
+count as returned, queued, unknown and the project slot use), plus its queued
+launches and automation waits with the wait reason and who can change it
+(`launch.queue`, every page, polled independently); then the no-project bucket.
+Registered projects with no tasks follow the populated ones and stay selectable.
+A failed read keeps the last server grouping marked stale and synthesizes none;
+`organization.changed` events refresh already loaded rows by id.
 Each `agent.list` row carries the group the daemon reads it in, so the desktop groups
 nothing by path, repository or name. An Agent whose execution label is not a
 registration, such as a legacy `wt-*` path label, stays in the no-project bucket

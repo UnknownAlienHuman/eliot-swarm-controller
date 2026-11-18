@@ -280,8 +280,8 @@ environment and creates no setup effects or worktree cleanup artifact.
 A conversation association links an existing Agent or chat to a project or
 display group. It leaves native session, execution workspace, permissions and
 historical command attribution intact: association is placement, never
-authority. The headless association API stores the overlay beside the
-existing Agent or chat identity (schema v64).
+authority. The headless association API stores the overlay and its link
+revision beside the existing Agent or chat identity (schema v64 and v65).
 
 - `chat.organization` returns the grouped projection: teams by project
   assignment, manager, repository or worktree, and ancestry, with
@@ -289,18 +289,22 @@ existing Agent or chat identity (schema v64).
   Chats group by their overlay link alone; a legacy chat that still carries
   an execution project reads in the no-project bucket until attached.
 - `chat.attach` moves chats under a retained project; `chat.detach` returns
-  them to the no-project bucket. `chat.tag` replaces tag groups. Each
-  mutation returns the committed per-Agent links; each fresh write appends
-  one `organization.changed` event in the same transaction so the
-  projection's event watermark advances.
+  them to the no-project bucket. `chat.tag` replaces tag groups. Every write
+  advances each written link's revision; a write carrying the revision it
+  read is refused whole when another write moved it since. Each mutation
+  returns the committed per-Agent links; each fresh write appends one
+  `organization.changed` event in the same transaction, naming each written
+  Agent's resulting group, tags and revision, so the projection's event
+  watermark advances and clients refresh loaded rows by id.
 - Continuing work in another project stays a separate, authorized execution
   operation through the existing switch/handoff path, not an organization
   mutation: a running Agent cannot change execution scope through an edit.
 
 Migration keeps every ID and all history. Links are derived only from
 unambiguous retained facts (registration, common directory, parent); never
-from names or the last message. Competing roots of one project surface as
-an explicit ambiguity and are never auto-reassigned. Rename and
+from names or the last message. Retained roots competing with a project's
+assigned manager surface as an explicit ambiguity and are never
+auto-reassigned; a project without a manager only needs assignment. Rename and
 archive reuse their existing paths; presentation preferences stay in the
 existing settings. The wire contract is [Chat organization](api.md#chat-organization).
 

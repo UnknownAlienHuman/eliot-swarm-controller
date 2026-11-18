@@ -4,14 +4,16 @@
 //! Organization is placement, never authority. Attach/detach move a chat's
 //! display placement between a retained project and the no-project bucket;
 //! tags group Agents and chats. Execution project, scope, workspace and
-//! history are never edited here. Change readback rides the existing event
-//! watermark; there is no organization revision.
+//! history are never edited here. Group readback rides the projection's
+//! event watermark; each overlay row carries its own link revision, and a
+//! menu write whose revision moved is refused.
 
 use super::*;
 use eliot_core::api::{
     ArchivedFilter, ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
     ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, MAX_ORG_MEMBERS_PER_GROUP,
-    MAX_ORG_MEMBERS_TOTAL, OrgGroupView, OrgLinkView, OrgMemberView, ProjectManagerIdentity,
+    MAX_ORG_MEMBERS_TOTAL, ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgLinkView, OrgMemberView,
+    OrgRowChange, OrganizationChangedEvent, ProjectManagerIdentity, ScopeLimits,
 };
 use std::collections::BTreeMap;
 
@@ -30,6 +32,28 @@ fn owner_only(principal: &str, what: &str) -> Result<()> {
     } else {
         Err(Error::new("not_allowed", format!("only Owner may {what}")))
     }
+}
+
+/// The default archived exclusion, the rule `agent.list` applies: unarchived
+/// rows plus custody-held archived rows in an ended state
+/// ([`agent_lifecycle::CUSTODY_VISIBLE_STATES`]). The projection's counts
+/// and member pages read through it, so a listed row is always counted.
+/// Custody ids are integers read from the database, so inlining them is
+/// exact.
+fn default_visible(conn: &Connection) -> Result<String> {
+    let held = agent_lifecycle::default_list_custody_agents(conn)?;
+    if held.is_empty() {
+        return Ok("a.archived = 0".to_owned());
+    }
+    let ids = held
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!(
+        "(a.archived = 0 OR (a.archived = 1 AND a.state IN ({}) AND a.id IN ({ids})))",
+        agent_lifecycle::CUSTODY_VISIBLE_STATES,
+    ))
 }
 
 fn organization_watermark(conn: &Connection) -> Result<i64> {
@@ -109,6 +133,14 @@ impl LinkRequest<'_> {
         }
     }
 
+    fn expected_revision(&self) -> &Option<Vec<i64>> {
+        match self {
+            LinkRequest::Attach(request) => &request.expected_revision,
+            LinkRequest::Detach(request) => &request.expected_revision,
+            LinkRequest::Tag(request) => &request.expected_revision,
+        }
+    }
+
     fn encode(&self) -> Result<Value> {
         match self {
             LinkRequest::Attach(request) => serde_json::to_value(request),
@@ -151,42 +183,49 @@ const ORGANIZATION_GROUP: &str = "CASE WHEN (a.chat = 1 AND o.project_link IS NO
           AND EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project))
     THEN a.project ELSE NULL END";
 
-/// One Agent's organization group ([`ORGANIZATION_GROUP`]) and tags, for
-/// its `agent.list` row.
+/// One Agent's organization group ([`ORGANIZATION_GROUP`]), tags and overlay
+/// revision, for its `agent.list` row and its `organization.changed` event
+/// row. The revision is `None` when the Agent has no overlay row; a menu
+/// write carries that back as revision 0.
 pub(super) fn agent_organization(
     conn: &Connection,
     agent: i64,
-) -> Result<(Option<String>, Vec<String>)> {
-    let (group, raw_tags): (Option<String>, Option<String>) = conn
+) -> Result<(Option<String>, Vec<String>, Option<i64>)> {
+    let (group, raw_tags, revision): (Option<String>, Option<String>, Option<i64>) = conn
         .query_row(
             &format!(
-                "SELECT {ORGANIZATION_GROUP}, o.tags
+                "SELECT {ORGANIZATION_GROUP}, o.tags, o.revision
                  FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
                  WHERE a.id = ?1"
             ),
             [agent],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(sql_error)?;
     let tags = match raw_tags {
         Some(raw) => decode_tags(&raw)?,
         None => Vec::new(),
     };
-    Ok((group, tags))
+    Ok((group, tags, revision))
 }
 
-/// Project-scoped member predicate shared by the count and the page: chats
-/// group by their overlay link alone (a retained execution label never
-/// places a chat), every other Agent by its execution project.
+/// Project-scoped member predicate shared by the count and the page, equal
+/// to [`ORGANIZATION_GROUP`] `= ?1` in index-seekable form: members of a
+/// retained registration only; chats by their overlay link alone (a
+/// retained execution label never places a chat), every other Agent by its
+/// execution project.
 fn organization_project_members() -> &'static str {
-    "((a.chat = 0 AND a.project = ?1) OR (a.chat = 1 AND o.project_link = ?1))"
+    "(EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = ?1)
+      AND ((a.chat = 0 AND a.project = ?1) OR (a.chat = 1 AND o.project_link = ?1)))"
 }
 
-/// Unplaced-bucket predicate shared by the count and the page: chats
-/// without a link plus non-chat Agents whose execution project is not a
-/// retained registration.
+/// Unplaced-bucket predicate shared by the count and the page, equal to
+/// [`ORGANIZATION_GROUP`] `IS NULL`: chats without a retained link (a chat
+/// whose linked project was removed included) plus non-chat Agents whose
+/// execution project is not a retained registration.
 fn organization_unplaced_members() -> &'static str {
-    "((a.chat = 1 AND o.project_link IS NULL)
+    "((a.chat = 1 AND (o.project_link IS NULL
+        OR NOT EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = o.project_link)))
       OR (a.chat = 0 AND NOT EXISTS(SELECT 1 FROM project_registrations r WHERE r.id = a.project)))"
 }
 
@@ -213,14 +252,21 @@ fn organization_count(conn: &Connection, project: Option<&str>, archived: &str) 
     Ok(total as usize)
 }
 
+/// What every group of one projection read shares: the archived
+/// predicate, the Owner limits for the project slot use, and the snapshot.
+struct GroupRead<'a> {
+    archived: &'a str,
+    limits: &'a ScopeLimits,
+    watermark: i64,
+    now: i64,
+}
+
 /// One group page in response order with its exact per-group totals and
 /// the group-truncation state.
 struct OrganizationPage<'a> {
     order: Vec<Option<String>>,
     counts: &'a BTreeMap<Option<String>, usize>,
-    archived: &'a str,
-    watermark: i64,
-    now: i64,
+    read: &'a GroupRead<'a>,
     groups_truncated: bool,
     next_after: Option<String>,
 }
@@ -376,6 +422,7 @@ impl Store {
         &self,
         principal: &str,
         request: &ChatOrganizationRequest,
+        limits: &ScopeLimits,
         now: i64,
     ) -> Result<ChatOrganizationResponse> {
         request.validate()?;
@@ -396,22 +443,32 @@ impl Store {
                 ),
             ));
         }
-        let archived = match request.archived {
-            ArchivedFilter::Exclude => "a.archived = 0",
+        // The visibility rule of the default `agent.list` rows, so a row
+        // lists exactly where the projection counts it.
+        let visible;
+        let archived: &str = match request.archived {
+            ArchivedFilter::Exclude => {
+                visible = default_visible(conn)?;
+                &visible
+            }
             ArchivedFilter::Only => "a.archived = 1",
             ArchivedFilter::Include => "1 = 1",
+        };
+        let read = GroupRead {
+            archived,
+            limits,
+            watermark,
+            now,
         };
         if let Some(project) = request.project.as_deref() {
             return self.single_project_organization(
                 conn,
                 project,
                 request.after.as_deref(),
-                archived,
-                watermark,
-                now,
+                &read,
             );
         }
-        self.all_projects_organization(conn, request.after.as_deref(), archived, watermark, now)
+        self.all_projects_organization(conn, request.after.as_deref(), &read)
     }
 
     /// One project group (or an empty page past the cursor) with its exact
@@ -421,9 +478,7 @@ impl Store {
         conn: &Connection,
         project: &str,
         after: Option<&str>,
-        archived: &str,
-        watermark: i64,
-        now: i64,
+        read: &GroupRead<'_>,
     ) -> Result<ChatOrganizationResponse> {
         let mut counts = BTreeMap::new();
         let mut order = Vec::new();
@@ -432,7 +487,7 @@ impl Store {
         if after.is_none_or(|after| after < project) {
             counts.insert(
                 Some(project.to_owned()),
-                organization_count(conn, Some(project), archived)?,
+                organization_count(conn, Some(project), read.archived)?,
             );
             order.push(Some(project.to_owned()));
         }
@@ -441,9 +496,7 @@ impl Store {
             OrganizationPage {
                 order,
                 counts: &counts,
-                archived,
-                watermark,
-                now,
+                read,
                 groups_truncated: false,
                 next_after: None,
             },
@@ -458,10 +511,9 @@ impl Store {
         &self,
         conn: &Connection,
         after: Option<&str>,
-        archived: &str,
-        watermark: i64,
-        now: i64,
+        read: &GroupRead<'_>,
     ) -> Result<ChatOrganizationResponse> {
+        let archived = read.archived;
         let mut keys = overview::list_overview_projects(conn, None, after)?;
         let groups_truncated = keys.len() > MAX_PAGE_ENTRIES;
         if groups_truncated {
@@ -504,9 +556,7 @@ impl Store {
             OrganizationPage {
                 order,
                 counts: &counts,
-                archived,
-                watermark,
-                now,
+                read,
                 groups_truncated,
                 next_after,
             },
@@ -528,8 +578,8 @@ impl Store {
             .map(|key| page.counts.get(key).copied().unwrap_or(0))
             .sum();
         let mut response = ChatOrganizationResponse {
-            event_watermark: page.watermark,
-            as_of: page.now,
+            event_watermark: page.read.watermark,
+            as_of: page.read.now,
             groups: Vec::new(),
             member_total,
             truncated: false,
@@ -547,7 +597,7 @@ impl Store {
                         Vec::new(),
                         full,
                         false,
-                        page.archived,
+                        page.read,
                     )?);
                 }
                 continue;
@@ -556,14 +606,14 @@ impl Store {
             budget -= take;
             kept += take;
             let mut members = Vec::with_capacity(take);
-            organization_members(conn, key.as_deref(), page.archived, take, &mut members)?;
+            organization_members(conn, key.as_deref(), page.read.archived, take, &mut members)?;
             response.groups.push(self.organization_group(
                 conn,
                 key,
                 members,
                 full,
                 full > take,
-                page.archived,
+                page.read,
             )?);
         }
         response.truncated = response.member_total > kept;
@@ -577,22 +627,23 @@ impl Store {
         members: Vec<OrgMemberView>,
         member_total: usize,
         members_truncated: bool,
-        archived: &str,
+        read: &GroupRead<'_>,
     ) -> Result<OrgGroupView> {
+        let archived = read.archived;
         let transfer = match project.as_deref() {
             Some(project) if projects::project_registration_tx(conn, project)?.is_some() => {
                 project_transfer::open_intent(conn, project)?
             }
             _ => None,
         };
-        let (registration, assignment, manager, needs_assignment, conflicting_roots) =
+        let (registration, assignment, manager, needs_assignment, conflicting_roots, team) =
             match project.as_deref() {
                 Some(project) => {
                     let registration = projects::project_registration_tx(conn, project)?;
                     if registration.is_none() {
                         // Execution labels and assignments without a retained
                         // registration group by label but carry no team detail.
-                        (None, None, None, false, Vec::new())
+                        (None, None, None, false, Vec::new(), None)
                     } else {
                         let assignment = project_assignment::read_assignment(conn, project)?;
                         let manager = overview::overview_manager_view(conn, Some(&assignment))?;
@@ -613,14 +664,18 @@ impl Store {
                                     }
                                     ProjectManagerIdentity::Remote { .. } => None,
                                 });
-                        let roots = organization_roots(conn, project, "1 = 1")?;
+                        // Competing roots need retained evidence of a
+                        // competing manager: the assignment names one, and
+                        // every other retained root competes with it.
+                        // Without a manager the roots wait for assignment,
+                        // never a conflict.
                         let conflicting_roots = match manager_num {
-                            Some(manager) => roots
+                            Some(manager) => organization_roots(conn, project, "1 = 1")?
                                 .into_iter()
                                 .filter(|root| *root != manager)
                                 .map(format_agent_id)
                                 .collect(),
-                            None => roots.into_iter().skip(1).map(format_agent_id).collect(),
+                            None => Vec::new(),
                         };
                         (
                             registration,
@@ -628,11 +683,13 @@ impl Store {
                             manager,
                             needs_assignment,
                             conflicting_roots,
+                            Some(overview::project_header_totals(conn, project, read.limits)?),
                         )
                     }
                 }
-                None => (None, None, None, false, Vec::new()),
+                None => (None, None, None, false, Vec::new(), None),
             };
+        let (totals, capacity) = team.unzip();
         Ok(OrgGroupView {
             project,
             registration,
@@ -644,6 +701,8 @@ impl Store {
             members,
             member_total,
             members_truncated,
+            totals,
+            capacity,
         })
     }
 
@@ -665,6 +724,7 @@ impl Store {
         let id = request.id();
         let agents = request.agents();
         let change = request.change();
+        let expected = request.expected_revision().clone();
         let payload = request.encode()?;
         let digest = canonical::digest(&payload)?;
         if let Some((old_principal, old_method, old_digest, result)) =
@@ -725,44 +785,69 @@ impl Store {
                 ));
             }
             let mut links = Vec::with_capacity(nums.len());
-            for (agent, num) in nums {
-                let current: Option<(Option<String>, String)> = tx
+            let mut rows = Vec::with_capacity(nums.len());
+            for (index, (agent, num)) in nums.into_iter().enumerate() {
+                let current: Option<(Option<String>, String, i64)> = tx
                     .query_row(
-                        "SELECT project_link, tags FROM chat_organization WHERE agent = ?1",
+                        "SELECT project_link, tags, revision FROM chat_organization WHERE agent = ?1",
                         [num],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()
                     .map_err(sql_error)?;
+                // A menu write carries the revision it observed (0 for no
+                // row yet); a write that raced another is refused whole and
+                // nothing is applied.
+                let observed = current.as_ref().map_or(0, |(_, _, revision)| *revision);
+                if expected
+                    .as_ref()
+                    .is_some_and(|entries| entries[index] != observed)
+                {
+                    return Err(Error::new(
+                        "conflict",
+                        format!("Agent {agent} was reorganized since it was read; read it again"),
+                    ));
+                }
+                let revision = observed + 1;
                 let (link, tags) = match &change {
                     LinkChange::Attach { project } => (
                         Some(project.clone()),
                         current
-                            .map(|(_, tags)| tags)
+                            .map(|(_, tags, _)| tags)
                             .unwrap_or_else(|| "[]".to_owned()),
                     ),
                     LinkChange::Detach => (
                         None,
                         current
-                            .map(|(_, tags)| tags)
+                            .map(|(_, tags, _)| tags)
                             .unwrap_or_else(|| "[]".to_owned()),
                     ),
                     LinkChange::Tag { tags } => {
                         let encoded = encode_json(tags)?;
-                        (current.and_then(|(link, _)| link), encoded)
+                        (current.and_then(|(link, _, _)| link), encoded)
                     }
                 };
                 db!(tx.execute(
-                    "INSERT INTO chat_organization(agent, project_link, tags)
-                     VALUES (?1, ?2, ?3)
+                    "INSERT INTO chat_organization(agent, project_link, tags, revision)
+                     VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(agent) DO UPDATE SET project_link = excluded.project_link,
-                         tags = excluded.tags",
-                    params![num, link, tags],
+                         tags = excluded.tags, revision = excluded.revision",
+                    params![num, link, tags, revision],
                 ));
+                // The event row is the Agent's `agent.list` placement as
+                // this write left it, read through the same group key.
+                let (organization, row_tags, _) = agent_organization(&tx, num)?;
+                rows.push(OrgRowChange {
+                    agent: agent.clone(),
+                    organization,
+                    tags: row_tags,
+                    revision,
+                });
                 links.push(OrgLinkView {
                     agent,
                     project_link: link,
                     tags: decode_tags(&tags)?,
+                    revision,
                 });
             }
             let value = ChatOrganizationMutationResponse {
@@ -781,15 +866,23 @@ impl Store {
             )?;
             // The projection advertises the event watermark as its change
             // readback, so the overlay write appends an event in the same
-            // transaction; the router publishes it after commit.
+            // transaction; the router publishes it after commit. Its rows
+            // let a client refresh the Agents it already loaded by id.
+            let change = OrganizationChangedEvent {
+                id: id.to_owned(),
+                method: method.to_owned(),
+                rows,
+            };
+            change.validate()?;
             let event = insert_daemon_event(
                 &tx,
                 now,
-                "organization.changed",
+                ORGANIZATION_CHANGED_KIND,
                 "organization",
                 None,
                 None,
-                serde_json::json!({"id": id, "method": method}),
+                serde_json::to_value(&change)
+                    .map_err(|_| Error::new("internal", "cannot encode organization event"))?,
             )?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(Change {
@@ -915,6 +1008,7 @@ mod tests {
             id: id.to_owned(),
             agents: agents.iter().map(|agent| agent.to_string()).collect(),
             project: project.to_owned(),
+            expected_revision: None,
         }
     }
 
@@ -979,6 +1073,7 @@ mod tests {
         let detach = ChatDetachRequest {
             id: Ulid::new().to_string(),
             agents: vec![chat.clone()],
+            expected_revision: None,
         };
         let detached = store.detach_chats("owner", &detach, now()).unwrap().value;
         detach.validate_response(&detached).unwrap();
@@ -999,6 +1094,7 @@ mod tests {
                     after: None,
                     archived: ArchivedFilter::Exclude,
                 },
+                &ScopeLimits::default(),
                 now(),
             )
             .unwrap();
@@ -1028,6 +1124,7 @@ mod tests {
             id: Ulid::new().to_string(),
             agents: vec![root.clone(), chat.clone()],
             tags: vec!["inbox".to_owned(), "k175".to_owned()],
+            expected_revision: None,
         };
         let tagged = store.tag_agents("owner", &tag, now()).unwrap().value;
         tag.validate_response(&tagged).unwrap();
@@ -1040,6 +1137,7 @@ mod tests {
                     after: None,
                     archived: ArchivedFilter::Exclude,
                 },
+                &ScopeLimits::default(),
                 now(),
             )
             .unwrap();
@@ -1085,6 +1183,7 @@ mod tests {
                     after: None,
                     archived: ArchivedFilter::Exclude,
                 },
+                &ScopeLimits::default(),
                 now(),
             )
             .unwrap();
@@ -1108,6 +1207,7 @@ mod tests {
             id: Ulid::new().to_string(),
             agents: vec![chat.clone()],
             tags: vec!["inbox".to_owned()],
+            expected_revision: None,
         };
         store.tag_agents("owner", &tag, now()).unwrap();
         let rows = store
@@ -1134,6 +1234,182 @@ mod tests {
     }
 
     #[test]
+    fn stale_menu_write_is_refused_and_fresh_write_bumps_revision() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        register(&mut store, "alpha", "/managed/alpha");
+        let chat = launch_chat(&mut store, &Ulid::new().to_string(), "/tmp/wt-k184b-rev");
+        // No overlay row yet: the menu observes revision 0.
+        let attach = ChatAttachRequest {
+            id: Ulid::new().to_string(),
+            agents: vec![chat.clone()],
+            project: "alpha".to_owned(),
+            expected_revision: Some(vec![0]),
+        };
+        let attached = store.attach_chats("owner", &attach, now()).unwrap().value;
+        attach.validate_response(&attached).unwrap();
+        assert_eq!(attached.links[0].revision, 1);
+        // A tag that raced the attach (still carrying 0) is refused, and
+        // nothing is applied.
+        let stale = ChatTagRequest {
+            id: Ulid::new().to_string(),
+            agents: vec![chat.clone()],
+            tags: vec!["late".to_owned()],
+            expected_revision: Some(vec![0]),
+        };
+        assert_eq!(
+            store.tag_agents("owner", &stale, now()).unwrap_err().code,
+            "conflict"
+        );
+        // The fresh revision applies and bumps the row.
+        let tag = ChatTagRequest {
+            id: Ulid::new().to_string(),
+            agents: vec![chat.clone()],
+            tags: vec!["late".to_owned()],
+            expected_revision: Some(vec![1]),
+        };
+        let tagged = store.tag_agents("owner", &tag, now()).unwrap().value;
+        tag.validate_response(&tagged).unwrap();
+        assert_eq!(tagged.links[0].revision, 2);
+        // The `agent.list` row reads the revision back for the next menu
+        // write.
+        let rows = store
+            .list_agent_summaries(
+                &crate::AgentListFilter::default(),
+                None,
+                100,
+                now(),
+                &eliot_core::SessionGrowthThresholds::default(),
+            )
+            .unwrap();
+        let row = rows
+            .summaries
+            .iter()
+            .find(|row| row.id == chat)
+            .expect("listed chat row");
+        assert_eq!(row.organization_revision, Some(2));
+        assert_eq!(row.organization.as_deref(), Some("alpha"));
+        // Detach with the moved revision is refused; with the fresh one it
+        // applies.
+        let stale_detach = ChatDetachRequest {
+            id: Ulid::new().to_string(),
+            agents: vec![chat.clone()],
+            expected_revision: Some(vec![1]),
+        };
+        assert_eq!(
+            store
+                .detach_chats("owner", &stale_detach, now())
+                .unwrap_err()
+                .code,
+            "conflict"
+        );
+        let detach = ChatDetachRequest {
+            id: Ulid::new().to_string(),
+            agents: vec![chat.clone()],
+            expected_revision: Some(vec![2]),
+        };
+        let detached = store.detach_chats("owner", &detach, now()).unwrap().value;
+        detach.validate_response(&detached).unwrap();
+        assert_eq!(detached.links[0].revision, 3);
+        assert_eq!(detached.links[0].project_link, None);
+    }
+
+    #[test]
+    fn removed_link_chat_counts_and_lists_in_the_unplaced_bucket() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        register(&mut store, "alpha", "/managed/alpha");
+        let chat = launch_chat(
+            &mut store,
+            &Ulid::new().to_string(),
+            "/tmp/wt-k184b-removed",
+        );
+        let attach = attach_request(&Ulid::new().to_string(), &[&chat], "alpha");
+        store.attach_chats("owner", &attach, now()).unwrap();
+        // The linked project is removed while the overlay row stays.
+        store
+            .connection
+            .execute("DELETE FROM project_registrations WHERE id = 'alpha'", [])
+            .unwrap();
+        let projection = store
+            .chat_organization(
+                "owner",
+                &ChatOrganizationRequest {
+                    project: None,
+                    after: None,
+                    archived: ArchivedFilter::Exclude,
+                },
+                &ScopeLimits::default(),
+                now(),
+            )
+            .unwrap();
+        let unplaced = projection
+            .groups
+            .iter()
+            .find(|group| group.project.is_none())
+            .expect("unplaced bucket");
+        // The bucket total counts the chat and the bucket page lists it.
+        assert_eq!(unplaced.member_total, unplaced.members.len());
+        assert!(unplaced.members.iter().any(|member| member.agent == chat));
+        // The `agent.list` row reads in the same bucket.
+        let rows = store
+            .list_agent_summaries(
+                &crate::AgentListFilter::default(),
+                None,
+                100,
+                now(),
+                &eliot_core::SessionGrowthThresholds::default(),
+            )
+            .unwrap();
+        let row = rows
+            .summaries
+            .iter()
+            .find(|row| row.id == chat)
+            .expect("listed chat row");
+        assert_eq!(row.organization, None);
+        row.validate().unwrap();
+    }
+
+    #[test]
+    fn competing_roots_need_a_manager() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        register(&mut store, "alpha", "/managed/alpha");
+        let _first = launch(
+            &mut store,
+            &Ulid::new().to_string(),
+            "alpha",
+            "/managed/alpha",
+        );
+        let _second = launch(
+            &mut store,
+            &Ulid::new().to_string(),
+            "alpha",
+            "/managed/alpha",
+        );
+        let projection = store
+            .chat_organization(
+                "owner",
+                &ChatOrganizationRequest {
+                    project: Some("alpha".to_owned()),
+                    after: None,
+                    archived: ArchivedFilter::Exclude,
+                },
+                &ScopeLimits::default(),
+                now(),
+            )
+            .unwrap();
+        let alpha = project_group(&projection, "alpha");
+        // No manager: the roots wait for assignment, never conflict.
+        assert!(alpha.needs_assignment);
+        assert!(alpha.conflicting_roots.is_empty());
+        // The header totals ride the same read: the registered project's
+        // exact team totals and its slot use beside the Owner limit.
+        let totals = alpha.totals.as_ref().expect("registered team totals");
+        assert_eq!(totals.live, totals.lifecycle.live);
+        let capacity = alpha.capacity.as_ref().expect("project slot use");
+        assert_eq!(capacity.scope, "project:alpha");
+        assert_eq!(capacity.limit, None);
+    }
+
+    #[test]
     fn legacy_project_bearing_chat_reads_back_and_detaches_to_unplaced() {
         let mut store = Store::open(Path::new(":memory:")).unwrap();
         register(&mut store, "alpha", "/managed/alpha");
@@ -1151,7 +1427,9 @@ mod tests {
             after: None,
             archived: ArchivedFilter::Exclude,
         };
-        let projection = store.chat_organization("owner", &request, now()).unwrap();
+        let projection = store
+            .chat_organization("owner", &request, &ScopeLimits::default(), now())
+            .unwrap();
         request.validate_response(&projection).unwrap();
         let unplaced = projection
             .groups
@@ -1169,7 +1447,9 @@ mod tests {
         // never under its retained execution project.
         let attach = attach_request(&Ulid::new().to_string(), &[&chat], "alpha");
         store.attach_chats("owner", &attach, now()).unwrap();
-        let projection = store.chat_organization("owner", &request, now()).unwrap();
+        let projection = store
+            .chat_organization("owner", &request, &ScopeLimits::default(), now())
+            .unwrap();
         request.validate_response(&projection).unwrap();
         let alpha = project_group(&projection, "alpha");
         let placed = alpha
@@ -1181,9 +1461,12 @@ mod tests {
         let detach = ChatDetachRequest {
             id: Ulid::new().to_string(),
             agents: vec![chat.clone()],
+            expected_revision: None,
         };
         store.detach_chats("owner", &detach, now()).unwrap();
-        let projection = store.chat_organization("owner", &request, now()).unwrap();
+        let projection = store
+            .chat_organization("owner", &request, &ScopeLimits::default(), now())
+            .unwrap();
         request.validate_response(&projection).unwrap();
         let alpha = project_group(&projection, "alpha");
         assert!(alpha.members.iter().all(|member| member.agent != chat));
@@ -1213,6 +1496,7 @@ mod tests {
                         after: None,
                         archived: ArchivedFilter::Exclude,
                     },
+                    &ScopeLimits::default(),
                     now(),
                 )
                 .unwrap()
@@ -1223,6 +1507,21 @@ mod tests {
         let change = store.attach_chats("owner", &first, now()).unwrap();
         assert_eq!(change.events.len(), 1);
         assert_eq!(change.events[0].kind, "organization.changed");
+        // The event names each written Agent with the group its
+        // `agent.list` row now reads in, its tags and its link revision.
+        let payload: OrganizationChangedEvent =
+            serde_json::from_value(change.events[0].data.clone()).unwrap();
+        payload.validate().unwrap();
+        assert_eq!(payload.id, first.id);
+        assert_eq!(
+            payload.rows,
+            [OrgRowChange {
+                agent: chat.clone(),
+                organization: Some("alpha".to_owned()),
+                tags: Vec::new(),
+                revision: 1,
+            }]
+        );
         let after = read(&store);
         assert!(after > before);
         assert_eq!(after, change.events[0].seq);
@@ -1245,7 +1544,9 @@ mod tests {
             after: None,
             archived: ArchivedFilter::Exclude,
         };
-        let first = store.chat_organization("owner", &request, now()).unwrap();
+        let first = store
+            .chat_organization("owner", &request, &ScopeLimits::default(), now())
+            .unwrap();
         request.validate_response(&first).unwrap();
         assert_eq!(first.groups.len(), MAX_PAGE_ENTRIES);
         assert!(first.groups_truncated);
@@ -1254,7 +1555,9 @@ mod tests {
             after: first.next_after.clone(),
             ..request
         };
-        let second = store.chat_organization("owner", &request, now()).unwrap();
+        let second = store
+            .chat_organization("owner", &request, &ScopeLimits::default(), now())
+            .unwrap();
         request.validate_response(&second).unwrap();
         assert!(!second.groups_truncated);
         assert_eq!(second.next_after, None);
@@ -1275,7 +1578,9 @@ mod tests {
             after: Some("page-1001".to_owned()),
             ..request
         };
-        let past = store.chat_organization("owner", &request, now()).unwrap();
+        let past = store
+            .chat_organization("owner", &request, &ScopeLimits::default(), now())
+            .unwrap();
         request.validate_response(&past).unwrap();
         assert_eq!(past.groups.len(), 1);
         assert!(past.groups[0].project.is_none());
@@ -1314,7 +1619,9 @@ mod tests {
                 after: None,
                 archived: ArchivedFilter::Exclude,
             };
-            let projection = store.chat_organization("owner", &request, now()).unwrap();
+            let projection = store
+                .chat_organization("owner", &request, &ScopeLimits::default(), now())
+                .unwrap();
             request.validate_response(&projection).unwrap();
             assert_eq!(projection.groups.len(), 1);
             assert_eq!(projection.member_total, projection.groups[0].members.len());
@@ -1325,7 +1632,9 @@ mod tests {
             after: None,
             archived: ArchivedFilter::Exclude,
         };
-        let projection = store.chat_organization("owner", &request, now()).unwrap();
+        let projection = store
+            .chat_organization("owner", &request, &ScopeLimits::default(), now())
+            .unwrap();
         let members: Vec<&str> = projection.groups[0]
             .members
             .iter()
@@ -1367,6 +1676,7 @@ mod tests {
                     after: None,
                     archived: ArchivedFilter::Exclude,
                 },
+                &ScopeLimits::default(),
                 now(),
             )
             .unwrap();
@@ -1395,6 +1705,7 @@ mod tests {
                     after: None,
                     archived: ArchivedFilter::Exclude,
                 },
+                &ScopeLimits::default(),
                 now(),
             )
             .unwrap();
@@ -1419,6 +1730,7 @@ mod tests {
                     after: None,
                     archived: ArchivedFilter::Exclude,
                 },
+                &ScopeLimits::default(),
                 now(),
             )
             .unwrap();
@@ -1523,11 +1835,11 @@ mod tests {
                 params![parse_agent_id(&conflicted).unwrap(), command],
             )
             .unwrap();
-        // Re-run the v64 migration over the populated store.
+        // Re-run the v64 migration (and v65 over it) over the populated store.
         store
             .connection
             .execute_batch(
-                "DROP TABLE chat_organization; DELETE FROM schema_migrations WHERE version = 64;",
+                "DROP TABLE chat_organization; DELETE FROM schema_migrations WHERE version >= 64;",
             )
             .unwrap();
         store.migrate().unwrap();

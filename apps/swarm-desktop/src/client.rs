@@ -21,9 +21,9 @@ use eliot_core::api::{
     EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest, HandoffResponse,
     HarnessModelsRequest, HarnessModelsResponse, LaunchIntentGetRequest, LaunchIntentView,
-    LaunchQueueListRequest, LaunchQueueRequest, LaunchQueueView, OrgGroupView,
-    ProjectOverviewEntry, ProjectOverviewRequest, ProjectOverviewResponse, ReparentRequest,
-    ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
+    LaunchQueueListRequest, LaunchQueueRequest, LaunchQueueView, ORGANIZATION_CHANGED_KIND,
+    OrgGroupView, OrgRowChange, OrganizationChangedEvent, ReparentRequest, ReparentResponse,
+    SwitchRequest, SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -556,17 +556,21 @@ pub async fn enqueue_launch(
     Ok(reply)
 }
 
-/// Most `chat.organization` group pages and `project.overview` pages one
-/// sidebar refresh reads; the daemon pages at 1,000 groups and 1.5 MiB.
+/// Most `chat.organization` group pages, `launch.queue` pages and
+/// `organization.changed` event pages one sidebar refresh reads; the daemon
+/// pages at 1,000 groups.
 const ORGANIZATION_PAGES: usize = 8;
 
 /// Every `chat.organization` group (projects first, the no-project bucket
-/// last), page by page, under the sidebar's archived filter.
+/// last) with its header and exact totals, page by page, under the
+/// sidebar's archived filter, and the lowest event watermark the pages
+/// observed: one bounded read for the whole sidebar.
 pub async fn chat_organization(
     data_dir: &Path,
     archived: ArchivedFilter,
-) -> Result<Vec<OrgGroupView>> {
+) -> Result<(Vec<OrgGroupView>, i64)> {
     let mut groups = Vec::new();
+    let mut watermark = i64::MAX;
     let mut after = None;
     for _ in 0..ORGANIZATION_PAGES {
         let request = ChatOrganizationRequest {
@@ -579,8 +583,9 @@ pub async fn chat_organization(
             eliot_daemon::client_call_typed(data_dir, "chat.organization", &request).await?;
         request.validate_response(&reply)?;
         groups.extend(reply.groups);
+        watermark = watermark.min(reply.event_watermark);
         if !reply.groups_truncated {
-            return Ok(groups);
+            return Ok((groups, watermark));
         }
         after = reply.next_after;
     }
@@ -590,37 +595,32 @@ pub async fn chat_organization(
     ))
 }
 
-/// One project's `project.overview` entry with its exact team totals, page
-/// by page (an index-scoped read; the whole-fleet read is far heavier on a
-/// large store). Detail split across pages keeps the first page's totals
-/// and the workspaces of every page.
-pub async fn project_overview(data_dir: &Path, project: &str) -> Result<Vec<ProjectOverviewEntry>> {
-    let mut entries: Vec<ProjectOverviewEntry> = Vec::new();
-    let mut after = None;
+/// The `organization.changed` rows committed after `after`, page by page,
+/// and the exclusive cursor to read on from: each names an Agent, the group
+/// its row now reads in, its tags and link revision, so loaded rows refresh
+/// by id.
+pub async fn organization_changes(data_dir: &Path, after: i64) -> Result<(Vec<OrgRowChange>, i64)> {
+    let filter = EventsFilter {
+        kinds: vec![ORGANIZATION_CHANGED_KIND.to_owned()],
+        ..EventsFilter::default()
+    };
+    let mut rows = Vec::new();
+    let mut cursor = after;
     for _ in 0..ORGANIZATION_PAGES {
-        let request = ProjectOverviewRequest {
-            project: Some(project.to_owned()),
-            after: after.take(),
-        };
-        request.validate()?;
-        let reply: ProjectOverviewResponse =
-            eliot_daemon::client_call_typed(data_dir, "project.overview", &request).await?;
-        request.validate_response(&reply)?;
-        for entry in reply.projects {
-            match entries
-                .iter_mut()
-                .find(|known| known.project == entry.project)
-            {
-                Some(known) => known.workspaces.extend(entry.workspaces),
-                None => entries.push(entry),
-            }
+        let page = events_read(data_dir, cursor, EVENT_SCAN_ROWS, &filter).await?;
+        for event in page.events {
+            let change: OrganizationChangedEvent = serde_json::from_value(event.data)
+                .map_err(|_| Error::new("unknown", "organization change event is malformed"))?;
+            change.validate()?;
+            rows.extend(change.rows);
         }
-        match reply.next_cursor {
-            Some(cursor) => after = Some(cursor),
-            None => return Ok(entries),
+        let more = page.truncated && page.next > cursor;
+        cursor = page.next;
+        if !more {
+            break;
         }
     }
-    Ok(entries)
+    Ok((rows, cursor))
 }
 
 /// `launch.intent.get`: one queued launch intent's current state, also
@@ -639,23 +639,60 @@ pub async fn launch_intent(data_dir: &Path, id: &str) -> Result<LaunchIntentView
     Ok(reply)
 }
 
-/// The first `launch.queue` page: queued interactive intents and
-/// automation assignment waits, each with its wait reason.
+/// The whole `launch.queue`: queued interactive intents and automation
+/// assignment waits, each with its wait reason, page by page. A watched
+/// intent's reason is read even beyond the first queue page.
 pub async fn launch_queue(data_dir: &Path) -> Result<LaunchQueueView> {
-    let request = LaunchQueueListRequest {
-        project: None,
-        after: None,
-    };
-    request.validate()?;
-    eliot_daemon::client_call_typed(data_dir, "launch.queue", &request).await
+    let mut interactive = Vec::new();
+    let mut assignments = Vec::new();
+    let mut after = None;
+    for _ in 0..ORGANIZATION_PAGES {
+        let request = LaunchQueueListRequest {
+            project: None,
+            after: after.take(),
+        };
+        request.validate()?;
+        let reply: LaunchQueueView =
+            eliot_daemon::client_call_typed(data_dir, "launch.queue", &request).await?;
+        interactive.extend(reply.interactive);
+        assignments.extend(reply.assignments);
+        match reply.next_after {
+            Some(cursor) => after = Some(cursor),
+            None => {
+                return Ok(LaunchQueueView {
+                    interactive,
+                    assignments,
+                    next_after: None,
+                });
+            }
+        }
+    }
+    Ok(LaunchQueueView {
+        interactive,
+        assignments,
+        next_after: after,
+    })
 }
 
-/// One organization mutation: placement or tags, never authority.
+/// One organization mutation: placement or tags, never authority. The
+/// revision is the link revision the menu observed (0 for no overlay row);
+/// the Store refuses a write whose revision moved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Organize {
-    Attach { agent: String, project: String },
-    Detach { agent: String },
-    Tag { agent: String, tags: Vec<String> },
+    Attach {
+        agent: String,
+        project: String,
+        revision: i64,
+    },
+    Detach {
+        agent: String,
+        revision: i64,
+    },
+    Tag {
+        agent: String,
+        tags: Vec<String>,
+        revision: i64,
+    },
 }
 
 /// `chat.attach`, `chat.detach` or `chat.tag` for one Agent, with the
@@ -666,32 +703,43 @@ pub async fn organize(
     change: Organize,
 ) -> Result<ChatOrganizationMutationResponse> {
     match change {
-        Organize::Attach { agent, project } => {
+        Organize::Attach {
+            agent,
+            project,
+            revision,
+        } => {
             let request = ChatAttachRequest {
                 id: mutation_id,
                 agents: vec![agent],
                 project,
+                expected_revision: Some(vec![revision]),
             };
             request.validate()?;
             let reply = eliot_daemon::client_call_typed(data_dir, "chat.attach", &request).await?;
             request.validate_response(&reply).map_err(unverified)?;
             Ok(reply)
         }
-        Organize::Detach { agent } => {
+        Organize::Detach { agent, revision } => {
             let request = ChatDetachRequest {
                 id: mutation_id,
                 agents: vec![agent],
+                expected_revision: Some(vec![revision]),
             };
             request.validate()?;
             let reply = eliot_daemon::client_call_typed(data_dir, "chat.detach", &request).await?;
             request.validate_response(&reply).map_err(unverified)?;
             Ok(reply)
         }
-        Organize::Tag { agent, tags } => {
+        Organize::Tag {
+            agent,
+            tags,
+            revision,
+        } => {
             let request = ChatTagRequest {
                 id: mutation_id,
                 agents: vec![agent],
                 tags,
+                expected_revision: Some(vec![revision]),
             };
             request.validate()?;
             let reply = eliot_daemon::client_call_typed(data_dir, "chat.tag", &request).await?;

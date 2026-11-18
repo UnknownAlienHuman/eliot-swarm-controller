@@ -164,7 +164,7 @@ fn schema_51_upgrade_records_the_legacy_generation_name_before_reminting() {
         .target
         .unwrap();
     store.dispatch(&id, now).unwrap();
-    store.connection.execute_batch("DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version=64; DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
+    store.connection.execute_batch("DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (64,65); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  ALTER TABLE workspaces DROP COLUMN original_preparation;
                  DROP TABLE project_transfers; DELETE FROM schema_migrations WHERE version IN (60,61);
@@ -665,7 +665,7 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version=64; DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
+            "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (64,65); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  ALTER TABLE workspaces DROP COLUMN original_preparation;
                  DROP TABLE project_transfers; DELETE FROM schema_migrations WHERE version IN (60,61);

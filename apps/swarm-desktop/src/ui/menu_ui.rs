@@ -118,6 +118,11 @@ pub(super) enum MenuMsg {
     TaskOpened(UiAgent),
     Hovered(Option<String>),
     RenameChanged(String),
+    /// The tag editor's field at this index changed (the index past the
+    /// last tag is the new-tag field).
+    TagChanged(usize, String),
+    /// The tag editor's remove button at this index.
+    TagRemoved(usize),
     RenameCommitted,
     RenameCancelled,
     /// The confirmation's answer (true: go ahead).
@@ -162,6 +167,9 @@ pub(super) struct MenuState {
     pub(super) hovered: Option<String>,
     /// The target being renamed and the text typed so far.
     pub(super) renaming: Option<(Target, String)>,
+    /// The tag editor's fields, one per tag (while `renaming` holds
+    /// [`Target::Tags`]): an existing tag round-trips unchanged.
+    pub(super) tag_fields: Vec<String>,
     pub(super) confirm: Option<(Target, Action)>,
     pub(super) rename_ref: ElementRef<TextBox>,
     /// The keyboard-highlighted row, bound when it renders: focusing
@@ -331,14 +339,29 @@ impl DesktopApp {
                     *typed = text;
                 }
             }
+            MenuMsg::TagChanged(index, text) => {
+                let fields = &mut self.menu.tag_fields;
+                if let Some(field) = fields.get_mut(index) {
+                    *field = text;
+                } else if index == fields.len() && !text.is_empty() {
+                    fields.push(text);
+                }
+            }
+            MenuMsg::TagRemoved(index) => {
+                if index < self.menu.tag_fields.len() {
+                    self.menu.tag_fields.remove(index);
+                }
+            }
             MenuMsg::RenameCommitted => {
-                if let Some((Target::Tags(agent), typed)) = self.menu.renaming.clone() {
+                if let Some((Target::Tags(agent), _)) = self.menu.renaming.clone() {
                     self.menu.renaming = None;
+                    let tags = nav::field_tags(&std::mem::take(&mut self.menu.tag_fields));
                     self.submit_organize(
                         "Tags".to_owned(),
                         client::Organize::Tag {
                             agent: agent.id.clone(),
-                            tags: nav::parse_tags(&typed),
+                            tags,
+                            revision: agent.organization_revision.unwrap_or(0),
                         },
                         context,
                     );
@@ -846,6 +869,7 @@ impl DesktopApp {
                         client::Organize::Attach {
                             agent: agent.id.clone(),
                             project,
+                            revision: agent.organization_revision.unwrap_or(0),
                         },
                         context,
                     );
@@ -856,13 +880,16 @@ impl DesktopApp {
                     "Detach from project".to_owned(),
                     client::Organize::Detach {
                         agent: agent.id.clone(),
+                        revision: agent.organization_revision.unwrap_or(0),
                     },
                     context,
                 );
             }
             (Action::EditTags, Target::Agent(agent)) => {
-                let typed = agent.tags.join(", ");
-                self.menu.renaming = Some((Target::Tags(agent.clone()), typed));
+                // One field per tag, so a tag such as `ops, EU` saves back
+                // unchanged.
+                self.menu.tag_fields = agent.tags.clone();
+                self.menu.renaming = Some((Target::Tags(agent.clone()), String::new()));
                 self.focus_rename(5, context);
             }
             (Action::Resume, Target::Agent(agent)) => {
@@ -1498,8 +1525,89 @@ impl DesktopApp {
         )
     }
 
+    /// The inline tag editor in place of a row's title: one field per tag
+    /// with its remove button, an empty field for a new tag, then Save and
+    /// Cancel (Enter saves through the window's keyboard hook). Nothing is
+    /// split, so every existing tag round-trips as it is.
+    fn tags_row(&self, indent: f64, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let fields = &self.menu.tag_fields;
+        let blank = String::new();
+        let mut rows: Vec<KeyedView> = fields
+            .iter()
+            .chain(std::iter::once(&blank))
+            .enumerate()
+            .map(|(index, tag)| {
+                let new = index == fields.len();
+                let mut field = m3::field()
+                    .text(tag.clone())
+                    .placeholder_text(if new { "New tag" } else { "Tag" })
+                    .automation_name(if new {
+                        "New tag".to_owned()
+                    } else {
+                        format!("Tag {}", index + 1)
+                    })
+                    .on_text_changed(
+                        context
+                            .callback(move |text| Message::Menu(MenuMsg::TagChanged(index, text))),
+                    );
+                if index == 0 {
+                    field = field.element_ref(&self.menu.rename_ref);
+                }
+                let remove: View = if new {
+                    View::empty()
+                } else {
+                    m3::icon_button(palette)
+                        .grid_column(1)
+                        .width(tokens::height::CONTROL)
+                        .height(tokens::height::CONTROL)
+                        .automation_name(format!("Remove tag {}", index + 1))
+                        .on_click(context.message(Message::Menu(MenuMsg::TagRemoved(index))))
+                        .content(m3::icon(m3::glyph::CLOSE))
+                };
+                KeyedView::new(
+                    format!("tag:{index}"),
+                    Grid::new()
+                        .columns([GridLength::STAR, GridLength::Pixel(tokens::height::CONTROL)])
+                        .column_spacing(tokens::spacing::XS)
+                        .children((field, remove)),
+                )
+            })
+            .collect();
+        rows.push(KeyedView::new(
+            "tag-actions",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .spacing(tokens::spacing::XS)
+                .children((
+                    m3::icon_button(palette)
+                        .width(tokens::height::CONTROL)
+                        .height(tokens::height::CONTROL)
+                        .automation_name("Save tags")
+                        .on_click(context.message(Message::Menu(MenuMsg::RenameCommitted)))
+                        .content(m3::icon(m3::glyph::CHECK)),
+                    m3::icon_button(palette)
+                        .width(tokens::height::CONTROL)
+                        .height(tokens::height::CONTROL)
+                        .automation_name("Cancel tags")
+                        .on_click(context.message(Message::Menu(MenuMsg::RenameCancelled)))
+                        .content(m3::icon(m3::glyph::CLOSE)),
+                )),
+        ));
+        StackPanel::new()
+            .margin(Thickness::new(
+                indent,
+                tokens::spacing::XS,
+                0.0,
+                tokens::spacing::XS,
+            ))
+            .spacing(tokens::spacing::XS)
+            .keyed_children(rows)
+    }
+
     /// The inline rename editor in place of a row's title, with Save and
-    /// Cancel (Enter saves through the window's keyboard hook).
+    /// Cancel (Enter saves through the window's keyboard hook); the tag
+    /// editor for a [`Target::Tags`].
     pub(super) fn rename_row(
         &self,
         typed: &str,
@@ -1507,12 +1615,10 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let tags = matches!(self.menu.renaming, Some((Target::Tags(_), _)));
-        let (placeholder, field, save, cancel) = if tags {
-            ("Tags, comma-separated", "Tags", "Save tags", "Cancel tags")
-        } else {
-            ("Name", "Rename", "Save name", "Cancel rename")
-        };
+        if matches!(self.menu.renaming, Some((Target::Tags(_), _))) {
+            return self.tags_row(indent, context, palette);
+        }
+        let (placeholder, field, save, cancel) = ("Name", "Rename", "Save name", "Cancel rename");
         Grid::new()
             .margin(Thickness::new(
                 indent,

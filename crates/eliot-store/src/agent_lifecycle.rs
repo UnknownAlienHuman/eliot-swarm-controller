@@ -310,6 +310,13 @@ pub(crate) fn custody_blockers_sql(agent: &str, observers: &str) -> String {
     )
 }
 
+/// The ended states in which a custody-held archived Agent stays visible
+/// under the default archived exclusion. `agent.list` rows and counts and
+/// the organization projection's members and totals all apply this list
+/// with [`default_list_custody_agents`], so a row lists exactly where the
+/// projection counts it.
+pub(crate) const CUSTODY_VISIBLE_STATES: &str = "'stopped','failed','lost'";
+
 /// Distinct Agent numbers holding unresolved custody for the default
 /// `agent.list` exclusion (the same blockers as [`custody_blockers_sql`]
 /// with observers disabled): an unexited owned process, an `unknown`

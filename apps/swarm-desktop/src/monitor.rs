@@ -2030,6 +2030,7 @@ mod tests {
                 session_growth: None,
                 organization: None,
                 tags: Vec::new(),
+                organization_revision: None,
             },
             observation: None,
         };
@@ -2092,6 +2093,7 @@ mod tests {
             session_growth: None,
             organization: None,
             tags: Vec::new(),
+            organization_revision: None,
         };
         let make_row = |usage: Option<TurnUsage>, usage_scope: Option<&str>| {
             MonitorRow::from_list(&AgentListRow {
@@ -2282,6 +2284,7 @@ mod tests {
                 session_growth: None,
                 organization: None,
                 tags: Vec::new(),
+                organization_revision: None,
             },
             observation: None,
         }

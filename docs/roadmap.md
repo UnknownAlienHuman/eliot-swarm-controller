@@ -102,10 +102,12 @@ Checked layers record delivered increments, not full crash/load qualification.
 - [x] **4b. Fair queue.** Arbitrate automation assignments across projects and support
   explicit queued interactive launch, wait readback and scoped manager budgets.
 - [x] **5. Desktop and migration.** The sidebar's projects are the `chat.organization`
-  groups (manager, standard worktree branch, assignment and transfer state, "Needs
-  assignment", competing roots, exact server totals, queued launches with their wait
-  reason); `agent.list` rows carry their group, so the desktop groups nothing itself.
-  A task's menu attaches, detaches and tags; a capacity refusal offers Queue it.
+  groups, read in one bounded read (manager, standard worktree branch, assignment
+  and transfer state, "Needs assignment", roots competing with an assigned manager,
+  exact server totals, queued launches with their wait reason); `agent.list` rows
+  carry their group, so the desktop groups nothing itself. A task's menu attaches,
+  detaches and tags under the link revision it read; a capacity refusal offers Queue
+  it, and a lost Queue it reply resolves its intent before the draft returns.
   Legacy path labels stay in the no-project bucket; history is not reinterpreted.
 
 ## L0 — Archive and smallest workspace

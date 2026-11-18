@@ -40,9 +40,14 @@ pub(super) enum ShellMsg {
     /// The owner chose a fresh private data directory (unsafe default).
     UseFreshDirectory,
     ProjectsLoaded(Fallible<Vec<UiProject>>),
-    /// The organization readbacks (`chat.organization`, `project.overview`,
-    /// `launch.queue`), each failed read as an error line.
+    /// The sidebar's grouping readback (`chat.organization` groups with
+    /// their headers and totals, and the `organization.changed` rows since
+    /// the cursor). A failed read keeps the last server grouping with a
+    /// stale marker.
     OrganizationLoaded(Box<nav::Organization>),
+    /// The sidebar's queue state (`launch.queue` waits and this window's
+    /// watched intents), polled independently of the grouping read.
+    QueueLoaded(Box<super::QueueRead>),
     AgentsLoaded(u64, bool, Fallible<AgentPage>),
     /// A first-recent-page refresh: merge the rows into the loaded history
     /// (a launch while the desktop is open arrives here, without dropping
@@ -187,6 +192,9 @@ pub(super) struct ShellState {
     pub(super) organization: nav::Organization,
     /// An organization read is in flight (one at a time).
     pub(super) organization_loading: bool,
+    /// A queue-state read is in flight (one at a time, independent of the
+    /// grouping read).
+    pub(super) queue_loading: bool,
     /// Listed pages, in daemon order.
     pub(super) agents: Vec<UiAgent>,
     /// Direct-children reads of expanded managers.
@@ -305,9 +313,38 @@ impl DesktopApp {
                     }
                 }
             }
-            ShellMsg::OrganizationLoaded(organization) => {
+            ShellMsg::OrganizationLoaded(read) => {
                 self.nav.organization_loading = false;
-                self.nav.organization = *organization;
+                let read = *read;
+                let organization = &mut self.nav.organization;
+                // A failed read keeps the last server grouping (marked
+                // stale); nothing is synthesized in its place.
+                if !read.stale {
+                    organization.groups = read.groups;
+                }
+                organization.stale = read.stale;
+                organization.errors = read.errors;
+                organization.changes_after = read.changes_after;
+                // Organization changes (retag, attach, detach) refresh the
+                // affected loaded rows by id, so an older loaded row never
+                // keeps a stale placement or tags.
+                let changed =
+                    nav::apply_changes(&mut self.nav.agents, &mut self.nav.branches, &read.changes);
+                if changed > 0 {
+                    self.refresh_search();
+                }
+            }
+            ShellMsg::QueueLoaded(read) => {
+                self.nav.queue_loading = false;
+                let read = *read;
+                let organization = &mut self.nav.organization;
+                // A failed queue read keeps the last waits beside its error.
+                if read.queue.is_some() {
+                    organization.queue = read.queue;
+                }
+                organization.intents = read.intents;
+                organization.missing_intents = read.missing;
+                organization.queue_errors = read.errors;
                 self.settle_queued_launches(context);
             }
             ShellMsg::ProjectsLoaded(projects) => match projects {
@@ -715,18 +752,26 @@ impl DesktopApp {
             ShellMsg::FocusSearch(tries) => self.focus_search(tries, context),
             ShellMsg::FocusSearchLater(tries) => self.focus_search_later(tries, context),
             ShellMsg::ShortcutsEnded => {}
-            ShellMsg::AlertDismissed => self.alert = None,
+            ShellMsg::AlertDismissed => {
+                // Dismissing the queue notice releases its draft only once
+                // no intent can exist for it (see `dismiss_queue_offer`).
+                self.alert = None;
+                self.dismiss_queue_notice(context);
+            }
             ShellMsg::ListTick => {
                 // The head (the first recent page plus the live and
                 // attention rows) is re-read on every poll and merged into
                 // the loaded history, even with older pages appended: a
                 // launch or a state change while the desktop is open
-                // arrives without a manual refresh.
+                // arrives without a manual refresh. The queue state polls on
+                // its own worker, so the grouping reads never delay an
+                // arbiter's admission or refusal.
                 if self.preferences_loaded && !self.nav.agents_loading {
                     self.refresh_head(context);
                 }
                 if self.preferences_loaded {
                     self.load_organization(context);
+                    self.load_queue(context);
                 }
                 self.watch_list(context);
             }
@@ -1253,6 +1298,25 @@ impl DesktopApp {
         } else {
             eliot_core::api::ArchivedFilter::Exclude
         };
+        let changes_after = self.nav.organization.changes_after;
+        let _task = context.spawn_background(move |_| {
+            Message::Shell(ShellMsg::OrganizationLoaded(Box::new(
+                load_organization_blocking(&data_dir, archived, changes_after),
+            )))
+        });
+    }
+
+    /// Re-read the queue state (`launch.queue` waits and this window's
+    /// queued intents) on a worker of its own, so the grouping reads never
+    /// delay an arbiter's admission or refusal.
+    pub(super) fn load_queue(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.nav.queue_loading {
+            return;
+        }
+        self.nav.queue_loading = true;
         let watched: Vec<String> = self
             .launch
             .watched
@@ -1260,9 +1324,9 @@ impl DesktopApp {
             .map(|(id, _)| id.clone())
             .collect();
         let _task = context.spawn_background(move |_| {
-            Message::Shell(ShellMsg::OrganizationLoaded(Box::new(
-                load_organization_blocking(&data_dir, archived, watched),
-            )))
+            Message::Shell(ShellMsg::QueueLoaded(Box::new(load_queue_blocking(
+                &data_dir, watched,
+            ))))
         });
     }
 
@@ -1554,9 +1618,15 @@ impl DesktopApp {
         };
         let mut items: Vec<KeyedView> =
             vec![KeyedView::new(format!("caption:{caption}"), caption_row)];
-        // A failed organization read says so; the rows keep the group the
-        // daemon placed them in.
-        for error in &self.nav.organization.errors {
+        // A failed organization or queue read says so; the rows keep the
+        // group the daemon placed them in.
+        for error in self
+            .nav
+            .organization
+            .errors
+            .iter()
+            .chain(&self.nav.organization.queue_errors)
+        {
             items.push(KeyedView::new(
                 format!("organization-error:{error}"),
                 detail_row(error, Some(palette.error())),
@@ -2500,6 +2570,7 @@ mod tests {
             pending: false,
             organization: None,
             tags: Vec::new(),
+            organization_revision: None,
         }
     }
 

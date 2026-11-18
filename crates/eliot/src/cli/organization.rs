@@ -48,6 +48,7 @@ pub(super) async fn run_chat(
                 id: mutation_id(id)?,
                 agents,
                 project,
+                expected_revision: None,
             };
             request.validate().map_err(Failure::for_mutation)?;
             let response: ChatOrganizationMutationResponse =
@@ -68,6 +69,7 @@ pub(super) async fn run_chat(
             let request = ChatDetachRequest {
                 id: mutation_id(id)?,
                 agents,
+                expected_revision: None,
             };
             request.validate().map_err(Failure::for_mutation)?;
             let response: ChatOrganizationMutationResponse =
@@ -89,6 +91,7 @@ pub(super) async fn run_chat(
                 id: mutation_id(id)?,
                 agents,
                 tags: tag,
+                expected_revision: None,
             };
             request.validate().map_err(Failure::for_mutation)?;
             let response: ChatOrganizationMutationResponse =

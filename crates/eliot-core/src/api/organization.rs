@@ -10,7 +10,8 @@
 //! never edit history.
 
 use super::{
-    agent_lifecycle::ArchivedFilter, overview::OverviewManagerView,
+    agent_lifecycle::ArchivedFilter,
+    overview::{OverviewManagerView, ProjectTotals, ScopeUsage},
     project_assignment::ProjectAssignment,
 };
 use crate::{AgentState, Error, Result, parse_agent_id};
@@ -96,8 +97,9 @@ pub(super) fn validate_tags(tags: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// One Agent's organizational link readback: placement and tags. Change
-/// readback rides the projection's event watermark, not a revision.
+/// One Agent's organizational link readback: placement, tags and the link
+/// revision the next menu write carries back. Change readback rides the
+/// projection's event watermark; a stale write is refused by revision.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrgLinkView {
@@ -106,6 +108,17 @@ pub struct OrgLinkView {
     pub project_link: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The overlay row's revision (1 for a freshly linked Agent): a menu
+    /// write carries the revision it observed, and the Store refuses a
+    /// write whose revision moved.
+    #[serde(default = "default_link_revision")]
+    pub revision: i64,
+}
+
+/// The revision of a freshly written overlay row; older retained receipts
+/// decode to the same value.
+pub fn default_link_revision() -> i64 {
+    1
 }
 
 impl OrgLinkView {
@@ -114,7 +127,14 @@ impl OrgLinkView {
         if let Some(project) = &self.project_link {
             validate_project_name(project, "organization link project")?;
         }
-        validate_tags(&self.tags)
+        validate_tags(&self.tags)?;
+        if self.revision < 1 {
+            return Err(Error::new(
+                "unknown",
+                "organization link revision is invalid",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -182,8 +202,7 @@ impl OrgMemberView {
                 ));
             }
         }
-        validate_tags(&self.tags)?;
-        Ok(())
+        validate_tags(&self.tags)
     }
 }
 
@@ -203,9 +222,11 @@ pub struct OrgGroupView {
     /// shown as needing assignment, never auto-assigned.
     #[serde(default)]
     pub needs_assignment: bool,
-    /// Independent roots beyond the first, by Agent id: competing execution
-    /// roots surface here without reassigning any of them. Counts every
-    /// retained root independently of the archived display filter.
+    /// Retained roots competing with the assigned manager, by Agent id:
+    /// they surface here without reassigning any of them. Without an
+    /// assigned manager there is no competing manager, so this stays empty
+    /// and an unassigned project reads `needs_assignment` alone. Counts
+    /// every retained root independently of the archived display filter.
     #[serde(default)]
     pub conflicting_roots: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,6 +241,15 @@ pub struct OrgGroupView {
     pub member_total: usize,
     #[serde(default)]
     pub members_truncated: bool,
+    /// A registered project's exact team totals, the numbers
+    /// `project.overview` reports for it, so one bounded read carries every
+    /// sidebar header and its totals. Absent without a registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totals: Option<ProjectTotals>,
+    /// A registered project's slot use beside its Owner limit (the
+    /// `project:<id>` capacity scope). Absent without a registration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<ScopeUsage>,
 }
 
 impl OrgGroupView {
@@ -237,7 +267,12 @@ impl OrgGroupView {
                     "organization group registration differs",
                 ));
             }
-        } else if self.assignment.is_some() || self.manager.is_some() || self.transfer.is_some() {
+        } else if self.assignment.is_some()
+            || self.manager.is_some()
+            || self.transfer.is_some()
+            || self.totals.is_some()
+            || self.capacity.is_some()
+        {
             return Err(Error::new(
                 "unknown",
                 "organization group carries team detail without a registration",
@@ -255,6 +290,18 @@ impl OrgGroupView {
             manager
                 .validate()
                 .map_err(|_| Error::new("unknown", "organization response manager is invalid"))?;
+        }
+        if let Some(capacity) = &self.capacity
+            && (capacity.validate().is_err()
+                || self
+                    .project
+                    .as_ref()
+                    .is_none_or(|project| capacity.scope != format!("project:{project}")))
+        {
+            return Err(Error::new(
+                "unknown",
+                "organization response capacity is invalid",
+            ));
         }
         if self
             .transfer
@@ -344,8 +391,9 @@ impl ChatOrganizationRequest {
 }
 
 /// The grouped projection readback: every group plus the event watermark
-/// the committed snapshot observed. There is no organization revision;
-/// mutation readback replays the retained row.
+/// the committed snapshot observed. Each overlay row carries its own link
+/// revision for the next menu write; mutation readback replays the retained
+/// row.
 #[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatOrganizationResponse {
@@ -433,6 +481,23 @@ impl ChatOrganizationResponse {
     }
 }
 
+/// The overlay revisions a menu write observed, one per selected Agent in
+/// request order (0 when the Agent has no overlay row yet). The Store
+/// refuses a write whose revision moved. Absent when the caller carries no
+/// readback (the CLI), which skips the check.
+fn validate_expected_revision(expected: &Option<Vec<i64>>, agents: &[String]) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if expected.len() != agents.len() || expected.iter().any(|revision| *revision < 0) {
+        return Err(Error::new(
+            "invalid",
+            "organization expected revisions carry one nonnegative entry per Agent",
+        ));
+    }
+    Ok(())
+}
+
 /// `chat.attach`: place chats under a retained project. Placement only:
 /// execution project, scope, workspace and history are untouched.
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
@@ -441,13 +506,20 @@ pub struct ChatAttachRequest {
     pub id: String,
     pub agents: Vec<String>,
     pub project: String,
+    /// The link revision each selected Agent was read with, in `agents`
+    /// order (`organization_revision` of its `agent.list` row, 0 without an
+    /// overlay row). A write whose revision moved is refused with
+    /// `conflict` and changes nothing. Omitted skips the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<Vec<i64>>,
 }
 
 impl ChatAttachRequest {
     pub fn validate(&self) -> Result<()> {
         validate_mutation_id(&self.id)?;
         validate_agents(&self.agents)?;
-        validate_project_name(&self.project, "params.project")
+        validate_project_name(&self.project, "params.project")?;
+        validate_expected_revision(&self.expected_revision, &self.agents)
     }
 
     pub fn validate_response(&self, reply: &ChatOrganizationMutationResponse) -> Result<()> {
@@ -470,12 +542,19 @@ impl ChatAttachRequest {
 pub struct ChatDetachRequest {
     pub id: String,
     pub agents: Vec<String>,
+    /// The link revision each selected Agent was read with, in `agents`
+    /// order (`organization_revision` of its `agent.list` row, 0 without an
+    /// overlay row). A write whose revision moved is refused with
+    /// `conflict` and changes nothing. Omitted skips the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<Vec<i64>>,
 }
 
 impl ChatDetachRequest {
     pub fn validate(&self) -> Result<()> {
         validate_mutation_id(&self.id)?;
-        validate_agents(&self.agents)
+        validate_agents(&self.agents)?;
+        validate_expected_revision(&self.expected_revision, &self.agents)
     }
 
     pub fn validate_response(&self, reply: &ChatOrganizationMutationResponse) -> Result<()> {
@@ -502,13 +581,20 @@ pub struct ChatTagRequest {
     pub agents: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The link revision each selected Agent was read with, in `agents`
+    /// order (`organization_revision` of its `agent.list` row, 0 without an
+    /// overlay row). A write whose revision moved is refused with
+    /// `conflict` and changes nothing. Omitted skips the check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<Vec<i64>>,
 }
 
 impl ChatTagRequest {
     pub fn validate(&self) -> Result<()> {
         validate_mutation_id(&self.id)?;
         validate_agents(&self.agents)?;
-        validate_tags(&self.tags)
+        validate_tags(&self.tags)?;
+        validate_expected_revision(&self.expected_revision, &self.agents)
     }
 
     pub fn validate_response(&self, reply: &ChatOrganizationMutationResponse) -> Result<()> {
@@ -522,6 +608,69 @@ impl ChatTagRequest {
                 .any(|(link, agent)| &link.agent != agent || link.tags != self.tags)
         {
             return Err(Error::new("unknown", "tag response binding differs"));
+        }
+        Ok(())
+    }
+}
+
+/// The `organization.changed` event kind: one per fresh attach, detach or
+/// tag write, published after commit.
+pub const ORGANIZATION_CHANGED_KIND: &str = "organization.changed";
+
+/// One Agent row as an organization write left it: the group its
+/// `agent.list` row now reads in, its tags and its link revision.
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrgRowChange {
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub revision: i64,
+}
+
+impl OrgRowChange {
+    pub fn validate(&self) -> Result<()> {
+        parse_agent_id(&self.agent)?;
+        if let Some(group) = &self.organization {
+            validate_project_name(group, "organization change group")?;
+        }
+        validate_tags(&self.tags)?;
+        if self.revision < 1 {
+            return Err(Error::new(
+                "unknown",
+                "organization change revision is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The `organization.changed` event payload: the write id and method, and
+/// one row per written Agent, so a client refreshes the rows it already
+/// loaded by id instead of re-reading history. Events retained before the
+/// rows were added decode with none.
+#[derive(Clone, Debug, PartialEq, Eq, JsonSchema, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrganizationChangedEvent {
+    pub id: String,
+    pub method: String,
+    #[serde(default)]
+    pub rows: Vec<OrgRowChange>,
+}
+
+impl OrganizationChangedEvent {
+    pub fn validate(&self) -> Result<()> {
+        validate_mutation_id(&self.id)?;
+        if self.rows.len() > MAX_ORG_AGENTS {
+            return Err(Error::new(
+                "unknown",
+                "organization change row bound differs",
+            ));
+        }
+        for row in &self.rows {
+            row.validate()?;
         }
         Ok(())
     }
@@ -567,6 +716,7 @@ mod tests {
             id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             agents: vec![agent()],
             project: "app".to_owned(),
+            expected_revision: Some(vec![1]),
         };
         request.validate().unwrap();
         let reply = ChatOrganizationMutationResponse {
@@ -575,6 +725,7 @@ mod tests {
                 agent: agent(),
                 project_link: Some("app".to_owned()),
                 tags: Vec::new(),
+                revision: 2,
             }],
         };
         request.validate_response(&reply).unwrap();
@@ -609,6 +760,7 @@ mod tests {
             id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             agents: vec![agent()],
             tags: vec!["inbox".to_owned()],
+            expected_revision: None,
         };
         request.validate().unwrap();
         let reply = ChatOrganizationMutationResponse {
@@ -617,6 +769,7 @@ mod tests {
                 agent: agent(),
                 project_link: None,
                 tags: vec!["inbox".to_owned()],
+                revision: 1,
             }],
         };
         request.validate_response(&reply).unwrap();
@@ -629,9 +782,39 @@ mod tests {
                 id: request.id.clone(),
                 agents: vec![agent()],
                 tags,
+                expected_revision: None,
             };
             assert!(bad.validate().is_err());
         }
+    }
+
+    #[test]
+    fn expected_revision_needs_one_nonnegative_entry_per_agent() {
+        let base = ChatDetachRequest {
+            id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            agents: vec![agent()],
+            expected_revision: None,
+        };
+        base.validate().unwrap();
+        let matching = ChatDetachRequest {
+            expected_revision: Some(vec![0]),
+            ..base.clone()
+        };
+        matching.validate().unwrap();
+        for expected in [Some(vec![]), Some(vec![1, 2]), Some(vec![-1])] {
+            let bad = ChatDetachRequest {
+                expected_revision: expected,
+                ..base.clone()
+            };
+            assert!(bad.validate().is_err());
+        }
+        let stale = OrgLinkView {
+            agent: agent(),
+            project_link: None,
+            tags: Vec::new(),
+            revision: 0,
+        };
+        assert!(stale.validate().is_err());
     }
 
     #[test]
@@ -646,6 +829,7 @@ mod tests {
                 tags: (0..MAX_ORG_TAGS)
                     .map(|tag| format!("{tag:016}{}", "t".repeat(MAX_ORG_TAG_BYTES - 16)))
                     .collect(),
+                revision: 1,
             })
             .collect();
         let reply = ChatOrganizationMutationResponse {
@@ -659,6 +843,29 @@ mod tests {
             "worst nominal receipt uses {} of {MAX_EVENT_BYTES} bytes",
             encoded.len(),
         );
+        // The `organization.changed` event carries the same rows with the
+        // group in place of the link, plus the method, and still fits.
+        let event = OrganizationChangedEvent {
+            id: reply.id.clone(),
+            method: "chat.attach".to_owned(),
+            rows: reply
+                .links
+                .iter()
+                .map(|link| OrgRowChange {
+                    agent: link.agent.clone(),
+                    organization: link.project_link.clone(),
+                    tags: link.tags.clone(),
+                    revision: i64::MAX,
+                })
+                .collect(),
+        };
+        event.validate().unwrap();
+        let encoded = serde_json::to_vec(&event).unwrap();
+        assert!(
+            encoded.len() + 1024 <= MAX_EVENT_BYTES,
+            "worst organization event uses {} of {MAX_EVENT_BYTES} bytes",
+            encoded.len(),
+        );
     }
 
     #[test]
@@ -670,6 +877,7 @@ mod tests {
             id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             agents,
             project: "app".to_owned(),
+            expected_revision: None,
         };
         assert_eq!(request.validate().unwrap_err().code, "invalid");
     }
@@ -711,6 +919,8 @@ mod tests {
                 members: vec![member],
                 member_total: 1,
                 members_truncated: false,
+                totals: None,
+                capacity: None,
             }],
             member_total: 1,
             truncated: false,
@@ -745,6 +955,8 @@ mod tests {
             members: Vec::new(),
             member_total: 0,
             members_truncated: false,
+            totals: None,
+            capacity: None,
         };
         let reply = ChatOrganizationResponse {
             event_watermark: 1,
