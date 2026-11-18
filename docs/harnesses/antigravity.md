@@ -157,11 +157,14 @@ Tool calls map from `tool_call` and `tool_call_update` using the native
 validated permission ask in the current prompt. Omitted title and status
 inherit the last value for that call. AGY can finish an asynchronous tool
 after its prompt has completed and emit unsolicited assistant or tool output.
-After the fenced terminal reply, assistant chunks and tool notifications
-received while idle have no Eliot turn and are discarded. A late delta for a
-prior call is also discarded during a later prompt, which has its own tool
-IDs. Session identity is checked before these rules. The next send uses the
-same live ACP session and a new fenced prompt.
+Once session identity is verified, assistant chunks and tool notifications
+received without a pending prompt record a `source.gap` scoped to `message` or
+`tool`. This applies before the first turn and after a fenced terminal reply.
+Each family reports at most one gap per idle episode. An unmatched tool delta
+during a later prompt records at most one `tool` gap for that prompt. These
+gaps leave the output unattributed. A confirmed coverage gap preserves stream
+health and permits the next send on the same live ACP session. An unresolved
+gap acknowledgement fences the stream.
 
 **Interrupt** is the ACP `session/cancel` notification scoped to the exact
 active Eliot turn (turn id required, stale turns reject). The command
