@@ -339,17 +339,11 @@ Codex or for unrelated adapters.
 The selected local scope remains in progress while the applicable L7
 qualification is incomplete; do not describe it as feature complete.
 
-- [ ] **Local adopted backends via OpenCode.** One documented usable
-      OpenCode + adopted-backend profile (Strata, Unsloth Studio, LM Studio
-      and llama.cpp presets with Ollama/vLLM on the same OpenAI-compatible
-      provider path; managed startup deferred to adopted endpoints only).
-      Completion: installed backend/harness versions with model/quantization
-      and effective context recorded; a coding turn with an actual tool
-      result, context/output-limit handling, interrupt/stop, and two Agents
-      sharing the server without cross-stop or extra model loading;
-      missing-key rejection and conflicting project settings checked. No
-      owner-global configuration edits or automatic harness/model/account
-      fallback. Codex against these backends stays unsupported.
+Local models are not a separate Swarm integration (owner decision, 2026-11-18;
+#408 closed). Users run them through a harness's own provider configuration,
+such as OpenCode providers, and Swarm launches that harness like any other. The
+existing `eliot-local` OpenCode profile path stays as implemented; it is not
+extended or qualified further.
 
 - [ ] **Failure diagnostics that say why and where (#384).** Typed `where`/`origin`
       on every settled failure, sanitized daemon log with standard/debug modes,
@@ -406,7 +400,6 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       `CLAUDE_CONFIG_DIR` credential mount; readiness commits, never unknown.
       Muse/Antigravity Linux binaries install and run, but their authenticated
       turns are not qualified here. Custody stays honestly degraded (see Docker README).
-- [ ] Adopted-service isolation (with the local adopted backends). Deferred by the owner.
 - [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent,
       2,000-events/s owner run is a release capacity check, not a prerequisite to L2.
 
