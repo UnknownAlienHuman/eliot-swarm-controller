@@ -474,10 +474,10 @@ stays in the plugin spec.
 Owner-only and freezes a profile-equivalent snapshot from safe defaults
 (`dangerously_skip_permissions = false`, explicit MCP `inherit`) plus flags. A model
 may be omitted to preserve the verified ACP session default described above.
-`cmd` is the installed `agy` CLI when it is on `PATH` (it serves both `acp`
-and `models`), falling back to the installed app at
-`%LOCALAPPDATA%\Programs\Antigravity\Antigravity.exe`, or `unsupported` when
-neither is found. `swarm models --harness antigravity` returns the live
+`cmd` is the installed `agy` CLI on `PATH` (it serves both `acp` and
+`models`); there is no fallback. An IDE-only install reports `unsupported`
+naming the IDE path with guidance to install `agy`: the IDE executable does
+not implement the native ACP/model CLI and is never launched for discovery. `swarm models --harness antigravity` returns the live
 read-only catalogue from `agy models` (exact argv `models`, bounded time and
 output, same environment construction as launch): tab-separated native ids
 kept verbatim (for example `gemini-4-argon-medium`, `gemini-4-hydrogen-xhigh`,

@@ -1221,23 +1221,41 @@ fn discover_antigravity_cmd() -> core::Result<String> {
         }
     }
     let mut searched: Vec<String> = vec!["agy.exe on PATH".to_owned()];
+    if cfg!(not(windows)) {
+        searched.push("agy on PATH".to_owned());
+    }
+    // An IDE-only install is reported with actionable guidance: name where
+    // the IDE was seen so the message points at the fix without launching it.
+    let mut ide_hint: Option<String> = None;
     for local in local_roots() {
         let native = local
             .join("Programs")
             .join("Antigravity")
             .join("Antigravity.exe");
         searched.push(native.to_string_lossy().into_owned());
-        if native.is_file() {
-            return Ok(native.to_string_lossy().into_owned());
+        if ide_hint.is_none() && native.is_file() {
+            ide_hint = Some(native.to_string_lossy().into_owned());
         }
     }
-    Err(core::Error::new(
+    Err(antigravity_missing_cli(&searched, ide_hint.as_deref()))
+}
+
+/// Error for an `agy`-less install. The IDE path, when seen, is named for
+/// guidance only: it is never returned, executed or version-probed.
+fn antigravity_missing_cli(searched: &[String], ide: Option<&str>) -> core::Error {
+    core::Error::new(
         "unsupported",
-        format!(
-            "antigravity native executable was not found; searched {}",
-            searched.join(", ")
-        ),
-    ))
+        match ide {
+            Some(ide) => format!(
+                "antigravity native CLI `agy` was not found on PATH; the Antigravity IDE at {ide} does not implement the required native ACP/model CLI and is never launched for discovery. Install the `agy` CLI and put it on PATH; searched {}",
+                searched.join(", ")
+            ),
+            None => format!(
+                "antigravity native executable was not found; searched {}",
+                searched.join(", ")
+            ),
+        },
+    )
 }
 
 /// Read-only harness installation facts. No model turn and no inference:
@@ -1674,6 +1692,32 @@ mod tests {
         // An empty store lists (none) instead of naming a secret-free blank.
         let error = resolve_opencode_default(Some("opencode/m"), &[]).unwrap_err();
         assert!(error.message.contains("(none)"), "{}", error.message);
+    }
+
+    #[test]
+    fn antigravity_discovery_never_selects_the_ide() {
+        // An IDE-only install reports guidance naming the IDE path without
+        // selecting it; no `Antigravity.exe` path is ever returned.
+        let searched = vec!["agy.exe on PATH".to_owned()];
+        let ide = r"C:\Users\owner\AppData\Local\Programs\Antigravity\Antigravity.exe";
+        let error = antigravity_missing_cli(&searched, Some(ide));
+        assert_eq!(error.code, "unsupported");
+        assert!(error.message.contains(ide), "guidance names the IDE path");
+        assert!(error.message.contains("never launched"));
+        let error = antigravity_missing_cli(&searched, None);
+        assert!(error.message.contains("was not found"));
+        assert!(!error.message.contains("Antigravity.exe"));
+        // Whatever the host PATH holds, live discovery never resolves the IDE.
+        match discover_antigravity_cmd() {
+            Ok(cmd) => {
+                assert!(
+                    !cmd.ends_with("Antigravity.exe"),
+                    "IDE binary selected: {cmd}"
+                );
+                assert!(cmd.to_ascii_lowercase().contains("agy"));
+            }
+            Err(error) => assert_eq!(error.code, "unsupported"),
+        }
     }
 
     #[test]
