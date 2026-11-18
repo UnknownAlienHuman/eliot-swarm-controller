@@ -336,16 +336,20 @@ tools = true
 
 `model` is the exact `provider/model` string; the `provider.<id>` fragment is
 written as-is into the isolated `opencode.jsonc` under `providers`. Every
-`{env:NAME}` reference must name a `pass_env`-allowed environment; a missing or
+credential-bearing field (`apiKey`, auth headers) must be exactly one valid
+`{env:NAME}` naming a `pass_env`-allowed environment; literals, prefixed or
+malformed references, and URLs with userinfo refuse at freeze. A missing or
 empty required value refuses before startup instead of silently becoming no-auth.
 `auth_integration` must be absent on this path so no unrelated canonical
-credential is imported. The plugin verifies that the fragment defines the requested provider and
-verifies the exact pair through the live `GET /api/model` catalogue
-(with limits from that catalogue row) before any native session is created —
-every verification failure settles the launch as failed with a short safe reason,
-never unknown — rejecting project overrides that retarget the route. An
-unreachable endpoint is not a start failure: the catalogue still lists the model
-and the native turn surfaces the refusal.
+credential is imported. The plugin verifies that the fragment defines the
+requested provider, that no workspace config redefines the same
+`providers.<id>`, and verifies the exact pair through the live `GET /api/model`
+catalogue (carrying that row's context and output limits into the ready result,
+omitted as unknown) before any native session is created — every verification
+failure settles the launch as failed with a short safe reason, never unknown —
+rejecting project overrides that retarget the route. An unreachable endpoint is
+not a start failure: the catalogue still lists the model and the native turn
+surfaces the refusal.
 There is no harness/model/account fallback. Codex profiles against these
 endpoints stay `unsupported`. See the
 [OpenCode harness page](../harnesses/opencode.md#custom-provider-fragments).

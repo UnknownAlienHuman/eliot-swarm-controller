@@ -308,6 +308,7 @@ pub fn as_catalog(reply: &HarnessModelsResponse) -> ModelsCatalogResponse {
                 default: entry.default || reply.default.as_deref() == Some(entry.id.as_str()),
                 availability: eliot_core::api::harness::CATALOG_AVAILABLE.to_owned(),
                 source: entry.source.clone(),
+                profile: None,
             })
             .collect(),
         next: None,

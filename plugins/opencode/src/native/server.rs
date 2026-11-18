@@ -96,6 +96,139 @@ fn fragment_env_refs(value: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
+/// Exact `{env:NAME}` reference, or `None` for literals, prefixed values
+/// and malformed placeholders.
+fn exact_fragment_env_ref(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    if !(trimmed.starts_with("{env:") && trimmed.ends_with('}')) {
+        return None;
+    }
+    let name = &trimmed[5..trimmed.len() - 1];
+    if name.is_empty()
+        || name.len() > 256
+        || !(name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn has_malformed_fragment_env_ref(value: &str) -> bool {
+    let mut index = 0;
+    while let Some(start) = value[index..].find("{env:") {
+        let base = index + start + 5;
+        let Some(end_rel) = value[base..].find('}') else {
+            return true;
+        };
+        let name = &value[base..base + end_rel];
+        if name.is_empty()
+            || name.len() > 256
+            || !(name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        {
+            return true;
+        }
+        index = base + end_rel + 1;
+    }
+    false
+}
+
+fn is_fragment_credential_field(key: &str, parent: Option<&str>) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    if matches!(
+        key.as_str(),
+        "apikey" | "api_key" | "api-key" | "authorization"
+    ) {
+        return true;
+    }
+    if let Some(parent) = parent.map(|parent| parent.trim().to_ascii_lowercase())
+        && matches!(parent.as_str(), "headers" | "header")
+    {
+        return true;
+    }
+    false
+}
+
+fn fragment_value_has_userinfo(value: &str) -> bool {
+    let Some(scheme_end) = value.find("://") else {
+        return false;
+    };
+    let rest = &value[scheme_end + 3..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    rest[..authority_end].contains('@')
+}
+
+/// Refuse literal credentials that bypassed freeze (for example a retained
+/// snapshot): credential-bearing fields must be exactly one valid `{env:}`
+/// reference, URLs must carry no userinfo, and every placeholder must be
+/// well-formed. This looks inside `{env:}` too, so a malformed placeholder
+/// never passes as a credential.
+fn validate_fragment_literals(fragment: &ProviderFragment) -> Result<()> {
+    fn walk(value: &serde_json::Value, parent: Option<&str>) -> Result<()> {
+        match value {
+            serde_json::Value::String(text) => {
+                if has_malformed_fragment_env_ref(text) {
+                    return Err(Error::new(
+                        "profile_error",
+                        "OpenCode provider fragment contains a malformed {env:} reference",
+                    ));
+                }
+                if text.contains("://") && fragment_value_has_userinfo(text) {
+                    return Err(Error::new(
+                        "profile_error",
+                        "OpenCode provider fragment URL must not contain credentials",
+                    ));
+                }
+                Ok(())
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, None)?;
+                }
+                Ok(())
+            }
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    if let serde_json::Value::String(text) = item {
+                        if has_malformed_fragment_env_ref(text) {
+                            return Err(Error::new(
+                                "profile_error",
+                                "OpenCode provider fragment contains a malformed {env:} reference",
+                            ));
+                        }
+                        if text.contains("://") && fragment_value_has_userinfo(text) {
+                            return Err(Error::new(
+                                "profile_error",
+                                "OpenCode provider fragment URL must not contain credentials",
+                            ));
+                        }
+                    }
+                    walk(item, Some(key))?;
+                    if let serde_json::Value::String(text) = item
+                        && is_fragment_credential_field(key, parent)
+                        && exact_fragment_env_ref(text).is_none()
+                    {
+                        return Err(Error::new(
+                            "profile_error",
+                            "OpenCode provider fragment credential fields must be a valid {env:NAME}",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    walk(&serde_json::Value::Object(fragment.clone()), None)
+}
+
 /// Every `{env:NAME}` in the fragment must resolve to a non-empty runtime
 /// value in the serve environment. A missing or empty value refuses before
 /// `serve` starts, never silently becoming no-auth mode.
@@ -103,6 +236,7 @@ pub(crate) fn validate_fragment_environment(
     fragment: &ProviderFragment,
     environment: &[(OsString, OsString)],
 ) -> Result<()> {
+    validate_fragment_literals(fragment)?;
     let mut refs = Vec::new();
     fragment_env_refs(&serde_json::Value::Object(fragment.clone()), &mut refs);
     for name in refs {
@@ -135,13 +269,12 @@ pub const SWARM_MCP_SERVER_NAME: &str = "eliot-swarm";
 /// providers or credentials in this document: the Agent runs the server
 /// defaults, and the selected native credential arrives through the pre-serve
 /// auth transfer into the isolated store, never through this document. On the
-/// adopted local path the frozen provider block below renders the installed
-/// native schema (`providers`, `package`, `settings`, model capabilities
-/// and `limit.context/output`) with `{env:NAME}` references only, so key
-/// values stay runtime-only; no-auth mode carries no `apiKey` key at all,
-/// never an empty string. A local-backend profile always carries an explicit
-/// model (the eliot-local segment): absent model with a local provider is a
-/// profile error raised by the caller, never rendered here.
+/// fragment path the frozen provider block below renders the installed
+/// native schema (`providers`, `package`, `settings`, model capabilities)
+/// with `{env:NAME}` references only, so key values stay runtime-only;
+/// no-auth mode carries no `apiKey` key at all, never an empty string.
+/// A fragment profile always carries an explicit model: absent model with a
+/// fragment is a profile error raised by the caller, never rendered here.
 ///
 /// `swarm_executable` and `swarm_data_dir` are the absolute active Swarm
 /// executable and the Agent's owned Eliot data root, validated by the
@@ -1074,6 +1207,43 @@ mod tests {
         // Malformed (relative/empty) store roots are rejected before I/O.
         assert!(stable_store_dir(Path::new("plugins"), "a12").is_err());
         assert!(stable_store_dir(Path::new(""), "a12").is_err());
+    }
+
+    #[test]
+    fn fragment_environment_refuses_literal_credentials() {
+        use std::ffi::OsString;
+        let env = vec![(
+            OsString::from("K173D_PROOF_KEY"),
+            OsString::from("secret-value"),
+        )];
+        // Valid {env:} reference passes.
+        let mut good = ProviderFragment::new();
+        good.insert(
+            "k173d-fixture".to_owned(),
+            serde_json::json!({"settings": {"apiKey": "{env:K173D_PROOF_KEY}"}}),
+        );
+        assert!(validate_fragment_environment(&good, &env).is_ok());
+        // Literal apiKey, header, URL userinfo and malformed refs refuse.
+        for bad in [
+            serde_json::json!({"settings": {"apiKey": "literal-test-key"}}),
+            serde_json::json!({"settings": {"headers": {"X-Auth": "literal"}}}),
+            serde_json::json!({"settings": {"baseURL": "https://user:pass@host/v1"}}),
+            serde_json::json!({"settings": {"apiKey": "{env:}"}}),
+            serde_json::json!({"settings": {"apiKey": "Bearer {env:K173D_PROOF_KEY}"}}),
+        ] {
+            let mut fragment = ProviderFragment::new();
+            fragment.insert("k173d-fixture".to_owned(), bad);
+            let error =
+                validate_fragment_environment(&fragment, &env).expect_err("literal must refuse");
+            assert_eq!(error.code, "profile_error");
+        }
+        // Missing env value refuses without becoming no-auth.
+        let mut missing = ProviderFragment::new();
+        missing.insert(
+            "k173d-fixture".to_owned(),
+            serde_json::json!({"settings": {"apiKey": "{env:MISSING_KEY}"}}),
+        );
+        assert!(validate_fragment_environment(&missing, &env).is_err());
     }
 
     #[test]

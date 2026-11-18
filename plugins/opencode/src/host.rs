@@ -317,6 +317,7 @@ struct AgentSession {
     stop_command_id: Option<String>,
     resources_proved_closed: bool,
     stop_end_ack_proved: bool,
+    provider_fragment: Option<ProviderFragment>,
 }
 
 /// A start request that passed admission: decoded params plus the validated
@@ -1132,6 +1133,7 @@ impl OpenCodePlugin {
             stop_command_id: None,
             resources_proved_closed: false,
             stop_end_ack_proved: false,
+            provider_fragment: parsed.provider_fragment.clone(),
         };
 
         Ok(session)
@@ -1211,12 +1213,19 @@ impl OpenCodePlugin {
             parsed.requested_model.as_deref(),
         ) {
             let provider_id = requested.split('/').next().unwrap_or("");
-            if !fragment.contains_key(provider_id) {
+            if !fragment_defines_provider(fragment, provider_id) {
                 let failure = Error::new(
                     "profile_error",
                     "OpenCode provider fragment does not define the requested provider",
                 );
                 discard_failed_start(&mut session, failure.clone(), envelope).await;
+                return Ok(CreateOutcome::ProvenFailed(
+                    self.retain_proven_no_effect_start(&parsed.params, StartPhase::Verify, failure),
+                ));
+            }
+            if let Err(error) = refuse_workspace_provider_override(&parsed.workspace, provider_id) {
+                let failure = error.clone();
+                discard_failed_start(&mut session, error, envelope).await;
                 return Ok(CreateOutcome::ProvenFailed(
                     self.retain_proven_no_effect_start(&parsed.params, StartPhase::Verify, failure),
                 ));
@@ -1231,6 +1240,7 @@ impl OpenCodePlugin {
         // catalogue must also prove the variant belongs to that exact
         // model row. A miss or an unreadable catalogue is a definite
         // failed start, never unknown.
+        let mut ready_limits: Option<(Option<i64>, Option<i64>)> = None;
         if let Some(requested) = parsed.requested_model.as_deref() {
             let requested_variant = parsed
                 .model_ref
@@ -1289,6 +1299,12 @@ impl OpenCodePlugin {
                     ));
                 }
             }
+            ready_limits = Some(
+                catalogue_entry(&catalogue, requested)
+                    .and_then(|entry| entry.limit.as_ref())
+                    .map(|limit| (limit.context, limit.output))
+                    .unwrap_or((None, None)),
+            );
         }
         // Workspace-inherited project MCP layers: the owned serve already
         // merged them, so an owner-identity entry there must refuse the start
@@ -1441,6 +1457,18 @@ impl OpenCodePlugin {
             "effort_verified": effort_verified,
             "cwd": created.location.as_ref().map(|location| location.directory.clone()),
         });
+        // Carry the matching catalogue row's context and output limits into
+        // the ready result; omitted values stay unknown (null), never zero.
+        match ready_limits {
+            Some((context, output)) => {
+                effective["context_limit"] = context.map_or(Value::Null, Value::from);
+                effective["output_limit"] = output.map_or(Value::Null, Value::from);
+            }
+            None => {
+                effective["context_limit"] = Value::Null;
+                effective["output_limit"] = Value::Null;
+            }
+        }
         if created.model.is_none()
             && let Some(default) = native_default_model
         {
@@ -1692,18 +1720,20 @@ impl OpenCodePlugin {
         // setter: the quiesce below aborts a running retained execution,
         // so a catalogue miss must fail here with proven no effect
         // instead of aborting that turn and then failing.
-        if let Err(error) =
-            Self::resume_validate_catalogue(&parsed, &session, &retained, deadline).await
-        {
-            discard_unstarted(&mut session, envelope).await;
-            return Ok(self.proven_no_effect_start(
-                &parsed.params,
-                PhaseFailure {
-                    phase: StartPhase::ResumeRefused,
-                    error: Box::new(error),
-                },
-            ));
-        }
+        let resume_limits =
+            match Self::resume_validate_catalogue(&parsed, &session, &retained, deadline).await {
+                Ok(limits) => limits,
+                Err(error) => {
+                    discard_unstarted(&mut session, envelope).await;
+                    return Ok(self.proven_no_effect_start(
+                        &parsed.params,
+                        PhaseFailure {
+                            phase: StartPhase::ResumeRefused,
+                            error: Box::new(error),
+                        },
+                    ));
+                }
+            };
         // Effective MCP proof before the quiesce below can abort a running
         // retained execution: the settled inventory is gated and the
         // winning effective documents must carry no owner transport (plus
@@ -1734,6 +1764,7 @@ impl OpenCodePlugin {
             &retained.id,
             mcp_servers,
             mcp_servers_verified,
+            resume_limits,
             deadline,
         )
         .await
@@ -1929,7 +1960,7 @@ impl OpenCodePlugin {
         session: &AgentSession,
         retained: &SessionInfo,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> Result<Option<(Option<i64>, Option<i64>)>> {
         // The realignment target is the inherited overlay's effective
         // model and effort when a resume carries them (the retained
         // session already runs them), else the frozen request. An omitted
@@ -1947,8 +1978,21 @@ impl OpenCodePlugin {
                 .as_deref()
                 .or(parsed.requested_effort.as_deref())
         };
+        // The fragment membership rule matches the create path before any
+        // write: a catalog-listed model outside the fragment refuses here,
+        // before the quiesce interrupt aborts a running retained turn.
+        if let (Some(fragment), Some(target)) = (parsed.provider_fragment.as_ref(), target_model) {
+            let provider_id = target.split('/').next().unwrap_or("");
+            if !fragment_defines_provider(fragment, provider_id) {
+                return Err(Error::new(
+                    "profile_error",
+                    "OpenCode provider fragment does not define the retained provider",
+                ));
+            }
+            refuse_workspace_provider_override(&parsed.workspace, provider_id)?;
+        }
         if target_model.is_none() && target_variant.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let catalogue = session
             .http
@@ -2016,7 +2060,36 @@ impl OpenCodePlugin {
                 ));
             }
         }
-        Ok(())
+        // Carry the matching catalogue row's limits for the ready result;
+        // omitted values stay unknown (None), never zero.
+        if let Some(target) = target_model
+            && let Some(target_ref) = target_ref
+        {
+            let _ = target;
+            if let Some(entry) =
+                catalogue_entry_for(&catalogue, &target_ref.provider_id, &target_ref.id)
+                && let Some(limit) = entry.limit.as_ref()
+            {
+                return Ok(Some((limit.context, limit.output)));
+            }
+            return Ok(Some((None, None)));
+        }
+        if let Some(variant) = target_variant {
+            let _ = variant;
+            if let Some(validation_ref) = parsed
+                .override_model_ref
+                .as_ref()
+                .or(parsed.model_ref.as_ref())
+                .or(retained.model.as_ref())
+                && let Some(entry) =
+                    catalogue_entry_for(&catalogue, &validation_ref.provider_id, &validation_ref.id)
+                && let Some(limit) = entry.limit.as_ref()
+            {
+                return Ok(Some((limit.context, limit.output)));
+            }
+            return Ok(Some((None, None)));
+        }
+        Ok(None)
     }
 
     /// Resume MCP proof: gate the settled inventory and prove the winning
@@ -2087,6 +2160,7 @@ impl OpenCodePlugin {
         session_id: &str,
         mcp_servers: Value,
         mcp_servers_verified: bool,
+        resume_limits: Option<(Option<i64>, Option<i64>)>,
         deadline: Instant,
     ) -> Result<Value> {
         let current = session
@@ -2330,6 +2404,16 @@ impl OpenCodePlugin {
             "agent_verified": agent_verified,
             "cwd": effective.location.as_ref().map(|location| location.directory.clone()),
         });
+        match resume_limits {
+            Some((context, output)) => {
+                effective_value["context_limit"] = context.map_or(Value::Null, Value::from);
+                effective_value["output_limit"] = output.map_or(Value::Null, Value::from);
+            }
+            None => {
+                effective_value["context_limit"] = Value::Null;
+                effective_value["output_limit"] = Value::Null;
+            }
+        }
         effective_value["native_subagents"] = json!(
             parsed
                 .native_subagents
@@ -2751,6 +2835,21 @@ impl OpenCodePlugin {
                 "state": "rejected",
                 "reason": format!("OpenCode model {model} is not in the native catalogue"),
             }));
+        }
+        // The same membership rule as the start and resume paths, before
+        // either one writes: a catalog-listed model outside the frozen
+        // fragment refuses here, never after quiescing or switching.
+        if let (Some(fragment), Some(model)) = (
+            session.provider_fragment.as_ref(),
+            requested.model.as_deref(),
+        ) {
+            let provider_id = model.split('/').next().unwrap_or("");
+            if !fragment_defines_provider(fragment, provider_id) {
+                return Ok(json!({
+                    "state": "rejected",
+                    "reason": "OpenCode provider fragment does not define the requested provider",
+                }));
+            }
         }
         let current = session
             .http
@@ -3720,7 +3819,7 @@ impl OpenCodePlugin {
 /// integration (ID or name) whose canonical credential the pre-serve
 /// transfer prepares. Required on the cloud path and nonsecret; the
 /// capacity-only account field is never consulted for authentication. On
-/// the adopted local path the selector must be absent: no canonical
+/// the fragment path the selector must be absent: no canonical
 /// credential is ever imported there.
 fn start_auth_selector(
     profile: &serde_json::Map<String, Value>,
@@ -3739,12 +3838,15 @@ fn start_auth_selector(
         }
         return Ok(None);
     }
-    let raw = raw.ok_or_else(|| {
-        Error::new(
+    let Some(raw) = raw else {
+        if let Some(migration) = retained_eliot_local_migration(profile) {
+            return Err(migration);
+        }
+        return Err(Error::new(
             "profile_error",
             "OpenCode profile requires an explicit auth_integration selector",
-        )
-    })?;
+        ));
+    };
     IntegrationSelector::new(raw)
         .map(Some)
         .map_err(|error| error.with_code("profile_error"))
@@ -3754,10 +3856,42 @@ fn start_auth_selector(
 /// provider ids and whose values are written as-is into the isolated
 /// `opencode.jsonc` under `providers`. Only the `provider` table is admitted;
 /// any fragment without a model fails closed at admission.
+/// A retained `eliot-local` profile predates the fragment path: its old
+/// TOML fields are rejected by the strict schema, and the frozen snapshot
+/// reaches here without a `provider` table. Report the migration naming
+/// `provider.<id>` instead of the misleading auth-selector guidance.
+fn retained_eliot_local_migration(profile: &serde_json::Map<String, Value>) -> Option<Error> {
+    let has_old_fields = [
+        "provider_base_url",
+        "backend",
+        "api_key_env",
+        "context_limit",
+        "output_limit",
+        "provider_package",
+    ]
+    .iter()
+    .any(|field| profile.contains_key(*field));
+    let is_eliot_local = profile
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|model| model.split('/').next().unwrap_or("") == "eliot-local");
+    if has_old_fields || is_eliot_local {
+        Some(Error::new(
+            "profile_error",
+            "OpenCode eliot-local profile migrated to provider.<id> fragment; recreate the profile with a provider.<id> table and model <provider>/<model>",
+        ))
+    } else {
+        None
+    }
+}
+
 fn start_provider_fragment(
     profile: &serde_json::Map<String, Value>,
 ) -> Result<Option<ProviderFragment>> {
     let Some(fragment) = profile.get("provider") else {
+        if let Some(migration) = retained_eliot_local_migration(profile) {
+            return Err(migration);
+        }
         return Ok(None);
     };
     let Some(map) = fragment.as_object() else {
@@ -3905,6 +4039,86 @@ fn refuse_owner_project_mcp(
         return Err(Error::new(
             "profile_error",
             crate::project_mcp::owner_refusal_reason(hit),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the frozen fragment defines the requested provider id.
+fn fragment_defines_provider(fragment: &ProviderFragment, provider_id: &str) -> bool {
+    fragment.contains_key(provider_id)
+}
+
+/// Refuse the start when any workspace-inherited project layer redefines the
+/// frozen fragment provider. The isolated XDG file is not authoritative:
+/// project layers load after the isolated global config, so a workspace
+/// `opencode.json`/`opencode.jsonc` (or `.opencode/` project file) that
+/// carries the same `providers.<id>` would redirect the fragment credential
+/// to another destination. No native precedence input outranks the project
+/// layer, so the collision refuses before the native session exists (create)
+/// or before the retained session is touched (resume), in every policy.
+fn refuse_workspace_provider_override(
+    workspace: &std::path::Path,
+    provider_id: &str,
+) -> Result<()> {
+    let mut layer: Option<&std::path::Path> = Some(workspace);
+    let mut depth = 0usize;
+    while let Some(dir) = layer {
+        if depth > crate::project_mcp::MAX_PROJECT_ANCESTORS {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode project provider layer scan exceeds its ancestor bound",
+            ));
+        }
+        let prefix = "../".repeat(depth);
+        for &file in crate::project_mcp::PROJECT_CONFIG_FILES {
+            let label = if depth == 0 {
+                file.to_owned()
+            } else {
+                format!("{prefix}{file}")
+            };
+            check_project_provider_file(&dir.join(file), &label, provider_id)?;
+            let project_label = if depth == 0 {
+                format!(".opencode/{file}")
+            } else {
+                format!("{prefix}.opencode/{file}")
+            };
+            check_project_provider_file(
+                &dir.join(".opencode").join(file),
+                &project_label,
+                provider_id,
+            )?;
+        }
+        layer = dir.parent();
+        depth += 1;
+    }
+    Ok(())
+}
+
+fn check_project_provider_file(
+    path: &std::path::Path,
+    label: &str,
+    provider_id: &str,
+) -> Result<()> {
+    use eliot_plugin::owner_scan as shared_scan;
+    let document_label = format!("OpenCode project provider layer in {label}");
+    let Some(document) = shared_scan::read_jsonc_document(
+        path,
+        &document_label,
+        crate::project_mcp::MAX_PROJECT_CONFIG_BYTES,
+    )?
+    else {
+        return Ok(());
+    };
+    let providers = document
+        .get("providers")
+        .and_then(serde_json::Value::as_object);
+    if providers.is_some_and(|providers| providers.contains_key(provider_id)) {
+        return Err(Error::new(
+            "profile_error",
+            format!(
+                "OpenCode workspace {label} redefines provider {provider_id:?}; refusing to redirect the isolated credential"
+            ),
         ));
     }
     Ok(())
@@ -6073,5 +6287,90 @@ mod tests {
         assert!(eliot_plugin::start_classification::is_proven_no_effect(
             eliot_plugin::start_classification::StartPoint::NativeRefusalBeforeDispatch
         ));
+    }
+
+    #[test]
+    fn fragment_membership_rule_matches_configure_and_resume() {
+        use super::{fragment_defines_provider, retained_eliot_local_migration};
+        use crate::native::server::ProviderFragment;
+        let mut fragment = ProviderFragment::new();
+        fragment.insert("k173d-fixture".to_owned(), json!({"package": "p"}));
+        assert!(fragment_defines_provider(&fragment, "k173d-fixture"));
+        assert!(!fragment_defines_provider(&fragment, "other"));
+        // A catalog-listed model outside the fragment refuses on both paths.
+        assert!(!fragment_defines_provider(&fragment, "openrouter"));
+        // Retained eliot-local profiles name the migration, not auth.
+        let retained: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
+            "harness": "opencode",
+            "model": "eliot-local/qwen3-8b",
+        }))
+        .expect("retained snapshot decodes");
+        let migration = retained_eliot_local_migration(&retained).expect("migration error");
+        assert_eq!(migration.code, "profile_error");
+        assert!(migration.message.contains("provider.<id>"));
+        let old_fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(json!({
+                "harness": "opencode",
+                "model": "k173d-fixture/m",
+                "provider_base_url": "http://127.0.0.1:1234/v1",
+            }))
+            .expect("old snapshot decodes");
+        assert!(retained_eliot_local_migration(&old_fields).is_some());
+        // Ordinary cloud profiles carry no migration.
+        let cloud: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
+            "harness": "opencode",
+            "model": "openrouter/m",
+            "auth_integration": "openrouter",
+        }))
+        .expect("cloud snapshot decodes");
+        assert!(retained_eliot_local_migration(&cloud).is_none());
+    }
+
+    #[test]
+    fn workspace_provider_override_refuses_before_session() {
+        use super::refuse_workspace_provider_override;
+        let dir = std::env::temp_dir().join(format!(
+            "eliot-k173e-provider-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // No workspace file: no override.
+        assert!(refuse_workspace_provider_override(&dir, "k173d-fixture").is_ok());
+        // A workspace file redefining the same provider refuses.
+        std::fs::write(
+            dir.join("opencode.json"),
+            r#"{"providers": {"k173d-fixture": {"package": "evil"}}}"#,
+        )
+        .expect("workspace file");
+        let error = refuse_workspace_provider_override(&dir, "k173d-fixture")
+            .expect_err("same provider must refuse");
+        assert_eq!(error.code, "profile_error");
+        assert!(error.message.contains("k173d-fixture"));
+        // An unrelated provider does not refuse.
+        assert!(refuse_workspace_provider_override(&dir, "other").is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ready_result_carries_catalogue_limits_with_unknown_for_omitted() {
+        // The ready gate copies the matching catalogue row's limits; omitted
+        // values stay unknown (null), never zero.
+        let with_limits: Vec<NativeModelEntry> = serde_json::from_value(json!([
+            {"providerID": "k173d-fixture", "id": "test-model",
+             "limit": {"context": 131072, "output": 8192}},
+            {"providerID": "k173d-fixture", "id": "nolimit"},
+        ]))
+        .expect("catalogue decodes");
+        let entry =
+            super::catalogue_entry(&with_limits, "k173d-fixture/test-model").expect("row present");
+        let limit = entry.limit.as_ref().expect("limits present");
+        assert_eq!(limit.context, Some(131072));
+        assert_eq!(limit.output, Some(8192));
+        let missing =
+            super::catalogue_entry(&with_limits, "k173d-fixture/nolimit").expect("row present");
+        assert!(missing.limit.is_none());
     }
 }

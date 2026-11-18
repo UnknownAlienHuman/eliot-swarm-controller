@@ -795,7 +795,10 @@ impl Router {
                         tokio::time::timeout_at(discovery_deadline, read_models(scoped)).await;
                     let scoped_value = match scoped_read {
                         Ok(Ok(value)) => value,
-                        Ok(Err(_)) => continue,
+                        Ok(Err(error)) => {
+                            failures.push(ModelsCatalogFailure::from_error(harness, &error));
+                            continue;
+                        }
                         Err(_) => {
                             failures.push(ModelsCatalogFailure::from_error(
                                 harness,
@@ -809,17 +812,35 @@ impl Router {
                             break;
                         }
                     };
-                    let Ok(scoped_response) = serde_json::from_value::<
+                    let scoped_response = match serde_json::from_value::<
                         eliot_core::api::HarnessModelsResponse,
-                    >(scoped_value) else {
-                        continue;
+                    >(scoped_value)
+                    {
+                        Ok(response) => response,
+                        Err(_) => {
+                            failures.push(ModelsCatalogFailure::from_error(
+                                harness,
+                                &Error::new(
+                                    "unavailable",
+                                    format!(
+                                        "profile {name:?} preview could not be decoded; profile preview incomplete"
+                                    ),
+                                ),
+                            ));
+                            continue;
+                        }
                     };
                     for model in scoped_response.models {
                         if seen.contains(&model.id) {
                             continue;
                         }
                         seen.insert(model.id.clone());
-                        models.push(catalog::catalog_entry(harness, model, None, None, now_ms()));
+                        models.push(catalog::profile_catalog_entry(
+                            harness,
+                            model,
+                            &name,
+                            now_ms(),
+                        ));
                     }
                 }
             }
@@ -1512,7 +1533,22 @@ pub(crate) fn catalog_entry(
         default: model.default,
         availability: availability(held, quota, &model.id, now).to_owned(),
         source: model.source,
+        profile: None,
     }
+}
+
+/// Build one profile-only `models.catalog` entry: the same shape as the
+/// ad-hoc row, but carrying the named profile that serves it so the picker
+/// launches with that profile and its fragment travels.
+pub(crate) fn profile_catalog_entry(
+    harness: &str,
+    model: eliot_core::api::HarnessModelEntry,
+    profile: &str,
+    now: i64,
+) -> eliot_core::api::ModelsCatalogEntry {
+    let mut entry = catalog_entry(harness, model, None, None, now);
+    entry.profile = Some(profile.to_owned());
+    entry
 }
 
 /// Catalogue membership establishes identity, not account availability.
@@ -2875,6 +2911,44 @@ mod tests {
             "profile:adhoc harness:opencode provider:k173d-fixture"
         );
         assert_eq!(credential, "fragment");
+    }
+
+    #[test]
+    fn profile_only_entries_carry_their_named_profile() {
+        let now = 1_000;
+        let entry = profile_catalog_entry(
+            "opencode",
+            eliot_core::api::HarnessModelEntry {
+                id: "k173d-fixture/test-model".to_owned(),
+                display_name: None,
+                default: false,
+                efforts: None,
+                default_effort: None,
+                source: None,
+            },
+            "opencode-local",
+            now,
+        );
+        assert_eq!(entry.profile.as_deref(), Some("opencode-local"));
+        assert_eq!(
+            entry.availability,
+            eliot_core::api::harness::CATALOG_UNKNOWN
+        );
+        let ad_hoc = catalog_entry(
+            "opencode",
+            eliot_core::api::HarnessModelEntry {
+                id: "k173d-fixture/test-model".to_owned(),
+                display_name: None,
+                default: false,
+                efforts: None,
+                default_effort: None,
+                source: None,
+            },
+            None,
+            None,
+            now,
+        );
+        assert!(ad_hoc.profile.is_none());
     }
 
     #[test]

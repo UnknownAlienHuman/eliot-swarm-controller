@@ -160,6 +160,7 @@ pub enum ItemKind {
     Model {
         harness: String,
         model: Option<String>,
+        profile: Option<String>,
     },
 }
 
@@ -200,11 +201,21 @@ impl Item {
         match &self.kind {
             ItemKind::Auto => Choice::Auto,
             ItemKind::Preset(name) => Choice::Preset(name.clone()),
-            ItemKind::Model { harness, model } => Choice::Model(Pick {
-                harness: harness.clone(),
-                model: model.clone(),
-                effort,
-            }),
+            ItemKind::Model {
+                harness,
+                model,
+                profile,
+            } => {
+                if let Some(profile) = profile {
+                    Choice::Preset(profile.clone())
+                } else {
+                    Choice::Model(Pick {
+                        harness: harness.clone(),
+                        model: model.clone(),
+                        effort,
+                    })
+                }
+            }
         }
     }
 
@@ -214,6 +225,7 @@ impl Item {
             ItemKind::Model {
                 harness,
                 model: Some(model),
+                ..
             } => Some(ModelRef {
                 harness: harness.clone(),
                 model: model.clone(),
@@ -629,6 +641,7 @@ fn claude_rows(
             kind: ItemKind::Model {
                 harness: code.to_owned(),
                 model,
+                profile: None,
             },
             title,
             detail,
@@ -720,6 +733,7 @@ fn remembered_item(
                 kind: ItemKind::Model {
                     harness: known.harness.clone(),
                     model: Some(known.model.clone()),
+                    profile: None,
                 },
                 title: short_model(&known.model).to_owned(),
                 detail: String::new(),
@@ -770,6 +784,7 @@ fn catalog_item(
         kind: ItemKind::Model {
             harness: model.harness.clone(),
             model: Some(model.id.clone()),
+            profile: model.profile.clone(),
         },
         title: if model.harness == "opencode" {
             short_model(&model.display_name).to_owned()
@@ -821,7 +836,7 @@ fn is_favorite(favorites: &[ModelRef], harness: &str, model: &str) -> bool {
 }
 
 fn item_matches(item: &Item, reply: Option<&ModelsCatalogResponse>, query: &str) -> bool {
-    if let (ItemKind::Model { harness, model }, Some(reply)) = (&item.kind, reply)
+    if let (ItemKind::Model { harness, model, .. }, Some(reply)) = (&item.kind, reply)
         && let Some(entry) = reply
             .models
             .iter()
@@ -1029,6 +1044,7 @@ mod tests {
             default: false,
             availability: CATALOG_AVAILABLE.to_owned(),
             source: None,
+            profile: None,
         }
     }
 
@@ -1403,5 +1419,29 @@ mod tests {
         assert_eq!(effort_name("medium"), "medium");
         assert_eq!(effort_name("xhigh"), "extra high");
         assert_eq!(effort_name("low"), "low");
+    }
+
+    #[test]
+    fn a_profile_only_row_launches_with_its_named_profile() {
+        let mut read = catalog();
+        let mut profile_only = model("opencode", "k173d-fixture/test-model", &[]);
+        profile_only.profile = Some("opencode-local".to_owned());
+        if let Ok(reply) = read.as_mut() {
+            reply.models.push(profile_only);
+        }
+        let shown = rows(&Inputs {
+            catalog: Some(&read),
+            query: "",
+            prefs: &Preferences::default(),
+            only_harness: None,
+            presets: &[],
+            current: &Choice::Auto,
+            auto_detail: "",
+            efforts: &HashMap::new(),
+            claude_efforts: &[],
+        });
+        let row =
+            find(&shown, Some("opencode:k173d-fixture/test-model")).expect("profile-only row");
+        assert_eq!(row.choice(), Choice::Preset("opencode-local".to_owned()));
     }
 }

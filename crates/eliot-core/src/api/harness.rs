@@ -676,6 +676,12 @@ pub struct ModelsCatalogEntry {
     /// frozen Claude alias/id list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Named profile that serves this model when the ad-hoc preview does
+    /// not list it (for example an OpenCode provider fragment defined only
+    /// by that profile). Absent for ad-hoc rows; the picker launches a
+    /// profile-only row with this profile so the fragment travels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 impl ModelsCatalogEntry {
@@ -712,6 +718,9 @@ impl ModelsCatalogEntry {
             ));
         }
         validate_source(self.source.as_deref())?;
+        if let Some(profile) = self.profile.as_deref() {
+            validate_profile_opt(Some(profile))?;
+        }
         Ok(())
     }
 }
@@ -876,6 +885,10 @@ pub fn catalog_matches(entry: &ModelsCatalogEntry, query: &str) -> bool {
     ]
     .iter()
     .any(|field| field.to_ascii_lowercase().contains(&query))
+        || entry
+            .profile
+            .as_deref()
+            .is_some_and(|profile| profile.to_ascii_lowercase().contains(&query))
 }
 
 /// Provider quota observed in a native stream, never inferred from token expenditure.
@@ -1234,6 +1247,7 @@ mod tests {
             default: false,
             availability: CATALOG_UNKNOWN.to_owned(),
             source: None,
+            profile: None,
         }
     }
 

@@ -210,20 +210,25 @@ launcher or a detached command under Agent custody. See
 The profile selects `harness = "opencode"` with `model = "<provider>/<model>"`
 and an optional native `provider.<id>` fragment. The fragment is written as-is
 into the isolated `opencode.jsonc` under `providers`; only the `provider` table
-is admitted. Every `{env:NAME}` reference must name an entry of the frozen
-`pass_env` allowlist; key values stay runtime-only. A fragment combined with
-`auth_integration` refuses. An unresolved or empty `{env:NAME}` refuses before
-`serve` starts, never silently becoming no-auth mode.
+is admitted. Every credential-bearing field (`apiKey`, auth headers) must be
+exactly one valid `{env:NAME}` naming a frozen `pass_env` entry; any literal,
+prefixed, malformed or unlisted reference refuses at freeze with `profile_error`,
+and every URL must carry no userinfo. Key values stay runtime-only. A fragment
+combined with `auth_integration` refuses. An unresolved or empty `{env:NAME}`
+refuses before `serve` starts, never silently becoming no-auth mode.
 
 Effective settings are read back, not assumed. The isolated XDG file is not the
 final authority (workspace-inherited layers load after the isolated global
 config), so before inference the plugin checks that the fragment defines the requested
-provider and selects the exact frozen provider/model pair locally from the
-live `GET /api/model` catalogue (the endpoint answers an
-object with a `data` array, with limits from that catalogue row). This
-verification runs before `POST /api/session` creates any native session: no
-session or prompt has been dispatched yet, so every verification failure - a
-known mismatch or an unreadable readback - settles the launch as a definite
+provider and that no workspace `opencode.json`/`opencode.jsonc` (or
+`.opencode/` project file) redefines the same `providers.<id>`; such a
+collision refuses before any native session exists. It then selects the exact
+frozen provider/model pair locally from the live `GET /api/model` catalogue
+(the endpoint answers an object with a `data` array) and carries that row's
+context and output limits into the ready result (omitted values stay unknown).
+This verification runs before `POST /api/session` creates any native session:
+no session or prompt has been dispatched yet, so every verification failure -
+a known mismatch or an unreadable readback - settles the launch as a definite
 failure with a short safe reason (failed-state start result, never unknown),
 and the daemon retires the plugin and releases capacity on proven exit instead
 of pinning an unknown Agent. Unknown is reserved for failures after a session
