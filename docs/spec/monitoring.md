@@ -683,6 +683,16 @@ and native current state, one key at a time:
 Dispatched effects become unknown until verb-specific readback. No reconcile pass blindly
 repeats a native or external write.
 
+Startup records an idle controlled generation as `stopped` when its native session
+identity is retained, its generation has no open request, open or unknown turn, or
+unsettled command, and prior owned-process exit and reader drain are durably proven.
+That proof requires recorded exited processes, a closed OS source, closed native
+sources and the Host's owned-exit record for the same generation. The retained
+session can be explicitly resumed. Recovery records `agent.stopped` with reason
+`owned_exit_before_restart` and preserves the turn and command history as recorded.
+A process still recorded as running at restart becomes unknown. Missing exit or
+drain proof and unresolved effects leave the generation on the `lost` path.
+
 ## Views
 
 `watch`, `top`, `show`, `daemon.status` query projections/events. They expose generation,

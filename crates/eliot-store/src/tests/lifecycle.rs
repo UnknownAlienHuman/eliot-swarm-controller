@@ -704,6 +704,110 @@ fn archiving_an_ended_agent_requires_drained_custody_and_names_the_blocker() {
 }
 
 #[test]
+fn restart_stops_an_idle_agent_after_owned_exit_and_keeps_its_session() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let agent = ready_steer_agent(&mut store, "restart-exited-idle", now);
+    install_live_custody_observations(&mut store, &agent, 1, now + 1);
+    let send = send_request(&agent, 1, "complete before restart");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 2).unwrap();
+    store.dispatch(&send_id, now + 3).unwrap();
+    let turn_id = "completed-before-restart";
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.started",
+                json!({"command_id": send_id, "turn_id": turn_id}),
+            ),
+            now + 4,
+        )
+        .unwrap();
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.completed",
+                json!({"command_id": send_id, "turn_id": turn_id, "status": "completed"}),
+            ),
+            now + 5,
+        )
+        .unwrap();
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 6);
+    let before = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(before.state, AgentState::Idle);
+
+    let events = store.recover_on_restart(now + 7).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, "agent.stopped");
+    assert_eq!(events[0].data["reason"], "owned_exit_before_restart");
+    let after = store.get_agent(&agent).unwrap().unwrap();
+    assert_eq!(after.state, AgentState::Stopped);
+    assert_eq!(after.generation, 1);
+    assert_eq!(after.native_scope, before.native_scope);
+    assert_eq!(after.native_ref, before.native_ref);
+    let turn = store.get_turn(&agent, 1, turn_id).unwrap().unwrap();
+    assert_eq!(turn.state, TurnState::Completed);
+    assert_eq!(turn.outcome, Some(TurnOutcome::Success));
+    assert!(store.recover_on_restart(now + 8).unwrap().is_empty());
+
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    store.submit("owner", resume, now + 9).unwrap();
+    store.dispatch(&resume_id, now + 10).unwrap();
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 2);
+}
+
+#[test]
+fn restart_loses_an_idle_agent_with_live_custody_or_an_uncertain_send() {
+    for exited in [false, true] {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = Ulid::new().timestamp_ms() as i64;
+        let agent = ready_steer_agent(&mut store, "restart-unproven-idle", now);
+        install_live_custody_observations(&mut store, &agent, 1, now + 1);
+        let send_id = exited.then(|| {
+            let send = send_request(&agent, 1, "unobserved send");
+            let id = send.id.clone();
+            store.submit("owner", send, now + 2).unwrap();
+            store.dispatch(&id, now + 3).unwrap();
+            simulate_normal_stop_proof(&mut store, &agent, 1, now + 4);
+            id
+        });
+        assert_eq!(
+            store.get_agent(&agent).unwrap().unwrap().state,
+            AgentState::Idle
+        );
+
+        let events = store.recover_on_restart(now + 5).unwrap();
+        assert_eq!(
+            store.get_agent(&agent).unwrap().unwrap().state,
+            AgentState::Lost
+        );
+        assert!(events.iter().any(|event| {
+            event.kind == "agent.lost" && event.data["reason"] == eliot_core::DAEMON_RESTART_REASON
+        }));
+        assert!(events.iter().all(|event| event.kind != "agent.stopped"));
+        if let Some(id) = send_id {
+            assert_eq!(
+                store.get_command(&id).unwrap().unwrap().state,
+                CommandState::Unknown
+            );
+        } else {
+            let state: String = store
+                .connection
+                .query_row("SELECT state FROM processes", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(state, "unknown");
+        }
+    }
+}
+
+#[test]
 fn an_archived_agent_lost_with_unresolved_custody_stays_in_the_default_list() {
     use crate::AgentListFilter;
     use eliot_core::api::ArchivedFilter;
