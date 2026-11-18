@@ -208,7 +208,14 @@ pub(crate) mod usage;
 mod workspace;
 
 fn sql_error(error: rusqlite::Error) -> Error {
-    Error::new("internal", error.to_string())
+    if matches!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    ) {
+        Error::new("busy", "SQLite lock unavailable for Store operation")
+    } else {
+        Error::new("internal", error.to_string())
+    }
 }
 
 fn validate_remote_command_context(
@@ -244,10 +251,19 @@ static TXN_COMMIT_ERRORS: AtomicU64 = AtomicU64::new(0);
 static TXN_COMMIT_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 fn commit_transaction(tx: Transaction<'_>, write_faulted: &Cell<bool>) -> Result<()> {
-    commit_sql(&tx).map_err(|error| {
+    let Err(error) = commit_sql(&tx) else {
+        return Ok(());
+    };
+    let error = sql_error(error);
+    if error.code == "busy" {
+        if !tx.is_autocommit() && tx.rollback().is_ok() {
+            return Err(error);
+        }
         write_faulted.set(true);
-        sql_error(error)
-    })
+        return Err(Error::new("internal", "Store commit could not be settled"));
+    }
+    write_faulted.set(true);
+    Err(error)
 }
 
 fn commit_sql(tx: &Transaction<'_>) -> rusqlite::Result<()> {
@@ -5260,7 +5276,8 @@ fn install_stream_source_plan(
     Ok(())
 }
 
-fn family_for_kind(kind: &str) -> Result<&'static str> {
+/// Resolve the Store-owned source family for a normalized native event kind.
+pub fn family_for_kind(kind: &str) -> Result<&'static str> {
     match kind {
         "session.ready" | "session.ended" | "session.usage" | "quota.observed" => Ok("session"),
         "turn.started" | "turn.completed" | "turn.unknown" | "turn.model_observed" => Ok("turn"),

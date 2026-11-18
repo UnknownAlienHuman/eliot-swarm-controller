@@ -234,9 +234,7 @@ pub(crate) struct State {
     writes_blocked: bool,
     gap_reported: bool,
     gap_number: u64,
-    source_health_attempted: bool,
-    pub source_health_stale: bool,
-    pub source_health_unknown: bool,
+    stream_loss_reported: bool,
     /// Open native permission asks by distinct local request id. The ask stays open
     /// (and the Agent waiting) until an explicit approve/deny reply, a
     /// cancelling interrupt/stop, or the turn closing it.
@@ -322,9 +320,7 @@ impl State {
             writes_blocked: false,
             gap_reported: false,
             gap_number: 0,
-            source_health_attempted: false,
-            source_health_stale: false,
-            source_health_unknown: false,
+            stream_loss_reported: false,
             pending_requests: HashMap::new(),
             cancellation: None,
             failure: None,
@@ -1660,7 +1656,7 @@ impl State {
         }
         match self.settle_prompt(prompt).await {
             Ok(()) => {}
-            Err(error) => self.lose(&error.message).await,
+            Err(error) => self.lose_observation(&error).await,
         }
     }
 
@@ -1858,6 +1854,18 @@ impl State {
     }
 
     pub async fn lose(&mut self, reason: &str) {
+        self.lose_inner(reason, true).await;
+    }
+
+    async fn lose_observation(&mut self, error: &Error) {
+        self.lose_inner(
+            &error.message,
+            error.failure_where.as_deref() != Some("plugin.events.put"),
+        )
+        .await;
+    }
+
+    async fn lose_inner(&mut self, reason: &str, report_gap: bool) {
         self.source_unknown = true;
         self.fail_pending_steer(Error::new(
             "unknown",
@@ -1879,12 +1887,20 @@ impl State {
         if let Some(pending) = self.pending.as_ref() {
             self.settlement = Some((pending.turn.clone(), "unknown".to_owned()));
         }
-        let health_deadline = Instant::now() + EVENT_DEADLINE;
-        if !self.gap_reported && !self.writes_blocked {
+        if report_gap && !self.gap_reported && !self.writes_blocked {
             let mut source = self.source();
-            let _ = source.record_gap_until(reason, health_deadline).await;
+            let _ = source.record_gap(reason).await;
         }
-        self.mark_source_stale(health_deadline).await;
+        if report_gap && !std::mem::replace(&mut self.stream_loss_reported, true) {
+            let update = SourceHealthUpdate::new(&self.agent, self.generation, "stream", "stale");
+            if let Ok(mut request) = serde_json::to_value(update) {
+                request["credential"] = json!(self.credential);
+                let _ = self
+                    .host
+                    .call("source.health", request, Instant::now() + EVENT_DEADLINE)
+                    .await;
+            }
+        }
         self.failure.get_or_insert_with(|| reason.to_owned());
         if let Some(reply) = self.pending.as_mut().and_then(|p| p.reply.take()) {
             let _ = reply.send(Err(Error::new(
@@ -1892,56 +1908,6 @@ impl State {
                 "Antigravity input outcome is unknown",
             )));
         }
-    }
-
-    async fn mark_source_stale(&mut self, deadline: Instant) {
-        if self.source_health_attempted {
-            return;
-        }
-        self.source_health_attempted = true;
-        let update =
-            SourceHealthUpdate::new(self.agent.clone(), self.generation, "stream", "stale");
-        let Ok(mut request) = serde_json::to_value(&update) else {
-            self.source_health_unknown = true;
-            return;
-        };
-        if update.validate().is_err() {
-            self.source_health_unknown = true;
-            return;
-        }
-        request["credential"] = json!(self.credential);
-        let acknowledgement = self.host.call("source.health", request, deadline).await;
-        if acknowledgement.as_ref().is_ok_and(|value| {
-            serde_json::from_value::<SourceHealthUpdate>(value.clone())
-                .is_ok_and(|ack| ack == update)
-        }) {
-            self.source_health_stale = true;
-            return;
-        }
-
-        // A lost health acknowledgement is settled by readback, never by replay.
-        let readback = self
-            .host
-            .call(
-                "source.state",
-                json!({
-                    "credential": self.credential,
-                    "agent_id": self.agent,
-                    "generation": self.generation,
-                    "source": "stream",
-                }),
-                deadline,
-            )
-            .await;
-        let confirmed = readback.as_ref().is_ok_and(|state| {
-            state.get("agent_id").and_then(Value::as_str) == Some(self.agent.as_str())
-                && state.get("generation").and_then(Value::as_i64) == Some(self.generation)
-                && state.get("source").and_then(Value::as_str) == Some("stream")
-                && state.get("state").and_then(Value::as_str) == Some("open")
-                && state.get("health").and_then(Value::as_str) == Some("stale")
-        });
-        self.source_health_stale = confirmed;
-        self.source_health_unknown = !confirmed;
     }
 
     async fn record_coverage_gap(&mut self, reason: &str, families: &[&str]) -> Result<()> {
@@ -2046,7 +2012,7 @@ pub(crate) fn spawn(
                     if let Err(error) =
                         handle_hook_callback(callback.callback, callback.binding, &state).await
                     {
-                        state.lock().await.lose(&error.message).await;
+                        state.lock().await.lose_observation(&error).await;
                     }
                     continue;
                 }
@@ -2058,7 +2024,7 @@ pub(crate) fn spawn(
                 Next::Frame(Some(frame)) => {
                     let mut state_guard = state.lock().await;
                     if let Err(error) = state_guard.observe(frame, &client).await {
-                        state_guard.lose(&error.message).await;
+                        state_guard.lose_observation(&error).await;
                     }
                     drop(state_guard);
                     let current = *stream.borrow();
@@ -2469,9 +2435,7 @@ mod tests {
             .close_pending_requests(None)
             .await
             .expect_err("rejected request.closed commit fails closure");
-        // `invalid` is not a definite batch rejection, so the sink latches the
-        // batch unknown: the closure outcome is `unknown`, an uncertain effect
-        // the stop must not paper over. The ask stays retained for recovery.
+        // This response does not prove no write. Keep the ask for recovery.
         assert_eq!(error.code, "unknown");
         assert!(state.pending_requests.contains_key("same-tool"));
         finish([peer_task, host_task]).await;

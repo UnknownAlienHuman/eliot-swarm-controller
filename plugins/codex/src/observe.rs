@@ -16,7 +16,7 @@ use crate::{
     },
 };
 use eliot_core::{
-    BatchAck, Error, NativeEvent, Result, SecretPolicy,
+    Error, Result, SecretPolicy,
     api::{
         MAX_OBSERVATION_CURSOR_BYTES, MAX_OBSERVATION_PAGE_BYTES, ObservationPage, ObservationQuery,
     },
@@ -81,19 +81,6 @@ struct SubjectRead {
     cli_version: String,
 }
 
-enum PendingLive {
-    Record {
-        events: Vec<NativeEvent>,
-        from: String,
-        cursor: String,
-    },
-    Gap {
-        reason: String,
-        cursor: String,
-    },
-}
-
-#[derive(Clone, PartialEq)]
 enum LiveIntent {
     Begin(String),
     Recover(String),
@@ -127,13 +114,12 @@ pub(crate) struct ObserverSession {
     live_publisher: Option<RecoveryPublisher>,
     live_cursor: Option<String>,
     live_baseline: Option<String>,
-    live_pending: Option<PendingLive>,
     live_started: bool,
     live_recovery_required: bool,
     live_stale: bool,
+    live_publication_failed: bool,
     live_reopen: bool,
     live_problem: Option<&'static str>,
-    live_intent: Option<LiveIntent>,
 }
 
 impl ObserverSession {
@@ -244,13 +230,12 @@ impl ObserverSession {
             live_publisher: None,
             live_cursor: None,
             live_baseline: None,
-            live_pending: None,
             live_started: false,
             live_recovery_required: false,
             live_stale: false,
+            live_publication_failed: false,
             live_reopen: false,
             live_problem: None,
-            live_intent: None,
         };
         Ok((session, attach_result))
     }
@@ -398,11 +383,10 @@ impl ObserverSession {
     }
 
     pub(crate) fn live_poll_enabled(&self) -> bool {
-        !self.reader_closed && !self.shutting_down && self.detach_command_id.is_none()
-    }
-
-    pub(crate) fn live_poll_timed_out(&mut self) {
-        self.live_stale = true;
+        !self.reader_closed
+            && !self.shutting_down
+            && self.detach_command_id.is_none()
+            && !self.live_publication_failed
     }
 
     pub(crate) async fn poll_live(
@@ -428,33 +412,19 @@ impl ObserverSession {
             .live_publisher
             .as_mut()
             .ok_or_else(live_unknown)?
-            .wait_observer_ready(deadline)
+            .observer_ready(deadline)
             .await?
         {
             return Ok(());
         }
         let result = self.poll_live_inner(deadline).await;
         if result.is_err() {
-            // Report after pending publication settles; never turn a lost ACK
-            // into a different batch or a speculative gap operation.
-            self.live_stale = true;
+            self.live_stale = !self.live_publication_failed;
         }
         result
     }
 
     async fn poll_live_inner(&mut self, deadline: Instant) -> Result<()> {
-        if let Some(ack) = self
-            .live_publisher
-            .as_mut()
-            .ok_or_else(live_unknown)?
-            .settle(deadline)
-            .await?
-        {
-            self.live_cursor = Some(settled_record_cursor(self.live_pending.as_ref(), &ack)?);
-            self.live_pending = None;
-        }
-        self.resume_live_intent(deadline).await?;
-        self.finish_live_pending(deadline).await?;
         if let Some(reason) = self.live_problem {
             self.publish_live_intent(
                 live_problem_intent(reason, self.live_started, self.live_recovery_required),
@@ -477,7 +447,9 @@ impl ObserverSession {
         }
         if self.live_reopen {
             if let Some(tail) = self.live_rollout.as_mut() {
-                tail.close().await?;
+                timeout_at(deadline, tail.close())
+                    .await
+                    .map_err(|_| live_read_timeout())??;
             }
             self.live_rollout = None;
             self.live_cursor = None;
@@ -486,18 +458,21 @@ impl ObserverSession {
             self.live_reopen = false;
         }
         self.open_live_rollout(deadline).await?;
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
         self.finish_live_baseline(deadline).await?;
         for _ in 0..MAX_LIVE_RECORDS_PER_POLL {
             if Instant::now() >= deadline {
                 return Ok(());
             }
             let from = self.live_cursor.clone().ok_or_else(live_unknown)?;
-            let read = self
-                .live_rollout
-                .as_mut()
-                .ok_or_else(live_unknown)?
-                .read_page(&from, 1, deadline.into_std())
-                .await;
+            let tail = self.live_rollout.as_mut().ok_or_else(live_unknown)?;
+            // The file read can be resumed from the same cursor. Only the
+            // source mutations below must run through their acknowledgement.
+            let read = timeout_at(deadline, tail.read_page(&from, 1, deadline.into_std()))
+                .await
+                .map_err(|_| live_read_timeout())?;
             let page = match read {
                 Ok(page) => page,
                 Err(error) if Instant::now() >= deadline => return Err(error),
@@ -507,15 +482,24 @@ impl ObserverSession {
                     return Err(error);
                 }
             };
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
             if let Some(reason) = page.gap {
                 if !page.records.is_empty() {
                     return Err(integrity());
                 }
-                self.live_pending = Some(PendingLive::Gap {
-                    reason,
-                    cursor: page.cursor,
-                });
-                self.finish_live_pending(deadline).await?;
+                let checkpoint = page.cursor;
+                self.publish_live_intent(
+                    LiveIntent::Gap {
+                        reason,
+                        checkpoint: Some(checkpoint.clone()),
+                    },
+                    deadline,
+                )
+                .await?;
+                self.live_reopen |= checkpoint == from;
+                self.live_cursor = Some(checkpoint);
                 return Ok(());
             }
             if page.records.len() > 1 {
@@ -532,19 +516,26 @@ impl ObserverSession {
                 {
                     return Err(integrity());
                 }
-                // Latch BEFORE any await. Reader turn context may already have
-                // advanced, so this record must settle before any further read.
-                self.live_pending = Some(PendingLive::Record {
-                    events: record.events,
-                    from,
-                    cursor: record.cursor,
-                });
-                self.finish_live_pending(deadline).await?;
+                if self.live_recovery_required {
+                    self.publish_live_intent(LiveIntent::Recover(from), deadline)
+                        .await?;
+                }
+                let result = self
+                    .live_publisher
+                    .as_mut()
+                    .ok_or_else(live_unknown)?
+                    .commit(record.events, record.cursor, deadline)
+                    .await;
+                self.live_publication_failed = result.is_err();
+                self.live_cursor = Some(result?);
             } else {
                 if page.cursor == from && !page.at_end && !page.partial_tail {
                     return Err(integrity());
                 }
                 self.live_cursor = Some(page.cursor);
+            }
+            if Instant::now() >= deadline {
+                return Ok(());
             }
             self.publish_live_health(
                 "transcript",
@@ -594,120 +585,36 @@ impl ObserverSession {
     }
 
     async fn publish_live_intent(&mut self, intent: LiveIntent, deadline: Instant) -> Result<()> {
-        if self
-            .live_intent
-            .as_ref()
-            .is_some_and(|pending| *pending != intent)
-        {
-            return Err(live_unknown());
-        }
-        self.live_intent = Some(intent);
-        self.resume_live_intent(deadline).await
-    }
-
-    async fn resume_live_intent(&mut self, deadline: Instant) -> Result<()> {
-        let Some(intent) = self.live_intent.clone() else {
-            return Ok(());
-        };
         let publisher = self.live_publisher.as_mut().ok_or_else(live_unknown)?;
-        match &intent {
-            LiveIntent::Begin(edge) => publisher.begin(edge, deadline).await?,
-            LiveIntent::Recover(edge) => publisher.recover(edge, deadline).await?,
+        let result = match &intent {
+            LiveIntent::Begin(edge) => publisher.begin(edge, self.live_problem, deadline).await,
+            LiveIntent::Recover(edge) => publisher.recover(edge, deadline).await,
             LiveIntent::Gap { reason, checkpoint } => {
-                let committed = publisher
-                    .unavailable(reason, checkpoint.clone(), deadline)
-                    .await?;
-                if committed != *checkpoint {
-                    return Err(live_unknown());
-                }
+                publisher.gap(reason, checkpoint.clone(), deadline).await
             }
             LiveIntent::Health { source, health } => {
-                publisher.health(source, health, deadline).await?
+                publisher.health(source, health, deadline).await
             }
-        }
-        // Nothing mutates the original intent or the pending record across the
-        // await above. Apply its local checkpoint only after its exact proof.
-        self.live_intent = None;
+        };
+        // The host owns the outcome. A failed publication cannot advance the
+        // file cursor or trigger another write from this reader.
+        self.live_publication_failed = result.is_err();
+        result?;
         acknowledge_live_outage(
             &intent,
             &mut self.live_problem,
             &mut self.live_recovery_required,
         );
         match intent {
-            LiveIntent::Begin(edge) => {
-                self.live_cursor = Some(edge);
-                self.live_baseline = None;
-                self.live_started = true;
-            }
-            LiveIntent::Recover(edge) => {
+            LiveIntent::Begin(edge) | LiveIntent::Recover(edge) => {
                 if self.live_baseline.as_deref() == Some(edge.as_str()) {
                     self.live_cursor = Some(edge);
                     self.live_baseline = None;
+                    self.live_started = true;
                 }
             }
-            LiveIntent::Gap { reason, checkpoint } => {
-                if let (
-                    Some(PendingLive::Gap {
-                        reason: pending_reason,
-                        cursor,
-                    }),
-                    Some(checkpoint),
-                ) = (self.live_pending.as_ref(), checkpoint)
-                {
-                    if *pending_reason != reason || *cursor != checkpoint {
-                        return Err(live_unknown());
-                    }
-                    self.live_reopen |= self.live_cursor.as_deref() == Some(cursor.as_str());
-                    self.live_cursor = Some(checkpoint);
-                    self.live_pending = None;
-                }
-            }
-            LiveIntent::Health { health, .. } => {
-                if health == "stale" {
-                    self.live_stale = false;
-                }
-            }
+            LiveIntent::Gap { .. } | LiveIntent::Health { .. } => {}
         }
-        Ok(())
-    }
-
-    async fn finish_live_pending(&mut self, deadline: Instant) -> Result<()> {
-        match self.live_pending.as_ref() {
-            Some(PendingLive::Record {
-                events,
-                from,
-                cursor,
-            }) => {
-                let events = events.clone();
-                let from = from.clone();
-                let cursor = cursor.clone();
-                if self.live_recovery_required {
-                    self.publish_live_intent(LiveIntent::Recover(from), deadline)
-                        .await?;
-                }
-                let ack = self
-                    .live_publisher
-                    .as_mut()
-                    .ok_or_else(live_unknown)?
-                    .commit(events, cursor.clone(), deadline)
-                    .await?;
-                self.live_cursor = Some(settled_record_cursor(self.live_pending.as_ref(), &ack)?);
-            }
-            Some(PendingLive::Gap { reason, cursor }) => {
-                let reason = reason.clone();
-                let cursor = cursor.clone();
-                self.publish_live_intent(
-                    LiveIntent::Gap {
-                        reason,
-                        checkpoint: Some(cursor),
-                    },
-                    deadline,
-                )
-                .await?;
-            }
-            None => return Ok(()),
-        }
-        self.live_pending = None;
         Ok(())
     }
 
@@ -872,7 +779,6 @@ impl ObserverSession {
             tail.close().await?;
         }
         self.live_rollout = None;
-        self.live_pending = None;
         Ok(())
     }
 
@@ -1412,6 +1318,10 @@ fn live_unknown() -> Error {
     )
 }
 
+fn live_read_timeout() -> Error {
+    Error::new("busy", "Codex live rollout read deadline elapsed")
+}
+
 fn live_problem_intent(reason: &str, started: bool, gap_acknowledged: bool) -> LiveIntent {
     if started && !gap_acknowledged {
         LiveIntent::Gap {
@@ -1453,14 +1363,6 @@ fn validate_live_codec(version: &str) -> Result<()> {
     Ok(())
 }
 
-fn settled_record_cursor(pending: Option<&PendingLive>, ack: &BatchAck) -> Result<String> {
-    match pending {
-        Some(PendingLive::Record { cursor, .. }) if ack.cursor.as_ref() == Some(cursor) => {
-            Ok(cursor.clone())
-        }
-        _ => Err(live_unknown()),
-    }
-}
 fn secret_in_payload() -> Error {
     Error::new(
         "secret_in_payload",
@@ -1477,11 +1379,9 @@ fn unverified_store() -> Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveIntent, PendingLive, acknowledge_live_outage, live_problem_intent, sanitize_text,
-        settled_record_cursor, validate_live_codec,
+        LiveIntent, acknowledge_live_outage, live_problem_intent, sanitize_text,
+        validate_live_codec,
     };
-    use eliot_core::{BatchAck, NativeEvent};
-    use serde_json::json;
 
     #[test]
     fn acknowledged_outage_retains_problem_until_verified_edge() {
@@ -1495,8 +1395,6 @@ mod tests {
                 ..
             }
         ));
-        // Local coordinator decisions only. The runtime calls this transition
-        // after publisher success; transport ACK/nonce proofs live in its tests.
         acknowledge_live_outage(&first, &mut problem, &mut recovery_required);
         assert!(problem.is_some());
         assert!(recovery_required);
@@ -1550,58 +1448,6 @@ mod tests {
         );
         assert!(problem.is_none());
         assert!(!recovery_required);
-    }
-
-    #[test]
-    fn uncertain_record_keeps_frozen_payload_and_cursor_until_exact_ack() {
-        let events = vec![NativeEvent {
-            kind: "message.completed".to_owned(),
-            native_id: "held-file-record".to_owned(),
-            ts: Some(1234),
-            data: json!({"turn_id":"native-turn","text":"dummy"}),
-        }];
-        let pending = PendingLive::Record {
-            events: events.clone(),
-            from: "before-record".to_owned(),
-            cursor: "after-record".to_owned(),
-        };
-        for cursor in [
-            None,
-            Some("before-record".to_owned()),
-            Some("another-record".to_owned()),
-        ] {
-            let ack = BatchAck {
-                first_seq: 1,
-                last_seq: 1,
-                cursor,
-            };
-            assert_eq!(
-                settled_record_cursor(Some(&pending), &ack)
-                    .unwrap_err()
-                    .code,
-                "unknown"
-            );
-        }
-        let ack = BatchAck {
-            first_seq: 1,
-            last_seq: 1,
-            cursor: Some("after-record".to_owned()),
-        };
-        assert_eq!(
-            settled_record_cursor(Some(&pending), &ack).unwrap(),
-            "after-record"
-        );
-        let PendingLive::Record {
-            events: retained,
-            from,
-            cursor,
-        } = pending
-        else {
-            panic!("record")
-        };
-        assert_eq!(retained, events);
-        assert_eq!(from, "before-record");
-        assert_eq!(cursor, "after-record");
     }
 
     #[test]

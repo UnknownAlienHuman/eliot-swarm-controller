@@ -91,15 +91,12 @@ pub(super) async fn record_source_handoff(
             bus.publish(&change.events);
             let ack: SourceHandoffAck = change.value;
             serde_json::to_value(ack).map_err(|_| {
-                CoreError::new(
-                    "unknown",
-                    "source.handoff acknowledgement is unavailable; settle with source.state",
-                )
+                CoreError::new("unknown", "source.handoff acknowledgement is unavailable")
             })
         }
         Err(_) if write_faulted => Err(CoreError::new(
             "unknown",
-            "source.handoff outcome is unknown; settle with source.state",
+            "source.handoff outcome is unknown",
         )),
         Err(error) => Err(super::redact_native_error(error, secrets)),
     }
@@ -144,15 +141,12 @@ pub(super) async fn record_source_health(
         Ok(change) => {
             bus.publish(&change.events);
             serde_json::to_value(change.value).map_err(|_| {
-                CoreError::new(
-                    "unknown",
-                    "source.health acknowledgement is unavailable; settle with source.state",
-                )
+                CoreError::new("unknown", "source.health acknowledgement is unavailable")
             })
         }
         Err(_) if faulted => Err(CoreError::new(
             "unknown",
-            "source.health outcome is unknown; settle with source.state",
+            "source.health outcome is unknown",
         )),
         Err(error) => Err(super::redact_native_error(error, secrets)),
     }

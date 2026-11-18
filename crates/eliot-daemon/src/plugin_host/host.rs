@@ -1849,6 +1849,10 @@ fn record_store_batch_rejection(
     let generation = key.generation.to_string();
     let code = format!("events_put_{}", safe_cause_code(cause));
     let validation = safe_store_validation_reason(error);
+    let outcome = match error.code.as_str() {
+        "unknown" | "busy" | "not_allowed" | "stale_generation" => error.code.as_str(),
+        _ => "rejected",
+    };
     crate::logging::record(
         &policy,
         &code,
@@ -1859,6 +1863,7 @@ fn record_store_batch_rejection(
             ("batch_id", batch_id),
             ("event_kind", event_kind),
             ("validation", &validation),
+            ("outcome", outcome),
         ],
         None,
     );
@@ -2005,10 +2010,7 @@ async fn record_source_gap(
                 )
             })
         }
-        Err(_) if write_faulted => Err(Error::new(
-            "unknown",
-            "source.gap outcome is unknown; settle with source.state",
-        )),
+        Err(_) if write_faulted => Err(Error::new("unknown", "source.gap outcome is unknown")),
         Err(error) => Err(redact_native_error(error, credentials)),
     }
 }
@@ -4337,7 +4339,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_payload_guards_precede_store_commit_and_bus_publish() {
+    async fn source_payload_guards_record_safe_gaps_without_publishing_rejected_events() {
         let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
         let command_id = Ulid::new().to_string();
         let now = now_ms();
@@ -4418,6 +4420,14 @@ mod tests {
                 .await
                 .unwrap_err(),
         );
+        let mut params = serde_json::to_value(&batch).unwrap();
+        params["events"][0]["native_id"] = json!(42);
+        params["credential"] = json!(credential);
+        let error = client
+            .call("events.put", params, deadline())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid");
 
         let mut gap = gap();
         gap.agent_id = agent_id.clone();
@@ -4434,11 +4444,26 @@ mod tests {
         }
         {
             let store = store.lock().await;
-            assert_eq!(store.read_events(0, 1000, None).unwrap(), before_events);
-            assert_eq!(
-                store.read_source_state(&agent_id, 1, "stream").unwrap(),
-                before_source
-            );
+            let events = store.read_events(0, 1000, None).unwrap();
+            let rejected = &events[before_events.len()..];
+            let gaps: Vec<_> = rejected
+                .iter()
+                .filter(|event| event.kind == "source.gap")
+                .collect();
+            assert_eq!(gaps.len(), 5);
+            assert_eq!(gaps[1].data["to"], Value::Null);
+            assert_eq!(gaps[4].data["reason"], "events.put rejected: invalid");
+            assert_eq!(rejected.len(), 6);
+            assert_eq!(rejected[1].kind, "source.health");
+            assert_eq!(rejected[1].data["health"], "stale");
+            assert!(rejected.iter().all(|event| event.native_id.is_none()));
+            for event in rejected {
+                assert_eq!(published.try_recv().unwrap().seq, event.seq);
+            }
+            let source = store.read_source_state(&agent_id, 1, "stream").unwrap();
+            assert_eq!(source["health"], "stale");
+            assert_eq!(source["cursor"], before_source["cursor"]);
+            assert_eq!(source["last_batch_id"], before_source["last_batch_id"]);
         }
         assert!(matches!(
             published.try_recv(),
@@ -4462,7 +4487,7 @@ mod tests {
         let events = store.lock().await.read_events(0, 1000, None).unwrap();
         let gap_event = events
             .iter()
-            .find(|event| event.kind == "source.gap")
+            .find(|event| event.kind == "source.gap" && event.data["gap_id"] == "gap-1")
             .unwrap();
         assert_eq!(gap_event.data["reason"], json!("reader lost [REDACTED]"));
         assert!(!serde_json::to_string(&events).unwrap().contains(SECRET));
@@ -4472,7 +4497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn events_put_malformed_params_are_definite_invalid() {
+    async fn events_put_replies_with_proven_no_write_and_host_gap() {
         let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
         let command_id = Ulid::new().to_string();
         let now = now_ms();
@@ -4548,6 +4573,56 @@ mod tests {
             published.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+        let mut batch = batch();
+        batch.agent_id = agent_id.clone();
+        batch.events[0].data["command_id"] = json!(command_id);
+        let mut params = serde_json::to_value(&batch).unwrap();
+        params["credential"] = json!("wrong-credential");
+        assert_eq!(
+            client
+                .call("events.put", params, deadline())
+                .await
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+        assert_eq!(store.lock().await.high_water().unwrap(), before);
+
+        // The first member would make the session ready. The second cannot
+        // complete an unstarted turn, so none of this batch enters the journal.
+        batch.events.push(NativeEvent {
+            kind: "turn.completed".to_owned(),
+            native_id: "unstarted-turn-completion".to_owned(),
+            ts: None,
+            data: json!({"turn_id":"unstarted", "status":"completed"}),
+        });
+        let mut params = serde_json::to_value(&batch).unwrap();
+        params["credential"] = json!(credential);
+        assert_eq!(
+            client
+                .call("events.put", params, deadline())
+                .await
+                .unwrap_err()
+                .code,
+            "rejected"
+        );
+
+        let source = client
+            .call(
+                "source.state",
+                json!({
+                    "credential":credential, "agent_id":agent_id, "generation":1, "source":"stream",
+                }),
+                deadline(),
+            )
+            .await
+            .unwrap();
+        assert!(source["last_batch_id"].is_null());
+        assert_eq!(source["health"], "stale");
+        let events = store.lock().await.read_events(before, 1000, None).unwrap();
+        assert!(events.iter().any(|event| event.kind == "source.gap"));
+        assert!(events.iter().all(|event| event.native_id.is_none()));
+
         client.close_input(deadline()).await.unwrap();
         timeout_at(deadline(), task).await.unwrap().unwrap();
     }

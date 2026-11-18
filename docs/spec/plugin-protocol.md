@@ -343,29 +343,21 @@ an exact duplicate of its last committed batch. Commit events, current projectio
 derived facts, cursor and last-batch acknowledgement together before replying/publishing.
 The next commit replaces only that last-batch acknowledgement in `source_state`.
 
-Same id with another semantic payload/cursor, or mixed new/duplicate events, is
-`source_integrity`. After a lost reply, read `source.state`; retry only that exact last
-batch. This retry is Store admission, never a native command retry. No adapter journal
-or unbounded seen-event store is required by this contract.
+Same id with another semantic payload/cursor, or mixed new/duplicate events, is a
+source-integrity rejection. The host replies with the committed acknowledgement or
+a definitive no-write error, including authorization failures, Store lock deadlines
+and rolled-back transactions. `unknown` is reserved for a commit whose fate the
+Store cannot establish. After an unusable acknowledgement or broken channel, the
+adapter stops publishing and the daemon retires the reader and records the missing
+coverage. Adapters do not reconcile or retry event writes through `source.state`.
 
-A typed `events.put` error returned from validation before the daemon opens the
-Store transaction is a definite rejection: the batch was never committed, so the
-plugin clears its unacknowledged-batch latch and surfaces the typed code. The
-definite set is `secret_in_payload`, `invalid`, `not_allowed` and
-`stale_generation`. Any error at or after the transaction (Store errors, lock
-deadlines, ack encoding) stays `unknown` with the latch kept; transport
-timeouts, closed peers and malformed/mismatched acks are likewise `unknown`.
-A definite rejection records a source gap with its typed reason (or fails the
-`session.ready` start as definite `failed` before any input); it never becomes
-`turn.unknown` or a launch `Unknown`. A definite rejection of event persistence
-after input dispatch does not by itself establish a definite native outcome:
-the dispatched command stays `unknown` with its exact binding, fencing fresh
-input until reconciliation.
-
-A replayable source resumes strictly after its opaque committed cursor. A source with
-no exclusive cursor reconnects at the live edge, records a gap and reads current native
-state; it does not republish history. With neither stable record id nor cursor, a lost
-acknowledgement is a gap/reconciliation case, not a speculative batch retry.
+The host records gaps and health from rejected batches for authorized source owners.
+A rejected `session.ready` before input can fail the start definitively. A rejected
+write after native input dispatch leaves the native outcome unknown unless separately
+proven. The exact dispatched command/turn binding still fences fresh input until
+settlement. A replayable source resumes strictly after its committed cursor. A source
+without an exclusive cursor starts at the live edge, records a gap and reads current
+native state without republishing history.
 
 Plugins publish only assigned native families. Agent/command/rule/mail/Git/process
 lifecycle, `agent.lost` and owner resolutions are daemon facts, not arbitrary plugin
@@ -389,11 +381,10 @@ settled exact-subject proof. The controlled path rejects reserved `daemon`, `os`
 `git` and `workspace_process` sources, stale generations, closed rows, and
 observer/child escalation. The committed health event and
 `source.state` readback carry lifecycle `state:"open"`; the four-field ACK does not.
-The event is published before the response. After an uncertain reply, settle through
-`source.state`, matching agent/generation/source and verifying open state plus requested
-health before proceeding; otherwise the outcome remains unknown. Do not infer health
-from a successful private-history read. Report `ok` only after verified live-edge
-recovery; keep the historical gap visible.
+The event is published before the response. A reader with an uncertain health reply
+stops publishing on that source. Report `ok` only after verified live-edge recovery
+and keep the historical gap visible. A successful private-history read does not
+establish live source health.
 
 The typed handoff contract is:
 
@@ -440,11 +431,11 @@ There is no `handoff_id`.
 
 `gap_id` identifies one uncovered interval. Same id and canonical fields return its
 stored result; the same id with different fields is an integrity error. After that
-operation is acknowledged/read back, a new interval uses a new stable id and replaces
+operation is acknowledged, a new interval uses a new stable id and replaces
 only the latest gap metadata; the previous gap event remains in retained history.
 
-At most one unacknowledged gap/handoff operation is allowed per source. Settle a lost
-reply with `source.state` before issuing the next operation.
+At most one unacknowledged gap/handoff operation is allowed per source. A lost
+reply fences later writes from that reader.
 
 Handoff is a single Store compare-and-swap. It verifies the current generation, an
 open predecessor and predecessor ownership of every named family. A controlled caller
@@ -457,9 +448,8 @@ rows. The predecessor lifecycle is unchanged, including when it owns zero famili
 Commit any new gap boundary, successor-open fact, owner transfer, `source.handoff` event
 and predecessor `last_handoff_digest`/`last_handoff` acknowledgement in that transaction.
 Publish the committed events and return `SourceHandoffAck` only after commit. The
-connected caller is a native adapter source; it verifies the handoff through
-`source.state` before switching to successor facts. Private history cannot be handed
-off or published by this caller. The separate Codex observe-only live grant is limited
+connected native adapter waits for the committed handoff ACK before publishing
+successor facts. Private history cannot be handed off or published by this caller. The separate Codex observe-only live grant is limited
 to `turn`, `message` and `tool`, with `observe` to `transcript` and mechanism
 `rollout_tail`. It reads the exact subject's rollout file from its captured live edge,
 commits an explicit gap-backed handoff before publishing complete normalized records,
@@ -471,15 +461,10 @@ first handoff, and all current generation owner/mechanism rows.
 `SourceHandoff::prepare(&mut self, policy:&SecretPolicy)->CoreResult<()>` is the shared,
 idempotent normalization step. It rejects known secrets in immutable fields before
 mutation and redacts only `gap.reason`; the canonical digest includes the full prepared
-request, including the redacted reason. Each caller prepares before sending, freezes that
-value, and reuses it for `source.state` proof. Host uses the same prepare path.
-Callers must not assume Host-only secret
-knowledge: if normalized request/digest agreement cannot be proven, the result is
-`unknown`. After a lost reply, accept only a matching digest/ACK, current successor
-owners and the same cursor or gap boundary. If any owner or boundary advanced, or the
-state is mixed/stale, the result is unknown; do not blindly retry. Retain only the latest
-handoff proof on the predecessor row. The public Agent `source_states` projection remains
-unchanged and never exposes that digest or ACK. No source epoch or open-id layer.
+request, including the redacted reason. The host uses the same prepare path.
+A reader with an uncertain handoff reply stops publishing on that source. It may
+publish successor facts only after a validated acknowledgement. The public Agent
+`source_states` projection omits the digest and ACK. No source epoch or open-id layer.
 
 ### Children and processes
 

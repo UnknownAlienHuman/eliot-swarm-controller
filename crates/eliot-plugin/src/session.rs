@@ -902,101 +902,8 @@ pub struct StreamSource<'a> {
 }
 
 impl StreamSource<'_> {
-    /// Commit one native record. An unknown acknowledgement latches the
-    /// source (no replay is ever allowed); a definite pre-transaction
-    /// rejection records an explicit gap with its typed reason and returns
-    /// that typed error instead of `unknown`.
+    /// Send one native record and wait for the host's outcome.
     pub async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
-        let mut ignored = None;
-        self.commit_event_inner(kind, native_id, data, &mut ignored)
-            .await
-    }
-
-    /// Child commit with retained gap: the same unresolved gap is driven
-    /// before any blocked return or new commit.
-    pub async fn commit_event_with_retained(
-        &mut self,
-        kind: &str,
-        native_id: String,
-        data: Value,
-        retained: &mut Option<SourceGap>,
-    ) -> Result<()> {
-        self.commit_event_inner(kind, native_id, data, retained)
-            .await
-    }
-
-    /// Record one explicit source gap. At most one gap is ever outstanding;
-    /// a second loss while it stands, or an ambiguous gap acknowledgement,
-    /// latches the source unknown.
-    pub async fn record_gap(&mut self, reason: &str) -> Result<()> {
-        let mut ignored = None;
-        self.record_gap_inner(reason, &mut ignored).await
-    }
-
-    /// Report missing observation coverage without declaring a native outcome
-    /// unknown. Only a canonical gap ACK permits continued admission; an
-    /// unresolved ACK fences the source exactly like an ordinary gap. Existing
-    /// uncertainty is never cleared. Callers must exclude session/turn identity, delivery,
-    /// transport and terminal loss from this path.
-    pub async fn record_coverage_gap(&mut self, reason: &str) -> Result<()> {
-        let mut ignored = None;
-        self.record_gap_inner_until(
-            reason,
-            &mut ignored,
-            (None, None),
-            Instant::now() + EVENT_DEADLINE,
-            false,
-        )
-        .await
-    }
-
-    /// Child gap with retained identity: the same gap body is retried until
-    /// its canonical ACK establishes the public gap.
-    pub async fn record_gap_with_retained(
-        &mut self,
-        reason: &str,
-        retained: &mut Option<SourceGap>,
-    ) -> Result<()> {
-        self.record_gap_inner(reason, retained).await
-    }
-
-    /// Cursor-bounded gap with retained identity: when the acknowledgement
-    /// is lost the exact gap body stays in `retained` so a later opportunity
-    /// can reconcile it instead of latching writes with the body discarded.
-    pub async fn record_gap_range_with_retained(
-        &mut self,
-        reason: &str,
-        from: Option<String>,
-        to: Option<String>,
-        deadline: Instant,
-        retained: &mut Option<SourceGap>,
-    ) -> Result<()> {
-        self.record_gap_inner_until(reason, retained, (from, to), deadline, true)
-            .await
-    }
-
-    /// Drive a retained child gap without recording a new loss. Returns true
-    /// when no gap is retained or its canonical ACK just established it.
-    pub async fn drive_retained_gap(&mut self, retained: &mut Option<SourceGap>) -> bool {
-        if retained.is_none() {
-            return true;
-        }
-        self.try_settle_retained(retained).await
-    }
-
-    async fn commit_event_inner(
-        &mut self,
-        kind: &str,
-        native_id: String,
-        data: Value,
-        retained: &mut Option<SourceGap>,
-    ) -> Result<()> {
-        if retained.is_some() && !self.try_settle_retained(retained).await {
-            return Err(Error::new(
-                "unknown",
-                format!("{} event acknowledgement is unresolved", self.harness),
-            ));
-        }
         if *self.writes_blocked {
             return Err(Error::new(
                 "unknown",
@@ -1024,63 +931,37 @@ impl StreamSource<'_> {
             Ok(_) => return Ok(()),
             Err(error) => error,
         };
-        if self
-            .sink
-            .is_unknown(self.agent_id, self.generation, "stream")
-        {
-            *self.writes_blocked = true;
-            *self.source_unknown = true;
-            *self.failure = Some(format!(
-                "{} event batch acknowledgement is unknown",
-                self.harness
-            ));
-            *self.batch_unknown = true;
-            return Err(Error::new(
-                "unknown",
-                format!("{} event batch acknowledgement is unknown", self.harness),
-            ));
+        if crate::is_definite_batch_rejection(&error.code) {
+            return Err(error.with_where("plugin.events.put"));
         }
-        // Definite rejection: the latch is clear, so the batch was never
-        // committed. Record a gap with the definite reason without latching
-        // unknown, and return the typed error so callers never map it to
-        // `turn.unknown` or a launch `Unknown`.
-        let reason = format!("{kind} could not be committed: {}", error.code);
-        self.record_gap_inner_until(
-            &reason,
-            retained,
-            (None, None),
-            Instant::now() + EVENT_DEADLINE,
-            false,
-        )
-        .await?;
+        *self.writes_blocked = true;
+        *self.source_unknown = true;
+        *self.failure = Some(format!(
+            "{} event batch acknowledgement is unknown",
+            self.harness
+        ));
+        *self.batch_unknown = true;
         Err(error)
     }
 
-    async fn record_gap_inner(
-        &mut self,
-        reason: &str,
-        retained: &mut Option<SourceGap>,
-    ) -> Result<()> {
-        self.record_gap_inner_until(
-            reason,
-            retained,
-            (None, None),
-            Instant::now() + EVENT_DEADLINE,
-            true,
-        )
-        .await
-    }
-
-    /// Use a caller-owned absolute deadline when a loss must also settle a
-    /// separate bounded source-health update.
-    pub async fn record_gap_until(&mut self, reason: &str, deadline: Instant) -> Result<()> {
-        let mut ignored = None;
-        self.record_gap_inner_until(reason, &mut ignored, (None, None), deadline, true)
+    /// Record a native loss reported by the adapter.
+    pub async fn record_gap(&mut self, reason: &str) -> Result<()> {
+        self.record_gap_until(reason, Instant::now() + EVENT_DEADLINE)
             .await
     }
 
-    /// Record the observed opaque cursor bounds without inferring positions
-    /// inside them. An unavailable upper bound stays absent.
+    /// Report missing observation coverage without declaring a native outcome unknown.
+    pub async fn record_coverage_gap(&mut self, reason: &str) -> Result<()> {
+        self.record_gap_inner_until(reason, (None, None), Instant::now() + EVENT_DEADLINE, false)
+            .await
+    }
+
+    pub async fn record_gap_until(&mut self, reason: &str, deadline: Instant) -> Result<()> {
+        self.record_gap_range_until(reason, None, None, deadline)
+            .await
+    }
+
+    /// Record the observed opaque cursor bounds without inferring positions inside them.
     pub async fn record_gap_range_until(
         &mut self,
         reason: &str,
@@ -1088,37 +969,17 @@ impl StreamSource<'_> {
         to: Option<String>,
         deadline: Instant,
     ) -> Result<()> {
-        let mut ignored = None;
-        self.record_gap_inner_until(reason, &mut ignored, (from, to), deadline, true)
+        self.record_gap_inner_until(reason, (from, to), deadline, true)
             .await
     }
 
     async fn record_gap_inner_until(
         &mut self,
         reason: &str,
-        retained: &mut Option<SourceGap>,
         bounds: (Option<String>, Option<String>),
         deadline: Instant,
         terminal_unknown: bool,
     ) -> Result<()> {
-        let had_retained = retained.is_some();
-        if had_retained && !self.try_settle_retained_until(retained, deadline).await {
-            *self.source_unknown = true;
-            return Err(Error::new(
-                "unknown",
-                format!(
-                    "{} event acknowledgement is unresolved; no source gap was issued",
-                    self.harness
-                ),
-            ));
-        }
-        if had_retained {
-            *self.source_unknown = true;
-            return Err(Error::new(
-                "unknown",
-                format!("{} source already has an unresolved gap", self.harness),
-            ));
-        }
         if *self.writes_blocked {
             *self.source_unknown = true;
             return Err(Error::new(
@@ -1174,7 +1035,7 @@ impl StreamSource<'_> {
                     "{} source gap acknowledgement is unknown",
                     self.harness
                 ));
-                *retained = Some(gap);
+                self.host.retire();
                 Err(Error::new(
                     "unknown",
                     format!("{} source gap acknowledgement is unknown", self.harness),
@@ -1183,80 +1044,28 @@ impl StreamSource<'_> {
         }
     }
 
-    async fn try_settle_retained(&mut self, retained: &mut Option<SourceGap>) -> bool {
-        self.try_settle_retained_until(retained, Instant::now() + EVENT_DEADLINE)
-            .await
-    }
-
-    async fn try_settle_retained_until(
-        &mut self,
-        retained: &mut Option<SourceGap>,
-        deadline: Instant,
-    ) -> bool {
-        let Some(gap) = retained.clone() else {
-            return true;
-        };
-        let result = self.send_gap_until(&gap, deadline).await;
-        self.apply_retained_attempt(retained, &gap, &result)
-    }
-
-    /// Serialize one retained-gap attempt for an owned send. Same wire body
-    /// as `send_gap`; the caller owns the RPC future.
-    pub fn gap_request_params(credential: &str, gap: &SourceGap) -> Value {
-        json!({
-            "credential": credential,
-            "agent_id": gap.agent_id,
-            "generation": gap.generation,
-            "source": gap.source,
-            "gap_id": gap.gap_id,
-            "families": gap.families,
-            "reason": gap.reason,
-            "from": gap.from,
-            "to": gap.to,
-        })
-    }
-
-    /// Apply one owned attempt result to the retained slot and latches.
-    /// Only the matching retained gap is settled; a stale attempt (retained
-    /// changed or cleared while the RPC was in flight) mutates nothing.
-    /// Returns true when the retained gap just settled.
-    pub fn apply_retained_attempt(
-        &mut self,
-        retained: &mut Option<SourceGap>,
-        attempted: &SourceGap,
-        result: &Result<Value>,
-    ) -> bool {
-        if retained.as_ref() != Some(attempted) {
-            return false;
-        }
-        match result {
-            Ok(ack) if Self::is_canonical_gap_ack(attempted, ack) => {
-                *retained = None;
-                *self.writes_blocked = false;
-                *self.source_unknown = true;
-                *self.failure = Some(format!("{}; terminal outcome is unknown", attempted.reason));
-                true
-            }
-            _ => {
-                *self.writes_blocked = true;
-                *self.source_unknown = true;
-                false
-            }
-        }
-    }
-
     async fn send_gap_until(&self, gap: &SourceGap, deadline: Instant) -> Result<Value> {
         self.host
             .call(
                 "source.gap",
-                Self::gap_request_params(self.credential, gap),
+                json!({
+                    "credential": self.credential,
+                    "agent_id": gap.agent_id,
+                    "generation": gap.generation,
+                    "source": gap.source,
+                    "gap_id": gap.gap_id,
+                    "families": gap.families,
+                    "reason": gap.reason,
+                    "from": gap.from,
+                    "to": gap.to,
+                }),
                 deadline,
             )
             .await
     }
 
     /// Whether `ack` canonically establishes `gap` (same gap_id, positive seq).
-    pub fn is_canonical_gap_ack(gap: &SourceGap, ack: &Value) -> bool {
+    fn is_canonical_gap_ack(gap: &SourceGap, ack: &Value) -> bool {
         ack.get("gap_id").and_then(Value::as_str) == Some(gap.gap_id.as_str())
             && ack
                 .get("seq")

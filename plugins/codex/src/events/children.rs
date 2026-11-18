@@ -8,10 +8,6 @@ use super::*;
 /// Bound on tracked child threads, unconfirmed threads and in-flight spawns per
 /// generation; overflow is a source gap.
 pub(super) const MAX_CHILD_THREADS: usize = 256;
-/// Independent child-gap retry cadence: the event loop drives ONE retained
-/// child gap per tick until its canonical ACK or shutdown. Same 1s cadence
-/// as the host live poll; private, not a public quota config.
-pub(super) const CHILD_GAP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) struct ChildState {
     binding: ChildBinding,
     writes_blocked: bool,
@@ -23,7 +19,6 @@ pub(super) struct ChildState {
     final_text: Option<String>,
     active_turn_id: Option<String>,
     ready_committed: bool,
-    pending_gap: Option<SourceGap>,
 }
 
 impl ChildState {
@@ -39,7 +34,6 @@ impl ChildState {
             final_text: None,
             active_turn_id: None,
             ready_committed: false,
-            pending_gap: None,
         }
     }
 
@@ -52,9 +46,6 @@ impl ChildState {
         native_id: String,
         data: Value,
     ) -> Result<()> {
-        // Split disjoint field borrows: the source borrows latches, `pending`
-        // borrows only the retained gap slot.
-        let pending = &mut self.pending_gap;
         let mut source = StreamSource {
             sink,
             host,
@@ -71,9 +62,7 @@ impl ChildState {
             batch_unknown: &mut self.batch_unknown,
             failure: &mut self.failure,
         };
-        source
-            .commit_event_with_retained(kind, native_id, data, pending)
-            .await
+        source.commit_event(kind, native_id, data).await
     }
 
     async fn record_gap(
@@ -83,7 +72,6 @@ impl ChildState {
         credential: &str,
         reason: &str,
     ) -> Result<()> {
-        let pending = &mut self.pending_gap;
         let mut source = StreamSource {
             sink,
             host,
@@ -100,7 +88,7 @@ impl ChildState {
             batch_unknown: &mut self.batch_unknown,
             failure: &mut self.failure,
         };
-        source.record_gap_with_retained(reason, pending).await
+        source.record_gap(reason).await
     }
 }
 
@@ -484,78 +472,6 @@ impl EventProcessor {
             self.defer_gap("Codex child-thread request could not be rejected");
         }
     }
-    pub(super) fn has_pending_child_gap(&self) -> bool {
-        self.child_states
-            .values()
-            .any(|state| state.pending_gap.is_some())
-    }
-
-    /// Fair rotation over retained child gaps: the next pending child after
-    /// the last served (sorted thread order, wrap-around), so one bad child
-    /// cannot starve the others. Synchronous; the caller owns the send.
-    pub(super) fn next_pending_gap(&mut self) -> Option<(String, SourceGap)> {
-        let mut pending: Vec<String> = self
-            .child_states
-            .iter()
-            .filter(|(_, state)| state.pending_gap.is_some())
-            .map(|(thread, _)| thread.clone())
-            .collect();
-        if pending.is_empty() {
-            return None;
-        }
-        pending.sort();
-        let start = self
-            .gap_last_served
-            .as_ref()
-            .and_then(|last| pending.iter().position(|thread| thread > last))
-            .unwrap_or(0);
-        let thread = pending[start % pending.len()].clone();
-        let gap = self.child_states.get(&thread)?.pending_gap.clone()?;
-        self.gap_last_served = Some(thread.clone());
-        Some((thread, gap))
-    }
-
-    /// Apply one owned attempt result to the matching child only.
-    /// Synchronous; holds `&mut` briefly after the RPC completes, never
-    /// across the wait. Reuses the shared latch logic.
-    pub(super) fn apply_gap_attempt(
-        &mut self,
-        child_thread: &str,
-        attempted: &SourceGap,
-        result: &Result<Value>,
-    ) -> bool {
-        let Some(state) = self.child_states.get_mut(child_thread) else {
-            return false;
-        };
-        if state.binding.agent_id != attempted.agent_id
-            || state.binding.agent_generation != attempted.generation
-            || state.pending_gap.as_ref() != Some(attempted)
-        {
-            return false;
-        }
-        let host = self.host.clone();
-        let credential = self.credential.clone();
-        let sink = &mut self.sink;
-        let pending = &mut state.pending_gap;
-        let mut source = StreamSource {
-            sink,
-            host: &host,
-            credential: &credential,
-            agent_id: &state.binding.agent_id,
-            generation: state.binding.agent_generation,
-            harness: "Codex",
-            id_prefix: "codex",
-            families: &eliot_core::NATIVE_CHILD_FAMILIES,
-            writes_blocked: &mut state.writes_blocked,
-            gap_reported: &mut state.gap_reported,
-            gap_number: &mut state.gap_number,
-            source_unknown: &mut state.source_unknown,
-            batch_unknown: &mut state.batch_unknown,
-            failure: &mut state.failure,
-        };
-        source.apply_retained_attempt(pending, attempted, result)
-    }
-
     async fn record_child_gap_visible(&mut self, child_thread: &str, reason: &str) {
         let Some(state) = self.child_states.get_mut(child_thread) else {
             return;
@@ -563,17 +479,13 @@ impl EventProcessor {
         let host = self.host.clone();
         let credential = self.credential.clone();
         let sink = &mut self.sink;
-        // Child metadata uncertainty stays in child scope: the retained gap,
-        // writes_blocked, source_unknown, and failure all live on the child
-        // state. A busy child gap must not set the parent loss_reason (no
-        // false parent source gap, healthy parent steer stays admitted).
-        // Genuine independent parent loss still sets loss_reason on parent
-        // paths; this path never clears it.
+        // A child gap updates only the child latches.
         let _ = state.record_gap(sink, &host, &credential, reason).await;
     }
 
     async fn handle_thread_started_error(&mut self, child_thread: &str, error: Error) {
         if self.child_states.contains_key(child_thread) {
+            let rejected = error.failure_where.as_deref() == Some("plugin.events.put");
             let (should_gap, reason) = {
                 let state = self.child_states.get_mut(child_thread).expect("checked");
                 state.source_unknown = true;
@@ -584,13 +496,14 @@ impl EventProcessor {
                 if state.failure.is_none() {
                     state.failure = Some(*error.message);
                 }
-                (!state.gap_reported && !state.writes_blocked, reason)
+                (
+                    !rejected && !state.gap_reported && !state.writes_blocked,
+                    reason,
+                )
             };
             if should_gap {
                 self.record_child_gap_visible(child_thread, &reason).await;
             }
-            // A retained gap stands: retries belong to the owned in-flight
-            // driver; frame handling never awaits retained-gap RPCs.
             return;
         }
         if self.child_pending.contains_key(child_thread)
@@ -618,11 +531,8 @@ impl EventProcessor {
         if self
             .child_states
             .get(&child_thread)
-            .is_some_and(|state| state.pending_gap.is_some())
+            .is_some_and(|state| state.writes_blocked)
         {
-            // Retained gap stands: drop this frame (covered by the gap) and
-            // leave the retry to the owned in-flight driver. Never await
-            // retained-gap RPCs from the frame path.
             return;
         }
         if !self.child_states.contains_key(&child_thread)
@@ -698,6 +608,7 @@ impl EventProcessor {
             .process_child_notification(&child_thread, method, params)
             .await
         {
+            let rejected = error.failure_where.as_deref() == Some("plugin.events.put");
             let (should_gap, reason) = {
                 let Some(state) = self.child_states.get_mut(&child_thread) else {
                     return;
@@ -710,7 +621,10 @@ impl EventProcessor {
                 if state.failure.is_none() {
                     state.failure = Some(*error.message);
                 }
-                (!state.gap_reported && !state.writes_blocked, reason)
+                (
+                    !rejected && !state.gap_reported && !state.writes_blocked,
+                    reason,
+                )
             };
             if should_gap {
                 self.record_child_gap_visible(&child_thread, &reason).await;
@@ -957,10 +871,8 @@ impl EventProcessor {
         if self
             .child_states
             .get(child_thread)
-            .is_some_and(|state| state.pending_gap.is_some())
+            .is_some_and(|state| state.writes_blocked)
         {
-            // Retained gap stands: drop buffered (covered by the gap) without
-            // awaiting retained-gap RPCs; the owned driver settles.
             let discarded: usize = queue.iter().map(child_frame_size).sum();
             self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(discarded);
             return Err(Error::new(
@@ -975,10 +887,8 @@ impl EventProcessor {
             if self
                 .child_states
                 .get(child_thread)
-                .is_some_and(|state| state.pending_gap.is_some())
+                .is_some_and(|state| state.writes_blocked)
             {
-                // A retained gap stood up mid-flush: drop this and the rest
-                // (covered by the gap) without further RPCs.
                 let rest: usize = queue.iter().map(child_frame_size).sum();
                 self.child_buffer_bytes = self.child_buffer_bytes.saturating_sub(rest);
                 return Err(Error::new(
@@ -992,6 +902,7 @@ impl EventProcessor {
                         .process_child_notification(child_thread, &method, params)
                         .await;
                     if let Err(error) = result {
+                        let rejected = error.failure_where.as_deref() == Some("plugin.events.put");
                         let (should_gap, code) = {
                             let Some(state) = self.child_states.get_mut(child_thread) else {
                                 continue;
@@ -1001,7 +912,10 @@ impl EventProcessor {
                             if state.failure.is_none() {
                                 state.failure = Some(*error.message);
                             }
-                            (!state.gap_reported && !state.writes_blocked, code)
+                            (
+                                !rejected && !state.gap_reported && !state.writes_blocked,
+                                code,
+                            )
                         };
                         if should_gap {
                             let reason = format!(
@@ -1018,8 +932,6 @@ impl EventProcessor {
                                 first_unresolved = Some(gap_error);
                             }
                         } else {
-                            // Retained retries belong to the owned driver;
-                            // only note blockage here.
                             let still_blocked = self
                                 .child_states
                                 .get(child_thread)
@@ -1302,14 +1214,6 @@ impl EventProcessor {
         self.record_gap(reason).await
     }
 }
-/// One owned child-gap attempt: cloned identity plus the RPC future.
-/// Polled in `run()` without borrowing `ChildState`; the result applies
-/// only to the matching child/gen/retained gap.
-pub(super) struct GapAttempt {
-    pub(super) child_thread: String,
-    pub(super) gap: SourceGap,
-    pub(super) future: Pin<Box<dyn Future<Output = Result<Value>> + Send>>,
-}
 /// A `spawnAgent` collab call: its item id and the spawned thread ids
 /// (`receiverThreadIds`, filled once the spawn completes).
 fn spawn_call(item: &Value) -> Option<(String, Vec<String>)> {
@@ -1428,6 +1332,7 @@ pub(super) fn top_level_parent_thread(thread: &Value) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn spawned_parent_reads_only_the_installed_thread_spawn_shape() {
@@ -1659,7 +1564,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_flush_gaps_failed_frame_and_processes_remainder() {
+    async fn child_flush_discards_frames_after_acknowledgement_loss() {
         let (_native, mut processor) = child_test_processor().await;
         let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
         let mut state = ChildState::new(ChildBinding {
@@ -1670,6 +1575,7 @@ mod tests {
         });
         state.ready_committed = true;
         state.writes_blocked = true;
+        state.source_unknown = true;
         processor.child_states.insert("child-1".to_owned(), state);
         let mut queue = VecDeque::new();
         queue.push_back(BufferedNativeFrame::Notification {
@@ -1695,20 +1601,8 @@ mod tests {
             .get("child-1")
             .expect("known child stays visible");
         assert!(state.source_unknown);
-        assert!(
-            state
-                .failure
-                .as_deref()
-                .is_some_and(|failure| failure.contains("omitted turn id"))
-        );
-        assert!(
-            processor
-                .children
-                .pending_spawns
-                .get("child-1")
-                .is_some_and(|items| items.contains("call-nested")),
-            "remainder is processed, not dropped"
-        );
+        assert!(state.writes_blocked);
+        assert!(!processor.children.pending_spawns.contains_key("child-1"));
         assert!(!processor.child_buffers.contains_key("child-1"));
         assert_eq!(processor.child_buffer_bytes, 0);
     }
@@ -2018,629 +1912,53 @@ mod tests {
 
         let (host_read, mut host_write) = split(host_io);
         let mut host_reader = BufReader::new(host_read);
-        let mut recorded_rpc = Vec::new();
-
         let fake_host = async {
             let mut line = String::new();
-
-            // 1. First gap request: busy-before-commit gap.
-            line.clear();
-            host_reader
-                .read_line(&mut line)
-                .await
-                .expect("read first child gap request");
-            let req1: RpcRequest = serde_json::from_str(&line).expect("decode req1");
-            recorded_rpc.push((req1.method.clone(), req1.params.clone()));
-            assert_eq!(req1.method, "source.gap");
-            let busy_reply = json!({
+            host_reader.read_line(&mut line).await.expect("read gap");
+            let request: RpcRequest = serde_json::from_str(&line).expect("decode gap");
+            assert_eq!(request.method, "source.gap");
+            assert_eq!(request.params["agent_id"], "a2");
+            assert_eq!(request.params["generation"], 1);
+            assert_eq!(request.params["source"], "stream");
+            let reply = json!({
                 "jsonrpc": "2.0",
-                "id": req1.id,
+                "id": request.id,
                 "error": {
                     "code": -32020,
-                    "message": "host source gap is busy",
-                    "data": { "code": "busy" }
+                    "message": "host source gap acknowledgement is unknown",
+                    "data": { "code": "unknown" }
                 }
             });
             host_write
-                .write_all(format!("{busy_reply}\n").as_bytes())
+                .write_all(format!("{reply}\n").as_bytes())
                 .await
-                .expect("send busy gap reply");
-
-            // 2. Owned driver retries SAME gap_id/body (no extra frame for
-            // the retry itself): host answers canonical ACK.
-            line.clear();
-            host_reader
-                .read_line(&mut line)
-                .await
-                .expect("read retried child gap request");
-            let req2: RpcRequest = serde_json::from_str(&line).expect("decode req2");
-            recorded_rpc.push((req2.method.clone(), req2.params.clone()));
-            assert_eq!(req2.method, "source.gap");
-            let gap_ack = json!({
-                "jsonrpc": "2.0",
-                "id": req2.id,
-                "result": {
-                    "gap_id": req2.params["gap_id"],
-                    "seq": 1,
-                }
-            });
-            host_write
-                .write_all(format!("{gap_ack}\n").as_bytes())
-                .await
-                .expect("send canonical gap ack");
-
-            // 3. Frame after settled gap commits its turn.started event
-            // (turn-2 arrived while pending and was dropped, covered by the
-            // gap; turn-3 arrives after settle and commits).
-            line.clear();
-            host_reader
-                .read_line(&mut line)
-                .await
-                .expect("read child fact after settled gap");
-            let req3: RpcRequest = serde_json::from_str(&line).expect("decode req3");
-            recorded_rpc.push((req3.method.clone(), req3.params.clone()));
-            assert_eq!(req3.method, "events.put");
-            assert_eq!(req3.params["events"][0]["data"]["turn_id"], "turn-3");
-            let fact_ack = json!({
-                "jsonrpc": "2.0",
-                "id": req3.id,
-                "result": {
-                    "first_seq": 2,
-                    "last_seq": 2,
-                    "cursor": null,
-                }
-            });
-            host_write
-                .write_all(format!("{fact_ack}\n").as_bytes())
-                .await
-                .expect("send turn fact ack");
-
-            drop(host_write);
-            drop(host_reader);
-            recorded_rpc
+                .expect("send error");
         };
 
         let driver = async {
-            // First frame: normalization failure triggers source.gap, host replies busy.
             processor
                 .handle_child_notification("turn/started", json!({"threadId": "child-1"}))
                 .await;
-
-            // Observe host-facing child gap / source.state before producer drain:
-            let state_before = processor
-                .child_states
-                .get("child-1")
-                .expect("child visible");
-            assert!(
-                state_before.writes_blocked,
-                "writes must be blocked while gap is unresolved"
-            );
-            assert!(
-                state_before.source_unknown,
-                "source must be marked unknown on gap ACK failure"
-            );
-            assert!(
-                state_before.pending_gap.is_some(),
-                "unresolved gap must be retained"
-            );
-            assert_eq!(
-                processor.loss_reason, None,
-                "child metadata uncertainty stays in child scope"
-            );
-            assert!(
-                !processor.status.source_unknown,
-                "parent source stays known while only a child gap is busy"
-            );
-            assert!(
-                !processor.gap_reported,
-                "parent must not report a gap for a child ACK failure"
-            );
-
-            // Frame while pending: dropped (covered by the gap), never
-            // triggers a retained-gap RPC from the frame path.
             processor
                 .handle_child_notification(
                     "turn/started",
                     json!({"threadId": "child-1", "turn": {"id": "turn-2"}}),
                 )
                 .await;
-            assert!(
-                processor.has_pending_child_gap(),
-                "still pending; frame path never retries"
-            );
-            assert_eq!(
-                processor.child_states["child-1"].active_turn_id, None,
-                "dropped while pending, not processed"
-            );
-
-            // Owned attempt for the SAME retained gap (no extra frame for
-            // the retry itself), settled by the canonical ACK.
-            let (retry_thread, retry_gap) =
-                processor.next_pending_gap().expect("pending for driver");
-            assert_eq!(retry_thread, "child-1");
-            let params =
-                eliot_plugin::session::StreamSource::gap_request_params("test-cred", &retry_gap);
-            let host = processor.host.clone();
-            let result = host
-                .call(
-                    "source.gap",
-                    params,
-                    tokio::time::Instant::now() + eliot_plugin::session::EVENT_DEADLINE,
-                )
-                .await;
-            assert!(
-                processor.apply_gap_attempt(&retry_thread, &retry_gap, &result),
-                "canonical ACK settles the matching retained gap"
-            );
-
-            // Frame after settle commits normally.
-            processor
-                .handle_child_notification(
-                    "turn/started",
-                    json!({"threadId": "child-1", "turn": {"id": "turn-3"}}),
-                )
-                .await;
         };
-
-        let (recorded_rpc, ()) = tokio::join!(fake_host, driver);
+        tokio::join!(fake_host, driver);
+        drop(host_write);
+        drop(host_reader);
         peer_task.await.expect("peer task clean shutdown");
 
-        assert_eq!(recorded_rpc.len(), 3);
-        // Request 1: first gap attempt
-        assert_eq!(recorded_rpc[0].0, "source.gap");
-        assert_eq!(recorded_rpc[0].1["agent_id"], "a2");
-        assert_eq!(recorded_rpc[0].1["generation"], 1);
-        assert_eq!(recorded_rpc[0].1["source"], "stream");
-        assert!(
-            recorded_rpc[0].1["gap_id"]
-                .as_str()
-                .unwrap()
-                .starts_with("codex:a2:1:gap-")
-        );
-
-        // Request 2: retried gap has identical gap_id and reason body
-        assert_eq!(recorded_rpc[1].0, "source.gap");
-        assert_eq!(recorded_rpc[1].1["agent_id"], "a2");
-        assert_eq!(recorded_rpc[1].1["generation"], 1);
-        assert_eq!(recorded_rpc[1].1["source"], "stream");
-        assert_eq!(
-            recorded_rpc[1].1["gap_id"], recorded_rpc[0].1["gap_id"],
-            "must retry SAME child gap_id"
-        );
-        assert_eq!(
-            recorded_rpc[1].1["reason"], recorded_rpc[0].1["reason"],
-            "must retry SAME child gap body"
-        );
-
-        // Request 3: turn-3 committed after settlement (turn-2 was dropped
-        // while pending, covered by the gap).
-        assert_eq!(recorded_rpc[2].0, "events.put");
-        assert_eq!(recorded_rpc[2].1["agent_id"], "a2");
-        assert_eq!(recorded_rpc[2].1["events"][0]["kind"], "turn.started");
-        assert_eq!(recorded_rpc[2].1["events"][0]["data"]["turn_id"], "turn-3");
-
-        // Observe host-facing child gap / source.state on child state after settlement:
-        let state_after = processor
-            .child_states
-            .get("child-1")
-            .expect("child visible");
-        assert_eq!(state_after.binding.agent_id, "a2");
-        assert_eq!(state_after.binding.agent_generation, 1);
-        assert_eq!(state_after.binding.native_ref, "child-1");
-        assert!(
-            state_after.pending_gap.is_none(),
-            "gap settled by canonical ACK"
-        );
-        assert!(state_after.gap_reported, "gap was reported");
-        assert_eq!(state_after.gap_number, 1);
-        assert!(
-            !state_after.writes_blocked,
-            "writes unblocked after canonical ACK"
-        );
-        assert!(
-            state_after.source_unknown,
-            "source marked unknown due to gap history"
-        );
-        assert!(
-            state_after
-                .failure
-                .as_deref()
-                .is_some_and(|f| f.contains("could not be normalized")),
-            "failure records normalization error"
-        );
-
-        // Assert exact child agent / generation / source from host observation:
-        assert_eq!(recorded_rpc[1].1["agent_id"], "a2");
-        assert_eq!(recorded_rpc[1].1["generation"], 1);
-        assert_eq!(recorded_rpc[1].1["source"], "stream");
-
-        // Parent native source has no false gap after the child ACK: the
-        // healthy-parent steer gate (host checks status.source_unknown)
-        // stays admitted.
-        assert_eq!(processor.loss_reason, None);
+        let child = &processor.child_states["child-1"];
+        assert!(child.writes_blocked);
+        assert!(child.source_unknown);
+        assert!(child.active_turn_id.is_none());
+        assert!(processor.loss_reason.is_none());
         assert!(!processor.status.source_unknown);
         assert!(!processor.gap_reported);
         assert!(processor.status.failure.is_none());
-
-        // No native input / spawn replay:
-        assert!(processor.children.pending_spawns.is_empty());
-    }
-
-    #[tokio::test]
-    async fn pending_child_gap_recovers_without_additional_frame_before_drain() {
-        use eliot_plugin::RpcRequest;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
-        use tokio::sync::{mpsc, oneshot, watch};
-
-        let (_native, mut processor, host_io, peer_task) = connected_child_processor("a1").await;
-        processor.status.thread_id = Some("owned".to_owned());
-        // Healthy parent turn: the steer gate needs an active turn and a
-        // known source. The child gap must not disturb either.
-        processor.status.active_command_id = Some("send-1".to_owned());
-        processor.status.active_turn_id = Some("turn-parent".to_owned());
-        let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", "child-1");
-        let mut state = ChildState::new(ChildBinding {
-            registration,
-            agent_id: "a2".to_owned(),
-            agent_generation: 1,
-            native_ref: "child-1".to_owned(),
-        });
-        state.ready_committed = true;
-        processor.child_states.insert("child-1".to_owned(), state);
-
-        // ACTUAL run loop: frames, stream, controls, and status channels.
-        // The producer stays alive (frames open, stream Open) throughout.
-        let (frames_tx, frames_rx) = mpsc::channel(16);
-        let (stream_tx, stream_rx) = watch::channel(StreamState::Open);
-        let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE);
-        let (status_tx, status_rx) = watch::channel(EventStatus::default());
-        let run_handle = tokio::spawn(run(frames_rx, stream_rx, processor, control_rx, status_tx));
-
-        // Coordination without timing: held (gap2 received, ACK not yet
-        // sent), ack (parent served, now send ACK), fact (turn-after
-        // committed, proving unblocked before drain).
-        let (held_tx, held_rx) = oneshot::channel::<()>();
-        let (ack_tx, ack_rx) = oneshot::channel::<()>();
-        let (fact_tx, fact_rx) = oneshot::channel::<()>();
-
-        let (host_read, mut host_write) = split(host_io);
-        let mut host_reader = BufReader::new(host_read);
-        let mut recorded_rpc = Vec::new();
-
-        let fake_host = async {
-            let mut line = String::new();
-
-            // 1. Last child frame's gap: host replies busy immediately.
-            line.clear();
-            timeout_at(
-                Instant::now() + EVENT_DEADLINE,
-                host_reader.read_line(&mut line),
-            )
-            .await
-            .expect("host read first child gap within deadline")
-            .expect("read first child gap request");
-            let req1: RpcRequest = serde_json::from_str(&line).expect("decode req1");
-            recorded_rpc.push((req1.method.clone(), req1.params.clone()));
-            assert_eq!(req1.method, "source.gap");
-            assert_eq!(req1.params["agent_id"], "a2");
-            let busy_reply = json!({
-                "jsonrpc": "2.0",
-                "id": req1.id,
-                "error": {
-                    "code": -32020,
-                    "message": "host source gap is busy",
-                    "data": { "code": "busy" }
-                }
-            });
-            host_write
-                .write_all(format!("{busy_reply}\n").as_bytes())
-                .await
-                .expect("send busy gap reply");
-
-            // 2. Owned retry (no extra child frame): SAME gap_id/body.
-            // Held: no ACK until the parent control is served.
-            line.clear();
-            timeout_at(
-                Instant::now() + EVENT_DEADLINE,
-                host_reader.read_line(&mut line),
-            )
-            .await
-            .expect("host read retried child gap within deadline")
-            .expect("read independently retried child gap");
-            let req2: RpcRequest = serde_json::from_str(&line).expect("decode req2");
-            assert_eq!(req2.method, "source.gap");
-            assert_eq!(
-                req2.params["gap_id"], req1.params["gap_id"],
-                "independent retry keeps SAME gap_id"
-            );
-            assert_eq!(
-                req2.params["reason"], req1.params["reason"],
-                "independent retry keeps SAME gap body"
-            );
-            recorded_rpc.push((req2.method.clone(), req2.params.clone()));
-            held_tx.send(()).expect("signal gap held");
-            timeout_at(Instant::now() + EVENT_DEADLINE, ack_rx)
-                .await
-                .expect("ack signal within deadline")
-                .expect("wait for parent-served signal");
-            let gap_ack = json!({
-                "jsonrpc": "2.0",
-                "id": req2.id,
-                "result": {
-                    "gap_id": req2.params["gap_id"],
-                    "seq": 1,
-                }
-            });
-            host_write
-                .write_all(format!("{gap_ack}\n").as_bytes())
-                .await
-                .expect("send canonical gap ack");
-
-            // 3. Turn-after commits only after settle (proving unblocked
-            // before drain). Any concurrent second gap attempt while held
-            // would arrive here instead and fail the method assertion.
-            line.clear();
-            timeout_at(
-                Instant::now() + EVENT_DEADLINE,
-                host_reader.read_line(&mut line),
-            )
-            .await
-            .expect("host read turn-after fact within deadline")
-            .expect("read turn-after fact");
-            let req3: RpcRequest = serde_json::from_str(&line).expect("decode req3");
-            assert_eq!(req3.method, "events.put");
-            assert_eq!(req3.params["agent_id"], "a2");
-            assert_eq!(req3.params["events"][0]["kind"], "turn.started");
-            assert_eq!(req3.params["events"][0]["data"]["turn_id"], "turn-after");
-            recorded_rpc.push((req3.method.clone(), req3.params.clone()));
-            let fact_ack = json!({
-                "jsonrpc": "2.0",
-                "id": req3.id,
-                "result": {
-                    "first_seq": 2,
-                    "last_seq": 2,
-                    "cursor": null,
-                }
-            });
-            host_write
-                .write_all(format!("{fact_ack}\n").as_bytes())
-                .await
-                .expect("send turn fact ack");
-            fact_tx.send(()).expect("signal fact committed");
-
-            drop(host_write);
-            drop(host_reader);
-            recorded_rpc
-        };
-
-        let mut status_rx = status_rx;
-        let driver = async {
-            // Initial state: no pending gaps (Option::None). Serves parent control.
-            let (initial_tx, initial_rx) = oneshot::channel();
-            control_tx
-                .send(Control::BeginStop { reply: initial_tx })
-                .await
-                .expect("send initial BeginStop");
-            let initial_reply = timeout_at(Instant::now() + EVENT_DEADLINE, initial_rx)
-                .await
-                .expect("initial control within bounded deadline")
-                .expect("parent control served with no pending gaps");
-            assert!(
-                initial_reply.is_ok(),
-                "BeginStop stays responsive before gaps"
-            );
-
-            // Last child frame: normalization failure, gap busy. No more
-            // child frames until after settle (retry is independent).
-            frames_tx
-                .send(NativeFrame::Notification {
-                    method: "turn/started".to_owned(),
-                    params: json!({"threadId": "child-1"}),
-                })
-                .await
-                .expect("send last child frame");
-            timeout_at(Instant::now() + EVENT_DEADLINE, held_rx)
-                .await
-                .expect("held signal within bounded deadline")
-                .expect("retry started without extra frame");
-
-            // Parent control served WHILE the metadata ACK is held.
-            let (reply_tx, reply_rx) = oneshot::channel();
-            control_tx
-                .send(Control::BeginStop { reply: reply_tx })
-                .await
-                .expect("send parent BeginStop");
-            let reply = timeout_at(Instant::now() + EVENT_DEADLINE, reply_rx)
-                .await
-                .expect("held control within bounded deadline")
-                .expect("parent control served while ACK held");
-            assert!(reply.is_ok(), "BeginStop stays responsive");
-            let held_status = status_rx.borrow_and_update().clone();
-            assert!(
-                !held_status.source_unknown,
-                "parent source stays known while child ACK held"
-            );
-            assert_eq!(
-                held_status.active_turn_id.as_deref(),
-                Some("turn-parent"),
-                "healthy parent turn retained while held"
-            );
-
-            // Now let the held ACK settle the child, then wait for the
-            // loop iteration that applies it (status send follows apply).
-            ack_tx.send(()).expect("release held ACK");
-            timeout_at(Instant::now() + EVENT_DEADLINE, status_rx.changed())
-                .await
-                .expect("status change within bounded deadline")
-                .expect("settle applied before drain");
-
-            // After canonical ACK settlement: gap_in_flight is None again; serves parent control again.
-            let (after_ack_tx, after_ack_rx) = oneshot::channel();
-            control_tx
-                .send(Control::BeginStop {
-                    reply: after_ack_tx,
-                })
-                .await
-                .expect("send parent BeginStop after ACK");
-            let after_ack_reply = timeout_at(Instant::now() + EVENT_DEADLINE, after_ack_rx)
-                .await
-                .expect("after-ack control within bounded deadline")
-                .expect("parent control served again after ACK/Option::None");
-            assert!(
-                after_ack_reply.is_ok(),
-                "BeginStop stays responsive after settlement"
-            );
-
-            // Subsequent frame commits (proving writes unblocked) before
-            // the producer drains (frames still open, stream Open).
-            frames_tx
-                .send(NativeFrame::Notification {
-                    method: "turn/started".to_owned(),
-                    params: json!({"threadId": "child-1", "turn": {"id": "turn-after"}}),
-                })
-                .await
-                .expect("send turn-after frame");
-            timeout_at(Instant::now() + EVENT_DEADLINE, fact_rx)
-                .await
-                .expect("fact signal within bounded deadline")
-                .expect("turn-after committed");
-
-            let last_status = status_rx.borrow().clone();
-            assert!(!last_status.source_unknown);
-            assert!(last_status.failure.is_none());
-
-            // Clean shutdown of the actual run loop.
-            let (close_tx, close_rx) = oneshot::channel();
-            control_tx
-                .send(Control::Close { reply: close_tx })
-                .await
-                .expect("send Close");
-            timeout_at(Instant::now() + EVENT_DEADLINE, close_rx)
-                .await
-                .expect("close within bounded deadline")
-                .expect("Close reply");
-            last_status
-        };
-
-        let (recorded_rpc, last_status) = tokio::join!(fake_host, driver);
-        run_handle.await.expect("run clean shutdown");
-        peer_task.await.expect("peer task clean shutdown");
-        drop(stream_tx);
-
-        // Public child boundary: gap, SAME-gap retry, then turn-after fact.
-        // No extra frame between busy and retry; one attempt at a time (no
-        // concurrent second gap while held); settled before drain.
-        assert_eq!(recorded_rpc.len(), 3);
-        assert_eq!(recorded_rpc[0].0, "source.gap");
-        assert_eq!(recorded_rpc[0].1["agent_id"], "a2");
-        assert_eq!(recorded_rpc[0].1["generation"], 1);
-        assert_eq!(recorded_rpc[0].1["source"], "stream");
-        assert_eq!(recorded_rpc[1].0, "source.gap");
-        assert_eq!(recorded_rpc[1].1["agent_id"], "a2");
-        assert_eq!(recorded_rpc[1].1["generation"], 1);
-        assert_eq!(recorded_rpc[1].1["source"], "stream");
-        assert_eq!(
-            recorded_rpc[1].1["gap_id"], recorded_rpc[0].1["gap_id"],
-            "independent retry keeps SAME gap_id"
-        );
-        assert_eq!(
-            recorded_rpc[1].1["reason"], recorded_rpc[0].1["reason"],
-            "independent retry keeps SAME gap body"
-        );
-        assert_eq!(recorded_rpc[2].0, "events.put");
-        assert_eq!(recorded_rpc[2].1["agent_id"], "a2");
-
-        // Parent native source has no false gap; healthy steer gate
-        // (active turn + known source) remains admitted.
-        assert!(!last_status.source_unknown);
-        assert!(!last_status.batch_unknown);
-        assert_eq!(last_status.active_turn_id.as_deref(), Some("turn-parent"));
-
-        // NO child registration / NativeInput / Spawn replay on the wire:
-        // only source.gap and the turn-after events.put.
-        assert!(
-            recorded_rpc
-                .iter()
-                .all(|(method, _)| matches!(method.as_str(), "source.gap" | "events.put"))
-        );
-    }
-
-    #[tokio::test]
-    async fn pending_gap_rotation_is_fair_and_apply_matches_only() {
-        let (_native, mut processor) = child_test_processor().await;
-        for (thread, agent, gap_id) in [
-            ("child-1", "a2", "codex:a2:1:gap-1"),
-            ("child-2", "a3", "codex:a3:1:gap-1"),
-        ] {
-            let registration = build_registration("call-1", "a1", 1, "owned", "codex:test", thread);
-            let mut state = ChildState::new(ChildBinding {
-                registration,
-                agent_id: agent.to_owned(),
-                agent_generation: 1,
-                native_ref: thread.to_owned(),
-            });
-            state.ready_committed = true;
-            state.writes_blocked = true;
-            state.source_unknown = true;
-            state.gap_reported = true;
-            state.gap_number = 1;
-            state.pending_gap = Some(SourceGap {
-                gap_id: gap_id.to_owned(),
-                agent_id: agent.to_owned(),
-                generation: 1,
-                source: "stream".to_owned(),
-                families: vec![
-                    "session".to_owned(),
-                    "turn".to_owned(),
-                    "message".to_owned(),
-                ],
-                reason: format!("gap for {thread}"),
-                from: None,
-                to: None,
-            });
-            processor.child_states.insert(thread.to_owned(), state);
-        }
-        // Fair rotation: sorted order, round-robin, no starvation.
-        let (first, gap1) = processor.next_pending_gap().expect("first");
-        assert_eq!(first, "child-1");
-        let (second, gap2) = processor.next_pending_gap().expect("second");
-        assert_eq!(second, "child-2");
-        let (third, _) = processor.next_pending_gap().expect("wraps");
-        assert_eq!(third, "child-1");
-
-        // Stale attempts are ignored: wrong child, generation, or gap.
-        let good_ack = json!({"gap_id": gap1.gap_id, "seq": 1});
-        assert!(!processor.apply_gap_attempt("child-2", &gap1, &Ok(good_ack.clone())));
-        assert!(processor.child_states["child-2"].pending_gap.is_some());
-        let mut wrong_gen = gap1.clone();
-        wrong_gen.generation = 2;
-        assert!(!processor.apply_gap_attempt("child-1", &wrong_gen, &Ok(good_ack.clone())));
-        let mut stale = gap1.clone();
-        stale.gap_id = "codex:a2:1:gap-999".to_owned();
-        assert!(!processor.apply_gap_attempt(
-            "child-1",
-            &stale,
-            &Ok(json!({"gap_id": stale.gap_id, "seq": 1}))
-        ));
-        // Non-canonical ACK and transport errors retain without settling.
-        assert!(!processor.apply_gap_attempt(
-            "child-1",
-            &gap1,
-            &Ok(json!({"gap_id": gap1.gap_id, "seq": 0}))
-        ));
-        assert!(!processor.apply_gap_attempt("child-2", &gap2, &Err(Error::new("busy", "held"))));
-        assert!(processor.child_states["child-1"].pending_gap.is_some());
-        assert!(processor.child_states["child-2"].pending_gap.is_some());
-        // Canonical ACK settles only the matching child.
-        assert!(processor.apply_gap_attempt("child-1", &gap1, &Ok(good_ack)));
-        assert!(processor.child_states["child-1"].pending_gap.is_none());
-        assert!(!processor.child_states["child-1"].writes_blocked);
-        assert!(
-            processor.child_states["child-2"].pending_gap.is_some(),
-            "other child untouched"
-        );
-        let (remaining, _) = processor.next_pending_gap().expect("remaining");
-        assert_eq!(remaining, "child-2");
     }
 
     #[tokio::test]
@@ -3505,7 +2823,6 @@ mod tests {
             .await;
         let state = processor.child_states.get("child-1").expect("child stays");
         assert!(!state.source_unknown);
-        assert!(state.pending_gap.is_none());
         assert!(!processor.gap_reported);
     }
 
@@ -3783,7 +3100,6 @@ mod tests {
         assert_eq!(state.active_turn_id.as_deref(), Some("turn-c1"));
         assert!(state.final_text.is_none());
         assert!(!state.source_unknown);
-        assert!(state.pending_gap.is_none());
         assert!(!processor.gap_reported);
         assert!(processor.loss_reason.is_none());
         assert!(processor.status.failure.is_none());

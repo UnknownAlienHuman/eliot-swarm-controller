@@ -194,26 +194,20 @@ impl EventProcessor {
         } else {
             None
         };
-        let health_deadline = Instant::now() + EVENT_DEADLINE;
-        // Retain the exact gap body across a lost acknowledgement so a
-        // later expiry can reconcile it instead of latching writes with
-        // the body discarded.
-        let mut retained = self.retained_gap.take();
+        let gap_deadline = Instant::now() + EVENT_DEADLINE;
         let gap_result = if !self.gap_reported && !self.writes_blocked {
             self.stream_source()
-                .record_gap_range_with_retained(
+                .record_gap_range_until(
                     &format!("{MUSE_VIEW_UNAVAILABLE_REASON_PREFIX} ({})", reason.label()),
                     after.clone(),
                     head.clone(),
-                    health_deadline,
-                    &mut retained,
+                    gap_deadline,
                 )
                 .await
         } else {
             Ok(())
         };
-        self.retained_gap = retained;
-        self.mark_source_stale(health_deadline).await;
+        self.report_view_stale().await;
         if self.status.active_turn_id.is_some() {
             let recoverable = gap_result.is_ok() && !self.writes_blocked && head.is_some();
             self.view_recovery = Some(ViewRecovery {
@@ -232,10 +226,10 @@ impl EventProcessor {
     }
 
     /// Whether an acknowledged unavailable-view gap episode stands: the
-    /// view latch is set with no retained (unacked) gap. Only such an
+    /// view latch is set and the source permits writes. Only such an
     /// episode may settle `unknown` with the counted projection prefix.
     pub(super) fn projection_episode(&self) -> bool {
-        self.status.view_unavailable && self.retained_gap.is_none()
+        self.status.view_unavailable && !self.writes_blocked
     }
 
     /// Arm recovery after a turn associates while view loss is already
@@ -508,10 +502,6 @@ impl EventProcessor {
             return true;
         };
         let session_id = self.status.session_id.clone().unwrap_or_default();
-        // A recovered channel unblocks the settlement write below: drive
-        // the retained gap and reconcile the latched batch first so a lost
-        // acknowledgement cannot keep the turn busy forever.
-        self.drive_writes().await;
         let prior_attempts = self
             .view_recovery
             .as_ref()
@@ -1212,7 +1202,6 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!*source.writes_blocked);
-            assert!(!source.sink.is_unknown("a1", 1, "stream"));
 
             // An unacknowledged completion cannot enter the dedup set or
             // replace the committed text, even if the source is blocked.

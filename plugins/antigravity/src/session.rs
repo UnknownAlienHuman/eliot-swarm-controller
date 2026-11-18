@@ -1046,8 +1046,6 @@ impl Session {
             "state": status, "native_scope": self.scope, "native_ref": state.conversation,
             "active_turn": if state.stopped { None } else { state.active_turn() }, "last_turn": last,
             "source_unknown": state.source_unknown, "batch_unknown": state.batch_unknown,
-            "source_health_stale": state.source_health_stale,
-            "source_health_unknown": state.source_health_unknown,
             "process_exited": process_exited,
             "result_known": result_known, "usage": Value::Null,
             "diagnostics": self.client.diagnostic_error(Error::new("unknown", "")).diagnostics}),
