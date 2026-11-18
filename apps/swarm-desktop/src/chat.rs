@@ -144,6 +144,12 @@ struct TurnEntry {
     command_id: Option<String>,
     final_text: Option<String>,
     event_final: Option<String>,
+    /// Raw vendor terminal reason from the authoritative turn readback;
+    /// shown when the turn failed.
+    native_status: Option<String>,
+    /// Effective model the failed turn ran under, from its retained
+    /// configuration; named in the failure so a denied default says so.
+    failure_model: Option<String>,
     read_back: bool,
     activity: Vec<Activity>,
     messages: usize,
@@ -163,6 +169,8 @@ impl TurnEntry {
             command_id: None,
             final_text: None,
             event_final: None,
+            native_status: None,
+            failure_model: None,
             read_back: false,
             activity: Vec::new(),
             messages: 0,
@@ -721,6 +729,8 @@ impl Conversation {
                 TurnState::Unknown => TurnStatus::Unknown,
             };
             turn.final_text = read.final_text.as_deref().map(bound_text);
+            turn.native_status = read.native_status.as_deref().map(bound_text);
+            turn.failure_model = read.config.as_ref().and_then(|config| config.model.clone());
             turn.read_back = true;
         }
         self.enforce_bounds();
@@ -1077,6 +1087,40 @@ impl Conversation {
                 Vec::new(),
             )),
         }
+        // A failed turn shows its native error inline, names the model it
+        // ran under, and points at the model picker for the next try. The
+        // picker itself stays available: nothing else in the chat changes.
+        // Failures render once, as one failed part.
+        if matches!(
+            turn.status,
+            TurnStatus::Completed(Some(TurnOutcome::Failure))
+        ) {
+            let reason = turn
+                .native_status
+                .clone()
+                .unwrap_or_else(|| "The turn failed.".to_owned());
+            let mut detail = Vec::new();
+            if let Some(model) = turn.failure_model.as_deref() {
+                detail.push(format!("Model {model}"));
+            }
+            detail.push("Open the model picker to try another model.".to_owned());
+            let final_part = parts.pop().expect("final part was just pushed");
+            let (text, detail) = match final_part.kind {
+                PartKind::Final => {
+                    let mut with_text = vec![reason];
+                    with_text.extend(detail);
+                    (final_part.text, with_text)
+                }
+                _ => (reason, detail),
+            };
+            parts.push(Part::new(
+                format!("failed:{}", turn.turn_id),
+                PartKind::Failed,
+                final_part.label,
+                text,
+                detail,
+            ));
+        }
         let revision = parts.iter().fold(text_hash(&turn.turn_id), |hash, part| {
             mix(hash, part.revision)
         });
@@ -1284,6 +1328,56 @@ mod tests {
             preceded_by: None,
             resolution_source: None,
         }
+    }
+
+    #[test]
+    fn a_failed_turn_names_its_native_error_and_model() {
+        let mut chat = Conversation::new("a1");
+        let mut failed = turn("t9", TurnState::Completed, None);
+        failed.outcome = Some(TurnOutcome::Failure);
+        failed.native_status = Some("Workspace access denied".to_owned());
+        failed.config = Some(eliot_core::api::AgentConfigView {
+            revision: 1,
+            application: "next_turn".to_owned(),
+            provenance: "configure".to_owned(),
+            profile: "adhoc-opencode".to_owned(),
+            profile_inherited: false,
+            requested_model: None,
+            requested_effort: None,
+            model: Some("opencode-go/iceman-contributor-free".to_owned()),
+            effort: None,
+            original_model: None,
+            original_effort: None,
+        });
+        chat.apply_turns(&[failed]);
+        let items = chat.items();
+        assert_eq!(items.len(), 1);
+        let failed_part = items[0]
+            .parts
+            .iter()
+            .find(|part| part.kind == PartKind::Failed)
+            .expect("failed turn shows its native error");
+        assert!(
+            failed_part.text.contains("Workspace access denied"),
+            "native error is inline: {}",
+            failed_part.text
+        );
+        assert!(
+            failed_part
+                .detail
+                .iter()
+                .any(|line| line.contains("opencode-go/iceman-contributor-free")),
+            "denied model is named: {:?}",
+            failed_part.detail
+        );
+        assert!(
+            failed_part
+                .detail
+                .iter()
+                .any(|line| line.contains("model picker")),
+            "picker affordance is offered: {:?}",
+            failed_part.detail
+        );
     }
 
     fn coverage() -> Coverage {
