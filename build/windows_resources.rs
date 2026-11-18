@@ -22,6 +22,7 @@ pub fn embed(binary: &str, description: &str) {
         "Windows MSVC builds require Windows SDK rc.exe. Install the Windows SDK or put its rc.exe on PATH.",
     );
     let version = env::var("CARGO_PKG_VERSION").expect("Cargo package version");
+    let escaped_version = rc_string(&version);
     let numeric_version = version.split(['-', '+']).next().expect("version core");
     let parts: Vec<u16> = numeric_version
         .split('.')
@@ -65,7 +66,10 @@ BEGIN
         VALUE "Translation", 0x0409, 1200
     END
 END
-"#
+"#,
+        description = rc_string(description),
+        version = escaped_version,
+        binary = rc_string(binary),
     );
     fs::write(out_dir.join("eliot-swarm.rc"), script).expect("Write the Windows resource script");
     let status = Command::new(&rc)
@@ -78,6 +82,24 @@ END
         "cargo:rustc-link-arg-bin={binary}={}",
         out_dir.join("eliot-swarm.res").display()
     );
+}
+
+fn rc_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => escaped.push_str("\"\""),
+            '\\' => escaped.push_str("\\\\"),
+            ch if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') => {
+                panic!(
+                    "Windows RC strings cannot contain control or newline characters (U+{:04X})",
+                    ch as u32
+                );
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn resource_compiler() -> Option<PathBuf> {
@@ -129,4 +151,24 @@ fn sdk_compiler(root: &Path, arch: &str) -> Option<PathBuf> {
         })
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, rc)| rc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rc_string;
+
+    #[test]
+    fn escapes_rc_quotes_and_backslashes() {
+        assert_eq!(rc_string(r#"a "quote"\new\"#), r#"a ""quote""\\new\\"#);
+    }
+
+    #[test]
+    fn rejects_control_and_newline_characters() {
+        for ch in ['\0', '\t', '\r', '\n', '\u{0085}', '\u{2028}', '\u{2029}'] {
+            let input = format!("before{ch}after");
+            let error = std::panic::catch_unwind(|| rc_string(&input)).unwrap_err();
+            let message = error.downcast_ref::<String>().unwrap();
+            assert!(message.contains(&format!("U+{:04X}", ch as u32)));
+        }
+    }
 }
