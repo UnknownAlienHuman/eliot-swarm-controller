@@ -1690,7 +1690,7 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                    "DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
