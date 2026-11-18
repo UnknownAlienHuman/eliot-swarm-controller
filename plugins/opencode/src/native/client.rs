@@ -22,7 +22,7 @@ use crate::native::{
     types::{
         AgentList, ConfigEntry, DataEnvelope, ErrorBody, FormInfo, FormReplyRequest, InboxPage,
         InboxUser, InterruptResponse, LocationRef, McpServerReadback, MessagePage, ModelRef,
-        NativeModelEntry, PermissionReplyRequest, PermissionRequest, PromptRequest,
+        NativeModelEntry, PermissionReplyRequest, PermissionRequest, PermissionRule, PromptRequest,
         ProviderReadback, SessionCreateRequest, SessionInfo, SwitchAgentRequest,
         SwitchModelRequest,
     },
@@ -159,12 +159,16 @@ impl OpenCodeHttp {
     }
 
     /// `POST /api/session`: create a session without input. An omitted
-    /// model defers to the configured native default.
+    /// model defers to the configured native default. `permissions` carries
+    /// the per-session ruleset the installed server merges after every
+    /// agent/project rule with last-match-wins evaluation; the launch path
+    /// sets the subagent deny here for `deny` profiles.
     pub async fn create_session(
         &self,
         title: &str,
         model: Option<&ModelRef>,
         directory: &str,
+        permissions: Option<&[PermissionRule]>,
         deadline: Instant,
     ) -> std::result::Result<SessionInfo, HttpOutcome> {
         let path = server_native_directory(Path::new(directory)).map_err(|_| {
@@ -185,6 +189,7 @@ impl OpenCodeHttp {
             location: Some(LocationRef {
                 directory: location_directory,
             }),
+            permissions: permissions.map(<[PermissionRule]>::to_vec),
         })
         .map_err(|_| HttpOutcome::unknown("OpenCode session/create params could not be encoded"))?;
         let response = self
@@ -211,6 +216,44 @@ impl OpenCodeHttp {
             return Ok(envelope.data);
         }
         Err(map_write_error("session/create", &response))
+    }
+
+    /// A stored session carries the deny rule exactly when the native side
+    /// persisted the launch path's per-session ruleset. The rule must name
+    /// the installed `subagent` action with a wildcard resource: narrower
+    /// resources would leave other agents callable, and the legacy `task`
+    /// key is not evaluated by the installed tool check.
+    pub fn session_subagent_deny_verified(info: &SessionInfo) -> bool {
+        info.permissions.as_deref().is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                rule.action == "subagent" && rule.resource == "*" && rule.effect == "deny"
+            })
+        })
+    }
+
+    /// `PATCH /api/session/{id}` (`session.update`): replace the stored
+    /// per-session ruleset. 204 applies; the caller proves the effective
+    /// value with `session.get`. Used only to repair a resumed session that
+    /// predates the launch path's deny ruleset; sessions the launch path
+    /// creates already carry it.
+    pub async fn update_session_permissions(
+        &self,
+        session_id: &str,
+        permissions: &[PermissionRule],
+        deadline: Instant,
+    ) -> std::result::Result<(), HttpOutcome> {
+        let path = format!("/api/session/{}", verified_segment(session_id)?,);
+        let body = serde_json::to_value(serde_json::json!({ "permissions": permissions }))
+            .map_err(|_| {
+                HttpOutcome::unknown("OpenCode session/update params could not be encoded")
+            })?;
+        let response = self
+            .send(reqwest::Method::PATCH, &path, &[], Some(body), deadline)
+            .await?;
+        if response.status == 204 {
+            return Ok(());
+        }
+        Err(map_write_error("session/update", &response))
     }
 
     /// `GET /api/session/{id}`: exact session readback.
@@ -1081,6 +1124,97 @@ async fn pump_sse(
 mod tests {
     use super::*;
 
+    fn deny_ruleset() -> Vec<PermissionRule> {
+        vec![PermissionRule {
+            action: "subagent".to_owned(),
+            resource: "*".to_owned(),
+            effect: "deny".to_owned(),
+        }]
+    }
+
+    fn info_with(permissions: Option<Vec<PermissionRule>>) -> SessionInfo {
+        SessionInfo {
+            id: "ses_test".to_owned(),
+            agent: None,
+            model: None,
+            location: None,
+            permissions,
+        }
+    }
+
+    #[test]
+    fn session_create_request_serializes_deny_permissions() {
+        let body = serde_json::to_value(SessionCreateRequest {
+            title: Some("eliot-a406-g1".to_owned()),
+            model: None,
+            location: None,
+            permissions: Some(deny_ruleset()),
+        })
+        .expect("valid JSON");
+        assert_eq!(
+            body["permissions"],
+            serde_json::json!([{"action": "subagent", "resource": "*", "effect": "deny"}])
+        );
+        let plain = serde_json::to_value(SessionCreateRequest {
+            title: Some("eliot-a406-g1".to_owned()),
+            model: None,
+            location: None,
+            permissions: None,
+        })
+        .expect("valid JSON");
+        assert!(
+            plain.get("permissions").is_none(),
+            "allow profiles send no ruleset: {plain}"
+        );
+    }
+
+    #[test]
+    fn subagent_deny_verifier_accepts_only_the_wildcard_subagent_deny() {
+        assert!(OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            Some(deny_ruleset())
+        )));
+        assert!(!OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            None
+        )));
+        assert!(!OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            Some(vec![])
+        )));
+        assert!(!OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            Some(vec![PermissionRule {
+                action: "subagent".to_owned(),
+                resource: "*".to_owned(),
+                effect: "allow".to_owned(),
+            }])
+        )));
+        // The legacy `task` key is not evaluated by the installed tool
+        // check, so it never verifies the denial.
+        assert!(!OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            Some(vec![PermissionRule {
+                action: "task".to_owned(),
+                resource: "*".to_owned(),
+                effect: "deny".to_owned(),
+            }])
+        )));
+        // A narrower resource would leave other agents callable.
+        assert!(!OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            Some(vec![PermissionRule {
+                action: "subagent".to_owned(),
+                resource: "build".to_owned(),
+                effect: "deny".to_owned(),
+            }])
+        )));
+        // A server echo with extra rules still verifies when the deny is present.
+        let mut rules = deny_ruleset();
+        rules.push(PermissionRule {
+            action: "edit".to_owned(),
+            resource: "*".to_owned(),
+            effect: "ask".to_owned(),
+        });
+        assert!(OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            Some(rules)
+        )));
+    }
+
     /// Owned workspace fixture: removed on unwind so a failed
     /// assertion never leaks it into the shared temp directory.
     #[cfg(target_os = "linux")]
@@ -1212,7 +1346,7 @@ mod tests {
             variant: None,
         };
         match http
-            .create_session("test", Some(&model), &directory_text, deadline)
+            .create_session("test", Some(&model), &directory_text, None, deadline)
             .await
         {
             Err(HttpOutcome::NotDispatched { reason }) => {
@@ -1311,7 +1445,7 @@ mod tests {
             variant: None,
         };
         match http
-            .create_session("test", Some(&model), &directory_text, deadline)
+            .create_session("test", Some(&model), &directory_text, None, deadline)
             .await
         {
             Err(HttpOutcome::Unknown { reason }) => {

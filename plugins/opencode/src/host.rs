@@ -6,7 +6,7 @@ use crate::{
         models::{run_model_metadata, run_models},
         types::{
             ConfigEntry, ConfigMcpServer, InboxUser, McpServerReadback, ModelRef, NativeModelEntry,
-            SessionInfo,
+            PermissionRule, SessionInfo,
         },
     },
 };
@@ -320,8 +320,10 @@ struct ControlBinding {
 /// the local path never imports a canonical credential.
 struct ParsedStart {
     params: AgentStartParams,
-    /// Frozen native-subagent switch (`allow` or `deny`): `deny` disables
-    /// the `task` tool in the isolated per-Agent config.
+    /// Frozen native-subagent switch (`allow` or `deny`): `deny` stores a
+    /// per-session `subagent` deny ruleset on the session (verified by
+    /// readback on create and resume) and keeps the `task` deny in the
+    /// isolated per-Agent config as a second layer.
     native_subagents: Option<String>,
     /// Requested `provider/model`, or `None` when the profile omitted it and
     /// the configured native default applies. Requested stays absent
@@ -1276,6 +1278,11 @@ impl OpenCodePlugin {
             parsed.params.agent_id, parsed.params.generation
         );
         let directory = parsed.workspace.to_string_lossy().into_owned();
+        // `deny` profiles establish the subagent denial as the session's own
+        // ruleset, where it outranks every agent/project rule; `allow`
+        // profiles create the session unchanged.
+        let deny_native_subagents = parsed.native_subagents.as_deref() == Some("deny");
+        let deny_permissions = deny_native_subagents.then(Self::subagent_deny_permissions);
         let create_timing = crate::native::startup::Step::new("session_create");
         let created = match session
             .http
@@ -1283,6 +1290,7 @@ impl OpenCodePlugin {
                 &title,
                 parsed.model_ref.as_ref(),
                 &directory,
+                deny_permissions.as_deref(),
                 phase_deadline(envelope, RPC_TIMEOUT),
             )
             .await
@@ -1468,6 +1476,43 @@ impl OpenCodePlugin {
         effective["mcp_servers"] = mcp_servers;
         effective["mcp_servers_verified"] = json!(mcp_servers_verified);
         effective["mcp_policy"] = json!(parsed.requested_mcp_policy.as_str());
+        // A project `subagent` allow would beat the isolated global config
+        // under last-match-wins evaluation, so `deny` profiles prove the
+        // stored session carries the per-session denial with a fresh
+        // readback. An unreadable or missing denial removes the created
+        // session and fails the start: an installed version that cannot
+        // store the ruleset can never serve a `deny` profile.
+        let subagents_verified = if deny_native_subagents {
+            match Self::readback_subagent_deny(
+                &session.http,
+                &created.id,
+                phase_deadline(envelope, RPC_TIMEOUT),
+            )
+            .await
+            {
+                Ok(verified) => verified,
+                Err(error) => {
+                    let kill_note =
+                        delete_created_session(&mut session, &created.id, envelope).await;
+                    let error = discard_failed_start(
+                        &mut session,
+                        Error::new("native_readback", format!("{}; {kill_note}", error.message)),
+                        envelope,
+                    )
+                    .await;
+                    return Err(self.retain_failed_start(&parsed.params, error));
+                }
+            }
+        } else {
+            true
+        };
+        effective["native_subagents"] = json!(
+            parsed
+                .native_subagents
+                .clone()
+                .unwrap_or_else(|| "allow".to_owned())
+        );
+        effective["native_subagents_verified"] = json!(subagents_verified);
         let hook_timing = crate::native::startup::Step::new("context_bind");
         let context_bound = bind_context_hooks(
             &session.http,
@@ -1484,14 +1529,14 @@ impl OpenCodePlugin {
         } else {
             with_context_points(effective, &[InjectPoint::NextInput])
         };
-        if !model_verified || !effort_verified || !location_ok {
+        if !model_verified || !effort_verified || !location_ok || !subagents_verified {
             let kill_note = delete_created_session(&mut session, &created.id, envelope).await;
             let error = discard_failed_start(
                 &mut session,
                 Error::new(
                     "profile_error",
                     format!(
-                        "OpenCode effective model, effort or session directory did not match the frozen profile; {kill_note}"
+                        "OpenCode effective model, effort, session directory or subagent denial did not match the frozen profile; {kill_note}"
                     ),
                 ),
                 envelope,
@@ -2075,6 +2120,37 @@ impl OpenCodePlugin {
                 "OpenCode retained session directory is not the frozen workspace",
             ));
         }
+        // `deny` profiles prove the retained session still carries the
+        // per-session subagent denial: a location reload never clears stored
+        // session rules, but a session created before the launch path set
+        // them is repaired here and re-read. An unrepairable, unreadable or
+        // contradicted denial fails the resume: the session must not run
+        // without it.
+        let deny_native_subagents = parsed.native_subagents.as_deref() == Some("deny");
+        let mut subagents_verified = !deny_native_subagents;
+        if deny_native_subagents && !OpenCodeHttp::session_subagent_deny_verified(&current) {
+            Self::resume_repair_subagent_deny(&session.http, session_id, deadline).await?;
+            let repaired = session
+                .http
+                .get_session(session_id, deadline)
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        "unknown",
+                        format!(
+                            "OpenCode resume subagent denial readback is unresolved ({})",
+                            error.message
+                        ),
+                    )
+                })?;
+            if !OpenCodeHttp::session_subagent_deny_verified(&repaired) {
+                return Err(Error::new(
+                    "unknown",
+                    "OpenCode retained session contradicts the applied subagent denial",
+                ));
+            }
+            subagents_verified = true;
+        }
         // The realignment target is the inherited overlay's effective
         // model and effort when a resume carries them (the retained
         // session already runs them), else the frozen request. An omitted
@@ -2232,6 +2308,13 @@ impl OpenCodePlugin {
             "agent_verified": agent_verified,
             "cwd": effective.location.as_ref().map(|location| location.directory.clone()),
         });
+        effective_value["native_subagents"] = json!(
+            parsed
+                .native_subagents
+                .clone()
+                .unwrap_or_else(|| "allow".to_owned())
+        );
+        effective_value["native_subagents_verified"] = json!(subagents_verified);
         // Adopted local path: the regenerated server config must still pin
         // the frozen provider. A known mismatch fails the resume for a
         // corrected retry; transport ambiguity stays unknown.
@@ -2306,6 +2389,72 @@ impl OpenCodePlugin {
             ));
         }
         Ok(echoed)
+    }
+
+    /// The frozen `deny` switch as a per-session ruleset: one wildcard
+    /// `subagent` deny. The installed server merges session rules after every
+    /// agent/project rule with last-match-wins evaluation, so this survives a
+    /// project `subagent` allow that would beat the isolated global config
+    /// under the same ordering. Denies are checked before saved allow rules,
+    /// so a user-saved allow cannot lift it either.
+    fn subagent_deny_permissions() -> Vec<PermissionRule> {
+        vec![PermissionRule {
+            action: "subagent".to_owned(),
+            resource: "*".to_owned(),
+            effect: "deny".to_owned(),
+        }]
+    }
+
+    /// Prove the stored session carries the deny ruleset with a fresh
+    /// `session.get`. A lost readback is `native_readback`, never unknown:
+    /// the read itself proves nothing was written.
+    async fn readback_subagent_deny(
+        http: &OpenCodeHttp,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let info = http
+            .get_session(session_id, deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "native_readback",
+                    format!(
+                        "OpenCode subagent denial readback failed ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        Ok(OpenCodeHttp::session_subagent_deny_verified(&info))
+    }
+
+    /// Repair a retained session that predates the per-session deny ruleset:
+    /// `PATCH` the ruleset, then the caller re-reads. A refusal proves the
+    /// installed server cannot establish the denial, so `deny` profiles fail
+    /// closed; anything ambiguous after the write is `unknown` (the ruleset
+    /// may have been stored).
+    async fn resume_repair_subagent_deny(
+        http: &OpenCodeHttp,
+        session_id: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let deny = Self::subagent_deny_permissions();
+        match http
+            .update_session_permissions(session_id, &deny, deadline)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(HttpOutcome::Rejected { reason, .. }) => Err(Error::new(
+                "profile_error",
+                format!("OpenCode retained session cannot carry the subagent denial ({reason})"),
+            )),
+            Err(HttpOutcome::Unknown { reason }) | Err(HttpOutcome::NotDispatched { reason }) => {
+                Err(Error::new(
+                    "unknown",
+                    format!("OpenCode resume subagent denial repair is unresolved ({reason})"),
+                ))
+            }
+        }
     }
 
     /// One resume setter: only its 204 applies. The session existed

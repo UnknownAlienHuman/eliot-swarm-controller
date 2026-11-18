@@ -272,6 +272,13 @@ profile snapshot and reported truthfully in the effective settings. Explicit
 Codex native subagents set `allow`). `deny` has a per-session mapping on
 Codex, Claude and OpenCode only; on Muse and Antigravity the installed
 binaries expose no verified switch, so `deny` is `unsupported` at config load.
+On OpenCode the denial is a per-session `subagent` deny ruleset stored on the
+session and verified by readback on create and resume: the server merges
+session rules after every agent/project rule with last-match-wins evaluation,
+so this survives a project `subagent` allow that would beat the isolated
+per-Agent config layer (which is kept only as a second layer). A session that
+cannot carry the denial fails the start; a retained session that predates the
+ruleset is repaired and re-read before use.
 
 An optional `collaboration_mode` selects Codex's `default` or `plan` preset for each
 turn. The selected mode is frozen with the profile; omission preserves the native

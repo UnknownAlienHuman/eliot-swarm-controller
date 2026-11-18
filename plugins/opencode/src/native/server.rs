@@ -100,12 +100,18 @@ pub const SWARM_MCP_SERVER_NAME: &str = "eliot-swarm";
 /// `mcp.servers.<name> = {type: "local", command: [...], environment?}`,
 /// and `GET /api/config` echoes the document while `GET /api/mcp`
 /// (`mcp.list`) reports the servers with connection status.
-/// Per-session native-subagent mapping for the installed OpenCode server
-/// (verified on 2.2.7: `opencode --version` reports v2.2.7 and the agent
-/// docs allow per-agent `tools`/`permission` control with `task` as the
-/// subagent tool): `deny` sets the isolated per-Agent config
-/// `permission.task` to `deny`, disabling the task tool for the session;
-/// `allow` omits the key and preserves today's behavior.
+/// Per-generation native-subagent config mapping for the installed
+/// OpenCode server (verified on 2.2.7: `opencode --version` reports v2.2.7
+/// and the agent docs allow per-agent `tools`/`permission` control with
+/// `task` as the subagent tool): `deny` sets the isolated per-Agent config
+/// `permission.task` to `deny`; `allow` omits the key and preserves today's
+/// behavior. This config layer alone cannot enforce `deny`: the server
+/// loads project configuration after the global layer with last-match-wins
+/// evaluation, so a project `subagent` allow would beat it. The launch path
+/// therefore also stores a per-session `subagent` deny ruleset on the
+/// session itself (merged after every agent/project rule and verified by
+/// readback on create and resume); that session layer is authoritative and
+/// this config entry is only a second layer.
 fn native_subagents_permission(native_subagents: Option<&str>) -> Option<serde_json::Value> {
     if native_subagents == Some("deny") {
         Some(serde_json::json!({"task": "deny"}))
@@ -201,8 +207,9 @@ pub struct ServerLaunch {
     /// The Agent's owned Eliot data root for the MCP `--data-dir` argument.
     /// Absolute; start admission resolves it from the launch environment.
     pub swarm_data_dir: PathBuf,
-    /// Frozen native-subagent switch (`allow` or `deny`): `deny` disables
-    /// the `task` tool in the isolated per-Agent config.
+    /// Frozen native-subagent switch (`allow` or `deny`): `deny` keeps the
+    /// `task` deny in the isolated per-Agent config as a second layer next
+    /// to the authoritative per-session `subagent` deny ruleset.
     pub native_subagents: Option<String>,
 }
 
