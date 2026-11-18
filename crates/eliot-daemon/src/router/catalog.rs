@@ -296,10 +296,7 @@ impl Router {
                 } else if harness == "muse" {
                     (
                         "native".to_owned(),
-                        Some(
-                            "Muse model/list names no default marker; the server default applies at launch"
-                                .to_owned(),
-                        ),
+                        Some(muse_catalog_note(default.as_deref())),
                     )
                 } else if harness == "opencode" {
                     (
@@ -733,6 +730,19 @@ pub(crate) const CATALOG_TTL_MS: u64 = HARNESS_READ_TTL_MS;
 /// continuation pages of the listing that built it, for at most this long;
 /// every first page rebuilds it, so the failed harness is read again.
 pub(crate) const PARTIAL_AGGREGATE_TTL_MS: u64 = 30_000;
+/// Muse catalogue note: the native `isDefault` marker names the default
+/// when the server marks a row; only an unmarked catalogue defers to the
+/// server default at launch.
+fn muse_catalog_note(default: Option<&str>) -> String {
+    match default {
+        Some(marked) if !marked.trim().is_empty() => format!(
+            "Muse model/list names its default with the native isDefault marker ({marked}); the server default applies at launch only when no row is marked"
+        ),
+        _ => "Muse model/list names no default marker; the server default applies at launch"
+            .to_owned(),
+    }
+}
+
 pub(super) fn quota_read_error(response: &mut HarnessQuotaResponse, error: eliot_core::Error) {
     if error.code == "unsupported" {
         response.status = "unsupported".to_owned();
@@ -1152,6 +1162,19 @@ mod tests {
             assert_eq!(provider.status, "supported");
             assert_eq!(provider.details.unwrap()["origin"], "provider");
         }
+    }
+
+    #[test]
+    fn muse_catalog_note_names_marker_only_when_supplied() {
+        // Audit #655: the same catalogue response that carries a default
+        // must not claim Muse supplies no marker.
+        let marked = muse_catalog_note(Some("m1"));
+        assert!(marked.contains("isDefault"), "note names the marker");
+        assert!(marked.contains("m1"), "note names the marked default");
+        assert_eq!(
+            muse_catalog_note(None),
+            "Muse model/list names no default marker; the server default applies at launch"
+        );
     }
 
     #[test]
