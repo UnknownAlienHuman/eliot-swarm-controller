@@ -739,4 +739,28 @@ mod tests {
             Some(utc_ms(2024, 3, 11, 6, 0))
         );
     }
+
+    #[test]
+    fn timer_schedule_persisted_json_shape_is_stable() {
+        // Audit 670 retention pin: a future migration off the
+        // chrono, chrono-tz and humantime stack must preserve this exact
+        // persisted JSON shape and the whole-millisecond grammar.
+        let anchored = parse_interval("90m", Some(100)).expect("parse 90m interval");
+        assert_eq!(
+            anchored,
+            TimerSchedule::Interval {
+                period_ms: 5_400_000,
+                anchor: Some(100),
+            }
+        );
+        let value = serde_json::to_value(&anchored).expect("serialize interval");
+        assert_eq!(
+            value,
+            serde_json::json!({"kind": "interval", "period_ms": 5_400_000, "anchor": 100})
+        );
+        assert_eq!(
+            serde_json::from_value::<TimerSchedule>(value).expect("round trip"),
+            anchored
+        );
+    }
 }

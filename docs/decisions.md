@@ -41,11 +41,10 @@ owning specs; do not reproduce them in every page. Existing IDs remain stable fo
 | D-34 | Core/bus → useful Codex → monitoring → automation → coordination → more adapters. | Scoped static checks per changed package; runtime qualification is actual installed vendor agents through Swarm on real tasks. Full crash/load/vendor/platform qualification is L7. No test harnesses, fakes, line-count quotas or per-task report packets; record actual checks in PR/CI. |
 | D-35 | Parent/child command rows represent linked input, selector expansion and ordered rule actions. | No link/run subsystem. Retain a referenced set; prune children then parent in one transaction, never expose partial fanout history. |
 | D-36 | Optional automated Git wrappers use isolated transport configuration and frozen OIDs. | Mutable branch/rewrite settings must not retarget admitted pushes. No generic pull or interception of a harness's own Git. [Automation](spec/automation.md#git-actions) |
-
 | D-37 | Use official `rmcp` 3.9.0 for the stdio server (`server` + `transport-io`). | SDK transport only; management authority and semantics stay in the existing authenticated API. [API](spec/api.md#mcp-stdio-server) |
-
 | D-38 | M1 uses one scoped Memory text profile through fresh tool-free Claude print mode, with native retries disabled. | Owner brought #199 into scope on 2026-11-14. Claude 2.1.325 exposes explicit tool/session/retry controls. The Codex Agent adapter is not an inference adapter. [API](spec/api.md#memory-one-shot-inference-m1-199) |
 | D-39 | Memory credentials use random private files plus Store version/hash, with exact idempotent staged rotation and retirement. | Recoverable publication needs no key hierarchy. Stable client owns calls across rotation. M1.2 fences old hashes before file cleanup after current-credential old-call read/release and restart; Memory owns backup dependency assertions for bounded release/retention. |
+| D-40 | Retain chrono 0.4.45, chrono-tz 0.10.4 and humantime 2.4.0 with owner review by 2027-05-18. | Latest published releases; the unmaintained notices name no patched version, and a jiff/time migration would rewrite timer civil-time, DST, interval-grammar and millisecond semantics without a compatibility plan. Audit 670. |
 
 ## Defaults
 
