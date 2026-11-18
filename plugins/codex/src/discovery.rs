@@ -499,9 +499,12 @@ pub(crate) async fn archive_thread(
             "Codex thread archive reference is invalid",
         ));
     }
-    if native_scope(&binding.home) != binding.native_scope {
-        return Err(unverified_store());
-    }
+    // The frozen binding may pin a separate SQLite root with its
+    // `codex-store:v1:` scope: validate it with the same canonical
+    // home-plus-root scope admission, controlled startup and observation use.
+    // A bare home comparison rejects every valid separate-root binding here
+    // while the daemon already proved the artifact identity against it.
+    verify_archive_scope(binding)?;
     let cwd = launch.cwd.clone();
     let launch = pinned_launch_for_binding(&launch, binding)?;
     let (mut probe, drainer, initialized) =
@@ -1061,6 +1064,18 @@ pub(crate) async fn verify_initialized_store(
     )?;
     let observed = read_store(client, &json!({}), &initialized.codex_home, cwd, deadline).await?;
     validate_pin(home, root, &observed)
+}
+
+/// Archive scope gate: the frozen binding's scope must equal the
+/// canonical home-plus-root scope over its own pinned directories. Accepts
+/// the exact frozen separate-root binding and the home form; anything else
+/// (including a home-form scope on a separate-root binding) is unverified.
+pub(crate) fn verify_archive_scope(binding: &NativeStoreBinding) -> Result<()> {
+    let (home, root) = binding_paths(binding)?;
+    if store_scope(&binding.home, home, root)? != binding.native_scope {
+        return Err(unverified_store());
+    }
+    Ok(())
 }
 
 fn binding_paths(binding: &NativeStoreBinding) -> Result<(&Path, &Path)> {
@@ -1738,7 +1753,12 @@ fn verify_store(reported_home: &str, selection: &StoreSelection) -> Result<Store
     })
 }
 
-fn store_scope(reported_home: &str, home: &Path, root: &Path) -> Result<String> {
+/// Canonical home-plus-SQLite-root scope shared by admission, controlled
+/// startup, observation and archive: the plain Codex-home scope when both
+/// canonical directories match, else the pinned `codex-store:v1:` digest over
+/// the canonical home and root. Store pin verification stays with the
+/// callers; this only names the scope the frozen binding must carry.
+pub(crate) fn store_scope(reported_home: &str, home: &Path, root: &Path) -> Result<String> {
     if home == root {
         return Ok(native_scope(reported_home));
     }
@@ -1948,12 +1968,58 @@ mod tests {
         decode_cursor, fingerprint, mcp_plugin_states, mcp_server_entries, native_scope,
         pinned_launch, pinned_launch_for_binding, project_rate_limit_snapshot, project_rate_limits,
         read_effective_mcp_surface, request_binding, select_store, sqlite_environment,
-        start_initialized_reader, store_scope, validate_pin, validate_store,
+        start_initialized_reader, store_scope, validate_pin, validate_store, verify_archive_scope,
     };
     use crate::native::types::NativeDiscoveryConfigReadResponse;
     use eliot_core::{NativeStoreBinding, SecretPolicy};
     use serde_json::json;
     use std::{ffi::OsString, path::Path, time::Duration};
+
+    #[test]
+    fn archive_gate_accepts_the_frozen_separate_root_binding() {
+        // Admission pins a separate SQLite root with the `codex-store:v1:`
+        // scope over both canonical directories; the archive gate must
+        // accept that exact frozen binding, keep accepting the home form,
+        // and reject a home-form or tampered scope on a separate root.
+        let base = std::env::temp_dir().join(format!("eliot-codex-scope-{}", ulid::Ulid::new()));
+        let home = base.join("home");
+        let root = base.join("store");
+        let home_text = home.to_str().expect("UTF-8 temp path").to_owned();
+        let root_text = root.to_str().expect("UTF-8 temp path").to_owned();
+        let separate_scope = store_scope(&home_text, &home, &root).expect("separate scope");
+        assert!(
+            separate_scope.starts_with("codex-store:v1:"),
+            "scope={separate_scope}"
+        );
+        let separate = NativeStoreBinding {
+            home: home_text.clone(),
+            root: root_text.clone(),
+            native_scope: separate_scope,
+        };
+        assert!(verify_archive_scope(&separate).is_ok());
+        let home_scope = store_scope(&home_text, &home, &home).expect("home scope");
+        assert!(home_scope.starts_with("codex-home:"), "scope={home_scope}");
+        assert!(
+            verify_archive_scope(&NativeStoreBinding {
+                home: home_text.clone(),
+                root: home_text.clone(),
+                native_scope: home_scope,
+            })
+            .is_ok()
+        );
+        for scope in ["codex-home:0000000000000000", "codex-store:v1:tampered"] {
+            assert_eq!(
+                verify_archive_scope(&NativeStoreBinding {
+                    home: home_text.clone(),
+                    root: root_text.clone(),
+                    native_scope: scope.to_owned(),
+                })
+                .unwrap_err()
+                .code,
+                "native_scope_unverified"
+            );
+        }
+    }
 
     #[test]
     fn malformed_archive_acknowledgement_is_unknown() {
