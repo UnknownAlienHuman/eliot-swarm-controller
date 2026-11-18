@@ -812,7 +812,11 @@ impl Store {
         }
         request.id = key.child_id.clone();
 
-        let limit = rule_action_limit(&stored)?;
+        // Rate-limit a retiring event under its own captured revision, not the
+        // edited current definition that replaced it (see the retirement
+        // handoff in docs/spec/automation.md). `canonical_definition` above
+        // already selected the retiring definition for this event.
+        let limit = rule_action_limit_for_definition(canonical_definition)?;
         let (scoped_count, global_count) = rule_action_counts(
             &tx,
             principal,
