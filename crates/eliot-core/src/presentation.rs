@@ -31,6 +31,7 @@ pub fn reason_words(code: &str) -> String {
         "fanout_limit" => "The manager's Agent limit would be exceeded",
         "id_conflict" => "This request was already used for a different action",
         "daemon_restart" => "Interrupted by a Swarm restart",
+        "root_exited" => "The agent app exited unexpectedly",
         "no_progress" => "No progress for a while",
         "source_unhealthy" => "Lost contact with its agent app",
         "children_unattended" => "Its subagents are unattended",
@@ -159,6 +160,7 @@ mod tests {
             "stale_generation",
             "source_unhealthy",
             "daemon_restart",
+            "root_exited",
             "id_conflict",
             "unknown",
         ] {

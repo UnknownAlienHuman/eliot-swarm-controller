@@ -22,6 +22,7 @@ use super::{
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
 use eliot_core::{Agent, AgentStartParams, Error, Result};
+use eliot_plugin::StderrView;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use std::sync::{Arc, Weak};
@@ -55,6 +56,139 @@ async fn spontaneous_root_wait(
     _: &Agent,
 ) -> (Result<std::process::ExitStatus>, bool) {
     (child.wait().await, false)
+}
+
+/// Arbitrate a finished reader against an observed root exit: an exit the OS
+/// already reported wins over EOF or task failure, so the reader arm never
+/// masks spontaneous-exit evidence with `stream_eof_without_session_terminal`.
+/// Returns the source-gap reason and whether the shared root-exit settlement
+/// path must run instead of the reader-loss path.
+pub(super) fn arbitrate_reader_close(root_exited: bool, reader_ok: bool) -> (&'static str, bool) {
+    if root_exited {
+        ("root_exit_without_session_terminal", true)
+    } else if reader_ok {
+        ("stream_eof_without_session_terminal", false)
+    } else {
+        ("stream_task_failed", false)
+    }
+}
+
+/// Shared spontaneous root-exit settlement: custody drain, then source and
+/// loss settlement with the `root_exited` cause and its exit evidence. Linux
+/// keeps #702's drain-before-reap order: the leader stays unreaped while the
+/// owned group drains, and only the bounded reap clears the birth-checked
+/// identity. Both the spontaneous-exit arm and the reader-EOF arbitration run
+/// this path, so EOF can never mask an observed root exit. This runs only
+/// from terminal arms where no stop was planned, matching the old
+/// `!planned_exit` guard at the call sites.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn settle_observed_root_exit(
+    state: &Weak<super::HostState>,
+    key: &super::AgentKey,
+    child: &mut OwnedChild,
+    monitoring: &Monitoring,
+    agent: &Agent,
+    event_task: &mut tokio::task::JoinHandle<()>,
+    completed_reader: Option<std::result::Result<(), tokio::task::JoinError>>,
+    stderr: &StderrView,
+) {
+    // Fence routing before the bounded cleanup so no racing dispatch enters.
+    if let Some(state) = state.upgrade() {
+        fence_command_routing(&state, key);
+    }
+    // Linux: observe without reaping while the birth identity still anchors
+    // group signals, then run the bounded group drain and the reap to
+    // completion outside the select so a queued message cannot cancel the
+    // drain and restart the grace period. Never signals a bare reused PGID:
+    // every group signal goes through the birth-checked leader identity.
+    #[cfg(target_os = "linux")]
+    let (status, _group_drained) = {
+        let observed = child.try_wait_exit_unreaped();
+        let _ = monitoring.sample_generation(agent).await;
+        // A failed observation proves nothing about the group: still
+        // terminate and drain before reaping so surviving descendants get a
+        // signal, then report unknown via drained=false below.
+        let group_drained = if observed.is_ok_and(|exited| exited) {
+            super::linux_drain_owned_group(child, STOP_GRACE).await
+        } else {
+            let _ = child.terminate();
+            let _ = super::linux_drain_owned_group(child, STOP_GRACE).await;
+            false
+        };
+        if group_drained {
+            let _ = monitoring.sample_generation(agent).await;
+        }
+        // Reap only after the bounded cleanup: the numeric PGID cannot be
+        // reused between the final observation and this reap because the
+        // exited leader is still unreaped. The reap itself is bounded: a
+        // failed observation may leave the child live (/proc loss also
+        // defeats birth-checked termination), and an unbounded wait would
+        // hang before source settlement. A timeout keeps status Err so the
+        // unknown-custody settlement below reports it.
+        (child.wait_bounded(STOP_GRACE).await, group_drained)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (status, _group_drained) = (child.wait().await, false);
+    // The plugin process exit is process evidence: its numeric code (and
+    // NTSTATUS for crash statuses) with the redacted stderr tail is recorded
+    // on `agent.lost` below. A killed process has no code; the tail still
+    // says what it last reported.
+    let exit =
+        eliot_core::ProcessExit::from_code(status.as_ref().ok().and_then(|status| status.code()));
+    let stderr_tail = stderr.snapshot().text;
+    if status.is_ok() {
+        let _ = monitoring.sample_generation(agent).await;
+    }
+    // Keep source authorization intact throughout the bounded drain. A reader
+    // arm that already consumed the JoinHandle result passes it here so this
+    // path never polls the completed handle a second time (Tokio panics on
+    // poll-after-completion). Only a still-pending reader is awaited.
+    let (gap_reason, drained) = match completed_reader {
+        Some(Ok(())) => ("root_exit_without_session_terminal", true),
+        Some(Err(_)) => ("root_exit_source_failed", true),
+        None => match timeout_at(Instant::now() + STOP_GRACE, &mut *event_task).await {
+            Ok(Ok(())) => ("root_exit_without_session_terminal", true),
+            Ok(Err(_)) => ("root_exit_source_failed", true),
+            Err(_) => {
+                event_task.abort();
+                let drained = timeout_at(Instant::now() + RPC_GRACE, event_task)
+                    .await
+                    .is_ok();
+                ("root_exit_drain_timeout", drained)
+            }
+        },
+    };
+    #[cfg(windows)]
+    let control_gone = match child.wait_family_empty(Duration::ZERO).await {
+        Ok(true) => true,
+        Ok(false) => {
+            child.terminate().is_ok()
+                && matches!(child.wait_family_empty(STOP_GRACE).await, Ok(true))
+        }
+        Err(_) => false,
+    };
+    // Unix custody remains degraded: leader exit proves native control loss,
+    // not that every descendant has been contained.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let control_gone = status.is_ok();
+    #[cfg(target_os = "linux")]
+    let control_gone = status.is_ok() && _group_drained;
+    if control_gone {
+        let _ = monitoring.sample_generation(agent).await;
+    }
+    let source_settled = settle_drained_source_exit(state, key, drained, control_gone, gap_reason)
+        .await
+        .is_ok();
+    if source_settled && control_gone {
+        mark_lost_state_with_exit(
+            state,
+            key,
+            eliot_core::PLUGIN_ROOT_EXITED_REASON,
+            Some(exit),
+            Some(stderr_tail),
+        )
+        .await;
+    }
 }
 
 pub(super) async fn run_agent_inner(
@@ -357,122 +491,34 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
             break;
         };
         tokio::select! {
-            root_exit = spontaneous_root_wait(child, monitoring, agent) => {
-                // The exit observation alone won the select. Fence routing
-                // before the bounded cleanup so no racing dispatch enters.
-                #[cfg(target_os = "linux")]
-                if let Some(state) = state.upgrade() {
-                    fence_command_routing(&state, key);
-                }
-                #[cfg(target_os = "linux")]
-                let (status, _group_drained) = {
-                    let observed = root_exit;
-                    let _ = monitoring.sample_generation(agent).await;
-                    // A failed observation proves nothing about the group:
-                    // still terminate and drain before reaping so surviving
-                    // descendants get a signal, then report unknown via the
-                    // drained=false below.
-                    let group_drained = if observed.is_err() {
-                        let _ = child.terminate();
-                        let _ = super::linux_drain_owned_group(child, STOP_GRACE).await;
-                        false
-                    } else {
-                        super::linux_drain_owned_group(child, STOP_GRACE).await
-                    };
-                    if group_drained {
-                        let _ = monitoring.sample_generation(agent).await;
-                    }
-                    // Reap only after the bounded cleanup: the numeric PGID
-                    // cannot be reused between the final observation and this
-                    // reap because the exited leader is still unreaped. The
-                    // reap itself is bounded: a failed observation may leave
-                    // the child live (/proc loss also defeats birth-checked
-                    // termination), and an unbounded wait would hang before
-                    // source settlement. A timeout keeps status Err so the
-                    // unknown-custody settlement below reports it.
-                    (child.wait_bounded(STOP_GRACE).await, group_drained)
-                };
-                #[cfg(not(target_os = "linux"))]
-                let (status, _group_drained) = root_exit;
-                // The plugin process exit is process evidence: its numeric
-                // code (and NTSTATUS for crash statuses) with the redacted
-                // stderr tail is recorded on `agent.lost` below. A killed
-                // process has no code; the tail still says what it last
-                // reported.
-                let exit = eliot_core::ProcessExit::from_code(
-                    status.as_ref().ok().and_then(|status| status.code()),
-                );
-                let stderr_tail = stderr.snapshot().text;
-                if let Some(state) = state.upgrade() {
-                    fence_command_routing(&state, key);
-                }
-                if status.is_ok() {
-                    let _ = monitoring.sample_generation(agent).await;
-                }
-                // Keep source authorization intact throughout the bounded drain.
-                let (gap_reason, drained) = match timeout_at(
-                    Instant::now() + STOP_GRACE,
-                    &mut *event_task,
-                ).await {
-                    Ok(Ok(())) => ("root_exit_without_session_terminal", true),
-                    Ok(Err(_)) => ("root_exit_source_failed", true),
-                    Err(_) => {
-                        event_task.abort();
-                        let drained = timeout_at(
-                            Instant::now() + RPC_GRACE,
-                            &mut *event_task,
-                        ).await.is_ok();
-                        ("root_exit_drain_timeout", drained)
-                    }
-                };
-                #[cfg(windows)]
-                let control_gone = match child.wait_family_empty(Duration::ZERO).await {
-                    Ok(true) => true,
-                    Ok(false) => {
-                        child.terminate().is_ok()
-                            && matches!(child.wait_family_empty(STOP_GRACE).await, Ok(true))
-                    }
-                    Err(_) => false,
-                };
-                // Unix custody remains degraded: leader exit proves native
-                // control loss, not that every descendant has been contained.
-                #[cfg(all(unix, not(target_os = "linux")))]
-                let control_gone = status.is_ok();
-                #[cfg(target_os = "linux")]
-                let control_gone = status.is_ok() && _group_drained;
-                if control_gone {
-                    let _ = monitoring.sample_generation(agent).await;
-                }
-                let source_settled = settle_drained_source_exit(
-                    state, key, drained, control_gone, gap_reason,
-                ).await.is_ok();
-                if source_settled && control_gone && !planned_exit {
-                    mark_lost_state_with_exit(
-                        state,
-                        key,
-                        Some(exit),
-                        Some(stderr_tail),
-                    )
-                    .await;
-                }
+            _ = spontaneous_root_wait(child, monitoring, agent) => {
+                // The exit observation alone won the select. The reader is
+                // still pending, so settlement awaits it below.
+                settle_observed_root_exit(state, key, child, monitoring, agent, event_task, None, stderr).await;
                 break;
             }
             event_result = &mut *event_task => {
                 if let Some(state) = state.upgrade() {
                     fence_command_routing(&state, key);
                 }
-                let gap_reason = if event_result.is_ok() {
-                    "stream_eof_without_session_terminal"
-                } else {
-                    "stream_task_failed"
-                };
+                // Arbitration: a root exit the OS already reported wins over
+                // EOF or task failure, so this arm never masks
+                // spontaneous-exit evidence with a stream gap reason. The
+                // select already consumed the JoinHandle result; passing it
+                // avoids polling the completed handle again inside settlement.
+                let (gap_reason, is_root_exit) =
+                    arbitrate_reader_close(child.try_observe_root_exit(), event_result.is_ok());
+                if is_root_exit {
+                    settle_observed_root_exit(state, key, child, monitoring, agent, event_task, Some(event_result), stderr).await;
+                    break;
+                }
                 let control_gone = child.terminate().is_ok()
                     && wait_child(&mut *child, STOP_GRACE, monitoring, agent).await;
                 let source_settled = settle_drained_source_exit(
                     state, key, true, control_gone, gap_reason,
                 ).await.is_ok();
                 if source_settled && control_gone {
-                    mark_lost_state(state, key).await;
+                    mark_lost_state(state, key, gap_reason).await;
                 }
                 planned_exit = true;
                 break;
@@ -511,7 +557,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                         state, key, Some(&mut *event_task), exited,
                         "plugin_owner_closed_without_session_terminal",
                     ).await.is_ok() {
-                        mark_lost_state(state, key).await;
+                        mark_lost_state(state, key, "plugin_owner_closed_without_session_terminal").await;
                     }
                     break;
                 };
@@ -865,7 +911,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                             let _ = reply.send(Err(error));
                             break;
                         }
-                        mark_lost_state(state, key).await;
+                        mark_lost_state(state, key, "daemon_force_exit_without_session_terminal").await;
                         planned_exit = true;
                         let _ = reply.send(Ok(()));
                         break;

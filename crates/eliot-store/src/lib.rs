@@ -2095,24 +2095,37 @@ impl Store {
         result
     }
 
+    /// Explicit Owner/host assertion that a generation is lost: the only path
+    /// that records `owner_marked_lost`. Daemon telemetry of a spontaneous
+    /// exit passes its truthful cause through `mark_lost_with_exit` instead.
     pub fn mark_lost(&mut self, agent: &str, generation: i64, now: i64) -> Result<Vec<Event>> {
-        self.mark_lost_with_exit(agent, generation, now, None, None)
+        self.mark_lost_with_exit(
+            agent,
+            generation,
+            now,
+            core::OWNER_MARKED_LOST_REASON,
+            None,
+            None,
+        )
     }
 
     /// Mark an agent generation lost with its process exit evidence: the
     /// numeric exit code, the Windows NTSTATUS hex for crash statuses, and
     /// the bounded redacted stderr tail. Numbers and the already-redacted
-    /// tail only; no argv, environment or output framing.
+    /// tail only; no argv, environment or output framing. The truthful loss
+    /// cause is recorded on `agent.lost`, the open turn's `turn.unknown`,
+    /// and the dispatched commands' `command.unknown`.
     pub fn mark_lost_with_exit(
         &mut self,
         agent: &str,
         generation: i64,
         now: i64,
+        reason: &str,
         exit: Option<eliot_core::ProcessExit>,
         stderr_tail: Option<String>,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
-        let result = self.mark_lost_inner(agent, generation, now, exit, stderr_tail);
+        let result = self.mark_lost_inner(agent, generation, now, reason, exit, stderr_tail);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -2123,6 +2136,7 @@ impl Store {
         agent: &str,
         generation: i64,
         now: i64,
+        reason: &str,
         exit: Option<eliot_core::ProcessExit>,
         stderr_tail: Option<String>,
     ) -> Result<Vec<Event>> {
@@ -2145,7 +2159,7 @@ impl Store {
             agent_num,
             generation,
             now,
-            "owner_marked_lost",
+            reason,
             exit.as_ref(),
             stderr_tail.as_deref(),
             &mut events,

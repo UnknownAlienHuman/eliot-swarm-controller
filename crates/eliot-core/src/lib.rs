@@ -1266,6 +1266,16 @@ impl FailureOrigin {
 /// The loss reason of a daemon restart: Swarm fences every live generation.
 pub const DAEMON_RESTART_REASON: &str = "daemon_restart";
 
+/// The loss reason for a spontaneous plugin root exit: the plugin process
+/// exited without a native session terminal, so the running turn is unknown
+/// and the generation is lost. The detailed drain cause stays on `source.gap`.
+pub const PLUGIN_ROOT_EXITED_REASON: &str = "root_exited";
+
+/// The loss reason for an explicit Owner/host assertion of loss. Only that
+/// assertion path may record it; daemon telemetry of a spontaneous exit
+/// passes its truthful cause instead.
+pub const OWNER_MARKED_LOST_REASON: &str = "owner_marked_lost";
+
 /// The typed origin and `where` of a loss Swarm caused itself, from the
 /// loss event's typed `reason` code: a daemon restart is `swarm` at
 /// `daemon.restart`. Every other loss keeps the evidence its producer

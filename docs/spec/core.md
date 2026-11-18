@@ -174,6 +174,15 @@ authorize a later force-stop of the conflicting Job.
 | restart of a remaining live generation | lost, open turn and dispatched effects become unknown |
 | exact controlled producer generation ends (native observed child) | stopped, `agent.stopped {reason: ended_with_parent}` |
 
+A controlled loss records its cause on `agent.lost` and, when a turn is open,
+on that turn's `turn.unknown`: `root_exited` for a spontaneous plugin root
+exit (the drain detail stays on `source.gap`), `daemon_restart` for restart
+recovery, `owner_marked_lost` only for an explicit Owner assertion of
+loss, and otherwise the settlement path's own cause (reader EOF or failure,
+owner-channel closure, daemon force-stop, startup cleanup, or the stop's own
+exit; see [Process observation and terminal ordering](monitoring.md#process-observation-and-terminal-ordering)).
+Readers accept persisted rows carrying any of these reasons.
+
 An open stop/transition is a command beside the observed state, not another state
 machine. Generation transition blocks ordinary turn work. Terminal settlement cancels
 undispatched work, revokes token/own identity, releases claims and pauses Goals atomically.

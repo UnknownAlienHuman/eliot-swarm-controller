@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::{
     ffi::{OsStr, OsString},
     fs,
-    io::{self, Read},
+    io::{self, Read, Seek},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -205,6 +205,134 @@ impl Drop for Captured {
     }
 }
 
+/// Bounded tail of a fixture-owned daemon stderr file, oldest bytes dropped.
+/// An early data-directory or lock failure happens before logging starts, so
+/// the CLI's stderr is the only evidence; keeping it in a fixture-owned file
+/// (never a pipe the daemon could hold) preserves the cause without leaking.
+pub fn file_stderr_tail(path: &Path, max_bytes: u64) -> String {
+    const TAIL_CONTEXT: u64 = 256;
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return "stderr file absent".to_owned(),
+    };
+    let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    let offset = size.saturating_sub(max_bytes.saturating_add(TAIL_CONTEXT));
+    if file.seek(io::SeekFrom::Start(offset)).is_err() {
+        return "stderr file unreadable".to_owned();
+    }
+    let mut bytes = Vec::new();
+    if file
+        .take(max_bytes.saturating_add(TAIL_CONTEXT))
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return "stderr file unreadable".to_owned();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let start = if offset > 0 {
+        text.find('\n').map(|index| index + 1).unwrap_or(text.len())
+    } else {
+        0
+    };
+    const MAX_TAIL_CHARS: usize = 2048;
+    let tail = &text[start..];
+    if tail.chars().count() <= MAX_TAIL_CHARS {
+        return tail.to_owned();
+    }
+    let mut chars: Vec<char> = tail.chars().collect();
+    let skip = chars.len() - MAX_TAIL_CHARS;
+    chars.drain(..skip);
+    let mut trimmed: String = chars.into_iter().collect();
+    while !trimmed.is_char_boundary(0) {
+        trimmed.remove(0);
+    }
+    trimmed
+}
+
+/// A test-owned daemon child. Its stdio is never inherited and never piped
+/// back to the test: stdin and stdout are null, and stderr goes to a
+/// fixture-owned file, so even a leaked daemon can never hold the harness
+/// pipe. Readiness and failure evidence comes from the daemon's files
+/// (`daemon.json`, `logs/daemon.log`), the stderr file and IPC, never from a
+/// pipe.
+///
+/// Drop kills the exact child handle first and reaps it within a bound, on
+/// every path including a panic mid-startup. Kill targets this exact process
+/// object, so PID reuse cannot redirect it; no IPC to a possibly wedged
+/// daemon is ever required.
+pub struct OwnedDaemon {
+    child: Child,
+    stderr_path: PathBuf,
+}
+
+impl OwnedDaemon {
+    pub fn spawn(mut command: Command, stderr_path: &Path) -> Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let stderr_file =
+            fs::File::create(stderr_path).expect("create fixture-owned daemon stderr file");
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr_file))
+            .spawn()
+            .expect("start test-owned daemon");
+        Self {
+            child,
+            stderr_path: stderr_path.to_owned(),
+        }
+    }
+
+    /// Bounded tail of this daemon's fixture-owned stderr file.
+    pub fn stderr_tail(&self) -> String {
+        file_stderr_tail(&self.stderr_path, 8192)
+    }
+
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Reap an already-stopping daemon without killing it: used after an
+    /// acknowledged shutdown. A daemon still live past the deadline is a test
+    /// failure the caller reports; the guard's Drop still kills it.
+    pub fn reap(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "owned daemon did not exit",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for OwnedDaemon {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            if self.reap(Duration::from_secs(10)).is_err() {
+                eprintln!(
+                    "test-owned daemon {} survived kill; leaked",
+                    self.child.id()
+                );
+            }
+        }
+    }
+}
+
 pub struct Reply {
     pub status: ExitStatus,
     pub stdout: String,
@@ -263,13 +391,38 @@ pub fn cli(data: &Path, args: &[&str]) -> Reply {
     run(command)
 }
 
+/// Bounded panic check without pipes: the crash hook records a
+/// `daemon.panicked-<pid>-<ts>.json` marker under `<data>/crashes`, and
+/// daemon startup consumes markers from earlier runs. A marker present after
+/// shutdown proves this run's daemon panicked.
+fn assert_no_daemon_panic(data: &Path) {
+    let mut panicked = false;
+    if let Ok(entries) = fs::read_dir(data.join("crashes")) {
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("daemon.panicked-"))
+            {
+                panicked = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        !panicked,
+        "daemon panicked; see the retained fixture crashes dir"
+    );
+}
+
 pub struct Fixture {
     pub root: PathBuf,
     pub data: PathBuf,
     pub workspace: PathBuf,
     pub retain_data: bool,
-    daemon: Option<Captured>,
+    daemon: Option<OwnedDaemon>,
     daemon_env: Vec<(OsString, OsString)>,
+    daemon_stderr: PathBuf,
     starts: u32,
 }
 
@@ -279,15 +432,53 @@ impl Fixture {
         fs::create_dir(&root).expect("create unique test root");
         let workspace = root.join("repo space");
         fs::create_dir(&workspace).expect("create fixture workspace");
+        let daemon_stderr = root.join("daemon.stderr.log");
         Self {
             data: root.join("data space"),
             workspace,
+            daemon_stderr,
             root,
             daemon: None,
             daemon_env: Vec::new(),
             retain_data: false,
             starts: 0,
         }
+    }
+
+    /// Extra environment for the owned daemon child (for example selector
+    /// credentials a regression test injects before startup).
+    pub fn set_daemon_env(&mut self, key: &str, value: &str) {
+        self.daemon_env
+            .push((OsString::from(key), OsString::from(value)));
+    }
+
+    /// Bounded tail of the owned daemon's fixture-owned stderr file.
+    pub fn daemon_stderr_tail(&self) -> String {
+        file_stderr_tail(&self.daemon_stderr, 8192)
+    }
+
+    /// Startup stderr with every injected daemon credential redacted, so a
+    /// startup panic never prints the secret the selector redaction
+    /// regression asserts is absent from persisted output.
+    fn redacted_stderr_tail(&self) -> String {
+        let mut tail = self
+            .daemon
+            .as_ref()
+            .map(|daemon| daemon.stderr_tail())
+            .unwrap_or_else(|| file_stderr_tail(&self.daemon_stderr, 8192));
+        for (_, value) in &self.daemon_env {
+            let secret = value.to_string_lossy();
+            if !secret.is_empty() {
+                tail = tail.replace(secret.as_ref(), "[redacted]");
+            }
+        }
+        tail
+    }
+
+    /// Exact PID of the owned daemon child (the guard's handle, never a
+    /// re-resolved PID, so the proof test cannot observe a recycled process).
+    pub fn daemon_pid(&self) -> u32 {
+        self.daemon.as_ref().expect("owned daemon").id()
     }
 
     pub fn start(&mut self) {
@@ -305,8 +496,8 @@ impl Fixture {
             .arg("--data-dir")
             .arg(data_argument)
             .args(["daemon", "--foreground"]);
-        self.daemon = Some(Captured::spawn(command));
-        let child_id = self.daemon.as_ref().unwrap().child.id();
+        self.daemon = Some(OwnedDaemon::spawn(command, &self.daemon_stderr));
+        let child_id = self.daemon.as_ref().unwrap().id();
         let started = Instant::now();
         let deadline = started + WAIT;
         let mut polls = 0u32;
@@ -316,26 +507,23 @@ impl Fixture {
                 .daemon
                 .as_mut()
                 .unwrap()
-                .child
                 .try_wait()
                 .expect("daemon status")
             {
-                let (_, stderr) = self.daemon.as_ref().unwrap().output(Duration::from_secs(2));
-                let mut end = stderr.len().min(16 * 1024);
-                while !stderr.is_char_boundary(end) {
-                    end -= 1;
-                }
-                let truncated = if end < stderr.len() {
-                    "\n[stderr truncated at 16384 bytes]"
-                } else {
-                    ""
-                };
+                // The owned daemon's stdout is null (never a pipe), so its
+                // last words come from its files: the published endpoint
+                // record, the timestamped phase codes in its log, and the
+                // bounded stderr tail (the only evidence when startup fails
+                // before logging starts). Injected credentials are redacted
+                // before formatting so a startup panic cannot print the
+                // secret the redaction regression asserts is absent.
                 panic!(
-                    "foreground daemon exited during startup (status={status:?}, per_process currently_starting={}, per_process peak_starting={}); stderr:\n{}{}",
+                    "foreground daemon exited during startup (status={status:?}, per_process currently_starting={}, per_process peak_starting={}); daemon.json={}; log={}; stderr={}",
                     CURRENTLY_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
                     PEAK_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
-                    &stderr[..end],
-                    truncated,
+                    daemon_info_snippet(&self.data),
+                    daemon_log_phases(&self.data),
+                    self.redacted_stderr_tail(),
                 );
             }
             let response = cli(&self.data, &["status"]);
@@ -354,12 +542,12 @@ impl Fixture {
             }
             assert!(
                 Instant::now() < deadline,
-                "daemon readiness deadline (start #{}, {polls} status polls in {:?}, per_process currently_starting={}, per_process peak_starting={}): child={}; daemon.json={}; first_error={}; last_error={}; log={}",
+                "daemon readiness deadline (start #{}, {polls} status polls in {:?}, per_process currently_starting={}, per_process peak_starting={}): child={}; daemon.json={}; first_error={}; last_error={}; log={}; stderr={}",
                 self.starts,
                 started.elapsed(),
                 CURRENTLY_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
                 PEAK_STARTING_DAEMONS_PER_PROCESS.load(Ordering::SeqCst),
-                match self.daemon.as_mut().unwrap().child.try_wait() {
+                match self.daemon.as_mut().unwrap().try_wait() {
                     Ok(None) => "alive".to_owned(),
                     Ok(Some(status)) => format!("exited({status:?})"),
                     Err(_) => "wait_error".to_owned(),
@@ -368,6 +556,7 @@ impl Fixture {
                 first_error.as_deref().unwrap_or("none"),
                 error_snippet(&response.stderr),
                 daemon_log_phases(&self.data),
+                self.redacted_stderr_tail(),
             );
             thread::sleep(Duration::from_millis(50));
         }
@@ -423,41 +612,36 @@ impl Fixture {
         let daemon = self.daemon.as_mut().unwrap();
         assert!(
             daemon
-                .wait(WAIT)
+                .reap(WAIT)
                 .expect("owned daemon shutdown deadline")
                 .success(),
             "owned daemon returned nonzero"
         );
-        let (_, stderr) = daemon.output(Duration::from_secs(2));
-        assert!(!stderr.contains("panicked"), "daemon panic: {stderr}");
+        assert_no_daemon_panic(&self.data);
         self.daemon = None;
     }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        // The owned foreground daemon dies with the fixture on every path,
+        // including a panic mid-startup such as the readiness deadline:
+        // dropping the guard kills the exact child handle first and reaps it,
+        // without depending on IPC to a daemon that may be wedged under load.
+        if let Some(daemon) = self.daemon.take() {
+            drop(daemon);
+        }
         if self.retain_data {
-            // A background starter can fail before metadata is published. Only
-            // attempt authenticated IPC; do not adopt a PID or claim OS exit.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                cli(&self.data, &["daemon", "stop", "--force"])
-            }));
+            // No owned foreground child remains (killed above through its
+            // exact handle). No IPC by data directory either: the daemon may
+            // have exited and a replacement may since have bound the
+            // directory. Detached-background cleanup belongs to the
+            // birth-verified handle claimed at creation, never to this drop.
             eprintln!(
                 "unconfirmed background fixture retained at {}",
                 self.root.display()
             );
             return;
-        }
-        if let Some(mut daemon) = self.daemon.take() {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                cli(&self.data, &["daemon", "stop", "--force"])
-            }));
-            if daemon.wait(WAIT).is_err() {
-                let _ = daemon.child.kill();
-                if daemon.wait(Duration::from_secs(5)).is_err() {
-                    return;
-                }
-            }
         }
         if thread::panicking() {
             eprintln!("failed fixture retained at {}", self.root.display());
