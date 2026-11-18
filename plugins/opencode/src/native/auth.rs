@@ -613,11 +613,10 @@ async fn import_once(
     ImportAttempt::Applied
 }
 
-/// Refuse when the isolated store unexpectedly holds a credential for the
-/// dedicated local provider ID. In env-key and no-auth modes no native
-/// credential may be active for that ID: a present entry means owner or
-/// project state selected a credential the frozen profile never named, so
-/// startup refuses before any inference instead of silently using it.
+/// Unused since k173d: fragment providers never import a canonical credential,
+/// so no isolated-store credential check is needed. Kept for the auth module
+/// boundary; allowed dead to keep the shared auth surface stable.
+#[allow(dead_code)]
 pub async fn ensure_no_credential_for_provider(
     program: &OsStr,
     workspace: &Path,

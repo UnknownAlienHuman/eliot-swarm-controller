@@ -294,13 +294,32 @@ fn editability(source: &str, policy: &SecretPolicy) -> Option<&'static str> {
 
 /// Profiles or adopted proxies whose URL fields carry credentials (userinfo,
 /// query, fragment) must never be handed to the editor as safe source.
-fn has_credentialed_url(config: &super::FileConfig, source: &str) -> bool {
+/// Provider fragments are written as-is; any `{env:}`-free URL carrying
+/// userinfo in a fragment still blocks the editor.
+fn provider_fragment_has_credentialed_url(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::String(text) => {
+            if let Some(after) = text.split("://").nth(1) {
+                let authority = after.split(['/', '?', '#']).next().unwrap_or(after);
+                if authority.contains('@') {
+                    return true;
+                }
+            }
+            false
+        }
+        toml::Value::Array(items) => items.iter().any(provider_fragment_has_credentialed_url),
+        toml::Value::Table(table) => table.values().any(provider_fragment_has_credentialed_url),
+        _ => false,
+    }
+}
+
+fn has_credentialed_url(config: &super::FileConfig, _source: &str) -> bool {
     config.profiles.values().any(|entry| {
-        entry
-            .get_ref()
-            .provider_base_url
-            .as_deref()
-            .is_some_and(|raw| super::validate_provider_base_url("", raw, source, 0).is_err())
+        entry.get_ref().provider.as_ref().is_some_and(|fragment| {
+            fragment
+                .values()
+                .any(provider_fragment_has_credentialed_url)
+        })
     }) || config.proxies.iter().any(|(name, entry)| {
         let proxy = entry.get_ref();
         core::RouteBinding {

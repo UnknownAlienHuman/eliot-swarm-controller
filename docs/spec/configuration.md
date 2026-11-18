@@ -312,42 +312,43 @@ permissions stay unknown (`null` / unverified) until a real native tool probe co
 posture. `collaboration_mode` and `approval_policy`
 presets stay rejected. See the [Muse page](../harnesses/muse.md).
 
-An OpenCode adopted-backend profile points one frozen profile at a local
+An OpenCode custom-provider profile points one frozen profile at a local
 OpenAI-compatible endpoint instead of a canonical integration:
 
 ```toml
 [profiles.opencode-local]
 harness = "opencode"
 cmd = "C:/Tools/OpenCode/opencode.exe"
-model = "eliot-local/qwen3-8b"
-provider_base_url = "http://127.0.0.1:1234/v1"
-backend = "lmstudio"
-context_limit = 131072
-output_limit = 8192
-# api_key_env = "LOCAL_LLM_KEY"  # plus a pass_env entry, when the backend needs a key
-# pass_env = ["LOCAL_LLM_KEY"]
+model = "k173d-fixture/test-model"
+pass_env = ["LOCAL_LLM_KEY"]
+
+[profiles.opencode-local.provider.k173d-fixture]
+package = "@opencode/ai/providers/openai-compatible"
+
+[profiles.opencode-local.provider.k173d-fixture.settings]
+baseURL = "http://127.0.0.1:1234/v1"
+apiKey = "{env:LOCAL_LLM_KEY}"
+
+[profiles.opencode-local.provider.k173d-fixture.models.test-model]
+name = "test-model"
+tools = true
 ```
 
-`backend` is one preset through the single OpenCode provider path:
-`strata`, `unsloth`, `lmstudio`, `llama.cpp`, `ollama`, `vllm` or `generic`
-(Ollama and vLLM reuse the same path, not separate executors). `model` must
-use the dedicated `eliot-local` provider segment, which has no canonical
-alias. `api_key_env` names one `pass_env`-allowed environment holding the
-backend key; absent means explicit no-auth mode, and a missing or empty
-required key refuses before startup instead of silently becoming no-auth.
+`model` is the exact `provider/model` string; the `provider.<id>` fragment is
+written as-is into the isolated `opencode.jsonc` under `providers`. Every
+`{env:NAME}` reference must name a `pass_env`-allowed environment; a missing or
+empty required value refuses before startup instead of silently becoming no-auth.
 `auth_integration` must be absent on this path so no unrelated canonical
-credential is imported. `context_limit` and `output_limit` are the explicit
-effective limits; the plugin renders them with the installed
-`@opencode/ai/providers/openai-compatible` package and verifies the
-effective provider, catalogue entry, limits and passive backend inventory
-before any native session is created — every verification failure
-(including an unreachable backend) settles the launch as failed with a
-short safe reason, never unknown — rejecting project overrides that
-retarget the route.
+credential is imported. The plugin verifies the exact provider through native
+`GET /api/provider/:providerID` and the exact pair through `GET /api/model`
+(with limits from that catalogue row) before any native session is created —
+every verification failure settles the launch as failed with a short safe reason,
+never unknown — rejecting project overrides that retarget the route. An
+unreachable endpoint is not a start failure: the catalogue still lists the model
+and the native turn surfaces the refusal.
 There is no harness/model/account fallback. Codex profiles against these
-backends stay `unsupported` until readiness, catalog/context, history and
-exact tool formats are resolved separately. See the
-[OpenCode harness page](../harnesses/opencode.md#adopted-local-backends).
+endpoints stay `unsupported`. See the
+[OpenCode harness page](../harnesses/opencode.md#custom-provider-fragments).
 
 ### Worker MCP policy
 

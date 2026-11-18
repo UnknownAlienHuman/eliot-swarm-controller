@@ -710,11 +710,12 @@ impl Router {
             // partial aggregate instead of holding the coalescing lock.
             let models_read =
                 tokio::time::timeout_at(discovery_deadline, read_models(params.clone())).await;
-            let response_value = match models_read {
-                Ok(Ok(value)) => value,
+            let (ad_hoc_response, ad_hoc_failed) = match models_read {
+                Ok(Ok(value)) => (Some(value), false),
                 Ok(Err(error)) => {
                     // The aggregate names the failed harness with its typed
                     // error instead of silently listing no models for it.
+                    // Named profile discovery below still runs independently.
                     crate::logging::record(
                         &self.secret_policy_snapshot(),
                         "catalog.harness_failed",
@@ -722,7 +723,7 @@ impl Router {
                         Some(&error),
                     );
                     failures.push(ModelsCatalogFailure::from_error(harness, &error));
-                    continue;
+                    (None, true)
                 }
                 Err(_) => {
                     failures.push(ModelsCatalogFailure::from_error(
@@ -732,27 +733,97 @@ impl Router {
                             "catalogue discovery budget elapsed; harness skipped",
                         ),
                     ));
-                    continue;
+                    (None, true)
                 }
             };
-            let response: eliot_core::api::HarnessModelsResponse =
-                serde_json::from_value(response_value)
-                    .map_err(|_| Error::new("internal", "harness models could not be decoded"))?;
-            let held = held_harness(harness);
-            let quota = tokio::time::timeout_at(discovery_deadline, read_quota(params))
-                .await
-                .ok()
-                .and_then(Result::ok);
-            for model in response.models {
-                models.push(catalog::catalog_entry(
-                    harness,
-                    model,
-                    held,
-                    quota.as_ref(),
-                    now_ms(),
-                ));
+            let mut seen: std::collections::HashSet<String> = models
+                .iter()
+                .filter(|entry| entry.harness == harness)
+                .map(|entry| entry.id.clone())
+                .collect();
+            let mut ad_hoc_quota_for_cache: Option<catalog::ScopedQuota> = None;
+            if let Some(response_value) = ad_hoc_response {
+                let response: eliot_core::api::HarnessModelsResponse =
+                    serde_json::from_value(response_value).map_err(|_| {
+                        Error::new("internal", "harness models could not be decoded")
+                    })?;
+                let held = held_harness(harness);
+                let quota = tokio::time::timeout_at(discovery_deadline, read_quota(params))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                for model in response.models {
+                    seen.insert(model.id.clone());
+                    models.push(catalog::catalog_entry(
+                        harness,
+                        model,
+                        held,
+                        quota.as_ref(),
+                        now_ms(),
+                    ));
+                }
+                ad_hoc_quota_for_cache = quota;
             }
-            if let Some(quota) = quota.filter(|quota| quota.route_verified) {
+            let _ = ad_hoc_failed;
+            // Profile-only models (for example a provider fragment defined
+            // only by an OpenCode profile) are absent from the ad-hoc preview.
+            // Feed the picker the same profile-scoped previews the existing
+            // `harness.models` reader serves, merged by id, independently of
+            // the ad-hoc read. Named models never inherit the ad-hoc hold or
+            // quota, so an unrelated ad-hoc hold cannot mark a fragment model.
+            if harness == "opencode" {
+                let profile_names =
+                    crate::config::profile_names_for_harness(&self.inner.data_root, harness);
+                let total = profile_names.len();
+                let mut attempted: usize = 0;
+                for name in profile_names {
+                    if tokio::time::Instant::now() >= discovery_deadline {
+                        failures.push(ModelsCatalogFailure::from_error(
+                            harness,
+                            &Error::new(
+                                "unavailable",
+                                format!(
+                                    "catalogue discovery budget elapsed; profile preview incomplete ({attempted} of {total} named profiles)"
+                                ),
+                            ),
+                        ));
+                        break;
+                    }
+                    attempted += 1;
+                    let scoped = json!({"harness": harness, "profile": name});
+                    let scoped_read =
+                        tokio::time::timeout_at(discovery_deadline, read_models(scoped)).await;
+                    let scoped_value = match scoped_read {
+                        Ok(Ok(value)) => value,
+                        Ok(Err(_)) => continue,
+                        Err(_) => {
+                            failures.push(ModelsCatalogFailure::from_error(
+                                harness,
+                                &Error::new(
+                                    "unavailable",
+                                    format!(
+                                        "catalogue discovery budget elapsed; profile preview incomplete ({attempted} of {total} named profiles)"
+                                    ),
+                                ),
+                            ));
+                            break;
+                        }
+                    };
+                    let Ok(scoped_response) = serde_json::from_value::<
+                        eliot_core::api::HarnessModelsResponse,
+                    >(scoped_value) else {
+                        continue;
+                    };
+                    for model in scoped_response.models {
+                        if seen.contains(&model.id) {
+                            continue;
+                        }
+                        seen.insert(model.id.clone());
+                        models.push(catalog::catalog_entry(harness, model, None, None, now_ms()));
+                    }
+                }
+            }
+            if let Some(quota) = ad_hoc_quota_for_cache.filter(|quota| quota.route_verified) {
                 quotas.insert(harness.to_owned(), quota);
             }
         }
@@ -1088,20 +1159,13 @@ pub(crate) fn describe_snapshot(
             {
                 scope.push_str(&format!(" auth:{integration}"));
                 credential = format!("auth:{integration}");
-            } else if let Some(base) = snapshot.get("provider_base_url").and_then(Value::as_str) {
-                if let Some(backend) = snapshot
-                    .get("backend")
-                    .and_then(Value::as_str)
-                    .filter(|name| !name.trim().is_empty())
-                {
-                    scope.push_str(&format!(" backend:{backend}"));
+            } else if let Some(fragment) = snapshot.get("provider").and_then(Value::as_object) {
+                let mut ids: Vec<&str> = fragment.keys().map(String::as_str).collect();
+                ids.sort_unstable();
+                if !ids.is_empty() {
+                    scope.push_str(&format!(" provider:{}", ids.join(",")));
                 }
-                scope.push_str(&format!(" provider:{}", endpoint_authority(base)));
-                credential = snapshot
-                    .get("api_key_env")
-                    .and_then(Value::as_str)
-                    .filter(|name| !name.trim().is_empty())
-                    .map_or_else(|| "no-auth".to_owned(), |name| format!("env:{name}"));
+                credential = "fragment".to_owned();
             }
         }
         "claude" => {
@@ -1140,10 +1204,8 @@ pub(crate) fn canonical_cache_identity(
         "harness": snapshot.get("harness"),
         "account": snapshot.get("account"),
         "auth": snapshot.get("auth_integration"),
-        "backend": snapshot.get("backend"),
-        "provider": snapshot.get("provider_base_url"),
+        "provider": snapshot.get("provider"),
         "route": snapshot.get("route_binding"),
-        "key_ref": snapshot.get("api_key_env"),
         "executable": snapshot.get("cmd"),
         "identity": verified,
         "model_pins": model_pins,
@@ -2793,7 +2855,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_auth_and_backend_scopes() {
+    fn opencode_auth_and_fragment_scopes() {
         let snapshot = json!({"harness": "opencode", "auth_integration": "personal"});
         let (scope, credential) = describe_snapshot("oc", "opencode", Some(&snapshot));
         assert_eq!(scope, "profile:oc harness:opencode auth:personal");
@@ -2801,15 +2863,41 @@ mod tests {
 
         let snapshot = json!({
             "harness": "opencode",
-            "backend": "lmstudio",
-            "provider_base_url": "http://127.0.0.1:1234/v1",
+            "provider": {
+                "k173d-fixture": {
+                    "package": "@opencode/ai/providers/openai-compatible",
+                },
+            },
         });
         let (scope, credential) = describe_snapshot("adhoc", "opencode", Some(&snapshot));
         assert_eq!(
             scope,
-            "profile:adhoc harness:opencode backend:lmstudio provider:127.0.0.1:1234"
+            "profile:adhoc harness:opencode provider:k173d-fixture"
         );
-        assert_eq!(credential, "no-auth");
+        assert_eq!(credential, "fragment");
+    }
+
+    #[test]
+    fn profile_scoped_models_without_profile_evidence_stay_unknown() {
+        let now = 1_000;
+        let entry = catalog_entry(
+            "opencode",
+            eliot_core::api::HarnessModelEntry {
+                id: "k173d-fixture/test-model".to_owned(),
+                display_name: None,
+                default: false,
+                efforts: None,
+                default_effort: None,
+                source: None,
+            },
+            None,
+            None,
+            now,
+        );
+        assert_eq!(
+            entry.availability,
+            eliot_core::api::harness::CATALOG_UNKNOWN
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ use tokio::{
 use crate::native::{
     AuthSetup, AuthTransfer,
     client::{OpenCodeHttp, server_native_directory},
-    ensure_no_credential_for_provider, transfer_selected_integration,
+    transfer_selected_integration,
 };
 
 const READINESS_POLL: Duration = Duration::from_millis(250);
@@ -54,20 +54,74 @@ const READINESS_POLL: Duration = Duration::from_millis(250);
 const ELIOT_CONTEXT_PLUGIN: &str = include_str!("eliot-context.ts");
 const ELIOT_CONTEXT_PLUGIN_FILE: &str = "eliot-context.ts";
 
-/// Frozen adopted-backend provider inputs (nonsecret): the dedicated
-/// provider id, the exact API model id, the explicit base URL, the optional
-/// key reference name (never its value), the explicit context/output
-/// limits, the backend preset kind, and the expected native package.
-#[derive(Debug, Clone)]
-pub struct LocalProvider {
-    pub provider_id: String,
-    pub api_model_id: String,
-    pub base_url: String,
-    pub api_key_env: Option<String>,
-    pub context_limit: i64,
-    pub output_limit: i64,
-    pub backend: String,
-    pub package: String,
+/// Frozen native `provider.<id>` fragment (nonsecret): one OpenCode provider
+/// id maps to its definition, written as-is into the isolated
+/// `opencode.jsonc` under `providers`. Secrets stay behind `{env:NAME}`
+/// references resolved at runtime from the serve environment, never as
+/// literal values in the frozen snapshot.
+pub type ProviderFragment = serde_json::Map<String, serde_json::Value>;
+
+/// Collect every `{env:NAME}` reference in a JSON provider fragment.
+fn fragment_env_refs(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            let bytes = text.as_bytes();
+            let mut index = 0;
+            while index + 6 < text.len() {
+                if index + 5 <= text.len() && &bytes[index..index + 5] == b"{env:" {
+                    if let Some(end) = text[index + 5..].find('}') {
+                        let name = &text[index + 5..index + 5 + end];
+                        if !name.is_empty() && !out.iter().any(|known| known == name) {
+                            out.push(name.to_owned());
+                        }
+                        index += 5 + end + 1;
+                        continue;
+                    }
+                    break;
+                }
+                index += 1;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                fragment_env_refs(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                fragment_env_refs(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every `{env:NAME}` in the fragment must resolve to a non-empty runtime
+/// value in the serve environment. A missing or empty value refuses before
+/// `serve` starts, never silently becoming no-auth mode.
+pub(crate) fn validate_fragment_environment(
+    fragment: &ProviderFragment,
+    environment: &[(OsString, OsString)],
+) -> Result<()> {
+    let mut refs = Vec::new();
+    fragment_env_refs(&serde_json::Value::Object(fragment.clone()), &mut refs);
+    for name in refs {
+        let present = environment.iter().any(|(key, value)| {
+            let matches = if cfg!(windows) {
+                key.to_string_lossy().eq_ignore_ascii_case(&name)
+            } else {
+                key.to_string_lossy() == name
+            };
+            matches && !value.to_string_lossy().trim().is_empty()
+        });
+        if !present {
+            return Err(Error::new(
+                "profile_error",
+                "OpenCode provider fragment requires a non-empty value for its configured reference; refusing to start without credentials",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Name of the Agent-scoped swarm MCP server in the per-Agent config.
@@ -122,7 +176,7 @@ fn native_subagents_permission(native_subagents: Option<&str>) -> Option<serde_j
 
 fn agent_config_json(
     model: Option<&str>,
-    local: Option<&LocalProvider>,
+    fragment: Option<&ProviderFragment>,
     swarm_executable: &str,
     swarm_data_dir: &str,
     native_subagents: Option<&str>,
@@ -140,7 +194,7 @@ fn agent_config_json(
         mcp.insert("servers".to_owned(), serde_json::Value::Object(servers));
         mcp
     });
-    let mut document = provider_config(model, local);
+    let mut document = provider_config(model, fragment);
     document["mcp"] = mcp;
     if let Some(permission) = native_subagents_permission(native_subagents) {
         document["permission"] = permission;
@@ -150,45 +204,16 @@ fn agent_config_json(
 
 pub(crate) fn provider_config(
     model: Option<&str>,
-    local: Option<&LocalProvider>,
+    fragment: Option<&ProviderFragment>,
 ) -> serde_json::Value {
-    let mut document = match local {
+    let mut document = match fragment {
         None => serde_json::json!({
             "$schema": "https://opencode.ai/config.json",
         }),
-        Some(provider) => {
-            let mut settings = serde_json::Map::new();
-            settings.insert(
-                "baseURL".to_owned(),
-                serde_json::Value::String(provider.base_url.clone()),
-            );
-            if let Some(name) = &provider.api_key_env {
-                settings.insert(
-                    "apiKey".to_owned(),
-                    serde_json::Value::String(format!("{{env:{name}}}")),
-                );
-            }
-            let mut models = serde_json::Map::new();
-            models.insert(
-                provider.api_model_id.clone(),
-                serde_json::json!({
-                    "name": provider.api_model_id,
-                    "tools": true,
-                    "limit": {
-                        "context": provider.context_limit,
-                        "output": provider.output_limit,
-                    },
-                }),
-            );
+        Some(fragment) => {
             serde_json::json!({
             "$schema": "https://opencode.ai/config.json",
-            "providers": {
-                &provider.provider_id: {
-                    "package": provider.package,
-                    "settings": settings,
-                    "models": models,
-                },
-            },
+            "providers": fragment,
             })
         }
     };
@@ -207,7 +232,7 @@ pub struct ServerLaunch {
     pub environment: Vec<(OsString, OsString)>,
     pub model: Option<String>,
     pub auth: Option<AuthSetup>,
-    pub local: Option<LocalProvider>,
+    pub provider_fragment: Option<ProviderFragment>,
     /// Active Swarm executable for the Agent-scoped MCP server command.
     /// Absolute; start admission resolves it from the running executable.
     pub swarm_executable: PathBuf,
@@ -295,10 +320,10 @@ impl OwnedServer {
             )
         })?;
         let config_path = config_dir.join("opencode.jsonc");
-        if launch.local.is_some() && launch.model.is_none() {
+        if launch.provider_fragment.is_some() && launch.model.is_none() {
             return Err(Error::new(
                 "profile_error",
-                "OpenCode local backend requires an explicit model with the dedicated eliot-local provider segment",
+                "OpenCode provider fragment requires an explicit model with the fragment provider segment",
             ));
         }
         // The MCP server command carries only public arguments; absolute
@@ -320,7 +345,7 @@ impl OwnedServer {
             &config_path,
             agent_config_json(
                 launch.model.as_deref(),
-                launch.local.as_ref(),
+                launch.provider_fragment.as_ref(),
                 swarm_executable,
                 swarm_data_dir,
                 launch.native_subagents.as_deref(),
@@ -392,40 +417,14 @@ impl OwnedServer {
         // roots the server will use. Cloud path: the isolated store sees no
         // canonical credential, so the selected integration moves in opaquely
         // (a refused or ambiguous transfer fails the start with no server
-        // child; resume reuses a correctly present credential). Local path:
-        // no canonical credential is ever imported; instead the required key
+        // child; resume reuses a correctly present credential). Fragment path:
+        // no canonical credential is ever imported; instead every `{env:}`
         // reference must resolve to a non-empty runtime value (a missing or
-        // empty key refuses before startup, never silently becoming no-auth
-        // mode) and the isolated store must hold no credential for the
-        // dedicated local provider ID.
+        // empty value refuses before startup, never silently becoming no-auth
+        // mode).
         drop(prepare_timing);
-        if let Some(local) = launch.local.as_ref() {
-            if let Some(name) = local.api_key_env.as_deref() {
-                let present = launch.environment.iter().any(|(key, value)| {
-                    let matches = if cfg!(windows) {
-                        key.to_string_lossy().eq_ignore_ascii_case(name)
-                    } else {
-                        key.to_string_lossy() == *name
-                    };
-                    matches && !value.to_string_lossy().trim().is_empty()
-                });
-                if !present {
-                    return Err(Error::new(
-                        "profile_error",
-                        "OpenCode local backend requires a non-empty API key value for its configured reference; refusing to start without credentials",
-                    ));
-                }
-            }
-            ensure_no_credential_for_provider(
-                &launch.program,
-                &launch.workspace,
-                &launch.environment,
-                &config_root,
-                &data_dir,
-                &local.provider_id,
-                envelope,
-            )
-            .await?;
+        if let Some(fragment) = launch.provider_fragment.as_ref() {
+            validate_fragment_environment(fragment, &launch.environment)?;
         } else {
             let auth = launch.auth.as_ref().ok_or_else(|| {
                 Error::new(
@@ -890,57 +889,87 @@ mod tests {
         }
     }
 
-    fn local_provider_fixture(api_key_env: Option<&str>) -> LocalProvider {
-        LocalProvider {
-            provider_id: "eliot-local".to_owned(),
-            api_model_id: "qwen3-8b".to_owned(),
-            base_url: "http://127.0.0.1:1234/v1".to_owned(),
-            api_key_env: api_key_env.map(str::to_owned),
-            context_limit: 131072,
-            output_limit: 8192,
-            backend: "lmstudio".to_owned(),
-            package: "@opencode/ai/providers/openai-compatible".to_owned(),
-        }
+    fn fragment_fixture() -> ProviderFragment {
+        let mut fragment = ProviderFragment::new();
+        fragment.insert(
+            "k173d-fixture".to_owned(),
+            serde_json::json!({
+                "package": "@opencode/ai/providers/openai-compatible",
+                "settings": {
+                    "baseURL": "http://127.0.0.1:1234/v1",
+                    "apiKey": "{env:K173D_PROOF_KEY}",
+                    "headers": { "X-Auth-Token": "{env:K173D_PROOF_KEY}" },
+                },
+                "models": {
+                    "test-model": {
+                        "name": "test-model",
+                        "tools": true,
+                        "limit": { "context": 131072, "output": 8192 },
+                    },
+                },
+            }),
+        );
+        fragment
     }
 
     #[test]
-    fn local_config_renders_provider_package_settings_limits_and_env_key_reference() {
+    fn fragment_config_renders_as_is_with_env_references_only() {
         let (executable, data_dir) = swarm_fixture();
+        let fragment = fragment_fixture();
         let parsed: serde_json::Value = serde_json::from_str(&agent_config_json(
-            Some("eliot-local/qwen3-8b"),
-            Some(&local_provider_fixture(Some("LOCAL_LLM_KEY"))),
+            Some("k173d-fixture/test-model"),
+            Some(&fragment),
             executable,
             data_dir,
             None,
         ))
         .expect("valid JSON");
-        assert_eq!(parsed["model"], "eliot-local/qwen3-8b");
+        assert_eq!(parsed["model"], "k173d-fixture/test-model");
         assert_swarm_mcp(&parsed, executable, data_dir);
-        let provider = &parsed["providers"]["eliot-local"];
+        let provider = &parsed["providers"]["k173d-fixture"];
         assert_eq!(
             provider["package"],
             "@opencode/ai/providers/openai-compatible"
         );
         assert_eq!(provider["settings"]["baseURL"], "http://127.0.0.1:1234/v1");
-        // The key travels as a reference only; the resolved value is never
-        // rendered into the document.
-        assert_eq!(provider["settings"]["apiKey"], "{env:LOCAL_LLM_KEY}");
-        let model = &provider["models"]["qwen3-8b"];
-        assert_eq!(model["name"], "qwen3-8b");
-        assert_eq!(model["tools"], true);
-        assert_eq!(model["limit"]["context"], 131072);
-        assert_eq!(model["limit"]["output"], 8192);
+        assert_eq!(provider["settings"]["apiKey"], "{env:K173D_PROOF_KEY}");
+        assert_eq!(
+            provider["settings"]["headers"]["X-Auth-Token"],
+            "{env:K173D_PROOF_KEY}"
+        );
+        let rendered = serde_json::to_string(&parsed).expect("encode");
+        assert!(
+            !rendered.contains("sk-"),
+            "no literal secret in generated config"
+        );
+    }
+
+    #[test]
+    fn fragment_environment_requires_non_empty_reference() {
+        let fragment = fragment_fixture();
+        let empty: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
+        assert!(validate_fragment_environment(&fragment, &empty).is_err());
+        let env = vec![(
+            std::ffi::OsString::from("K173D_PROOF_KEY"),
+            std::ffi::OsString::from("secret"),
+        )];
+        assert!(validate_fragment_environment(&fragment, &env).is_ok());
+        let blank = vec![(
+            std::ffi::OsString::from("K173D_PROOF_KEY"),
+            std::ffi::OsString::from("   "),
+        )];
+        assert!(validate_fragment_environment(&fragment, &blank).is_err());
     }
 
     #[test]
     fn preview_uses_the_launch_provider_document() {
         let (executable, data_dir) = swarm_fixture();
-        let local = local_provider_fixture(Some("LOCAL_LLM_KEY"));
-        let model = Some("eliot-local/qwen3-8b");
-        let preview = provider_config(model, Some(&local));
+        let fragment = fragment_fixture();
+        let model = Some("k173d-fixture/test-model");
+        let preview = provider_config(model, Some(&fragment));
         let launch: serde_json::Value = serde_json::from_str(&agent_config_json(
             model,
-            Some(&local),
+            Some(&fragment),
             executable,
             data_dir,
             None,
@@ -952,24 +981,26 @@ mod tests {
     }
 
     #[test]
-    fn local_no_auth_config_carries_no_key_not_an_empty_string() {
-        // Missing key must never become no-auth mode with an empty string:
-        // no-auth mode omits the key entirely.
+    fn fragment_no_auth_config_carries_no_key_not_an_empty_string() {
         let (executable, data_dir) = swarm_fixture();
+        let mut fragment = ProviderFragment::new();
+        fragment.insert(
+            "k173d-noauth".to_owned(),
+            serde_json::json!({
+                "package": "@opencode/ai/providers/openai-compatible",
+                "settings": { "baseURL": "http://127.0.0.1:1234/v1" },
+                "models": { "test-model": { "name": "test-model", "tools": true } },
+            }),
+        );
         let rendered = agent_config_json(
-            Some("eliot-local/qwen3-8b"),
-            Some(&local_provider_fixture(None)),
+            Some("k173d-noauth/test-model"),
+            Some(&fragment),
             executable,
             data_dir,
             None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
-        let settings = &parsed["providers"]["eliot-local"]["settings"];
-        assert_eq!(
-            settings.as_object().expect("object").len(),
-            1,
-            "only baseURL: {settings}"
-        );
+        let settings = &parsed["providers"]["k173d-noauth"]["settings"];
         assert_eq!(settings["baseURL"], "http://127.0.0.1:1234/v1");
         assert!(settings.get("apiKey").is_none());
         assert!(!rendered.contains("apiKey"));
@@ -977,7 +1008,7 @@ mod tests {
 
     #[test]
     fn absent_model_omits_the_key_for_the_native_default() {
-        // Requested-absent: no `model` key, so the configured native default
+        // Requested-absent: no \model\ key, so the configured native default
         // applies; the effective value is read back from the session.
         let (executable, data_dir) = swarm_fixture();
         let parsed: serde_json::Value =
@@ -988,8 +1019,8 @@ mod tests {
     }
 
     #[test]
-    fn config_covers_absent_cloud_model_and_explicit_local_model() {
-        // Ad-hoc cloud launch without a model: no `model` key and no
+    fn config_covers_absent_cloud_model_and_explicit_fragment_model() {
+        // Ad-hoc cloud launch without a model: no \model\ key and no
         // providers block, so the configured native default applies.
         let (executable, data_dir) = swarm_fixture();
         let cloud: serde_json::Value =
@@ -998,22 +1029,23 @@ mod tests {
         assert!(cloud.get("model").is_none());
         assert!(cloud.get("providers").is_none());
         assert_swarm_mcp(&cloud, executable, data_dir);
-        // Adopted local-backend profile: the explicit eliot-local model plus
-        // the frozen provider document.
-        let local: serde_json::Value = serde_json::from_str(&agent_config_json(
-            Some("eliot-local/qwen3-8b"),
-            Some(&local_provider_fixture(Some("LOCAL_LLM_KEY"))),
+        // Fragment profile: the explicit fragment model plus the frozen
+        // provider document written as-is.
+        let fragment = fragment_fixture();
+        let custom: serde_json::Value = serde_json::from_str(&agent_config_json(
+            Some("k173d-fixture/test-model"),
+            Some(&fragment),
             executable,
             data_dir,
             None,
         ))
         .expect("valid JSON");
-        assert_eq!(local["model"], "eliot-local/qwen3-8b");
+        assert_eq!(custom["model"], "k173d-fixture/test-model");
         assert_eq!(
-            local["providers"]["eliot-local"]["settings"]["baseURL"],
+            custom["providers"]["k173d-fixture"]["settings"]["baseURL"],
             "http://127.0.0.1:1234/v1"
         );
-        assert_swarm_mcp(&local, executable, data_dir);
+        assert_swarm_mcp(&custom, executable, data_dir);
     }
 
     #[test]
