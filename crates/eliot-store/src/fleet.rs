@@ -1,13 +1,19 @@
 use super::*;
-use eliot_core::api::{AGENT_LIST_STATES, AgentStateTotal, AgentSummary};
+use eliot_core::api::{
+    AGENT_LIST_STATES, AgentListOrder, AgentStateTotal, AgentSummary, decode_recent_cursor,
+    encode_recent_cursor,
+};
 
 impl Store {
     /// Compact fleet projection for `agent.list`: scope-checked, filtered,
-    /// ordered by Agent ID. Every equality filter rides one `agents_list_*`
-    /// composite index (forced with `INDEXED BY`, so `EXPLAIN QUERY PLAN`
-    /// shows the index); the cursor rides the primary key. The response
-    /// carries the matching total ignoring the cursor, honest truncation, and
-    /// the continuation cursor at the last returned row.
+    /// ordered by Agent ID (`order: id`) or newest activity first
+    /// (`order: recent`: `updated_at` descending, then ID descending, with a
+    /// stable `(updated_at, id)` cursor on the `agents_recent` index).
+    /// Every equality filter rides one `agents_list_*` composite index
+    /// (forced with `INDEXED BY`, so `EXPLAIN QUERY PLAN` shows the index);
+    /// the id cursor rides the primary key. The response carries the
+    /// matching total ignoring the cursor, honest truncation, and the
+    /// continuation cursor at the last returned row.
     pub fn list_agent_summaries(
         &self,
         filter: &AgentListFilter,
@@ -52,6 +58,16 @@ impl Store {
     ) -> Result<AgentListPage> {
         validate_limit(limit)?;
         filter.validate()?;
+        if filter.order == AgentListOrder::Recent {
+            return self.list_agent_summaries_recent(
+                caller,
+                filter,
+                after,
+                limit,
+                now_ms,
+                growth_thresholds,
+            );
+        }
         let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
         // Custody-held archived agents for the default exclusion, collected
         // once per page from the live custody tables (bounded by live custody,
@@ -149,6 +165,132 @@ impl Store {
         enforce_page_bytes(&mut summaries)?;
         truncated = truncated || summaries.len() < kept;
         let next = summaries.last().map(|summary| summary.id.clone());
+        Ok(AgentListPage {
+            summaries,
+            state_totals,
+            total: usize::try_from(total.max(0)).unwrap_or(0),
+            truncated,
+            next,
+        })
+    }
+
+    /// Recent-order fleet page: newest activity first (`updated_at`
+    /// descending, then numeric ID descending) with a stable
+    /// `(updated_at, id)` cursor seeking the `agents_recent` index.
+    /// `updated_at` is bumped by the core reducer on every native event,
+    /// so a busy Agent with fresh progress outranks an idle one touched
+    /// long ago, and the key never regresses when old events are pruned.
+    /// Totals ignore the cursor; `next` encodes the last row as
+    /// `id@updated_at`.
+    fn list_agent_summaries_recent(
+        &self,
+        caller: Option<&Agent>,
+        filter: &AgentListFilter,
+        after: Option<&str>,
+        limit: usize,
+        now_ms: i64,
+        growth_thresholds: &core::SessionGrowthThresholds,
+    ) -> Result<AgentListPage> {
+        let after_cursor: Option<(i64, i64)> = after
+            .map(decode_recent_cursor)
+            .transpose()?
+            .map(|(id, activity)| Ok::<_, Error>((activity, parse_agent_id(&id)?)))
+            .transpose()?;
+        let (after_activity, after_id) = after_cursor.unwrap_or((i64::MAX, i64::MAX));
+        let custody = if matches!(filter.archived, core::api::ArchivedFilter::Exclude) {
+            Some(super::agent_lifecycle::default_list_custody_agents(
+                &self.connection,
+            )?)
+        } else {
+            None
+        };
+        let probe = i64::try_from(limit)
+            .map_err(|_| Error::new("invalid", "page limit must fit the index bound"))?
+            + 1;
+        let page = agent_list_select_recent(
+            filter,
+            caller,
+            Some((after_activity, after_id)),
+            Some(probe),
+            AgentListProjection::Rows,
+            custody.as_deref(),
+        )?;
+        let mut statement = self.connection.prepare(&page.sql).map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params_from_iter(page.params.iter()),
+                agent_record_from_row,
+            )
+            .map_err(sql_error)?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(self.summary_from_record(
+                row.map_err(sql_error)?,
+                now_ms,
+                growth_thresholds,
+            )?);
+        }
+        let total_page = agent_list_select_recent(
+            filter,
+            caller,
+            None,
+            None,
+            AgentListProjection::Count,
+            custody.as_deref(),
+        )?;
+        let total: i64 = self
+            .connection
+            .query_row(
+                &total_page.sql,
+                rusqlite::params_from_iter(total_page.params.iter()),
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        let state_totals = if filter.states.is_some() {
+            let mut all_states = filter.clone();
+            all_states.states = None;
+            let select = agent_list_select_recent(
+                &all_states,
+                caller,
+                None,
+                None,
+                AgentListProjection::StateTotals,
+                custody.as_deref(),
+            )?;
+            let mut statement = self.connection.prepare(&select.sql).map_err(sql_error)?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(select.params.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sql_error)?;
+            let mut totals: Vec<_> = AGENT_LIST_STATES
+                .into_iter()
+                .map(|state| AgentStateTotal { state, total: 0 })
+                .collect();
+            for row in rows {
+                let (state, total) = row.map_err(sql_error)?;
+                let state: AgentState = parse_enum(&state, "Agent state")?;
+                let entry = totals
+                    .iter_mut()
+                    .find(|entry| entry.state == state)
+                    .ok_or_else(|| {
+                        Error::new("internal", "Agent state missing from state totals")
+                    })?;
+                entry.total = usize::try_from(total)
+                    .map_err(|_| Error::new("internal", "Agent state count exceeds usize"))?;
+            }
+            Some(totals)
+        } else {
+            None
+        };
+        let mut truncated = summaries.len() > limit;
+        summaries.truncate(limit);
+        let kept = summaries.len();
+        enforce_page_bytes(&mut summaries)?;
+        truncated = truncated || summaries.len() < kept;
+        let next = summaries
+            .last()
+            .map(|summary| encode_recent_cursor(&summary.id, summary.updated_at));
         Ok(AgentListPage {
             summaries,
             state_totals,
@@ -324,6 +466,7 @@ impl Store {
 #[derive(Clone, Debug, Default)]
 pub struct AgentListFilter {
     pub archived: core::api::ArchivedFilter,
+    pub order: AgentListOrder,
     pub state: Option<AgentState>,
     pub states: Option<Vec<AgentState>>,
     pub project: Option<String>,
@@ -415,6 +558,161 @@ fn require_filter_text(value: &str) -> Result<()> {
         return Err(Error::new("invalid", "Agent list filter must be nonblank"));
     }
     Ok(())
+}
+
+/// Assemble the `recent` fleet query: newest activity first
+/// (`updated_at` descending, then numeric ID descending) with a stable
+/// `(updated_at, id)` cursor. The ordering and the continuation predicate
+/// both seek the `agents_recent` index, so the first and continuation pages
+/// stay bounded on real volume. Unlike the ID-order path (which splits the
+/// archived exclusion into two indexed branches), the recent path keeps one
+/// predicate with the same custody set, so the first screen always carries
+/// the newest Agents.
+#[allow(clippy::too_many_arguments)]
+fn agent_list_select_recent(
+    filter: &AgentListFilter,
+    caller: Option<&Agent>,
+    after: Option<(i64, i64)>,
+    limit: Option<i64>,
+    projection: AgentListProjection,
+    custody: Option<&[i64]>,
+) -> Result<AgentListSelect> {
+    let count = !matches!(projection, AgentListProjection::Rows);
+    let columns = if matches!(projection, AgentListProjection::StateTotals) {
+        "agents.state, COUNT(*)".to_owned()
+    } else if count {
+        "COUNT(*)".to_owned()
+    } else {
+        "agents.id, agents.generation, agents.name, agents.project, agents.harness, agents.profile, \
+                agents.profile_snapshot, agents.native_scope, agents.native_ref, agents.workspace, agents.effective, \
+                agents.pending, agents.state, agents.active_turn, agents.created_at, agents.updated_at, agents.origin, agents.observe_only, (agents.token IS NOT NULL AND agents.observe_only = 0), \
+                agents.parent, agents.root, agents.depth, agents.control, agents.profile_inherited, agents.profile_choice, agents.archived, agents.chat, agents.project_scope"
+            .to_owned()
+    };
+    let mut predicates = Vec::new();
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(parent) = &filter.parent {
+        predicates.push("agents.parent = ?".to_owned());
+        params.push(rusqlite::types::Value::from(parse_agent_id(parent)?));
+    }
+    if let Some(root) = &filter.root {
+        predicates.push("agents.root = ?".to_owned());
+        params.push(rusqlite::types::Value::from(parse_agent_id(root)?));
+    }
+    if let Some(project) = &filter.project {
+        predicates.push("agents.project = ?".to_owned());
+        params.push(rusqlite::types::Value::from(project.clone()));
+    }
+    if let Some(scope) = &filter.project_scope {
+        predicates.push("COALESCE(agents.project_scope, agents.project) = ?".to_owned());
+        params.push(rusqlite::types::Value::from(scope.clone()));
+    }
+    if let Some(state) = filter.state {
+        predicates.push("agents.state = ?".to_owned());
+        params.push(rusqlite::types::Value::from(
+            agent_state_name(state).to_owned(),
+        ));
+    }
+    if let Some(harness) = &filter.harness {
+        predicates.push("agents.harness = ?".to_owned());
+        params.push(rusqlite::types::Value::from(harness.clone()));
+    }
+    match filter.archived {
+        core::api::ArchivedFilter::Exclude => {
+            let held: &[i64] = custody.unwrap_or(&[]);
+            if held.is_empty() {
+                predicates.push("agents.archived = 0".to_owned());
+            } else {
+                let placeholders = held.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                predicates.push(format!(
+                    "(agents.archived = 0 OR (agents.archived = 1 AND agents.state IN ('stopped','failed','lost') AND agents.id IN ({placeholders})))"
+                ));
+                params.extend(held.iter().map(|id| rusqlite::types::Value::from(*id)));
+            }
+        }
+        core::api::ArchivedFilter::Only => {
+            predicates.push("agents.archived = 1".to_owned());
+        }
+        core::api::ArchivedFilter::Include => {}
+    }
+    if let Some(states) = &filter.states {
+        let placeholders = vec!["?"; states.len()].join(",");
+        predicates.push(format!("agents.state IN ({placeholders})"));
+        params.extend(
+            states
+                .iter()
+                .map(|state| rusqlite::types::Value::from(agent_state_name(*state).to_owned())),
+        );
+    }
+    let mut prefix = String::new();
+    if let Some(caller) = caller {
+        let caller_num = parse_agent_id(&caller.id)?;
+        match caller.control {
+            AgentControl::Slf => {
+                predicates.push("agents.id = ?".to_owned());
+                params.push(rusqlite::types::Value::from(caller_num));
+            }
+            AgentControl::Project => {
+                predicates.push("COALESCE(agents.project_scope, agents.project) = ?".to_owned());
+                params.push(rusqlite::types::Value::from(
+                    caller.project_scope().to_owned(),
+                ));
+            }
+            AgentControl::Tree => {
+                prefix = format!(
+                    "WITH RECURSIVE subtree(id, depth) AS \
+                     (SELECT {caller_num}, 0 UNION ALL \
+                     SELECT a.id, s.depth + 1 FROM agents a JOIN subtree s ON a.parent = s.id \
+                     WHERE s.depth + 1 < {} ) ",
+                    hierarchy::ANCESTOR_WALK_CAP
+                );
+                predicates.push("agents.id IN (SELECT id FROM subtree)".to_owned());
+            }
+        }
+    }
+    if let Some((after_activity, after_id)) = after {
+        predicates.push(
+            "(agents.updated_at < ? OR (agents.updated_at = ? AND agents.id < ?))".to_owned(),
+        );
+        params.push(rusqlite::types::Value::from(after_activity));
+        params.push(rusqlite::types::Value::from(after_activity));
+        params.push(rusqlite::types::Value::from(after_id));
+    }
+    // The unfiltered pagination path (the sidebar's head and history pages)
+    // rides `agents_recent` outright, so the ordering never builds a
+    // temporary B-tree over the fleet. Filtered rows (attention states,
+    // project, branch children, scoped callers) let the planner pick the
+    // selective index and sort the bounded match instead of scanning the
+    // whole fleet in recency order.
+    let selective = filter.parent.is_some()
+        || filter.root.is_some()
+        || filter.project.is_some()
+        || filter.project_scope.is_some()
+        || filter.state.is_some()
+        || filter.harness.is_some()
+        || filter.states.is_some()
+        || caller.is_some();
+    let table = if !count && !selective {
+        "agents INDEXED BY agents_recent"
+    } else {
+        "agents"
+    };
+    let mut sql = format!("{prefix}SELECT {columns} FROM {table}");
+    if !predicates.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&predicates.join(" AND "));
+    }
+    if matches!(projection, AgentListProjection::StateTotals) {
+        sql.push_str(" GROUP BY agents.state");
+    }
+    if !count {
+        sql.push_str(" ORDER BY agents.updated_at DESC, agents.id DESC");
+    }
+    if let Some(limit) = limit {
+        sql.push_str(" LIMIT ?");
+        params.push(rusqlite::types::Value::from(limit));
+    }
+    Ok(AgentListSelect { sql, params })
 }
 
 /// Assemble the fleet query for one scope, filter set, and window. Equality
@@ -1117,6 +1415,173 @@ mod tests {
             .unwrap()
             .join(" | ");
         assert!(plan.contains("USING INDEX agents_list_state"), "{plan}");
+    }
+
+    #[test]
+    fn agent_list_recent_orders_by_updated_at_then_id_with_stable_cursor() {
+        use super::AgentListFilter;
+        use eliot_core::api::{AgentListOrder, decode_recent_cursor};
+
+        fn fleet_agent(store: &mut Store, project: &str, now: i64) -> String {
+            let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+            launch.expected_generation = Some(0);
+            launch.args = json!({"harness": "codex", "profile": "codex-test",
+                "profile_snapshot": {}, "project": project, "workspace": "synthetic-workspace"});
+            let command = launch.id.clone();
+            let id = store
+                .submit("owner", launch, now)
+                .expect("admit fleet launch")
+                .command
+                .target
+                .expect("launch target");
+            store
+                .dispatch(&command, now)
+                .expect("dispatch fleet launch");
+            id
+        }
+
+        let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+        let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+        let oldest = fleet_agent(&mut store, "fleet-r", now);
+        let middle = fleet_agent(&mut store, "fleet-r", now + 1);
+        let newest = fleet_agent(&mut store, "fleet-r", now + 2);
+        // Make the oldest the most recently active via updated_at; the other
+        // two keep launch order so the tiebreak (numeric ID descending) decides.
+        let oldest_num = eliot_core::parse_agent_id(&oldest).expect("parse oldest");
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now + 100, oldest_num],
+            )
+            .expect("touch oldest");
+
+        let filter = AgentListFilter {
+            order: AgentListOrder::Recent,
+            ..Default::default()
+        };
+        let page = store
+            .list_agent_summaries(
+                &filter,
+                None,
+                10,
+                now + 200,
+                &core::SessionGrowthThresholds::default(),
+            )
+            .expect("list recent");
+        assert_eq!(page.total, 3);
+        assert_eq!(page.summaries.len(), 3);
+        assert!(!page.truncated);
+        // Oldest touched last sorts first; middle/newest keep ID-descending.
+        assert_eq!(page.summaries[0].id, oldest);
+        let mut rest: Vec<_> = page.summaries[1..]
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        rest.sort_by(|a, b| {
+            eliot_core::parse_agent_id(b)
+                .unwrap()
+                .cmp(&eliot_core::parse_agent_id(a).unwrap())
+        });
+        let actual: Vec<_> = page.summaries[1..]
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        assert_eq!(actual, rest);
+        assert!(actual.contains(&middle) && actual.contains(&newest));
+        // The cursor encodes the last row's (updated_at, id) and round-trips.
+        let next = page.next.expect("recent next");
+        let (id, activity) = decode_recent_cursor(&next).expect("decode recent next");
+        let last = page.summaries.last().expect("last row");
+        assert_eq!(id, last.id);
+        assert_eq!(activity, last.updated_at);
+        // Paging through one row at a time never skips or repeats.
+        let mut after: Option<String> = None;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let chunk = store
+                .list_agent_summaries(
+                    &filter,
+                    after.as_deref(),
+                    1,
+                    now + 200,
+                    &core::SessionGrowthThresholds::default(),
+                )
+                .expect("page recent");
+            assert_eq!(chunk.summaries.len(), 1);
+            after = chunk.next.clone();
+            seen.push(chunk.summaries.into_iter().next().unwrap().id);
+        }
+        assert_eq!(seen.len(), 3);
+        let mut dedup = seen.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(dedup.len(), 3);
+        let drained = store
+            .list_agent_summaries(
+                &filter,
+                after.as_deref(),
+                1,
+                now + 200,
+                &core::SessionGrowthThresholds::default(),
+            )
+            .expect("drain recent");
+        assert!(drained.summaries.is_empty());
+        assert!(drained.next.is_none());
+        // A legacy id-order cursor never pages silently in recent order.
+        assert!(
+            store
+                .list_agent_summaries(
+                    &filter,
+                    Some(seen[1].as_str()),
+                    1,
+                    now + 200,
+                    &core::SessionGrowthThresholds::default(),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_list_recent_pages_seek_the_activity_index() {
+        use super::{AgentListFilter, AgentListProjection, agent_list_select_recent};
+        use eliot_core::api::AgentListOrder;
+
+        fn plan(store: &Store, after: Option<(i64, i64)>) -> String {
+            let filter = AgentListFilter {
+                order: AgentListOrder::Recent,
+                ..Default::default()
+            };
+            let select = agent_list_select_recent(
+                &filter,
+                None,
+                after,
+                Some(101),
+                AgentListProjection::Rows,
+                None,
+            )
+            .expect("recent select");
+            let mut statement = store
+                .connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", select.sql))
+                .expect("explain recent");
+            statement
+                .query_map(rusqlite::params_from_iter(select.params.iter()), |row| {
+                    row.get::<_, String>(3)
+                })
+                .expect("read plan")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect plan")
+                .join(" | ")
+        }
+
+        let store = Store::open(Path::new(":memory:")).expect("open Store");
+        let first = plan(&store, None);
+        assert!(first.contains("agents_recent"), "{first}");
+        assert!(!first.contains("TEMP B-TREE"), "{first}");
+        let continued = plan(&store, Some((1_700_000_000_000, 42)));
+        assert!(continued.contains("agents_recent"), "{continued}");
+        assert!(!continued.contains("TEMP B-TREE"), "{continued}");
     }
 
     #[test]

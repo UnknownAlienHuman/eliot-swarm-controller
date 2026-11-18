@@ -3648,6 +3648,7 @@ impl Router {
         request.validate()?;
         let filter = AgentListFilter {
             archived: request.archived,
+            order: request.order,
             state: request.state,
             states: request.states.clone(),
             project: request.project.clone(),

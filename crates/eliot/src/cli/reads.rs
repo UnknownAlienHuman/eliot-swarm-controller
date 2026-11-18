@@ -32,7 +32,7 @@ pub(crate) async fn run_ls(
     json_output: bool,
 ) -> Result<u8, Failure> {
     validate_limit(limit)?;
-    let params = list_params(after, limit, false, filter)?;
+    let params = list_params(after, limit, false, json_output, filter)?;
     if json_output {
         read_and_print!(
             &data_dir,
@@ -58,7 +58,7 @@ pub(crate) async fn run_top(
     json_output: bool,
 ) -> Result<u8, Failure> {
     validate_limit(limit)?;
-    let params = list_params(after, limit, true, filter)?;
+    let params = list_params(after, limit, true, json_output, filter)?;
     if json_output {
         read_and_print!(
             &data_dir,
@@ -775,6 +775,7 @@ pub(crate) fn list_params(
     after: Option<String>,
     limit: usize,
     observations: bool,
+    json_output: bool,
     filter: ListFilterArgs,
 ) -> Result<AgentListRequest, Failure> {
     let state = filter
@@ -788,12 +789,27 @@ pub(crate) fn list_params(
             })
         })
         .transpose()?;
+    // `recent` is the default only for humans reading the table: `--json`
+    // keeps the stable ID order for scripts, and an `id`-form `--after aN`
+    // cursor keeps ID order unless `--order` says otherwise. RPC and MCP
+    // already default to ID order at the DTO.
+    let order = match filter.order.as_deref() {
+        Some("recent") => eliot_core::api::AgentListOrder::Recent,
+        Some("id") => eliot_core::api::AgentListOrder::Id,
+        Some(_) => return Err(Failure::new(2, "order must be recent or id")),
+        None if json_output => eliot_core::api::AgentListOrder::Id,
+        None if after.as_deref().is_some_and(|cursor| !cursor.contains('@')) => {
+            eliot_core::api::AgentListOrder::Id
+        }
+        None => eliot_core::api::AgentListOrder::Recent,
+    };
     Ok(AgentListRequest {
         archived: serde_json::from_value(Value::String(filter.archived))
             .map_err(|_| Failure::new(2, "invalid archived filter"))?,
         after,
         limit,
         observations,
+        order,
         state,
         states: None,
         project: filter.project,
@@ -1324,17 +1340,74 @@ mod tests {
     fn list_params_rejects_unknown_state_before_any_call() {
         let filter = |state: Option<&str>| ListFilterArgs {
             archived: "exclude".to_owned(),
-
+            order: Some("recent".to_owned()),
             state: state.map(str::to_owned),
             project: None,
             harness: None,
             parent: None,
             root: None,
         };
-        let params = list_params(None, 10, false, filter(Some("busy"))).expect("busy parses");
+        let params =
+            list_params(None, 10, false, false, filter(Some("busy"))).expect("busy parses");
         assert_eq!(params.state, Some(AgentState::Busy));
-        assert!(list_params(None, 10, false, filter(Some("done"))).is_err());
-        assert!(list_params(None, 10, false, filter(Some("BUSY"))).is_err());
+        assert!(list_params(None, 10, false, false, filter(Some("done"))).is_err());
+        assert!(list_params(None, 10, false, false, filter(Some("BUSY"))).is_err());
+    }
+    #[test]
+    fn list_params_defaults_to_recent_only_for_humans() {
+        use eliot_core::api::AgentListOrder;
+        let filter = |order: Option<&str>| ListFilterArgs {
+            archived: "exclude".to_owned(),
+            order: order.map(str::to_owned),
+            state: None,
+            project: None,
+            harness: None,
+            parent: None,
+            root: None,
+        };
+        // Humans reading the table get newest first without asking.
+        let params = list_params(None, 10, false, false, filter(None)).expect("human defaults");
+        assert_eq!(params.order, AgentListOrder::Recent);
+        // Scripts (`--json`) keep the stable ID order unless `--order` says otherwise.
+        let params = list_params(None, 10, false, true, filter(None)).expect("json defaults");
+        assert_eq!(params.order, AgentListOrder::Id);
+        // An `id`-form `--after aN` cursor keeps ID order without an explicit `--order`,
+        // so existing scripts keep paging; a recent cursor keeps recent order.
+        let params = list_params(Some("a338".to_owned()), 10, false, false, filter(None))
+            .expect("id cursor defaults");
+        assert_eq!(params.order, AgentListOrder::Id);
+        let params = list_params(
+            Some("a338@1763440000000".to_owned()),
+            10,
+            false,
+            false,
+            filter(None),
+        )
+        .expect("recent cursor defaults");
+        assert_eq!(params.order, AgentListOrder::Recent);
+        // An explicit `--order` wins over both the `--json` and cursor fallbacks.
+        let params = list_params(
+            Some("a338".to_owned()),
+            10,
+            false,
+            true,
+            filter(Some("recent")),
+        )
+        .expect("explicit recent wins");
+        assert_eq!(params.order, AgentListOrder::Recent);
+        let params =
+            list_params(None, 10, false, false, filter(Some("id"))).expect("explicit id wins");
+        assert_eq!(params.order, AgentListOrder::Id);
+        // A stale `id` cursor fails request validation once `recent` is explicit.
+        let params = list_params(
+            Some("a338".to_owned()),
+            10,
+            false,
+            false,
+            filter(Some("recent")),
+        )
+        .expect("explicit recent builds");
+        assert!(params.validate().is_err());
     }
 
     fn fleet_summary(usage: Option<TurnUsage>, usage_scope: Option<&str>) -> AgentSummary {

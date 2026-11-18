@@ -1346,3 +1346,73 @@ fn multi_state_list_requires_complete_scoped_totals_and_a_bounded_page() {
     );
     assert!(serde_json::from_value::<AgentListRequest>(json!({"states":["busy","done"]})).is_err());
 }
+
+#[test]
+fn list_recent_validates_updated_at_order_and_stable_cursor() {
+    use crate::api::{AgentListOrder, AgentListRequest};
+    use crate::api::{decode_recent_cursor, encode_recent_cursor};
+    let mut first = summary();
+    first.id = "a2".to_owned();
+    first.root = "a2".to_owned();
+    first.updated_at = 200;
+    first.last_progress_at = None;
+    let mut second = summary();
+    second.id = "a10".to_owned();
+    second.root = "a10".to_owned();
+    second.updated_at = 100;
+    second.last_progress_at = None;
+    let request = AgentListRequest {
+        order: AgentListOrder::Recent,
+        ..Default::default()
+    };
+    request.validate().unwrap();
+    let reply = AgentListResponse {
+        state_totals: None,
+        agents: vec![
+            AgentListRow {
+                summary: first.clone(),
+                observation: None,
+            },
+            AgentListRow {
+                summary: second.clone(),
+                observation: None,
+            },
+        ],
+        next: Some(encode_recent_cursor(&second.id, second.updated_at)),
+        total: 2,
+        truncated: false,
+    };
+    request.validate_response(&reply).unwrap();
+    let (id, activity) = decode_recent_cursor(reply.next.as_deref().unwrap()).unwrap();
+    assert_eq!(id, "a10");
+    assert_eq!(activity, 100);
+    // Wrong order (ascending) rejects.
+    let mut swapped = reply.clone();
+    swapped.agents.swap(0, 1);
+    swapped.next = Some(encode_recent_cursor(&first.id, first.updated_at));
+    assert!(request.validate_response(&swapped).is_err());
+    // Legacy id cursor rejects in recent order.
+    assert!(
+        AgentListRequest {
+            order: AgentListOrder::Recent,
+            after: Some("a10".to_owned()),
+            ..Default::default()
+        }
+        .validate()
+        .is_err()
+    );
+    // Id order keeps the last-id cursor.
+    let id_request = AgentListRequest::default();
+    assert_eq!(id_request.order, AgentListOrder::Id);
+    let id_reply = AgentListResponse {
+        state_totals: None,
+        agents: vec![AgentListRow {
+            summary: second,
+            observation: None,
+        }],
+        next: Some("a10".to_owned()),
+        total: 1,
+        truncated: false,
+    };
+    id_request.validate_response(&id_reply).unwrap();
+}

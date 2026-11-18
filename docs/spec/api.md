@@ -791,7 +791,13 @@ sections:{projects:<remaining object>},client:"desktop",dry_run:false}`. This
 unregisters it without deleting its checkout or chats. No `project.remove` alias
 is needed. A later explicit open/launch in that checkout can discover it again.
 
-`agent.list` returns compact summaries ordered by Agent ID. Each summary can carry
+`agent.list` returns compact summaries ordered by Agent ID by default (`order: "id"`),
+or newest activity first with `order: "recent"` (`updated_at` descending, then numeric
+Agent ID descending; `updated_at` is bumped on every native event). The recent cursor is
+`<id>@<updated_at_ms>` of the last row: `after` continues after that exact sort position,
+and the unfiltered pages seek the `agents_recent` index, so the first and continuation
+pages stay bounded on real volume; the `id` cursor stays the last returned Agent ID.
+Existing callers keep the ID order unless they opt into `recent`. Each summary can carry
 the retained execution directory in `workspace`; full records stay available through
 `agent.get`. Optional `state`,
 `project`, `project_scope`, `harness`, `parent` and `root` filters are exact
@@ -804,7 +810,7 @@ combined with `project` by conjunction when both are present. The selective
 structural/scope index (`parent`/`root`/`project`/`project_scope`)
 leads when several filters are present. `states` optionally selects 1 through
 9 distinct lifecycle states and is mutually exclusive with `state`. It is one
-ordinary ID-ordered page: `limit` remains a **total** row cap (at most 1,000),
+ordinary page in the requested order (`id` or `recent`): `limit` remains a **total** row cap (at most 1,000),
 not a per-state allowance; the existing cursor and byte bounds still apply.
 When `states` is supplied, the response also requires `state_totals`, exactly
 one `{state,total}` for each of the nine lifecycle states, including zeroes.
@@ -814,6 +820,17 @@ to the page's `total`. They count persisted lifecycle state, not observed-child
 activity. No totals outside the caller's scope are exposed. Without `states`,
 `state_totals` is absent. Rows and counts are captured under the same Store
 lock; joined observations retain the generation checks below.
+
+The desktop sidebar requests `order: "recent"` and refreshes its head on every poll:
+the live and attention rows (`busy`, `starting`, `waiting`, plus the needs-attention
+states `waiting`, `failed`, `lost`, `unknown`) arrive on their own state-filtered page,
+and the first recent page is re-read and merged into the loaded history even after
+`Show more`. Older pages append, deduplicated by id, so a launch while the desktop is
+open appears without a manual refresh. The open Agent renders explicitly above the list,
+outside folding and page counts; within each project the design order still applies,
+and children render in child-ID order whatever the fetch order.
+`swarm ls`/`swarm top` default to `order: "recent"` for humans; `--json` and an
+`id`-form `--after aN` cursor keep the ID order unless `--order` is explicit.
 
 The desktop Monitor reads one such page for its eight live states, capped at
 800 total rows, and shows at most 100 rows per state. It groups the rows

@@ -139,6 +139,11 @@ pub struct AgentListRequest {
     )]
     #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub root: Option<String>,
+    /// Explicit list order: `id` (default, stable Agent-ID order) or
+    /// `recent` (newest activity first: `updated_at` descending, then ID
+    /// descending, with a stable `(updated_at, id)` cursor).
+    #[serde(default)]
+    pub order: super::AgentListOrder,
 }
 
 impl Default for AgentListRequest {
@@ -155,6 +160,7 @@ impl Default for AgentListRequest {
             harness: None,
             parent: None,
             root: None,
+            order: super::AgentListOrder::default(),
         }
     }
 }
@@ -177,6 +183,9 @@ impl AgentListRequest {
         }
         if let Some(after) = &self.after {
             text(after)?;
+            if self.order == super::AgentListOrder::Recent {
+                decode_recent_cursor(after)?;
+            }
         }
         if let Some(project) = &self.project {
             text(project)?;
@@ -205,18 +214,58 @@ impl AgentListRequest {
         if reply.total < reply.agents.len() {
             return Err(invalid_response());
         }
-        // The Store pages by Agent ID: every nonempty page carries `next` at
-        // the last returned row, and an empty page carries no cursor. A quiet
-        // nonempty page still requires continuing through `next` until empty.
-        match reply.agents.last() {
-            Some(last) => {
-                if reply.next.as_deref() != Some(last.summary.id.as_str()) {
-                    return Err(invalid_response());
+        if self.order == super::AgentListOrder::Recent {
+            // Recent order pages by stable (updated_at, id): every nonempty
+            // page carries `next` as the last row's recent cursor, and an
+            // empty page carries no cursor. A quiet nonempty page still
+            // requires continuing through `next` until empty.
+            match reply.agents.last() {
+                Some(last) => {
+                    if reply.next.as_deref()
+                        != Some(
+                            encode_recent_cursor(&last.summary.id, last.summary.updated_at)
+                                .as_str(),
+                        )
+                    {
+                        return Err(invalid_response());
+                    }
+                }
+                None => {
+                    if reply.next.is_some() {
+                        return Err(invalid_response());
+                    }
                 }
             }
-            None => {
-                if reply.next.is_some() {
-                    return Err(invalid_response());
+            // Recent pages must arrive newest-first: updated_at descending,
+            // then numeric Agent ID descending as the tiebreak.
+            let mut previous: Option<(i64, i64)> = None;
+            for row in &reply.agents {
+                let activity = row.summary.updated_at;
+                let num = crate::parse_agent_id(&row.summary.id).map_err(|_| invalid_response())?;
+                if let Some((prev_activity, prev_id)) = previous {
+                    if (activity, num) > (prev_activity, prev_id) {
+                        return Err(invalid_response());
+                    }
+                    if (activity, num) == (prev_activity, prev_id) {
+                        return Err(invalid_response());
+                    }
+                }
+                previous = Some((activity, num));
+            }
+        } else {
+            // The Store pages by Agent ID: every nonempty page carries `next` at
+            // the last returned row, and an empty page carries no cursor. A quiet
+            // nonempty page still requires continuing through `next` until empty.
+            match reply.agents.last() {
+                Some(last) => {
+                    if reply.next.as_deref() != Some(last.summary.id.as_str()) {
+                        return Err(invalid_response());
+                    }
+                }
+                None => {
+                    if reply.next.is_some() {
+                        return Err(invalid_response());
+                    }
                 }
             }
         }
@@ -691,6 +740,33 @@ impl DiagnoseRequest {
     pub fn validate_response(&self, reply: &DiagnoseResponse) -> Result<()> {
         reply.validate()
     }
+}
+
+/// Stable recent cursor for the last row of a `recent` page:
+/// `<id>@<updated_at_ms>`, e.g. `a587@1763440000000`. The activity is the
+/// row's `updated_at` (bumped on every native event), so paging continues
+/// after its exact sort position instead of re-seeking by ID.
+pub fn encode_recent_cursor(id: &str, activity: i64) -> String {
+    format!("{id}@{activity}")
+}
+
+/// Decode a [`encode_recent_cursor`] cursor into `(id, activity)`.
+/// Rejects blank IDs, non-Agent IDs, negative activity and malformed
+/// cursors as `invalid` so a stale `id`-order token never pages silently
+/// in `recent` order.
+pub fn decode_recent_cursor(cursor: &str) -> Result<(String, i64)> {
+    let (id, activity) = cursor
+        .rsplit_once('@')
+        .ok_or_else(|| Error::new("invalid", "invalid recent cursor"))?;
+    text(id)?;
+    crate::parse_agent_id(id)?;
+    let activity: i64 = activity
+        .parse()
+        .map_err(|_| Error::new("invalid", "invalid recent cursor"))?;
+    if activity < 0 {
+        return Err(Error::new("invalid", "invalid recent cursor"));
+    }
+    Ok((id.to_owned(), activity))
 }
 
 fn valid_agent(agent: &Agent) -> bool {
