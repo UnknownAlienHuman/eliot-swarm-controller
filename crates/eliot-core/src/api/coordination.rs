@@ -320,6 +320,24 @@ pub struct MailInboxRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(description = "Exact last delivery id returned by this mailbox selection.")]
     pub after: Option<String>,
+    /// Long-poll up to this many milliseconds for the first matching
+    /// delivery; values above 30000 are accepted and clamped to 30000.
+    #[serde(default)]
+    #[schemars(
+        range(min = 0),
+        description = "Unsigned milliseconds; values above 30000 are accepted and clamped to 30000."
+    )]
+    pub wait_ms: u64,
+    /// Narrow the page to one thread label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-maxBytes" = MAX_MAIL_THREAD_BYTES), description = "Optional nonblank thread label, no control characters.")]
+    pub thread: Option<String>,
+    /// Narrow the page to one exact `reply_to_delivery` reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Exact <write-id>/<recipient-agent> delivery id, at most 512 bytes, no NUL."
+    )]
+    pub reply_to: Option<String>,
 }
 
 impl MailInboxRequest {
@@ -347,6 +365,22 @@ impl MailInboxRequest {
             .is_some_and(|after| validate_delivery_id(after).is_err())
         {
             return Err(Error::new("invalid", "mail inbox cursor is invalid"));
+        }
+        if let Some(thread) = self.thread.as_deref() {
+            validate_mail_thread(thread).map_err(|e| {
+                e.with_field(
+                    "params.thread",
+                    "nonblank label at most 256 bytes, without control characters",
+                )
+            })?;
+        }
+        if let Some(reply_to) = self.reply_to.as_deref() {
+            validate_delivery_id(reply_to).map_err(|e| {
+                e.with_field(
+                    "params.reply_to",
+                    "<write-id>/<recipient> delivery id, at most 512 bytes, no NUL",
+                )
+            })?;
         }
         Ok(())
     }
@@ -664,6 +698,22 @@ pub struct VarGetRequest {
     pub scope: Option<String>,
     #[schemars(extend("x-maxBytes" = MAX_VAR_KEY_BYTES), description = "Nonblank key, no NUL.")]
     pub key: String,
+    /// Long-poll until the version differs from this one; `None` reads once.
+    /// An absent row reads as version 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        range(min = 0),
+        description = "Optional CAS baseline: wait until the version differs; absent rows read as version 0."
+    )]
+    pub after_version: Option<i64>,
+    /// Long-poll up to this many milliseconds for a version change; values
+    /// above 30000 are accepted and clamped to 30000.
+    #[serde(default)]
+    #[schemars(
+        range(min = 0),
+        description = "Unsigned milliseconds; values above 30000 are accepted and clamped to 30000."
+    )]
+    pub wait_ms: u64,
 }
 
 impl VarGetRequest {
@@ -682,6 +732,18 @@ impl VarGetRequest {
                 "nonblank string at most 256 UTF-8 bytes, no NUL",
             )
         })?;
+        if self.after_version.is_some_and(|version| version < 0) {
+            return Err(Error::invalid_field(
+                "params.after_version",
+                "integer zero or greater",
+            ));
+        }
+        if self.wait_ms > 0 && self.after_version.is_none() {
+            return Err(Error::invalid_field(
+                "params.wait_ms",
+                "a variable wait needs after_version",
+            ));
+        }
         Ok(())
     }
 
@@ -1551,6 +1613,7 @@ mod tests {
             agent: Some("a1".to_owned()),
             limit: Some(2),
             after: None,
+            ..Default::default()
         };
         request.validate().unwrap();
         request
@@ -1612,6 +1675,86 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn inbox_long_poll_filters_stay_bounded() {
+        MailInboxRequest {
+            wait_ms: 1_000,
+            thread: Some("task-1".to_owned()),
+            reply_to: Some("01J0000000000000000000000/a1".to_owned()),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        for request in [
+            MailInboxRequest {
+                thread: Some("  ".to_owned()),
+                ..Default::default()
+            },
+            MailInboxRequest {
+                thread: Some("a\u{0}b".to_owned()),
+                ..Default::default()
+            },
+            MailInboxRequest {
+                reply_to: Some("not-a-delivery".to_owned()),
+                ..Default::default()
+            },
+        ] {
+            assert!(request.validate().is_err());
+        }
+        // Large waits decode and validate; the server clamps them.
+        MailInboxRequest {
+            wait_ms: 90_000,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        assert!(
+            serde_json::from_value::<MailInboxRequest>(serde_json::json!({
+                "thread": "t", "reply_to": "01J0000000000000000000000/a1", "wait_ms": 500
+            }))
+            .unwrap()
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<MailInboxRequest>(serde_json::json!({
+                "wait_ms": -1
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn var_get_long_poll_baseline_stays_nonnegative() {
+        VarGetRequest {
+            scope: Some("global".to_owned()),
+            key: "flag".to_owned(),
+            after_version: Some(3),
+            wait_ms: 1_000,
+        }
+        .validate()
+        .unwrap();
+        assert!(
+            VarGetRequest {
+                scope: None,
+                key: "flag".to_owned(),
+                after_version: Some(-1),
+                wait_ms: 0,
+            }
+            .validate()
+            .is_err()
+        );
+        let unbound = VarGetRequest {
+            scope: None,
+            key: "flag".to_owned(),
+            after_version: None,
+            wait_ms: 1_000,
+        }
+        .validate()
+        .unwrap_err();
+        assert_eq!(unbound.code, "invalid");
     }
 
     #[test]
@@ -1788,6 +1931,8 @@ mod tests {
         let get = VarGetRequest {
             scope: Some("global".to_owned()),
             key: "flag".to_owned(),
+            after_version: None,
+            wait_ms: 0,
         };
         get.validate().unwrap();
         get.validate_response(&VarGetResponse {

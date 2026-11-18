@@ -56,13 +56,13 @@ use eliot_core::{
         EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
         GitFetchDefinitionArgs, GitView, HarnessDoctorRequest, HarnessDoctorResponse,
         HeavyAgentTotals, HeavyEpisodeView, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS,
-        MAX_SWARM_WAIT_TARGETS, MaintenanceRunRequest, MaintenanceRunResponse,
-        NotifyDefinitionArgs, ObservationPage, ObservationQuery, ObservationView,
-        ObserveHeavyRequest, ObserveHeavyResponse, ProcessPageCursor, ProjectDiscoverRequest,
-        ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
-        RuleStateView, ShutdownMode, SourceState, SwarmWaitRequest, SwarmWaitResponse,
-        TimerGetRequest, TimerStateView, TurnGetRequest, UsageScopeView, UsageSummaryRequest,
-        WaitEntryResult, WorkerTaskHealth,
+        MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FRAME_BYTES, MaintenanceRunRequest,
+        MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage, ObservationQuery,
+        ObservationView, ObserveHeavyRequest, ObserveHeavyResponse, ProcessPageCursor,
+        ProjectDiscoverRequest, ProjectRegistrationView, ProviderClearHoldRequest,
+        ProviderHoldsRequest, RuleGetRequest, RuleStateView, ShutdownMode, SourceState,
+        SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView, TurnGetRequest,
+        UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -196,6 +196,9 @@ struct EventFilter {
     agents: HashSet<String>,
     kinds: HashSet<String>,
     sources: HashSet<String>,
+    /// Encoded variable scopes whose Agent-less `var.changed` facts ride
+    /// along with an Agent filter: the scopes that Agent can read.
+    var_scopes: HashSet<String>,
 }
 
 pub(crate) struct PreparedSubmission {
@@ -204,6 +207,93 @@ pub(crate) struct PreparedSubmission {
 }
 
 use eliot_core::api::discovery::{ProjectGetRequest, ProjectListRequest};
+
+/// One locked snapshot of a frozen wait set: per-entry results plus the
+/// wake filter (watched Agents and commands, and the caller's mailbox for a
+/// `mailbox` wait) and that mailbox's delivery watermark. All Store reads
+/// happen under a single lock so entries never mix generations across a
+/// concurrent commit.
+struct WaitSnapshot {
+    results: Vec<WaitEntryResult>,
+    watch_agents: HashSet<String>,
+    watch_commands: HashSet<String>,
+    mailbox: Option<String>,
+    mail_current: Option<i64>,
+    mail_arrived: bool,
+}
+
+impl WaitSnapshot {
+    /// Wake only on facts that can move one of our entries (command
+    /// settlement, or a watched Agent's command/turn/session/request/agent
+    /// frame) or on a delivery to our own mailbox; streaming progress and
+    /// every other Agent's traffic keep waiting without a re-snapshot.
+    fn watches(&self, event: &Event) -> bool {
+        if event.kind == "mail.delivered" {
+            return event.agent.is_some() && event.agent == self.mailbox;
+        }
+        if event
+            .data
+            .get("command_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| self.watch_commands.contains(id))
+        {
+            return true;
+        }
+        ["command.", "turn.", "session.", "request.", "agent."]
+            .iter()
+            .any(|prefix| event.kind.starts_with(prefix))
+            && event
+                .agent
+                .as_deref()
+                .is_some_and(|agent| self.watch_agents.contains(agent))
+    }
+}
+
+/// Subscribe-then-snapshot long-poll shared by `swarm.wait`, `mail.inbox`
+/// and `var.get` (see `Router::long_poll`).
+pub(super) struct LongPoll {
+    receiver: broadcast::Receiver<Event>,
+    deadline: Instant,
+}
+
+impl LongPoll {
+    /// Wait for the next bus event `wakes` accepts (a lag also wakes):
+    /// true means snapshot again, false means the deadline passed and the
+    /// last snapshot is the answer.
+    pub(super) async fn wake(&mut self, wakes: impl Fn(&Event) -> bool) -> Result<bool> {
+        loop {
+            if Instant::now() >= self.deadline {
+                return Ok(false);
+            }
+            match timeout_at(self.deadline, self.receiver.recv()).await {
+                Ok(Ok(event)) if !wakes(&event) => continue,
+                Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => return Ok(true),
+                Ok(Err(broadcast::error::RecvError::Closed)) => {
+                    return Err(Error::new("unavailable", "event bus is closed"));
+                }
+                Err(_) => return Ok(false),
+            }
+        }
+    }
+}
+
+/// A resolved bound turn carried through unknown-masking to encoding.
+struct BoundTurn {
+    agent: String,
+    generation: i64,
+    turn_id: String,
+    turn: Turn,
+}
+
+/// One wait entry pending its turn data: either a leaf status or an
+/// index into the shared bound-turn list.
+struct PendingEntry {
+    kind: &'static str,
+    id: String,
+    leaf: String,
+    bound: Option<usize>,
+    command_unknown: bool,
+}
 
 impl Router {
     /// Test harness constructor with default `[mail]` limits; production
@@ -4020,6 +4110,23 @@ impl Router {
             .map_err(|error| Error::new("internal", format!("encode turn: {error}")))
     }
 
+    /// Variable scopes an Agent can read (global plus its own project), so
+    /// its event filter sees those Agent-less `var.changed` facts. Other
+    /// principals keep the plain filter: the owner reads every event
+    /// unfiltered.
+    async fn readable_var_scopes(&self, principal: &Principal) -> Result<HashSet<String>> {
+        let Principal::Agent { id, .. } = principal else {
+            return Ok(HashSet::new());
+        };
+        let mut scopes = HashSet::from([eliot_core::api::VarScope::Global.encoded()]);
+        if let Some(agent) = self.inner.store.lock().await.get_agent(id)? {
+            scopes.insert(
+                eliot_core::api::VarScope::Project(agent.project_scope().to_owned()).encoded(),
+            );
+        }
+        Ok(scopes)
+    }
+
     async fn events_bounds(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: EventsBoundsRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
@@ -4034,7 +4141,8 @@ impl Router {
     async fn events_read(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: EventsReadRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        let filter = authorize_event_filter(request.filter, principal)?;
+        let mut filter = authorize_event_filter(request.filter, principal)?;
+        filter.var_scopes = self.readable_var_scopes(principal).await?;
         let (events, next, high_water, truncated, _) = self
             .read_filtered(
                 request.after,
@@ -4059,7 +4167,8 @@ impl Router {
         request.validate()?;
         let limit = request.limit;
         let wait_ms = request.wait_ms.min(LIVE_WAIT_MAX_MS);
-        let filter = authorize_event_filter(request.filter, principal)?;
+        let mut filter = authorize_event_filter(request.filter, principal)?;
+        filter.var_scopes = self.readable_var_scopes(principal).await?;
 
         // Subscribe before reading high-water so commits are either replayed or buffered.
         let mut receiver = self.inner.bus.subscribe();
@@ -4155,41 +4264,47 @@ impl Router {
                 "wait requires 1..=256 captured entries",
             ));
         }
-        let wait_ms = request.wait_ms.min(MAX_SWARM_WAIT_MS);
-
-        // Subscribe before the first snapshot so commits are either replayed
-        // by the snapshot or buffered for the wait loop.
-        let mut receiver = self.inner.bus.subscribe();
-        let mut results = self.wait_snapshot(&request, principal).await?;
-        if Self::wait_mode_completed(request.mode.as_str(), &results) {
-            return Self::encode_wait(&request, results, false);
-        }
-        if wait_ms == 0 {
-            return Self::encode_wait(&request, results, true);
-        }
-        let deadline = Instant::now() + Duration::from_millis(wait_ms);
-        loop {
-            match timeout_at(deadline, receiver.recv()).await {
-                Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                    results = self.wait_snapshot(&request, principal).await?;
-                    if Self::wait_mode_completed(request.mode.as_str(), &results) {
-                        return Self::encode_wait(&request, results, false);
-                    }
-                    if Instant::now() >= deadline {
-                        return Self::encode_wait(&request, results, true);
-                    }
-                }
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    return Err(Error::new("unavailable", "event bus is closed"));
-                }
-                Err(_) => {
-                    results = self.wait_snapshot(&request, principal).await?;
-                    if Self::wait_mode_completed(request.mode.as_str(), &results) {
-                        return Self::encode_wait(&request, results, false);
-                    }
-                    return Self::encode_wait(&request, results, true);
-                }
+        // `mailbox` also ends the wait on new mail for the calling Agent; the
+        // owner has no mailbox to watch.
+        let mailbox = match (request.mailbox, principal) {
+            (false, _) => None,
+            (true, Principal::Agent { id, .. }) => Some(id.as_str()),
+            (true, _) => {
+                return Err(Error::new("invalid", "mailbox wait needs an Agent caller"));
             }
+        };
+        let mode = request.mode.as_str();
+        let mut poll = self.long_poll(request.wait_ms);
+        // Only deliveries admitted after the first snapshot end a mailbox
+        // wait: the watermark never drops on acknowledgement.
+        let mut mail_base: Option<i64> = None;
+        loop {
+            let mut snapshot = self.wait_snapshot(&request, principal, mailbox).await?;
+            if let Some(current) = snapshot.mail_current {
+                snapshot.mail_arrived = current > *mail_base.get_or_insert(current);
+            }
+            if snapshot.mail_arrived
+                || Self::wait_mode_completed(mode, &snapshot.results)
+                || !poll.wake(|event| snapshot.watches(event)).await?
+            {
+                return Self::encode_wait(
+                    &request,
+                    snapshot.results,
+                    !snapshot.mail_arrived,
+                    snapshot.mail_arrived,
+                );
+            }
+        }
+    }
+
+    /// Start a long-poll for `swarm.wait`, `mail.inbox` or `var.get`. It
+    /// subscribes before the caller's first snapshot, so a commit racing
+    /// that snapshot is either in it or buffered on the bus. The wait is
+    /// clamped to `MAX_SWARM_WAIT_MS`, like `events.subscribe`.
+    fn long_poll(&self, wait_ms: u64) -> LongPoll {
+        LongPoll {
+            receiver: self.inner.bus.subscribe(),
+            deadline: Instant::now() + Duration::from_millis(wait_ms.min(MAX_SWARM_WAIT_MS)),
         }
     }
 
@@ -4204,12 +4319,14 @@ impl Router {
         request: &SwarmWaitRequest,
         results: Vec<WaitEntryResult>,
         timed_out: bool,
+        mail_wake: bool,
     ) -> Result<Value> {
         let completed = Self::wait_mode_completed(request.mode.as_str(), &results);
         let response = SwarmWaitResponse {
             mode: request.mode.clone(),
             completed,
             timed_out: timed_out && !completed,
+            mail_wake,
             results,
         };
         request
@@ -4219,125 +4336,253 @@ impl Router {
             .map_err(|_| Error::new("internal", "swarm.wait response could not be encoded"))
     }
 
+    /// Snapshot every frozen entry under one Store lock: authorize and read
+    /// each command and bound turn, mask unknown turns, then encode bounded
+    /// retained `final_text` for completed turns within the frame budget.
+    /// `mailbox` names the calling Agent whose delivery watermark is read;
+    /// the caller keeps the baseline across snapshots.
     async fn wait_snapshot(
         &self,
         request: &SwarmWaitRequest,
         principal: &Principal,
-    ) -> Result<Vec<WaitEntryResult>> {
-        let mut results = Vec::with_capacity(request.total());
+        mailbox: Option<&str>,
+    ) -> Result<WaitSnapshot> {
+        // Capture the in-memory unknown marks before terminal-cache
+        // eviction: an uncertainty check must still see a marker whose
+        // command already settled, mirroring the old per-entry order (check
+        // first, evict while masking). Masking below uses the post-clear
+        // ids, also like before.
+        let unknown_causes: HashMap<String, String> =
+            self.inner.unknown_causes.lock_recover().clone();
+        self.clear_terminal_unknown_cache().await;
+        let memory_unknown = self.unknown_ids();
+        let store = self.inner.store.lock().await;
+        let mut pending: Vec<PendingEntry> = Vec::with_capacity(request.total());
+        let mut bounds: Vec<BoundTurn> = Vec::new();
+        let mut watch_agents: HashSet<String> = HashSet::new();
+        let watch_commands: HashSet<String> = request.commands.iter().cloned().collect();
         for id in &request.commands {
-            results.push(self.wait_entry_for_command(id, principal).await?);
-        }
-        for turn in &request.turns {
-            results.push(
-                self.wait_entry_for_bound_turn(
-                    WaitEntryResult::new("turn", turn.canonical_id(), "not_found"),
-                    &turn.agent,
-                    turn.generation,
-                    &turn.turn_id,
-                    principal,
-                )
-                .await?,
-            );
-        }
-        Ok(results)
-    }
-
-    async fn wait_entry_for_command(
-        &self,
-        id: &str,
-        principal: &Principal,
-    ) -> Result<WaitEntryResult> {
-        let command = {
-            let store = self.inner.store.lock().await;
             let command = match store.get_command(id)? {
                 Some(command) => command,
                 None => {
-                    return Ok(WaitEntryResult::new("command", id, "not_found"));
+                    pending.push(PendingEntry {
+                        kind: "command",
+                        id: id.clone(),
+                        leaf: "not_found".to_owned(),
+                        bound: None,
+                        command_unknown: false,
+                    });
+                    continue;
                 }
             };
             if let Err(error) =
                 crate::router::hierarchy::authorize_command_read(&store, principal, &command)
             {
                 if error.code == "not_allowed" {
-                    return Ok(WaitEntryResult::new("command", id, "not_visible"));
+                    pending.push(PendingEntry {
+                        kind: "command",
+                        id: id.clone(),
+                        leaf: "not_visible".to_owned(),
+                        bound: None,
+                        command_unknown: false,
+                    });
+                    continue;
                 }
                 return Err(error);
             }
-            command
-        };
-        // Uncertain commands are terminal unknown, never still running. This
-        // mirrors the command readback masking without mutating the row.
-        let command_unknown =
-            command.state == CommandState::Unknown || self.unknown_cause(&command.id).is_some();
-        if let (Some(target), Some(generation), Some(turn_id)) = (
-            command.target.as_deref(),
-            command.generation,
-            command.turn_id.as_deref(),
-        ) {
-            let mut entry = self
-                .wait_entry_for_bound_turn(
-                    WaitEntryResult::new("command", id, "unknown"),
-                    target,
-                    generation,
-                    turn_id,
+            if let Some(target) = command.target.as_deref() {
+                watch_agents.insert(target.to_owned());
+            }
+            // Uncertain commands are terminal unknown, never still running.
+            // This mirrors the command readback masking without mutating the
+            // row.
+            let command_unknown =
+                command.state == CommandState::Unknown || unknown_causes.contains_key(&command.id);
+            if let (Some(target), Some(generation), Some(turn_id)) = (
+                command.target.as_deref(),
+                command.generation,
+                command.turn_id.as_deref(),
+            ) {
+                if let Err(error) = crate::router::hierarchy::authorize_agent_read(
+                    &store,
                     principal,
-                )
-                .await?;
-            if command_unknown {
-                entry.status = "unknown".to_owned();
+                    target,
+                    Some(generation),
+                ) {
+                    if error.code == "not_allowed" {
+                        pending.push(PendingEntry {
+                            kind: "command",
+                            id: id.clone(),
+                            leaf: if command_unknown {
+                                "unknown".to_owned()
+                            } else {
+                                "not_visible".to_owned()
+                            },
+                            bound: None,
+                            command_unknown: false,
+                        });
+                        continue;
+                    }
+                    return Err(error);
+                }
+                match store.get_turn(target, generation, turn_id)? {
+                    Some(turn) => {
+                        watch_agents.insert(target.to_owned());
+                        bounds.push(BoundTurn {
+                            agent: target.to_owned(),
+                            generation,
+                            turn_id: turn_id.to_owned(),
+                            turn,
+                        });
+                        pending.push(PendingEntry {
+                            kind: "command",
+                            id: id.clone(),
+                            leaf: String::new(),
+                            bound: Some(bounds.len() - 1),
+                            command_unknown,
+                        });
+                    }
+                    // A command bound to a missing turn reads unknown, never
+                    // still running.
+                    None => pending.push(PendingEntry {
+                        kind: "command",
+                        id: id.clone(),
+                        leaf: "unknown".to_owned(),
+                        bound: None,
+                        command_unknown: false,
+                    }),
+                }
+                continue;
             }
-            return Ok(entry);
+            pending.push(PendingEntry {
+                kind: "command",
+                id: id.clone(),
+                leaf: if command_unknown {
+                    "unknown".to_owned()
+                } else {
+                    match command.state {
+                        CommandState::Applied => "succeeded",
+                        CommandState::Rejected | CommandState::Failed => "failed",
+                        CommandState::Cancelled => "interrupted",
+                        CommandState::Unknown => "unknown",
+                        CommandState::Accepted
+                        | CommandState::Queued
+                        | CommandState::Dispatched => "still_running",
+                    }
+                    .to_owned()
+                },
+                bound: None,
+                command_unknown: false,
+            });
         }
-        if command_unknown {
-            return Ok(WaitEntryResult::new("command", id, "unknown"));
-        }
-        let status = match command.state {
-            CommandState::Applied => "succeeded",
-            CommandState::Rejected | CommandState::Failed => "failed",
-            CommandState::Cancelled => "interrupted",
-            CommandState::Unknown => "unknown",
-            CommandState::Accepted | CommandState::Queued | CommandState::Dispatched => {
-                "still_running"
-            }
-        };
-        Ok(WaitEntryResult::new("command", id, status))
-    }
-
-    async fn wait_entry_for_bound_turn(
-        &self,
-        mut entry: WaitEntryResult,
-        agent: &str,
-        generation: i64,
-        turn_id: &str,
-        principal: &Principal,
-    ) -> Result<WaitEntryResult> {
-        let mut turn = {
-            let store = self.inner.store.lock().await;
+        for turn_ref in &request.turns {
+            let id = turn_ref.canonical_id();
             if let Err(error) = crate::router::hierarchy::authorize_agent_read(
                 &store,
                 principal,
-                agent,
-                Some(generation),
+                &turn_ref.agent,
+                Some(turn_ref.generation),
             ) {
                 if error.code == "not_allowed" {
-                    entry.status = "not_visible".to_owned();
-                    return Ok(entry);
+                    pending.push(PendingEntry {
+                        kind: "turn",
+                        id,
+                        leaf: "not_visible".to_owned(),
+                        bound: None,
+                        command_unknown: false,
+                    });
+                    continue;
                 }
                 return Err(error);
             }
-            match store.get_turn(agent, generation, turn_id)? {
-                Some(turn) => turn,
-                None => return Ok(entry),
+            match store.get_turn(&turn_ref.agent, turn_ref.generation, &turn_ref.turn_id)? {
+                Some(turn) => {
+                    watch_agents.insert(turn_ref.agent.clone());
+                    bounds.push(BoundTurn {
+                        agent: turn_ref.agent.clone(),
+                        generation: turn_ref.generation,
+                        turn_id: turn_ref.turn_id.clone(),
+                        turn,
+                    });
+                    pending.push(PendingEntry {
+                        kind: "turn",
+                        id,
+                        leaf: String::new(),
+                        bound: Some(bounds.len() - 1),
+                        command_unknown: false,
+                    });
+                }
+                None => pending.push(PendingEntry {
+                    kind: "turn",
+                    id,
+                    leaf: "not_found".to_owned(),
+                    bound: None,
+                    command_unknown: false,
+                }),
             }
+        }
+        // Mask turns whose commands never proved native completion, in the
+        // same lock as the reads above.
+        let mut groups: HashMap<(String, i64), Vec<String>> = HashMap::new();
+        for bound in &bounds {
+            groups
+                .entry((bound.agent.clone(), bound.generation))
+                .or_default()
+                .push(bound.turn_id.clone());
+        }
+        for ((agent, generation), turn_ids) in &groups {
+            let masked =
+                store.turns_with_unknown_commands(agent, *generation, turn_ids, &memory_unknown)?;
+            for bound in bounds.iter_mut() {
+                if bound.agent == *agent
+                    && bound.generation == *generation
+                    && masked.contains(&bound.turn_id)
+                {
+                    bound.turn.state = TurnState::Unknown;
+                    bound.turn.status = None;
+                }
+            }
+        }
+        let mail_current = match mailbox {
+            Some(_) => Some(store.mail_mailbox_high_water(&principal_name(principal), None)?),
+            None => None,
         };
-        self.mask_unknown_turns(agent, generation, std::slice::from_mut(&mut turn))
-            .await?;
-        entry.status = Self::turn_entry_status(&turn).to_owned();
-        entry.resolution_source = turn.resolution_source;
-        Ok(entry)
+        drop(store);
+        // Bounded retained `final_text` for completed bound turns, request
+        // order, within one response frame budget. A withheld tail marks
+        // `truncated` without its body.
+        let mut remaining = MAX_WAIT_FRAME_BYTES;
+        let mut results = Vec::with_capacity(pending.len());
+        for entry in pending {
+            let Some(index) = entry.bound else {
+                results.push(WaitEntryResult::new(entry.kind, entry.id, entry.leaf));
+                continue;
+            };
+            let bound = &bounds[index];
+            let mut result =
+                WaitEntryResult::new(entry.kind, entry.id, Self::turn_entry_status(&bound.turn))
+                    .with_turn(bound.agent.clone(), bound.generation, bound.turn_id.clone());
+            result.resolution_source = bound.turn.resolution_source;
+            if entry.command_unknown {
+                result.status = "unknown".to_owned();
+            }
+            if bound.turn.state == TurnState::Completed
+                && let Some(text) = bound.turn.final_text.as_deref()
+            {
+                result = result.with_final_text(text, remaining);
+                remaining -= result.final_text.as_ref().map_or(0, String::len);
+            }
+            results.push(result);
+        }
+        Ok(WaitSnapshot {
+            results,
+            watch_agents,
+            watch_commands,
+            mailbox: mailbox.map(str::to_owned),
+            mail_current,
+            mail_arrived: false,
+        })
     }
-
     fn turn_entry_status(turn: &Turn) -> &'static str {
         match turn.state {
             TurnState::Running => "still_running",
@@ -4399,11 +4644,13 @@ impl Router {
                     .collect();
                 let kinds: Vec<&str> = filter.kinds.iter().map(String::as_str).collect();
                 let sources: Vec<&str> = filter.sources.iter().map(String::as_str).collect();
+                let var_scopes: Vec<&str> = filter.var_scopes.iter().map(String::as_str).collect();
                 while cursor < high_water && events.len() < limit {
                     let page = store.read_agent_events(
                         &agents,
                         &kinds,
                         &sources,
+                        &var_scopes,
                         cursor,
                         high_water,
                         limit - events.len(),
@@ -4953,7 +5200,14 @@ impl EventFilter {
             || event
                 .agent
                 .as_ref()
-                .is_some_and(|agent| self.agents.contains(agent)))
+                .is_some_and(|agent| self.agents.contains(agent))
+            || (event.agent.is_none()
+                && event.kind == "var.changed"
+                && event
+                    .data
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .is_some_and(|scope| self.var_scopes.contains(scope))))
             && (self.kinds.is_empty() || self.kinds.contains(&event.kind))
             && (self.sources.is_empty() || self.sources.contains(&event.source))
     }
@@ -6526,6 +6780,7 @@ fn authorize_event_filter(raw: EventsFilter, principal: &Principal) -> Result<Ev
         agents: raw.agents.into_iter().collect(),
         kinds: raw.kinds.into_iter().collect(),
         sources: raw.sources.into_iter().collect(),
+        var_scopes: HashSet::new(),
     };
     if let Principal::Agent { id, .. } = principal
         && !filter.agents.is_empty()
@@ -14272,7 +14527,13 @@ mod run_authorization_tests {
         assert!(response.timed_out);
         assert_eq!(
             response.results,
-            vec![WaitEntryResult::new("command", &send_id, "still_running")]
+            vec![
+                WaitEntryResult::new("command", &send_id, "still_running").with_turn(
+                    agent.clone(),
+                    1,
+                    "turn-1"
+                )
+            ]
         );
         // Direct turn binding reports the same frozen running turn.
         let response: SwarmWaitResponse = serde_json::from_value(
@@ -14288,11 +14549,10 @@ mod run_authorization_tests {
         assert!(!response.completed);
         assert_eq!(
             response.results,
-            vec![WaitEntryResult::new(
-                "turn",
-                format!("{agent}/1/turn-1"),
-                "still_running"
-            )]
+            vec![
+                WaitEntryResult::new("turn", format!("{agent}/1/turn-1"), "still_running")
+                    .with_turn(agent.clone(), 1, "turn-1")
+            ]
         );
         // Missing ids are honest not_found, not success.
         let response: SwarmWaitResponse = serde_json::from_value(
@@ -14517,8 +14777,16 @@ mod run_authorization_tests {
         .unwrap();
         assert!(response.completed);
         let mut expected = [
-            WaitEntryResult::new("command", &send_id, "unknown"),
-            WaitEntryResult::new("turn", format!("{agent}/1/turn-1"), "unknown"),
+            WaitEntryResult::new("command", &send_id, "unknown").with_turn(
+                agent.clone(),
+                1,
+                "turn-1",
+            ),
+            WaitEntryResult::new("turn", format!("{agent}/1/turn-1"), "unknown").with_turn(
+                agent.clone(),
+                1,
+                "turn-1",
+            ),
         ];
         for entry in &mut expected {
             entry.resolution_source = Some(TurnResolutionSource::Owner);
@@ -14730,5 +14998,225 @@ mod run_authorization_tests {
         assert!(response.completed);
         assert_eq!(response.results[0].status, "unknown");
         let _ = agent;
+    }
+
+    #[tokio::test]
+    async fn swarm_wait_returns_bounded_final_text_for_completed_turns() {
+        let router = router();
+        let (agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            result_fixture(&mut store)
+        };
+        let long = "x".repeat(eliot_core::api::MAX_WAIT_FINAL_TEXT_BYTES + 16);
+        {
+            let mut store = router.inner.store.lock().await;
+            read_fixture_event(
+                &mut store,
+                &agent,
+                "turn.completed",
+                json!({"command_id": send_id, "turn_id": "turn-1", "status": "completed", "final_text": long}),
+            );
+            if store.get_command(&send_id).unwrap().unwrap().state == CommandState::Dispatched {
+                store
+                    .settle(
+                        &send_id,
+                        CommandState::Applied,
+                        Some(json!({"turn_id": "turn-1"})),
+                        now_ms(),
+                    )
+                    .unwrap();
+            }
+        }
+        let response: SwarmWaitResponse = serde_json::from_value(
+            router
+                .swarm_wait(
+                    &json!({"commands": [send_id], "turns": [], "mode": "all", "wait_ms": 0}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(response.completed);
+        assert!(!response.mail_wake);
+        let entry = &response.results[0];
+        assert_eq!(entry.status, "succeeded");
+        assert_eq!(entry.agent.as_deref(), Some(agent.as_str()));
+        assert_eq!(entry.generation, Some(1));
+        assert_eq!(entry.turn_id.as_deref(), Some("turn-1"));
+        let text = entry
+            .final_text
+            .as_deref()
+            .expect("completed turns carry retained final_text");
+        assert_eq!(text.len(), eliot_core::api::MAX_WAIT_FINAL_TEXT_BYTES);
+        assert!(entry.truncated);
+        assert!(long.starts_with(text));
+    }
+
+    #[tokio::test]
+    async fn swarm_wait_mailbox_needs_an_agent_caller() {
+        let router = router();
+        let error = router
+            .swarm_wait(
+                &json!({"commands": ["c1"], "turns": [], "mode": "any", "wait_ms": 0, "mailbox": true}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid");
+    }
+
+    #[tokio::test]
+    async fn swarm_wait_mailbox_wakes_agent_on_new_delivery() {
+        let router = router();
+        let (agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            result_fixture(&mut store)
+        };
+        let principal = Principal::Agent {
+            id: agent.clone(),
+            generation: 1,
+        };
+        let waiter = {
+            let router = router.clone();
+            let principal = principal.clone();
+            let send_id = send_id.clone();
+            tokio::spawn(async move {
+                router
+                    .swarm_wait(
+                        &json!({"commands": [send_id], "turns": [], "mode": "all", "wait_ms": 10_000, "mailbox": true}),
+                        &principal,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        router
+            .mail_send(
+                &json!({"id": ulid::Ulid::new().to_string(), "to": [agent], "mode": "queue", "text": "wake"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        let response: SwarmWaitResponse =
+            serde_json::from_value(waiter.await.unwrap().unwrap()).unwrap();
+        assert!(!response.completed);
+        assert!(!response.timed_out);
+        assert!(response.mail_wake);
+
+        // Without `mailbox`, new mail never ends an Agent's wait.
+        let waiter = {
+            let router = router.clone();
+            let principal = principal.clone();
+            let send_id = send_id.clone();
+            tokio::spawn(async move {
+                router
+                    .swarm_wait(
+                        &json!({"commands": [send_id], "turns": [], "mode": "all", "wait_ms": 1_500}),
+                        &principal,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        router
+            .mail_send(
+                &json!({"id": ulid::Ulid::new().to_string(), "to": [agent], "mode": "queue", "text": "later"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        let response: SwarmWaitResponse =
+            serde_json::from_value(waiter.await.unwrap().unwrap()).unwrap();
+        assert!(response.timed_out);
+        assert!(!response.mail_wake);
+    }
+
+    #[test]
+    fn agent_event_filter_admits_var_changed_only_for_readable_scopes() {
+        let filter = EventFilter {
+            agents: HashSet::from(["a1".to_owned()]),
+            kinds: HashSet::new(),
+            sources: HashSet::new(),
+            var_scopes: HashSet::from(["global".to_owned(), "project:app".to_owned()]),
+        };
+        let var = |scope: &str| Event {
+            seq: 1,
+            ts: 1,
+            kind: "var.changed".to_owned(),
+            agent: None,
+            subject: None,
+            generation: None,
+            source: "coordination".to_owned(),
+            native_id: None,
+            data: json!({"scope": scope, "key": "k", "version": 1, "set_by": "owner"}),
+            cause: None,
+        };
+        assert!(filter.matches(&var("global")));
+        assert!(filter.matches(&var("project:app")));
+        assert!(!filter.matches(&var("project:other")));
+        let owner_filter = EventFilter {
+            var_scopes: HashSet::new(),
+            ..filter
+        };
+        assert!(!owner_filter.matches(&var("global")));
+    }
+
+    #[tokio::test]
+    async fn mail_inbox_long_poll_returns_first_delivery() {
+        let router = router();
+        let agent = {
+            let mut store = router.inner.store.lock().await;
+            result_fixture(&mut store).0
+        };
+        let principal = Principal::Agent {
+            id: agent.clone(),
+            generation: 1,
+        };
+        let waiter = {
+            let router = router.clone();
+            tokio::spawn(async move {
+                router
+                    .mail_inbox(&json!({"wait_ms": 10_000}), &principal)
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        router
+            .mail_send(
+                &json!({"id": ulid::Ulid::new().to_string(), "to": [agent], "mode": "queue", "text": "hello"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        let inbox: Value = waiter.await.unwrap().unwrap();
+        assert_eq!(inbox["deliveries"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn var_get_long_poll_wakes_on_version_bump() {
+        let router = router();
+        let waiter = {
+            let router = router.clone();
+            tokio::spawn(async move {
+                router
+                    .var_get(
+                        &json!({"scope": "global", "key": "k186", "after_version": 0, "wait_ms": 10_000}),
+                        &Principal::Owner,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        router
+            .var_set(
+                &json!({"id": ulid::Ulid::new().to_string(), "scope": "global", "key": "k186", "value": 1}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        let read: Value = waiter.await.unwrap().unwrap();
+        assert_eq!(read["version"], 1);
+        assert_eq!(read["value"], 1);
     }
 }

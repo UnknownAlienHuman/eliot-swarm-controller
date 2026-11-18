@@ -944,6 +944,9 @@ pub(crate) struct WaitArgs {
     /// Explicit exact turn bindings, `agent/generation/turn_id`.
     #[arg(long, value_name = "TURN")]
     pub(crate) turn: Vec<String>,
+    /// End the wait when the calling Agent receives new mail.
+    #[arg(long)]
+    pub(crate) mail: bool,
 }
 
 #[derive(Args)]
@@ -984,9 +987,16 @@ pub(crate) struct InboxArgs {
     pub(crate) limit: Option<usize>,
     #[arg(long, value_name = "DELIVERY")]
     pub(crate) after: Option<String>,
+    /// Narrow the page to one thread label.
+    #[arg(long, value_name = "LABEL")]
+    pub(crate) thread: Option<String>,
+    /// Narrow the page to one exact `reply_to_delivery` reference.
+    #[arg(long, value_name = "DELIVERY")]
+    pub(crate) reply_to: Option<String>,
     /// Wait up to SECS for the first delivery (0 returns after a single
-    /// read; extreme values are rejected). Every wait RPC and sleep is
-    /// bounded by one checked absolute deadline.
+    /// read; extreme values are rejected). Each wait RPC long-polls the
+    /// server for up to 30 seconds; every wait RPC and sleep is bounded by
+    /// one checked absolute deadline.
     #[arg(long, value_name = "SECS")]
     pub(crate) wait: Option<u64>,
 }
@@ -1193,6 +1203,15 @@ pub(crate) struct VarGetArgs {
     pub(crate) key: String,
     #[arg(long, value_name = "SCOPE")]
     pub(crate) scope: Option<String>,
+    /// Wait until the version differs from this baseline (absent rows read
+    /// as version 0) instead of reading once.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(i64).range(0..))]
+    pub(crate) after_version: Option<i64>,
+    /// Wait up to SECS for the version change (0 reads once; extreme values
+    /// are rejected). Each wait RPC long-polls the server for up to 30
+    /// seconds under one checked absolute deadline.
+    #[arg(long, value_name = "SECS")]
+    pub(crate) wait: Option<u64>,
 }
 
 #[derive(Subcommand)]

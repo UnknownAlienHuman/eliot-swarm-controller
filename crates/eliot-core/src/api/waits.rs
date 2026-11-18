@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 pub const MAX_SWARM_WAIT_TARGETS: usize = 256;
 /// Maximum server wait, matching `events.subscribe` (`LIVE_WAIT_MAX_MS`).
 pub const MAX_SWARM_WAIT_MS: u64 = 30_000;
+/// Per-entry bound for retained `final_text` returned by `swarm.wait`.
+pub const MAX_WAIT_FINAL_TEXT_BYTES: usize = 16 * 1024;
+/// Total bound for retained `final_text` across one `swarm.wait` response,
+/// the same as one retained turn text (`MAX_EVENT_BYTES`).
+pub const MAX_WAIT_FRAME_BYTES: usize = 64 * 1024;
 
 /// Exact turn binding for one wait entry.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +72,13 @@ pub struct SwarmWaitRequest {
         description = "Unsigned milliseconds; values above 30000 are accepted and clamped to 30000."
     )]
     pub wait_ms: u64,
+    /// End the wait when the calling Agent receives new mail. Agent callers
+    /// only; the owner has no mailbox.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(
+        description = "Agent callers only: also end the wait when mail arrives in the caller's own mailbox after the wait starts."
+    )]
+    pub mailbox: bool,
 }
 
 impl SwarmWaitRequest {
@@ -81,7 +93,13 @@ impl SwarmWaitRequest {
             turns,
             mode: mode.into(),
             wait_ms,
+            mailbox: false,
         }
+    }
+
+    pub fn with_mailbox(mut self, mailbox: bool) -> Self {
+        self.mailbox = mailbox;
+        self
     }
 
     pub fn total(&self) -> usize {
@@ -162,7 +180,10 @@ impl SwarmWaitRequest {
     }
 }
 
-/// One frozen entry result.
+/// One frozen entry result. Completed entries with a bound turn also carry
+/// that turn's identity and its bounded retained `final_text`; `truncated`
+/// marks a per-entry cut or a withheld tail once the response frame budget
+/// is spent.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WaitEntryResult {
@@ -179,6 +200,24 @@ pub struct WaitEntryResult {
     /// Provenance of a direct turn or a command's bound turn, when qualified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_source: Option<TurnResolutionSource>,
+    /// Bound turn agent, when the entry resolved to a turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Bound turn generation, when the entry resolved to a turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0))]
+    pub generation: Option<i64>,
+    /// Bound turn id, when the entry resolved to a turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// Bounded retained `final_text` of a completed bound turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-maxBytes" = MAX_WAIT_FINAL_TEXT_BYTES))]
+    pub final_text: Option<String>,
+    /// True when `final_text` was cut to its bound or withheld by the
+    /// response frame budget; `agent.result` reads the whole text.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 impl WaitEntryResult {
@@ -188,7 +227,35 @@ impl WaitEntryResult {
             id: id.into(),
             status: status.into(),
             resolution_source: None,
+            agent: None,
+            generation: None,
+            turn_id: None,
+            final_text: None,
+            truncated: false,
         }
+    }
+
+    /// Attach the bound turn identity to an entry result.
+    pub fn with_turn(
+        mut self,
+        agent: impl Into<String>,
+        generation: i64,
+        turn_id: impl Into<String>,
+    ) -> Self {
+        self.agent = Some(agent.into());
+        self.generation = Some(generation);
+        self.turn_id = Some(turn_id.into());
+        self
+    }
+
+    /// Attach retained `final_text` cut to the per-entry bound and to the
+    /// `budget` bytes left in the response frame. A spent budget withholds
+    /// the text and marks the entry `truncated`.
+    pub fn with_final_text(mut self, text: &str, budget: usize) -> Self {
+        let (kept, cut) = truncate_bytes(text, budget.min(MAX_WAIT_FINAL_TEXT_BYTES));
+        self.truncated = cut;
+        self.final_text = (!kept.is_empty() || !cut).then_some(kept);
+        self
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -205,7 +272,38 @@ impl WaitEntryResult {
             "succeeded" | "failed" | "interrupted" | "unknown" | "still_running" | "not_found"
             | "not_visible" => Ok(()),
             _ => Err(Error::new("invalid", "unknown wait entry status")),
+        }?;
+        match (&self.agent, self.generation, &self.turn_id) {
+            (None, None, None) => {}
+            (Some(agent), Some(generation), Some(turn_id)) => {
+                validate_id(agent)?;
+                validate_generation(generation)?;
+                validate_id(turn_id)?;
+            }
+            _ => {
+                return Err(Error::new(
+                    "invalid",
+                    "wait entry turn binding needs agent, generation and turn_id together",
+                ));
+            }
         }
+        if self
+            .final_text
+            .as_deref()
+            .is_some_and(|text| text.len() > MAX_WAIT_FINAL_TEXT_BYTES)
+        {
+            return Err(Error::new(
+                "invalid",
+                "wait entry final_text exceeds its bound",
+            ));
+        }
+        if (self.final_text.is_some() || self.truncated) && self.agent.is_none() {
+            return Err(Error::new(
+                "invalid",
+                "wait entry final_text needs its turn binding",
+            ));
+        }
+        Ok(())
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -218,13 +316,16 @@ impl WaitEntryResult {
 }
 
 /// Bounded wait response. `completed` mirrors the requested mode condition;
-/// `timed_out` is true only when the deadline expired first.
+/// `timed_out` is true only when the deadline expired first. `mail_wake` is
+/// true when a `mailbox` wait returned early on new mail for the caller.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwarmWaitResponse {
     pub mode: String,
     pub completed: bool,
     pub timed_out: bool,
+    #[serde(default)]
+    pub mail_wake: bool,
     pub results: Vec<WaitEntryResult>,
 }
 
@@ -245,8 +346,36 @@ impl SwarmWaitResponse {
         if self.completed && self.timed_out {
             return Err(Error::new("invalid", "wait cannot complete and time out"));
         }
+        if self.mail_wake && self.timed_out {
+            return Err(Error::new("invalid", "mail wake is not a timeout"));
+        }
+        let frame: usize = self
+            .results
+            .iter()
+            .filter_map(|entry| entry.final_text.as_deref())
+            .map(|text| text.len())
+            .sum();
+        if frame > MAX_WAIT_FRAME_BYTES {
+            return Err(Error::new(
+                "invalid",
+                "wait response exceeds its final_text frame budget",
+            ));
+        }
         Ok(())
     }
+}
+
+/// Cut `text` to at most `bound` bytes on a UTF-8 boundary. Returns the kept
+/// prefix and whether anything was cut.
+fn truncate_bytes(text: &str, bound: usize) -> (String, bool) {
+    if text.len() <= bound {
+        return (text.to_owned(), false);
+    }
+    let mut end = bound;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true)
 }
 
 fn validate_id(value: &str) -> Result<()> {
@@ -341,6 +470,7 @@ mod tests {
             mode: "all".to_owned(),
             completed: true,
             timed_out: false,
+            mail_wake: false,
             results: vec![
                 WaitEntryResult::new("command", "c1", "succeeded"),
                 WaitEntryResult::new("turn", "a1/1/t1", "succeeded"),
@@ -351,6 +481,7 @@ mod tests {
             mode: "all".to_owned(),
             completed: true,
             timed_out: false,
+            mail_wake: false,
             results: vec![
                 WaitEntryResult::new("turn", "a1/1/t1", "succeeded"),
                 WaitEntryResult::new("command", "c1", "succeeded"),
@@ -361,6 +492,7 @@ mod tests {
             mode: "all".to_owned(),
             completed: true,
             timed_out: false,
+            mail_wake: false,
             results: vec![
                 WaitEntryResult::new("command", "c1", "succeeded"),
                 WaitEntryResult::new("turn", "a1/1/t1", "still_running"),
@@ -371,6 +503,7 @@ mod tests {
             mode: "all".to_owned(),
             completed: false,
             timed_out: true,
+            mail_wake: false,
             results: vec![
                 WaitEntryResult::new("command", "c1", "succeeded"),
                 WaitEntryResult::new("turn", "a1/1/t1", "still_running"),
@@ -404,5 +537,93 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn wait_mailbox_defaults_off_and_decodes() {
+        let plain: SwarmWaitRequest =
+            serde_json::from_value(json!({"commands": ["c1"], "mode": "all"})).unwrap();
+        assert!(!plain.mailbox);
+        let flagged: SwarmWaitRequest =
+            serde_json::from_value(json!({"commands": ["c1"], "mode": "all", "mailbox": true}))
+                .unwrap();
+        assert!(flagged.mailbox);
+        flagged.validate().unwrap();
+    }
+
+    #[test]
+    fn wait_entry_turn_binding_and_text_bounds() {
+        let bound = WaitEntryResult::new("turn", "a1/1/t1", "succeeded")
+            .with_turn("a1", 1, "t1")
+            .with_final_text("hello", MAX_WAIT_FRAME_BYTES);
+        bound.validate().unwrap();
+        assert_eq!(bound.final_text.as_deref(), Some("hello"));
+        assert!(!bound.truncated);
+
+        let long = "x".repeat(MAX_WAIT_FINAL_TEXT_BYTES + 1);
+        let cut = WaitEntryResult::new("turn", "a1/1/t1", "succeeded")
+            .with_turn("a1", 1, "t1")
+            .with_final_text(&long, MAX_WAIT_FRAME_BYTES);
+        cut.validate().unwrap();
+        assert!(cut.truncated);
+        assert_eq!(
+            cut.final_text.as_deref().unwrap().len(),
+            MAX_WAIT_FINAL_TEXT_BYTES
+        );
+
+        let partial = WaitEntryResult::new("turn", "a1/1/t1", "succeeded")
+            .with_final_text("hello", MAX_WAIT_FRAME_BYTES);
+        assert!(partial.validate().is_err());
+        // A spent frame budget withholds the text but keeps the mark.
+        let withheld = WaitEntryResult::new("turn", "a1/1/t1", "succeeded")
+            .with_turn("a1", 1, "t1")
+            .with_final_text("hello", 0);
+        withheld.validate().unwrap();
+        assert_eq!(withheld.final_text, None);
+        assert!(withheld.truncated);
+
+        let over = SwarmWaitResponse {
+            mode: "all".to_owned(),
+            completed: true,
+            timed_out: false,
+            mail_wake: false,
+            results: (0..9)
+                .map(|n| {
+                    WaitEntryResult::new("turn", format!("a1/1/t{n}"), "succeeded")
+                        .with_turn("a1", 1, format!("t{n}"))
+                        .with_final_text(&"y".repeat(MAX_WAIT_FINAL_TEXT_BYTES), usize::MAX)
+                })
+                .collect(),
+        };
+        assert!(over.validate().is_err());
+
+        let wake = SwarmWaitResponse {
+            mode: "all".to_owned(),
+            completed: false,
+            timed_out: false,
+            mail_wake: true,
+            results: vec![WaitEntryResult::new("turn", "a1/1/t1", "still_running")],
+        };
+        wake.validate().unwrap();
+
+        let wake_timeout = SwarmWaitResponse {
+            mode: "all".to_owned(),
+            completed: false,
+            timed_out: true,
+            mail_wake: true,
+            results: vec![WaitEntryResult::new("turn", "a1/1/t1", "still_running")],
+        };
+        assert!(wake_timeout.validate().is_err());
+    }
+
+    #[test]
+    fn wait_truncate_bytes_respects_utf8_boundaries() {
+        let (kept, cut) = truncate_bytes("héllo", 3);
+        assert!(cut);
+        assert!(kept.len() <= 3);
+        assert!("héllo".starts_with(&kept));
+        let (whole, whole_cut) = truncate_bytes("hi", 16);
+        assert!(!whole_cut);
+        assert_eq!(whole, "hi");
     }
 }

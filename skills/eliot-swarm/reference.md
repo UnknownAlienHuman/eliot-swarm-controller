@@ -53,31 +53,30 @@ shared edits. Give each Swarm child disjoint files, an exact assignment,
 and instructions to check `who`, claim before editing and acknowledge
 consumed mail. Agree on the result format before launch.
 
-Read the parent's own `agent.get` result and inspect the frozen
-`profile_snapshot.child_profiles`. A child may reuse the parent snapshot
-or name an allow-listed profile. Same-harness children must keep the
-parent's frozen policy and credential bindings and may differ only in model
-and effort. An allow-listed different harness uses its own profile policy
-and bindings. A configured `worker` role selects from eligible profiles.
-If a profile is refused, use an authorized compatible option or report
-the refusal. A later config edit cannot widen the frozen allow-list.
+Omit `parent`, `profile` and `workspace`: the daemon fills in the caller
+as parent, the parent's workspace, and the frozen profile snapshot, and
+the wait follows the child's turn. Name them only to override: a child may
+reuse the parent snapshot or name an allow-listed profile (check the
+parent's own `agent.get` `profile_snapshot.child_profiles` first).
+Same-harness children must keep the parent's frozen policy and credential
+bindings and may differ only in model and effort. An allow-listed different
+harness uses its own profile policy and bindings. A configured `worker`
+role selects from eligible profiles. If a profile is refused, use an
+authorized compatible option or report the refusal. A later config edit
+cannot widen the frozen allow-list. An Agent child shares its parent's
+workspace and cannot request a new worktree or broader control; pass
+`--workspace` on CLI launch only when the child needs a different one.
 
-For MCP launch, use `command.submit` with `verb: "launch"` and
-`args` containing `parent`, `profile` and `text` for a named, prompted
-child. The daemon freezes the profile snapshot and inherits the workspace
-when omitted. For CLI launch in a checkout, pass the parent's exact
-workspace with `--workspace`. An Agent child shares its parent's
-workspace and cannot request a new worktree or broader control.
-
-Keep the launch receipt and linked input. The launch command can settle
-when the child is ready, before its first turn finishes. CLI `launch
---wait` with text waits on the linked first turn. For MCP, read the
-linked input with `command.get` to capture the exact turn ID once it
-exists. If you have only the launch ID, use `command.children` to find
-its input command. Wait on the captured Agent, generation and turn with
-`swarm.wait` or use `swarm.digest` for a durable mailbox result. Re-read the
-same binding on timeout. Collect `agent.result` before integrating and
-read the outcome even when the result-read command exits successfully.
+Keep the launch receipt and its `linked_command`. The launch command can
+settle when the child is ready, before its first turn finishes. CLI `launch
+--wait` with text waits on the linked first turn. Wait on the linked command
+with `swarm.wait`: it follows the bound turn and returns the child's agent,
+generation, `turn_id` and `final_text` (16 KiB per entry, 64 KiB per
+response, `truncated` marks a cut). Use `swarm.digest` for a durable mailbox
+result. The CLI takes a linked id with `--command`, because `<id>/send`
+contains a slash. If you have only the launch ID, use `command.children` to
+find its input command. Re-read the same binding on timeout. Read the outcome
+before integrating, and read `agent.result` when the text was truncated.
 
 ## Mail and shared variables
 

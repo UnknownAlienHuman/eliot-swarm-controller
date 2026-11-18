@@ -35,21 +35,25 @@ this skill as first-turn text, find its companion at
 The examples use IDs, generations, paths, versions and turn IDs obtained
 from your own reads. Assign those values to the PowerShell variables first.
 
-### Launch a child and wait
+### Launch a child and collect its result
 
-- Read your own `agent.get` snapshot with your Agent ID, or run
-  `& $swarm show $myAgent --json`. Use the retained workspace and
-  `profile_snapshot.child_profiles`. Same-harness profiles may differ
-  only in model and effort. See [child profile and wait details](reference.md#children-and-results).
-- Launch a child with `command.submit`, verb `launch`, or run
-  `& $swarm launch --parent $myAgent --profile $childProfile --workspace $parentWorkspace --wait --timeout-seconds 30 $task`.
-  Give the child an explicit task and file scope. With a prompt, CLI
-  `--wait` waits for the first turn. Keep the write ID for readback.
-- Use `swarm.wait` for a captured child turn or set of turns.
-  `& $swarm wait --all --timeout-seconds 30 "$child/$childGeneration/$turnId"`
-  waits on one exact turn. A timeout only ends the wait.
-  `& $swarm digest --all --to $myAgent "$child/$childGeneration/$turnId"`
-  registers a durable mailbox summary via `swarm.digest`.
+The daemon fills in parent, workspace and profile and follows the child's turn:
+
+1. **Identity** (once): `api.identity {}`.
+2. **Launch:** `command.submit` with verb `launch` and args `{"text": $task}`.
+   Give the child an explicit task and file scope. Keep the response's
+   `linked_command`, the child's first input.
+3. **Wait:** `swarm.wait` with `commands: [linked_command]`, `mode: "all"` and
+   `wait_ms: 30000`. A timeout only ends the wait; wait again.
+4. **Result:** the entry's `status` and `final_text`. Call `agent.result`
+   only when `truncated` is true.
+
+PowerShell: `& $swarm launch --wait --timeout-seconds 600 $task` does steps
+2–4 and prints the child's turn. `mailbox: true` (`--mail`) also ends a wait
+when your own mail arrives. For a durable mailbox summary, use `swarm.digest`
+or `& $swarm digest --all --to $myAgent --command $linkedCommand`. Name a
+profile only to override the inherited one; see
+[child profile and wait details](reference.md#children-and-results).
 
 ### Send, steer and interrupt
 
@@ -74,13 +78,19 @@ then supply `expected_generation` and `expected_turn_id` to MCP.
 
 Use queue mail for coordination. Read the message, then acknowledge its exact
 delivery ID. After a finished task, a mail-only wake needs a brief read and ack.
+To get an answer in the same turn, send the question, then long-poll
+`mail.inbox` with `{"reply_to": $deliveryId, "wait_ms": 30000}` (or
+`& $swarm inbox --reply-to $deliveryId --wait 30`). Answer with
+`reply_to_delivery` set to the question's delivery ID: that wakes an idle
+asker at once.
 
 ### Shared variables with compare-and-swap
 
 Read with `var.get` or `& $swarm var get $key`. Write with `var.set` using
 `expect_version` or `& $swarm var set $key $value --expect-version $version`.
 Use version zero for an absent key. On a confirmed version conflict, re-read
-and recompute the change.
+and recompute the change. To wait for a change, pass `after_version` with
+`wait_ms` (or `& $swarm var get $key --after-version $version --wait 30`).
 
 ### Register artifacts and read results
 
