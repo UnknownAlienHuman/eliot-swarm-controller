@@ -217,6 +217,7 @@ impl TurnEntry {
             + self.final_text.as_ref().map_or(0, String::len)
             + self.event_final.as_ref().map_or(0, String::len)
             + self.item_groups.keys().map(String::len).sum::<usize>()
+            + self.item_order.iter().map(String::len).sum::<usize>()
     }
 
     fn tool_event(
@@ -785,8 +786,19 @@ impl Conversation {
     /// Record input texts read from retained commands.
     pub fn apply_inputs(&mut self, inputs: Vec<(String, InputText)>) {
         for (command, text) in inputs {
-            self.inputs.insert(command, text);
+            // Replies for departed owners never load the budget: only a
+            // waiting local input or a resident turn's command keeps text.
+            let wanted = self.local.iter().any(|known| known == &command)
+                || self.turns.values().any(|turn| {
+                    turn.command_id.as_deref() == Some(command.as_str())
+                });
+            if wanted {
+                self.inputs.insert(command, text);
+            }
         }
+        // Inputs alone can exceed the budget, so the limit holds on
+        // insertion instead of waiting for the next turn event.
+        self.enforce_bounds();
     }
 
     /// A command submitted from this window: shown at once, linked to its turn
@@ -803,6 +815,8 @@ impl Conversation {
         if !linked && !self.local.iter().any(|known| known == command) {
             self.local.push(command.to_owned());
         }
+        // A local prompt counts from insertion: evict old turns to fit it.
+        self.enforce_bounds();
     }
 
     /// What a local input waits for, shown under it until its turn starts.
@@ -1825,6 +1839,76 @@ mod tests {
     }
 
     #[test]
+    fn fetched_inputs_for_departed_turns_never_load_the_budget() {
+        // Finding 2: a reply for a command no resident turn and no
+        // waiting local input owns is dropped instead of retained.
+        let mut chat = Conversation::new("a1");
+        chat.apply_events(&[event(1, "turn.started", json!({"turn_id": "t0"}))]);
+        chat.apply_inputs(vec![
+            ("c-gone".to_owned(), InputText::Loaded("x".repeat(1_024))),
+        ]);
+        assert!(!chat.inputs.contains_key("c-gone"));
+        // A waiting local input's own fetch is kept.
+        chat.note_local_input("c-wait", "hello");
+        chat.apply_inputs(vec![(
+            "c-wait".to_owned(),
+            InputText::Loaded("hello".repeat(10)),
+        )]);
+        assert!(chat.inputs.contains_key("c-wait"));
+    }
+
+    #[test]
+    fn inserting_inputs_enforces_the_resident_budget() {
+        // Finding 2: inputs alone can exceed the budget, so the limit
+        // holds on insertion instead of waiting for the next turn event.
+        let mut chat = Conversation::new("a1");
+        let events: Vec<Event> = (0..40)
+            .map(|index| {
+                event(
+                    index + 1,
+                    "turn.started",
+                    json!({
+                        "turn_id": format!("t{index:02}"),
+                        "command_id": format!("c{index:02}"),
+                    }),
+                )
+            })
+            .collect();
+        chat.apply_events(&events);
+        chat.apply_inputs(
+            (0..40)
+                .map(|index| {
+                    (
+                        format!("c{index:02}"),
+                        InputText::Loaded("y".repeat(256 * 1024)),
+                    )
+                })
+                .collect(),
+        );
+        assert!(chat.coverage().evicted_turns > 0);
+        let bytes: usize = chat.turns.values().map(TurnEntry::bytes).sum::<usize>()
+            + chat
+                .inputs
+                .values()
+                .map(|text| match text {
+                    InputText::Loaded(text) => text.len(),
+                    InputText::Unavailable(reason) => reason.len(),
+                })
+                .sum::<usize>()
+            + chat.pending_exact.values().map(String::len).sum::<usize>();
+        assert!(bytes <= MAX_RESIDENT_BYTES);
+        for command in chat.inputs.keys() {
+            assert!(
+                chat.turns
+                    .values()
+                    .any(|turn| turn.command_id.as_deref() == Some(command.as_str()))
+                    || chat.local.iter().any(|known| known == command),
+                "kept input {command} nobody needs"
+            );
+        }
+    }
+
+    #[test]
     fn resident_input_texts_count_and_leave_with_their_turn() {
         // #642: input texts count toward the resident budget, an input
         // nobody references never loads it, and eviction takes the
@@ -1919,6 +2003,9 @@ mod tests {
         }
         assert_eq!(total, 300);
         assert_eq!(done, 300);
+        // Both copies of every tool identity count toward the budget.
+        let ids: usize = turn.item_groups.keys().map(String::len).sum();
+        assert!(TurnEntry::bytes(turn) >= ids * 2);
     }
 
     #[test]
