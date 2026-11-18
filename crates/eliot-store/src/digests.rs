@@ -294,17 +294,37 @@ impl Store {
 
     /// Bounded pending registrations, oldest first.
     pub fn pending_completion_digests(&self, limit: usize) -> Result<Vec<DigestRow>> {
+        self.pending_completion_digests_after(None, limit)
+    }
+
+    /// Bounded pending registrations after a keyset cursor, oldest first.
+    /// `after` is the last examined `(created_at, id)`; `None` starts at the
+    /// oldest row. The driver advances the cursor past every examined row and
+    /// wraps to `None` at the end, so pending or mailbox-blocked rows at the
+    /// front never trap later eligible registrations behind one fixed page.
+    pub fn pending_completion_digests_after(
+        &self,
+        after: Option<(i64, &str)>,
+        limit: usize,
+    ) -> Result<Vec<DigestRow>> {
         self.ensure_committed_reads()?;
         let limit = limit.clamp(1, 256) as i64;
-        let mut stmt = self
-            .connection
-            .prepare(
-                "SELECT id, parent, mode, commands, turns, requester, created_at, delivered_mail_id, delivered_at, payload_digest, hidden
-                 FROM completion_digests WHERE delivered_at IS NULL ORDER BY created_at ASC, id ASC LIMIT ?1",
-            )
-            .map_err(sql_error)?;
+        let mut sql = String::from(
+            "SELECT id, parent, mode, commands, turns, requester, created_at, delivered_mail_id, delivered_at, payload_digest, hidden
+             FROM completion_digests WHERE delivered_at IS NULL",
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some((created_at, id)) = after {
+            sql.push_str(" AND (created_at > ?1 OR (created_at = ?2 AND id > ?3))");
+            params.push(rusqlite::types::Value::from(created_at));
+            params.push(rusqlite::types::Value::from(created_at));
+            params.push(rusqlite::types::Value::from(id.to_owned()));
+        }
+        sql.push_str(" ORDER BY created_at ASC, id ASC LIMIT ?");
+        params.push(rusqlite::types::Value::from(limit));
+        let mut stmt = self.connection.prepare(&sql).map_err(sql_error)?;
         let rows = stmt
-            .query_map(params![limit], |row| {
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
                 Ok(StoredDigestRow {
                     id: row.get(0)?,
                     parent: row.get(1)?,
@@ -625,6 +645,55 @@ mod tests {
             .mail_send_digest_delivery("owner", &diverted, MailLimits::default(), late)
             .unwrap_err();
         assert_eq!(err.code, "id_expired");
+    }
+
+    #[test]
+    fn pending_digests_page_past_a_blocked_head_with_wraparound() {
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        // 51 pending registrations: a fixed oldest-50 page would revisit the
+        // same head forever and never examine the 51st.
+        let mut ids = Vec::new();
+        for index in 0..51 {
+            let id = ulid::Ulid::new().to_string();
+            let req = digest_request(&id, &parent);
+            store
+                .digest_register("owner", &req, &[false], now + index)
+                .expect("register");
+            ids.push(id);
+        }
+        let head = store
+            .pending_completion_digests_after(None, 50)
+            .expect("first page");
+        assert_eq!(head.len(), 50);
+        let cursor = head.last().map(|row| (row.created_at, row.id.clone()));
+        // The cursor advances past the blocked head: the next page reaches
+        // the tail the fixed window could never examine.
+        let (created_at, id) = cursor.expect("head cursor");
+        let tail = store
+            .pending_completion_digests_after(Some((created_at, id.as_str())), 50)
+            .expect("second page");
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].id, ids[50]);
+        // Past the newest row the page is empty; wrapping restarts at the
+        // oldest row so the sweep cycles instead of stalling.
+        let drained = store
+            .pending_completion_digests_after(
+                Some((tail[0].created_at, tail[0].id.as_str())),
+                50,
+            )
+            .expect("drained page");
+        assert!(drained.is_empty());
+        let wrapped = store
+            .pending_completion_digests_after(None, 50)
+            .expect("wrapped page");
+        assert_eq!(wrapped.len(), 50);
+        assert_eq!(wrapped[0].id, ids[0]);
+        // The legacy oldest-first entry point keeps its contract.
+        let legacy = store.pending_completion_digests(50).expect("legacy page");
+        assert_eq!(legacy.len(), 50);
+        assert_eq!(legacy[0].id, ids[0]);
     }
 
     #[test]

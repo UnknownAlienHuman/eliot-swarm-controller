@@ -16,6 +16,7 @@ use eliot_core::{
         SwarmWaitRequest, WaitEntryResult, digest_mode_completed, digest_text, digest_thread,
     },
 };
+use eliot_plugin::sync::LockExt;
 use eliot_store::DigestRow;
 use serde_json::Value;
 use tokio::{
@@ -248,13 +249,34 @@ impl Router {
         Ok(Some(delivered_response(&row, delivery_id, results)?))
     }
 
-    /// Try every pending digest once; returns the count delivered. A full
-    /// mailbox stays pending for the next tick.
+    /// Sweep one bounded pending-digest page; returns the count delivered. A
+    /// full mailbox stays pending for the next tick. The page starts after
+    /// the last examined registration and the cursor advances past every
+    /// examined row, wrapping to the oldest row at the end, so pending or
+    /// mailbox-blocked registrations at the front never starve later
+    /// eligible ones: each tick examines the next page, and every pending
+    /// registration is revisited once per full sweep.
     pub(crate) async fn poll_completion_digests_once(&self) -> Result<usize> {
-        let pending: Vec<DigestRow> = {
+        let after: Option<(i64, String)> = self.inner.digest_poll_cursor.lock_recover().clone();
+        let mut pending: Vec<DigestRow> = {
             let store = self.inner.store.lock().await;
-            store.pending_completion_digests(DIGEST_POLL_PAGE)?
+            let after = after.as_ref().map(|(created_at, id)| (*created_at, id.as_str()));
+            store.pending_completion_digests_after(after, DIGEST_POLL_PAGE)?
         };
+        if pending.is_empty() && after.is_some() {
+            // Swept past the newest row: wrap to the oldest so registrations
+            // behind the old cursor are examined on this same tick.
+            pending = {
+                let store = self.inner.store.lock().await;
+                store.pending_completion_digests_after(None, DIGEST_POLL_PAGE)?
+            };
+        }
+        if let Some(last) = pending.last() {
+            *self.inner.digest_poll_cursor.lock_recover() =
+                Some((last.created_at, last.id.clone()));
+        } else {
+            *self.inner.digest_poll_cursor.lock_recover() = None;
+        }
         let mut delivered = 0;
         for row in pending {
             match self.deliver_digest(&row.id).await {
@@ -275,8 +297,10 @@ impl Router {
     }
 }
 
-/// Periodically deliver pending completion digests. Each tick pages pending
-/// registrations and delivers those whose frozen set now satisfies `all`/`any`
+/// Periodically deliver pending completion digests. Each tick sweeps one
+/// bounded pending-registration page through a progressing keyset cursor
+/// (wrapping at the end) and delivers those whose frozen set now satisfies
+/// `all`/`any`
 /// through one ordinary queued mail; the mail id is the digest id, so a
 /// restart replays the same id without duplicating the result.
 pub(crate) async fn run_completion_digest(

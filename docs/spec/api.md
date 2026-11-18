@@ -1510,7 +1510,10 @@ as settled honest outcomes), the daemon delivers exactly one coalesced `mail.sen
 `completion-<id-prefix>`, and the body lists every entry outcome. Same id plus same
 payload replays the retained registration and mail without a second delivery; same
 id plus a different payload or principal rejects `id_conflict`. Reconnect or restart
-replays the same mail id, so the digest is never duplicated. The digest reuses the
+replays the same mail id, so the digest is never duplicated. The driver sweeps
+pending registrations with a progressing keyset cursor (wrapping at the end), so
+pending or undeliverable registrations at the front never starve later eligible
+ones. The digest reuses the
 ordinary mail wake (one generic coalesced notice per minute, at most one open notice
 command) and emits no `x.user.agent.attention` event; a successful completion stays
 distinct from an attention incident and no model call is needed to poll. The CLI is
