@@ -1388,10 +1388,10 @@ impl OpenCodePlugin {
             effective["local"] = fragment;
         }
         // Agent-scoped MCP readback after the session exists: names plus
-        // Agent-scoped MCP readback after the session exists: names plus
         // the connected verdict for the `eliot-swarm` entry. Observation
-        // stays read-only and best-effort; the inventory gate below may
-        // still refuse the start on an unexpected or owner-identity server.
+        // stays read-only and polled; the inventory gate below refuses
+        // the start on an unreadable inventory or an unexpected or
+        // owner-identity server.
         let mcp_timing = crate::native::startup::Step::new("mcp_inventory");
         let (mcp_servers, mcp_servers_verified, mcp_inventory) =
             observe_mcp_servers(&session.http, phase_deadline(envelope, RPC_TIMEOUT)).await;
@@ -1418,11 +1418,12 @@ impl OpenCodePlugin {
         // the file scan and the reserved-name inventory gate under
         // `inherit`. Second, a serving (`connected` or `pending`) managed
         // entry must still run the exact generated transport, since any
-        // inherited layer can replace the transport under that name. An
-        // unreadable effective config proves neither and fails the start
-        // closed with the created session killed, exactly like the gate
-        // above.
-        if mcp_inventory.is_some() {
+        // inherited layer can replace the transport under that name. The
+        // gate above already refused an unreadable inventory, so the
+        // winning documents always prove both here; an unreadable
+        // effective config proves neither and fails the start closed with
+        // the created session killed, exactly like the gate above.
+        {
             let expected_command = managed_mcp_command(parsed);
             let proof = match session
                 .http
@@ -1509,10 +1510,10 @@ impl OpenCodePlugin {
     /// generation. No prompt is ever replayed: the new server serves the
     /// same per-Agent store, the preflight proves the retained session
     /// exists, then proves the realignment target in the live catalogue
-    /// before the quiesce interrupt can abort a running retained turn,
-    /// then proves the session idle; the model/agent realign to the
-    /// frozen profile with an effective readback, and readiness adopts
-    /// the live edge.
+    /// and the effective MCP proof before the quiesce interrupt can abort
+    /// a running retained turn, then proves the session idle; the
+    /// model/agent realign to the frozen profile with an effective
+    /// readback, and readiness adopts the live edge.
     async fn resume_start_session(
         &mut self,
         parsed: ParsedStart,
@@ -1585,14 +1586,42 @@ impl OpenCodePlugin {
                 },
             ));
         }
+        // Effective MCP proof before the quiesce below can abort a running
+        // retained execution: the settled inventory is gated and the
+        // winning effective documents must carry no owner transport (plus
+        // the exact managed transport while the Agent-scoped entry serves),
+        // exactly like the create path. Nothing has been written yet, so a
+        // miss or an unreadable readback fails here with proven no effect
+        // instead of aborting that turn and then failing.
+        let (mcp_servers, mcp_servers_verified) =
+            match Self::resume_prove_mcp(&parsed, &session, deadline).await {
+                Ok(proof) => proof,
+                Err(error) => {
+                    discard_unstarted(&mut session, envelope).await;
+                    return Ok(self.proven_no_effect_start(
+                        &parsed.params,
+                        PhaseFailure {
+                            phase: StartPhase::ResumeRefused,
+                            error: Box::new(error),
+                        },
+                    ));
+                }
+            };
         if let Err(error) = Self::resume_quiesce(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, *error.message).await);
         }
         if let Err(error) = Self::resume_verify_idle(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, *error.message).await);
         }
-        let effective = match Self::resume_configure(&parsed, &session, &retained.id, deadline)
-            .await
+        let effective = match Self::resume_configure(
+            &parsed,
+            &session,
+            &retained.id,
+            mcp_servers,
+            mcp_servers_verified,
+            deadline,
+        )
+        .await
         {
             Ok(effective) => effective,
             Err(error) if error.code == "unknown" => {
@@ -1923,17 +1952,74 @@ impl OpenCodePlugin {
         Ok(())
     }
 
+    /// Resume MCP proof: gate the settled inventory and prove the winning
+    /// effective documents carry no owner transport (plus the exact
+    /// generated transport while the Agent-scoped entry serves), BEFORE
+    /// the retained session is touched. The quiesce interrupt below aborts
+    /// a running retained execution, so an unexpected or owner-identity
+    /// server must fail here with proven no effect instead of aborting
+    /// that turn and then failing. An unreadable inventory or effective
+    /// config is a pre-write readback failure (`native_readback`), also
+    /// with proven no effect; a proven owner hit, transport mismatch or
+    /// unexpected serving server is a `profile_error`. Returns the
+    /// observed inventory names plus the connected verdict for the
+    /// effective record.
+    async fn resume_prove_mcp(
+        parsed: &ParsedStart,
+        session: &AgentSession,
+        deadline: Instant,
+    ) -> Result<(Value, bool)> {
+        // Same polled readback as the create path: the resumed server
+        // re-spawns the Agent-scoped entry for this generation, and the
+        // gate below refuses an unreadable inventory.
+        let (mcp_servers, mcp_servers_verified, mcp_inventory) =
+            observe_mcp_servers(&session.http, deadline).await;
+        gate_mcp_inventory(mcp_inventory.as_deref(), parsed.requested_mcp_policy)?;
+        // Same proofs as the create path: no effective `mcp.servers` entry
+        // carries the owner identity under any name (managed layers merge
+        // above the project files), and a serving (`connected` or
+        // `pending`) managed entry still runs the exact generated
+        // transport. Nothing has been written yet, so an unreadable
+        // readback refuses here instead of staying unknown.
+        let documents = session.http.get_config(deadline).await.map_err(|error| {
+            Error::new(
+                "native_readback",
+                format!(
+                    "OpenCode managed MCP transport readback failed ({})",
+                    error.message
+                ),
+            )
+        })?;
+        refuse_effective_owner_mcp(
+            &documents,
+            parsed.swarm_executable.to_str(),
+            parsed.mcp_cloud_hostname.as_deref(),
+        )?;
+        if mcp_inventory.as_deref().is_some_and(|servers| {
+            servers
+                .iter()
+                .any(|server| server.is_serving(SWARM_MCP_SERVER_NAME))
+        }) {
+            verify_managed_mcp_transport(&documents, &managed_mcp_command(parsed))?;
+        }
+        Ok((mcp_servers, mcp_servers_verified))
+    }
+
     /// Resume configure: realign the retained session's model and agent
     /// to the frozen profile, then prove the effective values with a fresh
     /// `session.get`. The location must be the workspace; the requested
     /// agent must be installed (the switch validates nothing itself). Live
     /// catalogue membership was already proven by the pre-quiesce
-    /// `resume_validate_catalogue` gate, so no catalogue read happens
-    /// here after the interrupt.
+    /// `resume_validate_catalogue` gate, and the effective MCP proof by
+    /// the pre-quiesce `resume_prove_mcp` gate, so no catalogue, inventory
+    /// or effective-config read happens here after the interrupt: the
+    /// caller threads that proof through as the `mcp_servers` pair.
     async fn resume_configure(
         parsed: &ParsedStart,
         session: &AgentSession,
         session_id: &str,
+        mcp_servers: Value,
+        mcp_servers_verified: bool,
         deadline: Instant,
     ) -> Result<Value> {
         let current = session
@@ -2138,42 +2224,9 @@ impl OpenCodePlugin {
                 Err(error) => return Err(error),
             }
         }
-        // Same best-effort MCP readback as the create path: the resumed
-        // server re-spawns the Agent-scoped entry for this generation.
-        let (mcp_servers, mcp_servers_verified, mcp_inventory) =
-            observe_mcp_servers(&session.http, deadline).await;
-        gate_mcp_inventory(mcp_inventory.as_deref(), parsed.requested_mcp_policy)?;
-        // Same proofs as the create path: no effective `mcp.servers` entry
-        // carries the owner identity under any name (managed layers merge
-        // above the project files), and a serving (`connected` or
-        // `pending`) managed entry still runs the exact generated
-        // transport. The retained session predates this generation, so an
-        // unreadable readback stays unknown while a proven owner hit or
-        // transport mismatch fails the resume.
-        if mcp_inventory.is_some() {
-            let expected_command = managed_mcp_command(parsed);
-            let documents = session.http.get_config(deadline).await.map_err(|error| {
-                Error::new(
-                    "unknown",
-                    format!(
-                        "OpenCode managed MCP transport readback is unresolved ({})",
-                        error.message
-                    ),
-                )
-            })?;
-            refuse_effective_owner_mcp(
-                &documents,
-                parsed.swarm_executable.to_str(),
-                parsed.mcp_cloud_hostname.as_deref(),
-            )?;
-            if mcp_inventory.as_deref().is_some_and(|servers| {
-                servers
-                    .iter()
-                    .any(|server| server.is_serving(SWARM_MCP_SERVER_NAME))
-            }) {
-                verify_managed_mcp_transport(&documents, &expected_command)?;
-            }
-        }
+        // The effective MCP proof ran pre-quiesce (`resume_prove_mcp`): no
+        // inventory or effective-config read happens here after the
+        // interrupt or setters, only the proven pair joins the record.
         effective_value["mcp_servers"] = mcp_servers;
         effective_value["mcp_servers_verified"] = json!(mcp_servers_verified);
         effective_value["mcp_policy"] = json!(parsed.requested_mcp_policy.as_str());
@@ -3763,17 +3816,20 @@ const MCP_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2
 const MCP_SETTLE_FIRST_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const MCP_SETTLE_MAX_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Best-effort Agent-scoped MCP readback for the effective record:
+/// Polled Agent-scoped MCP readback for the effective record:
 /// `GET /api/mcp` (`mcp.list`) after the session exists, re-polled until
 /// the Agent-scoped server reports `connected` (or a terminal
 /// non-connected status, or the settle cap). Names come from the installed
 /// inventory when a query succeeds (`null` when none does, never
-/// fabricated); `mcp_servers_verified` is true only on `connected`. Only
+/// fabricated); `mcp_servers_verified` is true only on `connected`, and
+/// the inventory gate refuses the start when no query succeeded, so a
+/// `null` record never passes as verified. Only
 /// names and the status word are retained — never the failure text, which
-/// can carry local paths. A non-connected or unreadable surface never
-/// fails the start: this harness keeps `inherit` only, so the applied
-/// per-Agent config is the qualified record and this observation is
-/// reported honestly.
+/// can carry local paths. A non-connected surface alone never fails the
+/// start here: the inventory gate decides, refusing an unreadable
+/// inventory (without it the unexpected-server gate and the
+/// effective-transport proof cannot run) as well as unexpected or
+/// owner-identity servers.
 async fn observe_mcp_servers(
     http: &OpenCodeHttp,
     deadline: Instant,
@@ -3893,8 +3949,10 @@ fn refuse_effective_owner_mcp(
 
 /// Exclusive inventory gate for the worker MCP surface, applied after the
 /// settle observation on both the create and resume paths. An unreadable
-/// inventory reports unverified but never refuses: absence of evidence is
-/// not an unexpected server. Otherwise:
+/// inventory refuses the start: without it neither the unexpected-server
+/// gate nor the effective-transport proof below can run, so absence of
+/// evidence must fail closed, never widen the worker by default.
+/// Otherwise:
 ///
 /// minimal refuses any serving (`connected` or `pending`) server besides
 /// the Agent-scoped entry, so a project layer that defeats minimal fails
@@ -3905,7 +3963,10 @@ fn refuse_effective_owner_mcp(
 /// with the Agent-scoped entry connected.
 fn gate_mcp_inventory(servers: Option<&[McpServerReadback]>, policy: McpPolicy) -> Result<()> {
     let Some(servers) = servers else {
-        return Ok(());
+        return Err(Error::new(
+            "native_readback",
+            "OpenCode MCP inventory read failed (no native inventory query succeeded)",
+        ));
     };
     for server in servers {
         if !matches!(server.status.status.as_str(), "connected" | "pending") {
@@ -4942,6 +5003,27 @@ mod tests {
         assert!(super::refuse_effective_owner_mcp(&quiet, None, None).is_ok());
     }
     use std::path::PathBuf;
+
+    #[test]
+    fn unreadable_inventory_refuses_the_start_in_every_policy() {
+        // Absence of evidence must fail closed: without a readable
+        // inventory neither the unexpected-server gate nor the
+        // effective-transport proof can run, so the start refuses in
+        // every policy instead of widening the worker by default.
+        for policy in [McpPolicy::Minimal, McpPolicy::Inherit] {
+            let error = super::gate_mcp_inventory(None, policy).expect_err("unreadable refuses");
+            assert_eq!(error.code, "native_readback");
+        }
+        // A readable empty inventory still passes: nothing serves.
+        for policy in [McpPolicy::Minimal, McpPolicy::Inherit] {
+            assert!(super::gate_mcp_inventory(Some(&[]), policy).is_ok());
+        }
+        // The connected Agent-scoped entry alone passes in every policy.
+        let agent = [mcp_fixture(SWARM_MCP_SERVER_NAME, "connected")];
+        for policy in [McpPolicy::Minimal, McpPolicy::Inherit] {
+            assert!(super::gate_mcp_inventory(Some(&agent), policy).is_ok());
+        }
+    }
 
     const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
 

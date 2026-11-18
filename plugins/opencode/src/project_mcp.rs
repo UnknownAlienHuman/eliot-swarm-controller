@@ -160,12 +160,16 @@ pub fn find_owner_entries<'a>(
 /// table plus the native legacy spelling, where any other `mcp.<name>`
 /// key is itself a server (`packages/core/src/config/normalize.ts`
 /// `normalizeMcp`: `type: local` with a `command` array, `type: remote`
-/// with a `url`). Absent or null layers contribute nothing; a non-object
-/// layer fails closed. Non-object table entries are skipped; a non-record
-/// legacy value fails closed, since native would still decode it as a
-/// server candidate the scan could not evaluate. Enabled-only legacy
-/// values (`{enabled: bool}` without `type`) are omitted exactly like the
-/// native normalization omits them.
+/// with a `url`). `mcp.timeout` is the one exception with a dual native
+/// spelling: a number or a timeout record normalizes as the MCP timeout
+/// (never a server), while the direct legacy shape (`type: local` or
+/// `type: remote`) still decodes as one server under the key `timeout`.
+/// Absent or null layers contribute nothing; a non-object layer fails
+/// closed. Non-object table entries are skipped; a non-record legacy
+/// value fails closed, since native would still decode it as a server
+/// candidate the scan could not evaluate. Enabled-only legacy values
+/// (`{enabled: bool}` without `type`) are omitted exactly like the native
+/// normalization omits them.
 fn project_entries(document: &Value, file: String) -> Result<Vec<ProjectMcpEntry>> {
     let label = format!("OpenCode project MCP layer in {file}");
     let mcp = document.get("mcp");
@@ -180,7 +184,13 @@ fn project_entries(document: &Value, file: String) -> Result<Vec<ProjectMcpEntry
             ));
         };
         for (name, value) in table {
-            if name == "servers" || name == "timeout" {
+            if name == "servers" {
+                continue;
+            }
+            if name == "timeout" && !is_direct_legacy_server(value) {
+                // Native normalizes this spelling as the MCP timeout, never
+                // as a server; only the direct legacy shape falls through
+                // to the server decode below.
                 continue;
             }
             let Some(entry) = legacy_entry(name, value, &file, &label)? else {
@@ -533,7 +543,8 @@ mod tests {
             &dir,
             "opencode.jsonc",
             r#"{
-              // Native legacy spelling: any mcp.<name> key is a server.
+              // Native legacy spelling: any mcp.<name> key is a server, except
+              // a non-server mcp.timeout (number or timeout record).
               "mcp": {
                 "bridge": {"type": "local", "command": ["swarm", "mcp"]},
                 "old-split": {"command": "npm", "args": ["run", "server"]},
@@ -570,6 +581,33 @@ mod tests {
         let hits = find_owner_entries(&entries, None, None);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "bridge");
+    }
+
+    #[test]
+    fn direct_legacy_timeout_scans_like_a_server() {
+        // Native decodes `mcp.timeout` with `type: local|remote` as one
+        // server under the key `timeout` (`normalizeMcp` only normalizes
+        // the number/record spellings as the MCP timeout); the scan must
+        // see it, including an owner transport hiding under that key.
+        let scratch = ScratchDir::new();
+        let dir = scratch.path().to_path_buf();
+        write_project(
+            &dir,
+            "opencode.jsonc",
+            r#"{"mcp": {"timeout": {"type": "local", "command": ["swarm", "mcp"]}}}"#,
+        );
+        let entries = scan_project_mcp(&dir).expect("timeout server scans");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].name, "timeout");
+        assert_eq!(entries[0].command.as_deref(), Some("swarm"));
+        let hits = find_owner_entries(&entries, None, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name, "timeout");
+        // A bare number normalizes as the MCP timeout, never as a server:
+        // it scans clean with no entries and no failure.
+        write_project(&dir, "opencode.jsonc", r#"{"mcp": {"timeout": 5000}}"#);
+        let entries = scan_project_mcp(&dir).expect("numeric timeout scans");
+        assert!(entries.is_empty(), "{entries:?}");
     }
 
     #[test]
