@@ -491,7 +491,10 @@ impl SettingsState {
     /// move. A form shows the stored values again under the error; the
     /// settings file's JSON, a raw editor, keeps its draft for correction.
     fn refused(&mut self, page: Page, mut note: Note) {
-        if page != Page::Advanced {
+        // A refused Cloud MCP draft stays for fixing: discarding it would
+        // wipe a first setup back to the empty section.
+        let keep = page == Page::CloudMcp;
+        if page != Page::Advanced && !keep {
             self.discard(page);
             note.text = format!("{}. {SHOWS_SAVED}", note.text.trim_end_matches('.'));
         }
@@ -1020,8 +1023,9 @@ impl DesktopApp {
                     }
                     // Refused (an invalid value), nothing changed: a form
                     // shows the stored values under the error, a raw editor
-                    // (the JSON, typed presets TOML) keeps its draft, and the
-                    // other pages' changes still save.
+                    // (the JSON, typed presets TOML) and the Cloud MCP form
+                    // keep their drafts, and the other pages' changes still
+                    // save.
                     Err(_) => {
                         if !(page == Page::Models && self.editor.raw_dirty) {
                             if page == Page::Models {
@@ -2248,5 +2252,23 @@ model = \"gpt-6\"
             ..SettingsState::default()
         };
         assert!(off.request_sections(Page::CloudMcp, "").is_ok());
+    }
+    #[test]
+    fn a_refused_cloud_draft_stays_for_fixing() {
+        // Finding 6: a daemon validation error keeps the Cloud MCP draft
+        // and shows the error; other forms still reset to stored values.
+        let mut state = SettingsState::default();
+        let draft = serde_json::json!({"hostname": "example.com"});
+        state.cloud = draft.clone();
+        state.refused(Page::CloudMcp, Note::error("Cloud MCP configuration is malformed."));
+        assert_eq!(state.cloud, draft);
+        let note = &state.notes[&Page::CloudMcp];
+        assert!(note.error);
+        assert!(!note.text.contains(SHOWS_SAVED));
+        state.projects = serde_json::json!({"beta": {}});
+        state.refused(Page::Projects, Note::error("bad value."));
+        assert_eq!(state.projects, serde_json::json!({}));
+        let note = &state.notes[&Page::Projects];
+        assert!(note.text.contains(SHOWS_SAVED));
     }
 }
