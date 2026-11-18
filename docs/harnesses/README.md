@@ -4,6 +4,8 @@ The [roadmap](../roadmap.md) owns build order: useful direct Codex first; monito
 automation and coordination on Codex next; Claude/OpenCode and selected optional adapters
 in L6. A catalogue entry is not a requirement to build that adapter before L2 works.
 
+[Zed](zed.md) is a separately installed batch adapter with its own capability limits.
+
 Provider services are separate: [OpenCodex](opencodex.md), [local models](local-models.md).
 
 ## Common plugin contract

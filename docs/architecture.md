@@ -33,7 +33,7 @@ platform to build first.
 | `eliot-store` | migrations, one writer, bounded queries | core + SQLite |
 | `eliot-plugin` | small wire types/framing shared by host and plugins | core + transport/serialization; no Store |
 | `eliot-daemon` | API, router, bus, process/plugin ownership | core, store, plugin protocol |
-| `plugins/*` (codex, claude, opencode, Muse, antigravity) | harness translation and native readback, one process per Agent generation | plugin protocol; no daemon/Store dependency |
+| `plugins/*` (codex, claude, opencode, Muse, antigravity, zed) | harness translation and native readback, one process per Agent generation | plugin protocol; no daemon/Store dependency |
 | `apps/swarm-desktop` | optional Windows companion UI | daemon API and `settings.*` only; keeps no other preference store |
 | `eliot` | CLI and composition/entry points | application crates and built-in plugin entry points |
 
@@ -64,7 +64,7 @@ adding forwarding traits. Retain authority, generation, idempotency and source c
 their owning boundaries. Canonical payload/ACK digests and credential hashes serve those
 contracts; file size alone is not a reason to remove them or add another integrity layer.
 
-All five native adapters use the same protocol through their `plugins/*` process;
+The native adapters use the same protocol through their `plugins/*` process;
 the desktop is an optional client on the daemon API and `settings.*`.
 
 ## Memory inference boundary
@@ -81,7 +81,7 @@ Agent, Task, service-account framework or second mutation ledger is created.
 Completed history: L1 delivered local CLI, Store/router, a temporary fake, bus and
 result. L2 replaced that fake with a per-Agent Codex app-server and added native
 controls and readback over an existing workspace and account. Current code has no fake
-runtime: the five native adapters launch from explicit profiles, or by `--role` through
+runtime: native adapters launch from explicit profiles, or by `--role` through
 the ordered `[routing]` candidates when `--profile` is omitted, with frozen captured
 selectors. Routing runs before admission only; dispatch never reroutes, retries another
 route, or switches account on hold.

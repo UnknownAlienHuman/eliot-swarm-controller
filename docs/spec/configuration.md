@@ -156,7 +156,7 @@ pass_env = ["CODEX_HOME"]
 
 ## Ad-hoc Owner launch (no stored profile)
 
-`swarm launch --harness <codex|claude|muse|opencode|antigravity>
+`swarm launch --harness <codex|claude|muse|opencode|antigravity|zed>
 [--model M] [--effort E] [--auth I] [--access ask|auto|full] [--cmd PATH] --workspace W "prompt"` (and the same in
 `command.submit` `launch` args, where `cmd` and `access` ride beside `model`/`effort` in
 the exact retry-bound payload) is an Owner-only tool that builds and freezes
@@ -203,6 +203,10 @@ non-Owner replies refuse with `not_allowed` through CLI and MCP alike.
 The Agent-scoped Swarm MCP tool may be auto-approved because it cannot
 authorize these replies. A level a
 harness cannot express refuses with a typed `unsupported` reason.
+
+Zed eval-cli requires explicit `full` because the native runtime allows tools
+without an interactive approval contract. See [Zed](../harnesses/zed.md) for
+profile setup, scope and supported controls.
 
 | Level | Codex | Claude | OpenCode | Muse | Antigravity |
 | --- | --- | --- | --- | --- | --- |
