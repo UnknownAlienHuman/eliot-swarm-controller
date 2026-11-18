@@ -3869,7 +3869,8 @@ async fn fetch_backend_inventory(
 
 /// Verify the effective adopted provider before inference: the exact
 /// provider identity, package and base URL from `GET /api/provider`, the
-/// frozen API model id selected locally from `GET /api/model`, and the
+/// exact frozen provider/model pair selected locally from `GET /api/model`,
+/// and the
 /// frozen limits against observed ones, plus the backend's own passive
 /// inventory. Every failure reason is short and non-secret: reasons are
 /// persisted in the daemon outcome, so they never carry endpoints, ids,
@@ -3929,9 +3930,12 @@ async fn verify_local_effective(
         .list_native_models(deadline)
         .await
         .map_err(|_| Error::new("unknown", "adopted provider readback unresolved"))?;
-    let entry = models
-        .iter()
-        .find(|model| model.id.as_deref() == Some(local.api_model_id.as_str()))
+    // Exact pair: the frozen provider id AND the frozen API model id must
+    // name one catalogue row. Identical model ids under other providers
+    // never satisfy this readback, so an unrelated row cannot conceal an
+    // absent model or the wrong limits.
+    let requested = format!("{}/{}", local.provider_id.trim(), local.api_model_id.trim());
+    let entry = catalogue_entry(&models, &requested)
         .ok_or_else(|| Error::new("profile_error", "effective catalogue mismatch"))?;
     let mut limits_unavailable = Vec::new();
     if let Some(limit) = entry.limit.as_ref() {

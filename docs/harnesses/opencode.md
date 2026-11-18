@@ -229,16 +229,16 @@ document sets only that model. Managed policy authority is preserved: no
 owner or project file is ever edited.
 
 Effective settings are read back, not assumed. The isolated XDG file is not
-the final authority (project config loads after global config), so before
+the final authority (workspace-inherited layers load after the isolated global config), so before
 inference the plugin checks the exact provider through bounded native
-`GET /api/provider/:providerID`, selects the exact API model id locally from
+`GET /api/provider/:providerID`, selects the exact frozen provider/model pair locally from
 `GET /api/model` (the endpoint answers an object with a `data` array), and reads the backend's
 own passive `GET {base_url}/models` inventory — which never generates text,
 never sends `?reload=1` (that can unload running llama.cpp models), and
 never touches load/switch selectors. This verification runs before
 `POST /api/session` creates any native session: no session or prompt has
 been dispatched yet, so every verification failure — a known mismatch
-(foreign provider/package/endpoint, an absent catalogue id, divergent
+(foreign provider/package/endpoint, an absent catalogue pair, divergent
 limits, or an inventory without the frozen id), an unreadable readback, or
 an unreachable backend with no inventory at all — settles the launch as a
 definite failure with a short safe reason (failed-state start result, never
