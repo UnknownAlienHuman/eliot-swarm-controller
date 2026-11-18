@@ -599,8 +599,10 @@ does not scan the whole file in one call.
 For the pinned Codex 0.161.0 rollout format at upstream commit
 `979011409de0a60b52f179721948e65531d26144`, task/turn lifecycle uses canonical
 `task_started`/`turn_started`, `task_complete`/`turn_complete` and
-`task_aborted`/`turn_aborted` records. Routine `token_count` usage metadata
-and legacy message/tool echoes are ignorable without clearing binding; only
+`task_aborted`/`turn_aborted` records. Persisted usage/thread metadata
+(`token_count`, `thread_settings_applied`, `thread_goal_updated`,
+`thread_rolled_back`, `item_completed`), legacy message/tool echoes and
+legacy-mode records are ignorable without clearing binding; only
 lifecycle records mutate binding. An aborted turn emits an interrupted
 (`reason: interrupted`) or failed terminal turn with its native reason and
 clears the active binding, so a following start is not an anomaly. Only legacy

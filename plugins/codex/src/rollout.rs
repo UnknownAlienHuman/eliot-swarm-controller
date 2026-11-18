@@ -472,13 +472,13 @@ fn live_gap(cursor: &str, error: &Error) -> LiveRolloutPage {
 }
 
 // Pinned format: openai/codex 979011409de0a60b52f179721948e65531d26144,
-// protocol/src/{protocol,models}.rs and rollout/src/policy.rs. Lifecycle
-// EventMsg records (`task_started`/`turn_started`, `task_complete`/
-// `turn_complete`, `task_aborted`/`turn_aborted`) are canonical; routine
-// `token_count` usage metadata and legacy message/tool echoes
-// (`agent_message`, `user_message`, `exec_command_end`) are ignorable
-// without clearing binding. Any other EventMsg gaps without resetting
-// binding unless identity is lost or corrupt.
+// protocol/src/protocol.rs and rollout/src/policy.rs (`should_persist_event_msg`).
+// Lifecycle EventMsg records (`task_started`/`turn_started`, `task_complete`/`turn_complete`,
+// `task_aborted`/`turn_aborted`) are canonical. Every other EventMsg the pinned
+// writer persists (usage/thread metadata, completion bookkeeping, legacy echoes
+// and legacy-mode records) is ignorable without clearing binding. A never-
+// persisted, genuinely unknown EventMsg gaps without resetting binding unless
+// identity is lost or corrupt.
 fn normalize_live_line(
     state: &mut LiveCursor,
     line: &RolloutLine,
@@ -579,11 +579,28 @@ fn normalize_live_event(
         .and_then(Value::as_str)
         .ok_or_else(integrity)?;
     match event_type {
-        "agent_message" | "user_message" | "exec_command_end" | "token_count" => {
-            // Known non-owned metadata: routine usage updates and legacy
-            // echoes are ignorable without clearing turn/tool binding.
-            // Only lifecycle records below mutate binding; genuinely lost
-            // or corrupt identity still gaps via the callers.
+        "agent_message"
+        | "user_message"
+        | "exec_command_end"
+        | "token_count"
+        | "thread_settings_applied"
+        | "thread_goal_updated"
+        | "thread_rolled_back"
+        | "item_completed"
+        | "agent_reasoning"
+        | "agent_reasoning_raw_content"
+        | "entered_review_mode"
+        | "exited_review_mode"
+        | "patch_apply_end"
+        | "context_compacted"
+        | "mcp_tool_call_end"
+        | "web_search_end"
+        | "image_generation_end"
+        | "sub_agent_activity" => {
+            // Persisted rollout metadata per the pinned policy (`should_persist_event_msg`):
+            // usage, thread settings/goal/rollback, completion bookkeeping, legacy
+            // echoes/mode records. Ignorable without clearing turn/tool binding;
+            // only lifecycle records below mutate binding, the rest still gaps on lost identity.
             return Ok(None);
         }
         "task_started" | "turn_started" | "task_complete" | "turn_complete" | "task_aborted"
@@ -2063,6 +2080,66 @@ mod live_tests {
         assert_eq!(
             page.records[2].events[0].data["item_id"], "call-1",
             "output keeps its call binding after token_count"
+        );
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_rollout_metadata_is_ignorable_without_clearing_tool_binding() {
+        // Audit #644: every EventMsg the pinned rollout policy persists
+        // outside lifecycle (thread settings/goal/rollback, completion
+        // bookkeeping, legacy echoes/mode records) is ignorable metadata:
+        // no gap and no cleared turn/tool binding.
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"task_started","turn_id":"turn-1"}),
+        ));
+        fixture.append(line("response_item", json!({"type":"function_call","name":"exec_command","call_id":"call-1","id":"call-item","arguments":"{}"})));
+        for event_type in [
+            "token_count",
+            "thread_settings_applied",
+            "thread_goal_updated",
+            "thread_rolled_back",
+            "item_completed",
+            "agent_message",
+            "user_message",
+            "exec_command_end",
+            "agent_reasoning",
+            "agent_reasoning_raw_content",
+            "entered_review_mode",
+            "exited_review_mode",
+            "patch_apply_end",
+            "context_compacted",
+            "mcp_tool_call_end",
+            "web_search_end",
+            "image_generation_end",
+            "sub_agent_activity",
+        ] {
+            fixture.append(line(
+                "event_msg",
+                json!({"type":event_type,"turn_id":"turn-1"}),
+            ));
+        }
+        fixture.append(line("response_item", json!({"type":"function_call_output","call_id":"call-1","id":"output-item","output":"ok"})));
+        let page = reader.read_page(&baseline, 100, deadline()).await.unwrap();
+        assert!(page.gap.is_none(), "persisted metadata must not gap");
+        let kinds: Vec<_> = page
+            .records
+            .iter()
+            .flat_map(|record| &record.events)
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["turn.started", "tool.started", "tool.completed"]);
+        assert_eq!(
+            page.records[2].events[0].data["turn_id"], "turn-1",
+            "output keeps its native turn after persisted metadata"
+        );
+        assert_eq!(
+            page.records[2].events[0].data["item_id"], "call-1",
+            "output keeps its call binding after persisted metadata"
         );
         reader.close().await.unwrap();
     }
