@@ -1489,8 +1489,11 @@ impl OpenCodePlugin {
     /// Resume: reattach to the exact retained native session in this new
     /// generation. No prompt is ever replayed: the new server serves the
     /// same per-Agent store, the preflight proves the retained session
-    /// exists and is idle, the model/agent realign to the frozen profile
-    /// with an effective readback, and readiness adopts the live edge.
+    /// exists, then proves the realignment target in the live catalogue
+    /// before the quiesce interrupt can abort a running retained turn,
+    /// then proves the session idle; the model/agent realign to the
+    /// frozen profile with an effective readback, and readiness adopts
+    /// the live edge.
     async fn resume_start_session(
         &mut self,
         parsed: ParsedStart,
@@ -1547,6 +1550,22 @@ impl OpenCodePlugin {
             Err(error) => return Err(self.fail_resume(&parsed, session, error, envelope).await),
         };
         session.session_id = Some(retained.id.clone());
+        // Catalogue membership proves before any native interrupt or
+        // setter: the quiesce below aborts a running retained execution,
+        // so a catalogue miss must fail here with proven no effect
+        // instead of aborting that turn and then failing.
+        if let Err(error) =
+            Self::resume_validate_catalogue(&parsed, &session, &retained, deadline).await
+        {
+            discard_unstarted(&mut session, envelope).await;
+            return Ok(self.proven_no_effect_start(
+                &parsed.params,
+                PhaseFailure {
+                    phase: StartPhase::ResumeRefused,
+                    error: Box::new(error),
+                },
+            ));
+        }
         if let Err(error) = Self::resume_quiesce(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, *error.message).await);
         }
@@ -1799,10 +1818,99 @@ impl OpenCodePlugin {
         Ok((inbox.len(), permissions.len(), forms.len()))
     }
 
+    /// Resume catalogue gate: an explicit realignment target proves live
+    /// catalogue membership BEFORE the retained session is touched. The
+    /// quiesce interrupt below aborts a running retained execution, so a
+    /// catalogue miss must fail here with proven no effect instead of
+    /// aborting that turn and then failing. No native interrupt, model
+    /// switch or agent switch has been dispatched at this point, so a
+    /// miss is a profile error with proven no effect; an unreadable
+    /// catalogue is a pre-write readback failure, also with proven no
+    /// effect (the create path settles an unreadable catalogue the same
+    /// way). The `resume_configure` setters later only realign to the
+    /// target proven here.
+    async fn resume_validate_catalogue(
+        parsed: &ParsedStart,
+        session: &AgentSession,
+        retained: &SessionInfo,
+        deadline: Instant,
+    ) -> Result<()> {
+        // The realignment target is the inherited overlay's effective
+        // model and effort when a resume carries them (the retained
+        // session already runs them), else the frozen request. An omitted
+        // request keeps the retained server-selected model and variant. A
+        // carried model without an effort means the server default.
+        let target_model = parsed
+            .override_model
+            .as_deref()
+            .or(parsed.requested_model.as_deref());
+        let target_variant = if parsed.override_model.is_some() {
+            parsed.override_effort.as_deref()
+        } else {
+            parsed
+                .override_effort
+                .as_deref()
+                .or(parsed.requested_effort.as_deref())
+        };
+        if target_model.is_none() && target_variant.is_none() {
+            return Ok(());
+        }
+        let catalogue = session
+            .http
+            .list_native_models(deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "native_readback",
+                    format!(
+                        "OpenCode resume catalogue readback failed ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        if let Some(target) = target_model
+            && !catalogue_contains(&catalogue, target)
+        {
+            return Err(Error::new(
+                "profile_error",
+                format!("OpenCode model {target} is not in the native catalogue"),
+            ));
+        }
+        if let Some(variant) = target_variant {
+            let retained_model = retained
+                .model
+                .as_ref()
+                .map(|model| format!("{}/{}", model.provider_id, model.id));
+            let validation_model = target_model
+                .map(str::to_owned)
+                .or(retained_model)
+                .ok_or_else(|| {
+                    Error::new(
+                        "profile_error",
+                        "OpenCode resume configure effort needs a session model",
+                    )
+                })?;
+            let known = catalogue_variants(&catalogue, &validation_model)
+                .is_some_and(|variants| variants.iter().any(|known| known == variant));
+            if !known {
+                return Err(Error::new(
+                    "profile_error",
+                    format!(
+                        "OpenCode effort {variant} is not a variant of model {validation_model}"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Resume configure: realign the retained session's model and agent
     /// to the frozen profile, then prove the effective values with a fresh
     /// `session.get`. The location must be the workspace; the requested
-    /// agent must be installed (the switch validates nothing itself).
+    /// agent must be installed (the switch validates nothing itself). Live
+    /// catalogue membership was already proven by the pre-quiesce
+    /// `resume_validate_catalogue` gate, so no catalogue read happens
+    /// here after the interrupt.
     async fn resume_configure(
         parsed: &ParsedStart,
         session: &AgentSession,
@@ -1863,60 +1971,12 @@ impl OpenCodePlugin {
             .override_model_ref
             .as_ref()
             .or(parsed.model_ref.as_ref());
-        // The create echo is not membership proof, so neither is the
-        // resume echo: an explicit realignment target proves live catalogue
-        // membership before any setter runs, exactly like the create and
-        // configure paths. No switch has been dispatched at this point, so
-        // a miss is a profile error with proven no effect; an unreadable
-        // catalogue is an unresolved readback (`unknown`).
-        if target_model.is_some() || target_variant.is_some() {
-            let catalogue = session
-                .http
-                .list_native_models(deadline)
-                .await
-                .map_err(|error| {
-                    Error::new(
-                        "unknown",
-                        format!(
-                            "OpenCode resume catalogue readback is unresolved ({})",
-                            error.message
-                        ),
-                    )
-                })?;
-            if let Some(target) = target_model
-                && !catalogue_contains(&catalogue, target)
-            {
-                return Err(Error::new(
-                    "profile_error",
-                    format!("OpenCode model {target} is not in the native catalogue"),
-                ));
-            }
-            if let Some(variant) = target_variant {
-                let retained_model = current
-                    .model
-                    .as_ref()
-                    .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
-                let validation_model = target_model
-                    .map(str::to_owned)
-                    .or(retained_model)
-                    .ok_or_else(|| {
-                        Error::new(
-                            "unknown",
-                            "OpenCode resume configure effort needs a session model",
-                        )
-                    })?;
-                let known = catalogue_variants(&catalogue, &validation_model)
-                    .is_some_and(|variants| variants.iter().any(|known| known == variant));
-                if !known {
-                    return Err(Error::new(
-                        "profile_error",
-                        format!(
-                            "OpenCode effort {variant} is not a variant of model {validation_model}"
-                        ),
-                    ));
-                }
-            }
-        }
+        // Membership was proven by the pre-quiesce catalogue gate
+        // (`resume_validate_catalogue` runs before any interrupt or
+        // setter): the create echo is not membership proof, so neither is
+        // the resume echo, and re-checking here would run after the
+        // interrupt. The setters below plus the `session.get` effective
+        // readback only realign to that already-proven target.
         let model_needed = target_model.is_some_and(|target| {
             current
                 .model
