@@ -450,7 +450,7 @@ retained cursor. New queue entries must sort after the cursor. The folder scan i
 to 500 entries per firing; overflow fails closed rather than skipping an unseen earlier
 brief. Each brief is
 limited to the ordinary 64 KiB launch-text bound. Unsafe, oversized or invalid UTF-8
-briefs fail the slot visibly. At capacity or when no next brief exists, the timer slot is
+briefs fail the slot visibly. An unreadable or missing briefs folder fails only that assignment's slot with its code while the rule worker keeps running every other automation. At capacity or when no next brief exists, the timer slot is
 skipped and a later interval checks again. Settings generate a global interval timer
 rule and an ordinary completion rule. Before admitting cleanup, Store verifies that
 the captured Agent/generation was launched by this assignment's own launch for the

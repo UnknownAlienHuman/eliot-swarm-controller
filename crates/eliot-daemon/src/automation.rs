@@ -1791,6 +1791,11 @@ async fn reconcile_due_timers(
                             continue;
                         }
 
+                        // A per-assignment briefs failure (for example a missing
+                        // briefs folder, `unavailable`) fails only this slot, so
+                        // the worker keeps running every other automation. The
+                        // code is recorded as the slot skip reason below.
+                        let mut assignment_unavailable: Option<String> = None;
                         let prepared = match rule.definition.evaluate_timer() {
                             Ok(action) if action.verb == "run" => {
                                 router
@@ -1825,6 +1830,10 @@ async fn reconcile_due_timers(
                                             }
                                             None => router.prepare_owner_submission(action).await,
                                         },
+                                        Err(error) if error.code == "unavailable" => {
+                                            assignment_unavailable = Some(error.code.clone());
+                                            Err(error)
+                                        }
                                         Err(error) => Err(error),
                                     }
                                 }
@@ -1834,25 +1843,34 @@ async fn reconcile_due_timers(
                             }
                             Err(error) => return Err(error),
                         };
-                        match prepared {
-                            Ok(prepared) => (
-                                scheduled_at_ms,
-                                next_due_at_ms,
-                                Some(prepared.request),
-                                None,
-                                live_armed.then_some(scheduled_at_ms),
-                            ),
-                            Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                                (
+                        if let Some(code) = assignment_unavailable {
+                            if !router.rule_firings_open() {
+                                return Ok(false);
+                            }
+                            (scheduled_at_ms, next_due_at_ms, None, Some(code), None)
+                        } else {
+                            match prepared {
+                                Ok(prepared) => (
                                     scheduled_at_ms,
                                     next_due_at_ms,
+                                    Some(prepared.request),
                                     None,
-                                    Some(error.code),
-                                    None,
-                                )
+                                    live_armed.then_some(scheduled_at_ms),
+                                ),
+                                Err(error)
+                                    if is_deterministic_pre_admission_rejection(&error.code) =>
+                                {
+                                    (
+                                        scheduled_at_ms,
+                                        next_due_at_ms,
+                                        None,
+                                        Some(error.code),
+                                        None,
+                                    )
+                                }
+                                Err(_error) if !router.rule_firings_open() => return Ok(false),
+                                Err(error) => return Err(error),
                             }
-                            Err(_error) if !router.rule_firings_open() => return Ok(false),
-                            Err(error) => return Err(error),
                         }
                     }
                 };
@@ -2588,6 +2606,122 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         timer.blocked = true;
         assert_eq!(timer_wake_delay(&timer, 135), None);
     }
+    #[tokio::test]
+    async fn missing_briefs_folder_fails_only_its_assignment_slot() {
+        use eliot_core::api::TimerSchedule;
+        use std::{fs, io::Cursor, path::Path};
+
+        let root =
+            std::env::temp_dir().join(format!("eliot-assignment-isolation-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        let data_root = root.join("owner-data");
+        fs::create_dir_all(&data_root).unwrap();
+
+        let store = std::sync::Arc::new(tokio::sync::Mutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let router = Router::new(
+            data_root.clone(),
+            "assignment-isolation-fixture".to_owned(),
+            store.clone(),
+            crate::bus::Bus::new(16),
+        );
+
+        let now = 1_700_000_000_000_i64;
+        let missing_folder = root.join("no-such-briefs");
+        assert!(!missing_folder.exists());
+        let missing_folder = missing_folder.to_string_lossy().replace('\\', "/");
+
+        let sources = [
+            (
+                "broken-assignment",
+                format!(
+                    "[[rule]]\nid = 'broken-assignment'\non = {{ every = '1s' }}\ndo = [{{ action = 'launch', workspace = 'C:/work', role = 'worker', assignment = {{ key = 'broken', folder = '{missing_folder}', max_busy = 1 }} }}]\n",
+                ),
+            ),
+            (
+                "healthy-notify",
+                "[[rule]]\nid = 'healthy-notify'\non = { every = '1s' }\ndo = [{ action = 'notify', message = 'still running' }]\n"
+                    .to_owned(),
+            ),
+        ];
+        let mut rules = Vec::new();
+        for (id, source) in &sources {
+            let definition = definition::load(Cursor::new(source)).unwrap().remove(0);
+            let canonical = serde_json::to_value(&definition).unwrap();
+            let input = eliot_store::RuleDefinitionInput {
+                id: id.to_string(),
+                canonical_definition: serde_json::to_string(&canonical).unwrap(),
+                definition_digest: definition.semantic_digest().unwrap(),
+                enabled: true,
+            };
+            let state = store
+                .lock()
+                .await
+                .ensure_rule_state("owner", &input, now - 10_000)
+                .unwrap();
+            let timer_state = store
+                .lock()
+                .await
+                .ensure_timer_state(
+                    "owner",
+                    &eliot_store::TimerDefinitionInput {
+                        id: id.to_string(),
+                        schedule_revision: 1,
+                        schedule: TimerSchedule::Interval {
+                            period_ms: 1_000,
+                            anchor: None,
+                        },
+                        enabled: true,
+                        initial_next_due_at: Some(now - 9_000),
+                    },
+                    now - 10_000,
+                )
+                .unwrap();
+            rules.push(ActiveRule {
+                principal: "owner".to_owned(),
+                project: None,
+                definition,
+                source_present: true,
+                state,
+                retiring: None,
+                timer: Some(ActiveTimer {
+                    state: timer_state,
+                    catch_up: CatchUp::Latest,
+                    armed_due_at_ms: None,
+                    blocked: false,
+                }),
+            });
+        }
+
+        let worker_continues = reconcile_due_timers(&router, "owner", &mut rules, now)
+            .await
+            .expect("worker keeps running past a missing briefs folder");
+        assert!(worker_continues);
+
+        for id in ["broken-assignment", "healthy-notify"] {
+            let timer = store
+                .lock()
+                .await
+                .get_timer_state("owner", id)
+                .unwrap()
+                .expect("timer state remains stored");
+            assert!(
+                timer.last_key.is_some(),
+                "{id} slot committed instead of stalling the worker"
+            );
+        }
+        let skipped = store
+            .lock()
+            .await
+            .read_events(0, 1_000, None)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "rule.skipped" && event.data["rule"] == "broken-assignment")
+            .expect("missing folder is reported on its assignment slot");
+        assert_eq!(skipped.data["reason"], "unavailable");
+    }
+
     #[tokio::test]
     async fn event_run_catch_up_prepares_project_and_granted_global_commands() {
         use eliot_core::{
