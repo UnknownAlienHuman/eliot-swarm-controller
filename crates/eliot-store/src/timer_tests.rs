@@ -1884,6 +1884,122 @@ fn scheduled_and_manual_timer_launch_inputs_hold_following_firings() {
 }
 
 #[test]
+fn delete_removes_scheduled_and_manual_timer_launch_command_sets() {
+    for manual in [false, true] {
+        let mut store = store();
+        let now = now_ms();
+        let rule_id = "delete-timer-launch";
+        let period = 1_000;
+        let timer = ensure_interval(&mut store, rule_id, now, period);
+        let revision = rule_revision(&store, rule_id);
+        let due = timer.next_due_at.unwrap();
+        let next_due = Some(due + period);
+        let request = TimerRunRequest::new(Ulid::new().to_string(), rule_id);
+        let text = Some("initial timer input");
+        let fired = if manual {
+            store
+                .admit_manual_timer_run(
+                    "owner",
+                    &request,
+                    &timer,
+                    revision,
+                    timer_launch_action(rule_id, text),
+                    due,
+                )
+                .unwrap()
+        } else {
+            commit_scheduled_timer_launch(&mut store, &timer, due, next_due, rule_id, text, due)
+        };
+        let parent = fired.parent.unwrap();
+        assert!(parent.target.is_none());
+        assert_eq!(parent.state, CommandState::Applied);
+        let launch = fired.child.unwrap();
+        let agent = launch.command.target.unwrap();
+        let launch_id = launch.command.id;
+        let send_id = launch.linked_command.unwrap().id;
+        ready_timer_launch(&mut store, &launch_id, &agent, due + 1);
+        crate::tests::install_live_custody_observations(&mut store, &agent, 1, due + 3);
+        let turn_id =
+            apply_timer_launch_input_in_running_turn(&mut store, &agent, &send_id, due + 4);
+        store
+            .put_batch(
+                crate::tests::native_batch(
+                    &agent,
+                    1,
+                    "turn.completed",
+                    json!({"command_id":send_id,"turn_id":turn_id,"status":"completed"}),
+                ),
+                due + 6,
+            )
+            .unwrap();
+        let stop = stop_request(&agent);
+        let stop_id = stop.id.clone();
+        store.submit("owner", stop, due + 7).unwrap();
+        store.dispatch(&stop_id, due + 8).unwrap();
+        store
+            .settle(&stop_id, CommandState::Applied, None, due + 9)
+            .unwrap();
+        crate::tests::simulate_normal_stop_proof(&mut store, &agent, 1, due + 10);
+
+        // In the daemon the automation worker scans the event log for the timer rule.
+        let rule = store.get_rule_state("owner", rule_id).unwrap().unwrap();
+        let through = store.high_water().unwrap();
+        let scanned = store
+            .advance_rule_cursor(
+                "owner",
+                &rule,
+                through,
+                super::RuleCursorOutcome::NoMatch,
+                due + 11,
+            )
+            .unwrap()
+            .value;
+        let result = store
+            .change_agent_tree(&Ulid::new().to_string(), &agent, None, due + 12)
+            .unwrap();
+        assert_eq!(result["affected"], 1);
+        assert!(store.get_agent(&agent).unwrap().is_none());
+        for id in [parent.id, launch_id, send_id, stop_id] {
+            assert!(store.get_command(&id).unwrap().is_none());
+            assert!(super::write_exists(&store.connection, &id).unwrap());
+        }
+        assert_eq!(
+            store.get_timer_state("owner", rule_id).unwrap(),
+            Some(fired.state)
+        );
+        assert_eq!(
+            store.get_rule_state("owner", rule_id).unwrap(),
+            Some(scanned)
+        );
+        if manual {
+            let error = store
+                .admit_manual_timer_run(
+                    "owner",
+                    &request,
+                    &timer,
+                    revision,
+                    timer_launch_action(rule_id, text),
+                    due + 13,
+                )
+                .unwrap_err();
+            assert_eq!(error.code, "id_conflict");
+        } else {
+            let replay = commit_scheduled_timer_launch(
+                &mut store,
+                &timer,
+                due,
+                next_due,
+                rule_id,
+                text,
+                due + 13,
+            );
+            assert!(!replay.is_new && replay.parent.is_none() && replay.child.is_none());
+            assert!(replay.events.is_empty());
+        }
+    }
+}
+
+#[test]
 fn applied_timer_launch_input_releases_gate_while_its_turn_runs() {
     let mut store = store();
     let registration_ms = now_ms();

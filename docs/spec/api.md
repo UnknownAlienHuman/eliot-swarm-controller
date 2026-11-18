@@ -675,7 +675,10 @@ CLI: `swarm archive aN`, `swarm unarchive aN`, `swarm ls --archived include`.
 `agent.delete {id, agent:"aN"}` is Owner-only and removes a tree whose Agents are
 stopped or failed, using retention's leaf-first command cleanup. A failed launch
 can be removed after its sources and custody drain; an already-terminal `stop`
-does not need to rewrite its failure state. A `busy` refusal names the blocking
+does not need to rewrite its failure state. Delete removes a retained tree-selector,
+rule, or timer admission parent with its full member command set in the same
+transaction. Each member must pass the ordinary deletion checks. A set with commands
+outside the requested Agent tree returns `busy`. A `busy` refusal names the blocking
 Agent and its actual state, pending requests, command, turn (including generation
 and retained state) or undrained process, source or artifact, rather than treating stopped lifecycle as proof of drained
 history. A retained `unknown` turn still blocks deletion after stop. Live custody, open
@@ -1068,8 +1071,8 @@ the admitted `children` plus a bounded `skipped` list naming each skipped
 observe-only member as `{"agent": AGENT, "reason": "observe_only"}`; their
 lifecycle stays with their manager/native harness. Parent applied means expansion only.
 `command.children` pages that fixed set; a child created after admission is never
-part of it. Retain/prune parent sets transactionally so a caller never sees a partly
-pruned expansion; after removal return `history_gap`. Ordered rule actions reuse the
+part of it. Retention and explicit Agent deletion remove selector parents and
+their member commands atomically. Ordered rule actions reuse the
 same representation with a distinct link kind, not selector execution semantics.
 
 `command.children` is implemented for retained expansions through Core
