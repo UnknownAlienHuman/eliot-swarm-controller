@@ -349,9 +349,10 @@ resolution, and all other retained mutations) with an id bound to a completion
 digest rejects `id_conflict`, symmetric to the command/write checks at
 registration. Only the exact registered digest-delivery conversion reuses the
 id: the Store verifies the pending registration and requires the mail to target
-exactly the frozen parent recipient before binding anything, so a mismatched
-request through the digest path rejects with `id_conflict` without consuming
-the pending id. That conversion is exempt from the new-write age gate (its age
+exactly the frozen parent recipient on the frozen `completion-<id-prefix>`
+thread before binding anything, so a mismatched request through the digest
+path (wrong recipient or wrong thread) rejects with `id_conflict` without
+consuming the pending id. That conversion is exempt from the new-write age gate (its age
 is the registration's age), so a digest stays deliverable however long its
 child set takes. Mail and delivered mark commit in one Store transaction, so a
 restart never recomputes a changed body: the registration reads delivered

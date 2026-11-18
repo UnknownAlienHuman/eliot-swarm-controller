@@ -24,7 +24,7 @@ use eliot_core::{
         MAIL_NOTICE_COOLDOWN_MS, MailAckRequest, MailAckResponse, MailDefinitionArgs, MailDelivery,
         MailDeliverySummary, MailInboxRequest, MailInboxResponse, MailLimits, MailMode,
         MailReadRequest, MailSendRequest, MailSendResponse, VarDefinitionArgs, VarGetRequest,
-        VarGetResponse, VarScope, VarSetRequest, VarSetResponse, parse_var_scope,
+        VarGetResponse, VarScope, VarSetRequest, VarSetResponse, digest_thread, parse_var_scope,
     },
     parse_agent_id,
 };
@@ -955,18 +955,22 @@ impl Store {
             ));
         }
         // Digest-path exact conversion gate: a pending digest id may only be
-        // consumed by a mail to exactly the frozen parent recipient. Any
-        // mismatched digest-path request rejects with `id_conflict` before
-        // binding anything, so it can never poison the later delivery. A
-        // consumed (already delivered) digest id never admits new mail: an
+        // consumed by a mail to exactly the frozen parent recipient on the
+        // frozen `completion-<id-prefix>` thread. Any mismatched digest-path
+        // request rejects with `id_conflict` before binding anything, so it
+        // can never poison the later delivery and the digest stays pending.
+        // A consumed (already delivered) digest id never admits new mail: an
         // exact replay returns the retained response, anything else rejects.
         if allow_digest_id && digest_id_bound(&tx, &request.id)? {
             match Self::pending_digest_recipient(&tx, &request.id)? {
                 Some(parent) => {
-                    if request.to != [parent] {
+                    let expected_thread = digest_thread(&request.id);
+                    if request.to != [parent]
+                        || request.thread.as_deref() != Some(expected_thread.as_str())
+                    {
                         return Err(Error::new(
                             "id_conflict",
-                            "digest mail must target the registered parent recipient",
+                            "digest mail must target the registered parent recipient on the frozen completion thread",
                         ));
                     }
                     // Exact pending conversion. A retained mail binding under
@@ -1071,15 +1075,18 @@ impl Store {
             .as_deref()
             .is_some_and(|thread| thread.starts_with("attention-"));
         let digest_exempt = allow_digest_id
-            && Self::pending_digest_recipient(&tx, &request.id)?
-                .is_some_and(|parent| request.to == [parent]);
+            && Self::pending_digest_recipient(&tx, &request.id)?.is_some_and(|parent| {
+                request.to == [parent]
+                    && request.thread.as_deref() == Some(digest_thread(&request.id).as_str())
+            });
         if attention_write {
             validate_ulid(&request.id)?;
         } else if digest_exempt {
             // Authorized digest-delivery conversion: the id is already an
             // admitted durable digest whose first delivery is still pending,
-            // and the mail targets exactly the frozen parent recipient, so
-            // its age is the registration's age rather than a new write's.
+            // and the mail targets exactly the frozen parent recipient on
+            // the frozen completion thread, so its age is the registration's
+            // age rather than a new write's.
             // The format rule still applies; mail and delivered mark commit
             // atomically below so a restart never recomputes a changed body.
             validate_ulid(&request.id)?;

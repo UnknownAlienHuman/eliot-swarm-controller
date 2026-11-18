@@ -606,9 +606,42 @@ mod tests {
             .mail_send("owner", &mail, MailLimits::default(), now)
             .unwrap_err();
         assert_eq!(err.code, "id_conflict");
-        // The digest delivery path still delivers under the same id.
-        let delivered = store
+        // The digest path without the frozen completion thread also rejects:
+        // a pending digest id is consumed only by the exact conversion.
+        let err = store
             .mail_send_digest_delivery("owner", &mail, MailLimits::default(), now)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // So does the right recipient with the wrong thread.
+        let wrong_thread = MailSendRequest {
+            id: id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "foreign mail reusing a digest id".to_owned(),
+            thread: Some("completion-wrong".to_owned()),
+            reply_to_delivery: None,
+        };
+        let err = store
+            .mail_send_digest_delivery("owner", &wrong_thread, MailLimits::default(), now)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        // Neither mismatch consumes the pending id.
+        assert!(
+            store
+                .pending_completion_digests_after(None, 10)
+                .expect("pending digests")
+                .iter()
+                .any(|row| row.id == id),
+            "mismatched-thread mail leaves the digest pending"
+        );
+        // The exact conversion (frozen recipient plus frozen completion
+        // thread) still delivers under the same id.
+        let exact = MailSendRequest {
+            thread: Some(eliot_core::api::digest_thread(&id)),
+            ..mail
+        };
+        let delivered = store
+            .mail_send_digest_delivery("owner", &exact, MailLimits::default(), now)
             .expect("digest delivery");
         assert_eq!(delivered.outcome, crate::MailSendOutcome::Fresh);
     }
@@ -654,7 +687,7 @@ mod tests {
             to: vec![parent.clone()],
             mode: eliot_core::api::MailMode::Queue,
             text: "digest body".to_owned(),
-            thread: None,
+            thread: Some(eliot_core::api::digest_thread(&id)),
             reply_to_delivery: None,
         };
         store
@@ -672,13 +705,14 @@ mod tests {
         store
             .digest_register("owner", &req, &[false], now)
             .expect("register");
-        // First delivery uses the registration id as the mail id.
+        // First delivery uses the registration id as the mail id, on the
+        // frozen completion thread.
         let mail = MailSendRequest {
             id: id.clone(),
             to: vec![parent.clone()],
             mode: eliot_core::api::MailMode::Queue,
             text: "digest body".to_owned(),
-            thread: Some("completion-test".to_owned()),
+            thread: Some(eliot_core::api::digest_thread(&id)),
             reply_to_delivery: None,
         };
         let first = store
