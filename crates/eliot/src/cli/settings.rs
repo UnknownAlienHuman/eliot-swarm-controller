@@ -18,16 +18,14 @@ pub(crate) async fn run(
     let value = match args.command {
         SettingsCommand::Read => {
             let request = SettingsReadRequest::default();
-            request
-                .validate()
-                .map_err(|e| Failure::from_core(e, false))?;
+            request.validate().map_err(Failure::for_read)?;
             let reply: SettingsReadResponse =
                 eliot_daemon::client_call_typed(&data_dir, "settings.read", &request)
                     .await
-                    .map_err(|e| Failure::from_core(e, false))?;
+                    .map_err(Failure::for_read)?;
             request
                 .validate_response(&reply)
-                .map_err(|e| Failure::from_core(e, false))?;
+                .map_err(Failure::invalid_response)?;
             serde_json::to_value(reply)
         }
         SettingsCommand::Save { file, dry_run } => {
@@ -42,16 +40,14 @@ pub(crate) async fn run(
                 .map_err(|_| Failure::new(2, "invalid settings.save JSON request"))?;
             request.client = SettingsClientSource::Cli;
             request.dry_run |= dry_run;
-            request
-                .validate()
-                .map_err(|e| Failure::from_core(e, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let reply: SettingsSaveResponse =
                 eliot_daemon::client_call_typed(&data_dir, "settings.save", &request)
                     .await
-                    .map_err(|e| Failure::from_core(e, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&reply)
-                .map_err(|e| Failure::from_core(e, false))?;
+                .map_err(Failure::invalid_response)?;
             serde_json::to_value(reply)
         }
     }

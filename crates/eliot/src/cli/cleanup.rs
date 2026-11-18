@@ -26,16 +26,14 @@ pub(crate) async fn run_cleanup(
                 project,
                 older_than,
             };
-            request
-                .validate()
-                .map_err(|e| Failure::from_core(e, false))?;
+            request.validate().map_err(Failure::for_read)?;
             eliot_daemon::client_call_typed::<_, CleanupPlan>(&data, "cleanup.plan", &request)
                 .await
                 .and_then(|r| {
                     serde_json::to_value(r)
                         .map_err(|_| eliot_core::Error::new("unknown", "invalid plan"))
                 })
-                .map_err(|e| Failure::from_core(e, false))?
+                .map_err(Failure::for_read)?
         }
         CleanupCommand::Apply {
             plan_id,
@@ -48,9 +46,7 @@ pub(crate) async fn run_cleanup(
                 delete_remote,
                 artifacts: (!artifacts.is_empty()).then_some(artifacts),
             };
-            request
-                .validate()
-                .map_err(|e| Failure::from_core(e, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             eliot_daemon::client_call_typed::<_, CleanupApplyResponse>(
                 &data,
                 "cleanup.apply",
@@ -61,7 +57,7 @@ pub(crate) async fn run_cleanup(
                 serde_json::to_value(r)
                     .map_err(|_| eliot_core::Error::new("unknown", "invalid cleanup result"))
             })
-            .map_err(|e| Failure::from_core(e, true))?
+            .map_err(Failure::for_mutation)?
         }
     };
     print_value(&value, json);
@@ -90,13 +86,11 @@ pub(crate) async fn run_artifact(
             _ => ArtifactKind::Other,
         },
     };
-    request
-        .validate()
-        .map_err(|e| Failure::from_core(e, true))?;
+    request.validate().map_err(Failure::for_mutation)?;
     let result: ArtifactView =
         eliot_daemon::client_call_typed(&data, "artifact.register", &request)
             .await
-            .map_err(|e| Failure::from_core(e, true))?;
+            .map_err(Failure::for_mutation)?;
     print_value(
         &serde_json::to_value(result).map_err(|_| Failure::new(4, "invalid artifact result"))?,
         json,

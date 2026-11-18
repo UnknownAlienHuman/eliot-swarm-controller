@@ -89,16 +89,14 @@ pub(crate) async fn run_show(
         )
     } else {
         let params = AgentGetRequest::new(agent);
-        params
-            .validate()
-            .map_err(|error| Failure::from_core(error, false))?;
+        params.validate().map_err(Failure::for_read)?;
         let response: AgentGetResponse =
             eliot_daemon::client_call_typed(&data_dir, "agent.get", &params)
                 .await
-                .map_err(|error| Failure::from_core(error, false))?;
+                .map_err(Failure::for_read)?;
         params
             .validate_response(&response)
-            .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::invalid_response)?;
         if let Some(activity) = response.agent.activity.as_ref() {
             if response.agent.state == AgentState::Stopped {
                 println!(
@@ -168,16 +166,14 @@ pub(crate) async fn run_stats(
             AgentStatsResponse
         )
     } else {
-        params
-            .validate()
-            .map_err(|error| Failure::from_core(error, false))?;
+        params.validate().map_err(Failure::for_read)?;
         let response: AgentStatsResponse =
             eliot_daemon::client_call_typed(&data_dir, "agent.stats", &params)
                 .await
-                .map_err(|error| Failure::from_core(error, false))?;
+                .map_err(Failure::for_read)?;
         params
             .validate_response(&response)
-            .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::invalid_response)?;
         print_stats_table(&response);
         Ok(0)
     }
@@ -263,16 +259,14 @@ pub(crate) async fn run_usage(
             UsageSummaryResponse
         )
     } else {
-        params
-            .validate()
-            .map_err(|error| Failure::from_core(error, false))?;
+        params.validate().map_err(Failure::for_read)?;
         let response: UsageSummaryResponse =
             eliot_daemon::client_call_typed(&data_dir, "usage.summary", &params)
                 .await
-                .map_err(|error| Failure::from_core(error, false))?;
+                .map_err(Failure::for_read)?;
         params
             .validate_response(&response)
-            .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::invalid_response)?;
         print_usage_table(&response);
         Ok(0)
     }
@@ -289,16 +283,14 @@ pub(crate) async fn run_doctor(data_dir: PathBuf, json_output: bool) -> Result<u
             HarnessDoctorResponse
         )
     } else {
-        params
-            .validate()
-            .map_err(|error| Failure::from_core(error, false))?;
+        params.validate().map_err(Failure::for_read)?;
         let response: HarnessDoctorResponse =
             eliot_daemon::client_call_typed(&data_dir, "harness.doctor", &params)
                 .await
-                .map_err(|error| Failure::from_core(error, false))?;
+                .map_err(Failure::for_read)?;
         params
             .validate_response(&response)
-            .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::invalid_response)?;
         print_doctor_table(&response);
         Ok(0)
     }
@@ -351,16 +343,14 @@ pub(crate) async fn run_heavy(
             ObserveHeavyResponse
         )
     } else {
-        params
-            .validate()
-            .map_err(|error| Failure::from_core(error, false))?;
+        params.validate().map_err(Failure::for_read)?;
         let response: ObserveHeavyResponse =
             eliot_daemon::client_call_typed(&data_dir, "observe.heavy", &params)
                 .await
-                .map_err(|error| Failure::from_core(error, false))?;
+                .map_err(Failure::for_read)?;
         params
             .validate_response(&response)
-            .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::invalid_response)?;
         print_heavy_table(&response);
         Ok(0)
     }
@@ -525,16 +515,12 @@ pub(crate) async fn run_events(
         limit,
         filter: EventsFilter::default(),
     };
-    params
-        .validate()
-        .map_err(|error| Failure::from_core(error, false))?;
+    params.validate().map_err(Failure::for_read)?;
     let response: EventsReadResponse =
         eliot_daemon::client_call_typed(&data_dir, "events.read", &params)
             .await
-            .map_err(|error| Failure::from_core(error, false))?;
-    response
-        .validate(params.after)
-        .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::for_read)?;
+    response.validate(params.after).map_err(Failure::for_read)?;
     let result = serde_json::to_value(response)
         .map_err(|_| Failure::new(1, "unavailable: cannot render typed events.read response"))?;
     print_value(&result, json_output);
@@ -636,7 +622,7 @@ where
             Err(error) if is_transient_watch_error(&error) => {
                 consecutive += 1;
                 if consecutive > WATCH_TRANSIENT_RETRIES {
-                    let failure = Failure::from_core(error, false);
+                    let failure = Failure::for_read(error);
                     return WatchAttempt::Drained(match resume_after {
                         Some(after) => with_watch_resume_cursor(failure, after),
                         None => failure,
@@ -683,7 +669,7 @@ async fn watch_gap_failure(data_dir: &Path, after: i64, error: CoreError) -> Fai
         }
         _ => None,
     };
-    let failure = Failure::from_core(error, false);
+    let failure = Failure::for_read(error);
     match cursor {
         Some(cursor) => with_watch_resume_cursor(failure, cursor),
         None => with_watch_resume_cursor(failure, after),
@@ -722,7 +708,7 @@ pub(crate) async fn watch(
                 WatchAttempt::Ready(hi) => hi,
                 WatchAttempt::Cancelled => return Ok(0),
                 WatchAttempt::Fatal(error) => {
-                    return Err(Failure::from_core(error, false));
+                    return Err(Failure::for_read(error));
                 }
                 WatchAttempt::Drained(failure) => return Err(failure),
             }
@@ -735,9 +721,7 @@ pub(crate) async fn watch(
             wait_ms: 1_000,
             filter: filter.clone(),
         };
-        params
-            .validate()
-            .map_err(|error| Failure::from_core(error, false))?;
+        params.validate().map_err(Failure::for_read)?;
         let data_dir = data_dir.to_path_buf();
         let response = match watch_poll(
             || {
@@ -767,17 +751,12 @@ pub(crate) async fn watch(
                 return Err(watch_gap_failure(&data_dir, after, error).await);
             }
             WatchAttempt::Fatal(error) if is_watch_unreachable(&error) => {
-                return Err(with_watch_resume_cursor(
-                    Failure::from_core(error, false),
-                    after,
-                ));
+                return Err(with_watch_resume_cursor(Failure::for_read(error), after));
             }
-            WatchAttempt::Fatal(error) => return Err(Failure::from_core(error, false)),
+            WatchAttempt::Fatal(error) => return Err(Failure::for_read(error)),
             WatchAttempt::Drained(failure) => return Err(failure),
         };
-        response
-            .validate(params.after)
-            .map_err(|error| Failure::from_core(error, false))?;
+        response.validate(params.after).map_err(Failure::for_read)?;
         for event in &response.events {
             let value = serde_json::to_value(event).map_err(|_| {
                 Failure::new(1, "unavailable: cannot render typed events.subscribe event")
@@ -829,16 +808,14 @@ pub(crate) async fn read_agent_list(
     data_dir: &Path,
     params: &AgentListRequest,
 ) -> Result<AgentListResponse, Failure> {
-    params
-        .validate()
-        .map_err(|error| Failure::from_core(error, false))?;
+    params.validate().map_err(Failure::for_read)?;
     let response: AgentListResponse =
         eliot_daemon::client_call_typed(data_dir, "agent.list", params)
             .await
-            .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::for_read)?;
     params
         .validate_response(&response)
-        .map_err(|error| Failure::from_core(error, false))?;
+        .map_err(Failure::invalid_response)?;
     Ok(response)
 }
 
@@ -1146,16 +1123,14 @@ pub(crate) async fn run_why(
     if json_output {
         read_and_print!(&data_dir, json_output, "diagnose", params, DiagnoseResponse)
     } else {
-        params
-            .validate()
-            .map_err(|error| Failure::from_core(error, false))?;
+        params.validate().map_err(Failure::for_read)?;
         let response: DiagnoseResponse =
             eliot_daemon::client_call_typed(&data_dir, "diagnose", &params)
                 .await
-                .map_err(|error| Failure::from_core(error, false))?;
+                .map_err(Failure::for_read)?;
         params
             .validate_response(&response)
-            .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::invalid_response)?;
         print_why_diagnosis(&response);
         Ok(0)
     }

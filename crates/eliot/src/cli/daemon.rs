@@ -52,7 +52,7 @@ pub(crate) async fn run_daemon(
         None if foreground => {
             eliot_daemon::run(data_dir)
                 .await
-                .map_err(|error| Failure::from_core(error, false))?;
+                .map_err(Failure::for_read)?;
             Ok(0)
         }
         None => {
@@ -126,16 +126,14 @@ pub(crate) async fn run_maintenance(
 
 pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u8, Failure> {
     let params = DaemonStatusRequest::default();
-    params
-        .validate()
-        .map_err(|error| Failure::from_core(error, false))?;
+    params.validate().map_err(Failure::for_read)?;
     let response: DaemonStatusResponse =
         eliot_daemon::client_call_typed(&data_dir, "daemon.status", &params)
             .await
-            .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::for_read)?;
     params
         .validate_response(&response)
-        .map_err(|error| Failure::from_core(error, false))?;
+        .map_err(Failure::invalid_response)?;
     let mut value = serde_json::to_value(response)
         .map_err(|_| Failure::new(4, "daemon.status response is invalid"))?;
     if let Some(object) = value.as_object_mut() {
@@ -403,16 +401,14 @@ pub(crate) async fn shutdown_daemon(
     data_dir: &Path,
     params: &DaemonShutdownRequest,
 ) -> Result<DaemonShutdownResponse, Failure> {
-    params
-        .validate()
-        .map_err(|error| Failure::from_core(error, true))?;
+    params.validate().map_err(Failure::for_mutation)?;
     let response: DaemonShutdownResponse =
         eliot_daemon::client_call_typed(data_dir, "daemon.shutdown", params)
             .await
-            .map_err(|error| Failure::from_core(error, true))?;
+            .map_err(Failure::for_mutation)?;
     params
         .validate_response(&response)
-        .map_err(|_| Failure::new(4, "daemon.shutdown response is invalid"))?;
+        .map_err(Failure::invalid_response)?;
     Ok(response)
 }
 

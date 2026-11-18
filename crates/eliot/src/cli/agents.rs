@@ -717,13 +717,11 @@ pub(crate) async fn run_reparent(
         parent: args.parent,
         parent_generation: args.parent_generation,
     };
-    request
-        .validate()
-        .map_err(|error| Failure::from_core(error, true))?;
+    request.validate().map_err(Failure::for_mutation)?;
     let response: eliot_core::api::ReparentResponse =
         eliot_daemon::client_call_typed(&data_dir, "swarm.reparent", &request)
             .await
-            .map_err(|error| Failure::from_core(error, true))?;
+            .map_err(Failure::for_mutation)?;
     if response.id != request.id {
         return Err(Failure::new(4, "swarm.reparent response id differs"));
     }
@@ -760,16 +758,14 @@ pub(crate) async fn run_switch(
             base: args.base,
         },
     };
-    request
-        .validate()
-        .map_err(|error| Failure::from_core(error, true))?;
+    request.validate().map_err(Failure::for_mutation)?;
     let response: eliot_core::api::SwitchResponse =
         eliot_daemon::client_call_typed(&data_dir, "swarm.switch", &request)
             .await
-            .map_err(|error| Failure::from_core(error, true))?;
+            .map_err(Failure::for_mutation)?;
     request
         .validate_response(&response)
-        .map_err(|_| Failure::new(4, "switch response binding differs"))?;
+        .map_err(Failure::invalid_response)?;
     let exit = response_exit_code(response.state);
     print_value(
         &serde_json::to_value(response).map_err(|_| Failure::new(4, "invalid switch response"))?,
@@ -793,16 +789,14 @@ pub(crate) async fn run_handoff(
         task_command: args.task_command,
         commands: args.commands,
     };
-    request
-        .validate()
-        .map_err(|error| Failure::from_core(error, true))?;
+    request.validate().map_err(Failure::for_mutation)?;
     let response: eliot_core::api::HandoffResponse =
         eliot_daemon::client_call_typed(&data_dir, "swarm.handoff", &request)
             .await
-            .map_err(|error| Failure::from_core(error, true))?;
+            .map_err(Failure::for_mutation)?;
     request
         .validate_response(&response)
-        .map_err(|_| Failure::new(4, "handoff response binding differs"))?;
+        .map_err(Failure::invalid_response)?;
     print_value(
         &serde_json::to_value(response).map_err(|_| Failure::new(4, "invalid handoff response"))?,
         json_output,
@@ -877,16 +871,14 @@ pub(crate) async fn capture_exact_turn(
     agent: &str,
 ) -> Result<ExactTurnCapture, Failure> {
     let params = AgentGetRequest::new(agent);
-    params
-        .validate()
-        .map_err(|error| Failure::from_core(error, false))?;
+    params.validate().map_err(Failure::for_read)?;
     let response: AgentGetResponse =
         eliot_daemon::client_call_typed(data_dir, "agent.get", &params)
             .await
-            .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::for_read)?;
     params
         .validate_response(&response)
-        .map_err(|error| Failure::from_core(error, false))?;
+        .map_err(Failure::invalid_response)?;
     let turn_id = response
         .agent
         .active_turn
@@ -1032,16 +1024,14 @@ pub(crate) async fn swarm_wait(
     }
     let wait_ms = timeout_seconds.saturating_mul(1_000);
     let params = SwarmWaitRequest::new(commands, turns, mode, wait_ms);
-    params
-        .validate()
-        .map_err(|error| Failure::from_core(error, false))?;
+    params.validate().map_err(Failure::for_read)?;
     let response: SwarmWaitResponse =
         eliot_daemon::client_call_typed(data_dir, "swarm.wait", &params)
             .await
-            .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::for_read)?;
     params
         .validate_response(&response)
-        .map_err(|_| Failure::new(4, "swarm.wait response is invalid"))?;
+        .map_err(Failure::invalid_response)?;
     let value = serde_json::to_value(&response)
         .map_err(|_| Failure::new(4, "swarm.wait response is invalid"))?;
     print_value(&value, json_output);
@@ -1200,7 +1190,7 @@ pub(crate) async fn run_tree_change(
     }
     let value: Value = eliot_daemon::client_call_typed(&data_dir, method, &params)
         .await
-        .map_err(|e| Failure::from_core(e, true))?;
+        .map_err(Failure::for_mutation)?;
     print_value(&value, json_output);
     Ok(0)
 }
