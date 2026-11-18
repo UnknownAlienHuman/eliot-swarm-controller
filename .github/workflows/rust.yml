@@ -1,9 +1,9 @@
 name: Rust
 
+# Owner policy (2026-11-18): CI is not run on every PR or push. Run it on demand
+# (Actions > Rust > Run workflow) on Linux after a major stage, such as a new plugin.
+# Windows is covered by the local controller gate and live qualification.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -15,12 +15,8 @@ concurrency:
 
 jobs:
   build:
-    name: Rust (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    name: Rust (ubuntu-latest)
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -21,11 +21,14 @@ runtime or tooling. Select the next unchecked increment in the roadmap.
    changed packages only. This works for library-only and binary-only packages; no
    unconditional `--lib`.
 5. Runtime qualification uses actual installed vendor agents through Swarm on real tasks,
-   not synthetic/fake execution, test harness loops, or test edits. CI enforces static
-   validation only (formatting, warnings-denied Clippy, locked all-targets compilation);
-   it does not execute tests, call models, or provide runtime proof. Do not build test
-   frameworks or fake harnesses as detours. Record the exact binary hash, model, principal,
-   outcomes, and owned cleanup in the PR.
+   not synthetic/fake execution, test harness loops, or test edits. **Prove each change
+   live** on a private daemon. A whole-workspace `cargo test` run is not the gate. Do not
+   build test frameworks or fake harnesses as detours.
+   - CI enforces static validation only (formatting, warnings-denied Clippy, locked
+     all-targets compilation). It runs on Linux **on demand** after a major stage, such as
+     a new plugin, and not on every PR or push.
+   - CI does not execute tests, call models, or provide runtime proof.
+   - Record the exact binary hash, model, principal, outcomes, and owned cleanup in the PR.
 6. Tick completed work and record the actual static checks and real runtime evidence in
    the PR. Roadmap checkboxes are the only project status list; do not add permanent
    test/readiness reports or a readiness engine. Do not claim a runtime property from
