@@ -621,6 +621,7 @@ fn workspace_exceptions_stay_marker_bound_across_unknown_readback() {
         base_oid: "a".repeat(40),
         worktree_path: "/synthetic-worktree".to_owned(),
         frozen_setup: Vec::new(),
+        generated: None,
     };
     let start = store.submit_with_workspace("owner", SubmitCommand {
         id: start_id.clone(), target: None, selector: None, verb: "launch".to_owned(),

@@ -85,7 +85,7 @@ impl WorkspaceGit {
     /// the probe's sanitized environment (no inherited `GIT_*`). `None`
     /// without an origin, for a missing directory, or when Git cannot read
     /// it. The URL itself, which may embed credentials, never leaves here.
-    async fn origin_name(&self, common_dir: &str, deadline: Instant) -> Option<String> {
+    pub(crate) async fn origin_name(&self, common_dir: &str, deadline: Instant) -> Option<String> {
         let root = canonical_root(common_dir).ok()?;
         let output = self
             .git
@@ -156,6 +156,8 @@ impl WorkspaceGit {
         let deadline = Instant::now() + READ_TIME;
         let source = self.repository(repo_path, deadline).await?;
         self.validate_branch(&source.root, branch, deadline).await?;
+        self.require_branch_namespace_free(&source.root, branch, deadline)
+            .await?;
         let destination = destination_path(target)?;
         separate_target(&source, &destination)?;
         require_absent(&destination)?;
@@ -214,6 +216,56 @@ impl WorkspaceGit {
             base_oid,
             worktree_path: path_text(&destination)?,
         })
+    }
+
+    /// A requested branch must not collide with the branch namespace: an
+    /// existing branch `atlas` blocks `atlas/a1-task` (Git cannot create a
+    /// ref under an existing ref), and an existing `atlas/a1-task` blocks a
+    /// new `atlas`. The conflict is refused before admission.
+    async fn require_branch_namespace_free(
+        &self,
+        root: &Path,
+        branch: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let mut prefix = String::new();
+        for component in branch.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            if prefix.len() == branch.len() {
+                break;
+            }
+            if self.branch_oid(root, &prefix, deadline).await?.is_some() {
+                return Err(problem(
+                    "already_exists",
+                    "workspace branch conflicts with an existing branch",
+                ));
+            }
+        }
+        let pattern = format!("refs/heads/{branch}/");
+        let output = self
+            .git
+            .workspace_command(
+                root,
+                &["for-each-ref", "--format=%(refname)", &pattern],
+                deadline,
+            )
+            .await?;
+        if output.code != 0 {
+            return Err(problem(
+                "unknown",
+                "branch namespace check did not complete",
+            ));
+        }
+        if !output.stdout.is_empty() {
+            return Err(problem(
+                "already_exists",
+                "workspace branch conflicts with an existing branch namespace",
+            ));
+        }
+        Ok(())
     }
 
     /// Requires the manager's durable `creating` intent. This never spawns the
@@ -1020,6 +1072,11 @@ fn separate_target(source: &Repository, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Windows paths (including the trailing NUL) stay under 260 characters;
+/// the complete destination is budgeted before admission so generated
+/// names are always launchable.
+const MAX_DESTINATION_LEN: usize = 260;
+
 fn destination_path(path: &str) -> Result<PathBuf> {
     let path = Path::new(path);
     if !path.is_absolute()
@@ -1030,6 +1087,15 @@ fn destination_path(path: &str) -> Result<PathBuf> {
         return Err(problem(
             "invalid",
             "workspace path must be absolute without parent traversal",
+        ));
+    }
+    if path
+        .to_str()
+        .is_none_or(|text| text.len() >= MAX_DESTINATION_LEN)
+    {
+        return Err(problem(
+            "invalid",
+            "workspace path exceeds the Windows length limit",
         ));
     }
     #[cfg(windows)]
@@ -1310,6 +1376,65 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code, "unavailable");
+    }
+
+    #[test]
+    fn destination_path_budgets_the_windows_length_limit() {
+        let root = std::env::temp_dir();
+        let root_text = root.to_str().expect("temp dir is UTF-8");
+        let spare = MAX_DESTINATION_LEN
+            .saturating_sub(root_text.len())
+            .saturating_sub(2);
+        let fits = format!("{root_text}/{}", "d".repeat(spare));
+        assert!(fits.len() < MAX_DESTINATION_LEN);
+        assert!(destination_path(&fits).is_ok());
+        let overflow = format!("{root_text}/{}", "d".repeat(spare + 2));
+        assert!(overflow.len() >= MAX_DESTINATION_LEN);
+        assert_eq!(destination_path(&overflow).unwrap_err().code, "invalid");
+    }
+
+    #[tokio::test]
+    async fn freeze_resolves_namespace_conflicts() {
+        let fixture = WorkspaceGit::new().expect("resolve installed Git");
+        let root = TestRoot::new("naming-gate");
+        init_repo(&root.0);
+        git(&root.0, &["branch", "atlas"]);
+        let repo = path_text(&root.0).expect("fixture path is UTF-8");
+        let target = |leaf: &str| {
+            root.0
+                .join("worktrees")
+                .join(leaf)
+                .to_str()
+                .expect("target is UTF-8")
+                .to_owned()
+        };
+        // An existing branch `atlas` blocks `atlas/a1-task` before admission.
+        assert_eq!(
+            fixture
+                .freeze(&repo, "atlas/a1-task", None, &target("blocked"))
+                .await
+                .unwrap_err()
+                .code,
+            "already_exists"
+        );
+        git(&root.0, &["branch", "-D", "atlas"]);
+        git(&root.0, &["branch", "topic/sub"]);
+        // And an existing `topic/sub` blocks a new `topic`.
+        assert_eq!(
+            fixture
+                .freeze(&repo, "topic", None, &target("blocked-topic"))
+                .await
+                .unwrap_err()
+                .code,
+            "already_exists"
+        );
+        git(&root.0, &["branch", "-D", "topic/sub"]);
+        // A free branch freezes with the requested branch.
+        let frozen = fixture
+            .freeze(&repo, "atlas/a9-task", None, &target("pending-free"))
+            .await
+            .expect("free branch freezes");
+        assert_eq!(frozen.requested_branch, "atlas/a9-task");
     }
 
     #[tokio::test]

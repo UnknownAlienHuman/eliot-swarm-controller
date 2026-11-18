@@ -333,6 +333,7 @@ mod tests {
                 git: None,
                 interpreters: BTreeMap::new(),
                 run_env: Vec::new(),
+                workspace: crate::config::ProjectWorkspaceMode::Worktree,
             }]
         );
     }

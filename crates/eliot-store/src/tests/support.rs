@@ -85,6 +85,7 @@ pub(super) fn ready_managed_codex_agent(
         base_oid: base_oid.clone(),
         worktree_path: worktree_path.clone(),
         frozen_setup: Vec::new(),
+        generated: None,
     };
     let launch = store
         .submit_with_workspace(

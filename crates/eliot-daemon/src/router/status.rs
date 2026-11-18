@@ -1639,6 +1639,7 @@ mod tests {
                         base_oid: "b".repeat(40),
                         worktree_path: worktree,
                         frozen_setup: Vec::new(),
+                        generated: None,
                     },
                     now_ms(),
                 )

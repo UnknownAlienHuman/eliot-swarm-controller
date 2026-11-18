@@ -230,6 +230,128 @@ pub(super) fn validate_setup_file(file: &FrozenSetupFile) -> Result<()> {
     Ok(())
 }
 
+/// Windows length budget for a managed destination: the complete path,
+/// including the trailing NUL, stays under 260 characters so generated
+/// names are always launchable. Mirrors the daemon freeze gate.
+const MAX_FINAL_PATH_LEN: usize = 260;
+
+/// Finalize a daemon-prepared standard directory with the admitted Agent
+/// ID: `<project>/<agent>-<task-slug>` under the frozen worktrees parent.
+/// The Store is the only place that knows both the worktrees root (from the
+/// frozen placeholder's parent) and the admitted Agent ID, so the standard
+/// is implemented once here and never derives from caller command-id syntax.
+/// An explicitly requested branch always wins and is preserved; a `None`
+/// branch mints the standard branch. The finalized branch and path are
+/// validated here, not the frozen placeholder: the placeholder is short by
+/// construction while the finalized leaf carries the task slug.
+fn finalize_generated_naming(
+    connection: &Connection,
+    input: &WorkspacePreparationInput,
+    agent_id: &str,
+    naming: &core::GeneratedWorktreeNaming,
+) -> Result<(String, String)> {
+    require_nonempty(&naming.project_slug, "generated project slug")?;
+    require_nonempty(&naming.task_slug, "generated task slug")?;
+    let branch = match naming.branch.as_deref() {
+        Some(explicit) => {
+            require_nonempty(explicit, "requested workspace branch")?;
+            if explicit.starts_with('-') || explicit.contains('\0') {
+                return Err(Error::new("invalid", "invalid requested workspace branch"));
+            }
+            explicit.to_owned()
+        }
+        None => core::standard_branch(&naming.project_slug, agent_id, &naming.task_slug),
+    };
+    if branch.starts_with('-') || branch.contains('\0') {
+        return Err(Error::new("invalid", "invalid generated workspace branch"));
+    }
+    require_branch_namespace_free(connection, &branch)?;
+    let parent = std::path::Path::new(&input.worktree_path)
+        .parent()
+        .ok_or_else(|| Error::new("invalid", "generated worktree path has no parent"))?;
+    let path = parent.join(core::standard_leaf(agent_id, &naming.task_slug));
+    let path = path
+        .to_str()
+        .ok_or_else(|| Error::new("invalid", "generated worktree path is not valid UTF-8"))?;
+    require_absolute_workspace_path(path)?;
+    // The finalized leaf is longer than the frozen placeholder, so the
+    // complete destination is budgeted here; device names (such as `aux`)
+    // are refused even though the slugs escape them by construction.
+    if path.len() >= MAX_FINAL_PATH_LEN {
+        return Err(Error::new(
+            "invalid",
+            "generated worktree path exceeds the Windows length limit",
+        ));
+    }
+    if path
+        .replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .any(|part| {
+            let stem = part.split('.').next().unwrap_or(part);
+            core::is_windows_device_slug(stem)
+        })
+    {
+        return Err(Error::new(
+            "invalid",
+            "generated worktree path carries a Windows device name",
+        ));
+    }
+    if path == input.repo_path {
+        return Err(Error::new(
+            "invalid",
+            "prepared worktree must differ from owner repository",
+        ));
+    }
+    if load_workspace_by_path(connection, path)?.is_some() {
+        return Err(Error::new(
+            "id_conflict",
+            "generated worktree path is already managed",
+        ));
+    }
+    Ok((branch, path.to_owned()))
+}
+
+/// The finalized branch must not collide with the managed branch namespace:
+/// an existing managed `atlas` blocks a new `atlas/a1-task`, and an existing
+/// managed `atlas/a1-task` blocks a new `atlas`. Git-level collisions were
+/// already refused at freeze time for the placeholder prefix; this guards
+/// the finalized leaf admitted here.
+fn require_branch_namespace_free(connection: &Connection, branch: &str) -> Result<()> {
+    let mut statement = connection
+        .prepare("SELECT requested_branch FROM workspaces")
+        .map_err(sql_error)?;
+    let mut rows = statement.query([]).map_err(sql_error)?;
+    let mut existing: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().map_err(sql_error)? {
+        existing.push(row.get(0).map_err(sql_error)?);
+    }
+    let mut prefix = String::new();
+    for component in branch.split('/') {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        if prefix.len() == branch.len() {
+            break;
+        }
+        if existing.iter().any(|other| other == &prefix) {
+            return Err(Error::new(
+                "already_exists",
+                "generated worktree branch conflicts with an existing branch",
+            ));
+        }
+    }
+    let nested = format!("{branch}/");
+    if existing.iter().any(|other| other.starts_with(&nested)) {
+        return Err(Error::new(
+            "already_exists",
+            "generated worktree branch conflicts with an existing branch namespace",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_workspace_input(input: &WorkspacePreparationInput) -> Result<()> {
     if encode_json(input)?.len() > MAX_PAGE_BYTES {
         return Err(Error::new(
@@ -643,6 +765,13 @@ pub(super) fn admit_workspace_preparation(
             return Ok(());
         };
         require_workspace_sources_ready(tx, &input.repo_path, &input.frozen_setup, 0)?;
+        // A generated standard is finalized here, where the admitted Agent
+        // ID is known. Uniqueness comes from that ID, never from caller
+        // command-id syntax; an explicitly requested branch always wins.
+        let (requested_branch, worktree_path) = match input.generated.as_ref() {
+            Some(naming) => finalize_generated_naming(tx, input, &agent.id, naming)?,
+            None => (input.requested_branch.clone(), input.worktree_path.clone()),
+        };
         let workspace = WorkspacePreparation {
             agent: agent.id,
             target_generation: target,
@@ -650,10 +779,10 @@ pub(super) fn admit_workspace_preparation(
             project: input.project.clone(),
             repo_path: input.repo_path.clone(),
             repo_common_dir: input.repo_common_dir.clone(),
-            requested_branch: input.requested_branch.clone(),
+            requested_branch,
             base_ref: input.base_ref.clone(),
             base_oid: input.base_oid.clone(),
-            worktree_path: input.worktree_path.clone(),
+            worktree_path,
             frozen_setup: input.frozen_setup.clone(),
             phase: WorkspacePhase::Creating,
             setup_index: 0,
@@ -677,6 +806,15 @@ pub(super) fn admit_workspace_preparation(
                 workspace.requested_branch, workspace.base_ref, workspace.base_oid, workspace.worktree_path, encode_json(&workspace.frozen_setup)?,
                 workspace.outcome.as_ref().map(encode_json).transpose()?, now],
         ));
+        if input.generated.is_some() {
+            // The admitted Agent row still carries the frozen placeholder;
+            // rebind it to the finalized standard worktree so the dispatch
+            // gate and `swarm show` readback agree with the workspace row.
+            db!(tx.execute(
+                "UPDATE agents SET workspace = ?1 WHERE id = ?2",
+                params![workspace.worktree_path, agent_num],
+            ));
+        }
         events.push(workspace_event(tx, &workspace, now)?);
     } else if let Some(mut workspace) = load_workspace(tx, agent_num)? {
         if workspace.phase != WorkspacePhase::Ready

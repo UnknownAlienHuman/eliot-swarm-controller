@@ -424,7 +424,11 @@ pub(crate) struct LaunchArgs {
     pub(crate) workspace: Option<PathBuf>,
     #[arg(long, conflicts_with_all=["workspace","worktree","parent"])]
     pub(crate) chat: bool,
-    #[arg(long, value_name = "BRANCH")]
+    /// Prepare a managed worktree on a new branch. A value names the branch
+    /// explicitly; a bare `--worktree` generates the standard
+    /// `<project>/<agent>-<task-slug>` branch (use `--` before the prompt so
+    /// the prompt is not consumed as the value).
+    #[arg(long, value_name = "BRANCH", num_args(0..=1), default_missing_value = "")]
     pub(crate) worktree: Option<String>,
     #[arg(long, value_name = "REF", requires = "worktree")]
     pub(crate) base: Option<String>,
@@ -1553,6 +1557,39 @@ mod tests {
         assert!(args.profile.is_none());
         assert!(args.role.is_none());
         assert!(args.harness.is_none());
+    }
+
+    #[test]
+    fn launch_bare_worktree_means_generate_while_a_value_names_the_branch() {
+        let cli = Cli::try_parse_from([
+            "swarm",
+            "launch",
+            "--workspace",
+            ".",
+            "--worktree",
+            "--",
+            "Do things",
+        ])
+        .unwrap();
+        let Some(CliCommand::Launch(args)) = cli.command else {
+            panic!("launch required")
+        };
+        assert_eq!(args.worktree.as_deref(), Some(""));
+        assert_eq!(args.prompt.as_deref(), Some("Do things"));
+        let cli = Cli::try_parse_from([
+            "swarm",
+            "launch",
+            "--workspace",
+            ".",
+            "--worktree",
+            "feature/x",
+            "Do things",
+        ])
+        .unwrap();
+        let Some(CliCommand::Launch(args)) = cli.command else {
+            panic!("launch required")
+        };
+        assert_eq!(args.worktree.as_deref(), Some("feature/x"));
     }
 
     #[test]

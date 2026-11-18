@@ -2,6 +2,32 @@
 use super::*;
 use eliot_core::api::SwitchRequest;
 
+/// Whether a switch keeps its source checkout: it requests neither a
+/// workspace override nor a new branch. Reuse is selected before any
+/// preparation so the automatic worktree policy never mints (or fails to
+/// mint) a fresh worktree the replacement would drop anyway.
+fn reuse_source_checkout(launch: &eliot_core::api::SwitchLaunch) -> bool {
+    launch.workspace.is_none() && launch.worktree.is_none()
+}
+
+/// Whether a switch with no workspace override reuses the retained
+/// checkout: a freshly prepared worktree would leave the source's
+/// uncommitted edits behind in the old directory. Only an automatically
+/// minted worktree is dropped; an explicitly requested branch stays
+/// prepared from the retained checkout (its `generated.branch` is set).
+fn reuse_retained_checkout(
+    requested_workspace: Option<&str>,
+    prepared: &Option<WorkspacePreparationInput>,
+) -> bool {
+    requested_workspace.is_none()
+        && prepared.as_ref().is_some_and(|workspace| {
+            workspace
+                .generated
+                .as_ref()
+                .is_some_and(|naming| naming.branch.is_none())
+        })
+}
+
 impl Router {
     pub(super) async fn swarm_switch(
         &self,
@@ -70,9 +96,20 @@ impl Router {
                 })?;
             launch.args = request.launch.args(workspace)?;
             let scope = source.project_scope();
+            // A switch that requests neither a workspace nor a branch keeps
+            // the source checkout: reuse is selected before any preparation.
+            if reuse_source_checkout(&request.launch) {
+                launch.args["switch_reuse_source_checkout"] = json!(true);
+            }
             let mut prepared = self
                 .prepare_submission_after_authorization(launch, &Principal::Owner, false, false)
                 .await?;
+            if reuse_retained_checkout(request.launch.workspace.as_deref(), &prepared.workspace) {
+                prepared.workspace = None;
+                if let Some(args) = prepared.request.args.as_object_mut() {
+                    args.remove("workspace_preparation");
+                }
+            }
             // The replacement retains the source's authorization namespace for handoff.
             prepared.request.args["project"] = json!(scope);
             if let Some(workspace) = &mut prepared.workspace {
@@ -157,6 +194,73 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared_input(
+        generated: Option<eliot_core::GeneratedWorktreeNaming>,
+    ) -> WorkspacePreparationInput {
+        WorkspacePreparationInput {
+            project: "synthetic".to_owned(),
+            repo_path: "synthetic".to_owned(),
+            repo_common_dir: "synthetic/.git".to_owned(),
+            requested_branch: "atlas/a1-task".to_owned(),
+            base_ref: Some("main".to_owned()),
+            base_oid: "d".repeat(40),
+            worktree_path: "synthetic-worktree".to_owned(),
+            frozen_setup: Vec::new(),
+            generated,
+        }
+    }
+
+    #[test]
+    fn switch_without_a_workspace_or_branch_request_reuses_before_preparation() {
+        let bare = eliot_core::api::SwitchLaunch {
+            profile: Some("worker".to_owned()),
+            harness: None,
+            model: None,
+            effort: None,
+            auth: None,
+            cmd: None,
+            access: None,
+            workspace: None,
+            worktree: None,
+            base: None,
+        };
+        assert!(reuse_source_checkout(&bare));
+        let branched = eliot_core::api::SwitchLaunch {
+            worktree: Some("feature/manual".to_owned()),
+            ..bare.clone()
+        };
+        assert!(!reuse_source_checkout(&branched));
+        let moved = eliot_core::api::SwitchLaunch {
+            workspace: Some("/elsewhere".to_owned()),
+            ..bare.clone()
+        };
+        assert!(!reuse_source_checkout(&moved));
+    }
+
+    #[test]
+    fn switch_without_a_workspace_override_reuses_the_retained_checkout() {
+        let minted = prepared_input(Some(eliot_core::GeneratedWorktreeNaming {
+            project_slug: "atlas".to_owned(),
+            task_slug: "task".to_owned(),
+            branch: None,
+        }));
+        assert!(reuse_retained_checkout(None, &Some(minted)));
+        // An explicit override keeps its preparation, as does an explicitly
+        // requested branch prepared from the retained checkout.
+        assert!(!reuse_retained_checkout(Some("/elsewhere"), &None));
+        assert!(!reuse_retained_checkout(None, &None));
+        let explicit = prepared_input(Some(eliot_core::GeneratedWorktreeNaming {
+            project_slug: "atlas".to_owned(),
+            task_slug: "task".to_owned(),
+            branch: Some("feature/manual".to_owned()),
+        }));
+        assert!(!reuse_retained_checkout(None, &Some(explicit)));
+        assert!(!reuse_retained_checkout(
+            Some("/elsewhere"),
+            &Some(prepared_input(None))
+        ));
+    }
 
     #[tokio::test]
     async fn switch_preparation_failure_and_drain_retry_are_retained_without_launch() {

@@ -19,6 +19,7 @@ mod context;
 mod diagnostics;
 mod ids;
 mod mcp_policy;
+mod naming;
 mod native_child;
 mod native_store;
 mod observe;
@@ -48,6 +49,10 @@ pub use mcp_policy::{
     is_owner_swarm_stdio, is_swarm_executable_command, is_swarm_reserved_server_name,
     parse_snapshot_allow_list, parse_snapshot_cloud_hostname, strip_jsonc_comments,
     strip_jsonc_trailing_commas, url_host_equals, validate_allow_list,
+};
+pub use naming::{
+    FALLBACK_SLUG, MAX_PROJECT_SLUG_LEN, MAX_TASK_SLUG_LEN, is_windows_device_slug, project_slug,
+    standard_branch, standard_leaf, task_slug,
 };
 pub use native_child::{
     CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,
@@ -111,6 +116,20 @@ pub struct WorkspaceSetup {
     pub timeout_ms: u64,
 }
 
+/// Naming parts for a daemon-prepared standard worktree directory. The
+/// Store finalizes the directory (and, for generated branches, the branch)
+/// with the admitted Agent ID, so the standard never derives from caller
+/// command-id syntax. An absent value means a legacy preparation without a
+/// standard directory. An explicitly requested branch always wins and is
+/// carried in `branch`; a `None` branch mints the standard branch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratedWorktreeNaming {
+    pub project_slug: String,
+    pub task_slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspacePreparationInput {
     pub project: String,
@@ -121,6 +140,8 @@ pub struct WorkspacePreparationInput {
     pub base_oid: String,
     pub worktree_path: String,
     pub frozen_setup: Vec<WorkspaceSetup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<GeneratedWorktreeNaming>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

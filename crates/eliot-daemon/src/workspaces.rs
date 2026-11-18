@@ -201,23 +201,34 @@ impl WorkspaceManager {
         }
     }
 
+    /// Freeze an explicitly requested branch into the standard directory
+    /// (`<data_dir>/worktrees/<project>/<agent>-<task-slug>`). The branch
+    /// always wins; the directory is still finalized with the admitted Agent
+    /// ID by the Store, exactly like a generated worktree.
     pub(crate) async fn freeze_launch(
         &self,
         repo: &str,
         branch: &str,
         base_ref: Option<&str>,
+        project_slug: &str,
+        task_slug: &str,
         profile: &Value,
     ) -> Result<WorkspacePreparationInput> {
+        let project_slug = eliot_core::project_slug(project_slug);
+        let task_slug = eliot_core::task_slug(task_slug);
+        let pending = format!("pending-{}", Ulid::new().to_string().to_ascii_lowercase());
+        let branch = branch.to_owned();
         let target = self
             .inner
             .data_root
             .join("worktrees")
-            .join(Ulid::new().to_string());
+            .join(&project_slug)
+            .join(&pending);
         let target = target
             .to_str()
             .ok_or_else(|| problem("invalid", "managed workspace path is not UTF-8"))?;
         let frozen = WorkspaceGit::new()?
-            .freeze(repo, branch, base_ref, target)
+            .freeze(repo, &branch, base_ref, target)
             .await?;
         let frozen_setup = setup::freeze(profile, Path::new(&frozen.repo_path))?;
         let input = WorkspacePreparationInput {
@@ -229,6 +240,63 @@ impl WorkspaceManager {
             base_oid: frozen.base_oid,
             worktree_path: frozen.worktree_path,
             frozen_setup,
+            generated: Some(eliot_core::GeneratedWorktreeNaming {
+                project_slug,
+                task_slug,
+                branch: Some(branch),
+            }),
+        };
+        self.check_nonsecret(
+            serde_json::to_value(&input)
+                .map_err(|_| problem("invalid", "workspace preparation cannot be encoded"))?,
+        )?;
+        Ok(input)
+    }
+
+    /// Freeze a generated standard worktree (`<project>/<agent>-<task-slug>`
+    /// at `<data_dir>/worktrees/<project>/<agent>-<task-slug>`). The daemon
+    /// freezes the base OID, setup and a unique readable placeholder; the
+    /// Store finalizes the exact branch and path with the admitted Agent ID.
+    /// Uniqueness never derives from caller command-id syntax.
+    pub(crate) async fn freeze_launch_generated(
+        &self,
+        repo: &str,
+        project_slug: &str,
+        task_slug: &str,
+        base_ref: Option<&str>,
+        profile: &Value,
+    ) -> Result<WorkspacePreparationInput> {
+        let project_slug = eliot_core::project_slug(project_slug);
+        let task_slug = eliot_core::task_slug(task_slug);
+        let pending = format!("pending-{}", Ulid::new().to_string().to_ascii_lowercase());
+        let branch = format!("{project_slug}/{pending}");
+        let target = self
+            .inner
+            .data_root
+            .join("worktrees")
+            .join(&project_slug)
+            .join(&pending);
+        let target = target
+            .to_str()
+            .ok_or_else(|| problem("invalid", "managed workspace path is not UTF-8"))?;
+        let frozen = WorkspaceGit::new()?
+            .freeze(repo, &branch, base_ref, target)
+            .await?;
+        let frozen_setup = setup::freeze(profile, Path::new(&frozen.repo_path))?;
+        let input = WorkspacePreparationInput {
+            project: frozen.repo_path.clone(),
+            repo_path: frozen.repo_path,
+            repo_common_dir: frozen.repo_common_dir,
+            requested_branch: frozen.requested_branch,
+            base_ref: base_ref.map(str::to_owned),
+            base_oid: frozen.base_oid,
+            worktree_path: frozen.worktree_path,
+            frozen_setup,
+            generated: Some(eliot_core::GeneratedWorktreeNaming {
+                project_slug,
+                task_slug,
+                branch: None,
+            }),
         };
         self.check_nonsecret(
             serde_json::to_value(&input)
@@ -1847,6 +1915,7 @@ mod tests {
                 base_oid: "a".repeat(40),
                 worktree_path: worktree.display().to_string(),
                 frozen_setup: Vec::new(),
+                generated: None,
             };
             let mut store = eliot_store::Store::open(Path::new(":memory:")).unwrap();
             let launch_id = Ulid::new().to_string();
@@ -2065,6 +2134,7 @@ mod tests {
             base_oid: frozen.base_oid.clone(),
             worktree_path: frozen.worktree_path.clone(),
             frozen_setup: Vec::new(),
+            generated: None,
         };
         let request = SubmitCommand {
             id: id.clone(),

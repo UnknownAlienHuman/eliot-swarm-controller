@@ -188,6 +188,7 @@ fn native_store_binding_preserves_workspace_readiness_and_cancellation_fences() 
         base_oid: "a".repeat(40),
         worktree_path: "/synthetic-worktree".to_owned(),
         frozen_setup: Vec::new(),
+        generated: None,
     };
     request.args["project"] = json!(input.project);
     request.args["workspace"] = json!(input.repo_path);

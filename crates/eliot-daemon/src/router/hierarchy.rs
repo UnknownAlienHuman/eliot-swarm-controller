@@ -336,7 +336,10 @@ pub(super) fn check_agent_launch_authority(
             "Agent children share their parent's workspace",
         ));
     }
-    if request.args.get("worktree").is_some() || request.args.get("base").is_some() {
+    if request.args.get("worktree").is_some()
+        || request.args.get("base").is_some()
+        || request.args.get("auto_worktree").is_some()
+    {
         return Err(Error::new(
             "not_allowed",
             "Agent children cannot mint a new worktree",
@@ -1264,8 +1267,11 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        // The scope assertions below predate automatic worktrees; opt this
+        // fixture into the shared policy so top-level Owner launches keep
+        // their shared workspace here.
         let config = format!(
-            "{config}\n[projects.inner]\npath = {}\nprofiles = [\"stranger\"]\nactions = [\"launch\"]\n",
+            "{config}\n[projects.inner]\npath = {}\nprofiles = [\"stranger\"]\nactions = [\"launch\"]\nworkspace = \"shared\"\n",
             json!(main)
         );
         std::fs::write(root.join("config.toml"), &config).unwrap();

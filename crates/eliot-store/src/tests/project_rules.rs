@@ -274,6 +274,7 @@ fn project_stop_rejects_setup_ready_next_generation() {
             args: Vec::new(),
             timeout_ms: 1_000,
         }],
+        generated: None,
     };
     let launch = store
         .submit_with_workspace(
@@ -397,6 +398,7 @@ fn project_stop_cannot_cancel_a_new_workspace_generation_after_dispatch_admissio
         base_oid: base_oid.clone(),
         worktree_path: worktree_path.to_owned(),
         frozen_setup: Vec::new(),
+        generated: None,
     };
     let launch_id = Ulid::new().to_string();
     let launch = store

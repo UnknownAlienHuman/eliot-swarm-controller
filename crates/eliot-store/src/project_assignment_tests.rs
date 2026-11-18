@@ -68,6 +68,7 @@ fn managed_launch(
         base_oid: "0123456789abcdef0123456789abcdef01234567".into(),
         worktree_path: worktree.into(),
         frozen_setup: Vec::new(),
+        generated: None,
     };
     (request, input)
 }
@@ -364,6 +365,51 @@ fn manager_launch_reserves_atomically_and_legacy_launches_are_unchanged() {
         store.dispatch(&send.id, now).unwrap().value.state,
         CommandState::Dispatched
     );
+}
+
+#[test]
+fn manager_launch_binds_the_finalized_standard_path_never_the_placeholder() {
+    let now = Ulid::new().timestamp_ms() as i64;
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    register(&mut store, now);
+    let request = managed_request("alpha");
+    let (command, mut input) = managed_launch(
+        request.id.clone(),
+        "alpha",
+        "/synthetic-data/worktrees/alpha/pending-01k178manager",
+    );
+    input.generated = Some(eliot_core::GeneratedWorktreeNaming {
+        project_slug: "alpha".to_owned(),
+        task_slug: "nightly sync".to_owned(),
+        branch: None,
+    });
+    let reserved = store
+        .launch_project_manager(&request, Ok((command, Some(input))), now)
+        .unwrap()
+        .value;
+    assert_eq!(reserved.outcome, ProjectAssignmentOutcome::LaunchAdmitted);
+    let bound = reserved
+        .assignment
+        .workspace
+        .clone()
+        .expect("manager binds its worktree");
+    assert!(
+        !bound.contains("pending-"),
+        "a pending-* placeholder is never stored: {bound}"
+    );
+    let manager = store
+        .get_command(&request.id)
+        .unwrap()
+        .unwrap()
+        .target
+        .unwrap();
+    let agent = store.get_agent(&manager).unwrap().unwrap();
+    assert_eq!(agent.workspace.as_deref(), Some(bound.as_str()));
+    assert_eq!(
+        bound.replace('\\', "/"),
+        format!("/synthetic-data/worktrees/alpha/{manager}-nightly-sync")
+    );
+    assert!(store.workspace_assignment_bound(&bound).unwrap());
 }
 
 #[test]

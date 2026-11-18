@@ -254,7 +254,12 @@ These rules apply to plugins, services, hooks, scripts, checks, Git and workspac
 
 ## Workspace preparation
 
-`launch --worktree BRANCH [--base REF]` is pre-start work over one durable row:
+`launch [--worktree [BRANCH]] [--base REF]` is pre-start work over one
+durable row. A requested `BRANCH` always wins; a bare `--worktree` generates
+the standard branch below. A top-level Owner launch in a registered project
+whose `workspace` setting is `worktree` (the default) gets its own prepared
+worktree without any flag; workers keep sharing their parent's worktree
+through the parent link and never mint one.
 
 ```sql
 CREATE TABLE workspaces (
@@ -282,9 +287,34 @@ Admission resolves `REF^{commit}` locally, without fetch, and freezes the result
 It also freezes each note/setup file as bounded bytes or canonical allowed
 `path+size+digest`; dispatch verifies the digest before executing.
 The current opt-in creates a new branch; an existing branch is rejected rather than
-reset or renamed. Omitted `--base` means local `HEAD`. The destination is an opaque
-directory below `<data_dir>/worktrees`, independent of caller command-id syntax.
-Repository common-directory identity is frozen alongside the source checkout.
+reset or renamed, as is a branch that collides with the branch namespace (an
+existing `atlas` blocks `atlas/a1-task`, and vice versa). An explicit `--base`
+wins; an omitted `--base` means local `HEAD`. Repository common-directory
+identity is frozen alongside the source checkout.
+
+One naming standard, implemented once in the shared core and finalized in the
+Store with the admitted Agent ID:
+
+- `project`: the project's logical name as a slug (the owner's `[desktop]
+  display_names` entry, else the repository name of its `origin` remote,
+  else the folder of the repository's main checkout); registration IDs name
+  nothing a person reads and are never used;
+- `branch`: `<project>/<agent>-<task-slug>`, where the task slug is an ASCII,
+  bounded slug of the launch prompt's first line (`task` when empty);
+- `worktree path`: `<data_dir>/worktrees/<project>/<agent>-<task-slug>`.
+
+A requested branch name still wins, but even an explicit branch lands in the
+standard directory. Generated names are readable, unique per
+Agent, and never derived from caller command-id syntax: uniqueness comes from
+the admitted Agent ID, which no caller supplies. Windows device names
+(`aux`, `con`, `nul`, `com1` and the like) are escaped, and the complete
+destination path stays inside the Windows length limit, so generated names
+are always launchable. The daemon freezes a unique
+readable placeholder under the same parent; the Store finalizes the exact
+branch and leaf with the admitted Agent ID before the row is inserted, so
+same-ID retries read back the retained preparation instead of preparing a
+second worktree. `swarm show` carries the standard branch and worktree through
+the Agent's retained `branch` and `workspace` fields.
 
 Flow:
 
