@@ -478,39 +478,7 @@ impl DesktopApp {
     /// and pending rows are never offered: handoff stays in one scope,
     /// never across projects.
     fn handoff_targets(&self) -> Vec<&UiAgent> {
-        let listed = || {
-            self.nav
-                .agents
-                .iter()
-                .chain(self.nav.branches.values().flat_map(|branch| match branch {
-                    nav::Branch::Loaded { children, .. } => children.as_slice(),
-                    _ => &[],
-                }))
-        };
-        let scope = listed()
-            .find(|agent| agent.id == self.handoff.from)
-            .and_then(|agent| agent.scope())
-            .map(str::to_owned)
-            .filter(|scope| !scope.is_empty());
-        let mut seen = HashSet::new();
-        listed()
-            .filter(|agent| seen.insert(agent.id.as_str()))
-            .filter(|agent| agent.id != self.handoff.from)
-            .filter(|agent| {
-                scope
-                    .as_ref()
-                    .is_some_and(|scope| agent.scope() == Some(scope.as_str()))
-            })
-            .filter(|agent| {
-                !matches!(
-                    agent.state,
-                    eliot_core::AgentState::Stopped
-                        | eliot_core::AgentState::Failed
-                        | eliot_core::AgentState::Lost
-                        | eliot_core::AgentState::Unknown
-                )
-            })
-            .collect()
+        handoff_candidates(&self.handoff.from, &self.nav.agents, &self.nav.branches)
     }
 
     /// Whether a saved existing-Agent destination is still among the
@@ -1327,19 +1295,72 @@ fn small(text: impl Into<String>) -> TextBlock {
         .is_text_selection_enabled(true)
 }
 
+/// Live, non-source Agents of the navigation list in the source's
+/// authorization scope (the handoff picker flow): a missing source, an
+/// empty scope or an unknown one (a pending launch whose daemon row has
+/// not arrived) offers nothing, and pending rows are never offered.
+fn handoff_candidates<'a>(
+    from: &str,
+    agents: &'a [UiAgent],
+    branches: &'a std::collections::HashMap<String, nav::Branch>,
+) -> Vec<&'a UiAgent> {
+    let listed = || {
+        agents
+            .iter()
+            .chain(branches.values().flat_map(|branch| match branch {
+                nav::Branch::Loaded { children, .. } => children.as_slice(),
+                _ => &[],
+            }))
+    };
+    let scope = listed()
+        .find(|agent| agent.id == from)
+        .and_then(|agent| agent.scope())
+        .map(str::to_owned)
+        .filter(|scope| !scope.is_empty());
+    let mut seen = HashSet::new();
+    listed()
+        .filter(|agent| seen.insert(agent.id.as_str()))
+        .filter(|agent| agent.id != from)
+        .filter(|agent| {
+            scope
+                .as_ref()
+                .is_some_and(|scope| agent.scope() == Some(scope.as_str()))
+        })
+        .filter(|agent| {
+            !matches!(
+                agent.state,
+                eliot_core::AgentState::Stopped
+                    | eliot_core::AgentState::Failed
+                    | eliot_core::AgentState::Lost
+                    | eliot_core::AgentState::Unknown
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use eliot_core::AgentState;
 
     fn row(id: &str, generation: i64, pending: bool) -> UiAgent {
+        placed(id, generation, "p", Some("scope"), pending)
+    }
+
+    fn placed(
+        id: &str,
+        generation: i64,
+        project_id: &str,
+        scope: Option<&str>,
+        pending: bool,
+    ) -> UiAgent {
         UiAgent {
             id: id.to_owned(),
             generation,
             harness: "codex".to_owned(),
             state: AgentState::Idle,
-            project_id: "p".to_owned(),
-            project_scope: Some("scope".to_owned()),
+            project_id: project_id.to_owned(),
+            project_scope: scope.map(str::to_owned),
             repo_common_dir: None,
             workspace: None,
             parent: None,
@@ -1371,5 +1392,32 @@ mod tests {
             1,
             &pending_targets
         ));
+    }
+
+    #[test]
+    fn a_saved_destination_goes_stale_when_the_source_scope_disappears() {
+        use std::collections::HashMap;
+        // The destination shares the source's retained scope under another
+        // registration ID (a legacy row): filtering by ID would miss it.
+        let source = placed("a1", 1, "p", Some("/repo"), false);
+        let legacy = placed("a2", 1, "legacy", Some("/repo"), false);
+        let other_scope = placed("a3", 1, "p", Some("/elsewhere"), false);
+        let agents = vec![source.clone(), legacy.clone(), other_scope];
+        let branches: HashMap<String, nav::Branch> = HashMap::new();
+        // The picker flow offers the legacy row, and the saved choice is
+        // fresh against that flow.
+        let targets = handoff_candidates("a1", &agents, &branches);
+        assert!(targets.iter().any(|row| row.id == "a2"));
+        assert!(!targets.iter().any(|row| row.id == "a3"));
+        assert!(DesktopApp::existing_choice_fresh("a2", 1, &targets));
+        // The source scope disappears after the choice was saved (its
+        // daemon row is pending, so the scope is unknown): the same flow
+        // now offers nothing and the saved choice is stale.
+        let mut pending_source = source.clone();
+        pending_source.pending = true;
+        let agents = vec![pending_source, legacy.clone()];
+        let targets = handoff_candidates("a1", &agents, &branches);
+        assert!(targets.is_empty());
+        assert!(!DesktopApp::existing_choice_fresh("a2", 1, &targets));
     }
 }

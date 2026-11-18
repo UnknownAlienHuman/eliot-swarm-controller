@@ -544,23 +544,39 @@ mod tests {
     fn the_move_search_filters_by_effective_scope_never_the_workspace_path() {
         // The search derives its filter from the source row itself
         // ([`search_managers`] reads [`search_scope`]), exactly as the
-        // picker does: there is no caller-supplied filter to drift. If the
-        // search passed the workspace path, it would read nothing.
-        fn placed(id: &str, project_id: &str, workspace: &str, state: AgentState) -> UiAgent {
+        // picker does: there is no caller-supplied filter to drift. The
+        // source's retained scope differs from its recorded project ID, and
+        // a legacy destination shares the scope under another ID: querying
+        // by ID would miss it, querying by workspace path would read
+        // nothing.
+        fn placed(
+            id: &str,
+            project_id: &str,
+            scope: Option<&str>,
+            workspace: &str,
+            state: AgentState,
+        ) -> UiAgent {
             let mut row = agent(id, None, state, 1);
             row.project_id = project_id.to_owned();
+            row.project_scope = scope.map(str::to_owned);
             row.workspace = Some(workspace.to_owned());
             row
         }
-        let source = placed("a1", "p", "/repo", AgentState::Idle);
-        let same_scope = placed("a2", "p", "/repo", AgentState::Idle);
-        let same_workspace_other_scope = placed("a3", "q", "/repo", AgentState::Idle);
-        // The filter is the effective scope, never the workspace path.
-        assert_eq!(search_scope(&source), Some("p"));
+        let source = placed("a1", "p", Some("/repo"), "/repo/linked", AgentState::Idle);
+        let legacy_same_scope = placed("a2", "legacy", Some("/repo"), "/repo", AgentState::Idle);
+        let same_id_other_scope = placed(
+            "a3",
+            "p",
+            Some("/elsewhere"),
+            "/repo/linked",
+            AgentState::Idle,
+        );
+        // The filter is the effective scope, never the ID or workspace path.
+        assert_eq!(search_scope(&source), Some("/repo"));
         let rows = vec![
             source.clone(),
-            same_scope.clone(),
-            same_workspace_other_scope,
+            legacy_same_scope.clone(),
+            same_id_other_scope.clone(),
         ];
         let mut requests = Vec::new();
         let managers = crate::client::block_on(search_managers(&source, 10, 100, |request| {
@@ -569,15 +585,31 @@ mod tests {
             async move { Ok::<_, ()>(page) }
         }))
         .unwrap();
-        assert!(
-            requests.iter().all(|request| request.project.is_none()
-                && request.project_scope.as_deref() == Some("p"))
-        );
+        assert!(requests.iter().all(|request| request.project.is_none()
+            && request.project_scope.as_deref() == Some("/repo")));
         let ids: Vec<&str> = eligible_parents(&managers.agents, &[], &source)
             .iter()
             .map(|row| row.id.as_str())
             .collect();
         assert!(ids.contains(&"a2"), "same-scope agent missing: {ids:?}");
         assert!(!ids.contains(&"a3"));
+        // By recorded ID the legacy destination is invisible: an
+        // ID-filtered read returns only the source's own label.
+        let by_id = list(
+            &rows,
+            &AgentListRequest {
+                project: Some("p".to_owned()),
+                project_scope: None,
+                state: None,
+                limit: 10,
+                after: None,
+                ..AgentListRequest::default()
+            },
+        );
+        assert!(
+            !by_id.rows.iter().any(|row| row.id == "a2"),
+            "ID query must miss the legacy destination: {:?}",
+            by_id.rows.iter().map(|row| &row.id).collect::<Vec<_>>()
+        );
     }
 }

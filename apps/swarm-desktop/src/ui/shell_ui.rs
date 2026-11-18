@@ -706,20 +706,14 @@ impl DesktopApp {
     /// registration, or the repository's registration for a linked
     /// worktree checkout. None for chats and for folders outside the
     /// registered projects.
+    ///
+    /// Mirrors the daemon's [`matching_project`] precedence
+    /// (`crates/eliot-daemon/src/bootstrap.rs`): a linked worktree checkout
+    /// launches under its repository's registration (rank 2), never under
+    /// the linked worktree's own legacy registration (rank 1). A legacy
+    /// worktree entry cannot supersede the repository grant.
     pub(super) fn launch_registration(&self, checkout: &str) -> Option<&UiProject> {
-        let key = nav::path_key(checkout);
-        self.nav
-            .projects
-            .iter()
-            .find(|project| nav::path_key(&project.workspace) == key)
-            .or_else(|| {
-                self.nav.projects.iter().find(|project| {
-                    project
-                        .git_checkouts
-                        .iter()
-                        .any(|linked| nav::path_key(&linked.path) == key)
-                })
-            })
+        resolve_launch_registration(&self.nav.projects, checkout)
     }
 
     /// The project a new task starts in: its checkout, and its profile
@@ -2275,6 +2269,86 @@ fn task_dot(palette: Palette, agent: &UiAgent) -> View {
     }
 }
 
+/// Resolve the registration a checkout path launches under, mirroring the
+/// daemon's `matching_project` precedence
+/// (`crates/eliot-daemon/src/bootstrap.rs`): same repository (same
+/// `common_dir`) only, rank 2 for the repository's registration when the
+/// checkout is a linked worktree, rank 1 for an exact checkout match (or
+/// any same-repository registration when the checkout itself is linked).
+/// A legacy worktree entry cannot supersede the repository grant. `None`
+/// on no match or on an ambiguous tie (the daemon conflicts there).
+fn resolve_launch_registration<'a>(
+    projects: &'a [UiProject],
+    checkout: &str,
+) -> Option<&'a UiProject> {
+    let key = nav::path_key(checkout);
+    let (launch_common, launch_linked) = launch_identity(projects, &key)?;
+    let mut best: Option<&'a UiProject> = None;
+    let mut rank = 0;
+    let mut ambiguous = false;
+    for project in projects {
+        if nav::path_key(&project.common_dir) != nav::path_key(&launch_common) {
+            continue;
+        }
+        let registered_linked =
+            workspace_is_linked(&project.workspace, &project.common_dir, projects);
+        let candidate = if launch_linked && !registered_linked {
+            2
+        } else if launch_linked || nav::path_key(&project.workspace) == key {
+            1
+        } else {
+            continue;
+        };
+        if candidate > rank {
+            best = Some(project);
+            rank = candidate;
+            ambiguous = false;
+        } else if candidate == rank {
+            ambiguous = true;
+        }
+    }
+    if ambiguous { None } else { best }
+}
+
+/// The launch checkout's repository and whether it is a linked worktree:
+/// the live checkout inventory first, else the exact workspace match.
+/// Unknown checkouts have no repository.
+fn launch_identity(projects: &[UiProject], key: &str) -> Option<(String, bool)> {
+    for project in projects {
+        for view in &project.git_checkouts {
+            if nav::path_key(&view.path) == *key {
+                return Some((project.common_dir.clone(), !view.main));
+            }
+        }
+    }
+    let exact = projects
+        .iter()
+        .find(|project| nav::path_key(&project.workspace) == *key)?;
+    Some((
+        exact.common_dir.clone(),
+        workspace_is_linked(&exact.workspace, &exact.common_dir, projects),
+    ))
+}
+
+/// Whether a registration workspace is a linked worktree: its live
+/// inventory entry says so (`main == false`), searched across every
+/// registration's inventory (only one registration carries the shared
+/// inventory). Without inventory, the main checkout is the common
+/// directory's parent, so any other workspace in the repository is linked.
+fn workspace_is_linked(workspace: &str, common_dir: &str, projects: &[UiProject]) -> bool {
+    let key = nav::path_key(workspace);
+    for project in projects {
+        for view in &project.git_checkouts {
+            if nav::path_key(&view.path) == key {
+                return !view.main;
+            }
+        }
+    }
+    let common_key = nav::path_key(common_dir);
+    let parent = common_key.rsplit_once('/').map_or("", |(parent, _)| parent);
+    !parent.is_empty() && key != parent
+}
+
 /// The start of the local day, in ms since the epoch.
 fn today_start_ms() -> i64 {
     use chrono::{Local, TimeZone};
@@ -2283,4 +2357,66 @@ fn today_start_ms() -> i64 {
         .and_hms_opt(0, 0, 0)
         .and_then(|midnight| Local.from_local_datetime(&midnight).earliest())
         .map_or(0, |start| start.timestamp_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project(
+        id: &str,
+        workspace: &str,
+        common_dir: &str,
+        profiles: &[&str],
+        checkouts: Vec<(String, bool)>,
+    ) -> UiProject {
+        UiProject {
+            id: id.to_owned(),
+            profiles: profiles
+                .iter()
+                .map(|profile| (*profile).to_owned())
+                .collect(),
+            workspace: workspace.to_owned(),
+            common_dir: common_dir.to_owned(),
+            origin: None,
+            git_checkouts: checkouts
+                .into_iter()
+                .map(|(path, main)| eliot_core::api::ProjectCheckoutView {
+                    path,
+                    main,
+                    branch: None,
+                })
+                .collect(),
+            missing: false,
+        }
+    }
+
+    #[test]
+    fn linked_checkout_launches_under_the_repository_registration() {
+        // The daemon regression configuration
+        // (`linked_worktree_reuses_registered_checkout_and_its_exact_grants`):
+        // `repo` registers the main checkout, `legacy` registers the linked
+        // worktree in the same repository. Only one registration carries the
+        // shared checkout inventory.
+        let checkout = "/repo/checkout";
+        let linked = "/repo/linked";
+        let common = "/repo/checkout/.git";
+        let projects = vec![
+            project(
+                "repo",
+                checkout,
+                common,
+                &["chosen"],
+                vec![(checkout.to_owned(), true), (linked.to_owned(), false)],
+            ),
+            project("legacy", linked, common, &["chosen", "other"], vec![]),
+        ];
+        let resolved =
+            resolve_launch_registration(&projects, linked).expect("linked checkout resolves");
+        assert_eq!(resolved.id, "repo");
+        assert_eq!(resolved.profiles, vec!["chosen"]);
+        let main = resolve_launch_registration(&projects, checkout).expect("main resolves");
+        assert_eq!(main.id, "repo");
+        assert!(resolve_launch_registration(&projects, "/elsewhere").is_none());
+    }
 }
