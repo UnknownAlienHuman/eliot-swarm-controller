@@ -1122,18 +1122,22 @@ impl DesktopApp {
         }
     }
 
-    /// The registration ID the pending launch row carries: the launch
-    /// checkout's registered project (its repository's registration for a
-    /// linked worktree checkout), or none for chats and for folders
-    /// outside the registered projects. Never the workspace path: the
-    /// daemon's project label is a registration ID, not a directory.
+    /// The registration ID the pending launch row carries: the explicitly
+    /// chosen registered project's ID, when the launch still runs in its
+    /// checkout. "" for chats and for every other folder: the desktop
+    /// never re-implements the daemon's project resolution, so those rows
+    /// stay unknown until the daemon Agent row arrives. Never the
+    /// workspace path: the daemon's project label is a registration ID,
+    /// not a directory.
     fn launch_project_id(&self) -> String {
         if self.launch.chat {
             return String::new();
         }
-        self.launch_registration(&self.launch.workspace)
-            .map(|project| project.id.clone())
-            .unwrap_or_default()
+        chosen_project_id(
+            &self.nav.projects,
+            self.nav.selection.project.as_deref(),
+            &self.launch.workspace,
+        )
     }
 
     /// A start that did not go through gives its text back to the composer
@@ -1239,6 +1243,23 @@ impl DesktopApp {
     }
 }
 
+/// The pending row's project ID: the explicitly chosen registration's
+/// ID, when the launch still runs in that registration's checkout. Every
+/// other folder (a typed path, a subfolder, a linked checkout the daemon
+/// alone resolves) yields none: the row stays unknown until the daemon
+/// Agent row arrives.
+fn chosen_project_id(projects: &[UiProject], selected: Option<&str>, workspace: &str) -> String {
+    let Some(selected) = selected else {
+        return String::new();
+    };
+    let key = nav::path_key(workspace);
+    projects
+        .iter()
+        .find(|project| project.id == selected && nav::path_key(&project.workspace) == key)
+        .map(|project| project.id.clone())
+        .unwrap_or_default()
+}
+
 impl Submitted {
     /// The Recent entry a launch records: the submitted model and effort.
     fn recent(&self) -> Option<crate::settings::ModelRef> {
@@ -1336,6 +1357,47 @@ mod tests {
             model: Some(model.to_owned()),
             effort: Some(effort.to_owned()),
         })
+    }
+
+    fn project(id: &str, workspace: &str) -> UiProject {
+        UiProject {
+            id: id.to_owned(),
+            profiles: Vec::new(),
+            workspace: workspace.to_owned(),
+            common_dir: String::new(),
+            origin: None,
+            git_checkouts: Vec::new(),
+            missing: false,
+        }
+    }
+
+    #[test]
+    fn a_launch_from_an_arbitrary_folder_yields_an_unknown_pending_project() {
+        let projects = vec![project("p", "/repo/checkout")];
+        // The explicitly chosen registered project: the pending row
+        // carries its ID, and its scope still waits for the daemon row.
+        assert_eq!(
+            chosen_project_id(&projects, Some("p"), "/repo/checkout"),
+            "p"
+        );
+        // A typed folder the owner never picked as a project: unknown.
+        assert_eq!(chosen_project_id(&projects, None, "/elsewhere/work"), "");
+        // The chosen project, but the folder moved elsewhere: unknown.
+        assert_eq!(
+            chosen_project_id(&projects, Some("p"), "/elsewhere/work"),
+            ""
+        );
+        // A subfolder of the registered checkout: the daemon resolves the
+        // containing checkout, so the pending row stays unknown.
+        assert_eq!(
+            chosen_project_id(&projects, Some("p"), "/repo/checkout/sub"),
+            ""
+        );
+        // A registration that is gone: unknown.
+        assert_eq!(
+            chosen_project_id(&projects, Some("gone"), "/repo/checkout"),
+            ""
+        );
     }
 
     #[test]
