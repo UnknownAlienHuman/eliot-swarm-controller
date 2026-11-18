@@ -28,15 +28,19 @@ directories are recorded only by the Agent that created them through
 Existing worktree and native-subject facts are also reconciled
 when planning, without scanning arbitrary filesystem roots.
 
-`cleanup.plan {scope:self_tree|project|all,project?,older_than?,after?}` changes no
-filesystem objects. It retains a bounded snapshot with per-item size, reason and
+`cleanup.plan {scope:self_tree|project|all,project?,older_than?,continuation?}` changes
+no filesystem objects. It retains a bounded snapshot with per-item size, reason and
 `safe`/`keep` verdict. The cutoff is an exclusive Unix-millisecond creation time.
 Only `registered` rows are candidates: settled rows (`removed`, `unknown`,
 `skipped(...)`) are attempt history read back from retained plans, and filtering
 them before the page cap keeps a settled prefix from starving later eligible
-rows. `after` is a stable page cursor (the greatest artifact id of the previous
-page); rows at or below it are skipped before the cap, so blocked-but-registered
-rows cannot pin later rows either. Automatic retirement filters the exact Agent,
+rows. The Store pages the final candidate order once (ordinary rows, then
+worktrees, then branches and native sessions, each oldest insertion first), and a
+truncated plan returns an opaque `continuation` token: the last shown artifact, the
+consumed project-row offsets, the settings revision those offsets were read at, and
+the ledger snapshot the pages are pinned to. Rows inserted after the snapshot surface
+on a fresh listing, never inside a page; a moved settings revision or an unresolvable
+cursor rejects the continued page as stale. Automatic retirement filters the exact Agent,
 generation and kind before the same cap.
 Agents are restricted to their frozen and current subtree; Owner selects project
 or all. Terminal means Stopped or Failed with no open native source, pending

@@ -450,6 +450,7 @@ mod tests {
                 candidate(ArtifactKind::Build, "target", "keep", Some(1)),
             ],
             truncated: false,
+            continuation: None,
         };
         let groups = cleanup_groups(&plan);
         let titles: Vec<&str> = groups.iter().map(|group| group.group.title()).collect();
@@ -516,6 +517,7 @@ mod tests {
                 candidate(ArtifactKind::Worktree, "wt", "keep", None),
             ],
             truncated: false,
+            continuation: None,
         };
         let item = |index: usize, outcome: &str, reason: Option<&str>, bytes: u64| {
             eliot_core::api::CleanupItemOutcome {

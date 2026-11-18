@@ -5,13 +5,16 @@ use eliot_store::Store;
 use std::io::ErrorKind;
 
 impl Router {
+    /// Project rows plus the settings revision they were read at. The
+    /// revision pins continuation offsets to one project set: callers reject
+    /// a continued page whose revision moved.
     pub(super) async fn plan_project_registrations(
         &self,
         request: &CleanupPlanRequest,
-    ) -> Result<Vec<CleanupCandidate>> {
+    ) -> Result<(Vec<CleanupCandidate>, Option<String>)> {
         // Settings entries have no creation timestamp for a cutoff.
         if request.scope == CleanupScope::SelfTree || request.older_than.is_some() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let policy = self.secret_policy_snapshot();
         let store = self.inner.store.lock().await;
@@ -22,7 +25,7 @@ impl Router {
             &policy,
         )?;
         let Some(revision) = &read.revision else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
         let mut items = Vec::new();
         for (id, project) in project_entries(&read)? {
@@ -59,7 +62,7 @@ impl Router {
                 reason,
             });
         }
-        Ok(items)
+        Ok((items, Some(revision.clone())))
     }
 
     /// The Store lock spans live-use rechecks, settings publication and the

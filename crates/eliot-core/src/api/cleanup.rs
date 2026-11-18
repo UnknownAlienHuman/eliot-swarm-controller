@@ -14,6 +14,18 @@ pub enum ArtifactKind {
     ProjectRegistration,
     Other,
 }
+impl ArtifactKind {
+    /// Candidate priority band for cleanup display order: ordinary rows
+    /// first, then worktrees, then branches and native sessions. The Store
+    /// mirrors this order in SQL; keep the two in sync.
+    pub fn cleanup_rank(&self) -> u8 {
+        match self {
+            ArtifactKind::Worktree => 1,
+            ArtifactKind::Branch | ArtifactKind::NativeSession => 2,
+            _ => 0,
+        }
+    }
+}
 
 pub const MAX_CLEANUP_ITEMS: usize = 64;
 
@@ -96,11 +108,13 @@ pub struct CleanupPlanRequest {
     /// Unix epoch milliseconds, exclusive creation cutoff.
     #[serde(default)]
     pub older_than: Option<i64>,
-    /// Stable page cursor: the greatest artifact id of the previous page.
-    /// Rows at or below the cursor are skipped before the page cap, so a
-    /// blocked-but-registered prefix cannot pin later rows forever.
+    /// Opaque continuation token from a previous `cleanup.plan` response.
+    /// It encodes the artifact cursor, the consumed registration offsets,
+    /// the settings revision those offsets were computed against, and the
+    /// ledger snapshot the pages are pinned to. Filters still come from the
+    /// request: keep them stable across pages.
     #[serde(default)]
-    pub after: Option<String>,
+    pub continuation: Option<String>,
 }
 impl CleanupPlanRequest {
     pub fn validate(&self) -> Result<()> {
@@ -112,16 +126,62 @@ impl CleanupPlanRequest {
                     .is_none_or(|p| p.is_empty() || p.len() > 4096))
             || (self.scope != CleanupScope::Project && self.project.is_some())
             || self
-                .after
+                .continuation
                 .as_deref()
-                .is_some_and(|after| cleanup_id(after).is_err())
+                .is_some_and(|token| PlanContinuation::decode(token).is_err())
         {
             return Err(Error::new(
                 "invalid",
-                "cleanup scope, cutoff or cursor is invalid",
+                "cleanup scope, cutoff or continuation is invalid",
             ));
         }
         Ok(())
+    }
+}
+
+/// Explicit paging state for one `cleanup.plan` listing, serialized as an
+/// opaque token in the plan response and echoed back in the next request.
+/// The artifact cursor always resolves against the pinned ledger snapshot,
+/// so concurrent registrations can neither skip nor repeat candidates, and
+/// registration offsets skip already-emitted project rows whose ids are
+/// minted fresh on every plan.
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanContinuation {
+    /// Artifact id of the last shown candidate, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_after: Option<String>,
+    /// Project registrations already emitted, in deterministic project order.
+    #[serde(default)]
+    pub safe_skipped: usize,
+    #[serde(default)]
+    pub kept_skipped: usize,
+    /// Settings revision the registration offsets were computed against.
+    /// A mismatch restarts the whole listing: offsets into a changed
+    /// project set are meaningless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regs_revision: Option<String>,
+    /// Ledger insertion bound the pages are pinned to. New registrations
+    /// land past it and surface on a fresh listing, never inside a page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_seq: Option<i64>,
+}
+impl PlanContinuation {
+    pub fn encode(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|_| Error::new("internal", "cleanup continuation could not encode"))
+    }
+    pub fn decode(text: &str) -> Result<Self> {
+        let parsed: PlanContinuation = serde_json::from_str(text)
+            .map_err(|_| Error::new("invalid", "cleanup continuation is invalid"))?;
+        if parsed
+            .artifact_after
+            .as_deref()
+            .is_some_and(|id| cleanup_id(id).is_err())
+        {
+            return Err(Error::new("invalid", "cleanup continuation is invalid"));
+        }
+        Ok(parsed)
     }
 }
 
@@ -141,6 +201,10 @@ pub struct CleanupPlan {
     pub created_at: i64,
     pub items: Vec<CleanupCandidate>,
     pub truncated: bool,
+    /// Opaque token for the next page, absent when the listing is complete.
+    /// Echo it as `continuation` to continue in final candidate order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]

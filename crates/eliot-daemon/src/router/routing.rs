@@ -387,6 +387,7 @@ mod tests {
                 .await
                 .list_agents(None, 10)
                 .unwrap()
+                .0
                 .is_empty()
         );
         drop(router);
