@@ -168,6 +168,8 @@ authorize a later force-stop of the conflicting Job.
 | first request / last resolved request | waiting / busy |
 | exact active turn terminal result | idle, clear that turn's pending requests |
 | normal session end / fatal error / proven loss | stopped / failed / lost |
+| restart of an idle generation with a retained native session, prior owned exit and reader drain proven, no unsettled work | stopped, `agent.stopped {reason: owned_exit_before_restart}` |
+| restart of a remaining live generation | lost, open turn and dispatched effects become unknown |
 | exact controlled producer generation ends (native observed child) | stopped, `agent.stopped {reason: ended_with_parent}` |
 
 An open stop/transition is a command beside the observed state, not another state
@@ -594,7 +596,7 @@ codes, never from message text. Exit codes ride alongside (`exit_code`, plus an
 | Evidence | Origin |
 |---|---|
 | Swarm validation, schema, queue or implementation failure | `swarm` |
-| A loss Swarm caused itself: a daemon restart fences every live generation | `swarm` at `daemon.restart` |
+| Loss of a live generation during daemon restart | `swarm` at `daemon.restart` |
 | Missing executable; OS, disk, network or external credential failure | `environment` |
 | Native harness refusal, including an unavailable model without upstream evidence | `harness` |
 | Structured upstream rate, quota, auth or model error | `provider` |

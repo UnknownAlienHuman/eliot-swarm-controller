@@ -1332,6 +1332,45 @@ fn validate_control_applied_outcome(
     Ok(())
 }
 
+pub(super) fn stop_exited_idle_on_restart_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    now: i64,
+) -> Result<Option<Event>> {
+    // Restart marks prior running process rows unknown before reaching here.
+    // Only the prior Host and monitor can have committed this proof of exit.
+    if !capacity::has_owned_exit_and_reader_drain_tx(tx, agent, generation)? {
+        return Ok(None);
+    }
+    let stopped = db!(tx.execute(
+        "UPDATE agents AS a SET state = 'stopped', updated_at = ?1
+         WHERE a.id = ?2 AND a.generation = ?3 AND a.state = 'idle' AND a.observe_only = 0
+           AND TRIM(a.native_scope) <> '' AND TRIM(a.native_ref) <> ''
+           AND a.active_turn IS NULL AND a.pending = '[]'
+           AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.agent = a.id
+               AND t.generation = a.generation AND t.state IN ('running', 'unknown'))
+           AND NOT EXISTS (SELECT 1 FROM pending_requests r WHERE r.agent = a.id
+               AND r.generation = a.generation AND r.state = 'pending')
+           AND NOT EXISTS (SELECT 1 FROM commands c WHERE c.target = a.id
+               AND c.generation = a.generation AND c.state IN ('accepted', 'queued', 'dispatched', 'unknown'))",
+        params![now, agent, generation],
+    ));
+    if stopped == 0 {
+        return Ok(None);
+    }
+    insert_daemon_event(
+        tx,
+        now,
+        "agent.stopped",
+        "agent",
+        Some(agent),
+        Some(generation),
+        json!({"agent_id": format_agent_id(agent), "reason": "owned_exit_before_restart"}),
+    )
+    .map(Some)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn transition_lost_tx(
     tx: &Transaction<'_>,

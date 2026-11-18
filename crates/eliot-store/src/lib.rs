@@ -1789,8 +1789,8 @@ impl Store {
             .map_err(sql_error)
     }
 
-    /// On daemon restart, fence every live generation as lost, retain active
-    /// turns as unknown, and mark dispatched commands unknown without replay.
+    /// On daemon restart, stop proven exited idle generations, fence remaining
+    /// live generations as lost, and retain uncertain effects without replay.
     pub fn recover_on_restart(&mut self, now: i64) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
         let result = self.recover_on_restart_inner(now);
@@ -1884,12 +1884,14 @@ impl Store {
 
         let mut statement = tx
             .prepare(
-                "SELECT id, generation FROM agents
+                "SELECT id, generation, state = 'idle' FROM agents
                  WHERE observe_only = 0 AND state IN ('starting', 'idle', 'busy', 'waiting') ORDER BY id",
             )
             .map_err(sql_error)?;
         let rows = statement
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get(2)?))
+            })
             .map_err(sql_error)?;
         let mut agents = Vec::new();
         for row in rows {
@@ -1897,7 +1899,14 @@ impl Store {
         }
         drop(statement);
 
-        for (agent_num, generation) in agents {
+        for (agent_num, generation, idle) in agents {
+            if idle
+                && let Some(event) =
+                    lifecycle::stop_exited_idle_on_restart_tx(&tx, agent_num, generation, now)?
+            {
+                events.push(event);
+                continue;
+            }
             lifecycle::transition_lost_tx(
                 &tx,
                 agent_num,
