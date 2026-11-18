@@ -164,7 +164,9 @@ fn schema_51_upgrade_records_the_legacy_generation_name_before_reminting() {
         .target
         .unwrap();
     store.dispatch(&id, now).unwrap();
-    store.connection.execute_batch("ALTER TABLE commands DROP COLUMN assignment_binding;
+    store.connection.execute_batch("ALTER TABLE turns DROP COLUMN resolution_source;
+                 DELETE FROM schema_migrations WHERE version=56;
+                 ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
                  DROP TABLE project_assignments;
                  DELETE FROM schema_migrations WHERE version=55;
@@ -655,7 +657,9 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "ALTER TABLE commands DROP COLUMN assignment_binding;
+            "ALTER TABLE turns DROP COLUMN resolution_source;
+                 DELETE FROM schema_migrations WHERE version=56;
+                 ALTER TABLE commands DROP COLUMN assignment_binding;
                  ALTER TABLE cleanup_plans DROP COLUMN assignment_binding;
                  DROP TABLE project_assignments;
                  DELETE FROM schema_migrations WHERE version=55;

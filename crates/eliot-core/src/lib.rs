@@ -786,6 +786,13 @@ pub struct Turn {
     /// recorded. Trailing field; absent on old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preceded_by: Option<String>,
+    /// Owner provenance of an owner-resolved turn: `Some("owner")` only when
+    /// the turn was settled by an owner `turn.resolve` assertion without
+    /// native terminal evidence. `None` for every natively settled turn.
+    /// Readbacks must never report an owner-resolved turn as native success.
+    /// Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_source: Option<String>,
 }
 
 /// Native token usage attributed to one terminal turn. Every member is

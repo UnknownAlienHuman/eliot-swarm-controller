@@ -1689,7 +1689,8 @@ impl Store {
             .connection
             .prepare(
                 "SELECT agent, generation, turn_id, state, status, outcome, native_status,
-                        final_text, started_at, completed_at, usage, config_revision, preceded_by
+                        final_text, started_at, completed_at, usage, config_revision, preceded_by,
+                        resolution_source
                  FROM turns WHERE agent = ?1 AND generation = ?2
                  ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
                  LIMIT ?3",
@@ -3324,6 +3325,9 @@ struct TurnRecord {
     /// whose terminal event settled the turn. NULL for success, running
     /// turns and rows settled before predecessors were recorded.
     preceded_by: Option<String>,
+    /// Owner provenance: 'owner' only for turns settled by an owner
+    /// `turn.resolve` assertion without native terminal evidence, else NULL.
+    resolution_source: Option<String>,
 }
 
 struct SourceStateRecord {
@@ -4657,6 +4661,7 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
         usage: row.get(10)?,
         config_revision: row.get(11)?,
         preceded_by: row.get(12)?,
+        resolution_source: row.get(13)?,
     })
 }
 
@@ -4692,6 +4697,7 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
         config_revision: record.config_revision,
         config: None,
         preceded_by: record.preceded_by.filter(|value| !value.is_empty()),
+        resolution_source: record.resolution_source.filter(|value| !value.is_empty()),
     })
 }
 
@@ -5019,7 +5025,8 @@ fn load_turn(
     let record = connection
         .query_row(
             "SELECT agent, generation, turn_id, state, status, outcome, native_status,
-                    final_text, started_at, completed_at, usage, config_revision, preceded_by
+                    final_text, started_at, completed_at, usage, config_revision, preceded_by,
+                    resolution_source
              FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
             params![agent, generation, turn_id],
             turn_record_from_row,

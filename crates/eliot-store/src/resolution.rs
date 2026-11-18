@@ -6,10 +6,10 @@
 //! or turn association, never replays an effect, and never touches capacity
 //! reservations, Agent rows, or any sibling command/turn.
 //!
-//! Provenance lives on existing surfaces only: a resolved command carries
+//! Provenance is retained where every readback can see it: a resolved command carries
 //! `resolution_source=owner` in its outcome, and each resolution emits a
-//! `command.resolved`/`turn.resolved` event with the same marker. No schema
-//! beyond the shared migrations is required.
+//! `command.resolved`/`turn.resolved` event with the same marker, and a resolved turn
+//! carries it in its row. An owner-resolved turn never reads back as native success.
 //!
 //! A turn resolves only when its generation is stored terminal (Eliot no
 //! longer controls it), when its generation is superseded by a later one
@@ -458,7 +458,7 @@ fn resolve_command_tx(
 
 /// Complete one proven-inactive unknown turn with its asserted status. The
 /// stored status and completion time describe the owner assertion, not a
-/// native receipt; final text and every command row are left untouched.
+/// native receipt; the row keeps resolution_source owner so no readback mistakes it for native success. Final text and every command row are left untouched.
 fn resolve_turn_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
@@ -472,7 +472,7 @@ fn resolve_turn_tx(
     };
     let changed = tx
         .execute(
-            "UPDATE turns SET state = ?1, status = ?2, outcome = ?3, completed_at = ?4
+            "UPDATE turns SET state = ?1, status = ?2, outcome = ?3, completed_at = ?4, resolution_source = 'owner'
              WHERE agent = ?5 AND generation = ?6 AND turn_id = ?7 AND state = 'unknown'",
             params![
                 turn_state_name(TurnState::Completed),

@@ -4086,15 +4086,27 @@ impl Router {
         match turn.state {
             TurnState::Running => "still_running",
             TurnState::Unknown => "unknown",
-            TurnState::Completed => match turn
-                .outcome
-                .unwrap_or_else(|| TurnOutcome::classify_legacy_status(turn.status.as_deref()))
-            {
-                TurnOutcome::Success => "succeeded",
-                TurnOutcome::Failure => "failed",
-                TurnOutcome::Interrupted => "interrupted",
-                TurnOutcome::Unknown => "unknown",
-            },
+            TurnState::Completed => {
+                // An owner assertion is not native evidence: a resolved turn
+                // keeps its Owner provenance in the turn row, and wait/result
+                // never report it as native success.
+                if turn.resolution_source.as_deref() == Some("owner")
+                    && turn.outcome.unwrap_or_else(|| {
+                        TurnOutcome::classify_legacy_status(turn.status.as_deref())
+                    }) == TurnOutcome::Success
+                {
+                    return "unknown";
+                }
+                match turn
+                    .outcome
+                    .unwrap_or_else(|| TurnOutcome::classify_legacy_status(turn.status.as_deref()))
+                {
+                    TurnOutcome::Success => "succeeded",
+                    TurnOutcome::Failure => "failed",
+                    TurnOutcome::Interrupted => "interrupted",
+                    TurnOutcome::Unknown => "unknown",
+                }
+            }
         }
     }
 
@@ -13867,6 +13879,101 @@ mod run_authorization_tests {
         .unwrap();
         assert!(response.completed);
         assert_eq!(response.results[0].status, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn swarm_wait_never_reports_owner_resolved_turn_as_native_success() {
+        use eliot_core::api::{TurnResolveRequest, TurnResolveStatus};
+        let router = router();
+        let (agent, send_id) = {
+            let mut store = router.inner.store.lock().await;
+            result_fixture(&mut store)
+        };
+        // Stopping retains the running turn as unknown; the owner then asserts
+        // it completed. The assertion releases the gate but carries no native
+        // evidence, so no readback may present it as native success.
+        {
+            let mut store = router.inner.store.lock().await;
+            let mut stop = SubmitCommand::new(ulid::Ulid::new().to_string(), "stop");
+            stop.target = Some(agent.clone());
+            stop.expected_generation = Some(1);
+            let stop_id = stop.id.clone();
+            store.submit("owner", stop, now_ms()).unwrap();
+            store.dispatch(&stop_id, now_ms()).unwrap();
+            store
+                .settle(&stop_id, CommandState::Applied, None, now_ms())
+                .unwrap();
+            assert_eq!(
+                store.get_turn(&agent, 1, "turn-1").unwrap().unwrap().state,
+                TurnState::Unknown
+            );
+            store
+                .resolve_turn(
+                    "owner",
+                    &TurnResolveRequest {
+                        id: ulid::Ulid::new().to_string(),
+                        agent: agent.clone(),
+                        generation: 1,
+                        turn_id: "turn-1".to_owned(),
+                        status: TurnResolveStatus::Completed,
+                        reason: "owner verified the uncertain turn".to_owned(),
+                    },
+                    None,
+                    now_ms(),
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_turn(&agent, 1, "turn-1")
+                    .unwrap()
+                    .unwrap()
+                    .resolution_source
+                    .as_deref(),
+                Some("owner")
+            );
+        }
+        // Both the direct turn entry and the bound send entry read unknown,
+        // never succeeded, while the completed wait still terminates.
+        let response: SwarmWaitResponse = serde_json::from_value(
+            router
+                .swarm_wait(
+                    &json!({"commands": [send_id], "turns": [{"agent": agent, "generation": 1, "turn_id": "turn-1"}], "mode": "all", "wait_ms": 0}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(response.completed);
+        assert_eq!(
+            response.results,
+            vec![
+                WaitEntryResult::new("command", &send_id, "unknown"),
+                WaitEntryResult::new("turn", format!("{agent}/1/turn-1"), "unknown"),
+            ]
+        );
+        // agent.result keeps the owner provenance on the turn row.
+        let result: AgentResultResponse = serde_json::from_value(
+            router
+                .agent_result(&json!({"id": agent}), &Principal::Owner)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.turns.len(), 1);
+        assert_eq!(result.turns[0].resolution_source.as_deref(), Some("owner"));
+        // turn.get agrees.
+        let turn: Turn = serde_json::from_value(
+            router
+                .turn_get(
+                    &json!({"agent": agent, "generation": 1, "turn_id": "turn-1"}),
+                    &Principal::Owner,
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(turn.resolution_source.as_deref(), Some("owner"));
     }
 
     #[tokio::test]
