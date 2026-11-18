@@ -127,7 +127,9 @@ pub struct HarnessModelsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     /// Optional Agent whose frozen launch snapshot selects the route/account
-    /// (the catalogue that Agent's `configure` draws from). Exclusive with
+    /// (exactly what that Agent's live session accepts: the session catalogue
+    /// when the session owns it, else the isolated reader under the frozen
+    /// auth -- the same set `configure` admits against). Exclusive with
     /// `profile`; the Agent's harness must match `harness`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
@@ -295,7 +297,9 @@ pub struct HarnessModelsResponse {
     /// `native` (live catalogue), `aliases` (Claude documented aliases and
     /// full model ids, each entry carrying `source = "documented_alias"`),
     /// `empty` (the native read ran but listed no models; details in
-    /// `note`), or `none` (no catalogue; details in `note`).
+    /// `note`), or `none` (no catalogue; details in `note`). For OpenCode
+    /// the `note` always names the session-true source (`session`,
+    /// `isolated`, `canonical`).
     pub catalogue: String,
     pub models: Vec<HarnessModelEntry>,
     /// Native default model id, when the harness names one.

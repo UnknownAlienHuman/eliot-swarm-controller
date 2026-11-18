@@ -2205,6 +2205,9 @@ fn agent_command_params(
 
 fn validate_agent_command_result(value: Value, harness: &str, command: &Command) -> Result<Value> {
     let verb = command.verb.as_str();
+    if verb == "models" {
+        return validate_models_catalog_result(value);
+    }
     match value.get("state").and_then(Value::as_str) {
         Some("applied") if verb == "send" => validate_send_result(value),
         Some("applied") if verb == "configure" && harness == "claude" => {
@@ -2302,6 +2305,47 @@ fn complete_plugin_command(
             let _ = reply.send(result);
         }
     }
+}
+
+/// A read-only live session catalogue: the `model.list` response shape
+/// with `session` provenance. No state is claimed; the shape alone proves
+/// the read.
+fn validate_models_catalog_result(value: Value) -> Result<Value> {
+    if value.get("provenance").and_then(Value::as_str) != Some("session") {
+        return Err(Error::new(
+            "source_integrity",
+            "plugin session catalogue omitted its live provenance",
+        ));
+    }
+    let models = value
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::new("source_integrity", "plugin session catalogue is malformed"))?;
+    if models.len() > 1024 {
+        return Err(Error::new(
+            "source_integrity",
+            "plugin session catalogue exceeds 1024 entries",
+        ));
+    }
+    for model in models {
+        let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+        if id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+            return Err(Error::new(
+                "source_integrity",
+                "plugin session catalogue entry is malformed",
+            ));
+        }
+    }
+    if value
+        .get("default")
+        .is_some_and(|default| !default.is_null())
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "plugin session catalogue names an unexpected default",
+        ));
+    }
+    Ok(value)
 }
 
 fn validate_send_result(value: Value) -> Result<Value> {
