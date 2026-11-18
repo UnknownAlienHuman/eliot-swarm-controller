@@ -1192,6 +1192,8 @@ pub fn title_bar_colors(s: &Scheme) -> [(usize, Rgb8); 12] {
 /// title bar on Windows 11).
 pub fn apply_title_bar(scheme: Option<&Scheme>) -> Result<(), String> {
     let hwnd = own_window().ok_or("the window is not shown yet")?;
+    #[cfg(target_env = "msvc")]
+    set_window_icon(hwnd);
     let window_id = window_id(hwnd)?;
     let run = || -> windows_core::Result<()> {
         let statics = windows_core::factory::<AppWindow, IAppWindowStatics>()?;
@@ -1233,6 +1235,29 @@ pub fn apply_title_bar(scheme: Option<&Scheme>) -> Result<(), String> {
         Ok(())
     };
     run().map_err(|error| format!("{error} ({:#010X})", error.code().0))
+}
+
+#[cfg(target_env = "msvc")]
+fn set_window_icon(hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        ICON_BIG, ICON_SMALL, LoadIconW, SendMessageW, WM_SETICON,
+    };
+
+    // Resource 101 is the icon group embedded by the Windows build script.
+    let resource = std::ptr::without_provenance(101);
+    // SAFETY: null selects this executable. LoadIconW returns a shared handle
+    // that remains valid without a call to DestroyIcon.
+    unsafe {
+        let module = GetModuleHandleW(std::ptr::null());
+        if module.is_null() {
+            return;
+        }
+        let icon = LoadIconW(module, resource);
+        if !icon.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as LPARAM);
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon as LPARAM);
+        }
+    }
 }
 
 /// This process's visible WinUI window (the desktop has one).
