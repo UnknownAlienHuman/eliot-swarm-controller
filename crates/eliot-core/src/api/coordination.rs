@@ -1317,6 +1317,10 @@ pub struct WhoWorker {
     #[serde(default)]
     pub is_self: bool,
     pub state: AgentState,
+    /// True for a private chat Agent, which carries no project. Mirrors
+    /// AgentSummary chat handling: projectless rows are valid only for chats.
+    #[serde(default)]
+    pub chat: bool,
     pub project: String,
     #[serde(deserialize_with = "nullable")]
     pub workspace: Option<String>,
@@ -1345,7 +1349,11 @@ impl WhoWorker {
                 "terminal Agents are never current workers",
             ));
         }
-        if self.project.trim().is_empty() {
+        if self.chat {
+            if !self.project.is_empty() {
+                return Err(Error::new("invalid", "who worker chat carries a project"));
+            }
+        } else if self.project.trim().is_empty() {
             return Err(Error::new("invalid", "who worker project is invalid"));
         }
         if !self.singly_owned && !self.dirty.is_empty() {
@@ -1845,12 +1853,33 @@ mod tests {
         assert!(round_trip.is_self);
     }
 
+    #[test]
+    fn who_projectless_chat_row_validates() {
+        let mut chat = who_worker("a1");
+        chat.chat = true;
+        chat.project = String::new();
+        chat.workspace = None;
+        chat.singly_owned = false;
+        chat.git_available = false;
+        chat.attribution_complete = false;
+        chat.attributed_edits = Vec::new();
+        chat.dirty = Vec::new();
+        chat.validate().expect("projectless chat row validates");
+        let mut project_chat = who_worker("a2");
+        project_chat.chat = true;
+        assert!(project_chat.validate().is_err());
+        let mut projectless = who_worker("a3");
+        projectless.project = String::new();
+        assert!(projectless.validate().is_err());
+    }
+
     fn who_worker(agent: &str) -> WhoWorker {
         WhoWorker {
             agent: agent.to_owned(),
             generation: 1,
             is_self: false,
             state: AgentState::Idle,
+            chat: false,
             project: "app".to_owned(),
             workspace: Some("/repo".to_owned()),
             singly_owned: true,

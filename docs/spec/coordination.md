@@ -436,6 +436,9 @@ The [Store migrations](../../crates/eliot-store/src/schema.rs) own the
 dirty, Git dirty files in a singly owned worktree, branch differences from frozen base,
 advisory claims and optionally bounded recent history. Git history is provenance, not
 current ownership. Unattributed dirty bytes in a shared checkout stay unattributed.
+A private chat Agent is a current worker with `chat: true` and no project; it never
+fails roster validation and never widens scope (an Agent caller still reads only its
+own project, the empty chat scope included).
 
 [Monitoring](monitoring.md#git-and-filesystem-monitor) owns `agent_edits`; coordination
 does not declare a duplicate table. Git-clean paths remove edit rows. Old generations
