@@ -136,10 +136,14 @@ server, verified live on installed 2.1.321); the plugin retains that
 observed set (names and statuses only, secret-redacted and bounded) and
 attaches it to the turn terminal, where the reducer merges it into the
 effective set with `mcp_servers_verified` true. An absent or malformed init
-inventory leaves the effective set unknown. `effective.effort` carries the
-pushed `--effort` level (null when omitted, never fabricated): the idle
-readback proves the native accepted the start carrying it, so it reads back
-`effort_verified` true; an unknown level settles as a definite failed start before any spawn.
+inventory leaves the effective set unknown. The profile effort is retained in
+`requested.effort` and passed as `--effort`. Initialize does not report the
+applied level, so `effective.effort` is null and `effort_verified` is false.
+`CLAUDE_CODE_EFFORT_LEVEL` takes precedence over the flag and native settings
+can cap effort through `maxEffortLevel`. A conflicting nonempty
+`CLAUDE_CODE_EFFORT_LEVEL` in the frozen process environment refuses the
+launch before spawn.
+[Claude Code environment variables](https://code.claude.com/docs/en/env-vars).
 
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
 Avoid modes that disable required hooks/instructions.
