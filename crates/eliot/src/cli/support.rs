@@ -346,11 +346,19 @@ pub(crate) async fn wait_for_linked_turn(
             if params.validate().is_err() {
                 return Err(linked);
             }
-            let root: CoreCommand =
-                match eliot_daemon::client_call_typed(data_dir, "command.get", &params).await {
-                    Ok(command) => command,
-                    Err(_) => return Err(linked),
-                };
+            // Best-effort diagnostic within the remaining budget: the final
+            // root readback must not outlive the wait deadline, and the
+            // linked outcome stays authoritative when the budget is gone or
+            // the readback fails.
+            let root: CoreCommand = match timeout_at(
+                deadline,
+                eliot_daemon::client_call_typed(data_dir, "command.get", &params),
+            )
+            .await
+            {
+                Ok(Ok(command)) => command,
+                _ => return Err(linked),
+            };
             if params.validate_response(&root).is_err() {
                 return Err(linked);
             }
@@ -459,6 +467,14 @@ pub(crate) fn print_value(value: &Value, json_output: bool) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn wait_deadline_rejects_zero_and_overflow() {
+        assert_eq!(wait_deadline(0).unwrap_err().exit_code, 2);
+        assert!(wait_deadline(u64::MAX).is_err());
+        let end = wait_deadline(5).expect("small wait has a deadline");
+        assert!(end > Instant::now());
+    }
 
     #[test]
     fn invalid_mutation_id_names_the_global_option() {

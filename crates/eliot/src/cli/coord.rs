@@ -6,7 +6,8 @@ use super::args::{
     VarArgs, VarCommand, VarGetArgs, VarSetArgs, WhoArgs,
 };
 use super::support::{
-    Failure, WAIT_POLL_INTERVAL, command_value, mutation_id, print_value, validate_limit,
+    Failure, command_value, mutation_id, print_value, sleep_before_deadline, validate_limit,
+    wait_call, wait_deadline,
 };
 use eliot_core::Command as CoreCommand;
 use eliot_core::api::discovery::{IdentityRequest, IdentityResponse};
@@ -24,9 +25,8 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    time::Duration,
 };
-use tokio::time::{Instant, sleep};
+use tokio::time::Instant;
 
 pub(crate) async fn run_cmd(
     CmdArgs { command }: CmdArgs,
@@ -257,18 +257,27 @@ pub(crate) async fn run_inbox(
         limit,
         after,
     };
-    request
-        .validate()
-        .map_err(|error| Failure::from_core(error, false))?;
-    let deadline = wait.map(|secs| Instant::now() + Duration::from_secs(secs));
+    request.validate().map_err(Failure::for_read)?;
+    // One checked absolute deadline bounds every wait RPC and sleep; a short
+    // requested wait can no longer last until the full RPC timeout, and an
+    // extreme value is rejected instead of panicking on `Instant` overflow.
+    let (deadline, waited) = inbox_deadline(wait)?;
     loop {
-        let response: MailInboxResponse =
-            eliot_daemon::client_call_typed(&data_dir, "mail.inbox", &request)
+        let response: MailInboxResponse = match deadline {
+            Some(end) => {
+                wait_call(
+                    eliot_daemon::client_call_typed(&data_dir, "mail.inbox", &request),
+                    end,
+                )
+                .await?
+            }
+            None => eliot_daemon::client_call_typed(&data_dir, "mail.inbox", &request)
                 .await
-                .map_err(|error| Failure::from_core(error, false))?;
+                .map_err(Failure::for_read)?,
+        };
         request
             .validate_response(&response)
-            .map_err(|_| Failure::new(4, "mail.inbox response is invalid"))?;
+            .map_err(Failure::invalid_response)?;
         let done = match deadline {
             None => true,
             Some(end) => !response.deliveries.is_empty() || Instant::now() >= end,
@@ -277,12 +286,33 @@ pub(crate) async fn run_inbox(
             let value = serde_json::to_value(&response)
                 .map_err(|_| Failure::new(4, "mail.inbox response is invalid"))?;
             print_value(&value, json_output);
-            if deadline.is_some() && response.deliveries.is_empty() {
+            if waited && response.deliveries.is_empty() {
                 return Ok(5);
             }
             return Ok(0);
         }
-        sleep(WAIT_POLL_INTERVAL).await;
+        match deadline {
+            Some(end) => sleep_before_deadline(end).await?,
+            // Without a wait every iteration is already done; this is only
+            // defensive against a future loop change.
+            None => return Ok(0),
+        }
+    }
+}
+
+/// Deadline plan for `inbox --wait`: no `--wait` reads once and exits 0
+/// even when the inbox is empty; `--wait 0` reads once and reports an empty
+/// inbox as a timeout (exit 5); a positive wait bounds every RPC and sleep
+/// by one checked absolute deadline. Extreme values are rejected instead of
+/// panicking on `Instant` overflow.
+pub(crate) fn inbox_deadline(wait: Option<u64>) -> Result<(Option<Instant>, bool), Failure> {
+    match wait {
+        None => Ok((None, false)),
+        Some(0) => Ok((None, true)),
+        Some(secs) => Ok((
+            Some(wait_deadline(secs).map_err(|_| Failure::new(2, "--wait value is too large"))?),
+            true,
+        )),
     }
 }
 
@@ -494,4 +524,23 @@ pub(crate) fn read_var_value_file(path: &Path) -> Result<String, Failure> {
         ));
     }
     String::from_utf8(bytes).map_err(|_| Failure::new(2, "value file must be UTF-8"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbox_deadline_plans_zero_wait_and_rejects_overflow() {
+        let (deadline, waited) = inbox_deadline(None).expect("no wait reads once");
+        assert!(deadline.is_none());
+        assert!(!waited);
+        let (deadline, waited) = inbox_deadline(Some(0)).expect("zero wait reads once");
+        assert!(deadline.is_none());
+        assert!(waited, "an empty zero-wait read reports a timeout");
+        let (deadline, waited) = inbox_deadline(Some(5)).expect("small wait has a deadline");
+        assert!(deadline.unwrap() > Instant::now());
+        assert!(waited);
+        assert!(inbox_deadline(Some(u64::MAX)).is_err());
+    }
 }

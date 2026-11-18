@@ -864,6 +864,9 @@ pub(crate) struct InboxArgs {
     pub(crate) limit: Option<usize>,
     #[arg(long, value_name = "DELIVERY")]
     pub(crate) after: Option<String>,
+    /// Wait up to SECS for the first delivery (0 returns after a single
+    /// read; extreme values are rejected). Every wait RPC and sleep is
+    /// bounded by one checked absolute deadline.
     #[arg(long, value_name = "SECS")]
     pub(crate) wait: Option<u64>,
 }
