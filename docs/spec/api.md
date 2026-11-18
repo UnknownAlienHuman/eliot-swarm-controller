@@ -24,6 +24,15 @@ revoked credentials reject, never become owner. No manual `--owner` step is requ
 This prevents accidental attribution errors; it is not isolation from hostile processes
 of the same OS user. Reads are scoped as well as writes.
 
+For Agent-originated commands, Store checks the caller's generation and live
+identity again in the transactions that admit and dispatch work. A missing,
+superseded or terminal generation rejects as `stale_generation`. A current
+nonterminal generation without its own credential rejects as `not_allowed`.
+Exact retained admission replay returns the existing command before the
+new-admission gate. Credentials are still required to reach Store through the
+API. Dispatch refusal leaves already-dispatched commands to their usual
+settlement paths.
+
 A running script has a distinct `Run` principal, bound to exactly one run command and
 its saved originating principal/scope. The daemon creates a random 256-bit token for that
 command and keeps only its SHA-256 hash in an in-memory registry with the command id and

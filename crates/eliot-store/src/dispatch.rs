@@ -28,9 +28,11 @@ fn dispatch_target_tx(tx: &Transaction<'_>, command: &CommandRecord) -> Result<(
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", "command target Agent was not found"))?;
     projects::validate_project_command_dispatch_tx(tx, command)?;
-    if command.command.principal.starts_with("agent:") && command.command.verb != "launch" {
+    if command.command.principal.starts_with("agent:") {
         let caller = hierarchy::parse_caller(tx, &command.command.principal)?;
-        hierarchy::caller_may_command(tx, &caller, &agent)?;
+        if command.command.verb != "launch" {
+            hierarchy::caller_may_command(tx, &caller, &agent)?;
+        }
     }
     let command_generation = command.command.generation.unwrap_or(agent.generation);
     if !matches!(command.command.verb.as_str(), "attach" | "detach") {
