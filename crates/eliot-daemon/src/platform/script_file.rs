@@ -127,27 +127,49 @@ impl Directory {
         bytes: &[u8],
     ) -> Result<()> {
         // Preserve the existing entry's permission bits on the replacement
-        // inode: the temporary starts 0600 (private by construction) and
-        // would otherwise strip execute and group/other readability on
-        // rename. Only owner/group/other read/write/execute carry over;
-        // set-user-ID, set-group-ID and sticky bits are never copied onto a
-        // saved edit. New private artifacts keep their restrictive creation
-        // mode; this path only replaces an existing project script.
+        // inode: the staged temporary starts 0600 inside a private 0700
+        // staging directory on the same filesystem and would otherwise strip
+        // execute and group/other readability on rename. Only
+        // owner/group/other read/write/execute carry over; set-user-ID,
+        // set-group-ID and sticky bits are never copied onto a saved edit.
+        // New private artifacts keep their restrictive creation mode; this
+        // path only replaces an existing project script. Staging in a
+        // private directory (not a same-directory `.tmp`) means a rejected
+        // save leaves no group/other-readable file behind.
         #[cfg(unix)]
-        let preserved = native::permission_bits(original).map_err(io)?;
+        let preserved = native::permission_bits(original).map_err(io)? & 0o777;
+        #[cfg(unix)]
+        let stage_name = format!(".{}.stage", ulid::Ulid::new());
+        #[cfg(unix)]
+        let stage = native::open(self.handle(), stage_name.as_ref(), true, true).map_err(io)?;
+        #[cfg(unix)]
+        let temp_name = "data";
+        #[cfg(unix)]
+        let mut temp = native::open(&stage, temp_name.as_ref(), false, true).map_err(io)?;
+        #[cfg(not(unix))]
         let temporary = format!(".{}.tmp", ulid::Ulid::new());
+        #[cfg(not(unix))]
         let mut temp = native::open(self.handle(), temporary.as_ref(), false, true).map_err(io)?;
         let mut replaced = false;
         let result = (|| {
             temp.write_all(bytes).map_err(io)?;
-            #[cfg(unix)]
-            native::apply_mode(&temp, preserved).map_err(io)?;
             temp.sync_all().map_err(io)?;
             let mut current = self.file(name).map_err(|_| conflict())?;
             if !native::same(original, &current).map_err(io)? || read(&mut current)? != expected {
                 return Err(conflict());
             }
+            // The conflict check passed, so the staged replacement may now
+            // carry the preserved mode; until this point it stayed 0600
+            // inside the private staging directory.
+            #[cfg(unix)]
+            native::apply_mode(&temp, preserved).map_err(io)?;
             // Directory handle + single leaf name: never follows an ancestor.
+            // The staging directory lives in the same parent, so the rename
+            // stays on one filesystem.
+            #[cfg(unix)]
+            native::replace_staged(self.handle(), &stage, temp_name, name)
+                .map_err(|error| Error::new("unavailable", format!("script rename: {error}")))?;
+            #[cfg(not(unix))]
             native::replace(self.handle(), &temp, &temporary, name)
                 .map_err(|error| Error::new("unavailable", format!("script rename: {error}")))?;
             replaced = true;
@@ -155,6 +177,9 @@ impl Directory {
             {
                 // POSIX renameat names its source instead of consuming the
                 // open inode. Do not report success for a substituted source.
+                // All 0o7777 bits are compared so an unexpected set-user-ID,
+                // set-group-ID or sticky bit on the installed entry is
+                // unknown, never success.
                 let verify = || -> Result<()> {
                     let mut installed = self.file(name)?;
                     if !native::same(&temp, &installed).map_err(io)?
@@ -168,13 +193,22 @@ impl Directory {
                 verify().map_err(|_| {
                     Error::new(
                         "unknown",
-                        "script replacement identity or bytes could not be verified",
+                        "script replacement identity, bytes or mode could not be verified",
                     )
                 })?;
             }
             native::sync(self.handle())
                 .map_err(|_| Error::new("unknown", "script replaced but directory sync failed"))
         })();
+        #[cfg(unix)]
+        {
+            if result.is_err() && !replaced {
+                native::remove_staged(self.handle(), &stage, &stage_name, temp_name);
+            } else {
+                native::remove_stage_dir(self.handle(), &stage_name);
+            }
+        }
+        #[cfg(not(unix))]
         if result.is_err() && !replaced {
             native::remove(self.handle(), &temp, &temporary);
         }
@@ -861,6 +895,7 @@ mod native {
         let b = b.metadata()?;
         Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
     }
+    #[allow(dead_code)]
     pub(super) fn replace(parent: &File, _: &File, temp: &str, target: &str) -> io::Result<()> {
         let a = name(OsStr::new(temp))?;
         let b = name(OsStr::new(target))?;
@@ -877,11 +912,35 @@ mod native {
         }
         Ok(())
     }
-    /// Permission bits a replacement inherits from the existing entry:
-    /// owner/group/other read/write/execute only. Set-user-ID, set-group-ID
-    /// and sticky bits are never carried onto a saved edit.
+    /// Rename a staged replacement out of its private staging directory into
+    /// the parent. Both directories live on the same filesystem (the stage
+    /// is a child of the parent), so the rename stays atomic.
+    pub(super) fn replace_staged(
+        parent: &File,
+        stage: &File,
+        temp: &str,
+        target: &str,
+    ) -> io::Result<()> {
+        let a = name(OsStr::new(temp))?;
+        let b = name(OsStr::new(target))?;
+        if unsafe {
+            libc::renameat(
+                stage.as_raw_fd(),
+                a.as_ptr(),
+                parent.as_raw_fd(),
+                b.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    /// Installed mode bits for the post-rename readback: all 0o7777 bits so
+    /// an unexpected set-user-ID, set-group-ID or sticky bit is unknown,
+    /// never success. The preserved value masks to 0o777 at the call site.
     pub(super) fn permission_bits(file: &File) -> io::Result<u32> {
-        Ok(file.metadata()?.mode() & 0o777)
+        Ok(file.metadata()?.mode() & 0o7777)
     }
     pub(super) fn apply_mode(file: &File, mode: u32) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
@@ -891,6 +950,28 @@ mod native {
         // unlinkat cannot consume the open inode. A name recheck followed by
         // unlink still races another directory writer; leave a failed temp for
         // explicit owner cleanup rather than possibly deleting their entry.
+    }
+    /// Remove a failed staged replacement: the staging directory name is a
+    /// fresh ULID, so no other writer can hold the same names and both
+    /// unlinks are safe. Best-effort; failures leave the private stage for
+    /// explicit owner cleanup.
+    pub(super) fn remove_staged(parent: &File, stage: &File, stage_name: &str, temp: &str) {
+        if let Ok(temp_name) = name(OsStr::new(temp)) {
+            unsafe {
+                libc::unlinkat(stage.as_raw_fd(), temp_name.as_ptr(), 0);
+            }
+        }
+        remove_stage_dir(parent, stage_name);
+    }
+    /// Remove the (now empty) staging directory after a successful rename.
+    /// Best-effort; a leftover private 0700 directory never exposes entry
+    /// bytes.
+    pub(super) fn remove_stage_dir(parent: &File, stage_name: &str) {
+        if let Ok(dir_name) = name(OsStr::new(stage_name)) {
+            unsafe {
+                libc::unlinkat(parent.as_raw_fd(), dir_name.as_ptr(), libc::AT_REMOVEDIR);
+            }
+        }
     }
     pub(super) fn sync(parent: &File) -> io::Result<()> {
         parent.sync_all()

@@ -70,14 +70,17 @@ uses the native `NtSetInformationFile(FileRenameInformationEx)` form of
 `FileRenameInfoEx` with the parent `RootDirectory` (the Win32 wrapper rejected this
 relative form with error 87 on the qualification host); no path-based fallback is used.
 Global temporaries inherit the private data-directory boundary. On Unix, existing libc
-`openat(O_NOFOLLOW)` / `renameat` keep operations relative to retained file descriptors;
-temporaries have mode 0600 and the directory is synced after rename. A replacement
-inherits the existing entry's owner/group/other read/write/execute bits onto the new
-inode before syncing (set-user-ID, set-group-ID and sticky bits are never copied);
-new private artifacts keep their restrictive creation mode. Unix reopens the
-installed target after rename and verifies it against the temporary's inode, bytes
-and inherited permission bits; a mismatch or inability to verify is `unknown`. Failed Unix temporaries remain for
-explicit owner cleanup: pathname-based `unlinkat` could delete another writer's substitute.
+`openat(O_NOFOLLOW)` / `renameat` keep operations relative to retained file descriptors.
+A replacement is staged in a private 0700 staging directory on the same filesystem
+until rename: the staged file stays 0600 through the final conflict check, so a
+rejected save leaves no group/other-readable `.tmp` behind. Only after the check
+does the staged inode inherit the existing entry's owner/group/other read/write/execute
+bits (set-user-ID, set-group-ID and sticky bits are never copied); new private
+artifacts keep their restrictive creation mode. The directory is synced after rename.
+Unix reopens the installed target after rename and verifies it against the temporary's
+inode, bytes and all 0o7777 permission bits; a mismatch or inability to verify is
+`unknown`. Failed staged files are removed with their uniquely-named staging directory
+(same-writer names cannot collide); a leftover private stage never exposes entry bytes.
 
 The conflict guarantee is daemon-save exclusion plus an immediate handle-based recheck,
 not atomic compare-and-swap against every external writer. Windows must permit target

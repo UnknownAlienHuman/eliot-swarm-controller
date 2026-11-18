@@ -799,6 +799,46 @@ mod tests {
         }
     }
 
+    /// A rejected save stages in a private directory until rename, so no
+    /// group/other-readable `.tmp` with the rejected edit remains behind.
+    #[cfg(unix)]
+    #[test]
+    fn rejected_save_leaves_no_readable_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let files = Files::new();
+        let policy = SecretPolicy::default();
+        files.put("conflict.txt", "old");
+        std::fs::set_permissions(
+            files.0.join("scripts").join("conflict.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let revision = files.read("conflict.txt", &policy).unwrap().revision;
+        // Another writer changes the entry before the save's final recheck.
+        std::fs::write(files.0.join("scripts").join("conflict.txt"), "other").unwrap();
+        let error = files
+            .save("conflict.txt", revision, "rejected-edit", &policy)
+            .unwrap_err();
+        assert_eq!(error.code, "conflict");
+        for entry in std::fs::read_dir(files.0.join("scripts")).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().expect("UTF-8 entry");
+            assert!(!name.ends_with(".tmp"), "leftover temp {name}");
+            assert!(!name.ends_with(".stage"), "leftover stage {name}");
+            if entry.file_type().unwrap().is_file() && name != "conflict.txt" {
+                assert_ne!(
+                    std::fs::read(entry.path()).unwrap(),
+                    b"rejected-edit",
+                    "rejected bytes leaked into {name}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read(files.0.join("scripts").join("conflict.txt")).unwrap(),
+            b"other"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn real_junctions_are_refused_and_pinned_ancestors_cannot_be_swapped() {
