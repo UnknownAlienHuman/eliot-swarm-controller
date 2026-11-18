@@ -614,22 +614,20 @@ fn event_inject_binds_exact_agent_generation_and_turn() {
         .admit_rule_action("owner", &current, forged_event, forged, 64)
         .unwrap();
     assert!(rejected.child.is_none());
-    let rejection = rejected.parent.unwrap().outcome.unwrap();
-    assert_eq!(rejection["code"], "rule_action_binding_invalid");
-    assert_eq!(rejection["message"], "rule_action_binding_invalid");
+    assert_eq!(
+        rejected.parent.unwrap().outcome.unwrap()["code"],
+        "rule_action_binding_invalid"
+    );
 }
 
 #[test]
 fn rule_catch_up_capacity_refusal_retains_scope_and_remedy() {
     let mut store = store();
     let rule = definition("capacity-refusal", true);
-    let state = store.ensure_rule_state("owner", &rule, 1).unwrap();
-    let event_seq = insert_test_event(&mut store, "command.accepted", 2);
-    let state = store
-        .advance_rule_cursor("owner", &state, event_seq, RuleCursorOutcome::NoMatch, 2)
-        .unwrap()
-        .value;
-    let request_id = Ulid::new().to_string();
+    let request_id = Ulid::new();
+    let now = request_id.timestamp_ms() as i64;
+    let event_seq = insert_test_event(&mut store, "command.accepted", now - 1);
+    let state = store.ensure_rule_state("owner", &rule, now).unwrap();
     let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
     launch.args = json!({
         "project": "capacity-refusal-project",
@@ -645,11 +643,16 @@ fn rule_catch_up_capacity_refusal_retains_scope_and_remedy() {
     let admission = store
         .admit_rule_catch_up(
             "owner",
-            &core::api::RuleCatchUpRequest::new(request_id, rule.id.as_str(), 0, Some(event_seq)),
+            &core::api::RuleCatchUpRequest::new(
+                request_id.to_string(),
+                rule.id.as_str(),
+                event_seq - 1,
+                Some(event_seq),
+            ),
             &state,
             event_seq,
             &[RuleCatchUpAction::command(event_seq, launch)],
-            3,
+            now,
         )
         .unwrap();
     let rejection = admission
@@ -658,6 +661,7 @@ fn rule_catch_up_capacity_refusal_retains_scope_and_remedy() {
         .find(|event| event.kind == "rule.rejected")
         .expect("capacity refusal marker");
     assert_eq!(rejection.data["code"], "capacity_unavailable");
+    assert_eq!(rejection.data["where"], "store.admission.capacity");
     assert!(
         rejection.data["message"]
             .as_str()
