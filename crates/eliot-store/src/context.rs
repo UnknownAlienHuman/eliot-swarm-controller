@@ -5,6 +5,12 @@ use eliot_core::{ContextItem, ContextOutcome, InjectArgs, InjectPoint};
 use serde::{Deserialize, Serialize};
 
 const CONTEXT_ITEMS_ARG: &str = "context_items";
+/// Headroom for the `turn.started` envelope around `context_outcomes`
+/// (command and native turn ids plus the model/effort the adapter reports).
+/// The CommitSink measures the same compact JSON against the same bound,
+/// so the claim-time receipt budget and the persisted receipt share exact
+/// serialization rules.
+const TURN_STARTED_HEAD_RESERVE_BYTES: usize = 2048;
 const MAX_CONTEXT_QUERY_ROWS: usize = 32;
 const MAX_CONTEXT_QUERY_BYTES: usize = MAX_FRAME_BYTES;
 type ContextCursor = (i64, i64);
@@ -172,6 +178,18 @@ pub(super) fn claim_next_input_tx(
     let mut selected = Vec::new();
     let mut selected_ids = Vec::new();
     let mut cursor = None;
+    // One compact-JSON outcome per claimed item, measured exactly as the
+    // CommitSink measures the persisted receipt; only the count varies, so
+    // the per-item cost (plus one array separator) is exact for this send.
+    let outcome_len = serde_json::to_vec(&ContextOutcome {
+        mechanism: "send".to_owned(),
+        application_point: InjectPoint::NextInput,
+        consumer_id: send.id.clone(),
+    })
+    .map_err(|_| Error::new("internal", "context outcome could not be encoded"))?
+    .len()
+    .saturating_add(1);
+    let mut outcomes_len = 0_usize;
     loop {
         let (records, next_cursor) = pending_context_batch_page(
             tx,
@@ -236,6 +254,20 @@ pub(super) fn claim_next_input_tx(
             });
             match check_rpc_frame("agent.command", &frame) {
                 Ok(()) => {
+                    // The mandatory turn.started receipt carries one outcome
+                    // per claimed item. Stop before the receipt would exceed
+                    // the persisted-event bound; the rest stays pending for
+                    // a later input instead of dispatching text the Store
+                    // could never associate. A single item always fits.
+                    let next_len = outcomes_len.saturating_add(outcome_len);
+                    if TURN_STARTED_HEAD_RESERVE_BYTES
+                        .saturating_add(next_len)
+                        .saturating_add(2)
+                        > MAX_EVENT_BYTES
+                    {
+                        break;
+                    }
+                    outcomes_len = next_len;
                     selected = candidate;
                     selected_ids.push(record.command.id.clone());
                 }
@@ -1470,4 +1502,139 @@ fn combined_send_text_len(args: &Value, items: &[ContextItem]) -> Result<usize> 
     // The native adapters join claimed context and the original user text
     // with exactly one blank line between each part.
     Ok(text_len.saturating_add(items.len().saturating_mul(2)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn live_next_input_agent(store: &mut Store, now: i64) -> String {
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents(project,harness,profile,workspace,state,generation,created_at,updated_at) VALUES ('p','codex','p','ws','idle',1,?1,?1)",
+                [now],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET effective = '{\"context_points\":[\"next_input\"]}' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        "a1".to_owned()
+    }
+
+    fn submit_inject(store: &mut Store, agent: &str, text: &str, now: i64) -> String {
+        let id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: id.clone(),
+                    target: Some(agent.to_owned()),
+                    selector: None,
+                    verb: "inject".to_owned(),
+                    args: json!({"text": text, "point": "next_input"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .unwrap();
+        id
+    }
+
+    fn submit_send(store: &mut Store, agent: &str, now: i64) -> String {
+        let id = Ulid::new().to_string();
+        store
+            .submit(
+                "owner",
+                SubmitCommand {
+                    id: id.clone(),
+                    target: Some(agent.to_owned()),
+                    selector: None,
+                    verb: "send".to_owned(),
+                    args: json!({"text": "go"}),
+                    expected_generation: Some(1),
+                    expected_turn_id: None,
+                    request_id: None,
+                    probe: false,
+                },
+                now,
+            )
+            .unwrap();
+        id
+    }
+
+    fn pending_injects(store: &Store) -> i64 {
+        store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM commands WHERE verb = 'inject' AND state IN ('accepted','queued')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The adapter receipt shape for a claimed `next_input` batch: one
+    /// outcome per item, exactly as `PluginHost` forwards them.
+    fn prospective_turn_started(send_id: &str, claimed: usize) -> serde_json::Value {
+        let outcomes: Vec<serde_json::Value> = (0..claimed)
+            .map(|_| {
+                json!({
+                    "mechanism": "send",
+                    "application_point": "next_input",
+                    "consumer_id": send_id,
+                })
+            })
+            .collect();
+        json!({
+            "command_id": send_id,
+            "turn_id": "0".repeat(26),
+            "context_outcomes": outcomes,
+        })
+    }
+
+    #[test]
+    fn next_input_claim_is_bounded_by_the_turn_started_receipt() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let agent = live_next_input_agent(&mut store, now);
+        let mut queued = Vec::new();
+        for _ in 0..1024 {
+            queued.push(submit_inject(&mut store, &agent, "x", now));
+        }
+        let send_id = submit_send(&mut store, &agent, now);
+        let claimed = store
+            .dispatch_with_context(&send_id, now)
+            .unwrap()
+            .value
+            .context_items;
+        // Every item fits the send text and frame budgets, but the
+        // mandatory per-item receipt would overflow the persisted-event
+        // bound: the claim must stop early, in FIFO order, and leave the
+        // rest pending for a later input.
+        assert!(!claimed.is_empty());
+        assert!(claimed.len() < queued.len());
+        assert_eq!(claimed[0].command_id, queued[0]);
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|item| item.command_id.as_str())
+                .collect::<Vec<_>>(),
+            queued[..claimed.len()]
+        );
+        let receipt = prospective_turn_started(&send_id, claimed.len());
+        assert!(serde_json::to_vec(&receipt).unwrap().len() <= MAX_EVENT_BYTES);
+        assert_eq!(
+            pending_injects(&store),
+            (queued.len() - claimed.len()) as i64
+        );
+    }
 }

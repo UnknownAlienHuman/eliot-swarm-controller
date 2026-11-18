@@ -454,7 +454,11 @@ immediate native effect with no queue consumer. Admission or queue acceptance is
 not application.
 
 For `next_input`, the router claims eligible, unexpired items as part of dispatching the
-next ordinary SEND and the adapter prepends them inside that same native send. Context
+next ordinary SEND and the adapter prepends them inside that same native send. The claim is
+bounded by the send budgets and by the mandatory `turn.started` receipt envelope (one outcome
+per claimed item, measured in the same compact JSON the CommitSink enforces): items past the
+receipt bound stay pending for a later input, so a dispatch never carries text the Store could
+not associate. Context
 commands become applied only when that original send is associated with its exact native
 turn. For `turn_safe_point`, an authenticated native hook claims eligible items for the
 captured turn; application is reported only at the requested native point. For
