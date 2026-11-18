@@ -824,7 +824,8 @@ fn capacity_migration_uses_commands_and_physical_facts_without_rewriting_snapsho
                  id INTEGER PRIMARY KEY, generation INTEGER NOT NULL,
                  observe_only INTEGER NOT NULL, profile TEXT NOT NULL,
                  profile_snapshot TEXT NOT NULL,
-                 state TEXT NOT NULL, project TEXT NOT NULL, harness TEXT NOT NULL
+                 state TEXT NOT NULL, project TEXT NOT NULL, harness TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE commands(
                  id TEXT PRIMARY KEY, principal TEXT NOT NULL, method TEXT NOT NULL,

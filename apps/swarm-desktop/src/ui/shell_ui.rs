@@ -2493,3 +2493,52 @@ fn today_start_ms() -> i64 {
         .and_then(|midnight| Local.from_local_datetime(&midnight).earliest())
         .map_or(0, |start| start.timestamp_millis())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: &str, title: &str) -> UiAgent {
+        UiAgent {
+            id: id.to_owned(),
+            generation: 1,
+            harness: "muse".to_owned(),
+            state: eliot_core::AgentState::Idle,
+            project_id: "/p".to_owned(),
+            project_scope: None,
+            repo_common_dir: None,
+            workspace: None,
+            parent: None,
+            updated_at: 1,
+            title: title.to_owned(),
+            native_child: false,
+            tokens: None,
+            chat: false,
+            archived: false,
+            pending: false,
+        }
+    }
+
+    fn ids(loaded: &[UiAgent]) -> Vec<(&str, &str)> {
+        loaded
+            .iter()
+            .map(|agent| (agent.id.as_str(), agent.title.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn head_merge_replaces_known_rows_and_appends_new_ones_without_duplicates() {
+        // A head refresh (first recent page) or an attention fetch merges
+        // into the loaded history: known ids refresh in place, the rest
+        // append, so older Show more pages survive the poll.
+        let mut loaded = vec![row("a1", "old"), row("a2", "two")];
+        merge_head_rows(&mut loaded, vec![row("a2", "new"), row("a3", "three")]);
+        assert_eq!(
+            ids(&loaded),
+            [("a1", "old"), ("a2", "new"), ("a3", "three")]
+        );
+        // A repeated poll with the same rows never duplicates.
+        merge_head_rows(&mut loaded, vec![row("a2", "new"), row("a3", "three")]);
+        assert_eq!(ids(&loaded).len(), 3);
+    }
+}
