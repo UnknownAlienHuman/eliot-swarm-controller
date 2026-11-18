@@ -183,6 +183,10 @@ const METHODS: &[Method] = &[
     method!("swarm.switch", SwitchRequest, SwitchResponse, true, true, "Launch a new Agent session, then atomically hand off to it; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"task_command":"retained-task","commands":[],"launch":{"harness":"antigravity","model":"gemini-4-hydrogen-low"}}),
     method!("swarm.handoff", HandoffRequest, HandoffResponse, true, true, "Transfer selected undispatched inputs and children to an Agent; Owner only.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"to":"a2","to_generation":1,"task_command":"retained-task","commands":[]}),
     method!("command.cancel", CommandCancelRequest, CommandCancelResponse, true, true, "Withdraw one undispatched handoff input with no native effect; Owner only.", {"id":EXAMPLE_ID,"command_id":"retained-handoff/send-0"}),
+    method!("project.assignment.get", ProjectAssignmentGetRequest, ProjectAssignment, false, false, "Read a registered project's current manager and epoch.", {"project":"project-1"}),
+    method!("project.assignment.claim", ProjectAssignmentClaimRequest, ProjectAssignmentResult, false, true, "Claim a project for an eligible local manager under Owner policy.", {"id":EXAMPLE_ID,"project":"project-1","manager":{"kind":"local","agent":"a1","generation":1}}),
+    method!("project.assignment.launch", ProjectAssignmentLaunchRequest, ProjectAssignmentResult, true, true, "Reserve a free project and admit a manager launch in one transaction.", {"id":EXAMPLE_ID,"project":"project-1","profile":"chk-codex"}),
+    method!("project.assignment.release", ProjectAssignmentReleaseRequest, ProjectAssignmentResult, false, true, "Release the current manager by expected epoch.", {"id":EXAMPLE_ID,"project":"project-1","expected_epoch":1}),
     method!("project.get", ProjectGetRequest, ProjectRegistrationView, true, false, "Read one approved project registration.", {"id":"project-1"}),
     method!("workspace.list", WorkspaceListRequest, WorkspaceListResponse, true, false, "Page the managed worktrees Swarm created, with total and cursor.", {"limit":100}),
     method!(
@@ -427,6 +431,10 @@ impl Router {
         let identity = self.identity(principal).await?;
         let aliases: &[&str] = match method.name {
             "api.identity" => &["swarm identity"],
+            "project.assignment.get" => &["swarm project assignment get"],
+            "project.assignment.claim" => &["swarm project assignment claim"],
+            "project.assignment.launch" => &["swarm project assignment launch"],
+            "project.assignment.release" => &["swarm project assignment release"],
             "who" => &["swarm who"],
             "claim.set" => &["swarm claim set"],
             "claim.list" => &["swarm claim list"],

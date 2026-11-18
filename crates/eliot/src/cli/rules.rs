@@ -79,8 +79,12 @@ pub(crate) async fn run_project(
     ProjectArgs { command }: ProjectArgs,
     data_dir: PathBuf,
     json_output: bool,
+    id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
+        ProjectCommand::Assignment(args) => {
+            super::project_assignment::run(args.command, &data_dir, json_output, id).await
+        }
         ProjectCommand::List => {
             let response = eliot_daemon::client_call(&data_dir, "project.list", json!({}))
                 .await

@@ -39,10 +39,12 @@ impl Failure {
             1
         } else {
             match error.code.as_str() {
-                "rejected"
+                "assignment_occupied"
+                | "rejected"
                 | "not_allowed"
                 | "bad_state"
                 | "stale_generation"
+                | "stale_assignment"
                 | "stale_round"
                 | "invalid"
                 | "unsupported"
