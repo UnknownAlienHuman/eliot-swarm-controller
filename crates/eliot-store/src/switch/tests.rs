@@ -583,3 +583,320 @@ fn switch_savepoint_rolls_back_partial_claim_transfer_on_hierarchy_failure() {
         CommandState::Accepted
     );
 }
+
+fn register_project(store: &mut Store, id: &str) {
+    store
+        .upsert_project_registration(
+            "owner",
+            &ProjectRegistrationInput {
+                id: id.into(),
+                checkout: format!("/managed/{id}"),
+                repo_common_dir: format!("/managed/{id}/.git"),
+                git: None,
+                profiles: vec!["approved".into()],
+                actions: vec!["launch".into()],
+                interpreters: std::collections::BTreeMap::new(),
+                run_env: Vec::new(),
+            },
+            now(),
+        )
+        .unwrap();
+}
+
+fn with_target(r: &SwitchRequest, project: &str) -> SwitchRequest {
+    let mut changed = r.clone();
+    changed.id = Ulid::new().to_string();
+    changed.launch.project = Some(project.to_owned());
+    changed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_target(
+    s: &mut Store,
+    id: &str,
+    plan: &SwitchResponse,
+    scope: &str,
+    registered_project: &str,
+    revision: Option<i64>,
+    blank_scope: bool,
+    preparation: Option<core::WorkspacePreparationInput>,
+) -> String {
+    let mut c = SubmitCommand::new(plan.launch_command.clone(), "launch");
+    c.args = json!({"project":scope,"workspace":"switch-unit","harness":"antigravity","model":"gemini-4-hydrogen-low","profile":"new","profile_snapshot":{"control":"tree","model":"gemini-4-hydrogen-low"},"registered_project":registered_project});
+    if let Some(revision) = revision {
+        c.args[core::api::SWITCH_PROJECT_REVISION_ARG] = json!(revision);
+    }
+    if blank_scope {
+        c.args[core::api::SWITCH_BLANK_SCOPE_ARG] = json!(true);
+    }
+    s.admit_switch_launch(id, c, preparation, now())
+        .unwrap()
+        .command
+        .target
+        .unwrap()
+}
+
+fn chat_source(s: &mut Store) -> (String, String) {
+    let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    launch.args = json!({"chat": true, "workspace": "chat-unit", "harness": "codex", "profile": "worker", "profile_snapshot": {"control": "self"}});
+    let admitted = s.submit("owner", launch, now()).unwrap().command;
+    let a = admitted.target.unwrap();
+    ready(s, &admitted.id, &a);
+    let mut send = SubmitCommand::new(Ulid::new().to_string(), "send");
+    send.target = Some(a.clone());
+    send.expected_generation = Some(1);
+    send.args = json!({"text":"continued task"});
+    let task = s.submit("owner", send, now()).unwrap().command.id;
+    (a, task)
+}
+
+#[test]
+fn switch_target_project_must_be_registered_at_reserve() {
+    let (mut s, r) = setup();
+    let target = with_target(&r, "ghost");
+    assert_eq!(
+        s.reserve_switch("owner", &target, &core::SecretPolicy::default(), now())
+            .unwrap_err()
+            .code,
+        "not_found"
+    );
+    assert_eq!(s.agent_count().unwrap(), 1);
+}
+
+#[test]
+fn switch_projectless_source_needs_a_target_project() {
+    let (mut s, r) = setup();
+    s.connection
+        .execute(
+            "UPDATE agents SET project='', project_scope=NULL WHERE id=?1",
+            [parse_agent_id(&r.from).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        s.reserve_switch("owner", &r, &core::SecretPolicy::default(), now())
+            .unwrap_err()
+            .code,
+        "invalid"
+    );
+    assert_eq!(s.agent_count().unwrap(), 1);
+}
+
+#[test]
+fn switch_continue_binds_target_registration_and_records_continuation() {
+    let (mut s, r) = setup();
+    register_project(&mut s, "app");
+    let revision = s
+        .get_project_registration("owner", "app")
+        .unwrap()
+        .unwrap()
+        .revision;
+    let t = with_target(&r, "app");
+    let p = begin(&mut s, &t);
+    // A prepared launch outside the target repository is refused.
+    let mut foreign = SubmitCommand::new(p.launch_command.clone(), "launch");
+    foreign.args = json!({"project":"switch","workspace":"switch-unit","harness":"antigravity","model":"gemini-4-hydrogen-low","profile":"new","profile_snapshot":{"control":"tree","model":"gemini-4-hydrogen-low"},"registered_project":"other"});
+    foreign.args[core::api::SWITCH_PROJECT_REVISION_ARG] = json!(revision);
+    assert_eq!(
+        s.admit_switch_launch(&t.id, foreign, None, now())
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+    // A revoked registration between preparation and admission is refused.
+    let mut stale = SubmitCommand::new(p.launch_command.clone(), "launch");
+    stale.args = json!({"project":"switch","workspace":"switch-unit","harness":"antigravity","model":"gemini-4-hydrogen-low","profile":"new","profile_snapshot":{"control":"tree","model":"gemini-4-hydrogen-low"},"registered_project":"app"});
+    stale.args[core::api::SWITCH_PROJECT_REVISION_ARG] = json!(revision + 1);
+    assert_eq!(
+        s.admit_switch_launch(&t.id, stale, None, now())
+            .unwrap_err()
+            .code,
+        "stale_assignment"
+    );
+    let b = admit_target(
+        &mut s,
+        &t.id,
+        &p,
+        "switch",
+        "app",
+        Some(revision),
+        false,
+        None,
+    );
+    let agent = s.get_agent(&b).unwrap().unwrap();
+    assert_eq!(agent.project, "app");
+    assert_eq!(agent.project_scope(), "switch");
+    ready(&mut s, &p.launch_command, &b);
+    let change = s
+        .finish_switch(&t.id, &core::SecretPolicy::default(), now())
+        .unwrap();
+    assert_eq!(change.value.state, CommandState::Applied);
+    assert!(
+        change
+            .events
+            .iter()
+            .any(|event| event.kind == "organization.changed")
+    );
+    let continued: Option<String> = s
+        .connection
+        .query_row(
+            "SELECT continued_from FROM chat_organization WHERE agent=?1",
+            [parse_agent_id(&b).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(continued.as_deref(), Some(t.from.as_str()));
+}
+
+#[test]
+fn switch_chat_source_continues_into_a_project_with_blank_scope() {
+    let mut s = Store::open(Path::new(":memory:")).unwrap();
+    register_project(&mut s, "app");
+    let revision = s
+        .get_project_registration("owner", "app")
+        .unwrap()
+        .unwrap()
+        .revision;
+    let (a, task) = chat_source(&mut s);
+    let request = SwitchRequest {
+        id: Ulid::new().to_string(),
+        from: a.clone(),
+        from_generation: 1,
+        task_command: task.clone(),
+        commands: vec![task],
+        launch: serde_json::from_value::<SwitchLaunch>(
+            json!({"harness":"antigravity","model":"gemini-4-hydrogen-low","project":"app"}),
+        )
+        .unwrap(),
+    };
+    let plan = begin(&mut s, &request);
+    let b = admit_target(
+        &mut s,
+        &request.id,
+        &plan,
+        "",
+        "app",
+        Some(revision),
+        true,
+        None,
+    );
+    let agent = s.get_agent(&b).unwrap().unwrap();
+    assert_eq!(agent.project, "app");
+    assert_eq!(agent.project_scope(), "");
+    ready(&mut s, &plan.launch_command, &b);
+    let result = s
+        .finish_switch(&request.id, &core::SecretPolicy::default(), now())
+        .unwrap()
+        .value;
+    assert_eq!(result.state, CommandState::Applied);
+    assert_eq!(result.handoff.unwrap().to, b);
+    let projection = s
+        .chat_organization(
+            "owner",
+            &core::api::ChatOrganizationRequest {
+                project: Some("app".to_owned()),
+                after: None,
+                archived: core::api::ArchivedFilter::Exclude,
+            },
+            &core::api::ScopeLimits::default(),
+            now(),
+        )
+        .unwrap();
+    let member = projection
+        .groups
+        .iter()
+        .flat_map(|group| &group.members)
+        .find(|member| member.agent == b)
+        .unwrap();
+    assert_eq!(member.continued_from.as_deref(), Some(a.as_str()));
+}
+
+#[test]
+fn switch_continue_accepts_preparation_bound_to_the_target_project() {
+    let mut s = Store::open(Path::new(":memory:")).unwrap();
+    register_project(&mut s, "app");
+    let revision = s
+        .get_project_registration("owner", "app")
+        .unwrap()
+        .unwrap()
+        .revision;
+    let (a, task) = chat_source(&mut s);
+    let request = SwitchRequest {
+        id: Ulid::new().to_string(),
+        from: a.clone(),
+        from_generation: 1,
+        task_command: task.clone(),
+        commands: vec![task],
+        launch: serde_json::from_value::<SwitchLaunch>(
+            json!({"harness":"antigravity","model":"gemini-4-hydrogen-low","project":"app"}),
+        )
+        .unwrap(),
+    };
+    let plan = begin(&mut s, &request);
+    // The worker freezes the target worktree before admission; the frozen
+    // preparation carries the target project, not the blank source scope.
+    let root = std::env::temp_dir().join(format!("eliot-k185-{}", Ulid::new()));
+    let repo = root.join("repo");
+    let preparation = core::WorkspacePreparationInput {
+        project: "app".to_owned(),
+        repo_path: repo.to_string_lossy().into_owned(),
+        repo_common_dir: repo.join(".git").to_string_lossy().into_owned(),
+        requested_branch: "swarm/k185-continue".to_owned(),
+        base_ref: None,
+        base_oid: "0".repeat(40),
+        worktree_path: root.join("wt").to_string_lossy().into_owned(),
+        frozen_setup: Vec::new(),
+        generated: None,
+    };
+    let b = admit_target(
+        &mut s,
+        &request.id,
+        &plan,
+        "",
+        "app",
+        Some(revision),
+        true,
+        Some(preparation.clone()),
+    );
+    let agent = s.get_agent(&b).unwrap().unwrap();
+    assert_eq!(agent.project, "app");
+    assert_eq!(agent.project_scope(), "");
+    // The frozen worktree still settles through the ordinary workspace
+    // lifecycle before native dispatch.
+    s.settle_workspace_creation(
+        &plan.launch_command,
+        1,
+        core::WorkspaceCreationOutcome::Verified {
+            repo_path: preparation.repo_path.clone(),
+            repo_common_dir: preparation.repo_common_dir.clone(),
+            worktree_path: preparation.worktree_path.clone(),
+            branch: preparation.requested_branch.clone(),
+            head: preparation.base_oid.clone(),
+        },
+        now(),
+    )
+    .unwrap();
+    ready(&mut s, &plan.launch_command, &b);
+    let result = s
+        .finish_switch(&request.id, &core::SecretPolicy::default(), now())
+        .unwrap()
+        .value;
+    assert_eq!(result.state, CommandState::Applied);
+    let stored: String = s
+        .connection
+        .query_row(
+            "SELECT project FROM workspaces WHERE agent=?1",
+            [parse_agent_id(&b).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, "app");
+    let continued: Option<String> = s
+        .connection
+        .query_row(
+            "SELECT continued_from FROM chat_organization WHERE agent=?1",
+            [parse_agent_id(&b).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(continued.as_deref(), Some(a.as_str()));
+}

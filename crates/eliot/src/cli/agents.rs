@@ -834,6 +834,7 @@ pub(crate) async fn run_switch(
             auth: args.auth,
             cmd: args.cmd,
             access: args.access,
+            project: args.project,
             workspace: args.workspace,
             worktree: args.worktree,
             base: args.base,

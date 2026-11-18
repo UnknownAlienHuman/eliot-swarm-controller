@@ -1,6 +1,6 @@
 //! One durable switch worker composes normal launch and H2 transfer.
 use super::*;
-use eliot_core::api::SwitchRequest;
+use eliot_core::api::{SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchRequest};
 
 /// Whether a switch keeps its source checkout: it requests neither a
 /// workspace override nor a new branch. Reuse is selected before any
@@ -82,29 +82,69 @@ impl Router {
                     .get_agent(&request.from)?
                     .ok_or_else(|| Error::new("not_found", "source Agent missing"))?
             };
+            // Continue-in-project resolves the target checkout before any
+            // preparation: an omitted workspace uses the target
+            // registration's checkout, never the source repo. The
+            // registration the worker verifies here is rechecked inside the
+            // admission transaction, so a revocation between preparation and
+            // admission refuses instead of dispatching under stale authority.
+            let target = match request.launch.project.as_deref() {
+                Some(project) => Some({
+                    let store = self.inner.store.lock().await;
+                    store
+                        .get_project_registration("owner", project)?
+                        .ok_or_else(|| {
+                            Error::new(
+                                "not_found",
+                                format!("switch target project {project} was not found"),
+                            )
+                        })?
+                }),
+                None => None,
+            };
             let mut launch = SubmitCommand::new(&plan.launch_command, "launch");
-            let workspace = request
-                .launch
-                .workspace
-                .as_deref()
-                .or(source.workspace.as_deref())
-                .ok_or_else(|| {
-                    Error::new(
-                        "invalid",
-                        "switch requires a workspace when A has no retained workspace",
-                    )
-                })?;
-            launch.args = request.launch.args(workspace)?;
-            let scope = source.project_scope();
+            let workspace = match (
+                &target,
+                request.launch.workspace.as_deref(),
+                source.workspace.as_deref(),
+            ) {
+                (Some(_), Some(workspace), _) => workspace.to_owned(),
+                (Some(registration), None, _) => registration.checkout.clone(),
+                (None, workspace, retained) => workspace
+                    .or(retained)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "invalid",
+                            "switch requires a workspace when A has no retained workspace",
+                        )
+                    })?
+                    .to_owned(),
+            };
+            launch.args = request.launch.args(&workspace)?;
+            let scope = source.project_scope().to_owned();
             // A switch that requests neither a workspace nor a branch keeps
             // the source checkout: reuse is selected before any preparation.
-            if reuse_source_checkout(&request.launch) {
+            // A targeted continue never reuses the source checkout: B always
+            // runs from the target project through ordinary preparation.
+            if target.is_none() && reuse_source_checkout(&request.launch) {
                 launch.args["switch_reuse_source_checkout"] = json!(true);
+            }
+            if let Some(registration) = &target {
+                let git = crate::workspace_git::WorkspaceGit::new()?;
+                let (checkout, common_dir) = git.repository_identity(workspace.as_str()).await?;
+                if checkout != registration.checkout || common_dir != registration.repo_common_dir {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "switch workspace is outside the target project repository",
+                    ));
+                }
             }
             let mut prepared = self
                 .prepare_submission_after_authorization(launch, &Principal::Owner, false, false)
                 .await?;
-            if reuse_retained_checkout(request.launch.workspace.as_deref(), &prepared.workspace) {
+            if target.is_none()
+                && reuse_retained_checkout(request.launch.workspace.as_deref(), &prepared.workspace)
+            {
                 prepared.workspace = None;
                 if let Some(args) = prepared.request.args.as_object_mut() {
                     args.remove("workspace_preparation");
@@ -112,8 +152,53 @@ impl Router {
             }
             // The replacement retains the source's authorization namespace for handoff.
             prepared.request.args["project"] = json!(scope);
+            if let Some(target) = &target {
+                // The prepared launch must carry the resolved target
+                // registration; an explicit workspace in another repository
+                // resolves elsewhere and is refused here.
+                if prepared
+                    .request
+                    .args
+                    .get("registered_project")
+                    .and_then(Value::as_str)
+                    != Some(target.id.as_str())
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "switch target project differs from prepared registration",
+                    ));
+                }
+                let current = {
+                    let store = self.inner.store.lock().await;
+                    store
+                        .get_project_registration("owner", &target.id)?
+                        .ok_or_else(|| {
+                            Error::new(
+                                "not_found",
+                                format!("switch target project {} was not found", target.id),
+                            )
+                        })?
+                };
+                if current.revision != target.revision {
+                    return Err(Error::new(
+                        "stale_assignment",
+                        "switch target registration changed",
+                    ));
+                }
+                prepared.request.args["registered_project"] = json!(target.id);
+                prepared.request.args[SWITCH_PROJECT_REVISION_ARG] = json!(target.revision);
+            }
+            if scope.is_empty() {
+                prepared.request.args[SWITCH_BLANK_SCOPE_ARG] = json!(true);
+            }
             if let Some(workspace) = &mut prepared.workspace {
-                workspace.project = scope.to_owned();
+                // The frozen preparation belongs to the target execution
+                // project (it must stay non-blank); the authorization scope
+                // stays on the launch args for handoff.
+                workspace.project = target
+                    .as_ref()
+                    .map(|registration| registration.id.clone())
+                    .unwrap_or_else(|| scope.clone());
                 prepared.request.args["workspace_preparation"] = serde_json::to_value(workspace)
                     .map_err(|_| Error::new("internal", "cannot encode switch workspace"))?;
             }
@@ -221,6 +306,7 @@ mod tests {
             auth: None,
             cmd: None,
             access: None,
+            project: None,
             workspace: None,
             worktree: None,
             base: None,

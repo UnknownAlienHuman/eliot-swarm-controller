@@ -60,9 +60,10 @@ use eliot_core::{
         MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage, ObservationQuery,
         ObservationView, ObserveHeavyRequest, ObserveHeavyResponse, ProcessPageCursor,
         ProjectDiscoverRequest, ProjectRegistrationView, ProviderClearHoldRequest,
-        ProviderHoldsRequest, RuleGetRequest, RuleStateView, ShutdownMode, SourceState,
-        SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView, TurnGetRequest,
-        UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth,
+        ProviderHoldsRequest, RuleGetRequest, RuleStateView, SWITCH_BLANK_SCOPE_ARG,
+        SWITCH_PROJECT_REVISION_ARG, ShutdownMode, SourceState, SwarmWaitRequest,
+        SwarmWaitResponse, TimerGetRequest, TimerStateView, TurnGetRequest, UsageScopeView,
+        UsageSummaryRequest, WaitEntryResult, WorkerTaskHealth,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -6665,6 +6666,11 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
         "frozen_setup",
         "setup",
         "target_generation",
+        // Switch-only markers the worker sets after preparation; a launch
+        // caller can never carry a verified target revision or a retained
+        // blank scope past admission.
+        SWITCH_PROJECT_REVISION_ARG,
+        SWITCH_BLANK_SCOPE_ARG,
     ] {
         if args.contains_key(reserved) {
             return Err(Error::new(

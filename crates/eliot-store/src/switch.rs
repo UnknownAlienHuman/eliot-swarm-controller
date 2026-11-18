@@ -200,7 +200,7 @@ impl Store {
             }
             let source: SwitchRequest = serde_json::from_value(parent.args)
                 .map_err(|_| Error::new("source_integrity", "switch request malformed"))?;
-            let agent = source_tx(&tx, &source, self.hierarchy_limits)?;
+            let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits)?;
             let requested = serde_json::to_value(&source.launch)
                 .map_err(|_| Error::new("internal", "cannot encode switch selectors"))?;
             for key in [
@@ -221,6 +221,34 @@ impl Store {
                     "not_allowed",
                     "switch launch must keep the source project",
                 ));
+            }
+            // Continue-in-project keeps the source authorization scope above
+            // and additionally binds the resolved execution registration: the
+            // prepared launch must carry the target the worker verified, at
+            // the revision it verified, or a mismatched workspace or a
+            // revoked registration refuses inside this transaction.
+            if let Some(registration) = target {
+                if request
+                    .args
+                    .get("registered_project")
+                    .and_then(Value::as_str)
+                    != Some(registration.id.as_str())
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "switch target project differs from prepared registration",
+                    ));
+                }
+                let revision = request
+                    .args
+                    .get(core::api::SWITCH_PROJECT_REVISION_ARG)
+                    .and_then(Value::as_i64);
+                if revision != Some(registration.revision) {
+                    return Err(Error::new(
+                        "stale_assignment",
+                        "switch target registration changed",
+                    ));
+                }
             }
             if load_command(&tx, &request.id)?.is_some()
                 && component(&tx, id, &request.id, 0)?.is_none()
@@ -282,11 +310,16 @@ impl Store {
             let mut events = Vec::new();
             let mut state = CommandState::Failed;
             let mut error = None;
+            // The destination binding is captured before the transfer creates
+            // B's first input; re-deriving it afterwards would see that input
+            // and refuse.
+            let mut continued_to: Option<String> = None;
             if launch.state == CommandState::Applied {
                 tx.execute_batch("SAVEPOINT switch_transfer")
                     .map_err(sql_error)?;
                 let transfer: Result<handoff::HandoffAdmission> = (|| {
                     let destination = ready_destination_tx(&tx, &launch)?;
+                    continued_to = Some(destination.id.clone());
                     let handoff = request.handoff(
                         &plan.handoff_command,
                         &destination.id,
@@ -308,6 +341,41 @@ impl Store {
                         tx.execute_batch("RELEASE switch_transfer")
                             .map_err(sql_error)?;
                         events.extend(change.events);
+                        // The continuation rides the existing overlay: B's
+                        // link records the source it continues. Plain text,
+                        // never a foreign key, so deleting the source
+                        // afterwards cannot fault the Store writer.
+                        let created = continued_to
+                            .as_deref()
+                            .ok_or_else(|| {
+                                Error::new("source_integrity", "switch destination binding missing")
+                            })
+                            .and_then(|destination| {
+                                parse_agent_id(destination).map_err(|_| {
+                                    Error::new(
+                                        "source_integrity",
+                                        "switch destination id malformed",
+                                    )
+                                })
+                            })?;
+                        parse_agent_id(&request.from).map_err(|_| {
+                            Error::new("source_integrity", "switch source id malformed")
+                        })?;
+                        db!(tx.execute(
+                            "INSERT INTO chat_organization(agent, project_link, tags, continued_from)
+                             VALUES (?1, NULL, '[]', ?2)
+                             ON CONFLICT(agent) DO UPDATE SET continued_from = excluded.continued_from",
+                            params![created, request.from],
+                        ));
+                        events.push(insert_daemon_event(
+                            &tx,
+                            now,
+                            "organization.changed",
+                            "organization",
+                            None,
+                            None,
+                            json!({"id": id, "method": "swarm.switch"}),
+                        )?);
                         state = CommandState::Applied;
                     }
                     Err(e) => {
@@ -491,7 +559,7 @@ fn source_tx(
     tx: &Transaction<'_>,
     request: &SwitchRequest,
     limits: core::api::HierarchyLimits,
-) -> Result<Agent> {
+) -> Result<(Agent, Option<core::api::ProjectRegistrationView>)> {
     if request.commands.len() as i64 > limits.max_selector_targets {
         return Err(Error::new(
             "fanout_limit",
@@ -504,7 +572,27 @@ fn source_tx(
         return Err(Error::new("stale_generation", "source generation moved"));
     }
     handoff::quiescent(tx, &source, false)?;
-    Ok(source)
+    // Continue-in-project binds the target registration at reserve time, so
+    // preparation resolves the target checkout and never the source repo.
+    // A projectless source has no execution project for B: it must name one.
+    let target = match request.launch.project.as_deref() {
+        Some(project) => Some(projects::project_registration_tx(tx, project)?.ok_or_else(
+            || {
+                Error::new(
+                    "not_found",
+                    format!("switch target project {project} was not found"),
+                )
+            },
+        )?),
+        None if source.project_scope().is_empty() => {
+            return Err(Error::new(
+                "invalid",
+                "switch from a projectless chat needs a target project",
+            ));
+        }
+        None => None,
+    };
+    Ok((source, target))
 }
 
 fn ready_destination_tx(tx: &Connection, launch: &Command) -> Result<Agent> {

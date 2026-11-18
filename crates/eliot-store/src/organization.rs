@@ -87,9 +87,18 @@ fn decode_tags(raw: &str) -> Result<Vec<String>> {
 }
 
 /// Decode one stored overlay row: the placement link is read back as-is and
-/// the tag set is validated against the API bounds.
-fn decode_overlay(link: Option<String>, raw_tags: String) -> Result<(Option<String>, Vec<String>)> {
-    Ok((link, decode_tags(&raw_tags)?))
+/// the tag set is validated against the API bounds. The continuation
+/// pointer is plain display text (possibly naming a deleted source), so it
+/// only needs the Agent id shape, never liveness.
+fn decode_overlay(
+    link: Option<String>,
+    raw_tags: String,
+    continued_from: Option<String>,
+) -> Result<(Option<String>, Vec<String>, Option<String>)> {
+    if let Some(source) = &continued_from {
+        crate::parse_agent_id(source)?;
+    }
+    Ok((link, decode_tags(&raw_tags)?, continued_from))
 }
 
 enum LinkChange {
@@ -290,6 +299,7 @@ type OrgMemberRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 fn organization_members(
@@ -308,7 +318,7 @@ fn organization_members(
             .prepare(&format!(
                 "SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
                         a.chat, a.archived, a.observe_only, a.workspace,
-                        o.project_link, o.tags
+                        o.project_link, o.tags, o.continued_from
                  FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
                  WHERE {project_predicate}
                    AND {archived}
@@ -319,7 +329,7 @@ fn organization_members(
             .prepare(&format!(
                 "SELECT a.id, a.generation, a.state, a.harness, a.parent, a.root, a.project,
                         a.chat, a.archived, a.observe_only, a.workspace,
-                        o.project_link, o.tags
+                        o.project_link, o.tags, o.continued_from
                  FROM agents a LEFT JOIN chat_organization o ON o.agent = a.id
                  WHERE {unplaced_predicate}
                    AND {archived}
@@ -344,6 +354,7 @@ fn organization_members(
                     row.get::<_, Option<String>>(10)?,
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             })
             .map_err(sql_error)?
@@ -365,6 +376,7 @@ fn organization_members(
                     row.get::<_, Option<String>>(10)?,
                     row.get::<_, Option<String>>(11)?,
                     row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
                 ))
             })
             .map_err(sql_error)?
@@ -385,10 +397,14 @@ fn organization_members(
         workspace,
         link,
         raw_tags,
+        continued_from,
     ) in rows
     {
-        let (project_link, tags) =
-            decode_overlay(link, raw_tags.unwrap_or_else(|| "[]".to_owned()))?;
+        let (project_link, tags, continued_from) = decode_overlay(
+            link,
+            raw_tags.unwrap_or_else(|| "[]".to_owned()),
+            continued_from,
+        )?;
         members.push(OrgMemberView {
             agent: format_agent_id(num),
             generation,
@@ -402,6 +418,7 @@ fn organization_members(
             placed: chat && project_link.is_some(),
             project_link,
             tags,
+            continued_from,
             workspace,
         });
     }
@@ -787,18 +804,19 @@ impl Store {
             let mut links = Vec::with_capacity(nums.len());
             let mut rows = Vec::with_capacity(nums.len());
             for (index, (agent, num)) in nums.into_iter().enumerate() {
-                let current: Option<(Option<String>, String, i64)> = tx
+                let current: Option<(Option<String>, String, i64, Option<String>)> = tx
                     .query_row(
-                        "SELECT project_link, tags, revision FROM chat_organization WHERE agent = ?1",
+                        "SELECT project_link, tags, revision, continued_from
+                         FROM chat_organization WHERE agent = ?1",
                         [num],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .optional()
                     .map_err(sql_error)?;
                 // A menu write carries the revision it observed (0 for no
                 // row yet); a write that raced another is refused whole and
                 // nothing is applied.
-                let observed = current.as_ref().map_or(0, |(_, _, revision)| *revision);
+                let observed = current.as_ref().map_or(0, |(_, _, revision, _)| *revision);
                 if expected
                     .as_ref()
                     .is_some_and(|entries| entries[index] != observed)
@@ -809,23 +827,17 @@ impl Store {
                     ));
                 }
                 let revision = observed + 1;
+                // Attach/detach/tag never write provenance: the upsert below
+                // leaves `continued_from` as recorded, so a continuation
+                // survives every placement and tag change.
+                let (current_link, current_tags, continued_from) = match current {
+                    Some((link, tags, _, continued_from)) => (link, tags, continued_from),
+                    None => (None, "[]".to_owned(), None),
+                };
                 let (link, tags) = match &change {
-                    LinkChange::Attach { project } => (
-                        Some(project.clone()),
-                        current
-                            .map(|(_, tags, _)| tags)
-                            .unwrap_or_else(|| "[]".to_owned()),
-                    ),
-                    LinkChange::Detach => (
-                        None,
-                        current
-                            .map(|(_, tags, _)| tags)
-                            .unwrap_or_else(|| "[]".to_owned()),
-                    ),
-                    LinkChange::Tag { tags } => {
-                        let encoded = encode_json(tags)?;
-                        (current.and_then(|(link, _, _)| link), encoded)
-                    }
+                    LinkChange::Attach { project } => (Some(project.clone()), current_tags),
+                    LinkChange::Detach => (None, current_tags),
+                    LinkChange::Tag { tags } => (current_link, encode_json(tags)?),
                 };
                 db!(tx.execute(
                     "INSERT INTO chat_organization(agent, project_link, tags, revision)
@@ -848,6 +860,7 @@ impl Store {
                     project_link: link,
                     tags: decode_tags(&tags)?,
                     revision,
+                    continued_from,
                 });
             }
             let value = ChatOrganizationMutationResponse {
@@ -1166,6 +1179,91 @@ mod tests {
                 .iter()
                 .any(|member| member.agent == chat && member.tags == vec!["inbox", "k175"])
         );
+    }
+
+    #[test]
+    fn continued_from_survives_revision_checked_writes_and_batched_read() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        register(&mut store, "alpha", "/managed/alpha");
+        let source = launch_chat(&mut store, &Ulid::new().to_string(), "/tmp/wt-k185-source");
+        let chat = launch_chat(&mut store, &Ulid::new().to_string(), "/tmp/wt-k185-chat");
+        let tag = |id: &str, tags: &[&str], revision: i64| ChatTagRequest {
+            id: id.to_owned(),
+            agents: vec![chat.clone()],
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            expected_revision: Some(vec![revision]),
+        };
+        let first = tag(&Ulid::new().to_string(), &["inbox"], 0);
+        let tagged = store.tag_agents("owner", &first, now()).unwrap().value;
+        assert_eq!(tagged.links[0].revision, 1);
+        assert_eq!(tagged.links[0].continued_from, None);
+        // A switch completion records the source on the new Agent's link.
+        store
+            .connection
+            .execute(
+                "UPDATE chat_organization SET continued_from=?1 WHERE agent=?2",
+                params![source.clone(), parse_agent_id(&chat).unwrap()],
+            )
+            .unwrap();
+        let continued = |links: &[OrgLinkView]| links[0].continued_from.clone();
+        // Revision-checked attach, tag and detach each bump the revision
+        // and carry the recorded source through unchanged.
+        let attach = ChatAttachRequest {
+            expected_revision: Some(vec![1]),
+            ..attach_request(&Ulid::new().to_string(), &[&chat], "alpha")
+        };
+        let attached = store.attach_chats("owner", &attach, now()).unwrap().value;
+        attach.validate_response(&attached).unwrap();
+        assert_eq!(attached.links[0].revision, 2);
+        assert_eq!(continued(&attached.links), Some(source.clone()));
+        let retag = tag(&Ulid::new().to_string(), &["other"], 2);
+        let retagged = store.tag_agents("owner", &retag, now()).unwrap().value;
+        retag.validate_response(&retagged).unwrap();
+        assert_eq!(retagged.links[0].revision, 3);
+        assert_eq!(continued(&retagged.links), Some(source.clone()));
+        let detach = ChatDetachRequest {
+            id: Ulid::new().to_string(),
+            agents: vec![chat.clone()],
+            expected_revision: Some(vec![3]),
+        };
+        let detached = store.detach_chats("owner", &detach, now()).unwrap().value;
+        detach.validate_response(&detached).unwrap();
+        assert_eq!(detached.links[0].revision, 4);
+        assert_eq!(continued(&detached.links), Some(source.clone()));
+        // A stale write is refused whole and leaves the pointer in place.
+        let stale = tag(&Ulid::new().to_string(), &["stale"], 3);
+        assert_eq!(
+            store.tag_agents("owner", &stale, now()).unwrap_err().code,
+            "conflict"
+        );
+        let reattach = ChatAttachRequest {
+            expected_revision: Some(vec![4]),
+            ..attach_request(&Ulid::new().to_string(), &[&chat], "alpha")
+        };
+        let reattached = store.attach_chats("owner", &reattach, now()).unwrap().value;
+        assert_eq!(reattached.links[0].revision, 5);
+        assert_eq!(continued(&reattached.links), Some(source.clone()));
+        // The batched all-project read (the sidebar's one read) carries the
+        // pointer on the member row of its placed group.
+        let projection = store
+            .chat_organization(
+                "owner",
+                &ChatOrganizationRequest {
+                    project: None,
+                    after: None,
+                    archived: ArchivedFilter::Exclude,
+                },
+                &ScopeLimits::default(),
+                now(),
+            )
+            .unwrap();
+        let member = project_group(&projection, "alpha")
+            .members
+            .iter()
+            .find(|member| member.agent == chat)
+            .expect("continued chat");
+        assert_eq!(member.continued_from.as_deref(), Some(source.as_str()));
+        assert!(member.placed);
     }
 
     #[test]
@@ -1900,7 +1998,7 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE chat_organization; DELETE FROM schema_migrations WHERE version >= 64;",
+                "DROP TABLE chat_organization; DELETE FROM schema_migrations WHERE version IN (66,65,64);",
             )
             .unwrap();
         store.migrate().unwrap();

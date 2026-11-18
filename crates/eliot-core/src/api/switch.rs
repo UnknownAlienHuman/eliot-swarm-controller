@@ -15,7 +15,13 @@ pub struct SwitchLaunch {
     pub auth: Option<String>,
     pub cmd: Option<String>,
     pub access: Option<String>,
-    /// Omitted uses A's retained workspace. Normal launch canonicalization still applies.
+    /// Target execution project for B. Omitted keeps A's project. When set,
+    /// the switch worker prepares the target's standard worktree (or verifies
+    /// an explicit workspace against it); B still retains A's authorization
+    /// scope so the handoff stays in one namespace.
+    pub project: Option<String>,
+    /// Omitted uses A's retained workspace (or the target project's checkout
+    /// when `project` is set). Normal launch workspace checks apply.
     pub workspace: Option<String>,
     pub worktree: Option<String>,
     pub base: Option<String>,
@@ -43,6 +49,7 @@ impl SwitchLaunch {
                 &self.auth,
                 &self.cmd,
                 &self.access,
+                &self.project,
                 &self.workspace,
                 &self.worktree,
                 &self.base,
@@ -63,6 +70,14 @@ impl SwitchLaunch {
                 "switch access must be ask, auto or full",
             ));
         }
+        if let Some(project) = self.project.as_deref()
+            && (project.len() > 1024 || project.contains(char::is_control))
+        {
+            return Err(Error::new(
+                "invalid",
+                "switch project must be a name of at most 1024 bytes",
+            ));
+        }
         Ok(())
     }
 
@@ -71,12 +86,25 @@ impl SwitchLaunch {
             .map_err(|_| Error::new("internal", "cannot encode switch launch"))?;
         let object = args.as_object_mut().unwrap();
         object.retain(|_, value| !value.is_null());
+        // The target project is switch routing, never a launch arg: the
+        // worker resolves the checkout and sets the launch scope itself.
+        object.remove("project");
         object
             .entry("workspace")
             .or_insert_with(|| Value::String(workspace.to_owned()));
         Ok(args)
     }
 }
+
+/// Router-set launch arg naming the target registration revision the switch
+/// worker verified before preparation. The Store admission transaction
+/// rechecks it, so a revocation between preparation and admission refuses
+/// instead of dispatching under stale authority.
+pub const SWITCH_PROJECT_REVISION_ARG: &str = "switch_project_revision";
+/// Router-set launch flag admitting the blank source namespace on B when a
+/// switch continues a projectless source. Normal launches can never carry
+/// it: `reject_launch_derived_keys` refuses it from callers.
+pub const SWITCH_BLANK_SCOPE_ARG: &str = "switch_blank_scope";
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -194,6 +222,24 @@ mod tests {
             let args = launch.args("project").unwrap();
             assert_eq!(args["workspace"], "project");
             assert!(args.get("text").is_none());
+        }
+    }
+
+    #[test]
+    fn switch_target_project_validates_and_never_reaches_launch_args() {
+        let launch: SwitchLaunch =
+            serde_json::from_value(json!({"profile":"p", "project":"app"})).unwrap();
+        launch.validate().unwrap();
+        assert!(launch.args("project").unwrap().get("project").is_none());
+        for project in [
+            "".to_owned(),
+            " ".to_owned(),
+            "p".repeat(1025),
+            "a\tb".to_owned(),
+        ] {
+            let mut bad: SwitchLaunch = serde_json::from_value(json!({"profile":"p"})).unwrap();
+            bad.project = Some(project);
+            assert!(bad.validate().is_err());
         }
     }
 

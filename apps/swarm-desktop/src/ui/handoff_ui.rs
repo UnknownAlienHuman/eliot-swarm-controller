@@ -533,6 +533,7 @@ impl DesktopApp {
             effort,
             auth: None,
             cmd: None,
+            project: None,
             workspace: None,
             worktree: None,
             base: None,

@@ -839,6 +839,11 @@ pub(crate) struct SwitchArgs {
     pub(crate) cmd: Option<String>,
     #[arg(long, requires = "harness", value_parser = ["ask", "auto", "full"])]
     pub(crate) access: Option<String>,
+    /// Target execution project for B: continue A's chat in this project with
+    /// the target's standard worktree. Omitted keeps A's project. An explicit
+    /// workspace must lie in the target project's repository.
+    #[arg(long, value_name = "PROJECT")]
+    pub(crate) project: Option<String>,
     /// Omitted uses A's retained workspace; normal launch workspace checks apply.
     #[arg(long)]
     pub(crate) workspace: Option<String>,

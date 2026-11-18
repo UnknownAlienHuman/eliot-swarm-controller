@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 65;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 66;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1555,6 +1555,21 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 66 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            // The continue-in-project overlay pointer: which switch source an
+            // Agent continues. Plain display text, never a foreign key, so a
+            // deleted source leaves it dangling without faulting the writer.
+            tx.execute_batch(
+                "ALTER TABLE chat_organization ADD COLUMN continued_from TEXT;
+                 INSERT INTO schema_migrations(version) VALUES (66);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1594,7 +1609,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (64,65); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
+                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (66,65,64); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -1632,7 +1647,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (64,65); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
+                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (66,65,64); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -1705,7 +1720,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (64,65); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
+                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (66,65,64); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -1763,7 +1778,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (64,65); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
+                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (66,65,64); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -1864,7 +1879,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (64,65); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
+                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (66,65,64); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
@@ -2013,7 +2028,7 @@ mod continuity_tests {
         main_v57
             .connection
             .execute_batch(
-                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (64,65); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
+                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (66,65,64); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58;",
@@ -2063,7 +2078,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (64,65); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
+                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (66,65,64); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  DELETE FROM schema_migrations WHERE version=59;",
             )
@@ -2091,7 +2106,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (64,65); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61;",
+                "DROP TABLE IF EXISTS chat_organization; DELETE FROM schema_migrations WHERE version IN (66,65,64); DROP INDEX IF EXISTS agents_recent; DELETE FROM schema_migrations WHERE version=63; DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; DROP TABLE project_transfers; ALTER TABLE workspaces DROP COLUMN original_preparation; DELETE FROM schema_migrations WHERE version=61;",
             )
             .unwrap();
         let version: i64 = store
