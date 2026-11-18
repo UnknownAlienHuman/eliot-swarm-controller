@@ -823,9 +823,13 @@ fn answer_for_canonical(
             wire.free_text = Some(label.clone());
         }
     } else if question.selection.mode == "multiple" {
-        // A single non-option string is the free-text alternative; a
-        // multi-string answer must name only offered options.
-        if answers.len() == 1 && !labels.contains(&answers[0].as_str()) {
+        // Cardinality carries the wire shape the desktop submits: one answer
+        // is the free-text alternative, several answers are the selected
+        // labels. A label-identical string typed into the free-text field
+        // stays user wording (the MSP `freeText` alternative carries no
+        // selection bounds), so it must never become a selection that then
+        // fails the offered minimum.
+        if answers.len() == 1 {
             let text = &answers[0];
             if text.is_empty() || text.chars().count() > 500 {
                 return Err(Error::new("invalid", "answer text exceeds 500 chars"));
@@ -1192,6 +1196,38 @@ mod tests {
         let free =
             answer_for_canonical(&offered, &["my own wording".to_owned()]).expect("free text maps");
         assert_eq!(free.free_text.as_deref(), Some("my own wording"));
+        assert!(free.selected_labels.is_none());
+    }
+
+    #[test]
+    fn multiple_label_identical_text_is_free_text_without_minimum() {
+        // Audit #639: typing a label-identical string into the free-text
+        // field submits one text answer, which the MSP permits as `freeText`
+        // regardless of the selection minimum. It must never become a
+        // selection that then fails `min_selections`.
+        let offered = OfferedQuestion {
+            id: "q1".to_owned(),
+            header: "Deploy".to_owned(),
+            question: "Where?".to_owned(),
+            options: vec![
+                OfferedOption {
+                    label: "staging".to_owned(),
+                    description: None,
+                },
+                OfferedOption {
+                    label: "production".to_owned(),
+                    description: None,
+                },
+            ],
+            selection: OfferedSelection {
+                mode: "multiple".to_owned(),
+                min_selections: Some(2),
+                max_selections: None,
+            },
+        };
+        let free = answer_for_canonical(&offered, &["staging".to_owned()])
+            .expect("label-identical text maps");
+        assert_eq!(free.free_text.as_deref(), Some("staging"));
         assert!(free.selected_labels.is_none());
     }
 
