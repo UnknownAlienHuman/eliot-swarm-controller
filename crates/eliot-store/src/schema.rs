@@ -1376,7 +1376,10 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "ALTER TABLE turns DROP COLUMN resolution_source;
+                "ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                 ALTER TABLE project_assignments DROP COLUMN workspace_path;
+                 DELETE FROM schema_migrations WHERE version = 57;
+                 ALTER TABLE turns DROP COLUMN resolution_source;
                  DELETE FROM schema_migrations WHERE version = 56;",
             )
             .unwrap();
