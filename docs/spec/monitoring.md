@@ -324,6 +324,14 @@ Before filesystem changes, wait for the checkout's terminal Git sources to drain
 close, including subdirectory borrowers. This orders final hint attribution before
 removal cleanup and prevents a stale observation from recreating removed provenance.
 
+A workspace identifies the concrete checkout, branch and frozen base OID, using
+the existing preparation receipt when Swarm creates it. The receipt preserves the
+creating Agent and generation. The current workspace binding to a manager
+assignment is independent of that receipt. When assignment-bound worktrees are
+implemented, workers inherit that binding and preparation, and transfer and cleanup
+must check its current owner and borrowers. The 2a assignment core uses existing
+workspace selection.
+
 ## Git and filesystem monitor
 
 The current increment shares one Git monitor per admitted live worktree, which must

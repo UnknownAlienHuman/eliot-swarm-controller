@@ -165,6 +165,47 @@ control scope governs self and manager answers; this rule grants no new rights.
 Queue mail is communication, not control. Full-text `send|steer|inject` presentation
 requires ordinary command rights. No message content is executed as a router instruction.
 
+## Project manager assignment
+
+A registered project can have one current assignment. Its manager is a typed
+local Agent ID and generation or a future remote manager instance and grant
+revision. Store retains the current identity, monotonically increasing epoch,
+state and revision. Workspaces have independent preparation receipts and current
+[workspace bindings](monitoring.md#workspace-preparation). Remote grants require
+their own verified, project-scoped ingress identity and are unsupported in 2a.
+
+Claim and manager launch contend on the same Store transaction. The first wins
+and the competing caller receives the current record with a typed reason.
+Release advances the epoch and retains the vacant record. Resume advances the
+manager generation and epoch atomically with dispatch. Replacement requires an
+explicit release and new assignment. Release revokes Swarm authority and
+leaves existing execution to its native lifecycle. An unresolved manager start
+blocks release. Ordinary startup of a separate root is refused while the
+assignment is occupied. Restart reads the existing record. A heartbeat timeout,
+lost process or uncertain startup never frees an assignment. Owner retains explicit
+administrative and recovery authority. A scoped self-claim requires a live eligible
+root Agent in its own registered project and an Owner grant.
+
+Managed control requires both ordinary scope authorization and the current
+assignment. Admission freezes the project, generation and epoch used for
+control. Dispatch checks the same binding before work starts, including queued
+launches. Already dispatched and unknown effects keep their original bindings
+and outcomes. Mail and authorized history reads retain their existing scope.
+Project mutations, including vars, claims, workspace setup and cleanup, must
+respect current authority. Automation uses the same command fence. Legacy rows
+with no assignment history retain ordinary control. Adoption must account for
+existing writers before claiming exclusive workspace custody. Assignment is
+Swarm control authority. Filesystem isolation depends on the native sandbox.
+
+## Conversation association
+
+A conversation association links an existing Agent or chat to a project or
+display group. It leaves native session, execution workspace, permissions and
+historical command attribution intact. Continuing work in another project is
+a separate, authorized execution operation with a link back to the original
+conversation. Store will retain the association beside the existing chat identity
+when the headless association API is implemented.
+
 ## Mailbox
 
 A stable Agent owns its mailbox. One row is one concrete recipient delivery:

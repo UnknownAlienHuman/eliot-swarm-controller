@@ -747,6 +747,21 @@ common directory or an exact, currently verified checkout path. Unresolved legac
 paths appear in **Other locations**. This is a display derivation and leaves
 historical Agent rows intact.
 
+The registration ID is the stable Project identity. Owner settings own its
+registration lifecycle, display name, registered repository, allowed profiles and
+actions, and future budget policy. The initial managed path uses one primary
+repository, identified by its verified local Git common directory. Origin is display
+metadata. Additional repositories and independent assignments sharing a repository
+require explicit policy. The [manager assignment](coordination.md#project-manager-assignment)
+is current Store state keyed by registration ID. Removing registration revokes new
+scoped control and retains execution history. Display changes leave authority intact.
+Until a registration is explicitly adopted, its Agents retain legacy authorization.
+
+For future managed workspace selection, resolve an explicit permitted project,
+then inherited assignment or parent, then an unambiguous verified repository match.
+Ambiguity leaves work pending or unassigned until resolved. A private no-project
+chat is an explicit execution mode.
+
 The optional owner-global `[projects.ID.git]` table binds fetch authority to that
 registration. `fetch_remotes` maps exact remote names to approved direct endpoints without
 embedded credentials; the repository's raw fetch URL must match the selected endpoint.

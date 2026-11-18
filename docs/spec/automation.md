@@ -544,6 +544,13 @@ For an existing request ID, return the retained admission/result before resolvin
 current profile or workspace values. This replay does not re-dispatch an uncertain external
 effect or silently choose another profile or workspace.
 
+Managed project automation uses the existing timer, routing and command path.
+Project-owned rules keep their registered policy. Manager-directed work must
+carry the current [assignment](coordination.md#project-manager-assignment) binding
+through admission and dispatch, including queued launch. An epoch change does not
+rewrite pending work or replay an uncertain effect. Project capacity and fair
+selection extend this same path when those increments are implemented.
+
 ### Resume a retained Agent
 
 The `resume` action submits the existing ordinary `resume` command through the Router/Store
