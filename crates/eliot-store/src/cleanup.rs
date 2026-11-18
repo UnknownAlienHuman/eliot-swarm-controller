@@ -507,13 +507,15 @@ impl Store {
     }
 
     /// Retain one cleanup plan preview. A full ledger self-heals before it
-    /// refuses admission: the retain reclaims fully settled consumed plans
-    /// and abandoned never-consumed previews, oldest first, so ordinary
-    /// preview/apply cycles can never wedge the ledger. Plans with an
-    /// outstanding `unknown` attempt, plans whose consumed receipt is gone,
-    /// and fresh previews are never reclaimed. Anything still full
-    /// afterwards keeps the `unavailable` refusal: delete or settle plans
-    /// through the ordinary apply/settle paths and preview again.
+    /// refuses admission: the retain reclaims fully settled consumed plans,
+    /// receipt-less consumed plans with terminal settlement, and abandoned
+    /// never-consumed previews, oldest first, so ordinary preview/apply
+    /// cycles can never wedge the ledger. Plans with an outstanding `unknown`
+    /// attempt, receipt-less consumed plans with an uncertain outcome, and
+    /// fresh previews are never reclaimed. Anything still full afterwards
+    /// keeps the `unavailable` refusal, naming stranded receipt-less plans as
+    /// the blocker when they are the reason: delete or settle plans through
+    /// the ordinary apply/settle paths and preview again.
     pub fn retain_cleanup_plan(
         &mut self,
         principal: &str,
@@ -534,9 +536,16 @@ impl Store {
         if count >= MAX_CLEANUP_PLANS {
             count -= prune_reclaimable_cleanup_plans_tx(&tx, now)?;
             if count >= MAX_CLEANUP_PLANS {
+                let stranded = count_stranded_consumed_plans_tx(&tx)?;
                 return Err(Error::new(
                     "unavailable",
-                    "cleanup plan ledger is full (1024 entries)",
+                    if stranded > 0 {
+                        format!(
+                            "cleanup plan ledger is full (1024 entries); {stranded} consumed plans stranded by uncertain settlement (receipt pruned)"
+                        )
+                    } else {
+                        "cleanup plan ledger is full (1024 entries)".to_owned()
+                    },
                 ));
             }
         }
@@ -867,11 +876,14 @@ impl Store {
 /// Bounded self-heal for a full cleanup-plan ledger, oldest first. Deletes
 /// fully settled consumed plans (their receipt is retained and no item
 /// outcome is `unknown`, so the exact-apply replay and the unknown-attempt
-/// fences no longer need the row) and abandoned never-consumed previews
-/// (older than the write-id retry window plus clock skew, so no live manager
-/// can still be about to apply them). Never touches a plan with an
-/// outstanding `unknown` attempt, a consumed plan whose receipt is gone
-/// (unprovable settlement), or a fresh preview. Returns the reclaimed count.
+/// fences no longer need the row), consumed plans whose receipt is gone but
+/// whose own settlement is terminal and known (no item artifact is still
+/// `unknown`, so retention-time pruning stranded a row that exact replay can
+/// no longer use anyway), and abandoned never-consumed previews (older than
+/// the write-id retry window plus clock skew, so no live manager can still
+/// be about to apply them). Never touches a plan with an outstanding
+/// `unknown` attempt, a receipt-less consumed plan with an uncertain outcome,
+/// or a fresh preview. Returns the reclaimed count.
 fn prune_reclaimable_cleanup_plans_tx(tx: &Transaction<'_>, now: i64) -> Result<i64> {
     let settled = tx
         .execute(
@@ -882,6 +894,29 @@ fn prune_reclaimable_cleanup_plans_tx(tx: &Transaction<'_>, now: i64) -> Result<
                    AND NOT EXISTS (
                        SELECT 1 FROM json_each(w.result, '$.items') r
                        WHERE json_extract(r.value, '$.outcome') = 'unknown'
+                   )
+                 ORDER BY p.id LIMIT ?1
+             )",
+            [CLEANUP_PLAN_RECLAIM_BATCH],
+        )
+        .map_err(sql_error)? as i64;
+    // A consumed plan whose receipt was pruned before retention pinned
+    // consumed receipts can never replay (exact replay needs the receipt) and
+    // can never settle further through this row. Reclaim it when its own
+    // settlement is terminal and known: none of its item artifacts is still
+    // `unknown`. An uncertain outcome keeps the row; the full-ledger refusal
+    // names those stranded plans as the blocker. Nothing is replayed and no
+    // outcome is invented here, only the unusable plan row is deleted.
+    let stranded = tx
+        .execute(
+            "DELETE FROM cleanup_plans WHERE id IN (
+                 SELECT p.id FROM cleanup_plans p
+                 WHERE p.apply_id IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM writes w WHERE w.id = p.apply_id)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM json_each(p.body, '$.items') i
+                       JOIN artifacts a ON a.id = json_extract(i.value, '$.artifact.id')
+                       WHERE json_extract(a.body, '$.state') = 'unknown'
                    )
                  ORDER BY p.id LIMIT ?1
              )",
@@ -903,7 +938,27 @@ fn prune_reclaimable_cleanup_plans_tx(tx: &Transaction<'_>, now: i64) -> Result<
             params![stale_cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
         )
         .map_err(sql_error)? as i64;
-    Ok(settled + stale)
+    Ok(settled + stranded + stale)
+}
+
+/// Consumed plans whose receipt is gone and whose outcome is still uncertain
+/// (one of their item artifacts is `unknown`): kept by the reclaim above and
+/// reported as the blocker when the ledger stays full. Never replayed, never
+/// re-settled, and never given an invented outcome here.
+fn count_stranded_consumed_plans_tx(tx: &Transaction<'_>) -> Result<i64> {
+    tx.query_row(
+        "SELECT COUNT(*) FROM cleanup_plans p
+         WHERE p.apply_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM writes w WHERE w.id = p.apply_id)
+           AND EXISTS (
+               SELECT 1 FROM json_each(p.body, '$.items') i
+               JOIN artifacts a ON a.id = json_extract(i.value, '$.artifact.id')
+               WHERE json_extract(a.body, '$.state') = 'unknown'
+           )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 fn update_cleanup_receipt(
@@ -1375,6 +1430,155 @@ mod tests {
             .unwrap();
         assert!(!is_new);
         assert_eq!(replay.items[0].outcome, "unknown");
+    }
+
+    fn stranded_setup() -> (Store, CleanupPlan, CleanupApplyRequest, i64) {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','stopped',1,?1,?1)",[now]).unwrap();
+        let artifact = ArtifactView {
+            id: Ulid::new().to_string(),
+            agent: "a1".to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: vec!["a1:1".to_owned()],
+            path: "C:/scratch/target".to_owned(),
+            kind: ArtifactKind::Build,
+            purpose: "build".to_owned(),
+            identity: "original".to_owned(),
+            created_at: now,
+            state: "registered".to_owned(),
+            git: None,
+        };
+        store.record_known_artifact(artifact.clone()).unwrap();
+        let plan = CleanupPlan {
+            plan_id: Ulid::new().to_string(),
+            created_at: now,
+            items: vec![CleanupCandidate {
+                artifact,
+                bytes: Some(7),
+                verdict: "safe".to_owned(),
+                reason: "terminal".to_owned(),
+            }],
+            truncated: false,
+        };
+        store.retain_cleanup_plan("owner", &plan, now).unwrap();
+        let apply = CleanupApplyRequest {
+            id: Ulid::new().to_string(),
+            plan_id: plan.plan_id.clone(),
+            delete_remote: false,
+            artifacts: Some(vec![]),
+        };
+        (store, plan, apply, now)
+    }
+
+    #[test]
+    fn reclaims_consumed_plan_with_pruned_receipt_when_settlement_terminal() {
+        let (mut store, plan, apply, now) = stranded_setup();
+        // Empty selection settles every item as skipped: no unknown outcome,
+        // and the artifact is never fenced.
+        let (_, first, is_new) = store.begin_cleanup_apply("owner", &apply, now).unwrap();
+        assert!(is_new);
+        assert!(
+            first.items.iter().all(|item| item.outcome != "unknown"),
+            "empty selection settles"
+        );
+        // Retention-time pruning stranded the receipt before receipts were
+        // pinned: the settlement is terminal and known.
+        store
+            .connection
+            .execute("DELETE FROM writes WHERE id = ?1", [&apply.id])
+            .unwrap();
+        // Fill the ledger so the next retain must self-heal.
+        let stale_at = now - 2 * 86_400_000;
+        for _ in 0..(MAX_CLEANUP_PLANS - 1) {
+            let preview = CleanupPlan {
+                plan_id: Ulid::new().to_string(),
+                created_at: stale_at,
+                items: vec![],
+                truncated: false,
+            };
+            store
+                .connection
+                .execute(
+                    "INSERT INTO cleanup_plans(id,principal,body) VALUES (?1,'owner',?2)",
+                    params![preview.plan_id, encode_json(&preview).unwrap()],
+                )
+                .unwrap();
+        }
+        let admitted = CleanupPlan {
+            plan_id: Ulid::new().to_string(),
+            created_at: now,
+            items: vec![],
+            truncated: false,
+        };
+        store
+            .retain_cleanup_plan("owner", &admitted, now)
+            .expect("full ledger must reclaim the stranded terminal plan");
+        assert_eq!(
+            store.cleanup_plan("owner", &plan.plan_id).unwrap_err().code,
+            "not_found",
+            "stranded terminal plan is reclaimed"
+        );
+    }
+
+    #[test]
+    fn keeps_consumed_plan_with_pruned_receipt_while_attempt_unknown() {
+        let (mut store, plan, _, now) = stranded_setup();
+        // No selection attempts the item and fences it unknown.
+        let unknown_apply = CleanupApplyRequest {
+            id: Ulid::new().to_string(),
+            plan_id: plan.plan_id.clone(),
+            delete_remote: false,
+            artifacts: None,
+        };
+        let (_, first, is_new) = store
+            .begin_cleanup_apply("owner", &unknown_apply, now)
+            .unwrap();
+        assert!(is_new);
+        assert_eq!(first.items[0].outcome, "unknown");
+        // The receipt is pruned as pre-pin retention did, but the outcome is
+        // uncertain: the row must be kept, never replayed, and reported as
+        // the blocker when the ledger stays full.
+        store
+            .connection
+            .execute("DELETE FROM writes WHERE id = ?1", [&unknown_apply.id])
+            .unwrap();
+        let body: String = store
+            .connection
+            .query_row(
+                "SELECT body FROM cleanup_plans WHERE id = ?1",
+                [&plan.plan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for _ in 0..(MAX_CLEANUP_PLANS - 1) {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO cleanup_plans(id, principal, body, apply_id) VALUES (?1, 'owner', ?2, ?3)",
+                    params![Ulid::new().to_string(), body, Ulid::new().to_string()],
+                )
+                .unwrap();
+        }
+        let admitted = CleanupPlan {
+            plan_id: Ulid::new().to_string(),
+            created_at: now,
+            items: vec![],
+            truncated: false,
+        };
+        let err = store
+            .retain_cleanup_plan("owner", &admitted, now)
+            .unwrap_err();
+        assert_eq!(err.code, "unavailable");
+        assert!(
+            err.message.contains("stranded"),
+            "full-ledger refusal names the blocker: {}",
+            err.message
+        );
+        store
+            .cleanup_plan("owner", &plan.plan_id)
+            .expect("uncertain plan is kept");
     }
 
     #[test]

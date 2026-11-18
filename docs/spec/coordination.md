@@ -113,9 +113,14 @@ The current limits are 64 candidates, 4,096 retained artifacts, 1,024 retained
 plans, 10,000 filesystem entries, depth 64 and five seconds per tree scan.
 Exceeding a bound refuses the tree before deletion. A full plan ledger self-heals
 on retain first: it reclaims fully settled consumed plans (no `unknown` item
-outcome) and abandoned never-consumed previews older than the write-id retry
-window, oldest first, so ordinary preview/apply cycles never wedge it. Plans with
-an outstanding `unknown` attempt and their receipt fences are never reclaimed; only
+outcome), consumed plans whose receipt was pruned while their own settlement
+is terminal and known (none of their item artifacts is still `unknown`), and
+abandoned never-consumed previews older than the write-id retry window,
+oldest first, so ordinary preview/apply cycles never wedge it. Plans with
+an outstanding `unknown` attempt and their receipt fences are never reclaimed,
+and a receipt-less consumed plan with an uncertain outcome is kept, never
+replayed and never given an invented outcome; the full-ledger refusal then
+names those stranded plans as the blocker. Only
 when nothing reclaimable remains does exhaustion reject new admission. Exact
 apply retries check the retained receipt before loading the plan row, so a
 reclaimed settled plan still replays its retained response instead of `not_found`.
