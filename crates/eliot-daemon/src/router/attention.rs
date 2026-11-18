@@ -110,6 +110,10 @@ struct ActiveIncident {
     baseline_model_progress_at: Option<i64>,
     incident_delivery: Option<FrozenReport>,
     recovery_delivery: Option<FrozenReport>,
+    /// Deterministic loss-evidence report. Delivery is terminal (no recovery
+    /// follows a lost Agent), so a successful delivery drops the entry and
+    /// frees its reservation slot instead of retaining it.
+    is_loss: bool,
 }
 
 #[derive(Clone)]
@@ -482,6 +486,7 @@ async fn inspect_agent(
             baseline_model_progress_at,
             incident_delivery: Some(frozen),
             recovery_delivery: None,
+            is_loss: false,
         },
     );
     drop(child_guard);
@@ -527,8 +532,38 @@ async fn inspect_lost_agent(
         kind: IncidentKind::SourceUnhealthy,
         turn_id: None,
     };
-    if deliver_active_incident(router, &state, &key).await? {
-        return Ok(());
+    if let Some(existing_id) = {
+        let state = state.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .active
+            .get(&key)
+            .map(|incident| incident.incident_id.clone())
+    } {
+        if existing_id == incident_id {
+            // Already tracking this exact loss: settle any remaining
+            // delivery through the loss path, then return. A durably
+            // complete re-report no-ops above; a restart finds the same
+            // deterministic identity instead of a second one.
+            persist_loss_report(router, &state, &key).await?;
+            return Ok(());
+        }
+        // A generic incident occupies the loss key: settle its pending
+        // delivery, then drop it so the deterministic loss report is still
+        // persisted. The Agent is lost (terminal); no recovery follows a
+        // generic source incident for it. Returning here would swallow the
+        // loss identity, and a restart would then report it under a second
+        // identity.
+        deliver_active_incident(router, &state, &key).await?;
+        {
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if state
+                .active
+                .get(&key)
+                .is_some_and(|incident| incident.incident_id == existing_id)
+            {
+                state.active.remove(&key);
+            }
+        }
     }
     let Some(mut reservation) = reserve_incident(&state, &key) else {
         return Ok(());
@@ -571,6 +606,7 @@ async fn inspect_lost_agent(
             baseline_model_progress_at,
             incident_delivery: Some(frozen),
             recovery_delivery: None,
+            is_loss: true,
         },
     );
     persist_loss_report(router, &state, &key).await

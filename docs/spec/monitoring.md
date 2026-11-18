@@ -685,7 +685,13 @@ retained sequence is re-paged; pruned evidence is skipped, never
 synthesized), so no generic check can preempt the loss-anchored report with
 a different incident id. Only genuinely unrecoverable saturation (queue and
 map both full) drops a loss, and the retained Store evidence re-pages it
-from the cursor on the next reconcile.
+from the cursor on the next reconcile. A delivered loss report leaves the
+transient set at once: delivery is terminal for a lost generation (no
+recovery follows), so its reservation slot is freed for retained losses
+behind it. When a generic source-unhealthy incident is still open for a
+generation that is then reported lost, any pending delivery settles first
+and the entry is superseded by the deterministic loss report, so the loss
+identity is persisted before any restart and a re-report stays a no-op.
 Each attention escalation thread wakes its recipient only once per thread
 (recorded durably when the notice is claimed); an unchanged unread incident
 set cannot generate further wakes until new evidence arrives on a new thread.

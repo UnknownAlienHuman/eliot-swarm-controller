@@ -2,7 +2,9 @@
 
 use super::{
     ActiveIncident, AgentKey, AttentionState, FrozenReport, IncidentKey, Router, Trigger,
-    delivery::persist_and_notify, incidents::retire_superseded_incidents, inspect_agent,
+    delivery::{persist_and_notify, persist_loss_delivery},
+    incidents::retire_superseded_incidents,
+    inspect_agent,
 };
 use eliot_core::Result;
 use std::{
@@ -565,7 +567,7 @@ async fn reconcile_attention_state(
 fn reserve_pending_deliveries(
     state: &Arc<Mutex<AttentionState>>,
     limit: usize,
-) -> Vec<(IncidentKey, String, FrozenReport, bool)> {
+) -> Vec<(IncidentKey, String, FrozenReport, bool, bool)> {
     let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
     let available = MAX_CHECKS_IN_FLIGHT.saturating_sub(state.in_flight.len());
     let mut selected_agents = HashSet::new();
@@ -594,6 +596,7 @@ fn reserve_pending_deliveries(
                 incident.incident_id.clone(),
                 delivery.clone(),
                 recovery,
+                incident.is_loss,
                 agent_key,
             ))
         })
@@ -601,10 +604,12 @@ fn reserve_pending_deliveries(
         .collect::<Vec<_>>();
     selected
         .into_iter()
-        .map(|(key, incident_id, delivery, recovery, agent_key)| {
-            state.in_flight.insert(agent_key);
-            (key, incident_id, delivery, recovery)
-        })
+        .map(
+            |(key, incident_id, delivery, recovery, is_loss, agent_key)| {
+                state.in_flight.insert(agent_key);
+                (key, incident_id, delivery, recovery, is_loss)
+            },
+        )
         .collect()
 }
 
@@ -614,7 +619,7 @@ async fn retry_pending_deliveries(router: &Router, state: Arc<Mutex<AttentionSta
         return;
     }
     let mut tasks = JoinSet::new();
-    for (key, incident_id, delivery, recovery) in pending {
+    for (key, incident_id, delivery, recovery, is_loss) in pending {
         let router = router.clone();
         let state = Arc::clone(&state);
         tasks.spawn(async move {
@@ -625,7 +630,15 @@ async fn retry_pending_deliveries(router: &Router, state: Arc<Mutex<AttentionSta
                     generation: key.generation,
                 },
             };
-            if let Err(error) = persist_and_notify(&router, &delivery).await {
+            // Loss retries reuse the idempotent loss delivery (per-thread
+            // presence skips mail that is already delivered); the generic
+            // path would treat a retained duplicate mail binding as failure.
+            let delivered = if is_loss && !recovery {
+                persist_loss_delivery(&router, &delivery).await
+            } else {
+                persist_and_notify(&router, &delivery).await
+            };
+            if let Err(error) = delivered {
                 crate::logging::record(
                     &eliot_core::SecretPolicy::default(),
                     "daemon.attention_delivery_retry_failed",
@@ -642,7 +655,9 @@ async fn retry_pending_deliveries(router: &Router, state: Arc<Mutex<AttentionSta
             {
                 return;
             }
-            if recovery {
+            if recovery || is_loss {
+                // Loss delivery is terminal: no recovery follows a lost
+                // Agent, so drop the entry and free its reservation slot.
                 state.active.remove(&key);
             } else if let Some(incident) = state.active.get_mut(&key)
                 && incident
