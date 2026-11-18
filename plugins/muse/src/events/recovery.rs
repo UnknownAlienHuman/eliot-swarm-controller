@@ -140,11 +140,16 @@ impl EventProcessor {
             return Ok(false);
         }
         let cleared = self.status.clear_stale_idle_latch();
+        // The caller proved the owned session idle with a fresh
+        // `session/read` first, so that proof also drops a
+        // readback-recovery send gate. Clearing here (and only here, never
+        // in `clear_stale_idle_latch`) keeps the gate until exact proof.
+        let gate_held = std::mem::replace(&mut self.status.needs_idle_proof, false);
         if cleared {
             self.view_recovery = None;
             self.gap_reported = false;
         }
-        Ok(cleared)
+        Ok(cleared || gate_held)
     }
 
     /// One read-only `view/subscribe` attempt from the last applied cursor.

@@ -260,6 +260,7 @@ pub(super) async fn spawn_owned_session(
         command_turns: HashMap::new(),
         unknown_commands: HashSet::new(),
         rejected_commands: HashSet::new(),
+        rejected_reasons: HashMap::new(),
         control_commands: HashMap::new(),
         stop_command_id: None,
         skill_text,

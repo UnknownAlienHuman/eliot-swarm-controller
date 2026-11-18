@@ -1,7 +1,7 @@
 mod start;
 
 use crate::{
-    events::{EventHandle, TurnFacts, turn_native_error},
+    events::{EventHandle, EventStatus, TurnFacts, turn_native_error},
     native::{
         NativeClient, NativeLaunch, NativeProcess,
         requests::describe_request,
@@ -219,6 +219,15 @@ pub(super) fn native_initialize_params() -> NativeInitializeParams {
 }
 const STOP_SETTLEMENT_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
 const STOP_RESPONSE_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Time reserved at the end of an `agent.command` send budget to return
+/// the typed rejection (k167b): proof reads share the request deadline
+/// but must finish early enough that the rejection still settles
+/// `rejected` instead of racing the daemon's 30 s `unknown`.
+const SEND_REJECTION_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Typed follow-up rejection while the host-scoped MCP startup-audit
+/// latch stands (E47): MCP is disabled for this host's lifetime, so only
+/// an Agent restart on a fresh native host can continue.
+const MCP_AUDIT_DISABLED_REJECTION: &str = "Muse MCP startup audit failed; MCP is disabled for this runtime. Restart the Agent on the same worktree to continue with a fresh native host; turn/start was not dispatched.";
 /// Native half of the `agent.stop` RPC budget (`RPC_TIMEOUT` minus the two
 /// reserves above): the bound `BeginStop` must fit native termination and
 /// output drain inside. Recovery applies queued stop controls between native
@@ -294,6 +303,10 @@ struct AgentSession {
     command_turns: HashMap<String, String>,
     unknown_commands: HashSet<String>,
     rejected_commands: HashSet<String>,
+    /// Original rejection reason per rejected command (k167b): a repeated
+    /// command ID replays this reason so the caller still gets the
+    /// recovery action without redispatch, instead of a generic refusal.
+    rejected_reasons: HashMap<String, String>,
     control_commands: HashMap<String, ControlCommand>,
     stop_command_id: Option<String>,
     /// Bundled skill text read at start; prepended once to the first
@@ -470,7 +483,7 @@ impl MusePlugin {
             "model.list" => self.model_list(&request.params).await,
             "quota.read" => self.quota_read(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
-            "agent.command" => self.command(&request.params).await,
+            "agent.command" => self.command(&request.params, deadline).await,
             "agent.snapshot" => self.snapshot(&request.params).await,
             "agent.stop" => self.stop(&request.params, deadline).await,
             "shutdown" => self.shutdown().await,
@@ -1094,7 +1107,7 @@ impl MusePlugin {
         Ok(result)
     }
 
-    async fn command(&mut self, raw: &Value) -> Result<Value> {
+    async fn command(&mut self, raw: &Value, deadline: Instant) -> Result<Value> {
         let params: AgentCommandParams = decode(raw, "Muse agent.command params are invalid")?;
         validate_identity(
             &params.agent_id,
@@ -1103,7 +1116,7 @@ impl MusePlugin {
             "Muse",
         )?;
         match params.verb.as_str() {
-            "send" => self.send_command(params).await,
+            "send" => self.send_command(params, deadline).await,
             "configure" => self.configure_command(params).await,
             "steer" => self.steer_command(params).await,
             "inject" => self.inject_active_turn(params).await,
@@ -1347,7 +1360,40 @@ impl MusePlugin {
         }))
     }
 
-    async fn send_command(&mut self, params: AgentCommandParams) -> Result<Value> {
+    /// Re-prove an idle send gate with a fresh exact `session/read` (k167b):
+    /// the exact session, status `idle`, an explicitly null `activeTurnId`
+    /// (#427), and a healthy history envelope. On proof the actor latch is
+    /// cleared and re-read. Returns the fresh actor status only when every
+    /// step proved; any failure is not idle, so the caller rejects instead
+    /// of dispatching. All three reads share `proof_deadline`.
+    async fn reprove_idle_send_gate(
+        session: &mut AgentSession,
+        proof_deadline: Instant,
+    ) -> Option<EventStatus> {
+        let owned = session.session_id.clone()?;
+        if !session_read_proves_owned_idle(&session.native_client, &owned, proof_deadline).await {
+            return None;
+        }
+        if !session
+            .events
+            .reestablish_idle_at(owned.clone(), proof_deadline)
+            .await
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        session
+            .events
+            .view_readback_at(owned, None, proof_deadline)
+            .await
+            .ok()
+    }
+
+    async fn send_command(
+        &mut self,
+        params: AgentCommandParams,
+        deadline: Instant,
+    ) -> Result<Value> {
         let session = self
             .session
             .as_mut()
@@ -1390,106 +1436,130 @@ impl MusePlugin {
                 ));
             }
             if session.rejected_commands.contains(&params.command_id) {
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": "Muse turn/start was known not to apply",
-                }));
+                // k167b: replay the originally retained rejection so the
+                // caller still gets the recovery action without redispatch.
+                let reason = session
+                    .rejected_reasons
+                    .get(&params.command_id)
+                    .cloned()
+                    .unwrap_or_else(|| "Muse turn/start was known not to apply".to_owned());
+                return Ok(json!({"state": "rejected", "reason": reason}));
             }
             return Err(Error::new(
                 "unknown",
                 "Muse command was already dispatched without a retained exact outcome",
             ));
         }
+        // One request budget (k167b): every proof read below shares the
+        // dispatch `deadline`, and proof reads stop at `proof_deadline`
+        // so the typed rejection still returns before any native write.
+        let proof_deadline = deadline
+            .checked_sub(SEND_REJECTION_RESERVE)
+            .unwrap_or(deadline);
+        // Host-scoped MCP posture (E47): the owned host failed its MCP
+        // startup audit, so MCP stays disabled for that host's lifetime.
+        // Reject before any readback or dispatch; only a fresh host (an
+        // Agent restart) clears the latch.
+        if session.events.status().mcp_startup_audit_failed {
+            return Ok(reject_send(
+                session,
+                &params.command_id,
+                text,
+                MCP_AUDIT_DISABLED_REJECTION,
+            ));
+        }
         // A fresh send has no native effect yet. Serialize this check behind
         // the event actor's queued facts/terminal commit, rather than using
         // its potentially older watch snapshot. A durable terminal recovered
         // after projection loss does not restore the live source.
+        let session_id = session
+            .session_id
+            .clone()
+            .ok_or_else(|| Error::new("unknown", "Muse session identity is unresolved"))?;
         let mut event_status = match session
             .events
-            .view_readback(
-                session
-                    .session_id
-                    .clone()
-                    .ok_or_else(|| Error::new("unknown", "Muse session identity is unresolved"))?,
-                None,
-            )
+            .view_readback_at(session_id, None, proof_deadline)
             .await
         {
             Ok(status) => status,
-            Err(_) => {
-                let owned = session
-                    .session_id
-                    .clone()
-                    .ok_or_else(|| Error::new("unknown", "Muse session identity is unresolved"))?;
-                let idle_proven = match read_owned_session(&session.native_client, &owned).await {
-                    Ok(readback) => {
-                        readback.session.session_id == owned
-                            && readback.session.active_turn_id.is_none()
-                            && readback.history.unavailable_reason().is_none()
-                    }
-                    Err(_) => false,
-                };
-                if idle_proven
-                    && session
-                        .events
-                        .reestablish_idle(owned.clone())
-                        .await
-                        .unwrap_or(false)
-                {
-                    match session.events.view_readback(owned, None).await {
-                        Ok(status) => status,
-                        Err(_) => {
-                            session
-                                .command_inputs
-                                .insert(params.command_id.clone(), text.to_owned());
-                            session.rejected_commands.insert(params.command_id.clone());
-                            return Ok(rejected_control(
-                                "Muse native observation is unresolved after idle re-read; turn/start was not dispatched. Restart the Agent on the same worktree to continue.",
-                            ));
-                        }
-                    }
-                } else {
-                    session
-                        .command_inputs
-                        .insert(params.command_id.clone(), text.to_owned());
-                    session.rejected_commands.insert(params.command_id.clone());
-                    return Ok(rejected_control(
+            Err(_) => match Self::reprove_idle_send_gate(session, proof_deadline).await {
+                Some(status) => status,
+                None => {
+                    return Ok(reject_send(
+                        session,
+                        &params.command_id,
+                        text,
                         "Muse native observation is unresolved; turn/start was not dispatched. Restart the Agent on the same worktree to continue.",
                     ));
                 }
-            }
+            },
         };
+        // k167b: a readback-settled terminal keeps the send gate until the
+        // owned session proves idle with a fresh `session/read`, even when
+        // the actor readback itself succeeded.
+        if event_status.needs_idle_proof {
+            match Self::reprove_idle_send_gate(session, proof_deadline).await {
+                Some(fresh)
+                    if !fresh.needs_idle_proof
+                        && fresh.failure.is_none()
+                        && !fresh.view_unavailable =>
+                {
+                    event_status = fresh;
+                }
+                _ => {
+                    return Ok(reject_send(
+                        session,
+                        &params.command_id,
+                        text,
+                        "Muse native observation is unresolved after a recovered terminal; turn/start was not dispatched. Restart the Agent on the same worktree to continue.",
+                    ));
+                }
+            }
+        }
         if let Some(reason) = event_status.failure.clone() {
-            let view_related = crate::events::is_view_related_failure(&reason);
-            if view_related
-                && event_status.active_turn_id.is_none()
-                && let Some(owned) = session.session_id.clone()
-                && let Ok(readback) = read_owned_session(&session.native_client, &owned).await
-                && readback.session.session_id == owned
-                && readback.session.active_turn_id.is_none()
-                && readback.history.unavailable_reason().is_none()
-                && session
-                    .events
-                    .reestablish_idle(owned.clone())
-                    .await
-                    .unwrap_or(false)
-                && let Ok(fresh) = session.events.view_readback(owned, None).await
-                && fresh.failure.is_none()
-                && !fresh.view_unavailable
-            {
-                event_status = fresh;
-            } else {
-                session
-                    .command_inputs
-                    .insert(params.command_id.clone(), text.to_owned());
-                session.rejected_commands.insert(params.command_id.clone());
-                return Ok(rejected_control(&format!(
-                    "{reason}; turn/start was not dispatched. Restart the Agent on the same worktree to continue when the source stays unresolved."
-                )));
+            if !crate::events::is_view_related_failure(&reason) {
+                return Ok(reject_send(
+                    session,
+                    &params.command_id,
+                    text,
+                    &format!(
+                        "{reason}; turn/start was not dispatched. Restart the Agent on the same worktree to continue when the source stays unresolved."
+                    ),
+                ));
+            }
+            match Self::reprove_idle_send_gate(session, proof_deadline).await {
+                Some(fresh)
+                    if fresh.failure.is_none()
+                        && !fresh.view_unavailable
+                        && !fresh.needs_idle_proof =>
+                {
+                    event_status = fresh;
+                }
+                _ => {
+                    return Ok(reject_send(
+                        session,
+                        &params.command_id,
+                        text,
+                        &format!(
+                            "{reason}; turn/start was not dispatched. Restart the Agent on the same worktree to continue when the source stays unresolved."
+                        ),
+                    ));
+                }
             }
         }
         if event_status.active_turn_id.is_some() {
             return Err(Error::new("busy", "Muse already has an active turn"));
+        }
+        // Never dispatch once the rejection reserve is spent: without room
+        // to return the outcome the caller settles `unknown` past a
+        // dispatch it cannot observe.
+        if Instant::now() >= proof_deadline {
+            return Ok(reject_send(
+                session,
+                &params.command_id,
+                text,
+                "Muse send budget elapsed before turn/start; turn/start was not dispatched. Retry the send.",
+            ));
         }
         // Muse `serve` loads only the session workspace's skills and
         // rules; the checkout stays untouched and no trust is
@@ -1544,29 +1614,37 @@ impl MusePlugin {
         );
         let encoded = serde_json::to_value(turn_params)
             .map_err(|_| Error::new("internal", "Muse turn/start params could not be encoded"))?;
+        // One request budget (k167b): the native write shares the dispatch
+        // deadline instead of minting a fresh timeout past it.
         let response = session
             .native_client
-            .call("turn/start", encoded, Instant::now() + RPC_TIMEOUT)
+            .call("turn/start", encoded, deadline)
             .await;
         let response = match response {
             Ok(value) => value,
             Err(error) if native_no_write(&error.code) => {
-                session.rejected_commands.insert(command_id);
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": "Muse turn/start was not dispatched",
-                }));
+                return Ok(reject_send(
+                    session,
+                    &command_id,
+                    text,
+                    "Muse turn/start was not dispatched",
+                ));
             }
             Err(error) if error.code == "native_rejected" => {
-                session.rejected_commands.insert(command_id);
-                return Ok(json!({"state": "rejected", "reason": "Muse rejected turn/start"}));
+                return Ok(reject_send(
+                    session,
+                    &command_id,
+                    text,
+                    "Muse rejected turn/start",
+                ));
             }
             Err(error) if error.code == "frame_too_large" => {
-                session.rejected_commands.insert(command_id);
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": "Muse turn/start frame exceeded the native transport bound before dispatch",
-                }));
+                return Ok(reject_send(
+                    session,
+                    &command_id,
+                    text,
+                    "Muse turn/start frame exceeded the native transport bound before dispatch",
+                ));
             }
             Err(error) => {
                 session.unknown_commands.insert(command_id);
@@ -2946,33 +3024,83 @@ fn view_unknown_snapshot(
     Ok(snapshot)
 }
 
-async fn read_owned_session(
+/// Record a typed send rejection and retain its reason (k167b): a repeated
+/// command ID replays the retained reason so the caller still gets the
+/// recovery action without redispatch.
+fn reject_send(session: &mut AgentSession, command_id: &str, text: &str, reason: &str) -> Value {
+    session
+        .command_inputs
+        .insert(command_id.to_owned(), text.to_owned());
+    session.rejected_commands.insert(command_id.to_owned());
+    session
+        .rejected_reasons
+        .insert(command_id.to_owned(), reason.to_owned());
+    rejected_control(reason)
+}
+
+/// Fresh exact idle proof for the send gate (k167b): one raw
+/// `session/read`, checked with #427's exact rule (exact session, status
+/// `idle`, explicitly null `activeTurnId`, healthy history). Any failure —
+/// transport, schema, or unproven state — is not idle: the caller rejects
+/// instead of dispatching.
+async fn session_read_proves_owned_idle(
     client: &NativeClient,
     session_id: &str,
-) -> Result<NativeSessionReadResult> {
-    let response: NativeSessionReadResult = serde_json::from_value(
-        client
-            .call(
-                "session/read",
-                serde_json::to_value(NativeSessionReadParams {
-                    session_id: session_id.to_owned(),
-                    exclude_items: Some(true),
-                })
-                .map_err(|_| {
-                    Error::new("internal", "Muse session/read params could not be encoded")
-                })?,
-                Instant::now() + RPC_TIMEOUT,
-            )
-            .await?,
-    )
-    .map_err(|_| Error::new("native_readback", "Muse session/read response was invalid"))?;
-    if response.session.session_id != session_id {
+    deadline: Instant,
+) -> bool {
+    if Instant::now() >= deadline {
+        return false;
+    }
+    match read_owned_session_value(client, session_id, deadline).await {
+        Ok(value) => crate::events::session_read_proves_idle(&value, session_id),
+        Err(_) => false,
+    }
+}
+
+async fn read_owned_session_value(
+    client: &NativeClient,
+    session_id: &str,
+    deadline: Instant,
+) -> Result<Value> {
+    let value = client
+        .call(
+            "session/read",
+            serde_json::to_value(NativeSessionReadParams {
+                session_id: session_id.to_owned(),
+                exclude_items: Some(true),
+            })
+            .map_err(|_| Error::new("internal", "Muse session/read params could not be encoded"))?,
+            deadline,
+        )
+        .await?;
+    let owned = value
+        .get("session")
+        .and_then(|session| session.get("sessionId"))
+        .and_then(Value::as_str);
+    if owned != Some(session_id) {
         return Err(Error::new(
             "source_integrity",
             "Muse session/read returned another native session",
         ));
     }
-    Ok(response)
+    Ok(value)
+}
+
+async fn read_owned_session_at(
+    client: &NativeClient,
+    session_id: &str,
+    deadline: Instant,
+) -> Result<NativeSessionReadResult> {
+    let value = read_owned_session_value(client, session_id, deadline).await?;
+    serde_json::from_value(value)
+        .map_err(|_| Error::new("native_readback", "Muse session/read response was invalid"))
+}
+
+async fn read_owned_session(
+    client: &NativeClient,
+    session_id: &str,
+) -> Result<NativeSessionReadResult> {
+    read_owned_session_at(client, session_id, Instant::now() + RPC_TIMEOUT).await
 }
 
 /// One backward `view/page` fetch, newest records first. Every durable-view
@@ -4158,17 +4286,74 @@ mod tests {
 
     #[test]
     fn stale_view_failure_classification_keeps_mcp_audit_blocking() {
-        use crate::events::is_view_related_failure;
+        use crate::events::{is_mcp_startup_audit_failure, is_view_related_failure};
         for reason in [
             "Muse native view is unavailable (projectionUnavailable)",
             "Muse native observation is unresolved",
             "Muse unavailable-view terminal requires command-plane confirmation",
+            "Muse native view recovery did not prove live delivery after the recorded gap",
         ] {
-            assert!(is_view_related_failure(reason));
+            assert!(is_view_related_failure(reason), "{reason}");
         }
         assert!(!is_view_related_failure(
             "invalid run configuration: MCP startup audit failed; MCP is disabled for this runtime"
         ));
+        assert!(is_mcp_startup_audit_failure(
+            "invalid run configuration: MCP startup audit failed; MCP is disabled for this runtime"
+        ));
+        assert!(!is_mcp_startup_audit_failure(
+            "Muse native view is unavailable (projectionUnavailable)"
+        ));
+    }
+
+    #[test]
+    fn mcp_audit_rejection_names_the_posture_and_stays_non_view_related() {
+        use super::MCP_AUDIT_DISABLED_REJECTION;
+        use crate::events::{is_mcp_startup_audit_failure, is_view_related_failure};
+        assert!(is_mcp_startup_audit_failure(MCP_AUDIT_DISABLED_REJECTION));
+        assert!(!is_view_related_failure(MCP_AUDIT_DISABLED_REJECTION));
+    }
+
+    #[test]
+    fn session_read_idle_proof_requires_exact_idle_with_explicit_null() {
+        use crate::events::session_read_proves_idle;
+        let base = json!({
+            "session": {
+                "sessionId": "session-1",
+                "status": "idle",
+                "activeTurnId": null,
+                "turnCount": 1,
+            },
+            "history": {"mode": "none", "noneReason": "excluded"},
+            "viewCursor": "cursor-1",
+        });
+        assert!(session_read_proves_idle(&base, "session-1"));
+        // A `running` status with a missing `activeTurnId` (#427): the typed
+        // read sees `None` either way, so omission must never prove idle.
+        let mut running_omitted = base.clone();
+        running_omitted["session"]["status"] = json!("running");
+        running_omitted["session"]
+            .as_object_mut()
+            .expect("session object")
+            .remove("activeTurnId");
+        assert!(!session_read_proves_idle(&running_omitted, "session-1"));
+        // Idle without an explicit null proves nothing either.
+        let mut idle_omitted = base.clone();
+        idle_omitted["session"]
+            .as_object_mut()
+            .expect("session object")
+            .remove("activeTurnId");
+        assert!(!session_read_proves_idle(&idle_omitted, "session-1"));
+        // Idle with a live turn named.
+        let mut idle_turn = base.clone();
+        idle_turn["session"]["activeTurnId"] = json!("turn-1");
+        assert!(!session_read_proves_idle(&idle_turn, "session-1"));
+        // A foreign session never proves the owned one idle.
+        assert!(!session_read_proves_idle(&base, "session-2"));
+        // An unavailable history cannot prove the live source idle.
+        let mut unavailable = base.clone();
+        unavailable["history"] = json!({"mode": "none", "noneReason": "projectionUnavailable"});
+        assert!(!session_read_proves_idle(&unavailable, "session-1"));
     }
 
     #[test]
@@ -4191,5 +4376,26 @@ mod tests {
             ..Default::default()
         };
         assert!(!busy.clear_stale_idle_latch());
+    }
+
+    #[test]
+    fn readback_gate_and_mcp_posture_survive_idle_latch_clear() {
+        use crate::events::EventStatus;
+        // k167b: terminal commit may clear the stale live-view latch while
+        // a readback-settled turn keeps its send gate and an MCP-disabled
+        // host keeps its posture latch; only exact idle proof (or a live
+        // terminal, or a fresh host) drops them.
+        let mut gated = EventStatus {
+            view_unavailable: true,
+            needs_idle_proof: true,
+            mcp_startup_audit_failed: true,
+            failure: Some("Muse native view is unavailable (projectionUnavailable)".to_owned()),
+            ..Default::default()
+        };
+        assert!(gated.clear_stale_idle_latch());
+        assert!(!gated.view_unavailable);
+        assert!(gated.failure.is_none());
+        assert!(gated.needs_idle_proof);
+        assert!(gated.mcp_startup_audit_failed);
     }
 }
