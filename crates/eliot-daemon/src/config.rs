@@ -6,9 +6,8 @@
 //! errors. Project and automation helpers share this module's parser and
 //! validation path; profile freezing and resolution stay here.
 //!
-//! Snapshots retain admitted environment names. Only nonsecret native-store
-//! selector inputs are captured before admission; other environment values
-//! remain execution-time references.
+//! Snapshots retain admitted environment names. Codex retains its native-store execution inputs. Private
+//! route selectors are bound by digest and resolved only in the process environment.
 use eliot_core as core;
 use eliot_plugin::session::split_provider_model;
 use serde::Deserialize;
@@ -48,15 +47,122 @@ const PERMISSION_READ_ONLY: &str = "read-only";
 const PERMISSION_WORKSPACE_WRITE: &str = "workspace-write";
 const PERMISSION_DANGER_FULL_ACCESS: &str = "danger-full-access";
 
+/// Codex dispatch already retains these execution inputs verbatim. Other
+/// store and provider selectors are verified against an opaque route identity.
+pub(crate) const CODEX_STORE_SELECTORS: &[&str] = &["CODEX_HOME", "CODEX_SQLITE_HOME"];
+const PRIVATE_STORE_SELECTORS: &[&str] = &[
+    "CLAUDE_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "APPDATA",
+];
+const PRIVATE_PROVIDER_SELECTORS: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+];
+const CLAUDE_ROUTE_CREDENTIALS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+pub(crate) const ROUTE_HOME_SELECTORS: &[&str] = if cfg!(windows) {
+    &["HOME", "USERPROFILE", "LOCALAPPDATA"]
+} else {
+    &["HOME"]
+};
+
+fn env_name_matches(name: &str, selector: &str) -> bool {
+    if cfg!(windows) {
+        name.eq_ignore_ascii_case(selector)
+    } else {
+        name == selector
+    }
+}
+
 pub(crate) fn native_store_selector(name: &str) -> Option<&'static str> {
-    ["CODEX_HOME", "CODEX_SQLITE_HOME"]
-        .into_iter()
-        .find(|selector| {
-            if cfg!(windows) {
-                name.eq_ignore_ascii_case(selector)
+    CODEX_STORE_SELECTORS
+        .iter()
+        .chain(PRIVATE_STORE_SELECTORS)
+        .copied()
+        .find(|selector| env_name_matches(name, selector))
+}
+
+pub(crate) fn private_route_selector(name: &str) -> bool {
+    native_store_selector(name).is_some()
+        || PRIVATE_PROVIDER_SELECTORS
+            .iter()
+            .any(|selector| env_name_matches(name, selector))
+}
+
+fn admitted_selector<'a>(names: &'a [Value], selector: &str) -> Option<&'a str> {
+    names
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|name| env_name_matches(name, selector))
+}
+
+/// The identity binds admitted selector states and the default home inputs.
+/// The serialized inputs exist only during hashing. Credential values never
+/// enter the digest; presence binds the provider mode.
+pub(crate) fn native_route_identity(
+    profile: &Value,
+    mut lookup: impl FnMut(&str) -> core::Result<Option<String>>,
+) -> core::Result<String> {
+    let names = profile
+        .get("pass_env")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let mut selectors = serde_json::Map::new();
+    for &selector in ROUTE_HOME_SELECTORS
+        .iter()
+        .chain(CODEX_STORE_SELECTORS)
+        .chain(PRIVATE_STORE_SELECTORS)
+        .chain(PRIVATE_PROVIDER_SELECTORS)
+        .chain(CLAUDE_ROUTE_CREDENTIALS)
+    {
+        let admitted = admitted_selector(names, selector);
+        if let Some(name) =
+            admitted.or_else(|| ROUTE_HOME_SELECTORS.contains(&selector).then_some(selector))
+        {
+            let value = lookup(name)?;
+            let value = if CLAUDE_ROUTE_CREDENTIALS.contains(&selector) {
+                value.map(|value| Value::Bool(!value.is_empty()))
             } else {
-                name == *selector
+                value.map(Value::String)
+            };
+            selectors.insert(selector.to_owned(), value.unwrap_or(Value::Null));
+        }
+    }
+    let digest = core::canonical_json_sha256(&Value::Object(selectors))
+        .map_err(|_| core::Error::new("internal", "native route identity could not be encoded"))?;
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+pub(crate) fn metadata_route_scope_known(
+    profile: &Value,
+    environment: &serde_json::Map<String, Value>,
+) -> bool {
+    let harness = profile["harness"].as_str().unwrap_or_default();
+    environment
+        .iter()
+        .filter_map(|(name, value)| value.as_str().map(|value| (name, value)))
+        .filter(|(_, value)| !value.is_empty())
+        .all(|(name, value)| {
+            if (harness == "claude" && env_name_matches(name, "CLAUDE_CODE_OAUTH_TOKEN"))
+                || (harness == "opencode" && env_name_matches(name, "OPENCODE_CONFIG_CONTENT"))
+            {
+                return false;
             }
+            native_store_selector(name).is_none() || Path::new(value.trim()).is_absolute()
         })
 }
 
@@ -87,11 +193,8 @@ fn capture_native_store_inputs_inner(
         .and_then(Value::as_array)
         .ok_or_else(|| core::Error::new("invalid", "resolved profile pass_env must be an array"))?;
     let mut values = serde_json::Map::new();
-    for selector in ["CODEX_HOME", "CODEX_SQLITE_HOME"] {
-        let selected = names
-            .iter()
-            .filter_map(Value::as_str)
-            .find(|name| native_store_selector(name) == Some(selector));
+    for &selector in CODEX_STORE_SELECTORS {
+        let selected = admitted_selector(names, selector);
         let value = selected
             .and_then(&mut selector_lookup)
             .map(|value| {
@@ -107,7 +210,7 @@ fn capture_native_store_inputs_inner(
     let credentials = names
         .iter()
         .filter_map(Value::as_str)
-        .filter(|name| native_store_selector(name).is_none())
+        .filter(|name| !private_route_selector(name))
         .filter_map(&mut credential_lookup)
         .filter_map(|value| value.into_string().ok())
         .collect::<Vec<_>>();
@@ -116,6 +219,25 @@ fn capture_native_store_inputs_inner(
     let policy = core::SecretPolicy::new(credentials.iter().map(String::as_str));
     let mut snapshot = profile.clone();
     snapshot["pass_env_values"] = captured;
+    if snapshot.get("harness").and_then(Value::as_str).is_some() {
+        let identity = native_route_identity(&snapshot, |name| {
+            if let Some(selector) = native_store_selector(name)
+                && CODEX_STORE_SELECTORS.contains(&selector)
+            {
+                return Ok(snapshot["pass_env_values"][selector]
+                    .as_str()
+                    .map(str::to_owned));
+            }
+            selector_lookup(name)
+                .map(|value| {
+                    value.into_string().map_err(|_| {
+                        core::Error::new("invalid", "native route selector is not valid Unicode")
+                    })
+                })
+                .transpose()
+        })?;
+        snapshot["native_route_identity"] = Value::String(identity);
+    }
     if policy.contains_value(&snapshot) {
         return Err(core::Error::new(
             "secret_in_payload",
@@ -1581,6 +1703,8 @@ fn validate_profile_tail(
             };
             Some(if harness == "claude" {
                 require_native_claude_cmd(name, cmd, source, table_offset)?
+            } else if harness == "antigravity" {
+                require_native_antigravity_cmd(name, cmd, source, table_offset)?
             } else {
                 cmd
             })
@@ -2178,7 +2302,7 @@ fn freeze_local_backend(
                 "profile_error",
             )
         })?;
-        if native_store_selector(&key).is_some() {
+        if private_route_selector(&key) {
             return Err(profile_field_error(
                 source,
                 table_offset,
@@ -2557,7 +2681,7 @@ fn bind_route_and_capacity(
                     .into_iter()
                     .next()
                     .ok_or_else(|| fail("proxy", "invalid client key environment name"))?;
-                if native_store_selector(&name).is_some() {
+                if private_route_selector(&name) {
                     return Err(fail(
                         "proxy",
                         "client key cannot use a native store selector",
@@ -2942,6 +3066,30 @@ fn require_native_claude_cmd(
             profile,
             "cmd",
             "must name the native .exe, not a script wrapper",
+            "profile_error",
+        ));
+    }
+    Ok(cmd)
+}
+
+/// Antigravity is the protocol-capable `agy` CLI only: a cmd pointing at the
+/// `Antigravity` IDE executable (or any other file name) is refused at save
+/// time with a typed error, so catalog discovery can never launch the IDE as
+/// a version probe. PATH `agy` binaries additionally prove protocol
+/// capability through their `--version` output before any discovery use.
+fn require_native_antigravity_cmd(
+    profile: &str,
+    cmd: String,
+    source: &str,
+    offset: usize,
+) -> core::Result<String> {
+    if !crate::adhoc::antigravity_cli_identity(&cmd) {
+        return Err(profile_field_error(
+            source,
+            offset,
+            profile,
+            "cmd",
+            "must name the native `agy` CLI, not the Antigravity IDE executable (which does not implement the ACP/model CLI and is never launched); install the `agy` CLI and put it on PATH",
             "profile_error",
         ));
     }
@@ -3488,7 +3636,13 @@ mod tests {
             error.message
         );
         for harness in ["muse", "antigravity"] {
-            let cmd = "C:/Tools/Native/agent.exe";
+            // A valid native cmd per harness, so the refusal below proves
+            // the manager native_subagents default, not cmd validation.
+            let cmd = if harness == "antigravity" {
+                "C:/Tools/Native/agy.exe"
+            } else {
+                "C:/Tools/Native/agent.exe"
+            };
             fixture.write(&format!(
                 "[profiles.manager]\nharness = \"{harness}\"\ncmd = \"{cmd}\"\nchild_profiles = [\"worker\"]\n\
                  [profiles.worker]\nharness = \"codex\"\nmodel = \"fixture-cheap\"\n"
@@ -3650,7 +3804,10 @@ mod tests {
             }
         );
 
-        assert_eq!(alias["pass_env_values"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            alias["pass_env_values"].as_object().unwrap().len(),
+            crate::config::CODEX_STORE_SELECTORS.len()
+        );
 
         #[cfg(windows)]
         let invalid = {
@@ -3674,6 +3831,30 @@ mod tests {
             );
             assert_eq!(profile, original);
         }
+    }
+
+    #[test]
+    fn private_route_selectors_freeze_without_persisting_paths_or_urls() {
+        let mut profile = json!({"harness":"claude","pass_env":[
+            "CLAUDE_CONFIG_DIR", "ANTHROPIC_BASE_URL", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+        ]});
+        capture_native_store_inputs_with_lookups(
+            &mut profile,
+            |name| match name {
+                "CLAUDE_CONFIG_DIR" => Some("private-claude-config".into()),
+                "ANTHROPIC_BASE_URL" => Some("https://private-gateway.example/v1".into()),
+                "XDG_CONFIG_HOME" => Some("private-xdg-config".into()),
+                _ => None,
+            },
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(
+            profile["pass_env_values"],
+            json!({"CODEX_HOME":null,"CODEX_SQLITE_HOME":null})
+        );
+        assert_eq!(profile["native_route_identity"].as_str().unwrap().len(), 64);
+        assert!(!profile.to_string().contains("private-"));
     }
 
     #[test]
@@ -3849,7 +4030,10 @@ base_url_for.codex = "http://127.0.0.1:10300/v1"
         assert_eq!(snapshot["route_binding"].as_object().unwrap().len(), 5);
         capture_native_store_inputs_with_lookups(
             &mut snapshot,
-            |_| panic!("unselected store selectors must not be read"),
+            |name| {
+                assert!(ROUTE_HOME_SELECTORS.contains(&name));
+                None
+            },
             |name| (name == "RUNTIME_KEY").then(|| OsString::from("runtime-secret-value")),
         )
         .unwrap();
@@ -4368,6 +4552,27 @@ permissions = "workspace-write"
         let snapshot = resolve_text_profile(source, "c").unwrap();
         assert_eq!(snapshot["approval_policy"], "on-request");
         assert!(snapshot.get("approval").is_none());
+    }
+
+    #[test]
+    fn antigravity_profile_pointing_at_the_ide_is_refused() {
+        // A profile cmd naming the IDE (or any non-`agy` file) is a typed
+        // refusal at save time: catalog discovery can never launch it as a
+        // version probe.
+        for cmd in [
+            "C:/Program Files/Antigravity/Antigravity.exe",
+            "C:/Tools/agy/launcher.exe",
+        ] {
+            let source = format!(
+                "[profiles.agy]\nharness='antigravity'\nmodel='gemini-4-hydrogen-high'\ncmd='{cmd}'\n"
+            );
+            let error = resolve_text_profile(&source, "agy").expect_err("IDE cmd must be refused");
+            assert_eq!(error.code, "profile_error", "{source}");
+            assert!(error.message.contains("never launched"), "{source}");
+        }
+        let source = "[profiles.agy]\nharness='antigravity'\nmodel='gemini-4-hydrogen-high'\ncmd='C:/Tools/agy/agy.exe'\n";
+        let snapshot = resolve_text_profile(source, "agy").unwrap();
+        assert_eq!(snapshot["cmd"], "C:/Tools/agy/agy.exe");
     }
 
     #[test]

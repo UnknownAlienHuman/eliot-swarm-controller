@@ -1478,7 +1478,10 @@ fn valid_id(id: &Value) -> bool {
 }
 
 fn call_timeout(method: &str, params: &Value) -> Duration {
-    if method == "agent.discover" {
+    if matches!(method, "models.catalog" | "harness.list") {
+        // Leave time for IPC and encoding after the shared inventory deadline.
+        crate::adhoc::DISCOVERY_BUDGET + Duration::from_secs(5)
+    } else if method == "agent.discover" {
         // Includes bounded reader shutdown/reaping after the read deadline.
         Duration::from_secs(45)
     } else if method == "events.subscribe" {
@@ -1878,6 +1881,13 @@ mod tests {
             Duration::from_millis(30_000) + DEFAULT_CALL_TIMEOUT
         );
         assert_eq!(timeout(0), DEFAULT_CALL_TIMEOUT);
+    }
+
+    #[test]
+    fn catalogue_rpc_allows_the_server_discovery_deadline() {
+        for method in ["models.catalog", "harness.list"] {
+            assert!(call_timeout(method, &json!({})) > crate::adhoc::DISCOVERY_BUDGET);
+        }
     }
 
     #[test]

@@ -2110,20 +2110,25 @@ impl Router {
                 .map(str::to_owned);
             // An explicit `--cmd` pins the native executable (e.g. a Muse
             // binary version the launcher no longer marks current);
-            // otherwise the installed executable is discovered. Shape is
-            // validated with the frozen snapshot below.
+            // otherwise the installed executable is discovered on the
+            // blocking pool. Shape is validated with the frozen snapshot
+            // below.
             let cmd = match explicit_cmd {
                 Some(cmd) => Some(cmd),
-                None => crate::adhoc::discover_cmd_for_harness(&harness)?,
+                None => crate::adhoc::discover_cmd_for_harness_async(&harness).await?,
             };
-            let mut snapshot = crate::adhoc::adhoc_snapshot(
-                &harness,
-                model.as_deref(),
-                effort.as_deref(),
-                cmd,
-                crate::adhoc::AdhocAuth::Resolve(auth.as_deref()),
-                access.as_deref(),
-            )?;
+            let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+            let mut snapshot = crate::adhoc::blocking_discovery(deadline, move || {
+                crate::adhoc::adhoc_snapshot(
+                    &harness,
+                    model.as_deref(),
+                    effort.as_deref(),
+                    cmd,
+                    crate::adhoc::AdhocAuth::Resolve(auth.as_deref()),
+                    access.as_deref(),
+                )
+            })
+            .await??;
             crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
             crate::config::capture_native_store_inputs(&mut snapshot, |name| {
                 std::env::var_os(name)
@@ -2968,7 +2973,7 @@ impl Router {
         for verified in eliot_core::VERIFIED_HARNESSES {
             probes.push((
                 verified.harness,
-                crate::adhoc::harness_installation(verified.harness),
+                crate::adhoc::harness_installation_async(verified.harness).await,
             ));
         }
         let store = self.inner.store.lock().await;
@@ -7516,7 +7521,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             |name| match name {
                 "CODEX_HOME" => Some("../original-home".into()),
                 "CODEX_SQLITE_HOME" => None,
-                _ => panic!("unexpected selector lookup: {name}"),
+                _ => None,
             },
             |name| match name {
                 "EPHEMERAL_TOKEN" => Some(credential.into()),
@@ -7539,7 +7544,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             },
         )
         .unwrap();
-        assert_eq!(replacement["pass_env_values"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            replacement["pass_env_values"].as_object().unwrap().len(),
+            crate::config::CODEX_STORE_SELECTORS.len()
+        );
         assert!(!replacement.to_string().contains(credential));
         assert_ne!(replacement["pass_env_values"], snapshot["pass_env_values"]);
         let launch_id = ulid::Ulid::new().to_string();

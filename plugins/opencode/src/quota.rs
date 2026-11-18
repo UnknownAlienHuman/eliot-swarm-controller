@@ -29,14 +29,16 @@ use serde_json::{Value, json};
 pub(crate) async fn read(raw: &Value) -> Result<Value> {
     let params = q::decode(raw)?;
     let profile = &params.profile;
-    let selector = profile
-        .get("auth_integration")
-        .and_then(Value::as_str)
-        .unwrap_or("opencode-go");
-    if selector == "opencode-go" {
+    let selector = profile.get("auth_integration").and_then(Value::as_str);
+    if profile.get("provider_base_url").is_some() || profile.get("backend").is_some() {
+        return Ok(
+            json!({"status":"unsupported","note":"Adopted OpenCode backend has no verified provider quota reader","details":{}}),
+        );
+    }
+    if selector == Some("opencode-go") {
         return read_go_legacy(profile, &params.environment).await;
     }
-    if selector == "opencode" {
+    if selector == Some("opencode") {
         return read_console(profile, &params.environment).await;
     }
     Ok(
@@ -66,7 +68,9 @@ async fn read_go_legacy(profile: &Value, environment: &Value) -> Result<Value> {
             windows.push(window);
         }
     }
-    q::result(windows, "OpenCode Go usage")
+    let mut reply = q::result(windows, "OpenCode Go usage")?;
+    reply["details"]["integration"] = json!("opencode-go");
+    Ok(reply)
 }
 
 /// The Console sign-in path: the installed
@@ -109,15 +113,38 @@ async fn read_console(profile: &Value, environment: &Value) -> Result<Value> {
             json!({"status":"unsupported","note":"OpenCode Console sign-in has no workspace to report quotas for (the location is not signed in)","details":{}}),
         );
     };
-    q::result(
+    let mut reply = q::result(
         crate::native::usage::usage_windows(&info),
         "OpenCode Console usage",
-    )
+    )?;
+    reply["details"]["integration"] = json!("opencode");
+    reply["details"]["consoleWindows"] = json!(crate::native::usage::scoped_budget_windows(&info));
+    if serde_json::to_vec(&reply["details"]).is_ok_and(|encoded| {
+        encoded.len() > eliot_core::api::harness::MAX_HARNESS_QUOTA_DETAILS_BYTES
+    }) && let Some(details) = reply["details"].as_object_mut()
+    {
+        // Retain the display windows. A partial set of scope evidence
+        // cannot establish a routing verdict for this workspace.
+        details.remove("consoleWindows");
+    }
+    Ok(reply)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn omitted_and_adopted_selectors_do_not_read_go_quota() {
+        for profile in [
+            json!({"provider_base_url":"http://127.0.0.1:1234/v1","backend":"lmstudio"}),
+            json!({"provider_base_url":"http://127.0.0.1:1234/v1","auth_integration":"opencode-go"}),
+            json!({}),
+        ] {
+            let raw = json!({"profile":profile,"environment":{}});
+            assert_eq!(read(&raw).await.unwrap()["status"], "unsupported");
+        }
+    }
 
     #[tokio::test]
     async fn unknown_selector_stays_unsupported() {

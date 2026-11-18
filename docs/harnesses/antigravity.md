@@ -24,8 +24,11 @@ Installed CLI surface (observed 2026-11-17, read-only `--version`/`acp --help`;
 flags; it accepts no hook-config location or registration flag, and the
 top-level `--settings` flag is a print-mode session option, not an `acp`
 option. The install directory ships no bundled docs or settings schema, so
-hook discovery truly requires a directory root. The manifest's native version
-(`1.5.2`) stays diagnostic metadata, not a startup version gate.
+hook discovery truly requires a directory root. Inventory, model and quota reads,
+and launch check one resolved CLI. The daemon verifies the vendor CLI module in
+the executable before running bounded `agy acp --help` and `agy --version`.
+The ACP help must advertise stdio and the permission option used at launch.
+The manifest version stays diagnostic metadata.
 
 The adapter speaks Agent Client Protocol v1 (pinned schema
 `v1-7ec5185c.json`, AGY 1.5.2; permission and usage shapes re-verified
@@ -474,10 +477,15 @@ stays in the plugin spec.
 Owner-only and freezes a profile-equivalent snapshot from safe defaults
 (`dangerously_skip_permissions = false`, explicit MCP `inherit`) plus flags. A model
 may be omitted to preserve the verified ACP session default described above.
-`cmd` is the installed `agy` CLI when it is on `PATH` (it serves both `acp`
-and `models`), falling back to the installed app at
-`%LOCALAPPDATA%\Programs\Antigravity\Antigravity.exe`, or `unsupported` when
-neither is found. `swarm models --harness antigravity` returns the live
+`cmd` is the installed `agy` CLI on `PATH` (it serves both `acp` and
+`models`); there is no fallback. An IDE-only install reports `unsupported`
+naming the IDE path with guidance to install `agy`: the IDE executable does
+not implement the native ACP/model CLI and is never launched for discovery.
+CLI identity is established before any discovery probe: a profile or ad-hoc
+`cmd` must name the `agy` file itself (an `Antigravity.exe` cmd is refused
+with a typed error and never launched), and a PATH `agy` whose bounded
+`--version` output does not parse as a CLI triple is refused before any
+`models`, quota or launch use. `swarm models --harness antigravity` returns the live
 read-only catalogue from `agy models` (exact argv `models`, bounded time and
 output, same environment construction as launch): tab-separated native ids
 kept verbatim (for example `gemini-4-argon-medium`, `gemini-4-hydrogen-xhigh`,
@@ -553,6 +561,11 @@ define `groups`, `displayName`, `buckets`, `window`, `remainingFraction` and
 and Claude/GPT 5-hour/weekly windows. A missing group remains absent; no legacy
 model-availability response is substituted for account quota. Tokens, email and project
 identifiers never leave the plugin. No credential refresh or onboarding is done.
+Window-to-model mapping is documented-group only, never substring: the
+`Gemini 4 Argon` group constrains models with an `argon` id token, so an
+exhausted Argon weekly bucket skips Argon models but never a Hydrogen model;
+an unrecognized provider group (projected as a `Model group` label) maps to
+no model.
 Other platforms currently report a supported environment error because their
 native keyring reader is unimplemented; provider failures also remain supported
 error states. Queries never start a turn.

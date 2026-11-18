@@ -358,7 +358,11 @@ launch). `cmd` is discovered by following the npm shim to the native
 `<shim-dir>/node_modules/@opencode/cli/bin/opencode.exe`, then the known
 package-local paths under every roaming root including the
 `USERPROFILE`-derived default when `APPDATA` is stripped); `--cmd` pins one
-explicit install instead. `swarm models --harness opencode` lists the native
+explicit install instead. On Linux the bare `opencode` binary is used instead
+(`opencode` on `PATH`, `/usr/local/bin/opencode`, `~/.opencode/bin/opencode`,
+`/opt/opencode/.opencode/bin/opencode`); the npm `.cmd` shim layout does not
+exist there and is never consulted. Extensionless Unix candidates count as
+native only after an ELF or Mach-O header check; scripts never qualify. `swarm models --harness opencode` lists the native
 `opencode models --standalone` catalogue (`provider/model` ids verbatim) with each
 model's installed `Model.Variant` ids overlaid as `efforts` from the
 read-only `opencode api model.list --standalone` operation (`model.list`, the same
@@ -453,7 +457,12 @@ the operation before that registration lands; that failure surfaces as
 `quota_unavailable` (unknown), never as ready windows, and only an
 explicit null answer (not signed in) reports `unsupported`. The adapter
 projects Go rolling/weekly/monthly windows and one window per budget
-spend share from the operation's answer. The legacy `opencode-go`
+spend share from the operation's answer. The pinned
+[UsageLimits budget schema](https://github.com/anomalyco/opencode/blob/fedc6f2/packages/schema/src/usage-limits.ts)
+also supplies member or pooled scope, all-model or exact model coverage,
+and per-model spend when applicable. Routing uses this scope on the
+verified Console route and keeps the returned Go allowance separate.
+The legacy `opencode-go`
 selector keeps the Go-only public-URL path (OpenCodex 2.84.0 pattern,
 without copied code). Selectors without a verified read-only path report
 `unsupported`. No inference probe, native auth import, login, switch or

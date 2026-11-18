@@ -38,7 +38,7 @@
 use std::{ffi::OsStr, process::Stdio, time::Duration};
 
 use eliot_core::{Error, Result};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::{
     io::AsyncReadExt,
     process::Command,
@@ -69,6 +69,9 @@ pub(crate) struct UsageBudget {
     pub limit: f64,
     pub spent: f64,
     pub per: String,
+    pub scope: Option<String>,
+    pub coverage: Option<String>,
+    pub models: Vec<(String, Option<f64>)>,
     pub resets_at: Option<i64>,
 }
 
@@ -241,6 +244,31 @@ pub(crate) fn parse_usage_limits_output(text: &str) -> Result<Option<UsageInfo>>
                     .and_then(Value::as_str)
                     .unwrap_or("budget")
                     .to_owned(),
+                scope: budget
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                coverage: budget
+                    .get("coverage")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                models: budget
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|model| {
+                        let provider = model.get("providerID")?.as_str()?;
+                        let id = model.get("modelID")?.as_str()?;
+                        let full = format!("{provider}/{id}");
+                        eliot_plugin::session::split_provider_model(&full)?;
+                        let spent = model
+                            .get("spent")
+                            .and_then(Value::as_f64)
+                            .filter(|spent| spent.is_finite() && *spent >= 0.0);
+                        Some((full, spent))
+                    })
+                    .collect(),
                 resets_at: eliot_plugin::quota::reset(budget.get("resetsAt")),
             });
         }
@@ -284,6 +312,53 @@ pub(crate) fn usage_windows(info: &UsageInfo) -> Vec<Value> {
             eliot_plugin::quota::window(&label, Some(percent), budget.resets_at, None)
         {
             windows.push(window);
+        }
+    }
+    windows
+}
+
+/// Normalized routing evidence from the pinned UsageLimits.Budget schema.
+/// The top spend from a per-model budget is display-only; decisions use
+/// the measured spend of the exact model. A set budget can cover the whole
+/// Console account or a set of provider/model IDs.
+pub(crate) fn scoped_budget_windows(info: &UsageInfo) -> Vec<Value> {
+    let mut windows = Vec::new();
+    for budget in &info.budgets {
+        let Some(scope @ ("each" | "combined")) = budget.scope.as_deref() else {
+            continue;
+        };
+        let mut push = |spent: f64, coverage: &str, models: Vec<&str>| {
+            let percent = (spent / budget.limit * 100.0).clamp(0.0, 100.0);
+            if let Some(mut window) =
+                eliot_plugin::quota::window("Console budget", Some(percent), budget.resets_at, None)
+            {
+                window["scope"] = json!(scope);
+                window["coverage"] = json!(coverage);
+                window["models"] = json!(models);
+                windows.push(window);
+            }
+        };
+        match (budget.per.as_str(), budget.coverage.as_deref()) {
+            ("set", Some("all")) => push(budget.spent, "all", Vec::new()),
+            ("set", Some("models")) if !budget.models.is_empty() => {
+                push(
+                    budget.spent,
+                    "models",
+                    budget
+                        .models
+                        .iter()
+                        .map(|(model, _)| model.as_str())
+                        .collect(),
+                );
+            }
+            ("model", Some("all" | "models")) => {
+                for (model, spent) in &budget.models {
+                    if let Some(spent) = spent {
+                        push(*spent, "models", vec![model]);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     windows
@@ -381,6 +456,29 @@ mod tests {
         assert_eq!(windows.len(), 1, "{windows:?}");
         assert_eq!(windows[0]["label"], "Console model");
         assert_eq!(windows[0]["usedPercent"], 100.0);
+    }
+
+    #[test]
+    fn console_budget_windows_preserve_coverage_and_exact_model_spend() {
+        let info = parse_usage_limits_output(
+            r#"{"data":{"budgets":[
+                {"limit":100,"spent":100,"per":"model","coverage":"models","scope":"each",
+                 "models":[{"providerID":"opencode","modelID":"full","spent":100},
+                           {"providerID":"opencode","modelID":"partial","spent":5},
+                           {"providerID":"opencode","modelID":"unmeasured"}]},
+                {"limit":50,"spent":25,"per":"set","coverage":"all","scope":"combined"}
+            ]}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let windows = scoped_budget_windows(&info);
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0]["models"], json!(["opencode/full"]));
+        assert_eq!(windows[0]["usedPercent"], 100.0);
+        assert_eq!(windows[1]["models"], json!(["opencode/partial"]));
+        assert_eq!(windows[1]["usedPercent"], 5.0);
+        assert_eq!(windows[2]["scope"], "combined");
+        assert_eq!(windows[2]["coverage"], "all");
     }
 
     #[test]

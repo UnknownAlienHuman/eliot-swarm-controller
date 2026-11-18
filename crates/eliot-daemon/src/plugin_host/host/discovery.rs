@@ -233,7 +233,12 @@ impl PluginHost {
     /// metadata reader calls the harness's own `model.list` with no session,
     /// no turn and no inference. The caller supplies a frozen profile
     /// snapshot (ad-hoc or named) whose `cmd` names the native executable.
-    pub(crate) async fn models(&self, profile: Value) -> Result<Value> {
+    pub(crate) async fn models(
+        &self,
+        profile: Value,
+        environment: Value,
+        deadline: Instant,
+    ) -> Result<Value> {
         if !profile
             .get("harness")
             .and_then(Value::as_str)
@@ -244,14 +249,16 @@ impl PluginHost {
                 "harness.models needs a codex, muse, opencode or antigravity profile",
             ));
         }
-        let environment = Value::Object(build_process_environment(&profile)?);
-        let slot = self.discovery_slot().await?;
+        let slot = tokio::time::timeout_at(deadline, self.discovery_slot())
+            .await
+            .map_err(|_| crate::adhoc::discovery_timeout())??;
+        let until = deadline.min(Instant::now() + READER_DEADLINE);
         let (id, stop_rx, done_tx) = self.register_metadata_reader_slot(slot)?;
         let host = self.clone();
         let (reply, response) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let completion = host
-                .read_model_catalogue(profile, environment, stop_rx)
+                .read_model_catalogue(profile, environment, stop_rx, until)
                 .await;
             host.finish_metadata_reader(&id, done_tx, completion.cleanup);
             let _ = reply.send(completion.result);
@@ -267,7 +274,12 @@ impl PluginHost {
     /// `account/usage/read`) and Muse (`usage/read`) expose a read-only
     /// quota surface; other harnesses stay `unsupported` without spawning a
     /// reader.
-    pub(crate) async fn quota(&self, profile: Value) -> Result<Value> {
+    pub(crate) async fn quota(
+        &self,
+        profile: Value,
+        environment: Value,
+        deadline: Instant,
+    ) -> Result<Value> {
         if !profile
             .get("harness")
             .and_then(Value::as_str)
@@ -283,13 +295,15 @@ impl PluginHost {
                 "harness.quota needs a supported native profile",
             ));
         }
-        let environment = Value::Object(build_process_environment(&profile)?);
-        let slot = self.discovery_slot().await?;
+        let slot = tokio::time::timeout_at(deadline, self.discovery_slot())
+            .await
+            .map_err(|_| crate::adhoc::discovery_timeout())??;
+        let until = deadline.min(Instant::now() + READER_DEADLINE);
         let (id, stop_rx, done_tx) = self.register_metadata_reader_slot(slot)?;
         let host = self.clone();
         let (reply, response) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            let completion = host.read_quota(profile, environment, stop_rx).await;
+            let completion = host.read_quota(profile, environment, stop_rx, until).await;
             host.finish_metadata_reader(&id, done_tx, completion.cleanup);
             let _ = reply.send(completion.result);
         });
@@ -303,6 +317,7 @@ impl PluginHost {
         profile: Value,
         environment: Value,
         mut stop: watch::Receiver<Option<Instant>>,
+        until: Instant,
     ) -> MetadataRead<Value> {
         if stop.borrow().is_some() {
             return MetadataRead {
@@ -310,6 +325,12 @@ impl PluginHost {
                     "cancelled",
                     "quota.read was cancelled before spawn",
                 )),
+                cleanup: ReaderCleanup::Confirmed,
+            };
+        }
+        if Instant::now() >= until {
+            return MetadataRead {
+                result: Err(crate::adhoc::discovery_timeout()),
                 cleanup: ReaderCleanup::Confirmed,
             };
         }
@@ -347,7 +368,6 @@ impl PluginHost {
         let mut known: Vec<_> = self.state.secrets.lock_recover().iter().cloned().collect();
         known.extend([self.state.owner_token.clone(), reader.credential.clone()]);
         let metadata_secrets = metadata_secret_snapshot(&profile, &environment, known);
-        let until = Instant::now() + READER_DEADLINE;
         let read = async {
             let manifest = reader.initialize(&harness, until).await?;
             require_proxy_capability(&profile, &manifest)?;
@@ -535,12 +555,12 @@ impl PluginHost {
         profile: Value,
         environment: Value,
         stop: watch::Receiver<Option<Instant>>,
+        until: Instant,
     ) -> MetadataRead<Value> {
         // OpenCode's two CLI operations must never share a reader lifetime:
         // closing the first Job proves its standalone server is gone before
         // starting the metadata command. Retain one admission slot throughout.
         let opencode = profile["harness"] == "opencode";
-        let until = Instant::now() + READER_DEADLINE;
         let mut catalogue = self
             .read_model_catalogue_part(
                 profile.clone(),

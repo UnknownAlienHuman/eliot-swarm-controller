@@ -1558,7 +1558,16 @@ restores revoked control; unknown blocks another takeover.
 `AgentHistoryRequest`/`ObservationPage` from the canonical native metadata DTOs.
 `harness.list` (`HarnessListRequest`/`HarnessListResponse`, no params) reports
 per-harness installation facts (installed, resolved `cmd`, `--version`; Claude
-additionally reports every discovered install newest first in `candidates`);
+additionally reports every discovered install newest first in `candidates`).
+Inventory and native discovery run on the blocking pool. The
+`models.catalog` 90-second deadline covers the aggregate lock, inventory
+worker and per-harness reads. Expiry during a per-harness read can return a
+partial catalog. Cold version lookup and election are atomic for the resolved
+binary. Followers share its result within their deadline. On Unix the
+resolved payload must have an ELF or Mach-O header before a probe, including
+for explicit paths. Inventory, model discovery, quota and launch resolve one
+`agy` executable. They screen it for the vendor CLI module before running
+bounded `acp --help` and version checks. An IDE executable is refused.
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
 harness's own read-only catalogue (Codex/Muse native `model/list`, OpenCode
 native `opencode models` provider/model ids verbatim, Antigravity
@@ -1583,11 +1592,14 @@ harness must match and observed Agents are `not_allowed`. Every response
 carries `configure`, the harness's mid-session `configure` support from the
 same table `configure` admission uses: `model_refusal`/`effort_refusal` are
 absent when the field has a verified mechanism and otherwise hold the exact
-`unsupported` refusal admission returns. The read is cached per native route/account
-scope with a freshness timestamp (`fetched_at_ms`, `ttl_ms`) and a nonsecret
-credential identity (a name, never a value); every response carries its
-`scope`, `fetched_at_ms`, `ttl_ms` and `credential`. Native model ids are
-retained verbatim and a failed read never selects another model or account.
+`unsupported` refusal admission returns. Native read caching requires a frozen,
+opaque route identity verified against the exact private environment supplied
+to the reader. The private key also binds the account, integration, full
+configured endpoint and executable. Missing selectors, admitted unset
+selectors and admitted empty values are distinct. Legacy and unverified
+routes bypass the cache. Public `scope` names the profile and route without
+private store paths. Every response carries `scope`, `fetched_at_ms`, `ttl_ms`
+and a nonsecret `credential` reference. Native model IDs remain verbatim.
 `harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is an Owner-only,
 read-only provider quota query. `harness` and optional `profile` keep their current
 contract. The response retains `harness`, `scope`, `credential` (nonsecret names),
@@ -1600,12 +1612,36 @@ groups keep separate Gemini, Gemini 4 Argon and Claude/GPT model-family
 5-hour/weekly buckets where supplied; missing groups are never filled from
 legacy model-availability percentages (see [Antigravity](../harnesses/antigravity.md#read-only-provider-quota));
 OpenCode Go uses the selected native credential export and `GET /zen/go/v1/usage`.
+The named `opencode` integration reads Console workspace budgets and the Go
+allowance through the installed standalone usage operation. The ad-hoc quota
+read explicitly selects Go. Adopted profiles and profiles without a verified
+integration report `unsupported`.
 These provider readers return `details.windows`: at most 32
 [`QuotaWindow`](../../crates/eliot-core/src/api/harness.rs) values
 `{label, usedPercent, resetsAtMs, windowDurationMins}`. Percent is a finite number
 in 0..100; reset time is Unix milliseconds or null when absent. Windows identify
 5-hour, weekly and model-scoped limits when supplied; Eliot never invents limits
-or reset times. `details.state` is `ready` or `error`; `details.origin` is
+or reset times. Routing and the catalogue consume every reader through one
+typed projection carrying provider, scope, observation time, verdict
+(`exhausted`/`available`), mapping provenance and how the decisive bucket
+maps to the model: an exact bucket id, a documented provider group, or
+unmapped. Group matching is on whole model-id tokens against the documented
+group table, never substrings: a depleted `Gemini 4 Argon weekly` bucket
+skips Argon models but never a Hydrogen model, and an unrecognized label
+such as `Model group` applies to no model (reported as unmapped, so callers
+stay `unknown`). An omitted model has no group membership. Account limits
+require a verified route. Console spend budgets constrain their covered
+route or exact model, and Console's Go counters remain separate. For Codex
+only the primary bucket's explicit limit state
+settles exhaustion (`spendControlReached`, a non-null
+`rateLimitReachedType`, a depleted `individualLimit`, or a full primary
+window without credits); a full secondary window or a metered
+`rateLimitsByLimitId` bucket never skips a route. Callers never reparse raw
+quota JSON into booleans. Freshness is enforced through the same projection
+entry point in both consumers. A response past its TTL leaves routing status
+and availability `unknown`. Aggregate cache hits reproject availability
+against the observation and reset times. `details.state` is `ready` or
+`error`; `details.origin` is
 `provider` or `environment`. A failed read remains `status:"supported"` with
 `state:"error"`, a sanitized reason and no windows. Unsupported native integration
 sources remain `unsupported` with a concrete reason. Native JSON-RPC method-not-found
@@ -1615,15 +1651,19 @@ redirects, bounds each HTTP request to eight seconds and each response to 1 MiB;
 credential reads are bounded to 256 KiB. Quota calls wait at most eight seconds
 for one of the existing four metadata-reader permits, so a five-harness Usage
 refresh can complete without an arbitrary fifth-read rejection. The wait starts
-no process; shutdown/capacity failure remains an environment error. Reads never
-refresh or write credentials.
+no process; shutdown/capacity failure remains an environment error. OpenCode's
+native Console operation may refresh its active connection while resolving it.
 
 Muse has no provider endpoint. The plugin projects MSP `usage/changed` as the
 session-family `quota.observed` event; Store retains the typed observation, and
 `harness.quota` selects the latest observation under the exact frozen profile.
 Its `fetched_at_ms` remains the native `observedAtMs`, and `note` says "observed
 during a turn". `usage/read` can also return that last native observation, exposed
-under `details.usage`. With no observation, or no installed MSP method, Muse
+under `details.usage`. Routing and `models.catalog` consume the retained
+`windows[]`, live `usage` and legacy `window`/`weekly` shapes through one
+normalized projection, alongside the other four harnesses' readers, so an
+exhausted window skips the route exactly when the catalogue would refuse to
+call it available. With no observation, or no installed MSP method, Muse
 returns `unsupported` and its reason. No quota query starts a turn, performs
 inference or polls Agents. CLI: `swarm quota --harness H [--profile P]`.
 
