@@ -1181,17 +1181,20 @@ impl OpenCodePlugin {
         } else {
             None
         };
-        // A requested effort selects the documented `Model.Ref.variant` on
-        // the create below: the installed server echoes even bogus
-        // switches, so the live catalogue proves the variant belongs to
-        // the requested model before the session exists. A miss or an
-        // unreadable catalogue is a definite failed start, never unknown.
-        if let Some(requested) = parsed.requested_model.as_deref()
-            && let Some(variant) = parsed
+        // An explicit model must prove membership in the live catalogue
+        // before the create below: `Session.create` publishes its input
+        // model unchanged and only resolves availability lazily at
+        // inference, so the create echo alone never proves the
+        // provider/model exists. A requested effort additionally selects
+        // the documented `Model.Ref.variant` on the create, so the
+        // catalogue must also prove the variant belongs to that exact
+        // model row. A miss or an unreadable catalogue is a definite
+        // failed start, never unknown.
+        if let Some(requested) = parsed.requested_model.as_deref() {
+            let requested_variant = parsed
                 .model_ref
                 .as_ref()
-                .and_then(|model_ref| model_ref.variant.as_deref())
-        {
+                .and_then(|model_ref| model_ref.variant.as_deref());
             let _timing = crate::native::startup::Step::new("model_catalogue");
             let catalogue = match session
                 .http
@@ -1217,17 +1220,33 @@ impl OpenCodePlugin {
                     ));
                 }
             };
-            let known = catalogue_variants(&catalogue, requested)
-                .is_some_and(|variants| variants.iter().any(|known| known == variant));
-            if !known {
+            if !catalogue_contains(&catalogue, requested) {
                 let failure = Error::new(
                     "profile_error",
-                    format!("OpenCode effort {variant} is not a variant of model {requested}"),
+                    format!("OpenCode model {requested} is not in the native catalogue"),
                 );
                 discard_failed_start(&mut session, failure.clone(), envelope).await;
                 return Ok(CreateOutcome::ProvenFailed(
                     self.retain_proven_no_effect_start(&parsed.params, StartPhase::Verify, failure),
                 ));
+            }
+            if let Some(variant) = requested_variant {
+                let known = catalogue_variants(&catalogue, requested)
+                    .is_some_and(|variants| variants.iter().any(|known| known == variant));
+                if !known {
+                    let failure = Error::new(
+                        "profile_error",
+                        format!("OpenCode effort {variant} is not a variant of model {requested}"),
+                    );
+                    discard_failed_start(&mut session, failure.clone(), envelope).await;
+                    return Ok(CreateOutcome::ProvenFailed(
+                        self.retain_proven_no_effect_start(
+                            &parsed.params,
+                            StartPhase::Verify,
+                            failure,
+                        ),
+                    ));
+                }
             }
         }
         // Workspace project MCP layer: the owned serve already merged it,
@@ -1801,6 +1820,60 @@ impl OpenCodePlugin {
             .override_model_ref
             .as_ref()
             .or(parsed.model_ref.as_ref());
+        // The create echo is not membership proof, so neither is the
+        // resume echo: an explicit realignment target proves live catalogue
+        // membership before any setter runs, exactly like the create and
+        // configure paths. No switch has been dispatched at this point, so
+        // a miss is a profile error with proven no effect; an unreadable
+        // catalogue is an unresolved readback (`unknown`).
+        if target_model.is_some() || target_variant.is_some() {
+            let catalogue = session
+                .http
+                .list_native_models(deadline)
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        "unknown",
+                        format!(
+                            "OpenCode resume catalogue readback is unresolved ({})",
+                            error.message
+                        ),
+                    )
+                })?;
+            if let Some(target) = target_model
+                && !catalogue_contains(&catalogue, target)
+            {
+                return Err(Error::new(
+                    "profile_error",
+                    format!("OpenCode model {target} is not in the native catalogue"),
+                ));
+            }
+            if let Some(variant) = target_variant {
+                let retained_model = current
+                    .model
+                    .as_ref()
+                    .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
+                let validation_model = target_model
+                    .map(str::to_owned)
+                    .or(retained_model)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "unknown",
+                            "OpenCode resume configure effort needs a session model",
+                        )
+                    })?;
+                let known = catalogue_variants(&catalogue, &validation_model)
+                    .is_some_and(|variants| variants.iter().any(|known| known == variant));
+                if !known {
+                    return Err(Error::new(
+                        "profile_error",
+                        format!(
+                            "OpenCode effort {variant} is not a variant of model {validation_model}"
+                        ),
+                    ));
+                }
+            }
+        }
         let model_needed = target_model.is_some_and(|target| {
             current
                 .model
@@ -3983,12 +4056,17 @@ fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
     Ok(ConfigureModelRequest { model, effort })
 }
 
-/// Whether the live native catalogue carries the exact requested
-/// `provider/model` id. Entries missing either half never match; the
-/// installed server echoes even bogus switches, so this gate (read
-/// before any write) is what fails an unknown model honestly.
-fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
-    catalogue.iter().any(
+/// The live native catalogue row for one exact `provider/model` id: the
+/// entry's provider AND model id must both match. Entries missing either
+/// half never match, and identical model ids under different providers
+/// never substitute for each other. The installed server echoes even
+/// bogus switches, so this row (read before any write) is what fails an
+/// unknown model honestly.
+fn catalogue_entry<'a>(
+    catalogue: &'a [NativeModelEntry],
+    requested: &str,
+) -> Option<&'a NativeModelEntry> {
+    catalogue.iter().find(
         |entry| match (entry.provider_id.as_deref(), entry.id.as_deref()) {
             (Some(provider), Some(id)) => format!("{}/{}", provider.trim(), id.trim()) == requested,
             _ => false,
@@ -3996,29 +4074,25 @@ fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
     )
 }
 
+/// Whether the live native catalogue carries the exact requested
+/// `provider/model` id. See [`catalogue_entry`].
+fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
+    catalogue_entry(catalogue, requested).is_some()
+}
+
 /// The live native catalogue's selectable variant ids for one exact
 /// `provider/model` id (`Model.Variant` ids in wire order). `None` when
 /// the entry is absent or reports no variants member: unknown, never an
 /// empty wardrobe.
 fn catalogue_variants(catalogue: &[NativeModelEntry], requested: &str) -> Option<Vec<String>> {
-    catalogue
-        .iter()
-        .find_map(
-            |entry| match (entry.provider_id.as_deref(), entry.id.as_deref()) {
-                (Some(provider), Some(id))
-                    if format!("{}/{}", provider.trim(), id.trim()) == requested =>
-                {
-                    Some(entry.variants.as_ref().map(|variants| {
-                        variants
-                            .iter()
-                            .filter_map(|variant| variant.id.clone())
-                            .collect()
-                    }))
-                }
-                _ => None,
-            },
-        )
-        .flatten()
+    catalogue_entry(catalogue, requested).and_then(|entry| {
+        entry.variants.as_ref().map(|variants| {
+            variants
+                .iter()
+                .filter_map(|variant| variant.id.clone())
+                .collect()
+        })
+    })
 }
 
 /// A frozen effort value: the trimmed string, non-empty, at most 128
@@ -4366,12 +4440,12 @@ mod tests {
     use super::{
         BackendKind, DAEMON_START_TIMEOUT, LocalProvider, McpSettle, OpenCodeHttp, OpenCodePlugin,
         PhaseFailure, START_CLEANUP_BUDGET, START_ENVELOPE, START_SETTLE_RESERVE,
-        SWARM_MCP_SERVER_NAME, StartAdmission, StartPhase, catalogue_contains, catalogue_variants,
-        fetch_backend_inventory, local_key_value, mcp_names, mcp_settle, normalize_endpoint,
-        opencode_manifest, opencode_scope, parse_configure_model, parse_local_provider,
-        phase_budget, phase_deadline, policy_from_snapshot, presession_reason, split_model,
-        start_auth_selector, start_config_override, start_failure_is_proven_no_effect,
-        start_model_ref, verify_local_effective,
+        SWARM_MCP_SERVER_NAME, StartAdmission, StartPhase, catalogue_contains, catalogue_entry,
+        catalogue_variants, fetch_backend_inventory, local_key_value, mcp_names, mcp_settle,
+        normalize_endpoint, opencode_manifest, opencode_scope, parse_configure_model,
+        parse_local_provider, phase_budget, phase_deadline, policy_from_snapshot,
+        presession_reason, split_model, start_auth_selector, start_config_override,
+        start_failure_is_proven_no_effect, start_model_ref, verify_local_effective,
     };
     use crate::native::server::READINESS_TIMEOUT;
     use crate::native::types::{McpServerReadback, McpStatusReadback, NativeModelEntry};
@@ -4524,14 +4598,31 @@ mod tests {
                 limit: None,
                 variants: None,
             },
+            NativeModelEntry {
+                id: Some("kimi".to_owned()),
+                provider_id: Some("other".to_owned()),
+                limit: None,
+                variants: Some(vec![NativeModelVariant {
+                    id: Some("sibling".to_owned()),
+                }]),
+            },
         ];
         assert!(catalogue_contains(&catalogue, "opencode/kimi"));
+        assert!(catalogue_contains(&catalogue, "other/kimi"));
         assert!(!catalogue_contains(&catalogue, "opencode/other"));
-        assert!(!catalogue_contains(&catalogue, "other/kimi"));
         assert!(!catalogue_contains(&[], "opencode/kimi"));
         assert_eq!(
             catalogue_variants(&catalogue, "opencode/kimi"),
             Some(vec!["low".to_owned(), "high".to_owned()])
+        );
+        // The shared row is an exact provider/model pair: an identical
+        // model id under another provider never stands in, so neither the
+        // membership gate nor the variant gate can read the wrong row.
+        let row = catalogue_entry(&catalogue, "other/kimi").expect("exact pair row");
+        assert_eq!(row.provider_id.as_deref(), Some("other"));
+        assert_eq!(
+            catalogue_variants(&catalogue, "other/kimi"),
+            Some(vec!["sibling".to_owned()])
         );
         assert!(catalogue_variants(&catalogue, "opencode/other").is_none());
         assert!(catalogue_variants(&[], "opencode/kimi").is_none());
