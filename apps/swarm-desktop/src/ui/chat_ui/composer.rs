@@ -12,12 +12,20 @@ const USAGE_ROWS: usize = 3;
 const EFFORT_MIN_WIDTH: f64 = 300.0;
 
 impl DesktopApp {
-    /// What Send (the button, or Enter) does now: start the task, resume a
+    /// What Send (the button, or Enter) does now: retry the unresolved
+    /// submission with its saved identity, or start the task, resume a
     /// stopped Agent, steer the running turn, or send the next message.
     pub(in crate::ui) fn primary_action(&self) -> Option<Message> {
         let Some(agent) = self.selected_agent_id() else {
             return Some(Message::Launch(LaunchMsg::LaunchRequested));
         };
+        // An unresolved submission retries with its saved action, body,
+        // ledger key and mutation id, whatever the Agent state has become:
+        // reselecting now could Steer a running turn or Resume a stopped
+        // Agent under a fresh id and admit a second effect.
+        if self.chat.pending_retry.contains_key(&agent) {
+            return Some(Message::Chat(ChatMsg::RetryPending(agent)));
+        }
         let detail = self.chat.detail.as_ref()?;
         let action = match (&detail.active_turn, resumable(detail)) {
             (_, true) => DraftAction::Resume {
@@ -491,10 +499,11 @@ impl DesktopApp {
     }
 
     /// Send (steering the running turn), or Resume for a stopped Agent, with
-    /// Interrupt while a turn runs. Each is bound now, from the detail on
-    /// screen. A stopped Agent has one Resume: the filled button while the
-    /// field is empty, the Send arrow (resume with the message) once it has
-    /// text.
+    /// Interrupt while a turn runs. An unresolved submission shows Retry
+    /// instead, resubmitting its saved identity. Each is bound now, from
+    /// the detail on screen. A stopped Agent has one Resume: the filled
+    /// button while the field is empty, the Send arrow (resume with the
+    /// message) once it has text.
     fn composer_actions(
         &self,
         agent: Option<String>,
@@ -506,6 +515,15 @@ impl DesktopApp {
         let draft_blank = self.composer_text().trim().is_empty();
         let enabled = !self.submitting();
         let primary: View = match (agent.clone(), detail) {
+            // The unresolved draft's explicit Retry: resubmits the saved
+            // action, body, ledger key and mutation id, whatever the Agent
+            // state has become since. It needs no new text.
+            (Some(agent), _) if self.chat.pending_retry.contains_key(&agent) => m3::filled(palette)
+                .is_enabled(enabled)
+                .automation_name("Retry (Enter)")
+                .on_click(context.message(Message::Chat(ChatMsg::RetryPending(agent))))
+                .content(m3::label("Retry"))
+                .tooltip("Retry with the same id"),
             (Some(agent), Some(detail)) if resumable(detail) => {
                 let resume = context.message(Message::Chat(ChatMsg::DraftRequested(
                     DraftAction::Resume {

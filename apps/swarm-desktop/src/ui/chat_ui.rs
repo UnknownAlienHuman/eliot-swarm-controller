@@ -43,6 +43,9 @@ pub(super) enum ChatMsg {
     CopyCode(String, usize),
     /// Send, Steer or Resume with the draft, bound when it was clicked.
     DraftRequested(DraftAction),
+    /// Retry the unresolved submission with its saved action, body, ledger
+    /// key and mutation id, whatever the Agent state has become since.
+    RetryPending(String),
     SendSubmitted(Result<SendOutcome, SendFailure>),
     /// Interrupt the turn shown on the button (Agent, generation, turn).
     InterruptRequested(BoundAction),
@@ -112,6 +115,74 @@ const FOLLOW_DELAY_MS: u64 = 50;
 /// uncertain steer is never followed by a send.
 const STEER_FALLBACK: [&str; 3] = ["bad_state", "stale_generation", "unsupported"];
 
+/// Bound on retained unresolved-submission snapshots (one per Agent): beyond
+/// this, another Agent's entry is evicted to make room for the live one.
+const MAX_PENDING_RETRIES: usize = 16;
+
+/// The unresolved submission to retry for this Agent, if any: the saved
+/// action, body, ledger key and mutation id verbatim. It deliberately takes
+/// no fresh action: whatever Send would select from the current Agent state
+/// (Steer while a turn runs, Resume while stopped) must not replace the
+/// saved identity, or an already-admitted effect would run twice.
+pub(super) fn retry_submission(
+    pending: &HashMap<String, PendingRetry>,
+    agent: &str,
+) -> Option<PendingRetry> {
+    pending.get(agent).cloned()
+}
+
+/// Release an abandoned snapshot and its ledger key. Same-ID recovery is
+/// already impossible (any new submission mints fresh identity), so holding
+/// the key only leaks it.
+pub(super) fn abandon_retry(
+    pending: &mut HashMap<String, PendingRetry>,
+    ledger: &mut crate::state::MutationLedger,
+    agent: &str,
+) {
+    if let Some(snapshot) = pending.remove(agent) {
+        ledger.complete(&snapshot.ledger_key);
+    }
+}
+
+/// Store a retained unresolved submission, pruning what can never be
+/// retried and capping the map. Snapshots whose draft revision moved on are
+/// dead (their revision cannot recur): drop them and release their keys.
+/// When still over the cap, evict another Agent's entry in deterministic
+/// order to make room for this live one. Replacing this Agent's own entry
+/// releases a superseded key.
+pub(super) fn retain_retry(
+    pending: &mut HashMap<String, PendingRetry>,
+    ledger: &mut crate::state::MutationLedger,
+    drafts: &DraftStore,
+    agent: &str,
+    snapshot: PendingRetry,
+) {
+    let dead: Vec<String> = pending
+        .iter()
+        .filter(|(id, kept)| drafts.revision(id) != kept.revision)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in dead {
+        abandon_retry(pending, ledger, &id);
+    }
+    while pending.len() >= MAX_PENDING_RETRIES {
+        let Some(victim) = pending
+            .keys()
+            .filter(|id| id.as_str() != agent)
+            .min()
+            .cloned()
+        else {
+            break;
+        };
+        abandon_retry(pending, ledger, &victim);
+    }
+    if let Some(old) = pending.insert(agent.to_owned(), snapshot)
+        && old.ledger_key != pending[agent].ledger_key
+    {
+        ledger.complete(&old.ledger_key);
+    }
+}
+
 /// The composer's text change that Enter (no Shift) made: the text before
 /// it when the change only inserted one line break; `None` otherwise.
 pub(super) fn enter_send_text(previous: &str, text: &str) -> Option<String> {
@@ -139,25 +210,31 @@ pub(super) fn enter_send_text(previous: &str, text: &str) -> Option<String> {
 pub(super) struct SendFailure {
     pub(super) error: eliot_core::Error,
     pub(super) mutation_id: String,
+    pub(super) ledger_key: String,
     pub(super) text: String,
     pub(super) revision: u64,
     pub(super) action: DraftAction,
+    pub(super) fallback: bool,
 }
 
 impl SendFailure {
     fn new(
         error: &eliot_core::Error,
         mutation_id: &str,
+        ledger_key: &str,
         text: &str,
         revision: u64,
         action: &DraftAction,
+        fallback: bool,
     ) -> Self {
         Self {
             error: error.clone(),
             mutation_id: mutation_id.to_owned(),
+            ledger_key: ledger_key.to_owned(),
             text: text.to_owned(),
             revision,
             action: action.clone(),
+            fallback,
         }
     }
 }
@@ -212,6 +289,34 @@ impl DraftAction {
     }
 }
 
+/// An unconfirmed submission kept with the draft: the exact action, body,
+/// mutation id and ledger key to retry. The next identical Send reuses this
+/// snapshot instead of rederiving identity, which could admit a second
+/// effect after a fallback `send:...:after-steer` submission whose response
+/// was lost.
+#[derive(Clone, Debug)]
+pub(super) struct PendingRetry {
+    pub(super) action: DraftAction,
+    pub(super) text: String,
+    pub(super) revision: u64,
+    pub(super) mutation_id: String,
+    pub(super) ledger_key: String,
+    pub(super) fallback: bool,
+}
+
+/// Reuse the unresolved snapshot for this Agent when the draft revision
+/// still matches, whatever action is requested now. Retrying the saved
+/// action, body, ledger key and mutation id can only repeat the same
+/// effect; minting a fresh id for a reselected action (Resume after an
+/// unconfirmed Send) could admit a second effect. A moved-on revision or
+/// no snapshot means a genuinely new action with fresh identity (current
+/// generation/turn conflict handling is unchanged).
+pub(super) fn draft_retry(pending: Option<&PendingRetry>, revision: u64) -> Option<PendingRetry> {
+    pending
+        .filter(|snapshot| snapshot.revision == revision)
+        .cloned()
+}
+
 /// The selected Agent's conversation, its delivery chain and per-Agent drafts.
 pub(super) struct ChatState {
     // Conversation of the selected Agent.
@@ -251,6 +356,10 @@ pub(super) struct ChatState {
     pub(super) opened_from_search: bool,
     // Mutations.
     pub(super) drafts: DraftStore,
+    /// Unconfirmed submission identity per Agent, retried verbatim by
+    /// Retry (or the next identical Send) instead of rederiving a fresh
+    /// mutation id. Bounded, and abandoned on draft edits and Agent removal.
+    pub(super) pending_retry: HashMap<String, PendingRetry>,
     pub(super) answers: HashMap<String, eliot_core::requests::Answers>,
     /// The Force stop awaiting confirmation, bound at its menu click, with
     /// the title shown in the question.
@@ -261,6 +370,69 @@ pub(super) struct ChatState {
 }
 
 impl DesktopApp {
+    /// Replace one Agent's draft (bumping its revision) and abandon its
+    /// unresolved snapshot, if any: that revision can never recur, so the
+    /// saved identity is unretryable and its ledger key must be released.
+    /// Every draft edit goes through here so no stale snapshot survives it.
+    fn store_draft_text(&mut self, agent: &str, text: String) {
+        self.chat.drafts.set(agent, text);
+        abandon_retry(&mut self.chat.pending_retry, &mut self.ledger, agent);
+    }
+
+    /// Submit the unresolved snapshot verbatim: its saved action, body,
+    /// ledger key and mutation id, whatever the Agent state has become
+    /// since. A fresh Send could now select Steer or Resume and admit a
+    /// second effect under a fresh id; this path never reselects.
+    fn retry_pending(&mut self, agent: &str, context: &ComponentContext<Self>) {
+        if self.submitting() {
+            return;
+        }
+        if self.data_dir.is_err() {
+            return;
+        }
+        let Some(snapshot) = retry_submission(&self.chat.pending_retry, agent) else {
+            self.set_status("Nothing to retry.");
+            return;
+        };
+        self.in_flight_key = Some(snapshot.ledger_key.clone());
+        self.alert = None;
+        self.set_status(format!("Retry ({}).", snapshot.mutation_id));
+        // The saved revision, so the composer empties and a later Send of
+        // new text mints fresh identity.
+        let agent_id = agent.to_owned();
+        self.chat.drafts.ack(&agent_id, snapshot.revision);
+        if !snapshot.text.trim().is_empty()
+            && let Some(convo) = self.chat.convo.as_mut()
+            && convo.agent() == agent_id
+        {
+            convo.note_local_input(&snapshot.mutation_id, &snapshot.text);
+            convo.set_local_note(
+                &snapshot.mutation_id,
+                Some(
+                    if matches!(snapshot.action, DraftAction::Steer(_)) {
+                        "Steering the running turn…"
+                    } else {
+                        "Sending…"
+                    }
+                    .to_owned(),
+                ),
+            );
+        }
+        self.rebuild_items();
+        self.follow_latest(0, context);
+        let blank = snapshot.text.trim().is_empty();
+        self.spawn_draft(
+            snapshot.action,
+            snapshot.mutation_id,
+            snapshot.ledger_key,
+            snapshot.text,
+            snapshot.revision,
+            blank,
+            snapshot.fallback,
+            context,
+        );
+    }
+
     pub(super) fn chat_update(&mut self, msg: ChatMsg, context: &ComponentContext<Self>) {
         match msg {
             ChatMsg::ComposerChanged(text) => {
@@ -273,10 +445,15 @@ impl DesktopApp {
                 // Typing in the composer dismisses an open popover.
                 self.close_popover();
                 // Enter without Shift typed this line break: send instead.
+                // A pending retry needs no text (promptless Resume), so it
+                // satisfies the Enter guard on its own.
                 if crate::shortcuts::take_plain_enter()
                     && let Some(sent) = enter_send_text(&previous, &text)
                 {
-                    if !sent.trim().is_empty()
+                    let retry_ready = self
+                        .selected_agent_id()
+                        .is_some_and(|agent| self.chat.pending_retry.contains_key(&agent));
+                    if (!sent.trim().is_empty() || retry_ready)
                         && let Some(primary) = self.primary_action()
                     {
                         self.update(primary, context);
@@ -287,7 +464,7 @@ impl DesktopApp {
                 // copy would differ, be written back, and move the caret (or end
                 // an IME composition). Line endings are normalized at submission.
                 if let Some(agent) = self.selected_agent_id() {
-                    self.chat.drafts.set(&agent, text);
+                    self.store_draft_text(&agent, text);
                 } else {
                     self.launch.launch_text = text;
                     self.launch.launch_rev = self.launch.launch_rev.wrapping_add(1);
@@ -572,9 +749,47 @@ impl DesktopApp {
                     return;
                 }
                 let revision = self.chat.drafts.revision(&agent_id);
-                let key = action.key(revision);
-                let mutation_id = self.ledger.id_for(&key);
-                self.in_flight_key = Some(key);
+                // An unconfirmed submission at this revision is retried
+                // with its saved action, body, ledger key and mutation id,
+                // whatever is requested now: a reselected action (Resume
+                // from the sidebar or Monitor after an unconfirmed Send)
+                // under a fresh id could admit a second effect. Anything
+                // else is a genuinely new action: drop only a dead snapshot
+                // (its revision can never recur, releasing its key) and
+                // mint fresh identity. Edits already abandon theirs, so
+                // this only catches a revision that moved on another way.
+                if self
+                    .chat
+                    .pending_retry
+                    .get(&agent_id)
+                    .is_some_and(|pending| pending.revision != revision)
+                {
+                    abandon_retry(&mut self.chat.pending_retry, &mut self.ledger, &agent_id);
+                }
+                let retry = draft_retry(self.chat.pending_retry.get(&agent_id), revision);
+                let (action, text, key, mutation_id, fallback) = match retry {
+                    Some(snapshot) => {
+                        // The ledger still holds this key (an uncertain
+                        // outcome never releases it), so the snapshot id is
+                        // the key's id: no new mutation id is minted. The
+                        // saved action and body win over the request: the
+                        // same effect retried can only repeat itself.
+                        (
+                            snapshot.action,
+                            snapshot.text,
+                            snapshot.ledger_key,
+                            snapshot.mutation_id,
+                            snapshot.fallback,
+                        )
+                    }
+                    None => {
+                        let key = action.key(revision);
+                        let mutation_id = self.ledger.id_for(&key);
+                        (action, text, key, mutation_id, false)
+                    }
+                };
+                let blank = text.trim().is_empty();
+                self.in_flight_key = Some(key.clone());
                 let what = action.label();
                 self.alert = None;
                 self.set_status(format!("{what} ({mutation_id})…"));
@@ -600,7 +815,19 @@ impl DesktopApp {
                 }
                 self.rebuild_items();
                 self.follow_latest(0, context);
-                self.spawn_draft(action, mutation_id, text, revision, blank, false, context);
+                self.spawn_draft(
+                    action,
+                    mutation_id,
+                    key,
+                    text,
+                    revision,
+                    blank,
+                    fallback,
+                    context,
+                );
+            }
+            ChatMsg::RetryPending(agent) => {
+                self.retry_pending(&agent, context);
             }
             ChatMsg::SendSubmitted(outcome) => self.send_submitted(outcome, context),
             ChatMsg::InterruptRequested(bound) => {
@@ -920,9 +1147,11 @@ mod tests {
             let failure = super::SendFailure::new(
                 &eliot_core::Error::new(code, "transport: reply missing"),
                 &id,
+                &key,
                 "hello",
                 7,
                 &action,
+                false,
             );
             let result: Result<(), _> = Err(failure);
             if super::settles(&result) {
@@ -933,13 +1162,245 @@ mod tests {
         let refused = super::SendFailure::new(
             &eliot_core::Error::new("invalid", "unknown: quoted model prose"),
             "id",
+            "send:a2:7",
             "hello",
             7,
             &super::DraftAction::Send {
                 agent: "a2".to_owned(),
             },
+            false,
         );
         assert!(super::settles(&Err::<(), _>(refused)));
+    }
+
+    #[test]
+    fn retry_reuses_the_fallback_snapshot_verbatim() {
+        use super::{PendingRetry, draft_retry};
+        let send = || super::DraftAction::Send {
+            agent: "a2".to_owned(),
+        };
+        // An unconfirmed fallback SEND keeps its `:after-steer` ledger key
+        // and id; the next submission at the same revision must reuse that
+        // snapshot instead of rederiving `send:a2:3`, whose fresh id could
+        // admit a duplicate turn if the fallback SEND was already admitted.
+        let pending = PendingRetry {
+            action: send(),
+            text: "hello".to_owned(),
+            revision: 3,
+            mutation_id: "B".to_owned(),
+            ledger_key: "send:a2:3:after-steer".to_owned(),
+            fallback: true,
+        };
+        let retry = draft_retry(Some(&pending), 3).expect("same-revision retry reuses");
+        assert_eq!(retry.action, send());
+        assert_eq!(retry.text, "hello");
+        assert_eq!(retry.mutation_id, "B");
+        assert_eq!(retry.ledger_key, "send:a2:3:after-steer");
+        assert!(retry.fallback);
+        let mut ledger = crate::state::MutationLedger::default();
+        let fallback_id = ledger.id_for("send:a2:3:after-steer");
+        let fresh_id = ledger.id_for("send:a2:3");
+        assert_ne!(fallback_id, fresh_id, "rederiving would mint a second id");
+        assert_eq!(ledger.id_for("send:a2:3:after-steer"), fallback_id);
+        // A moved-on revision or no snapshot mints fresh identity.
+        assert!(draft_retry(Some(&pending), 4).is_none());
+        assert!(draft_retry(None, 3).is_none());
+    }
+
+    #[test]
+    fn resume_request_reuses_the_pending_send_snapshot() {
+        use super::{PendingRetry, draft_retry};
+        // Audit-j2 Finding 1 (#679): the fallback SEND went out, its reply
+        // and readback were both lost, and the draft is restored. The Agent
+        // then stops, and sidebar or Monitor Resume requests a Resume at
+        // the same revision. The shared handler must reuse the saved Send
+        // (action, body, ledger key and mutation id), never a fresh Resume
+        // id that could admit the same text as a linked SEND twice.
+        let send = super::DraftAction::Send {
+            agent: "a2".to_owned(),
+        };
+        let pending = PendingRetry {
+            action: send.clone(),
+            text: "hello".to_owned(),
+            revision: 3,
+            mutation_id: "B".to_owned(),
+            ledger_key: "send:a2:3:after-steer".to_owned(),
+            fallback: true,
+        };
+        // The handler selects by revision alone, so the requested Resume
+        // never reaches identity selection: the saved Send wins.
+        let retry = draft_retry(Some(&pending), 3).expect("pending retry wins over Resume");
+        assert_eq!(retry.action, send);
+        assert_eq!(retry.text, "hello");
+        assert_eq!(retry.mutation_id, "B");
+        assert_eq!(retry.ledger_key, "send:a2:3:after-steer");
+    }
+
+    #[test]
+    fn explicit_retry_resubmits_the_saved_fallback_verbatim() {
+        use super::{PendingRetry, retry_submission};
+        use std::collections::HashMap;
+        // The review's exact example: the fallback SEND went out, its reply
+        // and readback were both lost, and the draft is restored. The Agent
+        // has since started a turn, so a fresh Send would select Steer (or
+        // Resume were it stopped); the explicit Retry must still resubmit
+        // the saved Send with its ledger key and mutation id.
+        let send = || super::DraftAction::Send {
+            agent: "a2".to_owned(),
+        };
+        let pending: HashMap<String, PendingRetry> = HashMap::from([(
+            "a2".to_owned(),
+            PendingRetry {
+                action: send(),
+                text: "hello".to_owned(),
+                revision: 3,
+                mutation_id: "B".to_owned(),
+                ledger_key: "send:a2:3:after-steer".to_owned(),
+                fallback: true,
+            },
+        )]);
+        let retry = retry_submission(&pending, "a2").expect("unresolved retry");
+        assert_eq!(retry.action, send());
+        assert_eq!(retry.text, "hello");
+        assert_eq!(retry.revision, 3);
+        assert_eq!(retry.mutation_id, "B");
+        assert_eq!(retry.ledger_key, "send:a2:3:after-steer");
+        assert!(retry.fallback);
+        assert!(retry_submission(&pending, "a9").is_none());
+        // Whatever the Agent state selects now (Steer for the running turn,
+        // Resume for a stopped Agent), the retry keeps the saved Send: the
+        // lookup takes no fresh action, so a changed Agent state cannot
+        // divert it onto a fresh identity.
+    }
+
+    #[test]
+    fn draft_revision_change_abandons_snapshot_and_key() {
+        use super::{PendingRetry, abandon_retry};
+        use std::collections::HashMap;
+        // An uncertain submission holds its ledger key; the owner then edits
+        // the draft, which bumps the revision. The store edit plus the
+        // abandon (what `store_draft_text` does) must drop the snapshot and
+        // release the key: that revision can never recur.
+        let mut drafts = crate::state::DraftStore::default();
+        let revision = drafts.set("a2", "hello".to_owned());
+        let key = format!("send:a2:{revision}");
+        let mut ledger = crate::state::MutationLedger::default();
+        let id = ledger.id_for(&key);
+        let mut pending: HashMap<String, PendingRetry> = HashMap::from([(
+            "a2".to_owned(),
+            PendingRetry {
+                action: super::DraftAction::Send {
+                    agent: "a2".to_owned(),
+                },
+                text: "hello".to_owned(),
+                revision,
+                mutation_id: id.clone(),
+                ledger_key: key.clone(),
+                fallback: false,
+            },
+        )]);
+        drafts.set("a2", "hello, edited".to_owned());
+        abandon_retry(&mut pending, &mut ledger, "a2");
+        assert!(!pending.contains_key("a2"));
+        assert_ne!(
+            ledger.id_for(&key),
+            id,
+            "the released key must mint fresh instead of reusing the abandoned id"
+        );
+    }
+
+    #[test]
+    fn agent_removal_abandons_snapshot_and_key() {
+        use super::{PendingRetry, abandon_retry};
+        use std::collections::HashMap;
+        // Deleting the Agent drops a snapshot that could otherwise sit in
+        // the map until another submission on that Agent (which never
+        // comes), and releases its ledger key with it.
+        let mut ledger = crate::state::MutationLedger::default();
+        let id = ledger.id_for("send:a2:3");
+        let mut pending: HashMap<String, PendingRetry> = HashMap::from([(
+            "a2".to_owned(),
+            PendingRetry {
+                action: super::DraftAction::Send {
+                    agent: "a2".to_owned(),
+                },
+                text: "hello".to_owned(),
+                revision: 3,
+                mutation_id: id.clone(),
+                ledger_key: "send:a2:3".to_owned(),
+                fallback: false,
+            },
+        )]);
+        abandon_retry(&mut pending, &mut ledger, "a2");
+        assert!(!pending.contains_key("a2"));
+        assert_ne!(
+            ledger.id_for("send:a2:3"),
+            id,
+            "the removed Agent's key must mint fresh instead of reusing the abandoned id"
+        );
+    }
+
+    #[test]
+    fn retained_retries_are_capped_but_live_recovery_survives() {
+        use super::{PendingRetry, retain_retry};
+        use std::collections::HashMap;
+        // Sixteen Agents hold unresolved submissions with matching drafts;
+        // one more fails. The store keeps the live one (same-ID recovery
+        // intact) and evicts the lowest other Agent, releasing its key.
+        let mut drafts = crate::state::DraftStore::default();
+        let mut ledger = crate::state::MutationLedger::default();
+        let mut pending: HashMap<String, PendingRetry> = HashMap::new();
+        let mut held: HashMap<String, String> = HashMap::new();
+        for index in 0..super::MAX_PENDING_RETRIES {
+            let agent = format!("a{index:02}");
+            let revision = drafts.set(&agent, "hello".to_owned());
+            let key = format!("send:{agent}:{revision}");
+            let id = ledger.id_for(&key);
+            held.insert(agent.clone(), id.clone());
+            pending.insert(
+                agent.clone(),
+                PendingRetry {
+                    action: super::DraftAction::Send { agent },
+                    text: "hello".to_owned(),
+                    revision,
+                    mutation_id: id,
+                    ledger_key: key,
+                    fallback: false,
+                },
+            );
+        }
+        let revision = drafts.set("a99", "hello".to_owned());
+        let key = format!("send:a99:{revision}");
+        let id = ledger.id_for(&key);
+        retain_retry(
+            &mut pending,
+            &mut ledger,
+            &drafts,
+            "a99",
+            PendingRetry {
+                action: super::DraftAction::Send {
+                    agent: "a99".to_owned(),
+                },
+                text: "hello".to_owned(),
+                revision,
+                mutation_id: id.clone(),
+                ledger_key: key.clone(),
+                fallback: false,
+            },
+        );
+        assert_eq!(pending.len(), super::MAX_PENDING_RETRIES);
+        let kept = pending.get("a99").expect("the live submission is kept");
+        assert_eq!(kept.mutation_id, id);
+        assert_eq!(ledger.id_for(&key), id, "the live key still resolves");
+        assert!(
+            !pending.contains_key("a00"),
+            "the lowest other Agent is evicted first"
+        );
+        assert_ne!(
+            ledger.id_for("send:a00:1"),
+            held["a00"],
+            "the evicted key must mint fresh instead of reusing the abandoned id"
+        );
     }
 
     #[test]

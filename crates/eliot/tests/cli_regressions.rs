@@ -1434,6 +1434,9 @@ fn owner_var_cas_conflict_and_global_scope() {
             "stale",
         ],
     );
+    // `version_conflict` is a Store-confirmed pre-effect refusal (#663):
+    // the CAS guard returns before any write, so a stale expectation
+    // exits 3 through the shared Core classification, never 4.
     assert_eq!(conflict.status.code(), Some(3));
     assert!(conflict.stderr.contains("version_conflict"));
 

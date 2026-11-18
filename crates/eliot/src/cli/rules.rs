@@ -28,16 +28,14 @@ pub(crate) async fn run_provider(
     match command {
         ProviderCommand::Holds(ProviderHoldsArgs { after, limit }) => {
             let request = ProviderHoldsRequest { after, limit };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
+            request.validate().map_err(Failure::for_read)?;
             let response: ProviderHoldsResponse =
                 eliot_daemon::client_call_typed(&data_dir, "provider.holds", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, false))?;
+                    .map_err(Failure::for_read)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "provider.holds response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "provider.holds response is invalid"))?;
             print_value(&value, json_output);
@@ -57,16 +55,14 @@ pub(crate) async fn run_provider(
                 corrective_evidence,
                 expected_probe_command,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: ProviderClearHoldResponse =
                 eliot_daemon::client_call_typed(&data_dir, "provider.clear_hold", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "provider.clear_hold response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "provider.clear_hold response is invalid"))?;
             print_value(&value, json_output);
@@ -88,7 +84,7 @@ pub(crate) async fn run_project(
         ProjectCommand::List => {
             let response = eliot_daemon::client_call(&data_dir, "project.list", json!({}))
                 .await
-                .map_err(|error| Failure::from_core(error, false))?;
+                .map_err(Failure::for_read)?;
             let Some(projects) = response.as_array() else {
                 return Err(Failure::new(4, "project.list response is invalid"));
             };
@@ -107,7 +103,7 @@ pub(crate) async fn run_project(
             let response: ProjectRegistrationView =
                 eliot_daemon::client_call_typed(&data_dir, "project.get", &json!({"id":id}))
                     .await
-                    .map_err(|error| Failure::from_core(error, false))?;
+                    .map_err(Failure::for_read)?;
             if response.id != id || response.validate().is_err() {
                 return Err(Failure::new(4, "project.get response is invalid"));
             }
@@ -144,16 +140,14 @@ pub(crate) async fn run_rule(
                 Some(project) => request.in_project(project),
                 None => request,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: CoreCommand =
                 eliot_daemon::client_call_typed(&data_dir, "rule.catch_up", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, true))?;
+                .map_err(Failure::for_mutation)?;
             let exit_code = response_exit_code(response.state);
             let value = command_value(response)?;
             print_value(&value, json_output);
@@ -182,16 +176,14 @@ pub(crate) async fn run_timer(
                 Some(project) => request.in_project(project),
                 None => request,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: CoreCommand =
                 eliot_daemon::client_call_typed(&data_dir, "timer.run", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, true))?;
+                .map_err(Failure::for_mutation)?;
             let exit_code = response_exit_code(response.state);
             let value = command_value(response)?;
             print_value(&value, json_output);
@@ -235,16 +227,14 @@ pub(crate) async fn run_goal(
                 },
                 max_cost: None,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: GoalView =
                 eliot_daemon::client_call_typed(&data_dir, "goal.set", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, true))?;
+                .map_err(Failure::for_mutation)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "goal.set response is invalid"))?;
             print_value(&value, json_output);
@@ -268,16 +258,14 @@ pub(crate) async fn run_goal(
                 mode: goal_mode(&mode)?,
                 reason,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: GoalView =
                 eliot_daemon::client_call_typed(&data_dir, "goal.pause", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, true))?;
+                .map_err(Failure::for_mutation)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "goal.pause response is invalid"))?;
             print_value(&value, json_output);
@@ -289,16 +277,14 @@ pub(crate) async fn run_goal(
                 agent,
                 mode: goal_mode(&mode)?,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: GoalView =
                 eliot_daemon::client_call_typed(&data_dir, "goal.clear", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, true))?;
+                .map_err(Failure::for_mutation)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "goal.clear response is invalid"))?;
             print_value(&value, json_output);
@@ -310,16 +296,14 @@ pub(crate) async fn run_goal(
                 agent,
                 mode: goal_mode(&mode)?,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: GoalView =
                 eliot_daemon::client_call_typed(&data_dir, "goal.resume", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, true))?;
+                .map_err(Failure::for_mutation)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "goal.resume response is invalid"))?;
             print_value(&value, json_output);
@@ -344,16 +328,14 @@ pub(crate) async fn run_goal(
                 idle_seq,
                 slot,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: GoalRoundResponse =
                 eliot_daemon::client_call_typed(&data_dir, "goal.round", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, true))?;
+                .map_err(Failure::for_mutation)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "goal.round response is invalid"))?;
             print_value(&value, json_output);

@@ -338,13 +338,16 @@ fn request_takes_id(method: &Method) -> bool {
 }
 
 fn visible(method: &Method, principal: &Principal) -> bool {
+    // Discovery lists callable methods, so it shares the RPC gate's own
+    // principal/method classification: Memory-only entries such as
+    // `client.identity` and `inference.*` (except `inference.client.*`) are
+    // hidden from Owner exactly as invoking them is rejected.
+    if super::auth::authorize_rpc_method(principal, method.name).is_err() {
+        return false;
+    }
     match principal {
         Principal::Owner => true,
-        Principal::Agent { .. } => {
-            !method.owner_only
-                && method.name != "client.identity"
-                && !method.name.starts_with("inference.")
-        }
+        Principal::Agent { .. } => !method.owner_only,
         // These principals have no discovery RPC authority. Keep the helper
         // conservative even when used internally; do not broaden their gate.
         Principal::Run { .. }
@@ -959,7 +962,12 @@ mod tests {
     #[tokio::test]
     async fn audit_390_mutation_help_states_the_mcp_omission_rule() {
         let router = super::super::tests::router();
-        for method in METHODS.iter().filter(|m| m.mutation) {
+        // Only Owner-callable mutations have Owner help: Memory-only
+        // mutations are hidden by the same gate that rejects their calls.
+        for method in METHODS
+            .iter()
+            .filter(|m| m.mutation && visible(m, &Principal::Owner))
+        {
             let help = router
                 .method_help(&json!({"method": method.name}), &Principal::Owner)
                 .await
@@ -1125,6 +1133,47 @@ mod tests {
             assert!(
                 limits.contains(needle),
                 "command.submit limits must state {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_catalog_hides_memory_only_methods_it_cannot_call() {
+        for method in [
+            "client.identity",
+            "inference.text",
+            "inference.get",
+            "inference.list",
+        ] {
+            let entry = METHODS
+                .iter()
+                .find(|m| m.name == method)
+                .expect("catalog entry");
+            assert!(
+                !visible(entry, &Principal::Owner),
+                "{method} is rejected for Owner and must not be listed as callable"
+            );
+            assert!(
+                super::super::auth::authorize_rpc_method(&Principal::Owner, method).is_err(),
+                "{method} gate and catalog must agree"
+            );
+        }
+        for method in [
+            "inference.client.install",
+            "mail.send",
+            "api.methods",
+            "api.help",
+            "api.identity",
+            "daemon.status",
+            "swarm.wait",
+        ] {
+            let entry = METHODS
+                .iter()
+                .find(|m| m.name == method)
+                .expect("catalog entry");
+            assert!(
+                visible(entry, &Principal::Owner),
+                "{method} stays callable for Owner"
             );
         }
     }

@@ -6,7 +6,8 @@ use super::args::{
     VarArgs, VarCommand, VarGetArgs, VarSetArgs, WhoArgs,
 };
 use super::support::{
-    Failure, WAIT_POLL_INTERVAL, command_value, mutation_id, print_value, validate_limit,
+    Failure, command_value, mutation_id, print_value, sleep_before_deadline, validate_limit,
+    wait_deadline,
 };
 use eliot_core::Command as CoreCommand;
 use eliot_core::api::discovery::{IdentityRequest, IdentityResponse};
@@ -24,9 +25,8 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    time::Duration,
 };
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, timeout_at};
 
 pub(crate) async fn run_cmd(
     CmdArgs { command }: CmdArgs,
@@ -40,13 +40,11 @@ pub(crate) async fn run_cmd(
                 id: mutation_id(id)?,
                 command_id,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: eliot_core::api::CommandCancelResponse =
                 eliot_daemon::client_call_typed(&data_dir, "command.cancel", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             if response.command_id != request.command_id
                 || response.state != eliot_core::CommandState::Cancelled
             {
@@ -61,16 +59,14 @@ pub(crate) async fn run_cmd(
         }
         CmdCommand::Show(CmdShowArgs { command_id }) => {
             let params = CommandGetRequest::new(command_id);
-            params
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
+            params.validate().map_err(Failure::for_read)?;
             let response: CoreCommand =
                 eliot_daemon::client_call_typed(&data_dir, "command.get", &params)
                     .await
-                    .map_err(|error| Failure::from_core(error, false))?;
+                    .map_err(Failure::for_read)?;
             params
                 .validate_response(&response)
-                .map_err(|error| Failure::from_core(error, false))?;
+                .map_err(Failure::invalid_response)?;
             let result = command_value(response)?;
             print_value(&result, json_output);
             Ok(0)
@@ -86,16 +82,14 @@ pub(crate) async fn run_cmd(
                 after,
                 limit,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
+            request.validate().map_err(Failure::for_read)?;
             let response: CommandChildrenResponse =
                 eliot_daemon::client_call_typed(&data_dir, "command.children", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, false))?;
+                    .map_err(Failure::for_read)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "command.children response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "command.children response is invalid"))?;
             print_value(&value, json_output);
@@ -114,16 +108,14 @@ pub(crate) async fn run_cmd(
                 resolution,
                 reason,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: CommandResolveResponse =
                 eliot_daemon::client_call_typed(&data_dir, "command.resolve", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "command.resolve response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "command.resolve response is invalid"))?;
             print_value(&value, json_output);
@@ -157,16 +149,14 @@ pub(crate) async fn run_turn(
                 status,
                 reason,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: TurnResolveResponse =
                 eliot_daemon::client_call_typed(&data_dir, "turn.resolve", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "turn.resolve response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "turn.resolve response is invalid"))?;
             print_value(&value, json_output);
@@ -199,16 +189,14 @@ pub(crate) async fn run_msg(
                 thread,
                 reply_to_delivery: reply_to,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: MailSendResponse =
                 eliot_daemon::client_call_typed(&data_dir, "mail.send", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "mail.send response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "mail.send response is invalid"))?;
             print_value(&value, json_output);
@@ -219,16 +207,14 @@ pub(crate) async fn run_msg(
                 agent,
                 delivery_id: delivery,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
+            request.validate().map_err(Failure::for_read)?;
             let response: MailDelivery =
                 eliot_daemon::client_call_typed(&data_dir, "mail.read", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, false))?;
+                    .map_err(Failure::for_read)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "mail.read response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "mail.read response is invalid"))?;
             print_value(&value, json_output);
@@ -240,16 +226,14 @@ pub(crate) async fn run_msg(
                 agent,
                 deliveries: delivery,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: MailAckResponse =
                 eliot_daemon::client_call_typed(&data_dir, "mail.ack", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "mail.ack response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "mail.ack response is invalid"))?;
             print_value(&value, json_output);
@@ -273,32 +257,96 @@ pub(crate) async fn run_inbox(
         limit,
         after,
     };
-    request
-        .validate()
-        .map_err(|error| Failure::from_core(error, false))?;
-    let deadline = wait.map(|secs| Instant::now() + Duration::from_secs(secs));
+    request.validate().map_err(Failure::for_read)?;
+    // One checked absolute deadline bounds every wait RPC and sleep; a short
+    // requested wait can no longer last until the full RPC timeout, and an
+    // extreme value is rejected instead of panicking on `Instant` overflow.
+    // The last validated page is kept so expiry prints it instead of
+    // dropping the JSON result.
+    let (deadline, waited) = inbox_deadline(wait)?;
+    let mut last: Option<MailInboxResponse> = None;
     loop {
-        let response: MailInboxResponse =
-            eliot_daemon::client_call_typed(&data_dir, "mail.inbox", &request)
+        let response: MailInboxResponse = match deadline {
+            Some(end) => {
+                match timeout_at(
+                    end,
+                    eliot_daemon::client_call_typed(&data_dir, "mail.inbox", &request),
+                )
                 .await
-                .map_err(|error| Failure::from_core(error, false))?;
+                {
+                    Ok(Ok(response)) => response,
+                    // A completed inbox RPC failed before any wait expiry:
+                    // the read-only path wrote nothing, so this is a plain
+                    // read error (exit 1), not an uncertain command outcome.
+                    // Exit 5 stays for deadline expiry below.
+                    Ok(Err(error)) => return Err(Failure::for_read(error)),
+                    Err(_) => {
+                        if let Some(page) = last {
+                            print_inbox_page(&page, json_output)?;
+                            return Ok(5);
+                        }
+                        return Err(Failure::inbox_timeout());
+                    }
+                }
+            }
+            None => eliot_daemon::client_call_typed(&data_dir, "mail.inbox", &request)
+                .await
+                .map_err(Failure::for_read)?,
+        };
         request
             .validate_response(&response)
-            .map_err(|_| Failure::new(4, "mail.inbox response is invalid"))?;
+            .map_err(Failure::invalid_response)?;
         let done = match deadline {
             None => true,
             Some(end) => !response.deliveries.is_empty() || Instant::now() >= end,
         };
         if done {
-            let value = serde_json::to_value(&response)
-                .map_err(|_| Failure::new(4, "mail.inbox response is invalid"))?;
-            print_value(&value, json_output);
-            if deadline.is_some() && response.deliveries.is_empty() {
+            print_inbox_page(&response, json_output)?;
+            if waited && response.deliveries.is_empty() {
                 return Ok(5);
             }
             return Ok(0);
         }
-        sleep(WAIT_POLL_INTERVAL).await;
+        last = Some(response);
+        match deadline {
+            Some(end) => {
+                if sleep_before_deadline(end).await.is_err() {
+                    // The deadline expired between validated reads: print
+                    // the kept page, then report the timeout.
+                    if let Some(page) = last {
+                        print_inbox_page(&page, json_output)?;
+                    }
+                    return Ok(5);
+                }
+            }
+            // Without a wait every iteration is already done; this is only
+            // defensive against a future loop change.
+            None => return Ok(0),
+        }
+    }
+}
+
+/// Print one validated inbox page; serialization failure stays exit 4.
+fn print_inbox_page(response: &MailInboxResponse, json_output: bool) -> Result<(), Failure> {
+    let value = serde_json::to_value(response)
+        .map_err(|_| Failure::new(4, "mail.inbox response is invalid"))?;
+    print_value(&value, json_output);
+    Ok(())
+}
+
+/// Deadline plan for `inbox --wait`: no `--wait` reads once and exits 0
+/// even when the inbox is empty; `--wait 0` reads once and reports an empty
+/// inbox as a timeout (exit 5); a positive wait bounds every RPC and sleep
+/// by one checked absolute deadline. Extreme values are rejected instead of
+/// panicking on `Instant` overflow.
+pub(crate) fn inbox_deadline(wait: Option<u64>) -> Result<(Option<Instant>, bool), Failure> {
+    match wait {
+        None => Ok((None, false)),
+        Some(0) => Ok((None, true)),
+        Some(secs) => Ok((
+            Some(wait_deadline(secs).map_err(|_| Failure::new(2, "--wait value is too large"))?),
+            true,
+        )),
     }
 }
 
@@ -342,16 +390,14 @@ pub(crate) async fn run_var(
                 expect_version,
                 note,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: VarSetResponse =
                 eliot_daemon::client_call_typed(&data_dir, "var.set", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "var.set response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "var.set response is invalid"))?;
             print_value(&value, json_output);
@@ -359,16 +405,14 @@ pub(crate) async fn run_var(
         }
         VarCommand::Get(VarGetArgs { key, scope }) => {
             let request = VarGetRequest { scope, key };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
+            request.validate().map_err(Failure::for_read)?;
             let response: VarGetResponse =
                 eliot_daemon::client_call_typed(&data_dir, "var.get", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, false))?;
+                    .map_err(Failure::for_read)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "var.get response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "var.get response is invalid"))?;
             print_value(&value, json_output);
@@ -387,13 +431,11 @@ pub(crate) async fn run_who(
 
 pub(crate) async fn run_identity(data_dir: PathBuf, json_output: bool) -> Result<u8, Failure> {
     let request = IdentityRequest {};
-    request
-        .validate()
-        .map_err(|error| Failure::from_core(error, false))?;
+    request.validate().map_err(Failure::for_read)?;
     let response: IdentityResponse =
         eliot_daemon::client_call_typed(&data_dir, "api.identity", &request)
             .await
-            .map_err(|error| Failure::from_core(error, false))?;
+            .map_err(Failure::for_read)?;
     let value = serde_json::to_value(response)
         .map_err(|_| Failure::new(4, "api.identity response is invalid"))?;
     print_value(&value, json_output);
@@ -419,15 +461,13 @@ pub(crate) async fn run_who_command(
         project,
         history: Some(history),
     };
-    request
-        .validate()
-        .map_err(|error| Failure::from_core(error, false))?;
+    request.validate().map_err(Failure::for_read)?;
     let response: WhoResponse = eliot_daemon::client_call_typed(data_dir, "who", &request)
         .await
-        .map_err(|error| Failure::from_core(error, false))?;
+        .map_err(Failure::for_read)?;
     request
         .validate_response(&response)
-        .map_err(|_| Failure::new(4, "who response is invalid"))?;
+        .map_err(Failure::invalid_response)?;
     let value =
         serde_json::to_value(response).map_err(|_| Failure::new(4, "who response is invalid"))?;
     print_value(&value, json_output);
@@ -454,16 +494,14 @@ pub(crate) async fn run_claim_command(
                 note,
                 ttl_secs,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: ClaimSetResponse =
                 eliot_daemon::client_call_typed(data_dir, "claim.set", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "claim.set response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "claim.set response is invalid"))?;
             print_value(&value, json_output);
@@ -471,16 +509,14 @@ pub(crate) async fn run_claim_command(
         }
         ClaimCommand::List(ClaimListArgs { project, agent }) => {
             let request = ClaimListRequest { project, agent };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, false))?;
+            request.validate().map_err(Failure::for_read)?;
             let response: ClaimListResponse =
                 eliot_daemon::client_call_typed(data_dir, "claim.list", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, false))?;
+                    .map_err(Failure::for_read)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "claim.list response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "claim.list response is invalid"))?;
             print_value(&value, json_output);
@@ -492,16 +528,14 @@ pub(crate) async fn run_claim_command(
                 agent,
                 glob,
             };
-            request
-                .validate()
-                .map_err(|error| Failure::from_core(error, true))?;
+            request.validate().map_err(Failure::for_mutation)?;
             let response: ClaimReleaseResponse =
                 eliot_daemon::client_call_typed(data_dir, "claim.release", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, true))?;
+                    .map_err(Failure::for_mutation)?;
             request
                 .validate_response(&response)
-                .map_err(|_| Failure::new(4, "claim.release response is invalid"))?;
+                .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(response)
                 .map_err(|_| Failure::new(4, "claim.release response is invalid"))?;
             print_value(&value, json_output);
@@ -524,4 +558,23 @@ pub(crate) fn read_var_value_file(path: &Path) -> Result<String, Failure> {
         ));
     }
     String::from_utf8(bytes).map_err(|_| Failure::new(2, "value file must be UTF-8"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbox_deadline_plans_zero_wait_and_rejects_overflow() {
+        let (deadline, waited) = inbox_deadline(None).expect("no wait reads once");
+        assert!(deadline.is_none());
+        assert!(!waited);
+        let (deadline, waited) = inbox_deadline(Some(0)).expect("zero wait reads once");
+        assert!(deadline.is_none());
+        assert!(waited, "an empty zero-wait read reports a timeout");
+        let (deadline, waited) = inbox_deadline(Some(5)).expect("small wait has a deadline");
+        assert!(deadline.unwrap() > Instant::now());
+        assert!(waited);
+        assert!(inbox_deadline(Some(u64::MAX)).is_err());
+    }
 }

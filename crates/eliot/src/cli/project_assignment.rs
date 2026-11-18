@@ -19,7 +19,7 @@ pub(super) async fn run(
             let assignment: ProjectAssignment =
                 eliot_daemon::client_call_typed(data_dir, "project.assignment.get", &request)
                     .await
-                    .map_err(|error| Failure::from_core(error, false))?;
+                    .map_err(Failure::for_read)?;
             print_value(&serde_json::json!(assignment), json_output);
             return Ok(0);
         }
@@ -78,5 +78,5 @@ async fn call(
 ) -> Result<ProjectAssignmentResult, Failure> {
     eliot_daemon::client_call_typed(data_dir, method, request)
         .await
-        .map_err(|error| Failure::from_core(error, true))
+        .map_err(Failure::for_mutation)
 }

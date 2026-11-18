@@ -52,6 +52,15 @@ impl Router {
     }
 }
 
+/// A response produced after a mutation committed that fails local
+/// validation: report `unknown`, never a pre-admission rejection code.
+fn post_write_validation(what: &str, error: Error) -> Error {
+    Error::new(
+        "unknown",
+        format!("{what} applied but the response failed validation: {error}"),
+    )
+}
+
 fn encode<T: serde::Serialize>(value: &T, what: &str) -> Result<Value> {
     serde_json::to_value(value)
         .map_err(|_| Error::new("internal", format!("{what} could not be encoded")))
@@ -210,7 +219,11 @@ impl Router {
         if pause_changed || !events.is_empty() {
             self.signal_progress();
         }
-        request.validate_response(&reply)?;
+        // The save committed above: a response that fails local validation
+        // is an unknown effect, never a pre-admission rejection.
+        request
+            .validate_response(&reply)
+            .map_err(|error| post_write_validation("settings save", error))?;
         encode(&reply, "settings save")
     }
 
@@ -835,6 +848,41 @@ mod tests {
             timer: None,
             definition,
         }
+    }
+
+    #[test]
+    fn post_write_validation_failure_reports_unknown() {
+        use eliot_core::api::{
+            SettingsClientSource, SettingsSaveRequest, SettingsSaveResponse, SettingsSection,
+        };
+        // A save that committed but whose reply is inconsistent fails
+        // response validation with `invalid`; the daemon must report
+        // `unknown` at its source so the CLI never reads it as a
+        // pre-admission rejection.
+        let request = SettingsSaveRequest {
+            expected_revision: None,
+            sections: [(SettingsSection::Automation, json!({}))]
+                .into_iter()
+                .collect(),
+            dry_run: false,
+            client: SettingsClientSource::Desktop,
+        };
+        let reply = SettingsSaveResponse {
+            saved: true,
+            revision: None,
+            changed_sections: Vec::new(),
+            restart_required: Vec::new(),
+            history_revision: Some(1),
+        };
+        let error = request.validate_response(&reply).unwrap_err();
+        assert_eq!(error.code, "invalid");
+        let reported = post_write_validation("settings save", error);
+        assert_eq!(reported.code, "unknown");
+        assert!(
+            reported.message.contains("applied"),
+            "the message must say the write happened: {}",
+            reported.message
+        );
     }
 
     #[test]

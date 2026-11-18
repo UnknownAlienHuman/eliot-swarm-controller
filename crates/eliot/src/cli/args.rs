@@ -826,6 +826,14 @@ pub(crate) struct WaitArgs {
     /// Command ids, or `agent/generation/turn_id` for exact turn bindings.
     #[arg(value_name = "ID")]
     pub(crate) ids: Vec<String>,
+    /// Explicit command ids, preserved verbatim. Use for ids containing `/`
+    /// (such as linked `<id>/send` and nested derived ids), which a
+    /// positional would reject or misread as a turn.
+    #[arg(long, value_name = "COMMAND")]
+    pub(crate) command: Vec<String>,
+    /// Explicit exact turn bindings, `agent/generation/turn_id`.
+    #[arg(long, value_name = "TURN")]
+    pub(crate) turn: Vec<String>,
 }
 
 #[derive(Args)]
@@ -842,6 +850,14 @@ pub(crate) struct DigestArgs {
     /// Command ids, or `agent/generation/turn_id` for exact turn bindings.
     #[arg(value_name = "ID")]
     pub(crate) ids: Vec<String>,
+    /// Explicit command ids, preserved verbatim. Use for ids containing `/`
+    /// (such as linked `<id>/send` and nested derived ids), which a
+    /// positional would reject or misread as a turn.
+    #[arg(long, value_name = "COMMAND")]
+    pub(crate) command: Vec<String>,
+    /// Explicit exact turn bindings, `agent/generation/turn_id`.
+    #[arg(long, value_name = "TURN")]
+    pub(crate) turn: Vec<String>,
 }
 
 #[derive(Args)]
@@ -858,6 +874,9 @@ pub(crate) struct InboxArgs {
     pub(crate) limit: Option<usize>,
     #[arg(long, value_name = "DELIVERY")]
     pub(crate) after: Option<String>,
+    /// Wait up to SECS for the first delivery (0 returns after a single
+    /// read; extreme values are rejected). Every wait RPC and sleep is
+    /// bounded by one checked absolute deadline.
     #[arg(long, value_name = "SECS")]
     pub(crate) wait: Option<u64>,
 }

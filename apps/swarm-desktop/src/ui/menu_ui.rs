@@ -290,10 +290,17 @@ impl DesktopApp {
                 );
                 match outcome {
                     Ok(note) => {
-                        let title = self
-                            .menu
-                            .removal
-                            .take()
+                        let removed = self.menu.removal.take();
+                        if let Some(removal) = removed.as_ref() {
+                            // The Agent is gone: its unresolved snapshot can
+                            // never be retried, so release its ledger key too.
+                            super::chat_ui::abandon_retry(
+                                &mut self.chat.pending_retry,
+                                &mut self.ledger,
+                                &removal.agent.id,
+                            );
+                        }
+                        let title = removed
                             .map(|removal| self.agent_label(&removal.agent))
                             .unwrap_or_default();
                         self.set_status(format!("Stopped and deleted “{title}”: {note}."));

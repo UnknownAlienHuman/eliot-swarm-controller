@@ -711,6 +711,7 @@ impl Component for DesktopApp {
                 launches: HashMap::new(),
                 opened_from_search: false,
                 drafts: DraftStore::default(),
+                pending_retry: HashMap::new(),
                 answers: HashMap::new(),
                 confirm_force: None,
                 loss: None,
