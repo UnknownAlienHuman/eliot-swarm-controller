@@ -471,6 +471,40 @@ impl CommitSink {
             .contains_key(&(agent_id.to_owned(), generation, source.to_owned()))
     }
 
+    /// Reconcile the one unacked batch for this exact scope against a
+    /// private `source.state` readback. `Ok(None)` means no batch is
+    /// waiting, so the caller holds a stale latch. `Ok(Some)` proves the
+    /// batch landed and clears the wait. `Err` means the readback did not
+    /// prove it: the caller may retry the exact batch when the readback
+    /// proves it absent, and must never replay it otherwise.
+    pub fn settle_unknown_from_state(
+        &mut self,
+        agent_id: &str,
+        generation: i64,
+        source: &str,
+        state: &Value,
+    ) -> Result<Option<BatchAck>> {
+        let key = (agent_id.to_owned(), generation, source.to_owned());
+        let Some(batch) = self.unknown_batches.get(&key).cloned() else {
+            return Ok(None);
+        };
+        self.settle_from_state(&batch, state).map(Some)
+    }
+
+    /// Take the one unacked batch for this exact scope so the caller can
+    /// resubmit it after a readback proves it absent. A resubmission is a
+    /// first delivery, never a replay: only call it when the readback shows
+    /// the batch never landed.
+    pub fn take_unknown_batch(
+        &mut self,
+        agent_id: &str,
+        generation: i64,
+        source: &str,
+    ) -> Option<SourceBatch> {
+        self.unknown_batches
+            .remove(&(agent_id.to_owned(), generation, source.to_owned()))
+    }
+
     fn scope_key(batch: &SourceBatch) -> (String, i64, String) {
         (
             batch.agent_id.clone(),
@@ -1027,6 +1061,76 @@ mod tests {
         assert_eq!(recorded[2].0, "events.put");
         assert_eq!(recorded[2].1["agent_id"], "a1");
         assert_eq!(recorded[2].1["source"], "stream");
+    }
+
+    #[test]
+    fn unknown_scope_reconciles_from_state_then_resubmits_only_when_absent() {
+        let batch = SourceBatch {
+            batch_id: "batch-1".to_owned(),
+            agent_id: "a1".to_owned(),
+            generation: 3,
+            source: "stream".to_owned(),
+            events: vec![eliot_core::NativeEvent {
+                kind: "turn.unknown".to_owned(),
+                native_id: "native-1".to_owned(),
+                data: json!({"turn_id": "turn-1"}),
+                ts: None,
+            }],
+            cursor: None,
+        };
+        let mut sink = CommitSink::new(test_client(), "credential");
+        // No waiting batch: the caller holds a stale latch, not a write.
+        assert_eq!(
+            sink.settle_unknown_from_state("a1", 3, "stream", &batch_readback(&batch))
+                .unwrap(),
+            None
+        );
+        assert!(sink.take_unknown_batch("a1", 3, "stream").is_none());
+        sink.unknown_batches.insert(
+            (
+                batch.agent_id.clone(),
+                batch.generation,
+                batch.source.clone(),
+            ),
+            batch.clone(),
+        );
+        // A foreign readback proves nothing and keeps the wait.
+        let mut foreign = batch_readback(&batch);
+        foreign["agent_id"] = json!("a2");
+        assert!(
+            sink.settle_unknown_from_state("a1", 3, "stream", &foreign)
+                .is_err()
+        );
+        assert!(sink.is_unknown("a1", 3, "stream"));
+        // The exact readback proves the batch landed and clears the wait.
+        let ack = sink
+            .settle_unknown_from_state("a1", 3, "stream", &batch_readback(&batch))
+            .expect("exact readback settles")
+            .expect("ack returned");
+        assert_eq!(ack.cursor, batch.cursor);
+        assert!(!sink.is_unknown("a1", 3, "stream"));
+        // A readback proving another batch last means this one never
+        // landed: take it so the caller can resubmit the exact bytes as a
+        // first delivery, never as a replay of an applied batch.
+        sink.unknown_batches.insert(
+            (
+                batch.agent_id.clone(),
+                batch.generation,
+                batch.source.clone(),
+            ),
+            batch.clone(),
+        );
+        let mut absent = batch_readback(&batch);
+        absent["last_batch_id"] = json!("batch-0");
+        assert!(
+            sink.settle_unknown_from_state("a1", 3, "stream", &absent)
+                .is_err()
+        );
+        let taken = sink
+            .take_unknown_batch("a1", 3, "stream")
+            .expect("absent batch is retaken");
+        assert_eq!(taken, batch);
+        assert!(!sink.is_unknown("a1", 3, "stream"));
     }
 
     #[test]
