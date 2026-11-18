@@ -532,6 +532,16 @@ pub(crate) fn adhoc_snapshot(
                 )
             })?;
             let validated = validate_native_cmd(&profile_name, &cmd)?;
+            // CLI identity before any launch: an IDE-named cmd is refused
+            // here, never spawned as an agent server.
+            if !antigravity_cli_identity(&validated) {
+                return Err(core::Error::new(
+                    "profile_error",
+                    format!(
+                        "ad-hoc {profile_name}: cmd points at the Antigravity IDE ({validated}), which does not implement the required native ACP/model CLI and is never launched; use the `agy` CLI"
+                    ),
+                ));
+            }
             snapshot.insert("cmd".to_owned(), Value::String(validated));
             snapshot.insert(
                 "dangerously_skip_permissions".to_owned(),
@@ -637,12 +647,68 @@ pub(crate) fn is_script_wrapper(path: &str) -> bool {
         || lower.ends_with(".js")
 }
 
+/// Native-payload gate for discovery: on Unix an extensionless file counts
+/// as a native executable only after an ELF or Mach-O header check. A `#!`
+/// script or any other text payload is not a native executable, so wrapper
+/// execution is never introduced through discovery. Files with an extension
+/// keep the callers' wrapper rules; Windows behavior is unchanged.
+pub(crate) fn is_native_executable(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if cfg!(windows) {
+        return true;
+    }
+    if is_script_wrapper(&path.to_string_lossy()) {
+        return false;
+    }
+    if path.extension().is_some() {
+        return true;
+    }
+    has_native_executable_magic(path)
+}
+
+fn has_native_executable_magic(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 4];
+    if std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_err()
+    {
+        return false;
+    }
+    matches!(
+        header,
+        [0x7f, b'E', b'L', b'F'] // ELF
+            | [0xfe, 0xed, 0xfa, 0xce] // Mach-O 32-bit
+            | [0xfe, 0xed, 0xfa, 0xcf] // Mach-O 64-bit
+            | [0xce, 0xfa, 0xed, 0xfe] // Mach-O 32-bit, byte-swapped
+            | [0xcf, 0xfa, 0xed, 0xfe] // Mach-O 64-bit, byte-swapped
+            | [0xca, 0xfe, 0xba, 0xbe] // Mach-O universal (fat)
+            | [0xbe, 0xba, 0xfe, 0xca] // Mach-O universal, byte-swapped
+    )
+}
+
+/// Async `discover_cmd_for_harness` for Tokio handlers: candidate
+/// enumeration plus the bounded `--version` probes runs on the blocking
+/// pool, so slow native CLIs never stall async command/event service while
+/// cached catalogue data already exists.
+pub(crate) async fn discover_cmd_for_harness_async(harness: &str) -> core::Result<Option<String>> {
+    let harness = validate_adhoc_harness(harness)?;
+    tokio::task::spawn_blocking(move || discover_cmd_for_harness(&harness))
+        .await
+        .map_err(|_| core::Error::new("internal", "harness discovery was interrupted"))?
+}
+
 /// Resolve the installed native executable for a harness. Codex resolves by
 /// name (`codex`) through the existing PATH lookup at spawn, so this returns
 /// `None`. Every other harness returns an absolute native path, or a
 /// deterministic `unsupported`/`profile_error` naming what was searched.
 /// Executable names follow the platform: `*.exe` on Windows, bare names
 /// plus the documented `/usr/local/bin` install paths on Linux.
+///
+/// Blocking: candidate enumeration launches bounded `--version` probes.
+/// Tokio handlers must use [`discover_cmd_for_harness_async`].
 pub(crate) fn discover_cmd_for_harness(harness: &str) -> core::Result<Option<String>> {
     let harness = validate_adhoc_harness(harness)?;
     match harness.as_str() {
@@ -678,7 +744,7 @@ pub(crate) fn find_on_path(file: &str) -> Option<PathBuf> {
     let target = file.to_ascii_lowercase();
     for dir in path_search_dirs() {
         let candidate = dir.join(file);
-        if candidate.is_file()
+        if is_native_executable(&candidate)
             && candidate
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().to_ascii_lowercase() == target)
@@ -805,6 +871,9 @@ fn claude_candidate_paths() -> Vec<PathBuf> {
     };
     if cfg!(windows) {
         for dir in path_search_dirs() {
+            if !dir.is_absolute() {
+                continue;
+            }
             let exe = dir.join(native_exe_name("claude"));
             if exe.is_file() {
                 push(exe);
@@ -835,13 +904,18 @@ fn claude_candidate_paths() -> Vec<PathBuf> {
         }
     } else {
         for dir in path_search_dirs() {
+            // Absolute native payloads only: a relative PATH entry is never
+            // probed, and an extensionless script never counts as native.
+            if !dir.is_absolute() {
+                continue;
+            }
             let exe = dir.join("claude");
-            if exe.is_file() {
+            if is_native_executable(&exe) {
                 push(exe);
             }
         }
         let fixed = Path::new("/usr/local/bin/claude");
-        if fixed.is_file() {
+        if is_native_executable(fixed) {
             push(fixed.to_path_buf());
         }
         if let Some(home) = user_profile() {
@@ -867,7 +941,13 @@ fn probe_candidate_paths_with(
 ) -> Vec<core::api::HarnessCandidate> {
     /// One discovered install plus its parsed `--version` triple, if any.
     type VersionedCandidate = (core::api::HarnessCandidate, Option<(u64, u64, u64)>);
-    let existing: Vec<PathBuf> = paths.into_iter().filter(|path| path.is_file()).collect();
+    // Absolute native payloads only, before any probe: a relative candidate
+    // is never launched for `--version`, and on Unix an extensionless script
+    // never counts as a native executable.
+    let existing: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|path| path.is_absolute() && is_native_executable(path))
+        .collect();
     let mut candidates: Vec<VersionedCandidate> = existing
         .iter()
         .take(MAX_DISCOVERY_CANDIDATE_PROBES)
@@ -1088,7 +1168,7 @@ fn discover_opencode_cmd_unix() -> core::Result<String> {
     let mut candidates = Vec::new();
     for dir in path_search_dirs() {
         let exe = dir.join("opencode");
-        if exe.is_file() {
+        if is_native_executable(&exe) {
             candidates.push(exe);
         }
     }
@@ -1097,14 +1177,14 @@ fn discover_opencode_cmd_unix() -> core::Result<String> {
         Path::new("/opt/opencode/.opencode/bin/opencode").to_path_buf(),
     ] {
         searched.push(fixed.to_string_lossy().into_owned());
-        if fixed.is_file() && !candidates.contains(&fixed) {
+        if is_native_executable(&fixed) && !candidates.contains(&fixed) {
             candidates.push(fixed);
         }
     }
     if let Some(home) = user_profile() {
         let exe = home.join(".opencode").join("bin").join("opencode");
         searched.push(exe.to_string_lossy().into_owned());
-        if exe.is_file() && !candidates.contains(&exe) {
+        if is_native_executable(&exe) && !candidates.contains(&exe) {
             candidates.push(exe);
         }
     }
@@ -1200,7 +1280,7 @@ fn discover_muse_cmd_unix() -> core::Result<String> {
         searched.push(format!("muse on PATH (wrapper or non-absolute: {path})"));
     }
     let fixed = Path::new("/usr/local/bin/muse");
-    if fixed.is_file() {
+    if is_native_executable(fixed) {
         return Ok(fixed.to_string_lossy().into_owned());
     }
     Err(core::Error::new(
@@ -1410,7 +1490,9 @@ fn muse_hot_start_candidates() -> Vec<String> {
     let fixed = Path::new("/usr/local/bin/muse")
         .to_string_lossy()
         .into_owned();
-    if Path::new(&fixed).is_file() && !cmds.contains(&fixed) {
+    // The hot-start probe launches `muse serve`: only a verified native
+    // payload is ever a candidate, never a script on PATH.
+    if is_native_executable(Path::new(&fixed)) && !cmds.contains(&fixed) {
         cmds.push(fixed);
     }
     cmds
@@ -1475,6 +1557,43 @@ fn discover_antigravity_cmd() -> core::Result<String> {
     Err(antigravity_missing_cli(&searched, ide_hint.as_deref()))
 }
 
+/// Antigravity CLI identity from the file name alone, before any probe: the
+/// stem must be `agy`. The `Antigravity` IDE executable (or any other name)
+/// never implements the native ACP/model CLI and is refused without ever
+/// being launched.
+pub(crate) fn antigravity_cli_identity(cmd: &str) -> bool {
+    let file = cmd
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(cmd)
+        .to_ascii_lowercase();
+    file.strip_suffix(".exe").unwrap_or(&file) == "agy"
+}
+
+/// Typed refusal for an IDE-named Antigravity cmd: named for guidance only,
+/// never returned, executed or version-probed.
+pub(crate) fn antigravity_ide_unsupported(cmd: &str) -> core::Error {
+    core::Error::new(
+        "unsupported",
+        format!(
+            "antigravity cmd points at the Antigravity IDE ({cmd}), which does not implement the required native ACP/model CLI and is never launched for discovery; install the `agy` CLI and put it on PATH"
+        ),
+    )
+}
+
+/// Establish Antigravity CLI protocol capability from the bounded `--version`
+/// identity probe: the output must parse as a CLI version triple. A PATH
+/// file named `agy` without that capability is refused here, before any
+/// discovery probe uses it for `models`, quota or launch.
+pub(crate) fn antigravity_cli_version(version: Option<String>) -> core::Result<String> {
+    version.filter(|text| parse_cli_version(text).is_some()).ok_or_else(|| {
+        core::Error::new(
+            "unsupported",
+            "antigravity `agy` on PATH does not establish native CLI protocol capability (`--version` is missing or unparseable); install the `agy` CLI and put it on PATH",
+        )
+    })
+}
+
 /// Error for an `agy`-less install. The IDE path, when seen, is named for
 /// guidance only: it is never returned, executed or version-probed.
 fn antigravity_missing_cli(searched: &[String], ide: Option<&str>) -> core::Error {
@@ -1493,11 +1612,71 @@ fn antigravity_missing_cli(searched: &[String], ide: Option<&str>) -> core::Erro
     )
 }
 
+/// Async `harness_installation` for Tokio handlers: the blocking inventory
+/// read runs on the blocking pool. An interrupted pool (runtime shutdown)
+/// reports the harness as not installed with its cause, like a failed
+/// discovery, instead of stalling the handler.
+pub(crate) async fn harness_installation_async(harness: &str) -> Value {
+    let owned = harness.to_owned();
+    let harness = harness.to_owned();
+    tokio::task::spawn_blocking(move || harness_installation(&owned))
+        .await
+        .unwrap_or_else(|_| {
+            json!({
+                "harness": harness,
+                "installed": false,
+                "cmd": Value::Null,
+                "version": Value::Null,
+                "error": "harness inventory was interrupted",
+                "code": "internal",
+            })
+        })
+}
+
 /// Read-only harness installation facts. No model turn and no inference:
 /// only filesystem presence plus a bounded `--version` read.
+///
+/// Blocking: filesystem scans plus bounded `--version` probes. Tokio
+/// handlers must use [`harness_installation_async`].
 pub(crate) fn harness_installation(harness: &str) -> Value {
     match discover_cmd_for_harness(harness) {
         Ok(Some(cmd)) => {
+            // CLI identity before any discovery probe: an IDE-named binary
+            // is refused without launching it; a PATH `agy` without CLI
+            // protocol capability is refused before any discovery use.
+            if harness == "antigravity" {
+                if !antigravity_cli_identity(&cmd) {
+                    let error = antigravity_ide_unsupported(&cmd);
+                    return json!({
+                        "harness": harness,
+                        "installed": false,
+                        "cmd": Value::Null,
+                        "version": Value::Null,
+                        "error": error.message,
+                        "code": error.code,
+                    });
+                }
+                match antigravity_cli_version(native_version_string(&cmd)) {
+                    Ok(version) => {
+                        return json!({
+                            "harness": harness,
+                            "installed": true,
+                            "cmd": cmd,
+                            "version": Value::String(version),
+                        });
+                    }
+                    Err(error) => {
+                        return json!({
+                            "harness": harness,
+                            "installed": false,
+                            "cmd": Value::Null,
+                            "version": Value::Null,
+                            "error": error.message,
+                            "code": error.code,
+                        });
+                    }
+                }
+            }
             let version = native_version(&cmd);
             json!({
                 "harness": harness,
@@ -1508,14 +1687,18 @@ pub(crate) fn harness_installation(harness: &str) -> Value {
         }
         Ok(None) => {
             // Codex resolves `codex` by name at spawn; report PATH presence.
-            let installed = find_on_path("codex.exe")
-                .or_else(|| find_on_path("codex"))
-                .is_some();
+            // The probe is keyed by the resolved binary identity, the same
+            // absolute path `harness.models` resolves and probes, so
+            // inventory and model reads share one memoized probe per binary.
+            let resolved = find_on_path("codex.exe").or_else(|| find_on_path("codex"));
+            let version = resolved
+                .as_ref()
+                .and_then(|path| native_version_string(&path.to_string_lossy()));
             json!({
                 "harness": harness,
-                "installed": installed,
+                "installed": resolved.is_some(),
                 "cmd": Value::Null,
-                "version": if installed { native_version("codex") } else { Value::Null },
+                "version": version.map_or(Value::Null, Value::String),
             })
         }
         Err(error) => json!({
@@ -1552,17 +1735,57 @@ type VersionCache = std::collections::HashMap<String, (Option<String>, std::time
 static VERSION_CACHE: std::sync::LazyLock<std::sync::Mutex<VersionCache>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(VersionCache::new()));
 
+/// One in-flight `<exe> --version` probe shared by concurrent cold misses.
+/// The leader runs the probe; followers wait on the condition variable and
+/// share its result instead of launching the same binary again. Keyed by
+/// binary identity (the resolved executable path), so Codex inventory and
+/// model reads share one probe for the same binary.
+struct InflightVersionProbe {
+    state: std::sync::Mutex<Option<Option<String>>>,
+    ready: std::sync::Condvar,
+}
+
+type InflightVersionProbes =
+    std::collections::HashMap<String, std::sync::Arc<InflightVersionProbe>>;
+
+static VERSION_INFLIGHT: std::sync::LazyLock<std::sync::Mutex<InflightVersionProbes>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(InflightVersionProbes::new()));
+
+/// Bound on a follower wait: the leader's probe is itself bounded by
+/// [`VERSION_PROBE_TIMEOUT`], so this only covers scheduling slack. A
+/// follower that times out probes alone rather than blocking forever.
+const VERSION_INFLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Bounded `<exe> --version` first line, or `None` when the probe fails.
 /// The existing scoped process runner bounds output and owns the whole family.
-/// Results are memoized per executable (see `VERSION_CACHE_TTL`).
+/// Results are memoized per executable (see `VERSION_CACHE_TTL`); concurrent
+/// cold misses for one binary share a single in-flight probe instead of
+/// launching the same CLI once each.
 pub(crate) fn native_version_string(program: &str) -> Option<String> {
+    if let Some(hit) = version_cache_get(program) {
+        return hit;
+    }
+    let probe = match version_inflight_join(program) {
+        VersionProbeRole::Leader(probe) => probe,
+        VersionProbeRole::Follower(probe) => return version_inflight_wait(program, &probe),
+    };
+    let version = native_version_string_uncached(program);
+    version_cache_insert(program, version.clone());
+    version_inflight_finish(program, &probe, version.clone());
+    version
+}
+
+fn version_cache_get(program: &str) -> Option<Option<String>> {
     if let Ok(cache) = VERSION_CACHE.lock()
         && let Some((version, at)) = cache.get(program)
         && at.elapsed() < VERSION_CACHE_TTL
     {
-        return version.clone();
+        return Some(version.clone());
     }
-    let version = native_version_string_uncached(program);
+    None
+}
+
+fn version_cache_insert(program: &str, version: Option<String>) {
     if let Ok(mut cache) = VERSION_CACHE.lock() {
         if cache.len() >= VERSION_CACHE_MAX {
             cache.retain(|_, (_, at)| at.elapsed() < VERSION_CACHE_TTL);
@@ -1570,12 +1793,76 @@ pub(crate) fn native_version_string(program: &str) -> Option<String> {
                 cache.clear();
             }
         }
-        cache.insert(
-            program.to_owned(),
-            (version.clone(), std::time::Instant::now()),
-        );
+        cache.insert(program.to_owned(), (version, std::time::Instant::now()));
     }
-    version
+}
+
+enum VersionProbeRole {
+    Leader(std::sync::Arc<InflightVersionProbe>),
+    Follower(std::sync::Arc<InflightVersionProbe>),
+}
+
+fn version_inflight_join(program: &str) -> VersionProbeRole {
+    let mut inflight = match VERSION_INFLIGHT.lock() {
+        Ok(inflight) => inflight,
+        Err(_) => {
+            // A poisoned singleflight map must not block discovery: probe
+            // alone without sharing.
+            return VersionProbeRole::Leader(std::sync::Arc::new(InflightVersionProbe {
+                state: std::sync::Mutex::new(None),
+                ready: std::sync::Condvar::new(),
+            }));
+        }
+    };
+    if let Some(probe) = inflight.get(program) {
+        return VersionProbeRole::Follower(probe.clone());
+    }
+    let probe = std::sync::Arc::new(InflightVersionProbe {
+        state: std::sync::Mutex::new(None),
+        ready: std::sync::Condvar::new(),
+    });
+    inflight.insert(program.to_owned(), probe.clone());
+    VersionProbeRole::Leader(probe)
+}
+
+fn version_inflight_wait(
+    program: &str,
+    probe: &std::sync::Arc<InflightVersionProbe>,
+) -> Option<String> {
+    let mut state = match probe.state.lock() {
+        Ok(state) => state,
+        Err(_) => return None,
+    };
+    while state.is_none() {
+        let (next, timeout) = match probe.ready.wait_timeout(state, VERSION_INFLIGHT_WAIT) {
+            Ok(result) => result,
+            Err(_) => return None,
+        };
+        state = next;
+        if timeout.timed_out() {
+            // The leader is overdue (its own probe is bounded): probe alone
+            // rather than block the caller indefinitely.
+            drop(state);
+            let version = native_version_string_uncached(program);
+            version_cache_insert(program, version.clone());
+            return version;
+        }
+    }
+    state.clone().flatten()
+}
+
+fn version_inflight_finish(
+    program: &str,
+    probe: &std::sync::Arc<InflightVersionProbe>,
+    version: Option<String>,
+) {
+    if let Ok(mut state) = probe.state.lock() {
+        *state = Some(version);
+    }
+    probe.ready.notify_all();
+    if let Ok(mut inflight) = VERSION_INFLIGHT.lock() {
+        inflight.remove(program);
+    }
 }
 
 fn native_version_string_uncached(program: &str) -> Option<String> {
@@ -2337,7 +2624,11 @@ mod tests {
         let mut paths = Vec::new();
         for index in 0..(MAX_DISCOVERY_CANDIDATE_PROBES + 3) {
             let path = root.join(format!("candidate-{index:02}"));
-            std::fs::write(&path, b"probe me").unwrap();
+            // A native payload header: on Unix an extensionless file counts
+            // only with ELF/Mach-O magic, while Windows accepts the file.
+            let mut payload = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+            payload.extend_from_slice(b"probe me");
+            std::fs::write(&path, payload).unwrap();
             paths.push(path);
         }
         let mut calls = 0;
@@ -2355,6 +2646,126 @@ mod tests {
                 assert_eq!(candidate.version, None);
             }
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn candidate_probing_skips_scripts_and_relative_paths() {
+        let root = std::env::temp_dir().join(format!("eliot-probe-gate-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("script-candidate");
+        std::fs::write(&script, b"#!/usr/bin/env node\nconsole.log('nope');\n").unwrap();
+        let empty = root.join("empty-candidate");
+        std::fs::write(&empty, b"").unwrap();
+        let relative = std::path::PathBuf::from("relative-candidate");
+        let mut calls = Vec::new();
+        let found = probe_candidate_paths_with(vec![script, empty, relative], |cmd| {
+            calls.push(cmd.to_owned());
+            Some("9.9.9 (probe)".to_owned())
+        });
+        // A relative candidate is never probed on any platform. On Unix an
+        // extensionless script is not a native executable either; on Windows
+        // the payload gate keeps the established `is_file` behavior.
+        assert!(!calls.iter().any(|cmd| *cmd == "relative-candidate"));
+        assert!(
+            !found
+                .iter()
+                .any(|candidate| candidate.cmd == "relative-candidate")
+        );
+        if cfg!(unix) {
+            assert!(
+                calls.is_empty(),
+                "nothing unqualified is ever probed: {calls:?}"
+            );
+            assert!(found.is_empty());
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn concurrent_cold_misses_share_one_in_flight_probe() {
+        let program = format!("eliot-singleflight-{}", ulid::Ulid::new());
+        // The first joiner leads; joiners while it runs follow the same
+        // probe instead of launching the binary again.
+        let VersionProbeRole::Leader(leader) = version_inflight_join(&program) else {
+            panic!("first joiner must lead");
+        };
+        let VersionProbeRole::Follower(follower) = version_inflight_join(&program) else {
+            panic!("second joiner must follow");
+        };
+        let VersionProbeRole::Follower(third) = version_inflight_join(&program) else {
+            panic!("third joiner must follow");
+        };
+        let waiter_program = program.clone();
+        let waiter = std::thread::spawn(move || version_inflight_wait(&waiter_program, &follower));
+        version_inflight_finish(&program, &leader, Some("9.9.9 (shared)".to_owned()));
+        assert_eq!(
+            waiter.join().expect("waiter joins"),
+            Some("9.9.9 (shared)".to_owned())
+        );
+        drop(third);
+        // The finished probe leaves the map: the next cold joiner leads
+        // again instead of waiting on a stale entry.
+        let VersionProbeRole::Leader(again) = version_inflight_join(&program) else {
+            panic!("post-finish joiner must lead");
+        };
+        version_inflight_finish(&program, &again, None);
+    }
+
+    #[test]
+    fn antigravity_ide_cmd_is_refused_without_a_launch() {
+        // Identity is a file-name check: no process runs here.
+        assert!(antigravity_cli_identity("agy"));
+        assert!(antigravity_cli_identity("C:\\Tools\\agy\\agy.exe"));
+        assert!(antigravity_cli_identity("/usr/local/bin/agy"));
+        for ide in [
+            "Antigravity.exe",
+            "C:\\Program Files\\Antigravity\\Antigravity.exe",
+            "antigravity",
+            "/opt/antigravity/Antigravity",
+            "C:\\Tools\\agy\\launcher.exe",
+        ] {
+            assert!(!antigravity_cli_identity(ide), "{ide} is not the CLI");
+            let error = antigravity_ide_unsupported(ide);
+            assert_eq!(error.code, "unsupported");
+            assert!(error.message.contains("never launched"));
+        }
+        // Protocol capability comes from the bounded `--version` output: a
+        // PATH `agy` without a CLI triple is refused before any use.
+        assert_eq!(
+            antigravity_cli_version(Some("1.5.9".to_owned())).expect("agy triple"),
+            "1.5.9"
+        );
+        assert_eq!(
+            antigravity_cli_version(None).unwrap_err().code,
+            "unsupported"
+        );
+        assert_eq!(
+            antigravity_cli_version(Some("not a version".to_owned()))
+                .unwrap_err()
+                .code,
+            "unsupported"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_payload_gate_accepts_elf_and_rejects_scripts() {
+        let root = std::env::temp_dir().join(format!("eliot-payload-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let elf = root.join("elf-binary");
+        std::fs::write(&elf, [0x7f, b'E', b'L', b'F', 2, 1, 1, 0]).unwrap();
+        assert!(is_native_executable(&elf));
+        let macho = root.join("macho-binary");
+        std::fs::write(&macho, [0xfe, 0xed, 0xfa, 0xcf]).unwrap();
+        assert!(is_native_executable(&macho));
+        let script = root.join("shell-script");
+        std::fs::write(&script, b"#!/bin/sh\necho hi\n").unwrap();
+        assert!(!is_native_executable(&script));
+        let text = root.join("text-file");
+        std::fs::write(&text, b"just text").unwrap();
+        assert!(!is_native_executable(&text));
+        assert!(!is_native_executable(&root.join("missing")));
         std::fs::remove_dir_all(&root).ok();
     }
 

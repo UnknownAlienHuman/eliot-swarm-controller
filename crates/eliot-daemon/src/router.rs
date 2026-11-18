@@ -2110,11 +2110,12 @@ impl Router {
                 .map(str::to_owned);
             // An explicit `--cmd` pins the native executable (e.g. a Muse
             // binary version the launcher no longer marks current);
-            // otherwise the installed executable is discovered. Shape is
-            // validated with the frozen snapshot below.
+            // otherwise the installed executable is discovered on the
+            // blocking pool. Shape is validated with the frozen snapshot
+            // below.
             let cmd = match explicit_cmd {
                 Some(cmd) => Some(cmd),
-                None => crate::adhoc::discover_cmd_for_harness(&harness)?,
+                None => crate::adhoc::discover_cmd_for_harness_async(&harness).await?,
             };
             let mut snapshot = crate::adhoc::adhoc_snapshot(
                 &harness,
@@ -2968,7 +2969,7 @@ impl Router {
         for verified in eliot_core::VERIFIED_HARNESSES {
             probes.push((
                 verified.harness,
-                crate::adhoc::harness_installation(verified.harness),
+                crate::adhoc::harness_installation_async(verified.harness).await,
             ));
         }
         let store = self.inner.store.lock().await;
@@ -7526,7 +7527,8 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         .unwrap();
         assert_eq!(
             snapshot["pass_env_values"],
-            json!({"CODEX_HOME":"../original-home", "CODEX_SQLITE_HOME":null})
+            json!({"CODEX_HOME":"../original-home", "CODEX_SQLITE_HOME":null,
+                "CLAUDE_CONFIG_DIR":null, "XDG_CONFIG_HOME":null, "XDG_DATA_HOME":null})
         );
         assert!(!snapshot.to_string().contains(credential));
         let mut replacement = snapshot.clone();
@@ -7539,7 +7541,10 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             },
         )
         .unwrap();
-        assert_eq!(replacement["pass_env_values"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            replacement["pass_env_values"].as_object().unwrap().len(),
+            crate::config::NATIVE_STORE_SELECTORS.len()
+        );
         assert!(!replacement.to_string().contains(credential));
         assert_ne!(replacement["pass_env_values"], snapshot["pass_env_values"]);
         let launch_id = ulid::Ulid::new().to_string();

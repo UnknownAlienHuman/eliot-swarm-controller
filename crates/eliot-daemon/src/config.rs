@@ -48,16 +48,31 @@ const PERMISSION_READ_ONLY: &str = "read-only";
 const PERMISSION_WORKSPACE_WRITE: &str = "workspace-write";
 const PERMISSION_DANGER_FULL_ACCESS: &str = "danger-full-access";
 
+/// Frozen native store/configuration selectors: the effective nonsecret
+/// environment inputs that select the native account/configuration for
+/// quota and model reads. Codex homes select the Codex state roots, Claude
+/// selects its configuration root through `CLAUDE_CONFIG_DIR`, and OpenCode
+/// isolates its config and data roots through `XDG_CONFIG_HOME` /
+/// `XDG_DATA_HOME`. Their frozen values enter the cache identity, so adding
+/// or removing one invalidates the entry. Values are local paths: the
+/// snapshot policy rejects resolved secrets, and only names and nonsecret
+/// paths ever enter keys.
+pub(crate) const NATIVE_STORE_SELECTORS: &[&str] = &[
+    "CODEX_HOME",
+    "CODEX_SQLITE_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+];
+
 pub(crate) fn native_store_selector(name: &str) -> Option<&'static str> {
-    ["CODEX_HOME", "CODEX_SQLITE_HOME"]
-        .into_iter()
-        .find(|selector| {
-            if cfg!(windows) {
-                name.eq_ignore_ascii_case(selector)
-            } else {
-                name == *selector
-            }
-        })
+    NATIVE_STORE_SELECTORS.iter().copied().find(|selector| {
+        if cfg!(windows) {
+            name.eq_ignore_ascii_case(selector)
+        } else {
+            name == *selector
+        }
+    })
 }
 
 /// Called only for a newly resolved launch/attach profile, after retained-ID miss.
@@ -87,7 +102,7 @@ fn capture_native_store_inputs_inner(
         .and_then(Value::as_array)
         .ok_or_else(|| core::Error::new("invalid", "resolved profile pass_env must be an array"))?;
     let mut values = serde_json::Map::new();
-    for selector in ["CODEX_HOME", "CODEX_SQLITE_HOME"] {
+    for selector in NATIVE_STORE_SELECTORS.iter().copied() {
         let selected = names
             .iter()
             .filter_map(Value::as_str)
@@ -1581,6 +1596,8 @@ fn validate_profile_tail(
             };
             Some(if harness == "claude" {
                 require_native_claude_cmd(name, cmd, source, table_offset)?
+            } else if harness == "antigravity" {
+                require_native_antigravity_cmd(name, cmd, source, table_offset)?
             } else {
                 cmd
             })
@@ -2948,6 +2965,30 @@ fn require_native_claude_cmd(
     Ok(cmd)
 }
 
+/// Antigravity is the protocol-capable `agy` CLI only: a cmd pointing at the
+/// `Antigravity` IDE executable (or any other file name) is refused at save
+/// time with a typed error, so catalog discovery can never launch the IDE as
+/// a version probe. PATH `agy` binaries additionally prove protocol
+/// capability through their `--version` output before any discovery use.
+fn require_native_antigravity_cmd(
+    profile: &str,
+    cmd: String,
+    source: &str,
+    offset: usize,
+) -> core::Result<String> {
+    if !crate::adhoc::antigravity_cli_identity(&cmd) {
+        return Err(profile_field_error(
+            source,
+            offset,
+            profile,
+            "cmd",
+            "must name the native `agy` CLI, not the Antigravity IDE executable (which does not implement the ACP/model CLI and is never launched); install the `agy` CLI and put it on PATH",
+            "profile_error",
+        ));
+    }
+    Ok(cmd)
+}
+
 pub(crate) fn validate_executable_name(cmd: &str) -> Result<&str, &'static str> {
     let cmd = cmd.trim();
     if cmd.is_empty() || cmd.len() > MAX_CMD_LEN {
@@ -3488,7 +3529,13 @@ mod tests {
             error.message
         );
         for harness in ["muse", "antigravity"] {
-            let cmd = "C:/Tools/Native/agent.exe";
+            // A valid native cmd per harness, so the refusal below proves
+            // the manager native_subagents default, not cmd validation.
+            let cmd = if harness == "antigravity" {
+                "C:/Tools/Native/agy.exe"
+            } else {
+                "C:/Tools/Native/agent.exe"
+            };
             fixture.write(&format!(
                 "[profiles.manager]\nharness = \"{harness}\"\ncmd = \"{cmd}\"\nchild_profiles = [\"worker\"]\n\
                  [profiles.worker]\nharness = \"codex\"\nmodel = \"fixture-cheap\"\n"
@@ -3620,7 +3667,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             profile["pass_env_values"],
-            json!({"CODEX_HOME":raw, "CODEX_SQLITE_HOME":null})
+            json!({"CODEX_HOME":raw, "CODEX_SQLITE_HOME":null,
+                "CLAUDE_CONFIG_DIR":null, "XDG_CONFIG_HOME":null, "XDG_DATA_HOME":null})
         );
         let mut unselected = json!({"pass_env":[]});
         capture_native_store_inputs(&mut unselected, |_| {
@@ -3629,7 +3677,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             unselected["pass_env_values"],
-            json!({"CODEX_HOME":null, "CODEX_SQLITE_HOME":null})
+            json!({"CODEX_HOME":null, "CODEX_SQLITE_HOME":null,
+                "CLAUDE_CONFIG_DIR":null, "XDG_CONFIG_HOME":null, "XDG_DATA_HOME":null})
         );
         let mut empty = json!({"pass_env":["CODEX_HOME"]});
         capture_native_store_inputs(&mut empty, |_| Some(OsString::new())).unwrap();
@@ -3650,7 +3699,10 @@ mod tests {
             }
         );
 
-        assert_eq!(alias["pass_env_values"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            alias["pass_env_values"].as_object().unwrap().len(),
+            crate::config::NATIVE_STORE_SELECTORS.len()
+        );
 
         #[cfg(windows)]
         let invalid = {
@@ -3674,6 +3726,31 @@ mod tests {
             );
             assert_eq!(profile, original);
         }
+    }
+
+    #[test]
+    fn native_store_inputs_capture_claude_and_xdg_selectors() {
+        // Adding a Claude/XDG selector freezes its ambient value; removing
+        // it leaves a null, so the cache identity changes either way.
+        let mut profile =
+            json!({"pass_env":["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]});
+        capture_native_store_inputs_with_lookups(
+            &mut profile,
+            |name| match name {
+                "CLAUDE_CONFIG_DIR" => Some(OsString::from("C:/claude-cfg")),
+                "XDG_CONFIG_HOME" => Some(OsString::from("C:/xdg-cfg")),
+                "XDG_DATA_HOME" => None,
+                _ => panic!("unexpected selector lookup: {name}"),
+            },
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(
+            profile["pass_env_values"],
+            json!({"CODEX_HOME":null, "CODEX_SQLITE_HOME":null,
+                "CLAUDE_CONFIG_DIR":"C:/claude-cfg", "XDG_CONFIG_HOME":"C:/xdg-cfg",
+                "XDG_DATA_HOME":null})
+        );
     }
 
     #[test]
@@ -4368,6 +4445,27 @@ permissions = "workspace-write"
         let snapshot = resolve_text_profile(source, "c").unwrap();
         assert_eq!(snapshot["approval_policy"], "on-request");
         assert!(snapshot.get("approval").is_none());
+    }
+
+    #[test]
+    fn antigravity_profile_pointing_at_the_ide_is_refused() {
+        // A profile cmd naming the IDE (or any non-`agy` file) is a typed
+        // refusal at save time: catalog discovery can never launch it as a
+        // version probe.
+        for cmd in [
+            "C:/Program Files/Antigravity/Antigravity.exe",
+            "C:/Tools/agy/launcher.exe",
+        ] {
+            let source = format!(
+                "[profiles.agy]\nharness='antigravity'\nmodel='gemini-4-hydrogen-high'\ncmd='{cmd}'\n"
+            );
+            let error = resolve_text_profile(&source, "agy").expect_err("IDE cmd must be refused");
+            assert_eq!(error.code, "profile_error", "{source}");
+            assert!(error.message.contains("never launched"), "{source}");
+        }
+        let source = "[profiles.agy]\nharness='antigravity'\nmodel='gemini-4-hydrogen-high'\ncmd='C:/Tools/agy/agy.exe'\n";
+        let snapshot = resolve_text_profile(source, "agy").unwrap();
+        assert_eq!(snapshot["cmd"], "C:/Tools/agy/agy.exe");
     }
 
     #[test]

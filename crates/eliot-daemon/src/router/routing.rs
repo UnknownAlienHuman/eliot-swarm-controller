@@ -217,12 +217,20 @@ impl Router {
                 Some("unsupported") => RouteQuotaStatus::Unsupported,
                 _ => RouteQuotaStatus::Unknown,
             };
+            // The typed projection carries freshness: a stale observation
+            // stays `unknown` here exactly as in `models.catalog`, through
+            // the same function, so an expired window with a future reset
+            // never skips a route.
             if *quota_status == RouteQuotaStatus::Supported
-                && quota_exhausted(
-                    &harness,
-                    raw.get("details").unwrap_or(&Value::Null),
-                    snapshot.get("model").and_then(Value::as_str),
-                )
+                && serde_json::from_value::<eliot_core::api::HarnessQuotaResponse>(raw)
+                    .ok()
+                    .is_some_and(|response| {
+                        quota_exhausted(
+                            &response,
+                            snapshot.get("model").and_then(Value::as_str),
+                            now_ms(),
+                        )
+                    })
             {
                 held_accounts.insert(harness, account);
                 return Ok(Err(RouteSkipReason::QuotaExhausted));
@@ -277,9 +285,12 @@ fn native_installed(harness: &str, snapshot: &Value) -> bool {
 /// only the explicit limit state of the bucket the request actually uses
 /// settles exhaustion: the primary window, `spendControlReached`,
 /// `rateLimitReachedType`, or a depleted `individualLimit`.
-fn quota_exhausted(harness: &str, details: &Value, model: Option<&str>) -> bool {
-    catalog::project_quota(harness, details, model, now_ms())
-        .is_some_and(|projection| projection.exhausted)
+fn quota_exhausted(
+    response: &eliot_core::api::HarnessQuotaResponse,
+    model: Option<&str>,
+    now: i64,
+) -> bool {
+    catalog::projected_quota(response, model, now).is_some_and(|projection| projection.exhausted)
 }
 
 #[cfg(test)]
@@ -369,32 +380,50 @@ mod tests {
             account_identity(&json!({"model":"one"})),
             account_identity(&json!({"model":"two"}))
         );
-        assert!(!quota_exhausted(
+        assert!(!exhausted(
             "codex",
-            &json!({"rateLimits":{"primary":{"usedPercent":100,"resetsAt":1}}})
+            json!({"rateLimits":{"primary":{"usedPercent":100,"resetsAt":1}}}),
+            None,
         ));
+    }
+
+    fn supported_quota(harness: &str, details: Value) -> eliot_core::api::HarnessQuotaResponse {
+        eliot_core::api::HarnessQuotaResponse {
+            harness: harness.to_owned(),
+            scope: format!("profile:test harness:{harness}"),
+            fetched_at_ms: 1_000_000,
+            ttl_ms: 300_000,
+            credential: "ambient".to_owned(),
+            status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
+            note: None,
+            details: Some(details),
+        }
+    }
+
+    fn exhausted(harness: &str, details: Value, model: Option<&str>) -> bool {
+        quota_exhausted(&supported_quota(harness, details), model, 1_000_100)
     }
     #[test]
     fn quota_exhaustion_covers_retained_windows_and_all_adapters() {
         // Retained Muse `windows[]` observations skip the route like live reads.
-        assert!(quota_exhausted(
+        assert!(exhausted(
             "muse",
-            &json!({"windows": [{"label": "Weekly", "usedPercent": 100.0, "resetsAtMs": i64::MAX}]}),
+            json!({"windows": [{"label": "Weekly", "usedPercent": 100.0, "resetsAtMs": i64::MAX}]}),
             None,
         ));
         for harness in ["claude", "opencode", "antigravity"] {
             assert!(
-                quota_exhausted(
+                exhausted(
                     harness,
-                    &json!({"windows": [{"label": "Weekly", "usedPercent": 100.0, "resetsAtMs": i64::MAX}]}),
+                    json!({"windows": [{"label": "Weekly", "usedPercent": 100.0, "resetsAtMs": i64::MAX}]}),
                     None,
                 ),
                 "{harness} exhausted windows skip"
             );
             assert!(
-                !quota_exhausted(
+                !exhausted(
                     harness,
-                    &json!({"windows": [{"label": "Weekly", "usedPercent": 10.0, "resetsAtMs": i64::MAX}]}),
+                    json!({"windows": [{"label": "Weekly", "usedPercent": 10.0, "resetsAtMs": i64::MAX}]}),
                     None,
                 ),
                 "{harness} headroom does not skip"
@@ -402,77 +431,99 @@ mod tests {
         }
         // A model-scoped window never skips an unrelated model: account quota
         // alone invents no per-model entitlement.
-        assert!(!quota_exhausted(
+        assert!(!exhausted(
             "claude",
-            &json!({"windows": [{"label": "Opus weekly", "usedPercent": 100.0, "resetsAtMs": i64::MAX}]}),
+            json!({"windows": [{"label": "Opus weekly", "usedPercent": 100.0, "resetsAtMs": i64::MAX}]}),
             Some("sonnet-4"),
         ));
         // Unmapped shapes never skip.
-        assert!(!quota_exhausted("muse", &json!({}), None));
-        assert!(!quota_exhausted(
-            "opencode",
-            &json!({"rateLimits": {}}),
-            None
-        ));
+        assert!(!exhausted("muse", json!({}), None));
+        assert!(!exhausted("opencode", json!({"rateLimits": {}}), None));
     }
 
     #[test]
     fn quota_checks_only_known_native_windows_and_preserves_unknown() {
-        assert!(quota_exhausted(
+        assert!(exhausted(
             "codex",
-            &json!({"rateLimits":{"primary":{"usedPercent":100}}})
+            json!({"rateLimits":{"primary":{"usedPercent":100}}}),
+            None,
         ));
-        assert!(!quota_exhausted(
+        assert!(!exhausted(
             "codex",
-            &json!({"rateLimits":{"primary":{"usedPercent":100},"credits":{"hasCredits":true}}})
+            json!({"rateLimits":{"primary":{"usedPercent":100},"credits":{"hasCredits":true}}}),
+            None,
         ));
-        assert!(quota_exhausted(
+        assert!(exhausted(
             "muse",
-            &json!({"usage":{"weekly":{"usedPercent":100}}})
+            json!({"usage":{"weekly":{"usedPercent":100}}}),
+            None,
         ));
-        assert!(!quota_exhausted("muse", &json!({})));
-        assert!(!quota_exhausted(
+        assert!(!exhausted("muse", json!({}), None));
+        assert!(!exhausted(
             "codex",
-            &json!({"rateLimitsByLimitId":{"other":{"primary":{"usedPercent":100}}}})
+            json!({"rateLimitsByLimitId":{"other":{"primary":{"usedPercent":100}}}}),
+            None,
         ));
+    }
+
+    #[test]
+    fn stale_quota_observation_never_skips_a_route() {
+        // An exhausted retained window past its freshness TTL stays unknown:
+        // routing and the catalogue share the freshness gate, so an expired
+        // observation with a future reset cannot skip a route.
+        let stale = eliot_core::api::HarnessQuotaResponse {
+            fetched_at_ms: 1_000,
+            ttl_ms: 300_000,
+            ..supported_quota(
+                "muse",
+                json!({"windows": [{"label": "Weekly", "usedPercent": 100.0, "resetsAtMs": i64::MAX}]}),
+            )
+        };
+        assert!(!quota_exhausted(&stale, Some("m"), 1_000 + 300_000 + 1));
+        assert!(quota_exhausted(&stale, Some("m"), 1_000 + 300_000));
     }
     #[test]
     fn codex_quota_uses_primary_limit_state_only() {
         // Audit #630: explicit backend limit state exhausts even with
         // healthy windows.
-        assert!(quota_exhausted(
+        assert!(exhausted(
             "codex",
-            &json!({"rateLimits":{"primary":{"usedPercent":10},"spendControlReached":true}})
+            json!({"rateLimits":{"primary":{"usedPercent":10},"spendControlReached":true}}),
+            None,
         ));
-        assert!(quota_exhausted(
+        assert!(exhausted(
             "codex",
-            &json!({"rateLimits":{"primary":{"usedPercent":10},"rateLimitReachedType":"rate_limit_reached"}})
+            json!({"rateLimits":{"primary":{"usedPercent":10},"rateLimitReachedType":"rate_limit_reached"}}),
+            None,
         ));
-        assert!(quota_exhausted(
+        assert!(exhausted(
             "codex",
-            &json!({"rateLimits":{"primary":{"usedPercent":10},"individualLimit":{"remainingPercent":0}}})
+            json!({"rateLimits":{"primary":{"usedPercent":10},"individualLimit":{"remainingPercent":0}}}),
+            None,
         ));
         // Healthy limit state with healthy windows is not exhausted.
-        assert!(!quota_exhausted(
+        assert!(!exhausted(
             "codex",
-            &json!({"rateLimits":{"primary":{"usedPercent":10},"spendControlReached":false,"individualLimit":{"remainingPercent":40}}})
+            json!({"rateLimits":{"primary":{"usedPercent":10},"spendControlReached":false,"individualLimit":{"remainingPercent":40}}}),
+            None,
         ));
         // A full secondary window alone does not exhaust the primary route:
         // the request uses the primary bucket, not the secondary one.
-        assert!(!quota_exhausted(
+        assert!(!exhausted(
             "codex",
-            &json!({"rateLimits":{"primary":{"usedPercent":10},"secondary":{"usedPercent":100}}})
+            json!({"rateLimits":{"primary":{"usedPercent":10},"secondary":{"usedPercent":100}}}),
+            None,
         ));
         // Metered buckets never exhaust a route, even when their projected
         // slug names the requested model: `normalModelSlug` only names
         // display and reasoning options, never the metered model.
         let details = json!({"rateLimits":{"primary":{"usedPercent":1}},
             "rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":100},"normalModelSlug":"gpt-5.4"}}});
-        assert!(!quota_exhausted("codex", &details));
+        assert!(!exhausted("codex", details, None));
         // Luna Reserve-style alias bucket: an exhausted Reserve allowance
         // must not skip ordinary Luna when ordinary quota is healthy.
         let reserve = json!({"rateLimits":{"primary":{"usedPercent":10}},
             "rateLimitsByLimitId":{"luna-reserve":{"primary":{"usedPercent":100},"normalModelSlug":"gpt-5.4","limitId":"luna-reserve"}}});
-        assert!(!quota_exhausted("codex", &reserve));
+        assert!(!exhausted("codex", reserve, None));
     }
 }

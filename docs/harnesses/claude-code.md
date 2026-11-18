@@ -348,7 +348,10 @@ desktop-app bundles under `%APPDATA%\Claude\claude-code\<version>\<hash>`;
 `.cmd`/`.bat`/`.ps1` wrappers are refused and never frozen); `--cmd` pins one
 explicit install instead. On Linux the bare `claude` binary is used instead
 (`claude` on `PATH`, `/usr/local/bin/claude`, `~/.local/bin/claude`); the
-`.exe` names and desktop-app bundle layouts are Windows-only. `swarm harnesses` reports every discovered install
+`.exe` names and desktop-app bundle layouts are Windows-only. An
+extensionless Unix candidate counts as native only after an ELF or Mach-O
+header check (`#!` scripts never qualify), and every candidate must be an
+absolute path before any `--version` probe runs. `swarm harnesses` reports every discovered install
 newest first in `candidates`. `swarm models --harness claude` reports the
 frozen documented `--model` aliases (`best`, `fable`, `sonnet`, `opus`,
 `haiku`, `sonnet[1m]`, `opus[1m]`, `opusplan`, `opusplan[1m]`) and full model

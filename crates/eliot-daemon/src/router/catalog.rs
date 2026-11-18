@@ -93,7 +93,7 @@ impl Router {
     /// Antigravity when `live_antigravity` holds for `harness.models`, whose
     /// `agy models` reader needs a frozen cmd) while static harnesses (Claude,
     /// and Antigravity for `harness.quota`) need no snapshot at all.
-    fn resolve_catalog_snapshot(
+    async fn resolve_catalog_snapshot(
         &self,
         harness: &str,
         profile: Option<&str>,
@@ -115,7 +115,7 @@ impl Router {
         if matches!(harness, "codex" | "muse" | "opencode")
             || (live_antigravity && harness == "antigravity")
         {
-            let cmd = crate::adhoc::discover_cmd_for_harness(harness)?;
+            let cmd = crate::adhoc::discover_cmd_for_harness_async(harness).await?;
             let mut snapshot = crate::adhoc::adhoc_snapshot(
                 harness,
                 None,
@@ -191,7 +191,10 @@ impl Router {
         let profile = request.profile.as_deref().map(str::trim);
         let (snapshot, label) = match request.agent.as_deref() {
             Some(agent) => self.agent_catalog_snapshot(agent, &harness).await?,
-            None => self.resolve_catalog_snapshot(&harness, profile, true)?,
+            None => {
+                self.resolve_catalog_snapshot(&harness, profile, true)
+                    .await?
+            }
         };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
         let cache_scope = catalog::canonical_cache_identity(&label, &harness, snapshot.as_ref());
@@ -210,12 +213,25 @@ impl Router {
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| cmd.to_owned());
+        // Antigravity CLI identity before any probe: an IDE-named cmd is
+        // refused here without launching it, so a profile pointing at
+        // `Antigravity.exe` can never reach the version probe below.
+        if harness == "antigravity" && !crate::adhoc::antigravity_cli_identity(&cmd) {
+            return Err(crate::adhoc::antigravity_ide_unsupported(&cmd));
+        }
         let version = if harness == "claude" {
             Some("static-aliases".to_owned())
         } else {
             // The blocking probe (and its memoized reuse across catalogue
             // pages) runs on the blocking pool, never on a Tokio worker.
             crate::adhoc::native_version_string_async(&cmd).await
+        };
+        // A PATH `agy` without CLI protocol capability is refused after the
+        // bounded identity probe, before any `models` discovery use.
+        let version = if harness == "antigravity" {
+            Some(crate::adhoc::antigravity_cli_version(version)?)
+        } else {
+            version
         };
         let cache_key = catalog::models_key(&cache_scope, &cmd, version.as_deref());
         let now = now_ms();
@@ -407,9 +423,13 @@ impl Router {
             ));
         }
         let profile = request.profile.as_deref().map(str::trim);
-        let (mut snapshot, label) = self.resolve_catalog_snapshot(&harness, profile, true)?;
+        let (mut snapshot, label) = self
+            .resolve_catalog_snapshot(&harness, profile, true)
+            .await?;
         if harness == "claude" && snapshot.is_none() {
-            let cmd = crate::adhoc::discover_cmd_for_harness(&harness)?;
+            // Candidate probing plus the bounded `--version` reads run on
+            // the blocking pool, never on this async handler.
+            let cmd = crate::adhoc::discover_cmd_for_harness_async(&harness).await?;
             let mut resolved = crate::adhoc::adhoc_snapshot(
                 &harness,
                 None,
@@ -465,6 +485,15 @@ impl Router {
         }
         let profile = snapshot
             .ok_or_else(|| Error::new("profile_error", "quota requires a native profile"))?;
+        // A legacy profile pointing at the IDE is refused before the quota
+        // reader can launch it; current profiles are already refused at
+        // save time and discovery never returns an IDE path.
+        if harness == "antigravity"
+            && let Some(cmd) = profile.get("cmd").and_then(Value::as_str)
+            && !crate::adhoc::antigravity_cli_identity(cmd)
+        {
+            return Err(crate::adhoc::antigravity_ide_unsupported(cmd));
+        }
         let raw = self.inner.plugin_host.quota(profile).await;
         let mut response = eliot_core::api::HarnessQuotaResponse {
             harness: harness.clone(),
@@ -557,6 +586,10 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
+        // The aggregate budget starts here and covers inventory: a slow
+        // inventory leaves less (or no) time for per-harness reads, which
+        // then fail open into the partial aggregate below.
+        let discovery_deadline = tokio::time::Instant::now() + MODELS_CATALOG_DISCOVERY_BUDGET;
         let query = request.query.as_deref().unwrap_or("").to_owned();
         let limit = request.effective_limit();
         let after = request.after.clone();
@@ -616,7 +649,6 @@ impl Router {
         };
         let mut models: Vec<ModelsCatalogEntry> = Vec::new();
         let mut failures: Vec<ModelsCatalogFailure> = Vec::new();
-        let discovery_deadline = tokio::time::Instant::now() + MODELS_CATALOG_DISCOVERY_BUDGET;
         for entry in &harnesses {
             let harness = entry.harness.as_str();
             if tokio::time::Instant::now() >= discovery_deadline {
@@ -638,9 +670,16 @@ impl Router {
             // quota stays unsupported there, so their availability reads
             // unknown (membership alone never proves availability).
             let params = json!({"harness": harness});
-            let response_value = match self.harness_models(&params, principal).await {
-                Ok(value) => value,
-                Err(error) => {
+            // A slow read past the request deadline fails open into the
+            // partial aggregate instead of holding the coalescing lock.
+            let response_value = match tokio::time::timeout_at(
+                discovery_deadline,
+                self.harness_models(&params, principal),
+            )
+            .await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => {
                     // The aggregate names the failed harness with its typed
                     // error instead of silently listing no models for it.
                     crate::logging::record(
@@ -652,18 +691,29 @@ impl Router {
                     failures.push(ModelsCatalogFailure::from_error(harness, &error));
                     continue;
                 }
+                Err(_) => {
+                    failures.push(ModelsCatalogFailure::from_error(
+                        harness,
+                        &Error::new(
+                            "unavailable",
+                            "catalogue discovery budget elapsed; harness skipped",
+                        ),
+                    ));
+                    continue;
+                }
             };
             let response: eliot_core::api::HarnessModelsResponse =
                 serde_json::from_value(response_value)
                     .map_err(|_| Error::new("internal", "harness models could not be decoded"))?;
             let held = held_harness(harness);
-            let quota = self
-                .harness_quota(&params, principal)
-                .await
-                .ok()
-                .and_then(|value| {
-                    serde_json::from_value::<eliot_core::api::HarnessQuotaResponse>(value).ok()
-                });
+            let quota =
+                tokio::time::timeout_at(discovery_deadline, self.harness_quota(&params, principal))
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok())
+                    .and_then(|value| {
+                        serde_json::from_value::<eliot_core::api::HarnessQuotaResponse>(value).ok()
+                    });
             for model in response.models {
                 models.push(catalog::catalog_entry(
                     harness,
@@ -856,9 +906,17 @@ pub(crate) fn describe_snapshot(
     }
     // Frozen native store inputs select the native home/configuration. The
     // values are local paths (the snapshot policy rejects resolved secrets),
-    // so naming them keeps homes apart without leaking credentials.
+    // so naming them keeps homes apart without leaking credentials. Every
+    // effective selector shows: adding or removing one changes the display
+    // scope as well as the private canonical identity below.
     if let Some(values) = snapshot.get("pass_env_values").and_then(Value::as_object) {
-        for (selector, marker) in [("CODEX_HOME", " home:"), ("CODEX_SQLITE_HOME", " sqlhome:")] {
+        for (selector, marker) in [
+            ("CODEX_HOME", " home:"),
+            ("CODEX_SQLITE_HOME", " sqlhome:"),
+            ("CLAUDE_CONFIG_DIR", " claude_cfg:"),
+            ("XDG_CONFIG_HOME", " xdg_cfg:"),
+            ("XDG_DATA_HOME", " xdg_data:"),
+        ] {
             if let Some(home) = values
                 .get(selector)
                 .and_then(Value::as_str)
@@ -981,6 +1039,18 @@ pub(crate) fn canonical_cache_identity(
             .and_then(Value::as_str)
             .unwrap_or_default(),
         snapshot
+            .pointer("/pass_env_values/CLAUDE_CONFIG_DIR")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        snapshot
+            .pointer("/pass_env_values/XDG_CONFIG_HOME")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        snapshot
+            .pointer("/pass_env_values/XDG_DATA_HOME")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        snapshot
             .get("api_key_env")
             .and_then(Value::as_str)
             .unwrap_or_default(),
@@ -1065,7 +1135,7 @@ impl CatalogCache {
     pub(crate) fn get_models(&self, key: &str, now: i64) -> Option<HarnessModelsResponse> {
         self.models
             .get(key)
-            .filter(|entry| fresh(entry.fetched_at_ms, entry.ttl_ms, now))
+            .filter(|entry| quota_fresh(entry.fetched_at_ms, entry.ttl_ms, now))
             .cloned()
     }
 
@@ -1077,7 +1147,7 @@ impl CatalogCache {
     pub(crate) fn get_quota(&self, key: &str, now: i64) -> Option<HarnessQuotaResponse> {
         self.quotas
             .get(key)
-            .filter(|entry| fresh(entry.fetched_at_ms, entry.ttl_ms, now))
+            .filter(|entry| quota_fresh(entry.fetched_at_ms, entry.ttl_ms, now))
             .cloned()
     }
 
@@ -1159,34 +1229,71 @@ pub(crate) fn catalog_entry(
 /// Normalized provider quota projection: one typed, scoped observation
 /// per read, consumed identically by routing (skip exhausted routes) and the
 /// catalogue (availability needs affirmative headroom on every recognized
-/// window).
+/// window). Callers consume only these typed fields: they never reparse raw
+/// quota JSON into booleans.
 ///
+/// - `provider`: the harness whose native schema was consumed.
+/// - `scope`: the quota scope the observation covers (the response scope).
+/// - `observed_at_ms`: the native observation time.
 /// - `exhausted`: a recognized window is full with a future (or unknown)
-///   reset, Codex denies ordinary usage, or a provider-scoped per-model
-///   limit is full.
+///   reset; for Codex only the primary bucket's explicit limit state settles
+///   exhaustion (`spendControlReached`, a non-null `rateLimitReachedType`, a
+///   depleted `individualLimit`, or a full primary window without credits).
+///   A full secondary window or a metered `rateLimitsByLimitId` bucket never
+///   exhausts a route.
 /// - `available`: every recognized window for this model shows headroom
 ///   (used below 100% with a future reset; Codex additionally requires
-///   `ordinaryUsageAllowed` and per-model limits when the provider scopes
+///   `ordinaryUsageAllowed` and per-model headroom when the provider scopes
 ///   them). Account quota alone never invents per-model entitlement: a
 ///   model-scoped window only constrains matching models.
+/// - `mapping`: how the decisive bucket maps to the requested model (an
+///   exact bucket id, a documented provider group, or unmapped).
 /// - `provenance`: which provider shape was consumed (`muse:usage`,
 ///   `muse:windows`, `muse:window/weekly`, `codex:rateLimits`, `windows`).
 ///
-/// Unmapped, missing or unsupported signals yield `None`: callers keep
-/// `unknown` and never skip a route or assert availability from them.
+/// Missing or unsupported signals yield `None`. Windows that exist but map
+/// to no model yield an inert projection (`mapping: Unmapped`, neither
+/// exhausted nor available). Either way callers keep `unknown` and never
+/// skip a route or assert availability from them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuotaMapping {
+    /// A bucket keyed by the exact requested model id.
+    ExactId,
+    /// A documented provider group window applying to this model
+    /// (`account` for unlabeled account-scope windows).
+    Group(&'static str),
+    /// No documented mapping: the window constrains no model.
+    Unmapped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct QuotaProjection {
+    pub provider: String,
+    pub scope: String,
+    pub observed_at_ms: i64,
     pub exhausted: bool,
     pub available: bool,
+    pub mapping: QuotaMapping,
     pub provenance: &'static str,
 }
 
+/// Typed quota observation: the provider whose native schema was consumed,
+/// the quota scope it covers, and its native observation time. It travels
+/// from the typed `HarnessQuotaResponse` into the projection untouched, so
+/// neither the projectors nor their callers reparse raw quota JSON for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QuotaObservation<'a> {
+    pub provider: &'a str,
+    pub scope: &'a str,
+    pub observed_at_ms: i64,
+}
+
 /// Normalize provider-specific quota `details` into one projection.
-/// `model` scopes model-named windows; `None` applies every window.
-/// Returns `None` when no signal maps to this harness (missing, stale,
-/// unsupported or unmapped shapes stay `unknown` at the caller).
+/// `model` scopes model-named windows; `None` applies every recognized
+/// window. Returns `None` when no signal maps to this observation's provider
+/// (missing or unsupported shapes stay `unknown` at the caller).
 pub(crate) fn project_quota(
-    harness: &str,
+    observation: QuotaObservation<'_>,
     details: &Value,
     model: Option<&str>,
     now: i64,
@@ -1194,22 +1301,51 @@ pub(crate) fn project_quota(
     if !details.is_object() {
         return None;
     }
-    match harness {
+    match observation.provider {
         "muse" => {
             let (windows, complete, provenance) = muse_window_set(details)?;
-            windows_projection(&windows, complete, model, now, provenance)
+            windows_projection(observation, &windows, complete, model, now, provenance)
         }
-        "codex" => codex_projection(details, model, now),
+        "codex" => codex_projection(observation, details, model, now),
         "claude" | "opencode" | "antigravity" => {
             let windows = details
                 .get("windows")
                 .and_then(Value::as_array)
                 .filter(|windows| !windows.is_empty())?;
             let windows: Vec<&Value> = windows.iter().collect();
-            windows_projection(&windows, true, model, now, "windows")
+            windows_projection(observation, &windows, true, model, now, "windows")
         }
         _ => None,
     }
+}
+
+/// One typed entry point for routing and the catalogue: a `supported`
+/// response observed inside its freshness TTL projects, anything else
+/// (missing, stale, unsupported) stays `unknown`. Both consumers share this
+/// function, so a stale observation can neither skip a route nor mark a
+/// model available.
+pub(crate) fn projected_quota(
+    quota: &HarnessQuotaResponse,
+    model: Option<&str>,
+    now: i64,
+) -> Option<QuotaProjection> {
+    if quota.status != eliot_core::api::HARNESS_QUOTA_SUPPORTED {
+        return None;
+    }
+    if !quota_fresh(quota.fetched_at_ms, quota.ttl_ms, now) {
+        return None;
+    }
+    let details = quota.details.as_ref()?;
+    project_quota(
+        QuotaObservation {
+            provider: quota.harness.as_str(),
+            scope: quota.scope.as_str(),
+            observed_at_ms: quota.fetched_at_ms,
+        },
+        details,
+        model,
+        now,
+    )
 }
 
 /// Muse contributes three shapes over time: retained `windows[]`
@@ -1286,93 +1422,214 @@ fn window_headroom(window: &Value, now: i64) -> bool {
         && window_reset_ms(window).is_some_and(|reset| reset > now)
 }
 
-/// Model families named by provider window labels (`Opus weekly`, `Gemini
-/// 5-hour`, `Claude/GPT weekly`). A window naming families only constrains
-/// models of those families; account-level windows (no family in the label)
-/// constrain every model.
-const WINDOW_MODEL_FAMILIES: &[&str] = &[
-    "opus", "sonnet", "haiku", "fable", "gemini", "argon", "gpt", "claude",
+/// Documented provider quota groups: the window-label family plus the model-id
+/// tokens that prove membership. Group names come from the readers that emit
+/// the labels (Antigravity `retrieveUserQuotaSummary` display names, Claude
+/// CLI OAuth usage keys); a label whose family is not listed here is
+/// unrecognized and maps to no model. Matching is on whole id tokens, never
+/// substrings: the `Gemini 4 Argon` group requires an `argon` token, so an
+/// exhausted Argon bucket never constrains a Hydrogen model even though both
+/// contain `gemini`.
+const WINDOW_MODEL_GROUPS: &[(&str, &[&str])] = &[
+    ("gemini 4 argon", &["argon"]),
+    ("claude/gpt", &["claude", "gpt"]),
+    ("gemini", &["gemini"]),
+    ("opus", &["opus"]),
+    ("sonnet", &["sonnet"]),
+    ("fable", &["fable"]),
+    ("haiku", &["haiku"]),
 ];
 
-fn window_applies_to_model(window: &Value, model: Option<&str>) -> bool {
-    let (Some(label), Some(model)) = (window.get("label").and_then(Value::as_str), model) else {
-        return true;
-    };
-    let label = label.to_ascii_lowercase();
-    let families: Vec<&&str> = WINDOW_MODEL_FAMILIES
+/// Provider window-label periods emitted by the readers (`5-hour`, `Weekly`,
+/// `Monthly`, Antigravity `quota`). A label that is exactly a period, or
+/// carries no label at all, is account scope.
+const WINDOW_LABEL_PERIODS: &[&str] = &["weekly", "5-hour", "monthly", "quota"];
+
+fn documented_group(family: &str) -> Option<(&'static str, &'static [&'static str])> {
+    WINDOW_MODEL_GROUPS
         .iter()
-        .filter(|family| label.contains(**family))
-        .collect();
-    if families.is_empty() {
-        return true;
+        .find(|(name, _)| *name == family)
+        .map(|(name, tokens)| (*name, *tokens))
+}
+
+/// The provider group named by a window label, or `None` for account-scope
+/// (bare-period) labels. An unrecognized family yields `Some` of itself so
+/// the caller can report it unmapped.
+fn window_family(label: &str) -> Option<String> {
+    let lower = label.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
     }
-    let model = model.to_ascii_lowercase();
-    families.iter().any(|family| model.contains(**family))
+    for period in WINDOW_LABEL_PERIODS {
+        if lower == *period {
+            return None;
+        }
+        if let Some(family) = lower.strip_suffix(period) {
+            let family = family.trim().to_owned();
+            if !family.is_empty() {
+                return Some(family);
+            }
+        }
+    }
+    Some(lower)
+}
+
+fn model_token_present(model: &str, token: &str) -> bool {
+    model
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part.eq_ignore_ascii_case(token))
+}
+
+/// How one window maps to the requested model: an exact label match, a
+/// documented provider group the model belongs to, the unlabeled account
+/// scope, or unmapped (an unrecognized provider label, or a recognized group
+/// the model is not a member of). An unrecognized label applies to no model,
+/// even on an unscoped read.
+fn window_mapping(window: &Value, model: Option<&str>) -> QuotaMapping {
+    let label = window.get("label").and_then(Value::as_str).unwrap_or("");
+    if let Some(model) = model.filter(|model| !model.trim().is_empty())
+        && label.eq_ignore_ascii_case(model.trim())
+    {
+        return QuotaMapping::ExactId;
+    }
+    let family = window_family(label);
+    let Some(family) = family.as_deref() else {
+        return QuotaMapping::Group("account");
+    };
+    let Some((group, tokens)) = documented_group(family) else {
+        return QuotaMapping::Unmapped;
+    };
+    match model {
+        None => QuotaMapping::Group(group),
+        Some(model) if tokens.iter().any(|token| model_token_present(model, token)) => {
+            QuotaMapping::Group(group)
+        }
+        _ => QuotaMapping::Unmapped,
+    }
 }
 
 fn windows_projection(
+    observation: QuotaObservation<'_>,
     windows: &[&Value],
     complete: bool,
     model: Option<&str>,
     now: i64,
     provenance: &'static str,
 ) -> Option<QuotaProjection> {
-    let applicable: Vec<&&Value> = windows
+    let applicable: Vec<(&&Value, QuotaMapping)> = windows
         .iter()
-        .filter(|window| window_applies_to_model(window, model))
+        .map(|window| (window, window_mapping(window, model)))
+        .filter(|(_, mapping)| *mapping != QuotaMapping::Unmapped)
         .collect();
     if applicable.is_empty() {
-        return None;
+        // Windows exist but none maps to this model (for example an
+        // unrecognized `Model group` label, or an Argon bucket read for a
+        // Hydrogen model): report the inert unmapped projection so callers
+        // stay unknown instead of skipping a route or asserting availability.
+        return Some(QuotaProjection {
+            provider: observation.provider.to_owned(),
+            scope: observation.scope.to_owned(),
+            observed_at_ms: observation.observed_at_ms,
+            exhausted: false,
+            available: false,
+            mapping: QuotaMapping::Unmapped,
+            provenance,
+        });
     }
+    let exhausted = applicable
+        .iter()
+        .any(|(window, _)| window_exhausted(window, now));
+    // The decisive bucket drives the verdict: the first exhausted window
+    // when anything is exhausted (preferring an exact id), else the exact
+    // id when one matched, else the first applicable group window.
+    let mapping = applicable
+        .iter()
+        .filter(|(window, _)| window_exhausted(window, now) == exhausted)
+        .map(|(_, mapping)| *mapping)
+        .find(|mapping| *mapping == QuotaMapping::ExactId)
+        .or_else(|| {
+            applicable
+                .iter()
+                .filter(|(window, _)| window_exhausted(window, now) == exhausted)
+                .map(|(_, mapping)| *mapping)
+                .next()
+        })
+        .unwrap_or(applicable[0].1);
     Some(QuotaProjection {
-        exhausted: applicable
-            .iter()
-            .any(|window| window_exhausted(window, now)),
-        available: complete && applicable.iter().all(|window| window_headroom(window, now)),
+        provider: observation.provider.to_owned(),
+        scope: observation.scope.to_owned(),
+        observed_at_ms: observation.observed_at_ms,
+        exhausted,
+        available: complete
+            && applicable
+                .iter()
+                .all(|(window, _)| window_headroom(window, now)),
+        mapping,
         provenance,
     })
 }
 
-fn codex_projection(details: &Value, model: Option<&str>, now: i64) -> Option<QuotaProjection> {
+fn codex_projection(
+    observation: QuotaObservation<'_>,
+    details: &Value,
+    model: Option<&str>,
+    now: i64,
+) -> Option<QuotaProjection> {
     let rates = details
         .get("rateLimits")
         .filter(|rates| rates.is_object())?;
-    let exhausted_window = |rates: &Value| {
-        let credits = &rates["credits"];
-        let credit_available = credits["unlimited"].as_bool() == Some(true)
-            || credits["hasCredits"].as_bool() == Some(true);
-        !credit_available
-            && ["primary", "secondary"]
-                .iter()
-                .any(|key| window_exhausted(&rates[key], now))
-    };
-    let mut exhausted = exhausted_window(rates);
-    // Per-limit windows are relevant only when their id is the exact
-    // requested model. An unrelated exhausted model never blocks this one.
-    if let Some(limits) = details.get("rateLimitsByLimitId")
-        && let Some(by_model) = model.and_then(|model| limits.get(model))
-    {
-        exhausted |= exhausted_window(by_model);
-    }
-    let available = details["ordinaryUsageAllowed"].as_bool() == Some(true)
-        && ["primary", "secondary"]
-            .iter()
-            .all(|key| window_headroom(&rates[key], now))
+    // Only the primary bucket's explicit limit state settles exhaustion: the
+    // deny signals, or a full primary window without credits. A full secondary
+    // window or a metered `rateLimitsByLimitId` bucket never proves the
+    // request's own quota is spent, so neither skips the route.
+    let mut exhausted = rates.get("spendControlReached").and_then(Value::as_bool) == Some(true)
+        || rates
+            .get("rateLimitReachedType")
+            .is_some_and(|reached| !reached.is_null())
+        || rates
+            .get("individualLimit")
+            .and_then(|limit| limit.get("remainingPercent"))
+            .and_then(Value::as_i64)
+            .is_some_and(|remaining| remaining <= 0);
+    let credits = &rates["credits"];
+    let credit_available = credits["unlimited"].as_bool() == Some(true)
+        || credits["hasCredits"].as_bool() == Some(true);
+    exhausted |= !credit_available && window_exhausted(&rates["primary"], now);
+    let available = !exhausted
+        && details["ordinaryUsageAllowed"].as_bool() == Some(true)
+        && window_headroom(&rates["primary"], now)
+        && window_headroom(&rates["secondary"], now)
         && match details.get("rateLimitsByLimitId") {
             None | Some(Value::Null) => true,
             Some(Value::Object(limits)) if limits.is_empty() => true,
             Some(Value::Object(limits)) => model.is_some_and(|model| {
                 limits.get(model).is_some_and(|rates| {
-                    ["primary", "secondary"]
-                        .iter()
-                        .all(|key| window_headroom(&rates[key], now))
+                    window_headroom(&rates["primary"], now)
+                        && window_headroom(&rates["secondary"], now)
                 })
             }),
             _ => false,
         };
+    // An exact per-model bucket id establishes the mapping; otherwise the
+    // primary bucket scopes this model.
+    let mapping = match model {
+        Some(model)
+            if details
+                .get("rateLimitsByLimitId")
+                .and_then(|limits| limits.get(model))
+                .is_some() =>
+        {
+            QuotaMapping::ExactId
+        }
+        _ => QuotaMapping::Group("primary"),
+    };
     Some(QuotaProjection {
+        provider: observation.provider.to_owned(),
+        scope: observation.scope.to_owned(),
+        observed_at_ms: observation.observed_at_ms,
         exhausted,
         available,
+        mapping,
         provenance: "codex:rateLimits",
     })
 }
@@ -1390,29 +1647,24 @@ pub(crate) fn availability(
     if held == Some(true) {
         return CATALOG_HELD;
     }
-    let Some(quota) = quota.filter(|quota| {
-        held == Some(false)
-            && quota.status == "supported"
-            && fresh(quota.fetched_at_ms, quota.ttl_ms, now)
-    }) else {
-        return CATALOG_UNKNOWN;
-    };
-    let Some(details) = quota.details.as_ref() else {
+    let Some(quota) = quota.filter(|_| held == Some(false)) else {
         return CATALOG_UNKNOWN;
     };
     // One normalized projection serves every harness: affirmative headroom
     // on every recognized window establishes availability, anything else
-    // stays unknown. Membership alone never proves availability.
-    if project_quota(quota.harness.as_str(), details, Some(model), now)
-        .is_some_and(|projection| projection.available)
-    {
+    // stays unknown. Membership alone never proves availability. Freshness
+    // shares the routing entry point below, so a stale observation can
+    // neither skip a route nor mark a model available.
+    if projected_quota(quota, Some(model), now).is_some_and(|projection| projection.available) {
         CATALOG_AVAILABLE
     } else {
         CATALOG_UNKNOWN
     }
 }
 
-fn fresh(fetched_at_ms: i64, ttl_ms: u64, now: i64) -> bool {
+/// Shared freshness gate for routing and the catalogue: an observation past
+/// its TTL is rejected by both through [`projected_quota`].
+pub(crate) fn quota_fresh(fetched_at_ms: i64, ttl_ms: u64, now: i64) -> bool {
     fetched_at_ms >= 0 && now >= 0 && (now.saturating_sub(fetched_at_ms) as u64) <= ttl_ms
 }
 
@@ -1420,7 +1672,7 @@ fn evict_models(map: &mut HashMap<String, HarnessModelsResponse>, now: i64) {
     if map.len() < MAX_CACHED_SCOPES {
         return;
     }
-    map.retain(|_, entry| fresh(entry.fetched_at_ms, entry.ttl_ms, now));
+    map.retain(|_, entry| quota_fresh(entry.fetched_at_ms, entry.ttl_ms, now));
     if map.len() >= MAX_CACHED_SCOPES
         && let Some(key) = map.keys().next().cloned()
     {
@@ -1432,7 +1684,7 @@ fn evict_quotas(map: &mut HashMap<String, HarnessQuotaResponse>, now: i64) {
     if map.len() < MAX_CACHED_SCOPES {
         return;
     }
-    map.retain(|_, entry| fresh(entry.fetched_at_ms, entry.ttl_ms, now));
+    map.retain(|_, entry| quota_fresh(entry.fetched_at_ms, entry.ttl_ms, now));
     if map.len() >= MAX_CACHED_SCOPES
         && let Some(key) = map.keys().next().cloned()
     {
@@ -1445,6 +1697,14 @@ mod tests {
     use super::super::tests::router;
     use super::*;
     use serde_json::json;
+
+    fn obs<'a>(provider: &'a str, scope: &'a str, observed_at_ms: i64) -> QuotaObservation<'a> {
+        QuotaObservation {
+            provider,
+            scope,
+            observed_at_ms,
+        }
+    }
 
     #[test]
     fn quota_read_error_note_is_byte_bounded_on_a_char_boundary() {
@@ -1560,14 +1820,19 @@ mod tests {
     #[test]
     fn quota_projection_normalizes_all_provider_shapes() {
         let now = 1_000;
+        let scope = "profile:test harness:muse";
         // Retained Muse `windows[]` observation: a full window with a future
         // reset is exhausted, so routing must skip it.
         let retained = json!({"windows": [
             {"label": "Weekly", "usedPercent": 100.0, "resetsAtMs": 2_000},
         ]});
-        let projection = project_quota("muse", &retained, Some("m"), now)
+        let projection = project_quota(obs("muse", scope, now), &retained, Some("m"), now)
             .expect("retained muse windows project");
         assert_eq!(projection.provenance, "muse:windows");
+        assert_eq!(projection.provider, "muse");
+        assert_eq!(projection.scope, scope);
+        assert_eq!(projection.observed_at_ms, now);
+        assert_eq!(projection.mapping, QuotaMapping::Group("account"));
         assert!(projection.exhausted);
         assert!(!projection.available);
         // Live Muse `usage{window,weekly}` read with headroom: available.
@@ -1575,8 +1840,8 @@ mod tests {
             "window": {"usedPercent": 10.0, "resetsAtMs": 2_000},
             "weekly": {"usedPercent": 20.0, "resetsAtMs": 3_000},
         }});
-        let projection =
-            project_quota("muse", &live, Some("m"), now).expect("live muse usage projects");
+        let projection = project_quota(obs("muse", scope, now), &live, Some("m"), now)
+            .expect("live muse usage projects");
         assert_eq!(projection.provenance, "muse:usage");
         assert!(!projection.exhausted);
         assert!(projection.available);
@@ -1585,8 +1850,8 @@ mod tests {
             "window": {"usedPercent": 10.0, "resetsAtMs": 2_000},
             "weekly": {"usedPercent": 100.0, "resetsAtMs": 3_000},
         }});
-        let projection =
-            project_quota("muse", &live, Some("m"), now).expect("exhausted muse usage projects");
+        let projection = project_quota(obs("muse", scope, now), &live, Some("m"), now)
+            .expect("exhausted muse usage projects");
         assert!(projection.exhausted);
         assert!(!projection.available);
         // Other adapters' `windows[]` now establish availability too.
@@ -1595,9 +1860,12 @@ mod tests {
             {"label": "Weekly", "usedPercent": 20.0, "resetsAtMs": 3_000},
         ]});
         for harness in ["claude", "opencode", "antigravity"] {
-            let projection = project_quota(harness, &windows, Some("m"), now)
+            let scope = format!("profile:test harness:{harness}");
+            let projection = project_quota(obs(harness, &scope, now), &windows, Some("m"), now)
                 .unwrap_or_else(|| panic!("{harness} windows project"));
             assert_eq!(projection.provenance, "windows");
+            assert_eq!(projection.provider, harness);
+            assert_eq!(projection.scope, scope);
             assert!(!projection.exhausted);
             assert!(projection.available);
         }
@@ -1606,17 +1874,85 @@ mod tests {
         let scoped = json!({"windows": [
             {"label": "Opus weekly", "usedPercent": 100.0, "resetsAtMs": 2_000},
         ]});
-        let projection = project_quota("claude", &scoped, Some("opus-4"), now)
-            .expect("matching model sees its window");
+        let claude_scope = "profile:test harness:claude";
+        let projection = project_quota(
+            obs("claude", claude_scope, now),
+            &scoped,
+            Some("opus-4"),
+            now,
+        )
+        .expect("matching model sees its window");
+        assert_eq!(projection.mapping, QuotaMapping::Group("opus"));
         assert!(projection.exhausted);
         assert!(!projection.available);
-        assert!(project_quota("claude", &scoped, Some("sonnet-4"), now).is_none());
+        // An unrelated model is reported as unmapped, never skipped: the
+        // windows exist but map to no model.
+        let projection = project_quota(
+            obs("claude", claude_scope, now),
+            &scoped,
+            Some("sonnet-4"),
+            now,
+        )
+        .expect("unmapped windows report instead of vanishing");
+        assert_eq!(projection.mapping, QuotaMapping::Unmapped);
+        assert!(!projection.exhausted);
+        assert!(!projection.available);
         // Unmapped shapes stay unknown: empty muse usage, missing windows,
         // and a foreign harness shape never cross-talk.
-        assert!(project_quota("muse", &json!({}), None, now).is_none());
-        assert!(project_quota("muse", &json!({"usage": {}}), None, now).is_none());
-        assert!(project_quota("opencode", &json!({"rateLimits": {}}), None, now).is_none());
-        assert!(project_quota("unknown-harness", &windows, None, now).is_none());
+        assert!(project_quota(obs("muse", scope, now), &json!({}), None, now).is_none());
+        assert!(project_quota(obs("muse", scope, now), &json!({"usage": {}}), None, now).is_none());
+        assert!(
+            project_quota(
+                obs("opencode", scope, now),
+                &json!({"rateLimits": {}}),
+                None,
+                now
+            )
+            .is_none()
+        );
+        assert!(project_quota(obs("unknown-harness", scope, now), &windows, None, now).is_none());
+    }
+
+    #[test]
+    fn argon_weekly_bucket_does_not_exhaust_hydrogen() {
+        // Recorded `retrieveUserQuotaSummary` shape: a depleted
+        // `Gemini 4 Argon weekly` bucket must skip Argon models while every
+        // Hydrogen model stays routable, even though both contain `gemini`.
+        let now = 1_795_000_000_000;
+        let windows = json!({"windows": [
+            {"label": "Gemini weekly", "usedPercent": 1.0, "resetsAtMs": 1_795_290_000_000_i64},
+            {"label": "Gemini 4 Argon weekly", "usedPercent": 100.0, "resetsAtMs": 1_795_290_288_000_i64},
+        ]});
+        let scope = "profile:test harness:antigravity";
+        let argon = project_quota(
+            obs("antigravity", scope, now),
+            &windows,
+            Some("gemini-4-argon-medium"),
+            now,
+        )
+        .expect("argon model sees its bucket");
+        assert_eq!(argon.mapping, QuotaMapping::Group("gemini 4 argon"));
+        assert!(argon.exhausted);
+        assert!(!argon.available);
+        let hydrogen = project_quota(
+            obs("antigravity", scope, now),
+            &windows,
+            Some("gemini-4-hydrogen-high"),
+            now,
+        )
+        .expect("hydrogen model sees its bucket");
+        assert_eq!(hydrogen.mapping, QuotaMapping::Group("gemini"));
+        assert!(!hydrogen.exhausted);
+        assert!(hydrogen.available);
+        // An unrecognized provider label applies to no model.
+        let grouped = json!({"windows": [
+            {"label": "Model group weekly", "usedPercent": 100.0, "resetsAtMs": 1_795_290_288_000_i64},
+        ]});
+        let projection = project_quota(obs("antigravity", scope, now), &grouped, Some("m"), now)
+            .expect("unrecognized labels report instead of vanishing");
+        assert_eq!(projection.mapping, QuotaMapping::Unmapped);
+        assert!(!projection.exhausted);
+        assert!(!projection.available);
     }
 
     #[test]
@@ -1850,6 +2186,24 @@ mod tests {
         assert_ne!(key, canonical_cache_identity("p", "codex", Some(&other)));
         // Identical selectors: the same key, so reads still coalesce.
         assert_eq!(key, canonical_cache_identity("p", "codex", Some(&base)));
+        // Adding a Claude/XDG selector invalidates the entry: a same-profile
+        // edit that selects another native store must not reuse it.
+        for selector in ["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
+            let mut other = base.clone();
+            other["pass_env_values"][selector] = json!("C:/other-store");
+            let (other_scope, _) = describe_snapshot("p", "codex", Some(&other));
+            assert_ne!(
+                key,
+                canonical_cache_identity("p", "codex", Some(&other)),
+                "{selector} change must miss the cache"
+            );
+            assert_ne!(scope, other_scope, "{selector} change must move the scope");
+            assert!(
+                !canonical_cache_identity("p", "codex", Some(&other))
+                    .contains("super-secret-value"),
+                "key leaks a secret"
+            );
+        }
         // Display scope stays within its validated bound.
         eliot_core::api::HarnessQuotaResponse {
             harness: "codex".to_owned(),

@@ -1558,7 +1558,20 @@ restores revoked control; unknown blocks another takeover.
 `AgentHistoryRequest`/`ObservationPage` from the canonical native metadata DTOs.
 `harness.list` (`HarnessListRequest`/`HarnessListResponse`, no params) reports
 per-harness installation facts (installed, resolved `cmd`, `--version`; Claude
-additionally reports every discovered install newest first in `candidates`);
+additionally reports every discovered install newest first in `candidates`).
+Inventory probing runs on the blocking pool, never on async handlers; the
+`models.catalog` aggregate budget (90 seconds) starts at the beginning of the
+request and covers inventory, and per-harness reads past the deadline fail
+open into the partial aggregate. Concurrent cold misses share one in-flight
+`--version` probe per binary identity (Codex inventory and model reads use
+the same resolved-path key), so one binary is never launched twice for the
+same cold read. On Unix an extensionless file counts as a native executable
+only after an ELF or Mach-O header check (`#!` scripts never qualify);
+Claude candidates must be absolute paths before any probe. Antigravity
+establishes CLI identity before any discovery probe: the file stem must be
+`agy` (an `Antigravity.exe` profile or discovery hit is refused with a typed
+error and never launched), and the bounded `--version` output must parse as
+a CLI triple before `models`, quota or launch use the binary;
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
 harness's own read-only catalogue (Codex/Muse native `model/list`, OpenCode
 native `opencode models` provider/model ids verbatim, Antigravity
@@ -1585,12 +1598,14 @@ same table `configure` admission uses: `model_refusal`/`effort_refusal` are
 absent when the field has a verified mechanism and otherwise hold the exact
 `unsupported` refusal admission returns. The read is cached under a private
 canonical cache identity derived from the frozen native route/account
-selectors (account binding, native store paths, full provider endpoint,
-frozen executable) with a freshness timestamp (`fetched_at_ms`, `ttl_ms`)
-and a nonsecret credential identity (a name, never a value); every response
-carries its public display `scope`, `fetched_at_ms`, `ttl_ms` and
-`credential`. A profile/settings edit that changes any selector yields a new
-cache key, so the old account's entry is never served under the new profile. Native model ids are
+selectors (account binding, effective native store selectors
+`CODEX_HOME`/`CODEX_SQLITE_HOME`/`CLAUDE_CONFIG_DIR`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME`,
+full provider endpoint, frozen executable) with a freshness timestamp
+(`fetched_at_ms`, `ttl_ms`) and a nonsecret credential identity (a name,
+never a value; selector values are local paths and never credential values);
+every response carries its public display `scope`, `fetched_at_ms`, `ttl_ms`
+and `credential`. Adding or removing any store selector yields a new cache
+key, so the old account's entry is never served under the new profile. Native model ids are
 retained verbatim and a failed read never selects another model or account.
 `harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is an Owner-only,
 read-only provider quota query. `harness` and optional `profile` keep their current
@@ -1609,7 +1624,23 @@ These provider readers return `details.windows`: at most 32
 `{label, usedPercent, resetsAtMs, windowDurationMins}`. Percent is a finite number
 in 0..100; reset time is Unix milliseconds or null when absent. Windows identify
 5-hour, weekly and model-scoped limits when supplied; Eliot never invents limits
-or reset times. `details.state` is `ready` or `error`; `details.origin` is
+or reset times. Routing and the catalogue consume every reader through one
+typed projection carrying provider, scope, observation time, verdict
+(`exhausted`/`available`), mapping provenance and how the decisive bucket
+maps to the model: an exact bucket id, a documented provider group, or
+unmapped. Group matching is on whole model-id tokens against the documented
+group table, never substrings: a depleted `Gemini 4 Argon weekly` bucket
+skips Argon models but never a Hydrogen model, and an unrecognized label
+such as `Model group` applies to no model (reported as unmapped, so callers
+stay `unknown`). For Codex only the primary bucket's explicit limit state
+settles exhaustion (`spendControlReached`, a non-null
+`rateLimitReachedType`, a depleted `individualLimit`, or a full primary
+window without credits); a full secondary window or a metered
+`rateLimitsByLimitId` bucket never skips a route. Callers never reparse raw
+quota JSON into booleans. Freshness is enforced through the same projection
+entry point in both consumers: a response past its TTL stays `unknown`, so a
+stale observation with a future reset neither skips a route nor marks a
+model available. `details.state` is `ready` or `error`; `details.origin` is
 `provider` or `environment`. A failed read remains `status:"supported"` with
 `state:"error"`, a sanitized reason and no windows. Unsupported native integration
 sources remain `unsupported` with a concrete reason. Native JSON-RPC method-not-found

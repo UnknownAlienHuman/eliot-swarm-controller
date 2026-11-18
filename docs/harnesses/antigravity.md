@@ -477,7 +477,12 @@ may be omitted to preserve the verified ACP session default described above.
 `cmd` is the installed `agy` CLI on `PATH` (it serves both `acp` and
 `models`); there is no fallback. An IDE-only install reports `unsupported`
 naming the IDE path with guidance to install `agy`: the IDE executable does
-not implement the native ACP/model CLI and is never launched for discovery. `swarm models --harness antigravity` returns the live
+not implement the native ACP/model CLI and is never launched for discovery.
+CLI identity is established before any discovery probe: a profile or ad-hoc
+`cmd` must name the `agy` file itself (an `Antigravity.exe` cmd is refused
+with a typed error and never launched), and a PATH `agy` whose bounded
+`--version` output does not parse as a CLI triple is refused before any
+`models`, quota or launch use. `swarm models --harness antigravity` returns the live
 read-only catalogue from `agy models` (exact argv `models`, bounded time and
 output, same environment construction as launch): tab-separated native ids
 kept verbatim (for example `gemini-4-argon-medium`, `gemini-4-hydrogen-xhigh`,
@@ -553,6 +558,11 @@ define `groups`, `displayName`, `buckets`, `window`, `remainingFraction` and
 and Claude/GPT 5-hour/weekly windows. A missing group remains absent; no legacy
 model-availability response is substituted for account quota. Tokens, email and project
 identifiers never leave the plugin. No credential refresh or onboarding is done.
+Window-to-model mapping is documented-group only, never substring: the
+`Gemini 4 Argon` group constrains models with an `argon` id token, so an
+exhausted Argon weekly bucket skips Argon models but never a Hydrogen model;
+an unrecognized provider group (projected as a `Model group` label) maps to
+no model.
 Other platforms currently report a supported environment error because their
 native keyring reader is unimplemented; provider failures also remain supported
 error states. Queries never start a turn.

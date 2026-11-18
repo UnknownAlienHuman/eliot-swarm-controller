@@ -1488,7 +1488,7 @@ async fn run_agent(
 /// fails the start.
 async fn flag_harness_drift(state: &HostState, agent: &eliot_core::Agent) {
     let harness = agent.harness.clone();
-    let entry = crate::adhoc::harness_installation(&harness);
+    let entry = crate::adhoc::harness_installation_async(&harness).await;
     let installed = entry
         .get("version")
         .and_then(serde_json::Value::as_str)
@@ -2510,6 +2510,31 @@ pub(crate) fn build_process_environment(profile: &Value) -> Result<Map<String, V
     build_process_environment_with(profile, |name| std::env::var_os(name))
 }
 
+/// Frozen native store inputs are the exact selector set for new snapshots,
+/// or the legacy two-Codex-home set for snapshots frozen before the Claude
+/// and XDG selectors were captured. Every key must be a known selector with
+/// a null/string value; unknown keys or duplicates stay malformed.
+fn captured_store_inputs_valid(values: &Map<String, Value>) -> bool {
+    if !values
+        .values()
+        .all(|value| value.is_null() || value.is_string())
+    {
+        return false;
+    }
+    let mut selectors: Vec<&str> = values
+        .keys()
+        .filter_map(|name| crate::config::native_store_selector(name))
+        .collect();
+    selectors.sort_unstable();
+    selectors.dedup();
+    if selectors.len() != values.len() {
+        return false;
+    }
+    let mut full: Vec<&str> = crate::config::NATIVE_STORE_SELECTORS.to_vec();
+    full.sort_unstable();
+    selectors == full || selectors == ["CODEX_HOME", "CODEX_SQLITE_HOME"]
+}
+
 fn build_process_environment_with(
     profile: &Value,
     mut lookup: impl FnMut(&str) -> Option<OsString>,
@@ -2517,23 +2542,7 @@ fn build_process_environment_with(
     let captured = match profile.get("pass_env_values") {
         Some(value) => value
             .as_object()
-            .filter(|values| {
-                values.len() == 2
-                    && values
-                        .values()
-                        .all(|value| value.is_null() || value.is_string())
-                    && ["CODEX_HOME", "CODEX_SQLITE_HOME"]
-                        .into_iter()
-                        .all(|selector| {
-                            values
-                                .keys()
-                                .filter(|name| {
-                                    crate::config::native_store_selector(name) == Some(selector)
-                                })
-                                .count()
-                                == 1
-                        })
-            })
+            .filter(|values| captured_store_inputs_valid(values))
             .ok_or_else(|| Error::new("invalid", "frozen native store inputs are malformed"))?,
         None => {
             return Err(Error::new(
@@ -2586,18 +2595,21 @@ fn build_process_environment_with(
                 ));
             }
             if let Some(selector) = crate::config::native_store_selector(name) {
-                let value = captured
-                    .iter()
-                    .find_map(|(name, value)| {
-                        (crate::config::native_store_selector(name) == Some(selector))
-                            .then_some(value)
-                    })
-                    .expect("captured selector map was validated");
-                if let Some(value) = value.as_str() {
-                    insert_environment(&mut environment, selector, value.to_owned());
+                let frozen = captured.iter().find_map(|(name, value)| {
+                    (crate::config::native_store_selector(name) == Some(selector)).then_some(value)
+                });
+                match frozen {
+                    Some(Value::String(value)) => {
+                        insert_environment(&mut environment, selector, value.to_owned());
+                        continue;
+                    }
+                    // A captured null suppresses future ambient values. Empty
+                    // stays empty.
+                    Some(_) => continue,
+                    // A legacy snapshot predates this selector: keep the
+                    // previous live lookup instead of failing the launch.
+                    None => {}
                 }
-                // A captured null suppresses future ambient values. Empty stays empty.
-                continue;
             }
             if let Some(value) = lookup(name) {
                 let value = value.into_string().map_err(|_| {
