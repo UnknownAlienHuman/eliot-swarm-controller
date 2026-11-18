@@ -587,17 +587,28 @@ impl Store {
         request.validate()?;
         let payload = serde_json::to_value(request)
             .map_err(|_| Error::new("invalid", "cleanup request cannot encode"))?;
-        let plan = self.cleanup_plan(principal, &request.plan_id)?;
+        // Exact replay precedes plan load: a settled plan may already have
+        // been reclaimed from the ledger while its receipt is retained, and
+        // the retry must still read back the retained response instead of
+        // `not_found` for the missing plan row.
         if let Some(value) =
             self.cleanup_replay(principal, &request.id, "cleanup.apply", &payload)?
         {
-            return Ok((
-                plan,
-                serde_json::from_value(value)
-                    .map_err(|_| Error::new("source_integrity", "invalid cleanup receipt"))?,
-                false,
-            ));
+            let response: CleanupApplyResponse = serde_json::from_value(value)
+                .map_err(|_| Error::new("source_integrity", "invalid cleanup receipt"))?;
+            let plan = match self.cleanup_plan(principal, &request.plan_id) {
+                Ok(plan) => plan,
+                Err(error) if error.code == "not_found" => CleanupPlan {
+                    plan_id: request.plan_id.clone(),
+                    created_at: 0,
+                    items: Vec::new(),
+                    truncated: false,
+                },
+                Err(error) => return Err(error),
+            };
+            return Ok((plan, response, false));
         }
+        let plan = self.cleanup_plan(principal, &request.plan_id)?;
         validate_id_age(&request.id, now)?;
         if let Some(selected) = &request.artifacts
             && selected.iter().any(|id| {
@@ -1070,10 +1081,12 @@ mod tests {
             let (_, replay, fresh) = store.begin_cleanup_apply("owner", &request, now).unwrap();
             assert!(!fresh);
             assert_eq!(replay.items[0].outcome, expected);
+            // Every consumed plan keeps its receipt while the plan row exists,
+            // so neither settled nor unknown receipts prune before reclaim.
             let trimmed = store
                 .prune_retention(None, Some(1), None, now + 2 * 86_400_000)
                 .unwrap();
-            assert_eq!(trimmed.writes_deleted, i64::from(expected == "skipped"));
+            assert_eq!(trimmed.writes_deleted, 0);
         }
     }
 
@@ -1362,6 +1375,95 @@ mod tests {
             .unwrap();
         assert!(!is_new);
         assert_eq!(replay.items[0].outcome, "unknown");
+    }
+
+    #[test]
+    fn reclaimed_settled_plan_still_replays_retained_receipt() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        store.connection.execute("INSERT INTO agents(project,harness,profile,state,generation,created_at,updated_at) VALUES ('p','codex','p','stopped',1,?1,?1)",[now]).unwrap();
+        let artifact = ArtifactView {
+            id: Ulid::new().to_string(),
+            agent: "a1".to_owned(),
+            generation: 1,
+            project: "p".to_owned(),
+            tree: vec!["a1:1".to_owned()],
+            path: "C:/scratch/target".to_owned(),
+            kind: ArtifactKind::Build,
+            purpose: "build".to_owned(),
+            identity: "original".to_owned(),
+            created_at: now,
+            state: "registered".to_owned(),
+            git: None,
+        };
+        store.record_known_artifact(artifact.clone()).unwrap();
+        let plan = CleanupPlan {
+            plan_id: Ulid::new().to_string(),
+            created_at: now,
+            items: vec![CleanupCandidate {
+                artifact: artifact.clone(),
+                bytes: Some(7),
+                verdict: "safe".to_owned(),
+                reason: "terminal".to_owned(),
+            }],
+            truncated: false,
+        };
+        store.retain_cleanup_plan("owner", &plan, now).unwrap();
+        let apply = CleanupApplyRequest {
+            id: Ulid::new().to_string(),
+            plan_id: plan.plan_id.clone(),
+            delete_remote: false,
+            artifacts: Some(vec![]),
+        };
+        let (_, first, is_new) = store.begin_cleanup_apply("owner", &apply, now).unwrap();
+        assert!(is_new);
+        assert!(
+            first.items.iter().all(|item| item.outcome != "unknown"),
+            "empty selection settles"
+        );
+        // Retention must pin the consumed receipt while the plan row exists,
+        // so write pruning can never strand a consumed plan permanently
+        // ineligible for reclamation.
+        let trimmed = store
+            .prune_retention(None, Some(1), None, now + 2 * 86_400_000)
+            .unwrap();
+        assert_eq!(trimmed.writes_deleted, 0);
+        // Fill the ledger to force reclaim of the settled plan, then exact
+        // retry must still replay the retained receipt, not `not_found`.
+        let stale_at = now - 2 * 86_400_000;
+        for _ in 0..(MAX_CLEANUP_PLANS - 1) {
+            let preview = CleanupPlan {
+                plan_id: Ulid::new().to_string(),
+                created_at: stale_at,
+                items: vec![],
+                truncated: false,
+            };
+            store
+                .connection
+                .execute(
+                    "INSERT INTO cleanup_plans(id,principal,body) VALUES (?1,'owner',?2)",
+                    params![preview.plan_id, encode_json(&preview).unwrap()],
+                )
+                .unwrap();
+        }
+        let admitted = CleanupPlan {
+            plan_id: Ulid::new().to_string(),
+            created_at: now,
+            items: vec![],
+            truncated: false,
+        };
+        store
+            .retain_cleanup_plan("owner", &admitted, now)
+            .expect("full ledger must reclaim the settled plan");
+        assert_eq!(
+            store.cleanup_plan("owner", &plan.plan_id).unwrap_err().code,
+            "not_found",
+            "settled plan was reclaimed"
+        );
+        let (_, replay, is_new) = store.begin_cleanup_apply("owner", &apply, now).unwrap();
+        assert!(!is_new, "exact retry replays instead of failing");
+        assert_eq!(replay.plan_id, apply.plan_id);
+        assert_eq!(replay.items.len(), first.items.len());
     }
 
     #[test]

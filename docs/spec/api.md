@@ -723,7 +723,11 @@ clears the flag, so a live reader is never hidden.
 `agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;
 totals and cursors use the same filter. The default also lists an archived ended
 (stopped, failed or lost) Agent while its custody is unresolved, as when an archived
-idle Agent is lost with its process left running; `"only"` lists it too. Summaries and full Agents expose `archived`.
+idle Agent is lost with its process left running; `"only"` lists it too. The
+default exclusion collects the live custody set once per page from the process,
+artifact, and source tables (bounded by live custody, never by archived history):
+the archived leg seeks those ids by primary key and the totals use the same set,
+so no page scans archived history or probes custody per archived row. Summaries and full Agents expose `archived`.
 CLI: `swarm archive aN`, `swarm unarchive aN`, `swarm ls --archived include`.
 
 `agent.delete {id, agent:"aN"}` is Owner-only and removes a tree whose Agents are ended
@@ -1511,9 +1515,11 @@ as settled honest outcomes), the daemon delivers exactly one coalesced `mail.sen
 payload replays the retained registration and mail without a second delivery; same
 id plus a different payload or principal rejects `id_conflict`. Reconnect or restart
 replays the same mail id, so the digest is never duplicated. The driver sweeps
-pending registrations with a progressing keyset cursor (wrapping at the end), so
-pending or undeliverable registrations at the front never starve later eligible
-ones. The digest reuses the
+pending registrations with a progressing keyset cursor that seeks after the last
+examined `(created_at, id)` and wraps once it passes the sweep high-water
+observed at sweep start, so pending or undeliverable registrations at the front
+never starve later eligible ones even while new registrations keep arriving;
+new arrivals join the next sweep. The digest reuses the
 ordinary mail wake (one generic coalesced notice per minute, at most one open notice
 command) and emits no `x.user.agent.attention` event; a successful completion stays
 distinct from an attention incident and no model call is needed to poll. The CLI is
