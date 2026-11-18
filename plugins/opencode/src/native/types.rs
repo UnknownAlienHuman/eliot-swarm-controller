@@ -421,9 +421,10 @@ impl StructuredError {
 // Config readback
 // ---------------------------------------------------------------------------
 
-/// `GET /api/config` (`config.get`) entry subset. PR1 only needs the
-/// document path (proving the per-Agent config file is the effective one)
-/// and the default model.
+/// `GET /api/config` (`config.get`) entry subset. The document path
+/// proves the per-Agent config file is effective, the default model
+/// selects the native default, and the `mcp.servers` table proves the
+/// winning transport of the managed Agent-scoped entry.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigEntry {
@@ -440,6 +441,36 @@ pub struct ConfigEntry {
 pub struct ConfigInfo {
     #[serde(default)]
     pub model: Option<ConfigModel>,
+    #[serde(default)]
+    pub mcp: Option<ConfigMcp>,
+}
+
+/// Effective `mcp` document subset: only the server table decodes. Unknown
+/// fields and future server shapes are ignored; a missing table decodes as
+/// empty, never as proof of any transport.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigMcp {
+    #[serde(default)]
+    pub servers: std::collections::HashMap<String, ConfigMcpServer>,
+}
+
+/// One effective `mcp.servers` entry subset: the installed local shape
+/// (`type: local`, `command` argv, optional `environment`) and the remote
+/// shape (`type: remote`, `url`). Only these transport/auth-identity
+/// fields decode; cosmetic keys (timeouts, cwd, codemode, ...) never
+/// decide the proof.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigMcpServer {
+    #[serde(default, rename = "type")]
+    pub server_type: Option<String>,
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub environment: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +508,15 @@ impl McpServerReadback {
     /// Whether this entry proves the Agent-scoped server is serving.
     pub fn is_connected(&self, server_name: &str) -> bool {
         self.name == server_name && self.status.status == "connected"
+    }
+
+    /// Whether this entry counts as serving for the named Agent-scoped
+    /// server: `connected` or `pending`. The inventory gate treats both
+    /// words as serving, so the managed-transport proof must run for both
+    /// too; otherwise a still-connecting managed entry would skip the
+    /// proof while other pending servers are already refused.
+    pub fn is_serving(&self, server_name: &str) -> bool {
+        self.name == server_name && matches!(self.status.status.as_str(), "connected" | "pending")
     }
 }
 
@@ -1205,6 +1245,21 @@ mod tests {
         assert!(!entries[2].is_connected("eliot-swarm"));
         assert!(!entries[3].is_connected("eliot-swarm"));
         assert!(!entries[4].is_connected("eliot-swarm"));
+        // Serving covers the still-connecting Agent-scoped entry too:
+        // the inventory gate refuses other pending servers, so the
+        // managed proof cannot skip a pending managed entry.
+        assert!(entries[0].is_serving("eliot-swarm"));
+        assert!(!entries[1].is_serving("eliot-swarm"));
+        assert!(!entries[2].is_serving("eliot-swarm"));
+        let pending_swarm = McpServerReadback {
+            name: "eliot-swarm".to_owned(),
+            status: McpStatusReadback {
+                status: "pending".to_owned(),
+                error: None,
+            },
+        };
+        assert!(!pending_swarm.is_connected("eliot-swarm"));
+        assert!(pending_swarm.is_serving("eliot-swarm"));
     }
 
     #[test]

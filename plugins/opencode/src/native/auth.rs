@@ -678,9 +678,13 @@ async fn kill_and_reap(child: &mut Child) -> bool {
 
 /// Read only the selected canonical credential using the native export schema.
 /// No import or write is performed; stderr and secret-bearing parse failures are discarded.
-pub(crate) async fn quota_credential(
+/// The `integration` names one native integration id (`opencode` for the
+/// Console sign-in, `opencode-go` for the legacy Go credential); omitting
+/// the target would export every integration, so it is always explicit.
+pub(crate) async fn quota_credential_for(
     profile: &serde_json::Value,
     environment: Option<&serde_json::Value>,
+    integration: &str,
 ) -> Result<String> {
     let cmd = profile
         .get("cmd")
@@ -697,7 +701,7 @@ pub(crate) async fn quota_credential(
         }
     }
     command
-        .args(["auth", "export", "opencode-go", "--standalone"])
+        .args(["auth", "export", integration, "--standalone"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -728,22 +732,45 @@ pub(crate) async fn quota_credential(
         eliot_plugin::quota::environment("OpenCode credential export schema is unavailable")
     })?;
     let mut active = rows.iter().filter(|row| {
-        row.get("integrationID").and_then(serde_json::Value::as_str) == Some("opencode-go")
+        row.get("integrationID").and_then(serde_json::Value::as_str) == Some(integration)
             && row.get("active").and_then(serde_json::Value::as_bool) == Some(true)
     });
     let row = active.next().ok_or_else(|| {
-        eliot_plugin::quota::environment("OpenCode Go has no active native credential")
+        eliot_plugin::quota::environment(
+            "OpenCode selected integration has no active native credential",
+        )
     })?;
     if active.next().is_some() {
         return Err(eliot_plugin::quota::environment(
-            "OpenCode Go active native credential is ambiguous",
+            "OpenCode selected integration native credential is ambiguous",
         ));
     }
-    row.pointer("/value/key")
-        .and_then(serde_json::Value::as_str)
-        .filter(|key| !key.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| eliot_plugin::quota::environment("OpenCode Go native key is unavailable"))
+    let value = row.get("value").ok_or_else(|| {
+        eliot_plugin::quota::environment("OpenCode native credential value is unavailable")
+    })?;
+    // The native credential value is OAuth (`access` token) or an API key
+    // (`key`); externally managed credentials carry no exportable secret.
+    let bearer = match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("oauth") => value.get("access").and_then(serde_json::Value::as_str),
+        Some("key") => value.get("key").and_then(serde_json::Value::as_str),
+        _ => None,
+    }
+    .filter(|secret| !secret.is_empty())
+    .map(str::to_owned)
+    .ok_or_else(|| {
+        eliot_plugin::quota::environment(
+            "OpenCode selected integration native secret is unavailable",
+        )
+    })?;
+    Ok(bearer)
+}
+
+/// Read only the legacy Go credential's bearer material.
+pub(crate) async fn quota_credential(
+    profile: &serde_json::Value,
+    environment: Option<&serde_json::Value>,
+) -> Result<String> {
+    quota_credential_for(profile, environment, "opencode-go").await
 }
 
 #[cfg(test)]

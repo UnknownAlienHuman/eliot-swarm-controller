@@ -1864,7 +1864,9 @@ impl EventProcessor {
     /// Terminal readback: page the newest-first message list (bounded) and
     /// find our user message plus the newest `idle` message after it. Final
     /// text is the concatenated assistant text parts strictly between the
-    /// two in newest-first page order, in ascending time order. Usage is the
+    /// two in newest-first page order, reversed to chronological order
+    /// with each message's native `content` array order preserved (page
+    /// position decides; timestamps never reorder it). Usage is the
     /// final assistant message's native token usage in that same exact
     /// user-to-selected-idle slice, attributed at message scope. Anything
     /// else (missing user message, missing idle, contradictory outcome) is
@@ -1878,7 +1880,7 @@ impl EventProcessor {
         let mut cursor: Option<String> = None;
         let mut user_position: Option<usize> = None;
         let mut idle: Option<(String, String, Option<StructuredError>, usize)> = None;
-        let mut texts: Vec<(usize, i64, String, String)> = Vec::new();
+        let mut texts: Vec<(usize, usize, i64, String)> = Vec::new();
         let mut usages: HashMap<String, (usize, i64, Option<AssistantTokens>)> = HashMap::new();
         let mut position: usize = 0;
         for _ in 0..MAX_MESSAGE_PAGES {
@@ -1899,14 +1901,14 @@ impl EventProcessor {
                         user_position = Some(position);
                     }
                     Message::Assistant(assistant) => {
-                        for part in &assistant.content {
+                        for (part_index, part) in assistant.content.iter().enumerate() {
                             if let AssistantContent::Text(text) = part
                                 && let Some(body) = text.text.as_deref()
                             {
                                 texts.push((
                                     position,
+                                    part_index,
                                     assistant.time.created,
-                                    assistant.id.clone(),
                                     body.to_owned(),
                                 ));
                             }
@@ -1956,19 +1958,7 @@ impl EventProcessor {
         // newest-first page order: positions after the idle, before our user.
         // Both text and usage share this exact slice, so assistants newer
         // than the selected idle never leak into either.
-        let mut selected: Vec<(i64, String, String)> = texts
-            .into_iter()
-            .filter(|(position, _, _, _)| *position > idle_position && *position < user_position)
-            .map(|(_, created, id, body)| (created, id, body))
-            .collect();
-        selected.sort();
-        let mut final_text = String::new();
-        for (_, _, body) in selected {
-            if !final_text.is_empty() {
-                final_text.push('\n');
-            }
-            final_text.push_str(&body);
-        }
+        let final_text = project_terminal_text(texts, idle_position, user_position);
         Ok(TerminalReadback {
             idle_id,
             outcome: match outcome.as_str() {
@@ -1977,11 +1967,7 @@ impl EventProcessor {
                 _ => "interrupted".to_owned(),
             },
             idle_error,
-            final_text: if final_text.is_empty() {
-                None
-            } else {
-                Some(final_text)
-            },
+            final_text,
             usage: final_message_usage(&usages, idle_position, user_position),
         })
     }
@@ -2619,6 +2605,42 @@ struct TerminalReadback {
     usage: Option<TurnUsage>,
 }
 
+/// Project the terminal assistant text for one turn from collected parts:
+/// `(newest-first message position, intra-message content index, created,
+/// body)`. Positions are newest-first page order strictly between the
+/// selected idle and our input; the projection returns chronological text
+/// by reversing that page order while preserving each message's native
+/// `content` array order. Page position alone decides message order:
+/// `created` never outranks it, because timestamps can disagree with the
+/// native sequence across pages. The part index orders parts within one
+/// message (parts of one message share `created`, which previously made
+/// the text body the tiebreaker and reordered the response
+/// alphabetically).
+fn project_terminal_text(
+    texts: Vec<(usize, usize, i64, String)>,
+    idle_position: usize,
+    user_position: usize,
+) -> Option<String> {
+    let mut selected: Vec<(usize, usize, String)> = texts
+        .into_iter()
+        .filter(|(position, _, _, _)| *position > idle_position && *position < user_position)
+        .map(|(position, part, _, body)| (position, part, body))
+        .collect();
+    selected.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    let mut final_text = String::new();
+    for (_, _, body) in selected {
+        if !final_text.is_empty() {
+            final_text.push('\n');
+        }
+        final_text.push_str(&body);
+    }
+    if final_text.is_empty() {
+        None
+    } else {
+        Some(final_text)
+    }
+}
+
 /// The newest assistant message in the exact user-to-selected-idle slice
 /// contributes its native token usage at message scope. The slice is the
 /// newest-first page order strictly between our input and the selected
@@ -2942,6 +2964,53 @@ mod tests {
         // Successful conflicting evidence is retained for complete_turn's
         // contradiction check; it is never downgraded to unavailable enrichment.
         assert_eq!(readback.outcome, "failed");
+    }
+
+    #[test]
+    fn terminal_text_preserves_native_part_order_within_one_message() {
+        // One assistant message at newest-first position 1 between the
+        // selected idle (0) and our input (2), two text parts sharing
+        // `created` and the message id. Alphabetical body order must not
+        // leak into the projection: native `content` order wins.
+        let texts = vec![
+            (1, 0, 7, "Z first".to_owned()),
+            (1, 1, 7, "A second".to_owned()),
+        ];
+        assert_eq!(
+            super::project_terminal_text(texts, 0, 2).as_deref(),
+            Some("Z first\nA second")
+        );
+        // Equal timestamps across messages: the larger newest-first
+        // position is the older message and projects first.
+        let texts = vec![(1, 0, 7, "newer".to_owned()), (2, 0, 7, "older".to_owned())];
+        assert_eq!(
+            super::project_terminal_text(texts, 0, 3).as_deref(),
+            Some("older\nnewer")
+        );
+        // Page position decides across messages: the larger newest-first
+        // position is the earlier message, in timestamp order here.
+        let texts = vec![
+            (1, 0, 9, "second".to_owned()),
+            (2, 0, 7, "first".to_owned()),
+        ];
+        assert_eq!(
+            super::project_terminal_text(texts, 0, 3).as_deref(),
+            Some("first\nsecond")
+        );
+        // Page position wins even when timestamps disagree with the native
+        // sequence: the earlier message carries the newer timestamp.
+        let texts = vec![
+            (1, 0, 7, "later".to_owned()),
+            (2, 0, 9, "earlier".to_owned()),
+        ];
+        assert_eq!(
+            super::project_terminal_text(texts, 0, 3).as_deref(),
+            Some("earlier\nlater")
+        );
+        // Slice bounds and emptiness project to no text.
+        assert_eq!(super::project_terminal_text(Vec::new(), 0, 2), None);
+        let texts = vec![(5, 0, 7, "outside".to_owned())];
+        assert_eq!(super::project_terminal_text(texts, 0, 2), None);
     }
 
     #[tokio::test]

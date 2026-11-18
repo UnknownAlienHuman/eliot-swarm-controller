@@ -114,16 +114,16 @@ fail readiness with location-not-found (observed in the Linux Docker image).
 
 | Eliot operation | Mechanism / settlement |
 | --- | --- |
-| launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; before `serve`, the frozen nonsecret `auth_integration` selector's canonical credential transfers opaquely into the isolated store as described under [Authentication](#authentication), with no modification of owner global auth; exact session/model/directory echo required before Eliot `session.ready`. Readiness is the installed `GET /api/config` proving the live server honors the per-Agent roots (password plus our config document path), polled to a 60 s bound inside one 75 s start envelope shared with the transfer, spawn, subscribe, registration, and create phases, with every failure cleanup (event close plus owned-server terminate and diagnostics) clamped to the same envelope and 15 s reserved for the daemon's Job retirement and settlement, so a loaded cold start never outlives the daemon `agent.start` budget. Any failure before a native session or prompt exists is a definite failed start with a short typed reason and its processes reaped through the generation Job, except an uncertain auth import (the isolated credential store may already have been written and reconciliation failed), which stays `unknown`; `unknown` otherwise stays reserved for real uncertainty after a session or prompt may have been admitted |
+| launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; before `serve`, the frozen nonsecret `auth_integration` selector's canonical credential transfers opaquely into the isolated store as described under [Authentication](#authentication), with no modification of owner global auth; exact session/model/directory echo required before Eliot `session.ready`; an explicit model must also prove live `GET /api/model` catalogue membership as an exact `provider/model` pair — both native fields compared independently without trimming, exactly like the installed resolver — before create (the installed `Session.create` publishes its input unchanged and resolves availability lazily at inference, so the echo alone never proves a provider/model exists), and a requested effort must prove variant membership in that same catalogue row. Readiness is the installed `GET /api/config` proving the live server honors the per-Agent roots (password plus our config document path), polled to a 60 s bound inside one 75 s start envelope shared with the transfer, spawn, subscribe, registration, and create phases, with every failure cleanup (event close plus owned-server terminate and diagnostics) clamped to the same envelope and 15 s reserved for the daemon's Job retirement and settlement, so a loaded cold start never outlives the daemon `agent.start` budget. Any failure before a native session or prompt exists is a definite failed start with a short typed reason and its processes reaped through the generation Job, except an uncertain auth import (the isolated credential store may already have been written and reconciliation failed), which stays `unknown`; `unknown` otherwise stays reserved for real uncertainty after a session or prompt may have been admitted |
 | send | installed `POST /api/session/{id}/prompt`; the 200 inbox id is intermediate, applied needs the exact input-to-execution association on SSE (`session.inbox.enqueued`/`delivered` plus `session.execution.started`; turn id is the exact `started` event id) |
 | steer | exact-turn `POST /api/session/{id}/prompt` with explicit `delivery: steer` (v2.2.7 `Session.Inbox.Delivery`); the exact-turn gate refuses a finished turn as stale without a write, applied needs the input delivered on SSE while the exact turn stays active (native joins it at a step boundary, never a new turn here); terminal-first, cancelled, unwatched, or timed-out consumption is unknown with an exact `DELETE .../inbox/{inboxID}` whose removal must then be proven by inbox-list absence plus a stream-observed cancel — anything unproven latches the session unknown so no later send/Goal dispatches behind the unresolved input (the native 204 also covers the no-op, so it proves nothing alone) |
-| inject | `next_input` prepends inside the next `POST /api/session/{id}/prompt`; `turn_safe_point` claims through the authenticated `hook.event` channel (`hook=before_model`) and resolves to the vendor-native `context` hook (RPC `eliot-context` v1 `bind`/`next`/`resolve` over the existing authenticated HTTP transport) only after a verified v1 session binding; a hook never binds by copying its last-user message id without proving actual inbox delivery to the current turn, and only a confirmed `applied`/`empty` resolve emits a `hook.before_model` receipt |
+| inject | `next_input` prepends inside the next `POST /api/session/{id}/prompt`; `turn_safe_point` claims through the authenticated `hook.event` channel (`hook=before_model`) and resolves to the vendor-native `context` hook (RPC `eliot-context` v1 `bind`/`next`/`resolve` over the existing authenticated HTTP transport) only after a verified v1 session binding; a hook never binds by copying its last-user message id without proving actual inbox delivery to the current turn, and only a confirmed `applied`/`empty` resolve emits a `hook.before_model` receipt; the poll paces repeat `next` offers of one still-pending hook with bounded backoff instead of hot-polling, and the first offer always forwards immediately |
 | interrupt | installed `POST /api/session/{id}/interrupt` (`{"interrupted": bool}`); the exact-turn gate refuses a finished turn as stale without a write, `interrupted:true` applies and the terminal pair settles the turn |
 | stop | ordinary busy Stop: one installed exact-session interrupt guarded by the captured turn, then a bounded wait for that turn's SSE terminal; interrupt acknowledgement alone is not evidence. Read-only idle-leg checks and `GET /api/session/{id}` prove retention, then the owned server ends through generation custody. Missing terminal evidence retains an unknown turn; failed idle/retention readback still proceeds to bounded owned-server cleanup and makes the stop unknown. Idle Stop retains the native quiesce preflight. Force skips the cooperative wait and retention readback. Neither stop deletes the retained native session or touches another Agent |
 | detach | explicitly stop controlling/observing as defined, leaving native service/session alive |
-| resume | installed exact native session reattachment: `GET /api/session/{id}` proves the retained session, then the interrupt-quiesce (`POST .../interrupt`, which aborts a running retained execution — refusing would wedge crash-recovery resume) plus the empty `inbox`/`permission`/`form` lists prove it idle (anything still pending refuses the resume); never replays the prompt |
+| resume | installed exact native session reattachment: `GET /api/session/{id}` proves the retained session, then the live catalogue proves an explicit realignment target with proven no effect before any native interrupt or setter (a miss fails the resume without touching the retained turn), then the interrupt-quiesce (`POST .../interrupt`, which aborts a running retained execution — refusing would wedge crash-recovery resume) plus the empty `inbox`/`permission`/`form` lists prove it idle (anything still pending refuses the resume); never replays the prompt |
 | approve/deny/answer | installed `POST .../permission/{id}/reply` (`once`/`always`/`reject`; approve must name `once` or `always`, there is no default choice), `POST .../form/{id}/reply` (`answer` map), `DELETE .../form/{id}` for deny; the public request id is the native id, request.opened details are the shared ApprovalRequest/QuestionRequest, answers are the shared AnswerArgs converted to the field-typed native value (string, string array, number, boolean), choices stage against the offered schema (a miss rejects before any write), a lost reply is unknown and never rewritten |
-| configure | mid-run model and/or effort switch at configure time: the requested `provider/model` must be in the live `GET /api/model` catalogue or the command rejects before any write, and a requested effort must be one of that model's installed `variants` ids (the TUI "Variant" switch; the installed server validates nothing and echoes even bogus switches, so the catalogue gate is the honest failure); the switch runs installed `POST /api/session/{id}/model` with the documented `Model.Ref.variant` and a fresh `session.get` effective readback (`model_verified` and, when an effort was requested, `effort_verified` only from that readback), then the Router stores the overlay — a refused or unproven switch stores nothing and never claims applied. A model switch without an effort runs the server default variant. Resume-time realign keeps the installed `POST .../model` / `POST .../agent` setters against the retained session with `session.get` effective readback (a refused switch fails the resume as unknown), targeting the inherited overlay revision when a resume carries one |
+| configure | mid-run model and/or effort switch at configure time: the requested `provider/model` must be in the live `GET /api/model` catalogue or the command rejects before any write, and a requested effort must be one of that model's installed `variants` ids (the TUI "Variant" switch; the installed server validates nothing and echoes even bogus switches, so the catalogue gate is the honest failure); the switch runs installed `POST /api/session/{id}/model` with the documented `Model.Ref.variant` and a fresh `session.get` effective readback (`model_verified` and, when an effort was requested, `effort_verified` only from that readback), then the Router stores the overlay — a refused or unproven switch stores nothing and never claims applied. A model switch without an effort runs the server default variant. Resume-time realign proves live catalogue membership for an explicit target model (plus variant membership when an effort is carried) before any installed `POST .../model` / `POST .../agent` setter against the retained session, then verifies with `session.get` effective readback (a refused switch fails the resume as unknown; the catalogue gate already ran before the interrupt-quiesce, so an unreadable catalogue that early and a catalogue miss both fail the resume with proven no effect), targeting the inherited overlay revision when a resume carries one |
 | fork/background | installed native method and exact resulting identity/state |
 | goal | explicitly selected Eliot Goal; no assumed native Goal |
 
@@ -160,7 +160,7 @@ adapter commits no `session.usage` fact; `session_usage` stays null.
 Controlled exact-session SSE owns supplied lifecycle. Message/session reads repair
 current state, not a second live event stream. On disconnect: mark stale, reconnect,
 discard stale resync work, read permissions/forms/inbox/current execution, recover current
-output by exact message/part ids, record the uncovered gap, then follow live events.
+output by exact message/part ids (terminal text reverses the native newest-first page order with each message's content array order preserved; timestamps never reorder it), record the uncovered gap, then follow live events.
 
 A local reconnect counter may order concurrent snapshots; it is not another persisted
 Agent epoch. No guaranteed exclusive native history cursor means no historical replay.
@@ -184,8 +184,7 @@ slash: `opencode/deepseek-v4.1-flash-free` selects provider `opencode` and model
 Empty slash segments, backslash separators, whitespace and control characters reject.
 The native `#variant` suffix is not mapped by this slice and rejects; the frozen
 profile `effort` (or ad-hoc `--effort`) selects the documented `Model.Ref.variant`
-instead, gated against the live `GET /api/model` catalogue before the session
-exists. Effective output reports native `ModelRef.variant` as `model_variant` and,
+instead. An explicit model must prove live `GET /api/model` catalogue membership as an exact `provider/model` pair — both native fields compared independently without trimming — before the session exists (the create echo alone never proves it); a requested effort must additionally prove variant membership in that exact catalogue row. Effective output reports native `ModelRef.variant` as `model_variant` and,
 mirroring that readback, as `effort` with `effort_verified` (an omitted effort
 accepts the server default variant); `model_variant` alone stays readback-only and
 does not change `model_verified` (provider/id), while a requested effort joins the
@@ -230,16 +229,16 @@ document sets only that model. Managed policy authority is preserved: no
 owner or project file is ever edited.
 
 Effective settings are read back, not assumed. The isolated XDG file is not
-the final authority (project config loads after global config), so before
+the final authority (workspace-inherited layers load after the isolated global config), so before
 inference the plugin checks the exact provider through bounded native
-`GET /api/provider/:providerID`, selects the exact API model id locally from
+`GET /api/provider/:providerID`, selects the exact frozen provider/model pair locally from
 `GET /api/model` (the endpoint answers an object with a `data` array), and reads the backend's
 own passive `GET {base_url}/models` inventory — which never generates text,
 never sends `?reload=1` (that can unload running llama.cpp models), and
 never touches load/switch selectors. This verification runs before
 `POST /api/session` creates any native session: no session or prompt has
 been dispatched yet, so every verification failure — a known mismatch
-(foreign provider/package/endpoint, an absent catalogue id, divergent
+(foreign provider/package/endpoint, an absent catalogue pair, divergent
 limits, or an inventory without the frozen id), an unreadable readback, or
 an unreachable backend with no inventory at all — settles the launch as a
 definite failure with a short safe reason (failed-state start result, never
@@ -301,13 +300,13 @@ Mail wake text names this tool: an OpenCode Agent is told to use the
 CLI.
 
 Requested vs observed: `requested` carries `mcp_policy` (`inherit`
-always); `effective` carries `mcp_servers` (installed-inventory names, or
-`null` when no `GET /api/mcp` query succeeds) and `mcp_servers_verified`
-(true only when the `eliot-swarm` entry reports `connected`). Only names
+always); `effective` carries `mcp_servers` (installed-inventory names)
+and `mcp_servers_verified`
+(true only when the `eliot-swarm` entry reports `connected` and the winning effective `GET /api/config` document still carries the exact generated transport for that entry: a same-name replacement from any inherited layer refuses the start, whether that entry reports `connected` or `pending`). Only names
 and the status word are retained — never the failure text. The requested
 set is never echoed as observed. The applied per-Agent config document is
-the qualified record; the inventory observation is best-effort — re-polled
-until `connected`, a terminal refusal, or 20s — and the Worker MCP policy gate below may still refuse the start on an unexpected or owner-identity server.
+the qualified record; the inventory observation polls
+until `connected`, a terminal refusal, or 20s — then the Worker MCP policy gate refuses the start on an unreadable inventory or an unexpected or owner-identity server, as does a serving managed entry whose winning transport differs from the generated argv.
 
 ## Worker MCP policy
 
@@ -318,19 +317,21 @@ per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, verified on the installed
 Agent-scoped `eliot-swarm` server, so both policies serve that surface.
 `inherit` is an explicit opt-in to the same behavior, minus owner Swarm
 entries. A non-empty `mcp_allow` is rejected as `unsupported` at config
-load because OpenCode has no selective-inclusion mapping. Project-local
-workspace config (`opencode.json`/`opencode.jsonc`) still merges natively
-into the owned serve despite the isolated XDG roots, so that layer is not
-covered by the generated config: every start scans it pre-create
+load because OpenCode has no selective-inclusion mapping. Workspace-inherited config (every ancestor directory's `opencode.json`/`opencode.jsonc` plus its `.opencode/` project directory, each read as a native document
+(the `mcp.servers` table plus the legacy `mcp.<name>` server spelling, with
+the native `mcp.timeout` exception: only its direct-legacy server shape
+scans, while the number/record spellings normalize as the MCP timeout) still merges natively
+into the owned serve despite the isolated XDG roots, so those layers are not
+covered by the generated config: every start scans them pre-create
 (pre-touch on resume) for owner-identity entries -- a swarm executable
 selecting `mcp` without `--require-agent`, or a URL on the configured
 `cloud_mcp` hostname -- and a match refuses the start (`profile_error`,
-naming the server and file) in every policy, whatever the entry is named.
+naming the server and layer) in every policy, whatever the entry is named; a degenerate ancestor depth fails the start closed instead of silently succeeding. Managed, system and global layers merge above those files, so the winning effective `GET /api/config` documents are scanned the same way once the session exists (pre-quiesce on resume): a differently named owner transport there refuses the start in every policy.
 The settled inventory (`GET /api/mcp`) is then gated before the worker is
 accepted: `minimal` refuses any serving (`connected`/`pending`) unexpected
 server, so a project layer that defeats `minimal` fails the start instead
-of widening the worker; `inherit` refuses reserved Swarm names. An
-unreadable inventory reports unverified but never refuses. The requested
+of widening the worker; `inherit` refuses reserved Swarm names, and any serving (`connected` or `pending`) `eliot-swarm` entry whose winning effective transport differs from the generated local argv. An
+unreadable inventory refuses the start instead: without it neither the unexpected-server gate nor the effective-transport proof can run. The requested
 policy is reported in `effective.mcp_policy`, the observed inventory in
 `effective.mcp_servers`, and `mcp_servers_verified` only after the gate
 passes with the Agent-scoped entry connected. No project file is ever
@@ -430,12 +431,23 @@ widening. The level freezes as `access` in the snapshot. Implementation:
 
 ## Read-only provider quota
 
-`plugins/opencode/src/quota.rs` follows OpenCodex 2.84.0's Go usage pattern,
-without copied code. The native `auth export opencode-go --standalone` read is
-bounded and captured only in memory; exactly one active exported credential is
-required. Its key authenticates `GET https://opencode.ai/zen/go/v1/usage`.
-Rolling, weekly and monthly percentages/reset times are projected. Selected
-non-Go integrations report `unsupported`: Zen rate-limit replies require inference
-and are never used as a read-only quota source. No native auth import, login,
-switch or global-config edit occurs. Failures retain supported error states and
-provider/environment origin; secret-bearing native stderr is discarded.
+`plugins/opencode/src/quota.rs` shells the installed
+`api experimental.usage.limits --standalone` operation for the Console
+sign-in path (pinned v2.2.7 `packages/protocol/src/groups/usage.ts`,
+`packages/core/src/usage-limits.ts`, `packages/cli/src/commands/commands.ts`;
+quota custody has no running serve, so `--standalone` runs the operation
+against a private server). The native operation reads the active
+`opencode` integration connection and resolves it (refreshing a stale
+credential once the Console plugin has registered its OAuth refresh)
+before deriving the workspace binding, so a stored export read directly
+could fail where the native call succeeds. A one-shot cold boot can serve
+the operation before that registration lands; that failure surfaces as
+`quota_unavailable` (unknown), never as ready windows, and only an
+explicit null answer (not signed in) reports `unsupported`. The adapter
+projects Go rolling/weekly/monthly windows and one window per budget
+spend share from the operation's answer. The legacy `opencode-go`
+selector keeps the Go-only public-URL path (OpenCodex 2.84.0 pattern,
+without copied code). Selectors without a verified read-only path report
+`unsupported`. No inference probe, native auth import, login, switch or
+global-config edit occurs. Failures retain supported error states and
+provider/environment origin; native stderr is discarded.

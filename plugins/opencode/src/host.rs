@@ -4,7 +4,10 @@ use crate::{
         AuthSetup, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider, OpenCodeHttp,
         OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
         models::{run_model_metadata, run_models},
-        types::{InboxUser, McpServerReadback, ModelRef, NativeModelEntry, SessionInfo},
+        types::{
+            ConfigEntry, ConfigMcpServer, InboxUser, McpServerReadback, ModelRef, NativeModelEntry,
+            SessionInfo,
+        },
     },
 };
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result};
@@ -1181,17 +1184,20 @@ impl OpenCodePlugin {
         } else {
             None
         };
-        // A requested effort selects the documented `Model.Ref.variant` on
-        // the create below: the installed server echoes even bogus
-        // switches, so the live catalogue proves the variant belongs to
-        // the requested model before the session exists. A miss or an
-        // unreadable catalogue is a definite failed start, never unknown.
-        if let Some(requested) = parsed.requested_model.as_deref()
-            && let Some(variant) = parsed
+        // An explicit model must prove membership in the live catalogue
+        // before the create below: `Session.create` publishes its input
+        // model unchanged and only resolves availability lazily at
+        // inference, so the create echo alone never proves the
+        // provider/model exists. A requested effort additionally selects
+        // the documented `Model.Ref.variant` on the create, so the
+        // catalogue must also prove the variant belongs to that exact
+        // model row. A miss or an unreadable catalogue is a definite
+        // failed start, never unknown.
+        if let Some(requested) = parsed.requested_model.as_deref() {
+            let requested_variant = parsed
                 .model_ref
                 .as_ref()
-                .and_then(|model_ref| model_ref.variant.as_deref())
-        {
+                .and_then(|model_ref| model_ref.variant.as_deref());
             let _timing = crate::native::startup::Step::new("model_catalogue");
             let catalogue = match session
                 .http
@@ -1217,22 +1223,39 @@ impl OpenCodePlugin {
                     ));
                 }
             };
-            let known = catalogue_variants(&catalogue, requested)
-                .is_some_and(|variants| variants.iter().any(|known| known == variant));
-            if !known {
+            if !catalogue_contains(&catalogue, requested) {
                 let failure = Error::new(
                     "profile_error",
-                    format!("OpenCode effort {variant} is not a variant of model {requested}"),
+                    format!("OpenCode model {requested} is not in the native catalogue"),
                 );
                 discard_failed_start(&mut session, failure.clone(), envelope).await;
                 return Ok(CreateOutcome::ProvenFailed(
                     self.retain_proven_no_effect_start(&parsed.params, StartPhase::Verify, failure),
                 ));
             }
+            if let Some(variant) = requested_variant {
+                let known = catalogue_variants(&catalogue, requested)
+                    .is_some_and(|variants| variants.iter().any(|known| known == variant));
+                if !known {
+                    let failure = Error::new(
+                        "profile_error",
+                        format!("OpenCode effort {variant} is not a variant of model {requested}"),
+                    );
+                    discard_failed_start(&mut session, failure.clone(), envelope).await;
+                    return Ok(CreateOutcome::ProvenFailed(
+                        self.retain_proven_no_effect_start(
+                            &parsed.params,
+                            StartPhase::Verify,
+                            failure,
+                        ),
+                    ));
+                }
+            }
         }
-        // Workspace project MCP layer: the owned serve already merged it,
-        // so an owner-identity entry there must refuse the start before the
-        // native session exists. Every policy, whatever the entry is named.
+        // Workspace-inherited project MCP layers: the owned serve already
+        // merged them, so an owner-identity entry there must refuse the start
+        // before the native session exists. Every policy, whatever the entry
+        // is named.
         if let Err(error) = refuse_owner_project_mcp(
             &parsed.workspace,
             &parsed.swarm_executable,
@@ -1315,14 +1338,16 @@ impl OpenCodePlugin {
         let effective_model = created
             .model
             .as_ref()
-            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
+            .map(|model| format!("{}/{}", model.provider_id, model.id));
         // An omitted request accepts the configured native default as
         // effective; an explicit request must match exactly. A requested
         // effort must echo as the native variant.
-        let model_verified = parsed
-            .requested_model
-            .as_deref()
-            .is_none_or(|requested| effective_model.as_deref() == Some(requested));
+        let model_verified = parsed.requested_model.as_deref().is_none_or(|requested| {
+            created
+                .model
+                .as_ref()
+                .is_some_and(|model| model_ref_is(requested, model))
+        });
         let effective_variant = created
             .model
             .as_ref()
@@ -1363,10 +1388,10 @@ impl OpenCodePlugin {
             effective["local"] = fragment;
         }
         // Agent-scoped MCP readback after the session exists: names plus
-        // Agent-scoped MCP readback after the session exists: names plus
         // the connected verdict for the `eliot-swarm` entry. Observation
-        // stays read-only and best-effort; the inventory gate below may
-        // still refuse the start on an unexpected or owner-identity server.
+        // stays read-only and polled; the inventory gate below refuses
+        // the start on an unreadable inventory or an unexpected or
+        // owner-identity server.
         let mcp_timing = crate::native::startup::Step::new("mcp_inventory");
         let (mcp_servers, mcp_servers_verified, mcp_inventory) =
             observe_mcp_servers(&session.http, phase_deadline(envelope, RPC_TIMEOUT)).await;
@@ -1382,6 +1407,63 @@ impl OpenCodePlugin {
             )
             .await;
             return Err(self.retain_failed_start(&parsed.params, error));
+        }
+        // Effective-configuration proofs: the inventory gate above only sees
+        // entry names and statuses. Managed, system and global layers merge
+        // natively above the project files the pre-create scan sees
+        // (managed settings load last and override everything), so the
+        // winning documents must prove two things. First, no effective
+        // `mcp.servers` entry carries the owner identity under ANY name: a
+        // differently named owner transport in a managed layer escapes both
+        // the file scan and the reserved-name inventory gate under
+        // `inherit`. Second, a serving (`connected` or `pending`) managed
+        // entry must still run the exact generated transport, since any
+        // inherited layer can replace the transport under that name. The
+        // gate above already refused an unreadable inventory, so the
+        // winning documents always prove both here; an unreadable
+        // effective config proves neither and fails the start closed with
+        // the created session killed, exactly like the gate above.
+        {
+            let expected_command = managed_mcp_command(parsed);
+            let proof = match session
+                .http
+                .get_config(phase_deadline(envelope, RPC_TIMEOUT))
+                .await
+            {
+                Ok(documents) => refuse_effective_owner_mcp(
+                    &documents,
+                    parsed.swarm_executable.to_str(),
+                    parsed.mcp_cloud_hostname.as_deref(),
+                )
+                .and_then(|()| {
+                    if mcp_inventory.as_deref().is_some_and(|servers| {
+                        servers
+                            .iter()
+                            .any(|server| server.is_serving(SWARM_MCP_SERVER_NAME))
+                    }) {
+                        verify_managed_mcp_transport(&documents, &expected_command)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Err(error) => Err(Error::new(
+                    "profile_error",
+                    format!(
+                        "OpenCode managed MCP transport readback failed ({})",
+                        error.message
+                    ),
+                )),
+            };
+            if let Err(error) = proof {
+                let kill_note = delete_created_session(&mut session, &created.id, envelope).await;
+                let error = discard_failed_start(
+                    &mut session,
+                    Error::new("profile_error", format!("{}; {kill_note}", error.message)),
+                    envelope,
+                )
+                .await;
+                return Err(self.retain_failed_start(&parsed.params, error));
+            }
         }
         effective["mcp_servers"] = mcp_servers;
         effective["mcp_servers_verified"] = json!(mcp_servers_verified);
@@ -1427,8 +1509,11 @@ impl OpenCodePlugin {
     /// Resume: reattach to the exact retained native session in this new
     /// generation. No prompt is ever replayed: the new server serves the
     /// same per-Agent store, the preflight proves the retained session
-    /// exists and is idle, the model/agent realign to the frozen profile
-    /// with an effective readback, and readiness adopts the live edge.
+    /// exists, then proves the realignment target in the live catalogue
+    /// and the effective MCP proof before the quiesce interrupt can abort
+    /// a running retained turn, then proves the session idle; the
+    /// model/agent realign to the frozen profile with an effective
+    /// readback, and readiness adopts the live edge.
     async fn resume_start_session(
         &mut self,
         parsed: ParsedStart,
@@ -1485,14 +1570,58 @@ impl OpenCodePlugin {
             Err(error) => return Err(self.fail_resume(&parsed, session, error, envelope).await),
         };
         session.session_id = Some(retained.id.clone());
+        // Catalogue membership proves before any native interrupt or
+        // setter: the quiesce below aborts a running retained execution,
+        // so a catalogue miss must fail here with proven no effect
+        // instead of aborting that turn and then failing.
+        if let Err(error) =
+            Self::resume_validate_catalogue(&parsed, &session, &retained, deadline).await
+        {
+            discard_unstarted(&mut session, envelope).await;
+            return Ok(self.proven_no_effect_start(
+                &parsed.params,
+                PhaseFailure {
+                    phase: StartPhase::ResumeRefused,
+                    error: Box::new(error),
+                },
+            ));
+        }
+        // Effective MCP proof before the quiesce below can abort a running
+        // retained execution: the settled inventory is gated and the
+        // winning effective documents must carry no owner transport (plus
+        // the exact managed transport while the Agent-scoped entry serves),
+        // exactly like the create path. Nothing has been written yet, so a
+        // miss or an unreadable readback fails here with proven no effect
+        // instead of aborting that turn and then failing.
+        let (mcp_servers, mcp_servers_verified) =
+            match Self::resume_prove_mcp(&parsed, &session, deadline).await {
+                Ok(proof) => proof,
+                Err(error) => {
+                    discard_unstarted(&mut session, envelope).await;
+                    return Ok(self.proven_no_effect_start(
+                        &parsed.params,
+                        PhaseFailure {
+                            phase: StartPhase::ResumeRefused,
+                            error: Box::new(error),
+                        },
+                    ));
+                }
+            };
         if let Err(error) = Self::resume_quiesce(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, *error.message).await);
         }
         if let Err(error) = Self::resume_verify_idle(&session, &retained.id, deadline).await {
             return Err(self.stash_resume_unknown(session, *error.message).await);
         }
-        let effective = match Self::resume_configure(&parsed, &session, &retained.id, deadline)
-            .await
+        let effective = match Self::resume_configure(
+            &parsed,
+            &session,
+            &retained.id,
+            mcp_servers,
+            mcp_servers_verified,
+            deadline,
+        )
+        .await
         {
             Ok(effective) => effective,
             Err(error) if error.code == "unknown" => {
@@ -1737,14 +1866,180 @@ impl OpenCodePlugin {
         Ok((inbox.len(), permissions.len(), forms.len()))
     }
 
+    /// Resume catalogue gate: an explicit realignment target proves live
+    /// catalogue membership BEFORE the retained session is touched. The
+    /// quiesce interrupt below aborts a running retained execution, so a
+    /// catalogue miss must fail here with proven no effect instead of
+    /// aborting that turn and then failing. No native interrupt, model
+    /// switch or agent switch has been dispatched at this point, so a
+    /// miss is a profile error with proven no effect; an unreadable
+    /// catalogue is a pre-write readback failure, also with proven no
+    /// effect (the create path settles an unreadable catalogue the same
+    /// way). The `resume_configure` setters later only realign to the
+    /// target proven here.
+    async fn resume_validate_catalogue(
+        parsed: &ParsedStart,
+        session: &AgentSession,
+        retained: &SessionInfo,
+        deadline: Instant,
+    ) -> Result<()> {
+        // The realignment target is the inherited overlay's effective
+        // model and effort when a resume carries them (the retained
+        // session already runs them), else the frozen request. An omitted
+        // request keeps the retained server-selected model and variant. A
+        // carried model without an effort means the server default.
+        let target_model = parsed
+            .override_model
+            .as_deref()
+            .or(parsed.requested_model.as_deref());
+        let target_variant = if parsed.override_model.is_some() {
+            parsed.override_effort.as_deref()
+        } else {
+            parsed
+                .override_effort
+                .as_deref()
+                .or(parsed.requested_effort.as_deref())
+        };
+        if target_model.is_none() && target_variant.is_none() {
+            return Ok(());
+        }
+        let catalogue = session
+            .http
+            .list_native_models(deadline)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    "native_readback",
+                    format!(
+                        "OpenCode resume catalogue readback failed ({})",
+                        error.message
+                    ),
+                )
+            })?;
+        // The membership lookup uses the native fields, never the joined
+        // display string: see `catalogue_entry_for`.
+        let target_ref = parsed
+            .override_model_ref
+            .as_ref()
+            .or(parsed.model_ref.as_ref());
+        if let Some(target) = target_model {
+            let Some(target_ref) = target_ref else {
+                return Err(Error::new(
+                    "source_integrity",
+                    "OpenCode resume model is missing its native ref",
+                ));
+            };
+            if !catalogue_contains_for(&catalogue, &target_ref.provider_id, &target_ref.id) {
+                return Err(Error::new(
+                    "profile_error",
+                    format!("OpenCode model {target} is not in the native catalogue"),
+                ));
+            }
+        }
+        if let Some(variant) = target_variant {
+            // The native fields stay apart end to end: the validation ref
+            // is the overlay/frozen ref when a model is carried, else the
+            // retained native ref verbatim. Joining provider "a/b" plus
+            // model "c" into "a/b/c" and re-splitting would look up
+            // provider "a", model "b/c" instead.
+            let validation_ref = parsed
+                .override_model_ref
+                .as_ref()
+                .or(parsed.model_ref.as_ref())
+                .or(retained.model.as_ref())
+                .ok_or_else(|| {
+                    Error::new(
+                        "profile_error",
+                        "OpenCode resume configure effort needs a session model",
+                    )
+                })?;
+            let known =
+                catalogue_variants_for(&catalogue, &validation_ref.provider_id, &validation_ref.id)
+                    .is_some_and(|variants| variants.iter().any(|known| known == variant));
+            if !known {
+                // Display form only for the message; the lookup above uses
+                // the native fields, never this string.
+                let validation_model =
+                    format!("{}/{}", validation_ref.provider_id, validation_ref.id);
+                return Err(Error::new(
+                    "profile_error",
+                    format!(
+                        "OpenCode effort {variant} is not a variant of model {validation_model}"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resume MCP proof: gate the settled inventory and prove the winning
+    /// effective documents carry no owner transport (plus the exact
+    /// generated transport while the Agent-scoped entry serves), BEFORE
+    /// the retained session is touched. The quiesce interrupt below aborts
+    /// a running retained execution, so an unexpected or owner-identity
+    /// server must fail here with proven no effect instead of aborting
+    /// that turn and then failing. An unreadable inventory or effective
+    /// config is a pre-write readback failure (`native_readback`), also
+    /// with proven no effect; a proven owner hit, transport mismatch or
+    /// unexpected serving server is a `profile_error`. Returns the
+    /// observed inventory names plus the connected verdict for the
+    /// effective record.
+    async fn resume_prove_mcp(
+        parsed: &ParsedStart,
+        session: &AgentSession,
+        deadline: Instant,
+    ) -> Result<(Value, bool)> {
+        // Same polled readback as the create path: the resumed server
+        // re-spawns the Agent-scoped entry for this generation, and the
+        // gate below refuses an unreadable inventory.
+        let (mcp_servers, mcp_servers_verified, mcp_inventory) =
+            observe_mcp_servers(&session.http, deadline).await;
+        gate_mcp_inventory(mcp_inventory.as_deref(), parsed.requested_mcp_policy)?;
+        // Same proofs as the create path: no effective `mcp.servers` entry
+        // carries the owner identity under any name (managed layers merge
+        // above the project files), and a serving (`connected` or
+        // `pending`) managed entry still runs the exact generated
+        // transport. Nothing has been written yet, so an unreadable
+        // readback refuses here instead of staying unknown.
+        let documents = session.http.get_config(deadline).await.map_err(|error| {
+            Error::new(
+                "native_readback",
+                format!(
+                    "OpenCode managed MCP transport readback failed ({})",
+                    error.message
+                ),
+            )
+        })?;
+        refuse_effective_owner_mcp(
+            &documents,
+            parsed.swarm_executable.to_str(),
+            parsed.mcp_cloud_hostname.as_deref(),
+        )?;
+        if mcp_inventory.as_deref().is_some_and(|servers| {
+            servers
+                .iter()
+                .any(|server| server.is_serving(SWARM_MCP_SERVER_NAME))
+        }) {
+            verify_managed_mcp_transport(&documents, &managed_mcp_command(parsed))?;
+        }
+        Ok((mcp_servers, mcp_servers_verified))
+    }
+
     /// Resume configure: realign the retained session's model and agent
     /// to the frozen profile, then prove the effective values with a fresh
     /// `session.get`. The location must be the workspace; the requested
-    /// agent must be installed (the switch validates nothing itself).
+    /// agent must be installed (the switch validates nothing itself). Live
+    /// catalogue membership was already proven by the pre-quiesce
+    /// `resume_validate_catalogue` gate, and the effective MCP proof by
+    /// the pre-quiesce `resume_prove_mcp` gate, so no catalogue, inventory
+    /// or effective-config read happens here after the interrupt: the
+    /// caller threads that proof through as the `mcp_servers` pair.
     async fn resume_configure(
         parsed: &ParsedStart,
         session: &AgentSession,
         session_id: &str,
+        mcp_servers: Value,
+        mcp_servers_verified: bool,
         deadline: Instant,
     ) -> Result<Value> {
         let current = session
@@ -1801,12 +2096,17 @@ impl OpenCodePlugin {
             .override_model_ref
             .as_ref()
             .or(parsed.model_ref.as_ref());
+        // Membership was proven by the pre-quiesce catalogue gate
+        // (`resume_validate_catalogue` runs before any interrupt or
+        // setter): the create echo is not membership proof, so neither is
+        // the resume echo, and re-checking here would run after the
+        // interrupt. The setters below plus the `session.get` effective
+        // readback only realign to that already-proven target.
         let model_needed = target_model.is_some_and(|target| {
             current
                 .model
                 .as_ref()
-                .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()))
-                != Some(target.to_owned())
+                .is_none_or(|model| !model_ref_is(target, model))
         });
         let variant_needed = target_variant.is_some_and(|target| {
             current
@@ -1870,7 +2170,7 @@ impl OpenCodePlugin {
         // the realignment target (overlay or frozen), never a reverted
         // value. An omitted request keeps the server default and only
         // re-reads.
-        let effective = match target_model {
+        let effective = match target_ref {
             Some(target) => {
                 Self::readback_session_model(
                     &session.http,
@@ -1923,7 +2223,7 @@ impl OpenCodePlugin {
             ));
         }
         let mut effective_value = json!({
-            "model": effective.model.as_ref().map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim())),
+            "model": effective.model.as_ref().map(|model| format!("{}/{}", model.provider_id, model.id)),
             "model_verified": model_verified,
             "model_variant": effective_variant.clone(),
             "effort": effective_variant,
@@ -1944,11 +2244,9 @@ impl OpenCodePlugin {
                 Err(error) => return Err(error),
             }
         }
-        // Same best-effort MCP readback as the create path: the resumed
-        // server re-spawns the Agent-scoped entry for this generation.
-        let (mcp_servers, mcp_servers_verified, mcp_inventory) =
-            observe_mcp_servers(&session.http, deadline).await;
-        gate_mcp_inventory(mcp_inventory.as_deref(), parsed.requested_mcp_policy)?;
+        // The effective MCP proof ran pre-quiesce (`resume_prove_mcp`): no
+        // inventory or effective-config read happens here after the
+        // interrupt or setters, only the proven pair joins the record.
         effective_value["mcp_servers"] = mcp_servers;
         effective_value["mcp_servers_verified"] = json!(mcp_servers_verified);
         effective_value["mcp_policy"] = json!(parsed.requested_mcp_policy.as_str());
@@ -1964,11 +2262,13 @@ impl OpenCodePlugin {
     /// `configure`). The switch dispatch itself stays per-caller: resume
     /// maps every write failure to `unknown` (an earlier setter in the
     /// same realign may have applied), while configure maps a proven
-    /// no-effect refusal to its `rejected` value.
+    /// no-effect refusal to its `rejected` value. The target is the native
+    /// ref, never a joined string: re-splitting a `provider/model` display
+    /// form would change the target when the provider ID contains a slash.
     async fn readback_session_model(
         http: &OpenCodeHttp,
         session_id: &str,
-        target: &str,
+        target: &ModelRef,
         target_variant: Option<&str>,
         deadline: Instant,
         context: &str,
@@ -1985,11 +2285,11 @@ impl OpenCodePlugin {
                     ),
                 )
             })?;
-        let echoed_model = echoed
+        if echoed
             .model
             .as_ref()
-            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
-        if echoed_model.as_deref() != Some(target) {
+            .is_none_or(|model| !session_model_is(target, model))
+        {
             return Err(Error::new(
                 "unknown",
                 format!("OpenCode {context} model contradicts the applied configuration"),
@@ -2221,22 +2521,33 @@ impl OpenCodePlugin {
                     ),
                 )
             })?;
-        let current_model = current
-            .model
-            .as_ref()
-            .map(|model| format!("{}/{}", model.provider_id.trim(), model.id.trim()));
         let current_variant = current
             .model
             .as_ref()
             .and_then(|model| model.variant.clone());
-        let Some(target_model) = requested.model.clone().or(current_model.clone()) else {
+        // The switch target keeps the native fields apart end to end: an
+        // explicit request re-splits its already catalogue-proven pair,
+        // while an effort-only configure reuses the retained native ref
+        // verbatim. Routing the retained model through a joined
+        // `provider/model` string and back would re-split at the first
+        // slash, silently changing the selected model when the native
+        // provider ID itself contains a slash.
+        let Some(target_ref) =
+            configure_switch_ref(requested.model.as_deref(), current.model.as_ref())?
+        else {
             return Ok(json!({
                 "state": "rejected",
                 "reason": "OpenCode configure effort needs a session model",
             }));
         };
+        // Display form only: messages and the response echo the frozen
+        // pair text; the effort gate below, the switch and its echo
+        // verification use the native fields, never this string. Joining
+        // provider "a/b" plus model "c" into "a/b/c" and re-splitting
+        // would look up provider "a", model "b/c" instead.
+        let target_model = format!("{}/{}", target_ref.provider_id, target_ref.id);
         if let Some(effort) = requested.effort.as_deref() {
-            let known = catalogue_variants(&catalogue, &target_model)
+            let known = catalogue_variants_for(&catalogue, &target_ref.provider_id, &target_ref.id)
                 .is_some_and(|variants| variants.iter().any(|known| known == effort));
             if !known {
                 return Ok(json!({
@@ -2254,15 +2565,11 @@ impl OpenCodePlugin {
         } else {
             current_variant.clone()
         });
-        let switch_needed = Some(target_model.as_str()) != current_model.as_deref()
-            || target_variant.as_deref() != current_variant.as_deref();
+        let switch_needed = current.model.as_ref().is_none_or(|model| {
+            model.provider_id != target_ref.provider_id || model.id != target_ref.id
+        }) || target_variant.as_deref() != current_variant.as_deref();
         if switch_needed {
-            let mut model_ref = split_model(&target_model).ok_or_else(|| {
-                Error::new(
-                    "source_integrity",
-                    "OpenCode retained session model is not provider/model with non-empty slash segments",
-                )
-            })?;
+            let mut model_ref = target_ref.clone();
             model_ref.variant = target_variant.clone();
             match session
                 .http
@@ -2295,7 +2602,7 @@ impl OpenCodePlugin {
         Self::readback_session_model(
             &session.http,
             &session_id,
-            &target_model,
+            &target_ref,
             target_variant.as_deref(),
             deadline,
             "configure",
@@ -3538,17 +3845,20 @@ const MCP_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2
 const MCP_SETTLE_FIRST_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const MCP_SETTLE_MAX_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Best-effort Agent-scoped MCP readback for the effective record:
+/// Polled Agent-scoped MCP readback for the effective record:
 /// `GET /api/mcp` (`mcp.list`) after the session exists, re-polled until
 /// the Agent-scoped server reports `connected` (or a terminal
 /// non-connected status, or the settle cap). Names come from the installed
 /// inventory when a query succeeds (`null` when none does, never
-/// fabricated); `mcp_servers_verified` is true only on `connected`. Only
+/// fabricated); `mcp_servers_verified` is true only on `connected`, and
+/// the inventory gate refuses the start when no query succeeded, so a
+/// `null` record never passes as verified. Only
 /// names and the status word are retained — never the failure text, which
-/// can carry local paths. A non-connected or unreadable surface never
-/// fails the start: this harness keeps `inherit` only, so the applied
-/// per-Agent config is the qualified record and this observation is
-/// reported honestly.
+/// can carry local paths. A non-connected surface alone never fails the
+/// start here: the inventory gate decides, refusing an unreadable
+/// inventory (without it the unexpected-server gate and the
+/// effective-transport proof cannot run) as well as unexpected or
+/// owner-identity servers.
 async fn observe_mcp_servers(
     http: &OpenCodeHttp,
     deadline: Instant,
@@ -3586,12 +3896,12 @@ async fn observe_mcp_servers(
     }
 }
 
-/// Refuse the start when the workspace project MCP layer contributes the
-/// owner Swarm identity under any name. The owned serve already merged
-/// that layer, so the scan runs before the native session exists (create)
-/// or before the retained session is touched (resume), in every policy.
-/// No project file is read beyond the documented names, and none is
-/// ever edited.
+/// Refuse the start when any workspace-inherited project MCP layer
+/// contributes the owner Swarm identity under any name. The owned serve
+/// already merged those layers, so the scan runs before the native session
+/// exists (create) or before the retained session is touched (resume), in
+/// every policy. No project file is read beyond the documented names, and
+/// none is ever edited.
 fn refuse_owner_project_mcp(
     workspace: &std::path::Path,
     controller_executable: &std::path::Path,
@@ -3612,10 +3922,66 @@ fn refuse_owner_project_mcp(
     Ok(())
 }
 
+/// Refuse the start when any effective `mcp.servers` entry carries the
+/// owner Swarm identity under any name. The pre-create file scan only sees
+/// project layers, but managed, system, global and integration layers also
+/// merge natively (managed settings load last and override everything in
+/// `packages/core/src/config.ts`), so a differently named owner transport
+/// there escapes both that scan and the reserved-name inventory gate under
+/// `inherit`. The winning documents prove its absence. The Agent-scoped
+/// entry (`swarm mcp --require-agent`) never matches: it is not the owner
+/// identity.
+fn refuse_effective_owner_mcp(
+    documents: &[ConfigEntry],
+    controller_executable: Option<&str>,
+    cloud_mcp_hostname: Option<&str>,
+) -> Result<()> {
+    for document in documents {
+        let Some(servers) = document
+            .info
+            .as_ref()
+            .and_then(|info| info.mcp.as_ref())
+            .map(|mcp| &mcp.servers)
+        else {
+            continue;
+        };
+        for (name, server) in servers {
+            let owned = match server.command.as_deref() {
+                Some([head, tail @ ..]) => eliot_core::is_owner_swarm_server(
+                    Some(head.as_str()),
+                    Some(tail),
+                    server.url.as_deref(),
+                    controller_executable,
+                    cloud_mcp_hostname,
+                ),
+                _ => eliot_core::is_owner_swarm_server(
+                    None,
+                    None,
+                    server.url.as_deref(),
+                    controller_executable,
+                    cloud_mcp_hostname,
+                ),
+            };
+            if owned {
+                let origin = document.path.as_deref().unwrap_or("effective config");
+                return Err(Error::new(
+                    "profile_error",
+                    format!(
+                        "OpenCode effective MCP layer contributes the owner Swarm MCP server {name:?} from {origin}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Exclusive inventory gate for the worker MCP surface, applied after the
 /// settle observation on both the create and resume paths. An unreadable
-/// inventory reports unverified but never refuses: absence of evidence is
-/// not an unexpected server. Otherwise:
+/// inventory refuses the start: without it neither the unexpected-server
+/// gate nor the effective-transport proof below can run, so absence of
+/// evidence must fail closed, never widen the worker by default.
+/// Otherwise:
 ///
 /// minimal refuses any serving (`connected` or `pending`) server besides
 /// the Agent-scoped entry, so a project layer that defeats minimal fails
@@ -3626,7 +3992,10 @@ fn refuse_owner_project_mcp(
 /// with the Agent-scoped entry connected.
 fn gate_mcp_inventory(servers: Option<&[McpServerReadback]>, policy: McpPolicy) -> Result<()> {
     let Some(servers) = servers else {
-        return Ok(());
+        return Err(Error::new(
+            "native_readback",
+            "OpenCode MCP inventory read failed (no native inventory query succeeded)",
+        ));
     };
     for server in servers {
         if !matches!(server.status.status.as_str(), "connected" | "pending") {
@@ -3653,6 +4022,79 @@ fn gate_mcp_inventory(servers: Option<&[McpServerReadback]>, policy: McpPolicy) 
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+/// The managed Agent-scoped MCP transport the plugin generated: the exact
+/// local stdio command argv for `SWARM_MCP_SERVER_NAME`, rebuilt from the
+/// frozen start admission (the same values rendered into the per-Agent
+/// config document by `agent_config_json`).
+fn managed_mcp_command(parsed: &ParsedStart) -> Vec<String> {
+    vec![
+        parsed.swarm_executable.to_string_lossy().into_owned(),
+        "--data-dir".to_owned(),
+        parsed.swarm_data_dir.to_string_lossy().into_owned(),
+        "mcp".to_owned(),
+        "--require-agent".to_owned(),
+    ]
+}
+
+/// The winning effective `mcp.servers` transport for the managed
+/// Agent-scoped entry: the highest-precedence effective document defining
+/// it wins, mirroring the native fold where later documents replace earlier
+/// ones for the same server name. `None` when no effective document defines
+/// the entry at all.
+fn winning_managed_mcp_server(documents: &[ConfigEntry]) -> Option<&ConfigMcpServer> {
+    documents
+        .iter()
+        .filter(|entry| entry.entry_type == "document")
+        .filter_map(|entry| {
+            entry
+                .info
+                .as_ref()
+                .and_then(|info| info.mcp.as_ref())
+                .and_then(|mcp| mcp.servers.get(SWARM_MCP_SERVER_NAME))
+        })
+        .next_back()
+}
+
+/// Prove the serving managed entry still runs the exact generated
+/// transport: a same-name entry from any inherited layer (ancestor direct
+/// file, `.opencode/` project directory, or machine scope outside the file
+/// scan) replaces the managed document entry natively, while the inventory
+/// gate only sees the name and status. The winning definition must be the
+/// local stdio shape with exactly the generated argv, no URL, and no
+/// environment override; anything else refuses the start. Only the
+/// transport/auth-identity fields decide; cosmetic keys never do.
+fn verify_managed_mcp_transport(
+    documents: &[ConfigEntry],
+    expected_command: &[String],
+) -> Result<()> {
+    let server = winning_managed_mcp_server(documents).ok_or_else(|| {
+        Error::new(
+            "profile_error",
+            "OpenCode managed MCP entry has no effective transport",
+        )
+    })?;
+    let transport_ok = server
+        .server_type
+        .as_deref()
+        .is_none_or(|kind| kind == "local")
+        && server.command.as_deref() == Some(expected_command)
+        && server.url.as_deref().is_none_or(str::is_empty)
+        && server
+            .environment
+            .as_ref()
+            .is_none_or(std::collections::HashMap::is_empty);
+    if !transport_ok {
+        return Err(Error::new(
+            "profile_error",
+            format!(
+                "OpenCode serving {:?} entry does not run the managed Agent transport",
+                SWARM_MCP_SERVER_NAME
+            ),
+        ));
     }
     Ok(())
 }
@@ -3796,7 +4238,8 @@ async fn fetch_backend_inventory(
 
 /// Verify the effective adopted provider before inference: the exact
 /// provider identity, package and base URL from `GET /api/provider`, the
-/// frozen API model id selected locally from `GET /api/model`, and the
+/// exact frozen provider/model pair selected locally from `GET /api/model`,
+/// and the
 /// frozen limits against observed ones, plus the backend's own passive
 /// inventory. Every failure reason is short and non-secret: reasons are
 /// persisted in the daemon outcome, so they never carry endpoints, ids,
@@ -3856,9 +4299,12 @@ async fn verify_local_effective(
         .list_native_models(deadline)
         .await
         .map_err(|_| Error::new("unknown", "adopted provider readback unresolved"))?;
-    let entry = models
-        .iter()
-        .find(|model| model.id.as_deref() == Some(local.api_model_id.as_str()))
+    // Exact pair: the frozen provider id AND the frozen API model id must
+    // name one catalogue row. Identical model ids under other providers
+    // never satisfy this readback, so an unrelated row cannot conceal an
+    // absent model or the wrong limits.
+    let requested = format!("{}/{}", local.provider_id, local.api_model_id);
+    let entry = catalogue_entry(&models, &requested)
         .ok_or_else(|| Error::new("profile_error", "effective catalogue mismatch"))?;
     let mut limits_unavailable = Vec::new();
     if let Some(limit) = entry.limit.as_ref() {
@@ -3983,17 +4429,111 @@ fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
     Ok(ConfigureModelRequest { model, effort })
 }
 
-/// Whether the live native catalogue carries the exact requested
-/// `provider/model` id. Entries missing either half never match; the
-/// installed server echoes even bogus switches, so this gate (read
-/// before any write) is what fails an unknown model honestly.
-fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
-    catalogue.iter().any(
+/// The live native catalogue row for one exact native provider/model pair:
+/// the entry's provider AND model id must both match, compared as
+/// independent fields exactly as the installed resolver does
+/// (`model.providerID === ref.providerID && model.id === ref.id` in
+/// `packages/core/src/session/runner/model.ts`). Never join the pair into
+/// a `provider/model` display string first: re-splitting joins at the
+/// first slash, so a slash in the native provider ID would compare against
+/// another provider instead of matching. No trimming: a native id carrying
+/// whitespace never equals the frozen pair, and identical model ids under
+/// different providers never substitute for each other. The installed
+/// server echoes even bogus switches, so this row (read before any write)
+/// is what fails an unknown model honestly.
+fn catalogue_entry_for<'a>(
+    catalogue: &'a [NativeModelEntry],
+    provider_id: &str,
+    id: &str,
+) -> Option<&'a NativeModelEntry> {
+    catalogue.iter().find(
         |entry| match (entry.provider_id.as_deref(), entry.id.as_deref()) {
-            (Some(provider), Some(id)) => format!("{}/{}", provider.trim(), id.trim()) == requested,
+            (Some(entry_provider), Some(entry_id)) => {
+                entry_provider == provider_id && entry_id == id
+            }
             _ => false,
         },
     )
+}
+
+/// The live native catalogue row for one exact `provider/model` id, split
+/// at the first slash. See [`catalogue_entry_for`]: callers holding the
+/// native fields already must use that entry point instead of joining.
+fn catalogue_entry<'a>(
+    catalogue: &'a [NativeModelEntry],
+    requested: &str,
+) -> Option<&'a NativeModelEntry> {
+    let (provider, id) = split_provider_model(requested)?;
+    catalogue_entry_for(catalogue, provider, id)
+}
+
+/// Whether an installed `Model.Ref` names exactly the requested
+/// `provider/model` pair: both fields compared independently, never
+/// trimmed or joined. See [`catalogue_entry`].
+fn model_ref_is(requested: &str, model: &ModelRef) -> bool {
+    split_provider_model(requested)
+        .is_some_and(|(provider, id)| model.provider_id == provider && model.id == id)
+}
+
+/// Whether an installed `Model.Ref` is exactly the switch target: both
+/// native fields compared independently, never joined or re-split. A
+/// joined `provider/model` display string would re-split at the first
+/// slash, so a slash in the native provider ID compares against another
+/// provider here instead of matching. See [`catalogue_entry`].
+fn session_model_is(target: &ModelRef, model: &ModelRef) -> bool {
+    target.provider_id == model.provider_id && target.id == model.id
+}
+
+/// The configure switch target: an explicit request re-splits its
+/// already catalogue-proven pair, while an effort-only configure reuses
+/// the retained native ref verbatim (`None` when the session reports no
+/// model). The retained ref never routes through a joined
+/// `provider/model` string: re-splitting would change the selected model
+/// when the native provider ID itself contains a slash.
+fn configure_switch_ref(
+    requested: Option<&str>,
+    current: Option<&ModelRef>,
+) -> Result<Option<ModelRef>> {
+    match requested {
+        Some(wanted) => Ok(Some(split_model(wanted).ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "OpenCode configure model is not provider/model with non-empty slash segments",
+            )
+        })?)),
+        None => Ok(current.cloned()),
+    }
+}
+
+/// Whether the live native catalogue carries the exact native
+/// provider/model pair. See [`catalogue_entry_for`].
+fn catalogue_contains_for(catalogue: &[NativeModelEntry], provider_id: &str, id: &str) -> bool {
+    catalogue_entry_for(catalogue, provider_id, id).is_some()
+}
+
+/// Whether the live native catalogue carries the exact requested
+/// `provider/model` id. See [`catalogue_entry`].
+fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
+    catalogue_entry(catalogue, requested).is_some()
+}
+
+/// The live native catalogue's selectable variant ids for one exact native
+/// provider/model pair (`Model.Variant` ids in wire order). `None` when
+/// the entry is absent or reports no variants member: unknown, never an
+/// empty wardrobe. See [`catalogue_entry_for`].
+fn catalogue_variants_for(
+    catalogue: &[NativeModelEntry],
+    provider_id: &str,
+    id: &str,
+) -> Option<Vec<String>> {
+    catalogue_entry_for(catalogue, provider_id, id).and_then(|entry| {
+        entry.variants.as_ref().map(|variants| {
+            variants
+                .iter()
+                .filter_map(|variant| variant.id.clone())
+                .collect()
+        })
+    })
 }
 
 /// The live native catalogue's selectable variant ids for one exact
@@ -4001,24 +4541,14 @@ fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
 /// the entry is absent or reports no variants member: unknown, never an
 /// empty wardrobe.
 fn catalogue_variants(catalogue: &[NativeModelEntry], requested: &str) -> Option<Vec<String>> {
-    catalogue
-        .iter()
-        .find_map(
-            |entry| match (entry.provider_id.as_deref(), entry.id.as_deref()) {
-                (Some(provider), Some(id))
-                    if format!("{}/{}", provider.trim(), id.trim()) == requested =>
-                {
-                    Some(entry.variants.as_ref().map(|variants| {
-                        variants
-                            .iter()
-                            .filter_map(|variant| variant.id.clone())
-                            .collect()
-                    }))
-                }
-                _ => None,
-            },
-        )
-        .flatten()
+    catalogue_entry(catalogue, requested).and_then(|entry| {
+        entry.variants.as_ref().map(|variants| {
+            variants
+                .iter()
+                .filter_map(|variant| variant.id.clone())
+                .collect()
+        })
+    })
 }
 
 /// A frozen effort value: the trimmed string, non-empty, at most 128
@@ -4366,15 +4896,18 @@ mod tests {
     use super::{
         BackendKind, DAEMON_START_TIMEOUT, LocalProvider, McpSettle, OpenCodeHttp, OpenCodePlugin,
         PhaseFailure, START_CLEANUP_BUDGET, START_ENVELOPE, START_SETTLE_RESERVE,
-        SWARM_MCP_SERVER_NAME, StartAdmission, StartPhase, catalogue_contains, catalogue_variants,
-        fetch_backend_inventory, local_key_value, mcp_names, mcp_settle, normalize_endpoint,
-        opencode_manifest, opencode_scope, parse_configure_model, parse_local_provider,
-        phase_budget, phase_deadline, policy_from_snapshot, presession_reason, split_model,
-        start_auth_selector, start_config_override, start_failure_is_proven_no_effect,
-        start_model_ref, verify_local_effective,
+        SWARM_MCP_SERVER_NAME, StartAdmission, StartPhase, catalogue_contains, catalogue_entry,
+        catalogue_variants, fetch_backend_inventory, local_key_value, mcp_names, mcp_settle,
+        normalize_endpoint, opencode_manifest, opencode_scope, parse_configure_model,
+        parse_local_provider, phase_budget, phase_deadline, policy_from_snapshot,
+        presession_reason, split_model, start_auth_selector, start_config_override,
+        start_failure_is_proven_no_effect, start_model_ref, verify_local_effective,
+        verify_managed_mcp_transport, winning_managed_mcp_server,
     };
     use crate::native::server::READINESS_TIMEOUT;
-    use crate::native::types::{McpServerReadback, McpStatusReadback, NativeModelEntry};
+    use crate::native::types::{
+        ConfigEntry, ConfigInfo, ConfigMcp, McpServerReadback, McpStatusReadback, NativeModelEntry,
+    };
     use eliot_core::{AgentStartParams, McpPolicy, Result};
     use eliot_plugin::session::{
         ResumeSubject, optional_profile_text, parse_resume_subject, validate_source_plan,
@@ -4454,7 +4987,143 @@ mod tests {
         ];
         assert_eq!(mcp_names(&servers), json!(["owner-search", "eliot-swarm"]));
     }
+    fn config_document(servers: serde_json::Value) -> ConfigEntry {
+        ConfigEntry {
+            entry_type: "document".to_owned(),
+            path: Some("config/opencode/opencode.jsonc".to_owned()),
+            info: Some(ConfigInfo {
+                model: None,
+                mcp: Some(ConfigMcp {
+                    servers: serde_json::from_value(servers).expect("servers decode"),
+                }),
+            }),
+        }
+    }
+
+    fn managed_command() -> Vec<String> {
+        ["swarm", "--data-dir", "data", "mcp", "--require-agent"]
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect()
+    }
+
+    fn managed_server(command: Vec<String>) -> serde_json::Value {
+        let mut servers = serde_json::Map::new();
+        servers.insert(
+            SWARM_MCP_SERVER_NAME.to_owned(),
+            json!({"type": "local", "command": command}),
+        );
+        serde_json::Value::Object(servers)
+    }
+
+    #[test]
+    fn managed_mcp_transport_proof_requires_the_winning_entry() {
+        let expected = managed_command();
+        // No effective document defines the entry: nothing proves the
+        // serving transport, so the start must not claim it.
+        assert!(winning_managed_mcp_server(&[]).is_none());
+        assert!(verify_managed_mcp_transport(&[], &expected).is_err());
+        // An unrelated table is not a proof either.
+        let other = vec![config_document(json!({"other": {"type": "local"}}))];
+        assert!(winning_managed_mcp_server(&other).is_none());
+        assert!(verify_managed_mcp_transport(&other, &expected).is_err());
+        // The exact generated transport verifies.
+        let managed = vec![config_document(managed_server(expected.clone()))];
+        assert!(verify_managed_mcp_transport(&managed, &expected).is_ok());
+        // A same-name replacement transport under any inherited layer
+        // refuses, even though the inventory gate only sees the name.
+        let replaced = vec![config_document(managed_server(vec![
+            "evil".to_owned(),
+            "--data-dir".to_owned(),
+            "data".to_owned(),
+            "mcp".to_owned(),
+            "--require-agent".to_owned(),
+        ]))];
+        assert!(verify_managed_mcp_transport(&replaced, &expected).is_err());
+        // Native precedence wins: later documents replace earlier ones, so
+        // the proof follows the same winning entry the server serves.
+        let shadowed = vec![
+            config_document(managed_server(vec!["evil".to_owned()])),
+            config_document(managed_server(expected.clone())),
+        ];
+        assert!(verify_managed_mcp_transport(&shadowed, &expected).is_ok());
+        let shadowing = vec![
+            config_document(managed_server(expected.clone())),
+            config_document(managed_server(vec!["evil".to_owned()])),
+        ];
+        assert!(verify_managed_mcp_transport(&shadowing, &expected).is_err());
+        // A remote URL, an environment override, or a non-local type under
+        // the managed name is not the managed transport.
+        for servers in [
+            json!({"eliot-swarm": {"type": "remote", "url": "https://x.example/mcp"}}),
+            json!({"eliot-swarm": {"command": expected.clone(), "url": "https://x.example/mcp"}}),
+            json!({"eliot-swarm": {"type": "local", "command": expected.clone(), "environment": {"A": "b"}}}),
+        ] {
+            assert!(verify_managed_mcp_transport(&[config_document(servers)], &expected).is_err());
+        }
+        // A missing `type` still verifies when the argv matches exactly:
+        // `mcp add` writes it, hand-merged layers may omit it.
+        let untyped = vec![config_document(
+            json!({"eliot-swarm": {"command": expected}}),
+        )];
+        assert!(verify_managed_mcp_transport(&untyped, &expected).is_ok());
+        // Non-document entries never contribute a winning transport.
+        let directory = vec![ConfigEntry {
+            entry_type: "directory".to_owned(),
+            path: Some("workspace".to_owned()),
+            info: None,
+        }];
+        assert!(winning_managed_mcp_server(&directory).is_none());
+    }
+
+    #[test]
+    fn effective_owner_transport_refuses_any_name() {
+        // No effective servers: nothing to refuse.
+        assert!(super::refuse_effective_owner_mcp(&[], None, None).is_ok());
+        // The managed Agent-scoped entry is never the owner identity.
+        let managed = vec![config_document(managed_server(managed_command()))];
+        assert!(super::refuse_effective_owner_mcp(&managed, None, None).is_ok());
+        // A differently named owner stdio transport in a managed layer
+        // refuses, even though the inventory gate only sees names.
+        let evil = vec![config_document(
+            json!({"night-bridge": {"type": "local", "command": ["swarm", "mcp"]}}),
+        )];
+        let error = super::refuse_effective_owner_mcp(&evil, None, None).expect_err("owner hit");
+        assert_eq!(error.code, "profile_error");
+        assert!(error.message.contains("night-bridge"));
+        // A swarm-named entry WITHOUT the Agent scope is the owner too.
+        let renamed = vec![config_document(
+            json!({"eliot-swarm": {"type": "local", "command": ["swarm", "mcp"]}}),
+        )];
+        assert!(super::refuse_effective_owner_mcp(&renamed, None, None).is_err());
+        // Unrelated transports pass.
+        let quiet = vec![config_document(
+            json!({"helper": {"type": "local", "command": ["npm", "run", "server"]}}),
+        )];
+        assert!(super::refuse_effective_owner_mcp(&quiet, None, None).is_ok());
+    }
     use std::path::PathBuf;
+
+    #[test]
+    fn unreadable_inventory_refuses_the_start_in_every_policy() {
+        // Absence of evidence must fail closed: without a readable
+        // inventory neither the unexpected-server gate nor the
+        // effective-transport proof can run, so the start refuses in
+        // every policy instead of widening the worker by default.
+        for policy in [McpPolicy::Minimal, McpPolicy::Inherit] {
+            let error = super::gate_mcp_inventory(None, policy).expect_err("unreadable refuses");
+            assert_eq!(error.code, "native_readback");
+        }
+        // A readable empty inventory still passes: nothing serves.
+        for policy in [McpPolicy::Minimal, McpPolicy::Inherit] {
+            assert!(super::gate_mcp_inventory(Some(&[]), policy).is_ok());
+        }
+        // The connected Agent-scoped entry alone passes in every policy.
+        let agent = [mcp_fixture(SWARM_MCP_SERVER_NAME, "connected")];
+        for policy in [McpPolicy::Minimal, McpPolicy::Inherit] {
+            assert!(super::gate_mcp_inventory(Some(&agent), policy).is_ok());
+        }
+    }
 
     const FAMILIES: &[&str] = &["session", "turn", "message", "request"];
 
@@ -4524,17 +5193,197 @@ mod tests {
                 limit: None,
                 variants: None,
             },
+            NativeModelEntry {
+                id: Some("kimi".to_owned()),
+                provider_id: Some("other".to_owned()),
+                limit: None,
+                variants: Some(vec![NativeModelVariant {
+                    id: Some("sibling".to_owned()),
+                }]),
+            },
         ];
         assert!(catalogue_contains(&catalogue, "opencode/kimi"));
+        assert!(catalogue_contains(&catalogue, "other/kimi"));
         assert!(!catalogue_contains(&catalogue, "opencode/other"));
-        assert!(!catalogue_contains(&catalogue, "other/kimi"));
         assert!(!catalogue_contains(&[], "opencode/kimi"));
         assert_eq!(
             catalogue_variants(&catalogue, "opencode/kimi"),
             Some(vec!["low".to_owned(), "high".to_owned()])
         );
+        // The shared row is an exact provider/model pair: an identical
+        // model id under another provider never stands in, so neither the
+        // membership gate nor the variant gate can read the wrong row.
+        let row = catalogue_entry(&catalogue, "other/kimi").expect("exact pair row");
+        assert_eq!(row.provider_id.as_deref(), Some("other"));
+        assert_eq!(
+            catalogue_variants(&catalogue, "other/kimi"),
+            Some(vec!["sibling".to_owned()])
+        );
         assert!(catalogue_variants(&catalogue, "opencode/other").is_none());
         assert!(catalogue_variants(&[], "opencode/kimi").is_none());
+        // Field-by-field without trimming (installed
+        // `SessionRunnerModel.select` compares `providerID` and `id`
+        // independently with `===`): padded native ids never equal the
+        // frozen pair, and padded requests never split.
+        let padded = vec![NativeModelEntry {
+            id: Some("kimi ".to_owned()),
+            provider_id: Some(" opencode".to_owned()),
+            limit: None,
+            variants: None,
+        }];
+        assert!(!catalogue_contains(&padded, "opencode/kimi"));
+        assert!(!catalogue_contains(&catalogue, "opencode/kimi "));
+        assert!(!catalogue_contains(&catalogue, " opencode/kimi"));
+        let echo = crate::native::types::ModelRef {
+            id: "kimi".to_owned(),
+            provider_id: "opencode".to_owned(),
+            variant: None,
+        };
+        assert!(super::model_ref_is("opencode/kimi", &echo));
+        let padded_echo = crate::native::types::ModelRef {
+            id: "kimi ".to_owned(),
+            provider_id: "opencode".to_owned(),
+            variant: None,
+        };
+        assert!(!super::model_ref_is("opencode/kimi", &padded_echo));
+    }
+
+    #[test]
+    fn configure_switch_ref_keeps_slash_provider_intact() {
+        // A slash in the native provider ID must survive an effort-only
+        // configure: the retained ref is reused verbatim instead of
+        // round-tripping through a joined `provider/model` string, which
+        // would re-split at the first slash and select another provider.
+        let retained = crate::native::types::ModelRef {
+            id: "c".to_owned(),
+            provider_id: "a/b".to_owned(),
+            variant: Some("low".to_owned()),
+        };
+        let target = super::configure_switch_ref(None, Some(&retained))
+            .expect("effort-only keeps the retained ref")
+            .expect("session reports a model");
+        assert_eq!(target.provider_id, "a/b");
+        assert_eq!(target.id, "c");
+        // The old join/re-split path selects provider "a", model id "b/c"
+        // for the same retained session: this documents the regression the
+        // verbatim reuse closes.
+        let joined = format!("{}/{}", retained.provider_id, retained.id);
+        let misparsed = split_model(&joined).expect("display form splits");
+        assert_ne!(
+            (misparsed.provider_id.as_str(), misparsed.id.as_str()),
+            (target.provider_id.as_str(), target.id.as_str()),
+            "joining and re-splitting the retained pair must not select",
+        );
+        // An explicit request still re-splits its own catalogue-proven pair.
+        let explicit = super::configure_switch_ref(Some("opencode/kimi"), None)
+            .expect("explicit splits")
+            .expect("explicit target");
+        assert_eq!(explicit.provider_id, "opencode");
+        assert_eq!(explicit.id, "kimi");
+        // Neither a request nor a retained model means no target.
+        assert!(
+            super::configure_switch_ref(None, None)
+                .expect("absent target is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_echo_compares_native_fields_without_joining() {
+        // The echo verification compares provider and model id as
+        // independent fields: a slash in the provider ID matches the same
+        // slash provider, never the first-slash re-split. The variant is
+        // checked separately by the readback, so it never affects this.
+        let target = crate::native::types::ModelRef {
+            id: "c".to_owned(),
+            provider_id: "a/b".to_owned(),
+            variant: None,
+        };
+        let same = crate::native::types::ModelRef {
+            id: "c".to_owned(),
+            provider_id: "a/b".to_owned(),
+            variant: Some("low".to_owned()),
+        };
+        assert!(super::session_model_is(&target, &same));
+        let resplit = crate::native::types::ModelRef {
+            id: "b/c".to_owned(),
+            provider_id: "a".to_owned(),
+            variant: None,
+        };
+        assert!(!super::session_model_is(&target, &resplit));
+        let other_provider = crate::native::types::ModelRef {
+            id: "c".to_owned(),
+            provider_id: "other".to_owned(),
+            variant: None,
+        };
+        assert!(!super::session_model_is(&target, &other_provider));
+    }
+
+    #[test]
+    fn slash_provider_catalogue_lookups_use_native_fields() {
+        // A native provider ID containing a slash must look up by fields,
+        // never by joining to "a/b/c" and re-splitting at the first slash
+        // (provider "a", model "b/c"). Covers the configure effort gate
+        // and the resume catalogue check alike.
+        use crate::native::types::NativeModelVariant;
+        let catalogue = vec![
+            NativeModelEntry {
+                id: Some("c".to_owned()),
+                provider_id: Some("a/b".to_owned()),
+                limit: None,
+                variants: Some(vec![NativeModelVariant {
+                    id: Some("low".to_owned()),
+                }]),
+            },
+            NativeModelEntry {
+                id: Some("b/c".to_owned()),
+                provider_id: Some("a".to_owned()),
+                limit: None,
+                variants: Some(vec![NativeModelVariant {
+                    id: Some("high".to_owned()),
+                }]),
+            },
+        ];
+        // Native-field lookups select the slash-provider row verbatim.
+        assert!(super::catalogue_contains_for(&catalogue, "a/b", "c"));
+        assert_eq!(
+            super::catalogue_variants_for(&catalogue, "a/b", "c"),
+            Some(vec!["low".to_owned()])
+        );
+        // The joined display form re-splits onto the other row, which is
+        // why the gates must never join before looking up.
+        assert_eq!(
+            super::catalogue_variants(&catalogue, "a/b/c"),
+            Some(vec!["high".to_owned()])
+        );
+        // Configure effort verification: an effort-only configure reuses
+        // the retained slash-provider ref, so its wardrobe is ["low"].
+        let retained = crate::native::types::ModelRef {
+            id: "c".to_owned(),
+            provider_id: "a/b".to_owned(),
+            variant: None,
+        };
+        let target = super::configure_switch_ref(None, Some(&retained))
+            .expect("effort-only keeps the retained ref")
+            .expect("session reports a model");
+        let known = super::catalogue_variants_for(&catalogue, &target.provider_id, &target.id)
+            .is_some_and(|variants| variants.iter().any(|known| known == "low"));
+        assert!(known, "slash-provider effort must match its own row");
+        let wrong = super::catalogue_variants_for(&catalogue, &target.provider_id, &target.id)
+            .is_some_and(|variants| variants.iter().any(|known| known == "high"));
+        assert!(
+            !wrong,
+            "slash-provider effort must not read the re-split row"
+        );
+        // Resume catalogue check: the overlay-absent validation ref is the
+        // retained native pair, so the same field lookup applies.
+        let validation: Option<&crate::native::types::ModelRef> = Some(&retained);
+        let row = validation.and_then(|model| {
+            super::catalogue_entry_for(&catalogue, &model.provider_id, &model.id)
+        });
+        assert!(row.is_some_and(|entry| entry.provider_id.as_deref() == Some("a/b")));
+        assert!(super::catalogue_contains_for(&catalogue, "a", "b/c"));
+        assert!(!super::catalogue_contains_for(&catalogue, "a/b", "b/c"));
     }
 
     #[test]
