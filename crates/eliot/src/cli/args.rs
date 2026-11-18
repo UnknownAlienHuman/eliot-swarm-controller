@@ -167,6 +167,8 @@ pub(crate) enum CliCommand {
     Handoff(HandoffArgs),
     /// Launch a new session and hand off task inputs, claims, Goal and children (Owner only).
     Switch(SwitchArgs),
+    /// Group chats into projects, move placement, or tag chats and Agents (Owner only).
+    Chat(ChatArgs),
     /// Send, read or acknowledge addressed Agent mail.
     Msg(MsgArgs),
     /// Read one page of unread mail for a mailbox.
@@ -859,6 +861,66 @@ pub(crate) struct HandoffArgs {
     pub(crate) task_command: String,
     /// Ordered accepted/queued SEND command ids, at most 64.
     pub(crate) commands: Vec<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct ChatArgs {
+    #[command(subcommand)]
+    pub(crate) command: ChatCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ChatCommand {
+    /// Read the grouped work projection: teams by project assignment,
+    /// manager, repository/worktree and ancestry, with event-watermark readback.
+    Organization(ChatOrganizationArgs),
+    /// Place chats under a retained project. Placement only: execution
+    /// scope, workspace and history are untouched.
+    Attach(ChatAttachArgs),
+    /// Return chats to the no-project bucket. Placement only.
+    Detach(ChatDetachArgs),
+    /// Replace the tag groups of Agents or chats.
+    Tag(ChatTagArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ChatOrganizationArgs {
+    /// Read back one registered project only; omitted reads every group.
+    #[arg(long, value_name = "PROJECT")]
+    pub(crate) project: Option<String>,
+    /// Group cursor: the next_after of the previous page.
+    #[arg(long, value_name = "PROJECT")]
+    pub(crate) after: Option<String>,
+    /// Include archived rows (default hides them).
+    #[arg(long)]
+    pub(crate) archived: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct ChatAttachArgs {
+    /// Chats to place, at most 16 per call.
+    #[arg(value_name = "CHAT")]
+    pub(crate) agents: Vec<String>,
+    /// Retained project receiving the placement.
+    #[arg(long, value_name = "PROJECT")]
+    pub(crate) project: String,
+}
+
+#[derive(Args)]
+pub(crate) struct ChatDetachArgs {
+    /// Chats to detach, at most 16 per call.
+    #[arg(value_name = "CHAT")]
+    pub(crate) agents: Vec<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct ChatTagArgs {
+    /// Agents or chats to tag, at most 16 per call.
+    #[arg(value_name = "AGENT")]
+    pub(crate) agents: Vec<String>,
+    /// Replacement tags, at most 16; omitted clears every tag.
+    #[arg(long, value_name = "TAG")]
+    pub(crate) tag: Vec<String>,
 }
 
 #[derive(Args)]

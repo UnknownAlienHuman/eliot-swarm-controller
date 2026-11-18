@@ -25,6 +25,7 @@ mod native_pages;
 mod native_requests;
 mod notify;
 mod observe;
+mod organization;
 mod overview;
 pub use launch_queue::*;
 mod provider;
@@ -133,6 +134,12 @@ pub use observe::{
     DEFAULT_OBSERVE_WINDOW_SECS, DoctorHarnessEntry, HarnessDoctorRequest, HarnessDoctorResponse,
     HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_DOCTOR_HARNESSES, MAX_HEAVY_EPISODES,
     MAX_OBSERVE_WINDOW_SECS, ObserveHeavyRequest, ObserveHeavyResponse, SessionGrowthView,
+};
+pub use organization::{
+    ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
+    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, MAX_ORG_AGENTS,
+    MAX_ORG_MEMBERS_PER_GROUP, MAX_ORG_MEMBERS_TOTAL, MAX_ORG_TAG_BYTES, MAX_ORG_TAGS,
+    OrgGroupView, OrgLinkView, OrgMemberView,
 };
 pub use overview::{
     FleetTotals, HarnessCount, LifecycleTotals, NativeChildView, OverviewCoverage,

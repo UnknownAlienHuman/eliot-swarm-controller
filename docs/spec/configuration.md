@@ -1463,11 +1463,18 @@ becomes implemented; absent later features return `unsupported`, not a hidden su
 
 `[daemon].chats_root` is an optional absolute local root (at most 4096 bytes),
 defaulting to `<user home>/Eliot/chats`. `settings.read` exposes the effective
-default, and `settings.save` replaces it with the daemon section. It must be outside
-the daemon data directory, harness homes and user configuration roots, and cannot
-contain those roots. Before canonicalization or admission, every existing component
-of the supplied path is checked for links and Windows reparse points, including
-ancestors of a nonexistent suffix. The daemon validates
+root and `settings.save` replaces it with the daemon section; both resolve the
+explicit and the default root through the same validator, so a stored root
+inside the owner chat tree is refused at readback exactly as at launch. The one
+exception is an explicit root equal to the canonical owner chat tree itself: the
+Owner may choose it for a non-default data directory, such as a production
+controller. Derived defaults never resolve there. When
+the owner home cannot be resolved for a non-default data directory, validation
+fails closed instead of omitting the owner tree from the protected set. It must
+be outside the daemon data directory, harness homes and user configuration
+roots, and cannot contain those roots. Before canonicalization or admission,
+every existing component of the supplied path is checked for links and Windows
+reparse points, including ancestors of a nonexistent suffix. The daemon validates
 private directory ownership, rejects links/reparse traversal and creates a new
 `aN` child exclusively for an Owner `launch` with `chat:true` and no workspace.
 Native stores and owner configuration are never created there by Eliot. Changing

@@ -512,6 +512,7 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
         ("attention_wakes", "recipient"),
         ("completion_digests", "parent"),
         ("artifacts", "agent"),
+        ("chat_organization", "agent"),
     ] {
         delete_db!(tx.execute(
             &format!("DELETE FROM {table} WHERE {column} IN (SELECT id FROM deleted_agents)"),

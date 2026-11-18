@@ -15,6 +15,7 @@ mod handoff;
 mod hierarchy;
 mod inference;
 pub(crate) mod launch_queue;
+mod organization;
 mod overview;
 mod project_assignment;
 mod resolution;
@@ -451,6 +452,10 @@ impl Router {
             "swarm.reparent" => self.swarm_reparent(&params, &principal).await,
             "swarm.handoff" => self.swarm_handoff(&params, &principal).await,
             "swarm.switch" => self.swarm_switch(&params, &principal).await,
+            "chat.organization" => self.chat_organization(&params, &principal).await,
+            "chat.attach" => self.chat_attach(&params, &principal).await,
+            "chat.detach" => self.chat_detach(&params, &principal).await,
+            "chat.tag" => self.chat_tag(&params, &principal).await,
             "command.cancel" => self.command_cancel(&params, &principal).await,
             "project.transfer" => self.project_transfer(&params, &principal).await,
             "project.assignment.get" => self.project_assignment_get(&params, &principal).await,

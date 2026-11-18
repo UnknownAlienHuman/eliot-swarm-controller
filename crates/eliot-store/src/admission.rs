@@ -955,8 +955,8 @@ fn admit_launch_tx(
                 "private chat launch is owner-only without a parent or worktree",
             ));
         }
-        // Agent ids restart at a1 in every data dir while chats_root is a
-        // per-user default shared by every daemon, so the Agent id alone
+        // Agent ids restart at a1 in every data dir while the default chat
+        // root is specific to each data dir, so the Agent id alone
         // collides. The admitting command id is unique and replays to the
         // same path for the same command.
         let path = std::path::Path::new(&workspace).join(format!(

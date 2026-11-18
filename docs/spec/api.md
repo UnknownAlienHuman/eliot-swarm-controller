@@ -455,6 +455,9 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `settings.read/save` | owner-only unified section read/save, revision CAS, dry run, restart indication and bounded author history; see configuration |
 | `project.transfer` | Owner-only transfer intent, optional replacement launch, atomic commit or cancellation with typed readback. See [Project transfer](coordination.md#project-transfer). |
 | `project.assignment.get/claim/launch/release` | Current registered project manager, explicit adoption or manager launch, and revision-bound release through the ordinary command path. See [project manager assignments](#project-manager-assignments). |
+| `chat.organization` | owner-only grouped work projection by project assignment, manager, repository/worktree and ancestry, with event-watermark and per-group readback; no client repeats Git discovery or grouping. See [Chat organization](#chat-organization). |
+| `chat.attach` / `chat.detach` | owner-only chat placement moves between a retained project and the no-project bucket; committed per-Agent link readback; execution scope, workspace and history untouched |
+| `chat.tag` | owner-only replacement tag groups for Agents or chats (an omitted tag list clears); committed per-Agent link readback |
 | `project.discover` | owner-only opened Git checkout registration through the settings writer; non-Git paths return no project |
 | `routing.preview` | owner-only advisory `RoutingDecision` for a role, computed like admission without admitting, freezing or reserving; see configuration |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
@@ -518,6 +521,52 @@ reports its own snapshot watermark. CLI callers use
 `swarm project overview [--project ID] [--after CURSOR]`. See
 [project manager assignment](coordination.md#project-manager-assignment) for
 detail visibility and capacity semantics.
+
+### Chat organization
+
+The owning semantics are [Coordination: Conversation association](coordination.md#conversation-association).
+Owner only, with identical behavior from the CLI (`swarm chat ...`) and MCP
+(`chat.organization`, `chat.attach`, `chat.detach`, `chat.tag`);
+the desktop has no organization entry yet (deferred to step 5).
+Organization is placement, never authority: attach, detach and tag write the
+organizational overlay beside the Agent id through Owner-only Store
+transactions (schema v64: `chat_organization` with placement and tags
+beside the Agent id); the execution project, scope,
+workspace and history of every Agent keep their retained values.
+
+`chat.organization` (`ChatOrganizationRequest`/`ChatOrganizationResponse` in
+[`organization.rs`](../../crates/eliot-core/src/api/organization.rs)) groups
+work by project assignment, manager, repository or worktree, and ancestry, and
+returns the ready projection with event-watermark readback, so no client
+repeats Git discovery or grouping. The optional `project` reads back one
+registered project through an index-scoped member query with its exact total
+from the same scoped predicates; `archived` includes
+archived rows (default hides them). Groups carry at most 200 members each and
+1,000 across the projection. The all-project read pages its group list: `after`
+takes the previous page's `next_after`, and a truncated page sets
+`groups_truncated` with the cursor for the next page. Competing roots of one
+project surface as an
+explicit ambiguity (`conflicting_roots`, counted independently of the
+archived filter) and are never auto-reassigned. Chats keep their retained
+execution labels and group by their overlay link alone; a legacy chat that
+carries an execution project reads in the no-project bucket until attached.
+
+`chat.attach` places 1-16 chats under a retained project; `chat.detach` returns
+1-16 chats to the no-project bucket. `chat.tag` replaces the tag groups of
+1-16 Agents or chats with at most 16 trimmed nonempty tags of at most 64 bytes
+each; an omitted tag list clears every tag. The batch bound keeps the worst
+nominal receipt (every link with a full-length project and a full tag set)
+inside the 64 KiB retained-result bound. Every mutation carries an id:
+exact replay returns the committed result before current-state checks, and the
+response carries the committed per-Agent links (`id`, `links:
+Vec<OrgLinkView>` with placement and tags); each fresh write appends one
+`organization.changed` event in the same transaction so the projection's
+event watermark advances, and the router publishes it after commit. Rename
+stays the desktop
+`[desktop] display_names` presentation preference and archive stays
+`agent.archive`. Errors include `invalid`, `not_found`, `not_allowed`,
+`bad_state`, `unavailable`, `id_conflict`, `source_integrity` and mutation
+binding/age errors.
 
 ### Authenticated method discovery
 
@@ -2215,6 +2264,10 @@ swarm discover --profile P [--harness H] [--scope S] [--cursor C] [--archived] [
 swarm attach --profile P --harness H --scope S --ref R [--project LABEL]
 swarm history A --view subject|turns|items [--source native|rollout] [--turn-id ID] [--cursor C] [--limit N]
 swarm detach A [--generation N]
+swarm chat organization [--project P] [--after P] [--archived]
+swarm chat attach CHAT... --project P
+swarm chat detach CHAT...
+swarm chat tag AGENT... [--tag TAG]...
 swarm provider holds [--after SCOPE] [--limit N]
 swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
 swarm plugin NAME | plugin-test ... | hook ... | mcp

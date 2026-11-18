@@ -27,7 +27,7 @@ pub(crate) use automation::{
 };
 use projects::{ProjectEntry, project_registrations_in};
 pub(crate) use projects::{
-    ProjectRegistrationConfig, ProjectWorkspaceMode, default_chats_root, load_project_display_name,
+    ProjectRegistrationConfig, ProjectWorkspaceMode, load_project_display_name,
     load_project_registration_config, validate_chats_location,
 };
 

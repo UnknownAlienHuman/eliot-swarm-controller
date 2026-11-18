@@ -195,6 +195,7 @@ mod agent_lifecycle;
 mod native_events;
 mod observer;
 mod observer_live;
+mod organization;
 mod processes;
 mod project_assignment;
 mod project_transfer;

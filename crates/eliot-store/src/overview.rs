@@ -6,8 +6,8 @@ mod tests;
 use super::*;
 use eliot_core::api::{
     FleetTotals, HarnessCount, LifecycleTotals, NativeChildView, OverviewCoverage,
-    OverviewManagerView, OverviewWorkerView, ProjectAssignmentState, ProjectManagerIdentity,
-    ProjectOverviewEntry, ProjectTotals, ScopeLimits, ScopeUsage,
+    OverviewManagerView, OverviewWorkerView, ProjectAssignment, ProjectAssignmentState,
+    ProjectManagerIdentity, ProjectOverviewEntry, ProjectTotals, ScopeLimits, ScopeUsage,
 };
 
 const PROJECTS: &str = "SELECT id AS project FROM project_registrations
@@ -178,7 +178,7 @@ fn read_fleet(conn: &Connection, limits: &ScopeLimits) -> Result<(FleetTotals, O
     Ok((fleet, coverage))
 }
 
-fn list_overview_projects(
+pub(super) fn list_overview_projects(
     conn: &Connection,
     filter: Option<&str>,
     after: Option<&str>,
@@ -198,20 +198,15 @@ fn list_overview_projects(
     rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
 }
 
-fn project_team(
+/// The retained manager view for one project assignment, shared by the
+/// project overview and the organization projection: a local manager in a
+/// matching (or starting) generation reads its live state, anything else
+/// reads unknown without changing the assignment.
+pub(super) fn overview_manager_view(
     conn: &Connection,
-    project: &str,
-    limits: &ScopeLimits,
-    access: &DetailAccess,
-    worker_after: Option<i64>,
-    workspace_after: Option<i64>,
-) -> Result<ProjectOverviewEntry> {
-    let detail = access.can_detail(project);
-    let assignment = detail
-        .then(|| project_assignment::read_assignment(conn, project))
-        .transpose()?;
-    let manager = assignment
-        .as_ref()
+    assignment: Option<&ProjectAssignment>,
+) -> Result<Option<OverviewManagerView>> {
+    assignment
         .and_then(|assignment| match assignment.manager.as_ref() {
             Some(ProjectManagerIdentity::Local { agent, generation }) => {
                 Some((assignment, agent, *generation))
@@ -235,7 +230,22 @@ fn project_team(
                 workspace: assignment.workspace.clone(),
             })
         })
+        .transpose()
+}
+
+fn project_team(
+    conn: &Connection,
+    project: &str,
+    limits: &ScopeLimits,
+    access: &DetailAccess,
+    worker_after: Option<i64>,
+    workspace_after: Option<i64>,
+) -> Result<ProjectOverviewEntry> {
+    let detail = access.can_detail(project);
+    let assignment = detail
+        .then(|| project_assignment::read_assignment(conn, project))
         .transpose()?;
+    let manager = overview_manager_view(conn, assignment.as_ref())?;
 
     let worker_total = count(
         conn,

@@ -59,6 +59,18 @@ const METHODS: &[Method] = &[
     method!("agent.archive", AgentArchiveRequest, AgentTreeResponse, true, true, "Archive or unarchive an idle or ended Agent tree (ended: custody resolved); never stops it.", {"id":EXAMPLE_ID,"agent":"a1","archived":true}),
     method!("agent.delete", AgentDeleteRequest, AgentTreeResponse, true, true, "Delete stopped or failed Agent trees after custody drains; preserve files.", {"id":EXAMPLE_ID,"agent":"a1"}),
     method!("artifact.register", ArtifactRegisterRequest, ArtifactView, false, true, "Register an existing Agent-owned artifact directory with exact generation and opened identity.", {"id":EXAMPLE_ID,"path":"C:/scratch/build","kind":"build","purpose":"assignment build"}),
+    method!(
+        "chat.organization",
+        ChatOrganizationRequest,
+        ChatOrganizationResponse,
+        true,
+        false,
+        "Grouped work projection by assignment, manager, repo and ancestry with event-watermark readback.",
+        {}
+    ),
+    method!("chat.attach", ChatAttachRequest, ChatOrganizationMutationResponse, true, true, "Place chats under a retained project; execution scope is untouched.", {"id":EXAMPLE_ID,"agents":["a1"],"project":"app"}),
+    method!("chat.detach", ChatDetachRequest, ChatOrganizationMutationResponse, true, true, "Return chats to the no-project bucket; execution scope is untouched.", {"id":EXAMPLE_ID,"agents":["a1"]}),
+    method!("chat.tag", ChatTagRequest, ChatOrganizationMutationResponse, true, true, "Replace tag groups of Agents or chats with revision readback.", {"id":EXAMPLE_ID,"agents":["a1"],"tags":["inbox"]}),
     method!("cleanup.plan", CleanupPlanRequest, CleanupPlan, false, false, "Plan bounded cleanup: Agents own subtree; Owner project or all. No deletion.", {"scope":"self_tree"}),
     method!("cleanup.apply", CleanupApplyRequest, CleanupApplyResponse, false, true, "Consume one plan, rechecking safe entries; replay returns retained outcomes.", {"id":EXAMPLE_ID,"plan_id":EXAMPLE_ID}),
     method!(
@@ -468,6 +480,10 @@ impl Router {
             "swarm.reparent" => &["swarm reparent"],
             "swarm.handoff" => &["swarm handoff"],
             "swarm.switch" => &["swarm switch"],
+            "chat.organization" => &["swarm chat organization"],
+            "chat.attach" => &["swarm chat attach"],
+            "chat.detach" => &["swarm chat detach"],
+            "chat.tag" => &["swarm chat tag"],
             "command.cancel" => &["swarm cmd cancel"],
             _ => &[],
         };
@@ -814,6 +830,12 @@ fn method_scopes(name: &str, principal: &Principal, identity: &IdentityResponse)
 
 fn method_limits(name: &str) -> &'static str {
     match name {
+        "chat.attach" | "chat.detach" | "chat.tag" => {
+            "Owner only. Placement and tags only; execution scope is untouched. At most 16 Agents per call. Retry the same id for the retained readback."
+        }
+        "chat.organization" => {
+            "Owner only. Ready grouped projection with event-watermark readback; no client-side Git discovery."
+        }
         "swarm.switch" => {
             "Owner only. Exact source generation; at most 64 selected plain SENDs. Reserve child IDs before launch preparation. Choose profile or ad-hoc harness/model/effort/auth/cmd. No launch prompt. Exact session readiness precedes atomic H2 handoff. Failure retains created B; stop separately. Same-ID replay never launches again. Finish an untransferred ready B with ordinary swarm.handoff."
         }

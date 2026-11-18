@@ -277,10 +277,30 @@ environment and creates no setup effects or worktree cleanup artifact.
 
 A conversation association links an existing Agent or chat to a project or
 display group. It leaves native session, execution workspace, permissions and
-historical command attribution intact. Continuing work in another project is
-a separate, authorized execution operation with a link back to the original
-conversation. Store will retain the association beside the existing chat identity
-when the headless association API is implemented.
+historical command attribution intact: association is placement, never
+authority. The headless association API stores the overlay beside the
+existing Agent or chat identity (schema v64).
+
+- `chat.organization` returns the grouped projection: teams by project
+  assignment, manager, repository or worktree, and ancestry, with
+  event-watermark readback. Clients never repeat Git discovery or grouping.
+  Chats group by their overlay link alone; a legacy chat that still carries
+  an execution project reads in the no-project bucket until attached.
+- `chat.attach` moves chats under a retained project; `chat.detach` returns
+  them to the no-project bucket. `chat.tag` replaces tag groups. Each
+  mutation returns the committed per-Agent links; each fresh write appends
+  one `organization.changed` event in the same transaction so the
+  projection's event watermark advances.
+- Continuing work in another project stays a separate, authorized execution
+  operation through the existing switch/handoff path, not an organization
+  mutation: a running Agent cannot change execution scope through an edit.
+
+Migration keeps every ID and all history. Links are derived only from
+unambiguous retained facts (registration, common directory, parent); never
+from names or the last message. Competing roots of one project surface as
+an explicit ambiguity and are never auto-reassigned. Rename and
+archive reuse their existing paths; presentation preferences stay in the
+existing settings. The wire contract is [Chat organization](api.md#chat-organization).
 
 ## Mailbox
 
