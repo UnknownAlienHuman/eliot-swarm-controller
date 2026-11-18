@@ -501,8 +501,8 @@ into the retained `SessionUsage` snapshot and commits it as `session.usage`
 when accepted (source `codex:thread/tokenUsage/updated`), with `observed_at`
 captured at acceptance: the cumulative `total` replaces
 the retained input/output/cache counters (never a derived total),
-`total.totalTokens` projects to `context_used_tokens` (the installed schema's
-only occupancy signal, read against `modelContextWindow`), and
+`last.totalTokens` projects to `context_used_tokens` (the latest active context size,
+per upstream TUI `tokens_in_context_window`) read against `modelContextWindow`, and
 `modelContextWindow` replaces the retained capacity; account-level
 cost/credits (`GetAccountTokenUsage`) stay account scope. Missing per-turn
 counters stay null. Idle updates merge and commit without waiting for a
