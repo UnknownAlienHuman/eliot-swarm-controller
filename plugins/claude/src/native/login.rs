@@ -64,6 +64,16 @@ async fn logged_in(
     cwd: &Path,
     environment: &[(OsString, OsString)],
 ) -> Result<bool> {
+    auth_status(program, cwd, environment)
+        .await
+        .map(|status| logged_in_status(&status))
+}
+
+pub(crate) async fn auth_status(
+    program: &OsStr,
+    cwd: &Path,
+    environment: &[(OsString, OsString)],
+) -> Result<Value> {
     let output = tokio::time::timeout(
         STATUS_DEADLINE,
         cli(program, cwd, environment)
@@ -81,13 +91,12 @@ async fn logged_in(
             format!("Claude CLI auth status could not run: {error}"),
         )
     })?;
-    let status: Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+    serde_json::from_slice(&output.stdout).map_err(|_| {
         Error::new(
             "native_not_dispatched",
             "Claude CLI auth status did not print its JSON status",
         )
-    })?;
-    Ok(logged_in_status(&status))
+    })
 }
 
 fn logged_in_status(status: &Value) -> bool {

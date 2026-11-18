@@ -95,35 +95,27 @@ the owned CLI and is removed after confirmed stop and drain.
 
 ### Worker MCP policy
 
-The additive per-run config above is the `inherit` policy (now an explicit
-opt-in): other native MCP sources keep Claude Code's normal behavior,
-except owner Swarm entries. Profiles default to `mcp = "minimal"`, frozen
-in the profile snapshot; a non-empty `mcp_allow` is rejected as `unsupported` at
-config load, and launch planning re-checks the frozen snapshot (`check_mcp_allow_empty`),
-so a stale snapshot fails closed. Claude has no selective-inclusion mechanism.
-`--mcp-config`, so only the per-run file applies. For `inherit` there is no
-safe native filter: installed 2.1.325 offers no per-server disable or deny
-switch for the per-run surface (`claude --help` shows only the
-all-or-nothing `--strict-mcp-config`; `--setting-sources` selects whole
-settings sources rather than servers and `.mcp.json` project servers sit
-outside those sources; `claude mcp --help` shows no deny list; the
-per-project disable state is interactive approval state, not a per-run
-mechanism -- all verified read-only against installed 2.1.325 on
-2026-11-16), so the owner-side sources (project `.mcp.json`, project and
-local `.claude/settings*.json`, user `~/.claude/settings.json` and legacy
-`~/.claude.json`) are scanned pre-spawn for owner-identity entries -- a
-swarm executable selecting `mcp` without `--require-agent`, or a URL on
-the configured `cloud_mcp` hostname -- and a match settles the launch as a
-definite failed start (proven-no-effect, never `unknown`) with a typed
-reason carrying the triggering code (`profile_error`) in `inherit`,
-whatever the entry is named. The same rule covers every other pre-spawn
-refusal -- cmd resolution, MCP config preparation, skill-root availability,
-settings validation, and CLI login -- while any failure at or after the
-native spawn keeps its honest classification. Verified read-only: `--strict-mcp-config`
-means "Only use MCP servers from `--mcp-config`, ignoring all other MCP
-configurations" (wording re-checked against installed 2.1.325 on
-2026-11-16; earlier pins to 2.1.278 and 2.1.321 describe the same
-surface). Eliot never writes Claude's user configuration in either policy.
+Profiles default to `mcp = "minimal"`, which passes
+`--strict-mcp-config` and uses the supplied per-run file. A nonempty
+`mcp_allow` is rejected at config load and rechecked at launch. The
+explicit `inherit` policy adds the per-run file to native MCP
+configuration. Before spawn, Eliot checks project `.mcp.json` and
+settings, user settings, and both user and workspace-local `mcpServers`
+from `.claude.json`. With `CLAUDE_CONFIG_DIR`, the user files come from
+that root. Eliot refuses inherit when it sees a settings redirect, a
+server identity field with environment expansion, enabled or installed
+plugins, or managed files. It also requires
+`ENABLE_CLAUDEAI_MCP_SERVERS=false` in the frozen process environment,
+because Claude fetches connector entries itself.
+
+An owner Swarm stdio entry or a URL on the configured `cloud_mcp`
+hostname fails preflight with `profile_error` naming the entry and source.
+The inherit launch also provides a native URL deny rule for that hostname
+on all ports, covering remote servers Claude discovers after the file
+scan. Pre-spawn refusal retains a definite failed start. A failure after
+spawn has its own classification. Eliot does not write the user config.
+[Claude Code MCP scopes](https://code.claude.com/docs/en/mcp#mcp-installation-scopes)
+and [managed MCP policy](https://code.claude.com/docs/en/managed-mcp).
 
 Requested vs observed: `requested` carries `mcp_policy` and `mcp_allow`;
 `effective` carries `mcp_policy` and the server set. The `initialize`
@@ -136,10 +128,14 @@ server, verified live on installed 2.1.321); the plugin retains that
 observed set (names and statuses only, secret-redacted and bounded) and
 attaches it to the turn terminal, where the reducer merges it into the
 effective set with `mcp_servers_verified` true. An absent or malformed init
-inventory leaves the effective set unknown. `effective.effort` carries the
-pushed `--effort` level (null when omitted, never fabricated): the idle
-readback proves the native accepted the start carrying it, so it reads back
-`effort_verified` true; an unknown level settles as a definite failed start before any spawn.
+inventory leaves the effective set unknown. The profile effort is retained in
+`requested.effort` and passed as `--effort`. Initialize does not report the
+applied level, so `effective.effort` is null and `effort_verified` is false.
+`CLAUDE_CODE_EFFORT_LEVEL` takes precedence over the flag and native settings
+can cap effort through `maxEffortLevel`. A conflicting nonempty
+`CLAUDE_CODE_EFFORT_LEVEL` in the frozen process environment refuses the
+launch before spawn.
+[Claude Code environment variables](https://code.claude.com/docs/en/env-vars).
 
 Resolve Windows executables explicitly; never insert an unrequested shell wrapper.
 Avoid modes that disable required hooks/instructions.
@@ -356,13 +352,14 @@ frozen documented `--model` aliases (`best`, `fable`, `sonnet`, `opus`,
 ids (for example `claude-haiku-5-5`, `claude-opus-5-5`), each entry marked
 `source = "documented_alias"` with the CLI effort vocabulary attached and
 `unknown` availability; an omitted `--model` selects the CLI default, whose
-effective value is read back from initialize/stream. No live native catalogue
-exists (verified read-only against installed Claude Code 2.1.325 on
-2026-11-16: no `models` subcommand, `--model` names aliases or a full model
-name, settings `model`/`availableModels` is an allowlist rather than an
-inventory, and the stream-json `initialize` reply reports only the session
-model). Source: [Model configuration](https://code.claude.com/docs/en/model-config)
-(checked 2026-11-16) and the installed CLI `--help`.
+effective value is read back from initialize/stream. The native stream-json
+`initialize` response includes `models` with selectable values, display names,
+resolved model IDs and model-specific effort levels when the CLI reports them.
+The plugin's private `model.list` method reads that metadata without a prompt or
+auto-login, using the installed CLI's `--safe-mode` and strict empty MCP config. It declines
+profiles with `pass_env` until the daemon supplies that environment to the reader.
+The public command still uses the daemon's documented catalogue.
+[Claude Agent SDK model information](https://code.claude.com/docs/en/agent-sdk/typescript#modelinfo).
 ## Agent skill delivery (`eliot-swarm`)
 
 Every owned CLI spawn passes `--plugin-dir <data-dir>/skills`, the
@@ -422,10 +419,14 @@ Implementation:
 ## Read-only provider quota
 
 `harness.quota` is implemented in `plugins/claude/src/quota.rs`, following
-OpenCodex 2.84.0's OAuth usage reader as a pattern only. It reads the CLI's own
+OpenCodex 2.84.0's OAuth usage reader as a pattern only. It refuses external or
+ambiguous provider and authentication selectors in the profile environment and
+native user settings. The installed CLI's `auth status --json` must confirm a
+first-party subscription route in the isolated reader directory. Then it reads
+the CLI's own
 `CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`) without writes, selects
 `claudeAiOauth.accessToken`, and calls Anthropic `/api/oauth/usage` with
 `anthropic-beta: oauth-2025-04-20`. It projects `five_hour`, `seven_day`, recognized
 model weekly buckets and `limits[kind=weekly_scoped]`, never account identity.
 Missing credentials, expiry and provider failures remain supported error states
-with explicit origin. No refresh, model turn or inference probe is attempted.
+with explicit origin. No refresh, login, model turn or inference probe is attempted.

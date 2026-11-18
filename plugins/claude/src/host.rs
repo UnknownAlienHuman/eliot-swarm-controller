@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsString,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -312,6 +312,7 @@ struct StartPlan {
     /// Frozen Claude Code `--effort` level (closed CLI vocabulary); absent
     /// keeps the CLI default.
     requested_effort: Option<String>,
+    inherit_cloud_hostname: Option<String>,
     requested_mcp_policy: McpPolicy,
     requested_mcp_allow: Vec<String>,
     /// Frozen native-subagent switch: `deny` disables the native subagent
@@ -733,6 +734,7 @@ impl ClaudePlugin {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
             "quota.read" => crate::quota::read(&request.params).await,
+            "model.list" => self.model_list(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => match self.command(request).await {
                 DispatchOutcome::Ready(result) => result,
@@ -782,6 +784,20 @@ impl ClaudePlugin {
                 Ok(value)
             }
         }
+    }
+
+    async fn model_list(&self, raw: &Value) -> Result<Value> {
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("Claude"))?;
+        if self.session.is_some() || self.failed_start.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Claude model.list requires a dedicated reader plugin instance",
+            ));
+        }
+        crate::native::models::read(raw, Path::new(&initialized.instance_dir)).await
     }
 
     fn initialize(&mut self, raw: &Value) -> Result<Value> {
@@ -958,6 +974,7 @@ impl ClaudePlugin {
             mut secrets,
             config_dir,
         } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
+        check_effort_override(requested_effort.as_deref(), &environment)?;
         let data_root = ClaudeMcpConfigFile::require_agent_data_root(
             &environment,
             &params.agent_id,
@@ -982,19 +999,23 @@ impl ClaudePlugin {
                 "the current Eliot executable for Claude MCP is unavailable",
             ));
         }
-        // Inherit keeps the CLI normal MCP precedence, which no per-run
-        // flag narrows per server (installed 2.1.325: only the
-        // all-or-nothing `--strict-mcp-config`, reserved for minimal; see
-        // `owner_scan`). An owner Swarm entry reachable under inherit
-        // therefore fails the start closed with its name instead of
-        // leaking the owner daemon identity to the worker.
-        if requested_mcp_policy == McpPolicy::Inherit {
+        let inherit_cloud_hostname = if requested_mcp_policy == McpPolicy::Inherit {
+            let hostname = eliot_core::parse_snapshot_cloud_hostname(profile);
             crate::owner_scan::refuse_owner_mcp_sources(
                 &workspace,
+                config_dir.as_deref(),
+                environment.iter().find_map(|(name, value)| {
+                    name.eq_ignore_ascii_case("ENABLE_CLAUDEAI_MCP_SERVERS")
+                        .then(|| value.to_str())
+                        .flatten()
+                }),
                 &swarm_binary,
-                eliot_core::parse_snapshot_cloud_hostname(profile).as_deref(),
+                hostname.as_deref(),
             )?;
-        }
+            hostname
+        } else {
+            None
+        };
         secrets.push(initialized.credential.clone());
         if let Some(subject) = resume_subject.as_ref()
             && subject.native_scope != claude_scope(config_dir.as_deref())
@@ -1027,6 +1048,7 @@ impl ClaudePlugin {
             requested_model,
             requested_permission_mode,
             requested_effort,
+            inherit_cloud_hostname,
             requested_mcp_policy,
             requested_mcp_allow,
             native_subagents_deny,
@@ -1252,26 +1274,8 @@ impl ClaudePlugin {
         // retains that observed set and attaches it to the turn terminal, so
         // the reducer merges it into the effective set with verified true.
         // An absent or malformed init inventory stays unknown.
-        // Effort travels on the native `--effort` argv; the CLI never reads
-        // it back, so the effective value is the pushed level (or null for
-        // the CLI default, never fabricated). The idle-session readback
-        // proves the native accepted the start carrying it, which marks it
-        // verified; an unknown level fails admission before any spawn.
-        let effort_verified = plan.requested_effort.is_some();
-        let effective = with_context_points(
-            json!({
-                "model": null,
-                "effort": plan.requested_effort.clone(),
-                "effort_verified": effort_verified,
-                "permission_mode": effective_mode,
-                "session_state": readback.session_state,
-                "pid": readback.pid,
-                "mcp_policy": plan.requested_mcp_policy.as_str(),
-                "mcp_servers": null,
-                "mcp_servers_verified": false,
-            }),
-            &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
-        );
+        let effective =
+            start_effective_settings(&readback, effective_mode, plan.requested_mcp_policy);
         Ok((session, effective))
     }
 
@@ -2454,6 +2458,17 @@ async fn launch_session(
         plan.requested_mcp_policy,
         mcp_config.path().as_os_str(),
     ));
+    if let Some(hostname) = &plan.inherit_cloud_hostname {
+        // Native policy also covers remote servers fetched after preflight.
+        // Per-scope deny entries merge, including with managed settings.
+        argv.push(OsString::from("--settings"));
+        argv.push(OsString::from(
+            json!({
+                "deniedMcpServers": [{"serverUrl": format!("*://{hostname}:*/*")}],
+            })
+            .to_string(),
+        ));
+    }
     // Expose the daemon-materialized coordination skill through the CLI's
     // own plugin mechanism: the materialized skill root doubles as the
     // plugin directory, so no checkout or global skill location changes.
@@ -2734,6 +2749,49 @@ fn claude_scope(config_dir: Option<&str>) -> String {
     }
 }
 
+fn check_effort_override(
+    requested: Option<&str>,
+    environment: &[(OsString, OsString)],
+) -> Result<()> {
+    if let Some(requested) = requested
+        && let Some((_, native)) = environment.iter().find(|(name, _)| {
+            name == "CLAUDE_CODE_EFFORT_LEVEL"
+                || (cfg!(windows) && name.eq_ignore_ascii_case("CLAUDE_CODE_EFFORT_LEVEL"))
+        })
+        && !native.is_empty()
+        && native != requested
+    {
+        return Err(Error::new(
+            "profile_error",
+            "Claude requested effort conflicts with CLAUDE_CODE_EFFORT_LEVEL",
+        ));
+    }
+    Ok(())
+}
+
+fn start_effective_settings(
+    readback: &InitializeReadback,
+    permission_mode: Option<String>,
+    mcp_policy: McpPolicy,
+) -> Value {
+    // Initialize has no effective effort field. The environment can override
+    // --effort, and a model or maxEffortLevel setting can cap the result.
+    with_context_points(
+        json!({
+            "model": null,
+            "effort": null,
+            "effort_verified": false,
+            "permission_mode": permission_mode,
+            "session_state": readback.session_state,
+            "pid": readback.pid,
+            "mcp_policy": mcp_policy.as_str(),
+            "mcp_servers": null,
+            "mcp_servers_verified": false,
+        }),
+        &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
+    )
+}
+
 /// The shared start/input/stop commands plus the Claude-only interrupt,
 /// request-reply, and steer commands.
 fn known_command(session: &AgentSession, command_id: &str) -> bool {
@@ -2772,6 +2830,29 @@ fn target_environment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effort_override_refuses_conflicts_and_initialize_cannot_verify_effort() {
+        let env = vec![("CLAUDE_CODE_EFFORT_LEVEL".into(), "low".into())];
+        assert_eq!(
+            super::check_effort_override(Some("high"), &env)
+                .unwrap_err()
+                .code,
+            "profile_error",
+        );
+        assert!(super::check_effort_override(Some("low"), &env).is_ok());
+        assert!(super::check_effort_override(None, &env).is_ok());
+        let readback = serde_json::from_value(serde_json::json!({
+            "session_state": "idle",
+            "models": [{"value": "sonnet", "supportedEffortLevels": ["low", "high"]}],
+        }))
+        .expect("native initialize");
+        let effective =
+            super::start_effective_settings(&readback, None, eliot_core::McpPolicy::Minimal);
+        assert_eq!(effective["session_state"], "idle");
+        assert_eq!(effective["effort"], serde_json::Value::Null);
+        assert_eq!(effective["effort_verified"], false);
+    }
+
     use super::{
         ClaudePlugin, PendingSend, PhaseFailure, SendHistory, StartPhase, check_mcp_allow_empty,
         claude_manifest, claude_scope, mcp_argv, native_subagents_argv, new_uuid, prespawn_reason,
