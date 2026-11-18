@@ -95,6 +95,9 @@ pub(super) enum MenuMsg {
     HighlightMove(i32),
     /// Choose the keyboard-highlighted row, if any.
     HighlightActivate,
+    /// Bring the keyboard-highlighted row into view after its render
+    /// (the highlight move that needs it).
+    Reveal(u64),
     Chosen(Action),
     Quick(UiAgent, Action),
     TaskOpened(UiAgent),
@@ -143,6 +146,15 @@ pub(super) struct MenuState {
     pub(super) renaming: Option<(Target, String)>,
     pub(super) confirm: Option<(Target, Action)>,
     pub(super) rename_ref: ElementRef<TextBox>,
+    /// The keyboard-highlighted row, bound when it renders: focusing
+    /// it scrolls it into view (WinUI brings a focused element in).
+    row_ref: ElementRef<Button>,
+    /// Highlight moves handed out by `reveal_highlight`: a reveal for
+    /// an older move is ignored.
+    reveal_epoch: u64,
+    /// Renders composed when the latest highlight move ran: the reveal
+    /// waits for the render that binds the row.
+    reveal_after: u64,
     /// A live Agent's Stop and delete in progress (its dialog stays open).
     pub(super) removal: Option<Removal>,
     /// "Move under another task…" is open.
@@ -206,6 +218,9 @@ const ARCHIVED_NOTICE_MS: u64 = 10_000;
 
 /// The menu's width.
 const MENU_WIDTH: f64 = 248.0;
+/// Between bringing the highlighted row into view and retrying it:
+/// one frame later (see `reveal_highlight`).
+const MENU_REVEAL_RETRY_MS: u64 = 16;
 
 impl DesktopApp {
     pub(super) fn menu_update(&mut self, msg: MenuMsg, context: &ComponentContext<Self>) {
@@ -227,6 +242,29 @@ impl DesktopApp {
                 }
                 let count = self.menu_entries(target).len();
                 self.menu.highlight = highlight_step(self.menu.highlight, step, count);
+                if self.menu.highlight.is_some() {
+                    self.reveal_highlight(context);
+                }
+            }
+            MenuMsg::Reveal(epoch) => {
+                if epoch != self.menu.reveal_epoch || self.menu.open.is_none() {
+                    return;
+                }
+                // Only a highlighted row binds the reference.
+                if self.menu.highlight.is_none() {
+                    return;
+                }
+                // The highlighted row's reference binds when it renders.
+                if self.renders.get() <= self.menu.reveal_after {
+                    self.post_reveal_highlight(epoch, MENU_REVEAL_RETRY_MS, context);
+                    return;
+                }
+                // Focusing the row brings it into view; the thread hook
+                // keeps the keyboard while the menu is open, so arrows
+                // and Enter keep working.
+                if !self.menu.row_ref.request_focus() {
+                    self.post_reveal_highlight(epoch, MENU_REVEAL_RETRY_MS, context);
+                }
             }
             MenuMsg::HighlightActivate => {
                 let Some((target, _, _)) = &self.menu.open else {
@@ -849,6 +887,28 @@ impl DesktopApp {
         });
     }
 
+    /// After the next render, bring the highlighted menu row into view.
+    fn reveal_highlight(&mut self, context: &ComponentContext<Self>) {
+        self.menu.reveal_epoch += 1;
+        self.menu.reveal_after = self.renders.get();
+        self.post_reveal_highlight(self.menu.reveal_epoch, 0, context);
+    }
+
+    fn post_reveal_highlight(
+        &self,
+        epoch: u64,
+        delay_ms: u64,
+        context: &ComponentContext<Self>,
+    ) {
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            if delay_ms > 0 {
+                let _ = feed::backoff(delay_ms, &cancelled);
+            }
+            Message::Menu(MenuMsg::Reveal(epoch))
+        });
+    }
+
     /// The menu's entries for a target, in order: (action, label, glyph,
     /// destructive).
     pub(super) fn menu_entries(
@@ -1058,7 +1118,11 @@ impl DesktopApp {
         };
         let width = self.window_width.unwrap_or(tokens::layout::WINDOW_WIDTH);
         let height = self.window_height.unwrap_or(tokens::layout::WINDOW_HEIGHT);
-        let left = x.min(width - MENU_WIDTH - tokens::spacing::SM).max(0.0);
+        let margin = tokens::spacing::SM;
+        // A narrow client caps the outer menu (its padding included)
+        // instead of running past the client edge (#683).
+        let menu_width = menu_width(width);
+        let left = x.min(width - menu_width - margin).max(0.0);
         let entries = self.menu_entries(target);
         let (top, max_height) = menu_placement(*y, entries.len(), height);
         let highlight = self.menu.highlight;
@@ -1071,17 +1135,22 @@ impl DesktopApp {
                 } else {
                     m3::body(label.clone())
                 };
+                let mut button = m3::row(palette, highlight == Some(index))
+                    .automation_name(label.clone())
+                    .on_click(context.message(Message::Menu(MenuMsg::Chosen(action))));
+                if highlight == Some(index) {
+                    // Bound when it renders; focusing it scrolls it into
+                    // view (#683).
+                    button = button.element_ref(&self.menu.row_ref);
+                }
                 KeyedView::new(
-                    label.clone(),
-                    m3::row(palette, highlight == Some(index))
-                        .automation_name(label)
-                        .on_click(context.message(Message::Menu(MenuMsg::Chosen(action))))
-                        .content(
-                            StackPanel::new()
-                                .orientation(Orientation::Horizontal)
-                                .spacing(tokens::spacing::SM)
-                                .children((m3::icon(glyph), text)),
-                        ),
+                    label,
+                    button.content(
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .spacing(tokens::spacing::SM)
+                            .children((m3::icon(glyph), text)),
+                    ),
                 )
             })
             .collect();
@@ -1092,7 +1161,7 @@ impl DesktopApp {
                     context.callback(|_: PointerEventInfo| Message::Menu(MenuMsg::Closed)),
                 ),
             m3::popover(palette)
-                .width(MENU_WIDTH)
+                .width(menu_width)
                 .horizontal_alignment(HorizontalAlignment::Left)
                 .vertical_alignment(VerticalAlignment::Top)
                 .margin(Thickness::new(left, top, 0.0, 0.0))
@@ -1345,6 +1414,14 @@ const MENU_ROW_HEIGHT: f64 = tokens::height::CONTROL;
 /// The popover's vertical insets around the rows.
 const MENU_VERTICAL_PADDING: f64 = 2.0 * tokens::spacing::XS;
 
+/// The menu's width in window DIPs: the fixed width, capped
+/// to a narrow client (the same margin both sides) so the outer menu,
+/// its padding included, never runs past the client edge (#683). It
+/// never collapses below one row's height.
+fn menu_width(client_width: f64) -> f64 {
+    MENU_WIDTH.min((client_width - 2.0 * tokens::spacing::SM).max(MENU_ROW_HEIGHT))
+}
+
 /// The menu's top edge in window DIPs and its visible height cap: the
 /// pointer, moved up when the menu would run past the client bottom. An
 /// oversized menu keeps the top margin and scrolls instead of placing
@@ -1400,6 +1477,15 @@ mod tests {
         let (top, max) = menu_placement(10.0, 40, 400.0);
         assert_eq!(top, 8.0);
         assert_eq!(max, 384.0);
+    }
+
+    #[test]
+    fn a_narrow_client_caps_the_menu_width() {
+        // #683: the fixed width would run past a narrow client; the
+        // outer menu (padding included) stays inside the margins.
+        assert_eq!(menu_width(1440.0), MENU_WIDTH);
+        assert_eq!(menu_width(200.0), 184.0);
+        assert_eq!(menu_width(40.0), MENU_ROW_HEIGHT);
     }
 
     #[test]
