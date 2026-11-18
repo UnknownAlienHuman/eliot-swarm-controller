@@ -260,7 +260,9 @@ impl Router {
         let after: Option<(i64, String)> = self.inner.digest_poll_cursor.lock_recover().clone();
         let mut pending: Vec<DigestRow> = {
             let store = self.inner.store.lock().await;
-            let after = after.as_ref().map(|(created_at, id)| (*created_at, id.as_str()));
+            let after = after
+                .as_ref()
+                .map(|(created_at, id)| (*created_at, id.as_str()));
             store.pending_completion_digests_after(after, DIGEST_POLL_PAGE)?
         };
         if pending.is_empty() && after.is_some() {

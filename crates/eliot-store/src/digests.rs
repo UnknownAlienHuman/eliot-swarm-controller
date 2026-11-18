@@ -679,10 +679,7 @@ mod tests {
         // Past the newest row the page is empty; wrapping restarts at the
         // oldest row so the sweep cycles instead of stalling.
         let drained = store
-            .pending_completion_digests_after(
-                Some((tail[0].created_at, tail[0].id.as_str())),
-                50,
-            )
+            .pending_completion_digests_after(Some((tail[0].created_at, tail[0].id.as_str())), 50)
             .expect("drained page");
         assert!(drained.is_empty());
         let wrapped = store
