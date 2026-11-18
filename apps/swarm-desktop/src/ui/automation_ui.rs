@@ -590,6 +590,21 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
     cards
 }
 
+/// The edit form whose assignment no longer has a card (another writer
+/// removed it while it was open): render it after the cards so its retained
+/// inputs and refusal stay visible.
+pub(super) fn unmatched_editing_form<'a>(
+    form: Option<&'a AssignmentForm>,
+    cards: &'a [Card],
+) -> Option<&'a AssignmentForm> {
+    let form = form.filter(|form| form.editing.is_some())?;
+    let editing = form.editing.as_ref()?;
+    let matched = cards
+        .iter()
+        .any(|card| card.assignment.as_ref().map(|(key, _)| key) == Some(editing));
+    (!matched).then_some(form)
+}
+
 /// A refused Run now in words. An assignment with no new brief or with its
 /// most tasks already running refuses the manual run
 /// (`automation::assignment::prepare`): that is an answer, not a failure.
@@ -1414,5 +1429,44 @@ mod tests {
             assert_eq!(reopened.read_id().unwrap(), None);
         }
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn editing_form(key: Option<&str>) -> AssignmentForm {
+        AssignmentForm {
+            editing: key.map(str::to_owned),
+            name: key.unwrap_or_default().to_owned(),
+            ..AssignmentForm::default()
+        }
+    }
+
+    fn assignment_card(key: &str) -> Card {
+        Card {
+            key: format!("assignment:{key}"),
+            title: key.to_owned(),
+            sentence: String::new(),
+            state: CardState::Running,
+            times: String::new(),
+            paths: Vec::new(),
+            run: None,
+            assignment: Some((key.to_owned(), true)),
+            technical: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_editing_form_without_its_card_is_unmatched() {
+        let cards = vec![assignment_card("queue10")];
+        // The edited assignment still has its card: rendered in place.
+        let matched = editing_form(Some("queue10"));
+        assert!(unmatched_editing_form(Some(&matched), &cards).is_none());
+        // Another writer removed it: rendered after the cards.
+        let gone = editing_form(Some("gone"));
+        let removed = unmatched_editing_form(Some(&gone), &cards).unwrap();
+        assert_eq!(removed.editing.as_deref(), Some("gone"));
+        // A new automation is never unmatched.
+        let fresh = editing_form(None);
+        assert!(unmatched_editing_form(Some(&fresh), &cards).is_none());
+        assert!(unmatched_editing_form(None, &cards).is_none());
+        assert!(unmatched_editing_form(Some(&gone), &[]).is_some());
     }
 }

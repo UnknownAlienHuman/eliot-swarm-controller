@@ -6,7 +6,7 @@
 
 use super::super::automation_ui::{
     AssignmentForm, AssignmentView, AutomationMsg, Card, CardInputs, FormField, TimerKey, cards,
-    interval_ms,
+    interval_ms, unmatched_editing_form,
 };
 use super::*;
 
@@ -294,6 +294,17 @@ impl DesktopApp {
                     Some(form) => self.assignment_form_view(form, context, palette),
                     None => self.automation_card(card, context, palette),
                 },
+            ));
+        }
+        // Another writer may have removed the edited assignment while its
+        // form was open: no card matches, so the form renders after the
+        // cards with its retained inputs and refusal.
+        if let Some(unmatched) = unmatched_editing_form(form, &cards)
+            && let Some(editing) = unmatched.editing.as_ref()
+        {
+            parts.push(KeyedView::new(
+                format!("form:editing:{editing}"),
+                self.assignment_form_view(unmatched, context, palette),
             ));
         }
         for namespace in &self.automation.rules {
