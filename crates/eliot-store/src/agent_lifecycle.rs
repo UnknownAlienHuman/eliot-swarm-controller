@@ -338,7 +338,12 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     db!(tx.execute("DELETE FROM processes WHERE EXISTS(SELECT 1 FROM deleted_agents d WHERE processes.owner GLOB 'agent:a'||d.id||'#*' OR processes.owner GLOB 'workspace:a'||d.id||'#*')",[]));
     // Keep retry identities after removing payloads: a deleted native effect can never be admitted again.
     db!(tx.execute("INSERT INTO writes(id,principal,method,payload_digest,result,created_at) SELECT c.id,c.principal,c.method,c.payload_digest,'{}',?1 FROM deleted_commands d JOIN commands c ON c.id=d.id",[now]));
-    db!(tx.execute("UPDATE provider_holds SET probe_command=NULL WHERE probe_command IN (SELECT id FROM deleted_commands)",[]));
+    // A deleted probe binding is proven settled (the tree guard above admits
+    // no live or unknown command), so its claim falls back to the
+    // conservative held restriction instead of violating the held/probing
+    // CHECK or silently dropping the restriction. Genuinely unknown ongoing
+    // probes never reach this statement: they block the delete above.
+    db!(tx.execute("UPDATE provider_holds SET probe_command=NULL, state='held', updated_at=?1 WHERE probe_command IN (SELECT id FROM deleted_commands)",[now]));
     // Active cleanup attempts already block. Deleting the Agent supersedes
     // plan items that never acquired an attempt fence.
     for (table, column) in [

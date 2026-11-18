@@ -663,3 +663,104 @@ fn fresh_launch_rebinds_parent_startup_metadata_without_reselecting_profile() {
         admission.command.args
     );
 }
+
+#[test]
+fn delete_after_failed_probe_releases_claim_to_held_without_faulting_writer() {
+    // #609: a known-failed probe keeps its probing claim. Deleting the Agent
+    // must retain the conservative held restriction while dropping the
+    // deleted binding, not violate the provider_holds CHECK and fault the
+    // shared writer.
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let agent = ready_agent(&mut store, "provider-probe-delete", now);
+    let healthy_launch = SubmitCommand {
+        id: Ulid::new().to_string(),
+        target: None,
+        selector: None,
+        verb: "launch".to_owned(),
+        args: json!({"project":"provider-probe-delete-other", "workspace":"synthetic-workspace", "harness":"codex", "profile":"unheld", "profile_snapshot":{}}),
+        expected_generation: Some(0),
+        expected_turn_id: None,
+        request_id: None,
+        probe: false,
+    };
+    let first_id = Ulid::new().to_string();
+    let first_turn = start_provider_turn(&mut store, &agent, &first_id, false, now + 1);
+    complete_provider_turn(
+        &mut store,
+        &agent,
+        &first_id,
+        &first_turn,
+        "failed",
+        Some((ProviderRestrictionKind::RateLimit, None)),
+        now + 4,
+    );
+
+    let probe_id = Ulid::new().to_string();
+    store
+        .submit(
+            "owner",
+            provider_send_request(&agent, &probe_id, true),
+            now + 5,
+        )
+        .expect("admit probe");
+    store.dispatch(&probe_id, now + 6).unwrap();
+    store
+        .settle(
+            &probe_id,
+            CommandState::Failed,
+            Some(json!({"reason":"known failure may have partial effects"})),
+            now + 7,
+        )
+        .expect("retain known failed command result");
+    let hold = store.list_provider_holds(None, 10).unwrap().holds.remove(0);
+    assert_eq!(hold.state, ProviderHoldState::Probing);
+    assert_eq!(hold.probe_command.as_deref(), Some(probe_id.as_str()));
+
+    // Clean stop with drained custody so the retained probing claim is the
+    // only delete-sensitive state left.
+    install_live_custody_observations(&mut store, &agent, 1, now + 8);
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(agent.clone());
+    stop.expected_generation = Some(1);
+    let stop_id = stop.id.clone();
+    store.submit("owner", stop, now + 8).unwrap();
+    store.dispatch(&stop_id, now + 8).unwrap();
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "probe-delete:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                cursor: None,
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "probe-delete:ended".to_owned(),
+                    data: json!({"command_id": stop_id}),
+                }],
+            },
+            now + 8,
+        )
+        .unwrap();
+    store
+        .settle(&stop_id, CommandState::Applied, None, now + 8)
+        .unwrap();
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 8);
+
+    store
+        .change_agent_tree(&Ulid::new().to_string(), &agent, None, now + 8)
+        .expect("delete after a failed probe keeps the conservative hold");
+    assert!(store.get_agent(&agent).unwrap().is_none());
+    let holds = store.list_provider_holds(None, 10).unwrap().holds;
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].kind, ProviderRestrictionKind::RateLimit);
+    assert_eq!(holds[0].state, ProviderHoldState::Held);
+    assert!(holds[0].probe_command.is_none());
+    // The shared writer must stay healthy for unrelated mutations.
+    assert!(!store.is_write_faulted());
+    store
+        .submit("owner", healthy_launch, now + 8)
+        .expect("unrelated launch still commits after the delete");
+}

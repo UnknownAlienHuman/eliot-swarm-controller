@@ -1331,7 +1331,9 @@ provider scope through the normal send path. Future bounded automation must use 
 same path, not a parallel probe executor. The flag defaults false and does not enter
 native input. Time makes a probe eligible but never clears a hold. A successful
 exact-bound terminal probe clears rate-limit/quota holds; failed or interrupted probes
-retain them, while unknown probes retain their claim across restart. Auth and ModelRemoved
+retain them, while unknown probes retain their claim across restart. Deleting an Agent
+whose probe command is settled releases that probe binding back to the conservative
+held restriction instead of dropping it. Auth and ModelRemoved
 holds require owner correction and are not probe-eligible. Provider restriction facts
 are defined in [monitoring](monitoring.md#provider-holds).
 
