@@ -1583,10 +1583,14 @@ harness must match and observed Agents are `not_allowed`. Every response
 carries `configure`, the harness's mid-session `configure` support from the
 same table `configure` admission uses: `model_refusal`/`effort_refusal` are
 absent when the field has a verified mechanism and otherwise hold the exact
-`unsupported` refusal admission returns. The read is cached per native route/account
-scope with a freshness timestamp (`fetched_at_ms`, `ttl_ms`) and a nonsecret
-credential identity (a name, never a value); every response carries its
-`scope`, `fetched_at_ms`, `ttl_ms` and `credential`. Native model ids are
+`unsupported` refusal admission returns. The read is cached under a private
+canonical cache identity derived from the frozen native route/account
+selectors (account binding, native store paths, full provider endpoint,
+frozen executable) with a freshness timestamp (`fetched_at_ms`, `ttl_ms`)
+and a nonsecret credential identity (a name, never a value); every response
+carries its public display `scope`, `fetched_at_ms`, `ttl_ms` and
+`credential`. A profile/settings edit that changes any selector yields a new
+cache key, so the old account's entry is never served under the new profile. Native model ids are
 retained verbatim and a failed read never selects another model or account.
 `harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is an Owner-only,
 read-only provider quota query. `harness` and optional `profile` keep their current

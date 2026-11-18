@@ -1,11 +1,20 @@
 //! Bounded cached catalogue/quota scope derivation for `harness.models`
 //! and `harness.quota`.
 //!
-//! The cache is keyed by the nonsecret native route/account scope, so one
-//! live native read serves every caller on that scope until its TTL lapses.
-//! Scope and credential identity derive only from frozen snapshot selectors
-//! (harness, profile label, route/binding names); credential values,
-//! `pass_env` resolutions and literal environment bodies are never read here.
+//! The cache is keyed by the private canonical identity
+//! ([`catalog::canonical_cache_identity`]), so one live native read serves
+//! every caller on that scope until its TTL lapses. The public `scope`
+//! string stays a human-readable display; the key additionally carries the
+//! exact frozen nonsecret selectors that determine the native
+//! account/configuration and endpoint (account binding, native store paths,
+//! full provider URL, frozen executable). Scope, key and credential identity
+//! derive only from frozen snapshot selectors; credential values,
+//! `literal_env` bodies and other resolved secrets are never read here.
+//! A profile/settings edit that changes any selector yields a new key, so
+//! the old account's entry is never served under the new profile; entries
+//! for retired keys linger at most until TTL eviction. Account changes made
+//! outside Eliot configuration (native login flows) take effect within the
+//! same TTL bound.
 
 use super::{MODE_OPEN, Principal, Router, catalog, now_ms, require_owner};
 use eliot_core::api::{
@@ -171,6 +180,7 @@ impl Router {
             None => self.resolve_catalog_snapshot(&harness, profile, true)?,
         };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+        let cache_scope = catalog::canonical_cache_identity(&label, &harness, snapshot.as_ref());
         let cmd = snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.get("cmd"))
@@ -191,7 +201,7 @@ impl Router {
         } else {
             crate::adhoc::native_version_string(&cmd)
         };
-        let cache_key = catalog::models_key(&scope, &cmd, version.as_deref());
+        let cache_key = catalog::models_key(&cache_scope, &cmd, version.as_deref());
         let now = now_ms();
         if let Some(hit) = cache_key
             .as_deref()
@@ -405,6 +415,7 @@ impl Router {
             profile: None,
         };
         let (scope, credential) = catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+        let cache_key = catalog::canonical_cache_identity(&label, &harness, snapshot.as_ref());
         if harness == "muse"
             && let Some(profile) = snapshot.as_ref()
             && let Some(observation) = self
@@ -424,7 +435,7 @@ impl Router {
             .inner
             .catalog_cache
             .lock_recover()
-            .get_quota(&scope, now_ms())
+            .get_quota(&cache_key, now_ms())
         {
             request.validate_response(&hit)?;
             return serde_json::to_value(hit)
@@ -499,7 +510,7 @@ impl Router {
         self.inner
             .catalog_cache
             .lock_recover()
-            .insert_quota(response.clone());
+            .insert_quota(cache_key.clone(), response.clone());
         serde_json::to_value(response).map_err(|_| Error::new("internal", "quota encoding failed"))
     }
 
@@ -794,6 +805,29 @@ pub(crate) fn describe_snapshot(
         .unwrap_or(harness);
     let mut scope = format!("profile:{profile_label} harness:{harness}");
     let mut credential = "none".to_owned();
+    // The frozen account binding selects the native account: a profile edit
+    // that renames it must not reuse the previous account's cache entry.
+    if let Some(account) = snapshot
+        .get("account")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+    {
+        push_display_segment(&mut scope, &format!(" account:{account}"));
+    }
+    // Frozen native store inputs select the native home/configuration. The
+    // values are local paths (the snapshot policy rejects resolved secrets),
+    // so naming them keeps homes apart without leaking credentials.
+    if let Some(values) = snapshot.get("pass_env_values").and_then(Value::as_object) {
+        for (selector, marker) in [("CODEX_HOME", " home:"), ("CODEX_SQLITE_HOME", " sqlhome:")] {
+            if let Some(home) = values
+                .get(selector)
+                .and_then(Value::as_str)
+                .filter(|home| !home.is_empty())
+            {
+                push_display_segment(&mut scope, &format!("{marker}{home}"));
+            }
+        }
+    }
     match harness {
         "codex" => match snapshot.get("route_binding").and_then(Value::as_object) {
             Some(binding) => {
@@ -852,6 +886,73 @@ pub(crate) fn describe_snapshot(
         _ => {}
     }
     (scope, credential)
+}
+
+/// Append one display segment, dropping it when the public scope would
+/// exceed its validated bound. Display stays lossy but valid; the private
+/// canonical identity always carries the full selectors.
+fn push_display_segment(scope: &mut String, segment: &str) {
+    if scope.len() + segment.len() <= eliot_core::api::MAX_HARNESS_SCOPE_BYTES {
+        scope.push_str(segment);
+    }
+}
+
+/// Private canonical cache identity for one frozen snapshot: the public
+/// display scope plus the exact frozen nonsecret selectors that determine
+/// the native account/configuration and endpoint. The full provider URL
+/// enters (authority alone collides across paths sharing a host), as do the
+/// account binding, the native store paths and the frozen executable. Only
+/// names and nonsecret paths enter: never credential values, never
+/// `literal_env` bodies, never resolved secrets.
+pub(crate) fn canonical_cache_identity(
+    profile_label: &str,
+    harness: &str,
+    snapshot: Option<&Value>,
+) -> String {
+    let (display, _) = describe_snapshot(profile_label, harness, snapshot);
+    let mut key = display;
+    key.push('\0');
+    let Some(snapshot) = snapshot else {
+        return key;
+    };
+    for value in [
+        snapshot
+            .get("account")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        snapshot
+            .pointer("/route_binding/provider_base_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        snapshot
+            .get("provider_base_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        snapshot
+            .get("cmd")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        snapshot
+            .pointer("/pass_env_values/CODEX_HOME")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        snapshot
+            .pointer("/pass_env_values/CODEX_SQLITE_HOME")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        snapshot
+            .get("api_key_env")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        snapshot
+            .pointer("/route_binding/client_key_env_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    ] {
+        key.push_str(value);
+        key.push('\0');
+    }
+    key
 }
 
 /// Strip a provider base URL to its authority (host with port, no userinfo
@@ -933,16 +1034,19 @@ impl CatalogCache {
         self.models.insert(key, entry);
     }
 
-    pub(crate) fn get_quota(&self, scope: &str, now: i64) -> Option<HarnessQuotaResponse> {
+    pub(crate) fn get_quota(&self, key: &str, now: i64) -> Option<HarnessQuotaResponse> {
         self.quotas
-            .get(scope)
+            .get(key)
             .filter(|entry| fresh(entry.fetched_at_ms, entry.ttl_ms, now))
             .cloned()
     }
 
-    pub(crate) fn insert_quota(&mut self, entry: HarnessQuotaResponse) {
+    /// Insert under the private canonical identity (`key`); the response
+    /// keeps its public display `scope`. The two are separate on purpose:
+    /// display is for operators, the key is for cache correctness.
+    pub(crate) fn insert_quota(&mut self, key: String, entry: HarnessQuotaResponse) {
         evict_quotas(&mut self.quotas, entry.fetched_at_ms);
-        self.quotas.insert(entry.scope.clone(), entry);
+        self.quotas.insert(key, entry);
     }
 
     /// The fresh aggregate for `key`. A partial one answers only a
@@ -1383,6 +1487,55 @@ mod tests {
     }
 
     #[test]
+    fn cache_identity_separates_accounts_homes_and_endpoints() {
+        let base = json!({
+            "harness": "codex",
+            "account": "team-a",
+            "route_binding": {
+                "name": "corp",
+                "provider_base_url": "http://127.0.0.1:10300/v1",
+                "client_key_env_name": "LOCAL_CLIENT",
+            },
+            "pass_env_values": {"CODEX_HOME": "C:/homes/a", "CODEX_SQLITE_HOME": null},
+            "literal_env": {"TOKEN": "super-secret-value"},
+        });
+        let key = canonical_cache_identity("p", "codex", Some(&base));
+        let (scope, _) = describe_snapshot("p", "codex", Some(&base));
+        // Display names the new selectors but never a credential value.
+        assert!(scope.contains("account:team-a"), "{scope}");
+        assert!(scope.contains("home:C:/homes/a"), "{scope}");
+        assert!(!scope.contains("super-secret-value"), "{scope}");
+        assert!(!key.contains("super-secret-value"), "key leaks a secret");
+        // Same profile label, different home: a different key.
+        let mut other = base.clone();
+        other["pass_env_values"]["CODEX_HOME"] = json!("C:/homes/b");
+        assert_ne!(key, canonical_cache_identity("p", "codex", Some(&other)));
+        // Same authority, different endpoint path: a different key.
+        let mut other = base.clone();
+        other["route_binding"]["provider_base_url"] = json!("http://127.0.0.1:10300/v2");
+        assert_ne!(key, canonical_cache_identity("p", "codex", Some(&other)));
+        // Different account binding: a different key.
+        let mut other = base.clone();
+        other["account"] = json!("team-b");
+        assert_ne!(key, canonical_cache_identity("p", "codex", Some(&other)));
+        // Identical selectors: the same key, so reads still coalesce.
+        assert_eq!(key, canonical_cache_identity("p", "codex", Some(&base)));
+        // Display scope stays within its validated bound.
+        eliot_core::api::HarnessQuotaResponse {
+            harness: "codex".to_owned(),
+            scope: scope.clone(),
+            fetched_at_ms: 1_000,
+            ttl_ms: CATALOG_TTL_MS,
+            credential: "env:LOCAL_CLIENT".to_owned(),
+            status: "supported".to_owned(),
+            note: None,
+            details: None,
+        }
+        .validate()
+        .expect("display scope stays valid");
+    }
+
+    #[test]
     fn static_harnesses_use_minimal_scope() {
         let (scope, credential) = describe_snapshot("adhoc", "antigravity", None);
         assert_eq!(scope, "profile:adhoc harness:antigravity");
@@ -1406,7 +1559,7 @@ mod tests {
             note: None,
             details: None,
         };
-        cache.insert_quota(entry);
+        cache.insert_quota("profile:adhoc harness:codex route:direct".to_owned(), entry);
         assert!(
             cache
                 .get_quota("profile:adhoc harness:codex route:direct", 61_000)
@@ -1424,16 +1577,19 @@ mod tests {
     fn cache_stays_bounded() {
         let mut cache = CatalogCache::default();
         for index in 0..(MAX_CACHED_SCOPES + 5) {
-            cache.insert_quota(HarnessQuotaResponse {
-                harness: "codex".to_owned(),
-                scope: format!("scope-{index}"),
-                fetched_at_ms: 1_000 + index as i64,
-                ttl_ms: CATALOG_TTL_MS,
-                credential: "ambient".to_owned(),
-                status: "unsupported".to_owned(),
-                note: None,
-                details: None,
-            });
+            cache.insert_quota(
+                format!("scope-{index}"),
+                HarnessQuotaResponse {
+                    harness: "codex".to_owned(),
+                    scope: format!("scope-{index}"),
+                    fetched_at_ms: 1_000 + index as i64,
+                    ttl_ms: CATALOG_TTL_MS,
+                    credential: "ambient".to_owned(),
+                    status: "unsupported".to_owned(),
+                    note: None,
+                    details: None,
+                },
+            );
         }
         assert!(cache.len().1 <= MAX_CACHED_SCOPES);
     }
@@ -1600,7 +1756,13 @@ mod tests {
             "antigravity",
             Some(&json!({"harness":"antigravity"})),
         );
+        let cache_key = catalog::canonical_cache_identity(
+            "adhoc",
+            "antigravity",
+            Some(&json!({"harness":"antigravity"})),
+        );
         router.inner.catalog_cache.lock_recover().insert_quota(
+            cache_key,
             eliot_core::api::HarnessQuotaResponse {
                 harness: "antigravity".to_owned(),
                 scope,
