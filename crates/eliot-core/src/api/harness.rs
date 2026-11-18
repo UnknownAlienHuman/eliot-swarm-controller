@@ -848,6 +848,10 @@ pub struct QuotaWindow {
 }
 impl QuotaObservation {
     pub fn validate(&self) -> Result<()> {
+        // Upstream MSP SubscriptionUsageWindow/Weekly allow integer
+        // usedPercent >= 0 including values > 100 (over-quota is valid).
+        // Canonical observations retain the finite nonnegative measurement;
+        // only UI remaining-progress visualization clamps to 0..100.
         if self.observed_at_ms < 0
             || self.windows.is_empty()
             || self.windows.len() > 32
@@ -856,7 +860,7 @@ impl QuotaObservation {
                     || w.label.len() > 128
                     || w.label.chars().any(char::is_control)
                     || !w.used_percent.is_finite()
-                    || !(0.0..=100.0).contains(&w.used_percent)
+                    || w.used_percent < 0.0
                     || w.resets_at_ms.is_some_and(|at| at < 0)
                     || w.window_duration_mins.is_some_and(|m| m <= 0)
             })
@@ -884,6 +888,49 @@ mod tests {
             credential: "ambient".to_owned(),
             configure: ConfigureSupport::for_harness(harness),
         }
+    }
+
+    #[test]
+    fn quota_observation_retains_over_quota_percent() {
+        // Audit #640: upstream MSP usedPercent >= 0 including > 100 is valid.
+        let over = QuotaObservation {
+            observed_at_ms: 1,
+            windows: vec![
+                QuotaWindow {
+                    label: "5-hour".to_owned(),
+                    used_percent: 101.0,
+                    resets_at_ms: Some(2),
+                    window_duration_mins: Some(300),
+                },
+                QuotaWindow {
+                    label: "Weekly".to_owned(),
+                    used_percent: 250.0,
+                    resets_at_ms: Some(3),
+                    window_duration_mins: Some(10080),
+                },
+            ],
+        };
+        over.validate().expect("over-quota is valid");
+        let bad = QuotaObservation {
+            observed_at_ms: 1,
+            windows: vec![QuotaWindow {
+                label: "5-hour".to_owned(),
+                used_percent: -1.0,
+                resets_at_ms: Some(2),
+                window_duration_mins: Some(300),
+            }],
+        };
+        assert!(bad.validate().is_err());
+        let nan = QuotaObservation {
+            observed_at_ms: 1,
+            windows: vec![QuotaWindow {
+                label: "5-hour".to_owned(),
+                used_percent: f64::NAN,
+                resets_at_ms: Some(2),
+                window_duration_mins: Some(300),
+            }],
+        };
+        assert!(nan.validate().is_err());
     }
 
     #[test]
