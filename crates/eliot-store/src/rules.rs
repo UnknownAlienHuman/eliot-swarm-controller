@@ -76,6 +76,13 @@ pub enum RuleCursorOutcome {
     Disabled,
     /// A deterministic definition/action rejection was recorded.
     Rejected { code: String },
+    /// A configured-capacity preparation refusal retains bounded Owner remedy
+    /// text for automation readback; all other errors use `Rejected`.
+    RejectedWithCapacity {
+        code: String,
+        message: String,
+        failure_where: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -188,11 +195,15 @@ impl<'a> RuleFiringKey<'a> {
         data
     }
 
-    fn rejected_data(&self, code: &str) -> Value {
+    fn rejected_data(&self, rejection: &Error) -> Value {
         let mut data = self.args.clone();
         let object = data.as_object_mut().expect("firing args are an object");
         object.insert("parent_command".to_owned(), json!(self.parent_id));
-        object.insert("code".to_owned(), json!(code));
+        object.insert("code".to_owned(), json!(rejection.code));
+        if let Some((message, where_)) = capacity_metadata(rejection) {
+            object.insert("message".to_owned(), json!(message));
+            object.insert("where".to_owned(), json!(where_));
+        }
         data
     }
 
@@ -242,7 +253,7 @@ fn next_rule_cause_depth(trigger_cause: Option<&core::EventCause>) -> u8 {
 
 enum RuleParentOutcome<'a> {
     Admitted,
-    Rejected { code: &'a str },
+    Rejected { error: &'a Error },
 }
 
 impl Store {
@@ -504,29 +515,37 @@ impl Store {
                     }
                 }
                 RuleCursorOutcome::Rejected { code } => {
-                    validate_rule_rejection_code(&code)?;
-                    let trigger = load_rule_trigger(&tx, through)?;
-                    // A malformed rule-triggered bookkeeping event is consumed
-                    // silently so a rule cannot generate an endless rejection chain.
-                    // Also suppress a would-be sixth-level derivative before
-                    // writing the rejection marker; the cursor still commits below.
-                    if !trigger.kind.starts_with("rule.")
-                        && next_rule_cause_depth(trigger.cause.as_ref()) <= 5
+                    events.extend(rule_rejection_event(
+                        &tx,
+                        &state.id,
+                        revision,
+                        cursor + 1..=through,
+                        &code,
+                        None,
+                        now,
+                    )?);
+                }
+                RuleCursorOutcome::RejectedWithCapacity {
+                    code,
+                    message,
+                    failure_where,
+                } => {
+                    if code != "capacity_unavailable" || failure_where != "store.admission.capacity"
                     {
-                        events.push(insert_rule_event_with_cause(
-                            &tx,
-                            now,
-                            "rule.rejected",
-                            json!({
-                                "rule": state.id,
-                                "revision": revision,
-                                "from_seq": cursor + 1,
-                                "through_seq": through,
-                                "code": code,
-                            }),
-                            trigger.cause,
-                        )?);
+                        return Err(Error::new(
+                            "invalid",
+                            "rule capacity rejection metadata is invalid",
+                        ));
                     }
+                    events.extend(rule_rejection_event(
+                        &tx,
+                        &state.id,
+                        revision,
+                        cursor + 1..=through,
+                        &code,
+                        Some((&message, &failure_where)),
+                        now,
+                    )?);
                 }
             }
 
@@ -777,7 +796,8 @@ impl Store {
         };
         if let Some(code) = binding_error {
             request.id = key.child_id.clone();
-            return reject_rule_event(tx, &self.write_faulted, &key, &code, now);
+            let error = Error::new(code.clone(), code);
+            return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
         }
         let canonical_definition = if retiring {
             stored
@@ -808,7 +828,7 @@ impl Store {
         if let Err(error) = validate_project_rule_action_tx(&tx, principal, &request) {
             if core::is_deterministic_pre_admission_rejection(&error.code) {
                 request.id = key.child_id.clone();
-                return reject_rule_event(tx, &self.write_faulted, &key, &error.code, now);
+                return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
             }
             return Err(error);
         }
@@ -828,7 +848,8 @@ impl Store {
             now,
         )?;
         if rule_limit_reached(scoped_count, limit.max) || global_count >= GLOBAL_RULE_ACTION_LIMIT {
-            return reject_rule_event(tx, &self.write_faulted, &key, "rate_limited", now);
+            let error = Error::new("rate_limited", "rule action rate limit reached");
+            return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
         }
 
         if request.verb == "run" {
@@ -843,11 +864,12 @@ impl Store {
         // performs the normal deterministic checks before inserting the child;
         // the surrounding transaction rolls every write back on persistence failure.
         let limits = self.hierarchy_limits;
+        let policy = self.capacity_policy.as_deref();
         let (parent, child_admission, events) =
-            match admit_rule_action_tx(&tx, &key, request, now, limits) {
+            match admit_rule_action_tx(&tx, &key, request, now, limits, policy) {
                 Ok(admission) => admission,
                 Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
-                    return reject_rule_event(tx, &self.write_faulted, &key, &error.code, now);
+                    return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
                 }
                 Err(error) => return Err(error),
             };
@@ -2427,6 +2449,40 @@ fn validate_rule_rejection_code(code: &str) -> Result<()> {
     Ok(())
 }
 
+fn capacity_metadata(error: &Error) -> Option<(&str, &str)> {
+    (error.code == "capacity_unavailable"
+        && error.failure_where.as_deref() == Some("store.admission.capacity"))
+    .then_some((error.message.as_str(), "store.admission.capacity"))
+}
+
+fn rule_rejection_event(
+    tx: &Transaction<'_>,
+    rule: &str,
+    revision: i64,
+    range: std::ops::RangeInclusive<i64>,
+    code: &str,
+    capacity: Option<(&str, &str)>,
+    now: i64,
+) -> Result<Option<Event>> {
+    validate_rule_rejection_code(code)?;
+    let trigger = load_rule_trigger(tx, *range.end())?;
+    if trigger.kind.starts_with("rule.") || next_rule_cause_depth(trigger.cause.as_ref()) > 5 {
+        return Ok(None);
+    }
+    let mut data = json!({
+        "rule": rule,
+        "revision": revision,
+        "from_seq": range.start(),
+        "through_seq": range.end(),
+        "code": code,
+    });
+    if let Some((message, failure_where)) = capacity {
+        data["message"] = json!(message);
+        data["where"] = json!(failure_where);
+    }
+    insert_rule_event_with_cause(tx, now, "rule.rejected", data, trigger.cause).map(Some)
+}
+
 fn insert_rule_parent(
     tx: &Transaction<'_>,
     key: &RuleFiringKey<'_>,
@@ -2436,15 +2492,25 @@ fn insert_rule_parent(
     if write_exists(tx, &key.parent_id)? {
         return Err(Error::new("id_conflict", "rule parent id is already used"));
     }
-    let (child_ids, state, rejection_code) = match outcome_kind {
+    let (child_ids, state, rejection_code) = match &outcome_kind {
         RuleParentOutcome::Admitted => (vec![key.child_id.clone()], CommandState::Applied, None),
-        RuleParentOutcome::Rejected { code } => (Vec::new(), CommandState::Rejected, Some(code)),
+        RuleParentOutcome::Rejected { error } => (
+            Vec::new(),
+            CommandState::Rejected,
+            Some(error.code.as_str()),
+        ),
     };
     let args = &key.args;
     let mut outcome = match rejection_code {
         Some(code) => json!({"children": child_ids, "code": code}),
         None => json!({"children": child_ids}),
     };
+    if let RuleParentOutcome::Rejected { error } = &outcome_kind
+        && let Some((message, where_)) = capacity_metadata(error)
+    {
+        outcome["message"] = json!(message);
+        outcome["where"] = json!(where_);
+    }
     if rejection_code.is_none()
         && let Some(script_context) = &key.script_context
     {
@@ -2521,6 +2587,7 @@ fn admit_rule_action_tx(
     mut request: SubmitCommand,
     now: i64,
     limits: core::api::HierarchyLimits,
+    policy: Option<&capacity::PolicyLoader>,
 ) -> Result<(Command, Admission, Vec<Event>)> {
     let parent_cause = key.command_cause(&key.parent_id)?;
     let child_cause = key.command_cause(&key.child_id)?;
@@ -2531,7 +2598,7 @@ fn admit_rule_action_tx(
     tx.execute_batch("SAVEPOINT rule_child_admission")
         .map_err(sql_error)?;
     let mut child_admission =
-        match admission::submit_tx(tx, key.principal, request, None, now, true, limits) {
+        match admission::submit_tx(tx, key.principal, request, None, now, true, limits, policy) {
             Ok(admission) => {
                 tx.execute_batch("RELEASE rule_child_admission")
                     .map_err(sql_error)?;
@@ -2613,7 +2680,7 @@ fn reject_rule_event(
     tx: Transaction<'_>,
     write_faulted: &Cell<bool>,
     key: &RuleFiringKey<'_>,
-    code: &str,
+    error: &Error,
     now: i64,
 ) -> Result<RuleEventAdmission> {
     let RuleFiringIdentity::Event { event_seq } = key.identity else {
@@ -2624,14 +2691,14 @@ fn reject_rule_event(
     };
     let parent_cause = key.command_cause(&key.parent_id)?;
     let (parent, mut parent_event) =
-        insert_rule_parent(&tx, key, RuleParentOutcome::Rejected { code }, now)?;
+        insert_rule_parent(&tx, key, RuleParentOutcome::Rejected { error }, now)?;
     annotate_new_command_cause_tx(&tx, &parent.id, &mut parent_event, parent_cause.clone())?;
     let mut events = vec![parent_event];
     events.push(insert_rule_event_with_cause(
         &tx,
         now,
         "rule.rejected",
-        key.rejected_data(code),
+        key.rejected_data(error),
         Some(parent_cause),
     )?);
     let view = update_rule_cursor_tx(&tx, key.principal, key.state, event_seq, now)?;

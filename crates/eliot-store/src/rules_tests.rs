@@ -621,6 +621,62 @@ fn event_inject_binds_exact_agent_generation_and_turn() {
 }
 
 #[test]
+fn rule_catch_up_capacity_refusal_retains_scope_and_remedy() {
+    let mut store = store();
+    let rule = definition("capacity-refusal", true);
+    let request_id = Ulid::new();
+    let now = request_id.timestamp_ms() as i64;
+    let event_seq = insert_test_event(&mut store, "command.accepted", now - 1);
+    let state = store.ensure_rule_state("owner", &rule, now).unwrap();
+    let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
+    launch.args = json!({
+        "project": "capacity-refusal-project",
+        "harness": "codex",
+        "profile": "fake",
+        "profile_snapshot": {
+            "capacity_scopes": [{"scope": "profile:fake", "max_live": 0}]
+        },
+        "workspace": "capacity-refusal-workspace"
+    });
+    launch.expected_generation = Some(0);
+
+    let admission = store
+        .admit_rule_catch_up(
+            "owner",
+            &core::api::RuleCatchUpRequest::new(
+                request_id.to_string(),
+                rule.id.as_str(),
+                event_seq - 1,
+                Some(event_seq),
+            ),
+            &state,
+            event_seq,
+            &[RuleCatchUpAction::command(event_seq, launch)],
+            now,
+        )
+        .unwrap();
+    let rejection = admission
+        .events
+        .iter()
+        .find(|event| event.kind == "rule.rejected")
+        .expect("capacity refusal marker");
+    assert_eq!(rejection.data["code"], "capacity_unavailable");
+    assert_eq!(rejection.data["where"], "store.admission.capacity");
+    assert!(
+        rejection.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("profile:fake")
+    );
+    assert!(
+        rejection.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("[profiles.fake] max_live")
+    );
+}
+
+#[test]
 fn event_inject_cannot_rebind_an_old_event_to_a_resumed_generation() {
     for point in ["next_input", "turn_safe_point"] {
         for generation in [None, Some(2), Some(1)] {
@@ -2600,6 +2656,7 @@ fn scheduled_and_manual_timer_store_paths_reject_resume_without_old_generation()
                 next_due_at_ms: None,
                 action: Some(scheduled_resume),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             scheduled_at_ms,
         )

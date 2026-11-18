@@ -238,6 +238,7 @@ impl Store {
                 now,
                 false,
                 self.hierarchy_limits,
+                self.capacity_policy.as_deref(),
             )?;
             tx.execute(
                 "UPDATE commands SET parent_command=?1,link_kind='switch',ordinal=0 WHERE id=?2",

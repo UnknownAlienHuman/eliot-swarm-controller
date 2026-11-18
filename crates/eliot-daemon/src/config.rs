@@ -372,6 +372,8 @@ struct FileConfig {
     #[serde(default)]
     projects: HashMap<String, toml::Spanned<ProjectEntry>>,
     #[serde(default)]
+    capacity: CapacityConfig,
+    #[serde(default)]
     automation: AutomationConfig,
     #[serde(default)]
     daemon: DaemonConfig,
@@ -989,6 +991,31 @@ struct AccountEntry {
     #[serde(default)]
     max_live: Option<u64>,
 }
+/// Owner-set bounds for the daemon-wide, per-project and per-assignment
+/// admission scopes (`global:swarm`, `project:<id>`, `manager_assignment:<id>`).
+/// A missing limit (`None`) is unlimited, as for profile, account and proxy
+/// caps; `0` disables admission to that scope. Limits ride the frozen launch
+/// snapshot, so lowering one blocks new admissions without stopping running
+/// work.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CapacityConfig {
+    #[serde(default)]
+    pub(crate) global_max_live: Option<u64>,
+    #[serde(default)]
+    pub(crate) projects: HashMap<String, CapacityProjectEntry>,
+}
+
+/// Per-project Owner bounds: the project cap and the manager-assignment cap.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CapacityProjectEntry {
+    #[serde(default)]
+    pub(crate) max_live: Option<u64>,
+    #[serde(default)]
+    pub(crate) manager_max_live: Option<u64>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProxyBaseUrls {
@@ -1418,6 +1445,20 @@ fn parse_config(source: &str) -> core::Result<FileConfig> {
             .iter()
             .map(|(role, profiles)| (role.as_str(), profiles)),
     );
+    if config.capacity.projects.len() > MAX_PROFILES {
+        return Err(core::Error::new(
+            "profile_error",
+            "config.toml: capacity projects exceed 256 entries",
+        ));
+    }
+    for name in config.capacity.projects.keys() {
+        if name.is_empty() || name.len() > 1024 || name.contains(char::is_control) {
+            return Err(core::Error::new(
+                "profile_error",
+                "config.toml: capacity project name is invalid",
+            ));
+        }
+    }
     for (role, profiles) in role_candidates {
         validate_routing_role(role)?;
         if profiles.len() > 64 {
@@ -1505,6 +1546,30 @@ pub(crate) fn load_daemon_config(data_root: &Path) -> core::Result<DaemonConfig>
         return Ok(DaemonConfig::default());
     };
     config.daemon.validate()
+}
+
+/// Current Owner capacity policy for admission and overview readback.
+pub(crate) fn load_scope_limits(data_root: &Path) -> core::Result<core::api::ScopeLimits> {
+    let Some((config, _)) = read_config(data_root)? else {
+        return Ok(core::api::ScopeLimits::default());
+    };
+    Ok(core::api::ScopeLimits {
+        global: config.capacity.global_max_live,
+        projects: config
+            .capacity
+            .projects
+            .into_iter()
+            .map(|(project, limits)| {
+                (
+                    project,
+                    core::api::ProjectScopeLimits {
+                        project: limits.max_live,
+                        manager_assignment: limits.manager_max_live,
+                    },
+                )
+            })
+            .collect(),
+    })
 }
 
 pub(crate) fn load_cloud_mcp_config(
@@ -5117,5 +5182,45 @@ output_limit = 4096
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn capacity_config_defaults_parses_and_validates() {
+        let config = parse_config("").unwrap();
+        assert_eq!(config.capacity, CapacityConfig::default());
+
+        let config = parse_config(
+            "[capacity]\nglobal_max_live=3\n[capacity.projects.app]\nmax_live=2\nmanager_max_live=1\n",
+        )
+        .unwrap();
+        assert_eq!(config.capacity.global_max_live, Some(3));
+        let entry = config.capacity.projects.get("app").unwrap();
+        assert_eq!(entry.max_live, Some(2));
+        assert_eq!(entry.manager_max_live, Some(1));
+
+        // Unknown capacity keys are rejected, like every other section.
+        assert!(parse_config("[capacity]\nunknown_key=1\n").is_err());
+        assert!(parse_config("[capacity.projects.app]\nunknown_key=1\n").is_err());
+
+        // Project names must be usable as capacity scope suffixes. Bare keys
+        // with surrounding whitespace parse to the trimmed name, so the
+        // hostile cases use quoted keys.
+        for bad in [" ", "a:b", "a\n"] {
+            let source = format!("[capacity.projects.{bad}]\nmax_live=1\n");
+            assert!(parse_config(&source).is_err(), "accepted {bad:?}");
+        }
+        for good in [" a", "a ", "a:b", "C:/work/app", "\\\\?\\C:\\work\\app"] {
+            // Backslashes are escapes inside TOML quoted keys, so the
+            // on-disk form doubles them; the parsed name stays `good`.
+            let key = good.replace('\\', "\\\\");
+            let source = format!("[capacity.projects.\"{key}\"]\nmax_live=1\n");
+            let config = parse_config(&source).unwrap();
+            assert!(config.capacity.projects.contains_key(good), "lost {good:?}");
+        }
+        {
+            let bad = "";
+            let source = format!("[capacity.projects.\"{bad}\"]\nmax_live=1\n");
+            assert!(parse_config(&source).is_err(), "accepted {bad:?}");
+        }
     }
 }

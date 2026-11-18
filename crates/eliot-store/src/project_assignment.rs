@@ -168,6 +168,7 @@ impl Store {
         request.validate()?;
         let write = AssignmentWrite::new(&request.id, LAUNCH, "owner", request, now)?;
         let limits = self.hierarchy_limits;
+        let policy = self.capacity_policy.clone();
         self.change_project_assignment(write, |tx| {
             let (registration, _) = authorize_project(tx, "owner", &request.project)?;
             let current = read_assignment(tx, &request.project)?;
@@ -217,8 +218,16 @@ impl Store {
             };
             launch.args["registered_project"] = json!(request.project);
             launch.args[MANAGER_LAUNCH_ARG] = json!(registration.revision);
-            let admission =
-                admission::submit_tx(tx, "owner", launch, preparation, now, false, limits)?;
+            let admission = admission::submit_tx(
+                tx,
+                "owner",
+                launch,
+                preparation,
+                now,
+                false,
+                limits,
+                policy.as_deref(),
+            )?;
             bind_manager_workspace(tx, &request.project, &bound_path, adopted.is_some())?;
             let result = ProjectAssignmentResult {
                 assignment: read_assignment(tx, &request.project)?,
@@ -386,7 +395,7 @@ fn startup_blocks_release(conn: &Connection, assignment: &ProjectAssignment) -> 
         || start.state == CommandState::Unknown && !preparation_unknown)
 }
 
-fn read_assignment(conn: &Connection, project: &str) -> Result<ProjectAssignment> {
+pub(super) fn read_assignment(conn: &Connection, project: &str) -> Result<ProjectAssignment> {
     let (num, generation, epoch, revision) = load_row(conn, project)?.unwrap_or((None, None, 0, 0));
     let (workspace, start_command_id, state): (Option<String>, Option<String>, Option<String>) =
         conn.query_row(

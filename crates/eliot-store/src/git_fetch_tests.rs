@@ -232,6 +232,7 @@ fn owner_and_project_event_and_timer_actions_admit_the_same_targetless_command()
                 next_due_at_ms: None,
                 action: Some(fetch_request(String::new(), &frozen)),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             scheduled_at_ms,
         )

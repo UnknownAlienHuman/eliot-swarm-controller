@@ -275,6 +275,7 @@ fn commit_scheduled_timer_run(
                 next_due_at_ms,
                 action: Some(action),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             scheduled_at_ms,
         )
@@ -451,6 +452,7 @@ fn commit_scheduled_timer_launch(
                 next_due_at_ms,
                 action: Some(timer_launch_action(project, text)),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             now,
         )
@@ -547,6 +549,7 @@ fn scheduled_stop(slot_ms: i64, next_due_at_ms: Option<i64>, agent: &str) -> Tim
         next_due_at_ms,
         action: Some(stop_request(agent)),
         skip_code: None,
+        skip_capacity_message: None,
     }
 }
 
@@ -757,6 +760,7 @@ fn scheduled_owner_resume_uses_exact_generation_and_never_replays_uncertain_inpu
                 next_due_at_ms: Some(first_due + period_ms),
                 action: Some(timer_resume_request(&agent, 2, None)),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             first_due,
         )
@@ -783,6 +787,7 @@ fn scheduled_owner_resume_uses_exact_generation_and_never_replays_uncertain_inpu
                     Some("new literal timer input"),
                 )),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             resume_at,
         )
@@ -840,6 +845,7 @@ fn scheduled_owner_resume_uses_exact_generation_and_never_replays_uncertain_inpu
                 next_due_at_ms: Some(resume_at + period_ms),
                 action: Some(timer_resume_request(&agent, 0, Some("replacement input"))),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             dispatch_at + 1,
         )
@@ -862,6 +868,7 @@ fn scheduled_owner_resume_uses_exact_generation_and_never_replays_uncertain_inpu
                 next_due_at_ms: Some(resume_at + period_ms),
                 action: Some(timer_resume_request(&agent, 0, Some("replacement input"))),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             dispatch_at + 3,
         )
@@ -1262,6 +1269,7 @@ fn scheduled_timer_run_output_uses_parent_saved_rate_policy() {
                 next_due_at_ms: Some(scheduled_at_ms + 60_000),
                 action: Some(action),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             scheduled_at_ms,
         )
@@ -1485,6 +1493,7 @@ fn assert_forged_scheduled_timer_run_rejected(
                 next_due_at_ms: Some(scheduled_at_ms + period_ms),
                 action: Some(action),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             scheduled_at_ms,
         )
@@ -2439,6 +2448,7 @@ fn scheduled_project_timer_launch_replay_precedes_current_profile_gate() {
                 next_due_at_ms: Some(first_due + period_ms),
                 action: Some(launch_action(Some("initial Project timer input"))),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             first_due,
         )
@@ -2473,6 +2483,7 @@ fn scheduled_project_timer_launch_replay_precedes_current_profile_gate() {
                 next_due_at_ms: Some(second_due + period_ms),
                 action: Some(launch_action(None)),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             second_due,
         )
@@ -2508,6 +2519,7 @@ fn scheduled_project_timer_launch_replay_precedes_current_profile_gate() {
                 next_due_at_ms: Some(third_due + period_ms),
                 action: Some(launch_action(None)),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             third_due,
         )
@@ -2623,6 +2635,7 @@ fn timer_var_set_fires_three_times_with_cas_counter() {
                     next_due_at_ms: Some(slot_ms + 1_000),
                     action: Some(action),
                     skip_code: None,
+                    skip_capacity_message: None,
                 },
                 slot_ms,
             )
@@ -2719,6 +2732,7 @@ fn project_timer_run_reuses_registration_authority_at_dispatch() {
                 next_due_at_ms: Some(scheduled_at_ms + period_ms),
                 action: Some(action),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             scheduled_at_ms,
         )
@@ -2843,6 +2857,7 @@ fn project_scheduled_and_manual_timer_resume_keep_bindings_and_gate_new_input() 
                 next_due_at_ms: Some(scheduled_at_ms + period_ms),
                 action: Some(timer_resume_request(&scheduled_agent, 1, None)),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             scheduled_at_ms,
         )
@@ -3014,6 +3029,7 @@ fn project_scheduled_and_manual_timer_resume_keep_bindings_and_gate_new_input() 
                 next_due_at_ms: Some(scheduled_at_ms + period_ms),
                 action: Some(timer_resume_request(&manual_agent, 9, Some("replacement"))),
                 skip_code: None,
+                skip_capacity_message: None,
             },
             dispatch_at + 3,
         )

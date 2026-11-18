@@ -1283,10 +1283,41 @@ limits. An omitted cap (`None`) is unlimited; `0` disables that scope. The snaps
 freezes the scope names and configured values. Cross-harness children reserve
 their own scopes and inherited parent
 account/proxy scopes together, so multiple distinct scopes of one kind are allowed;
-duplicate scope identities reject. A full scope rejects before native
-control with `capacity_unavailable`. That request is not admitted or persisted, so it
-creates no command, Agent, event or reservation; the same ID may be submitted again
-after capacity changes. An already admitted command retains its result under its ID, and
+duplicate scope identities reject. The daemon-wide `global:swarm` scope, the per-registered-project
+`project:<id>` scope and the per-project `manager_assignment:<id>` scope join
+the profile, account and proxy scopes. The Owner sets their bounds in the one
+config store:
+
+```toml
+[capacity]
+global_max_live = 3
+
+[capacity.projects.app]
+max_live = 2
+manager_max_live = 2
+```
+
+A missing bound is unlimited; zero disables new admissions to that scope.
+The Store loads the current daemon-owned limits inside the reservation
+transaction for each fresh start, including resume, managed manager launch
+and automated launch. This read follows workspace and rule preparation.
+Profile, account and proxy bounds remain frozen in the native profile and
+are the capacity bounds used in routing candidate checks.
+
+The unit is a controlled generation or reservation, including an idle
+manager. Every reservation counts in the fleet and its execution project.
+Assignment usage follows the current assigned manager generation and its
+team. Releasing the assignment removes that team's charge to the assignment
+scope while its reservations still count in the project and fleet. Overview
+uses the same reservation membership as admission.
+
+A full scope refuses admission with `capacity_unavailable` and names the
+blocking scope and its Owner setting in `config.toml`. A directly refused
+request creates no command, Agent, event or reservation and can be submitted
+with the same ID after capacity changes. Automation retains its refusal for
+the existing firing with the same scope and remedy. Lowering a limit stops nothing running: existing
+reservations keep running and only new admissions are refused until usage
+drops. Retained unknown reservations keep occupying their scopes. An already admitted command retains its result under its ID, and
 replay never starts another native generation or reservation. A capacity reservation is
 released only after the owned generation is proven closed: the OS source closed
 with every recorded process of the generation exited (at least one plugin or

@@ -11,9 +11,10 @@ use eliot_core::Command as CoreCommand;
 use eliot_core::api::{
     DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalClearRequest, GoalDefinition, GoalGetRequest, GoalMode,
     GoalPauseRequest, GoalResumeRequest, GoalRoundRequest, GoalRoundResponse, GoalSetRequest,
-    GoalView, ProjectRegistrationView, ProviderClearHoldRequest, ProviderClearHoldResponse,
-    ProviderCorrectiveEvidence, ProviderHoldsRequest, ProviderHoldsResponse, RuleCatchUpRequest,
-    RuleGetRequest, RuleStateView, TimerGetRequest, TimerRunRequest, TimerStateView,
+    GoalView, ProjectOverviewRequest, ProjectOverviewResponse, ProjectRegistrationView,
+    ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,
+    ProviderHoldsRequest, ProviderHoldsResponse, RuleCatchUpRequest, RuleGetRequest, RuleStateView,
+    TimerGetRequest, TimerRunRequest, TimerStateView,
 };
 use serde_json::Value;
 use serde_json::json;
@@ -97,6 +98,23 @@ pub(crate) async fn run_project(
                     .map_err(|_| Failure::new(4, "project.list response is invalid"))?;
             }
             print_value(&response, json_output);
+            Ok(0)
+        }
+        ProjectCommand::Overview { project, after } => {
+            let request = ProjectOverviewRequest { project, after };
+            request
+                .validate()
+                .map_err(|error| Failure::from_core(error, true))?;
+            let response: ProjectOverviewResponse =
+                eliot_daemon::client_call_typed(&data_dir, "project.overview", &request)
+                    .await
+                    .map_err(|error| Failure::from_core(error, false))?;
+            request
+                .validate_response(&response)
+                .map_err(|_| Failure::new(4, "project.overview response is invalid"))?;
+            let value = serde_json::to_value(response)
+                .map_err(|_| Failure::new(4, "project.overview response is invalid"))?;
+            print_value(&value, json_output);
             Ok(0)
         }
         ProjectCommand::Show(ProjectShowArgs { id }) => {

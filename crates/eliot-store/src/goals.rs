@@ -1805,6 +1805,7 @@ impl Store {
                     now,
                     false,
                     limits,
+                    None,
                 )?;
                 let outcome = GoalCommitOutcome::Continued {
                     command_id: send.command.id.clone(),

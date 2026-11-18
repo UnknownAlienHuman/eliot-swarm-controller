@@ -188,6 +188,7 @@ const METHODS: &[Method] = &[
     method!("project.assignment.launch", ProjectAssignmentLaunchRequest, ProjectAssignmentResult, true, true, "Reserve a free project and admit a manager launch in one transaction.", {"id":EXAMPLE_ID,"project":"project-1","profile":"chk-codex"}),
     method!("project.assignment.release", ProjectAssignmentReleaseRequest, ProjectAssignmentResult, false, true, "Release the current manager by expected epoch.", {"id":EXAMPLE_ID,"project":"project-1","expected_epoch":1}),
     method!("project.get", ProjectGetRequest, ProjectRegistrationView, true, false, "Read one approved project registration.", {"id":"project-1"}),
+    method!("project.overview", ProjectOverviewRequest, ProjectOverviewResponse, false, false, "Read one project team or every team with workspaces, queue, capacity and whole-fleet totals.", {"project":"project-1"}),
     method!("workspace.list", WorkspaceListRequest, WorkspaceListResponse, true, false, "Page the managed worktrees Swarm created, with total and cursor.", {"limit":100}),
     method!(
         "project.list",

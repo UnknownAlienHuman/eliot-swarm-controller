@@ -15,6 +15,7 @@ mod goals;
 mod handoff;
 mod hierarchy;
 mod inference;
+mod overview;
 mod project_assignment;
 mod resolution;
 mod routing;
@@ -453,6 +454,7 @@ impl Router {
                 self.project_assignment_release(&params, &principal).await
             }
             "project.get" => self.project_get(&params, &principal).await,
+            "project.overview" => self.project_overview(&params, &principal).await,
             "project.list" => self.project_list(&params, &principal).await,
             "workspace.list" => self.workspace_list(&params, &principal).await,
             "project.discover" => self.project_discover(&params, &principal).await,
@@ -2744,6 +2746,7 @@ impl Router {
         let report = matches!(
             &outcome,
             eliot_store::RuleCursorOutcome::Rejected { .. }
+                | eliot_store::RuleCursorOutcome::RejectedWithCapacity { .. }
                 | eliot_store::RuleCursorOutcome::Disabled
         );
         let change = {

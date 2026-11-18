@@ -20,6 +20,7 @@ pub struct TimerSlotCommit {
     pub next_due_at_ms: Option<i64>,
     pub action: Option<SubmitCommand>,
     pub skip_code: Option<String>,
+    pub skip_capacity_message: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -528,7 +529,8 @@ impl Store {
                 }
             };
             if let Some(code) = rejected {
-                let (rejected_parent, event) = reject_timer_fire_tx(&tx, &key, &code, now)?;
+                let error = Error::new(code.clone(), code);
+                let (rejected_parent, event) = reject_timer_fire_tx(&tx, &key, &error, now)?;
                 parent = Some(rejected_parent);
                 events.extend(event);
             } else {
@@ -539,7 +541,8 @@ impl Store {
                     key.run_rate_limit = Some(rule_action_limit(&rule)?);
                 }
                 let limits = self.hierarchy_limits;
-                match admit_rule_action_tx(&tx, &key, action, now, limits) {
+                let policy = self.capacity_policy.as_deref();
+                match admit_rule_action_tx(&tx, &key, action, now, limits, policy) {
                     Ok((admitted_parent, admitted_child, admitted_events)) => {
                         parent = Some(admitted_parent);
                         child = Some(admitted_child);
@@ -547,7 +550,7 @@ impl Store {
                     }
                     Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
                         let (rejected_parent, rejected_events) =
-                            reject_timer_fire_tx(&tx, &key, &error.code, now)?;
+                            reject_timer_fire_tx(&tx, &key, &error, now)?;
                         parent = Some(rejected_parent);
                         events.extend(rejected_events);
                     }
@@ -555,17 +558,17 @@ impl Store {
                 }
             }
         } else {
-            events.push(insert_rule_event(
-                &tx,
-                now,
-                "rule.skipped",
-                json!({
-                    "rule": state.id,
-                    "schedule_revision": state.schedule_revision,
-                    "scheduled_at_ms": slot.scheduled_at_ms,
-                    "reason": slot.skip_code,
-                }),
-            )?);
+            let mut data = json!({
+                "rule": state.id,
+                "schedule_revision": state.schedule_revision,
+                "scheduled_at_ms": slot.scheduled_at_ms,
+                "reason": slot.skip_code,
+            });
+            if let Some(message) = slot.skip_capacity_message {
+                data["message"] = json!(message);
+                data["where"] = json!("store.admission.capacity");
+            }
+            events.push(insert_rule_event(&tx, now, "rule.skipped", data)?);
         }
 
         let next_state = update_timer_slot_tx(
@@ -752,7 +755,8 @@ impl Store {
             key.run_rate_limit = Some(limit);
         }
         let limits = self.hierarchy_limits;
-        match admit_rule_action_tx(&tx, &key, action, now, limits) {
+        let policy = self.capacity_policy.as_deref();
+        match admit_rule_action_tx(&tx, &key, action, now, limits, policy) {
             Ok((parent, child, events)) => {
                 commit_transaction(tx, &self.write_faulted)?;
                 Ok(TimerSlotAdmission {
@@ -765,7 +769,7 @@ impl Store {
                 })
             }
             Err(error) if core::is_deterministic_pre_admission_rejection(&error.code) => {
-                let (parent, events) = reject_timer_fire_tx(&tx, &key, &error.code, now)?;
+                let (parent, events) = reject_timer_fire_tx(&tx, &key, &error, now)?;
                 commit_transaction(tx, &self.write_faulted)?;
                 Ok(TimerSlotAdmission {
                     state: timer.view,
@@ -1389,9 +1393,20 @@ fn validate_timer_slot(slot: &TimerSlotCommit, now: i64) -> Result<()> {
         }
     }
     if let Some(code) = &slot.skip_code
-        && (code.trim().is_empty() || code.len() > 128)
+        && (code.trim().is_empty() || code.len() > 512)
     {
         return Err(Error::new("invalid", "timer skip reason is invalid"));
+    }
+    if let Some(message) = &slot.skip_capacity_message
+        && (slot.skip_code.as_deref() != Some("capacity_unavailable")
+            || message.is_empty()
+            || message.len() > 4096
+            || message.contains(char::is_control))
+    {
+        return Err(Error::new(
+            "invalid",
+            "timer capacity skip message is invalid",
+        ));
     }
     Ok(())
 }
@@ -1495,18 +1510,18 @@ fn update_timer_slot_tx(
 fn reject_timer_fire_tx(
     tx: &Transaction<'_>,
     key: &RuleFiringKey<'_>,
-    code: &str,
+    error: &Error,
     now: i64,
 ) -> Result<(Command, Vec<Event>)> {
     let parent_cause = key.command_cause(&key.parent_id)?;
     let (parent, mut parent_event) =
-        insert_rule_parent(tx, key, RuleParentOutcome::Rejected { code }, now)?;
+        insert_rule_parent(tx, key, RuleParentOutcome::Rejected { error }, now)?;
     annotate_new_command_cause_tx(tx, &parent.id, &mut parent_event, parent_cause.clone())?;
     let rejected = insert_rule_event_with_cause(
         tx,
         now,
         "rule.rejected",
-        key.rejected_data(code),
+        key.rejected_data(error),
         Some(parent_cause),
     )?;
     Ok((parent, vec![parent_event, rejected]))

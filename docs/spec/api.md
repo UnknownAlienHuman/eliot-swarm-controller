@@ -441,6 +441,7 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `swarm.handoff`, `command.cancel` | atomic task transfer to an existing Agent; Owner withdrawal of undispatched handoff input |
 | `command.children` | implemented scoped, paged child readback for a retained expansion |
 | `project.list/get` | owner-only read of registered project authority |
+| `project.overview` | Owner or Agent read of one project team or every team with workspaces, queue, capacity and whole-fleet totals; a manager sees its own team in full and aggregates for other projects |
 | `rule.list/get/catch_up` | owner-only paged rule list (state, timer state, canonical definition), one rule read, and finite committed-history catch-up |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
@@ -500,6 +501,16 @@ For ordinary commands, a supplied `args.assignment_epoch` is a precondition when
 the verb accepts it. Admission records the current binding even when it is
 omitted. See [coordination](coordination.md#project-manager-assignment) for
 generation, epoch and dispatch behavior.
+
+`project.overview` returns exact fleet totals beside authorized project and
+native-child detail. A `project` filter scopes the returned detail. Each
+reply has an event watermark from its committed Store snapshot and a separate
+native observation coverage label. When `next_cursor` is present, pass it as
+`after` with the same filter. Each page applies current read authority and
+reports its own snapshot watermark. CLI callers use
+`swarm project overview [--project ID] [--after CURSOR]`. See
+[project manager assignment](coordination.md#project-manager-assignment) for
+detail visibility and capacity semantics.
 
 ### Authenticated method discovery
 

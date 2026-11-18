@@ -108,11 +108,62 @@ impl CapacityScope {
         let Some((kind, name)) = self.scope.split_once(':') else {
             return Err(invalid_capacity_scope());
         };
-        if !matches!(kind, "profile" | "account" | "proxy") || !valid_name(name) {
-            return Err(invalid_capacity_scope());
+        match kind {
+            "profile" | "account" | "proxy" => {
+                if !valid_name(name) {
+                    return Err(invalid_capacity_scope());
+                }
+            }
+            "global" => {
+                if name != "swarm" {
+                    return Err(invalid_capacity_scope());
+                }
+            }
+            "project" | "manager_assignment" => {
+                if !valid_project_scope_name(name) {
+                    return Err(invalid_capacity_scope());
+                }
+            }
+            _ => return Err(invalid_capacity_scope()),
         }
         Ok(())
     }
+
+    /// Stable scope key for this daemon's controlled load.
+    pub fn global_scope() -> String {
+        "global:swarm".to_owned()
+    }
+
+    /// Stable scope key for one registered project.
+    pub fn is_daemon_owned(scope: &str) -> bool {
+        scope == "global:swarm"
+            || scope.starts_with("project:")
+            || scope.starts_with("manager_assignment:")
+    }
+
+    pub fn project_scope(project: &str) -> String {
+        format!("project:{project}")
+    }
+
+    /// Stable scope key for one project manager assignment.
+    pub fn manager_assignment_scope(project: &str) -> String {
+        format!("manager_assignment:{project}")
+    }
+}
+
+/// Project and manager-assignment scope names ride the registered project id
+/// when one is discovered, else the launch scope label, which defaults to the
+/// canonical workspace path. Names only need to be non-empty, bounded and
+/// free of control characters; the kind/name split is always the first colon.
+/// Project and manager-assignment scope names ride the registered project id
+/// when one is discovered, else the launch scope label, which defaults to the
+/// canonical workspace path. Names only need to be non-empty, bounded and
+/// free of control characters; the kind/name split is always the first colon.
+fn valid_project_scope_name(value: &str) -> bool {
+    if value.is_empty() || value.len() > 1024 {
+        return false;
+    }
+    !value.contains(char::is_control)
 }
 
 /// Structured provider restriction facts accepted from an exact native result.
@@ -431,6 +482,52 @@ mod tests {
         );
         assert!(
             serde_json::from_value::<CapacityScope>(json!({"scope":"proxy:x","other":1})).is_err()
+        );
+
+        for scope in [
+            "global:swarm",
+            "project:app",
+            "project:a:b",
+            "project://?/C:/work/app",
+            "manager_assignment:app",
+            "manager_assignment:  ",
+            "profile:codex-luna",
+            "account:main",
+            "proxy:opencodex",
+        ] {
+            CapacityScope {
+                scope: scope.to_owned(),
+                max_live: Some(2),
+            }
+            .validate()
+            .unwrap();
+        }
+        for scope in [
+            "global:other",
+            "global:",
+            "project:",
+            "manager_assignment:",
+            "route:x",
+            "nocolon",
+        ] {
+            assert!(
+                CapacityScope {
+                    scope: scope.to_owned(),
+                    max_live: None,
+                }
+                .validate()
+                .is_err(),
+                "scope {scope} must be rejected"
+            );
+        }
+        assert_eq!(CapacityScope::global_scope(), "global:swarm".to_owned());
+        assert_eq!(
+            CapacityScope::project_scope("app"),
+            "project:app".to_owned()
+        );
+        assert_eq!(
+            CapacityScope::manager_assignment_scope("app"),
+            "manager_assignment:app".to_owned()
         );
     }
 
