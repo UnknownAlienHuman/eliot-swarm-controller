@@ -1246,7 +1246,7 @@ fn project_transfer_reports_and_preserves_queued_and_unknown_commands() {
 }
 
 #[test]
-fn project_transfer_waits_at_capacity_and_prefers_eligible_idle_manager() {
+fn project_transfer_reports_source_blockers_and_prefers_eligible_idle_manager() {
     let now = Ulid::new().timestamp_ms() as i64;
     let mut store = Store::open(Path::new(":memory:")).unwrap();
     register(&mut store, now);
@@ -1267,16 +1267,22 @@ fn project_transfer_waits_at_capacity_and_prefers_eligible_idle_manager() {
     let mut replacement = launch(Ulid::new().to_string(), "alpha");
     replacement.args["profile_snapshot"]["capacity_scopes"] =
         json!([{"scope":"profile:approved","max_live":1}]);
-    let waiting = store
+    let blocked = store
         .project_transfer(&stage, Some(Ok(replacement)), &policy, now)
         .unwrap()
         .value;
-    assert_eq!(waiting.outcome, ProjectTransferOutcome::WaitingCapacity);
+    assert_eq!(blocked.outcome, ProjectTransferOutcome::Blocked);
+    assert!(
+        blocked
+            .blockers
+            .iter()
+            .any(|b| b.code == "source_custody_open")
+    );
     assert_eq!(
         reserved_generation(&store, parse_agent_id(&source).unwrap()),
         Some(1)
     );
-    assert!(waiting.launch_command.is_none());
+    assert!(blocked.launch_command.is_none());
 
     let (mut store, _, destination, now) = transfer_fixture();
     store.project_transfer(&begin, None, &policy, now).unwrap();
@@ -1292,6 +1298,61 @@ fn project_transfer_waits_at_capacity_and_prefers_eligible_idle_manager() {
             generation: 1
         })
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn project_transfer_checks_continuation_policy_before_capacity_wait() {
+    let now = Ulid::new().timestamp_ms() as i64;
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    register(&mut store, now);
+    let source = ready(&mut store, "alpha", now);
+    ready(&mut store, "beta", now);
+    store
+        .claim_project_manager(&format!("agent:{source}:1"), &claim_request(), now)
+        .unwrap();
+    let policy = core::SecretPolicy::default();
+    let begin = transfer_request(ProjectTransferAction::Begin {
+        saved_context: None,
+    });
+    store.project_transfer(&begin, None, &policy, now).unwrap();
+    let stage = transfer_request(ProjectTransferAction::Launch {
+        intent: begin.id.clone(),
+        profile: "approved".into(),
+    });
+    let mut replacement = launch(Ulid::new().to_string(), "alpha");
+    replacement.args["profile_snapshot"]["capacity_scopes"] =
+        json!([{"scope":"profile:approved","max_live":1}]);
+    let blocked = store
+        .project_transfer(&stage, Some(Ok(replacement.clone())), &policy, now)
+        .unwrap()
+        .value;
+    assert_eq!(blocked.outcome, ProjectTransferOutcome::Blocked);
+    assert!(
+        blocked
+            .blockers
+            .iter()
+            .any(|b| b.code == "replacement_requires_saved_context_and_policy")
+    );
+
+    let cancel = transfer_request(ProjectTransferAction::Cancel { intent: begin.id });
+    store.project_transfer(&cancel, None, &policy, now).unwrap();
+    let begin = transfer_request(ProjectTransferAction::Begin {
+        saved_context: Some("Continue".into()),
+    });
+    store.project_transfer(&begin, None, &policy, now).unwrap();
+    stop_with_transfer_custody(&mut store, &source, now);
+    let stage = transfer_request(ProjectTransferAction::Launch {
+        intent: begin.id,
+        profile: "approved".into(),
+    });
+    let waiting = store
+        .project_transfer(&stage, Some(Ok(replacement)), &policy, now)
+        .unwrap()
+        .value;
+    assert_eq!(waiting.outcome, ProjectTransferOutcome::WaitingCapacity);
+    assert_eq!(waiting.blockers[0].code, "capacity_unavailable");
+    assert!(waiting.launch_command.is_none());
 }
 
 #[cfg(windows)]

@@ -534,12 +534,13 @@ remain unsupported.
 - **Begin** retains an intent, keeps the assignment occupied and fences new A
   controls and automated work addressed to A. Owner readback, replies,
   interrupt and stop remain available. Other workers can finish work in their
-  existing native sessions. Unsettled commands, approvals and Goal rounds are
-  reported. Source custody must close when A has a workspace. Idle alone
-  supplies no writer-exit evidence.
+  existing native sessions. Unsettled commands, approvals, unresolved Goal
+  rounds and a blocked source Goal are reported. Source custody must close when
+  A has a workspace. Idle alone supplies no writer-exit evidence.
 - **Launch**, if needed, prefers a compatible idle root in A's actual workspace
   on the requested approved profile. A new root uses ordinary launch admission
-  and reservations. A full profile, account or proxy returns a capacity wait.
+  and reservations. A full capacity scope returns a capacity wait after
+  continuation policy and source blockers have been checked.
   The Owner may authorize provisioning after stop by supplying saved
   continuation context at Begin, with the project launch action permitted.
   The daemon requires owned-process exit, reader drain and closure of A's
@@ -550,8 +551,14 @@ remain unsupported.
 - **Commit** requires the exact idle compatible B. Store advances assignment
   revision and epoch, moves the current workspace binding and worker topology,
   and transfers advisory claims and the paused Eliot Goal in one transaction.
-  The workspace creation receipt and worker generations, references and
-  reservations stay in place. Unsettled queues block the transaction. Their
+  Only controlled workers move. Native observations keep their recorded
+  parentage and roots. The managed workspace and its Git artifacts follow the
+  successor's retained start so cleanup can find them after the old manager is
+  deleted and the assignment is released. The original preparation identity is
+  preserved. If the receipt remains with an earlier owner, deletion is blocked
+  while the path is bound or borrowed. Worker generations, references and
+  reservations stay in place. A successor team over its assignment limit and
+  unsettled queues block the transaction. Queues keep their
   retained principals and assignment epochs are preserved. Project-owned rules
   stay project-owned and targeted automation follows current membership.
 - **Cancel** removes the intent and lifts its drain fence once any staged

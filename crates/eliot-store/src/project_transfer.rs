@@ -1,9 +1,9 @@
 //! Transactional Owner transfer over the current assignment and the existing H1/H2 edits.
 use super::*;
 use eliot_core::api::{
-    HierarchyLimits, PROJECT_TRANSFER_METHOD, ProjectAssignment, ProjectManagerIdentity,
-    ProjectTransferAction, ProjectTransferBlocker, ProjectTransferOutcome, ProjectTransferRequest,
-    ProjectTransferResult, ReparentRequest,
+    GoalStatus, HierarchyLimits, PROJECT_TRANSFER_METHOD, ProjectAssignment,
+    ProjectManagerIdentity, ProjectTransferAction, ProjectTransferBlocker, ProjectTransferOutcome,
+    ProjectTransferRequest, ProjectTransferResult, ReparentRequest,
 };
 use project_assignment::{AssignmentWrite, read_assignment, write_next_assignment};
 
@@ -228,7 +228,7 @@ impl Store {
                     }
                     if value.blockers.is_empty() {
                         db!(tx.execute_batch("SAVEPOINT project_transfer_commit"));
-                        match commit_transfer(tx, &from, &to, &mut value, limits, policy, now) {
+                        match commit_transfer(tx, &from, &to, &mut value, limits, policy, now, capacity_policy.as_deref()) {
                             Ok(committed) => {
                                 db!(tx.execute_batch("RELEASE project_transfer_commit"));
                                 events = committed;
@@ -237,6 +237,10 @@ impl Store {
                             Err(error) if matches!(error.code.as_str(), "busy" | "bad_state" | "claim_limit" | "fanout_limit") => {
                                 db!(tx.execute_batch("ROLLBACK TO project_transfer_commit; RELEASE project_transfer_commit"));
                                 value.blockers.push(blocker(&error.code, None));
+                            }
+                            Err(error) if error.code == "capacity_unavailable" => {
+                                db!(tx.execute_batch("ROLLBACK TO project_transfer_commit; RELEASE project_transfer_commit"));
+                                value.blockers.push(blocker(&error.code, Some(*error.message)));
                             }
                             Err(error) => return Err(error),
                         }
@@ -363,6 +367,9 @@ fn blockers(
     read_blockers(&mut found, &mut goals, managers, limit, |id| {
         blocker("goal_round_unresolved", Some(id))
     })?;
+    if goals::eliot_goal_status(tx, from_num)? == Some(GoalStatus::Blocked) {
+        found.push(blocker("source_goal_blocked", Some(from.id.clone())));
+    }
     Ok(found)
 }
 
@@ -511,6 +518,23 @@ fn stage_launch(
             .push(blocker("replacement_custody_open", Some(launch.id)));
         return Ok(());
     }
+    value.blockers = blockers(tx, from, None, limits.max_selector_targets)?;
+    if from.workspace.is_none() && !source_custody_closed(tx, from)? {
+        value
+            .blockers
+            .push(blocker("source_custody_open", Some(from.id.clone())));
+    }
+    if transfer.saved_context.is_none()
+        || !registration.actions.iter().any(|action| action == "launch")
+    {
+        value.blockers.push(blocker(
+            "replacement_requires_saved_context_and_policy",
+            None,
+        ));
+    }
+    if !value.blockers.is_empty() {
+        return Ok(());
+    }
     let mut launch = launch
         .ok_or_else(|| Error::new("internal", "missing replacement launch preparation"))??;
     if launch.verb != "launch"
@@ -533,46 +557,44 @@ fn stage_launch(
             .push(blocker("provider_hold", Some(profile.into())));
         return Ok(());
     }
-    if let Err(error) = capacity::require_free(tx, &candidate, 0) {
-        if error.code != "capacity_unavailable" {
-            return Err(error);
-        }
-        value.outcome = ProjectTransferOutcome::WaitingCapacity;
-        value
-            .blockers
-            .push(blocker("capacity_unavailable", Some(*error.message)));
-        return Ok(());
-    }
-    value.blockers = blockers(tx, from, None, limits.max_selector_targets)?;
-    if from.workspace.is_none() && !source_custody_closed(tx, from)? {
-        value
-            .blockers
-            .push(blocker("source_custody_open", Some(from.id.clone())));
-    }
-    if transfer.saved_context.is_none()
-        || !registration.actions.iter().any(|action| action == "launch")
-    {
-        value.blockers.push(blocker(
-            "replacement_requires_saved_context_and_policy",
-            None,
-        ));
-    }
-    if !value.blockers.is_empty() {
-        return Ok(());
-    }
     launch.args["registered_project"] = json!(from.project);
     launch.args[LAUNCH_ARG] = json!(transfer.id);
+    db!(tx.execute_batch("SAVEPOINT project_transfer_launch"));
     db!(tx.execute(
         "UPDATE project_transfers SET launch_command=?1 WHERE project=?2",
         params![launch.id, from.project],
     ));
-    let admission = admission::submit_tx(tx, "owner", launch, None, now, false, limits, capacity_policy)?;
+    let admission = match admission::submit_tx(
+        tx,
+        "owner",
+        launch,
+        None,
+        now,
+        false,
+        limits,
+        capacity_policy,
+    ) {
+        Ok(admission) => admission,
+        Err(error) if error.code == "capacity_unavailable" => {
+            db!(tx.execute_batch(
+                "ROLLBACK TO project_transfer_launch; RELEASE project_transfer_launch"
+            ));
+            value.outcome = ProjectTransferOutcome::WaitingCapacity;
+            value
+                .blockers
+                .push(blocker(&error.code, Some(*error.message)));
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    db!(tx.execute_batch("RELEASE project_transfer_launch"));
     *events = admission.events;
     value.launch_command = Some(admission.command.id);
     value.outcome = ProjectTransferOutcome::LaunchAdmitted;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_transfer(
     tx: &Transaction<'_>,
     from: &Agent,
@@ -581,6 +603,7 @@ fn commit_transfer(
     limits: HierarchyLimits,
     policy: &core::SecretPolicy,
     now: i64,
+    capacity_policy: Option<&capacity::PolicyLoader>,
 ) -> Result<Vec<Event>> {
     if value.assignment.workspace.is_some() && value.assignment.workspace != from.workspace {
         return Err(Error::new(
@@ -601,6 +624,7 @@ fn commit_transfer(
         },
         limits,
         now,
+        true,
     )?;
     for member in &moved.value.moved {
         let member = exact_agent(tx, &member.agent, member.generation)?;
@@ -626,8 +650,11 @@ fn commit_transfer(
     }
     let goal_revision = goals::transfer_goal_tx(tx, from, to, policy, now, &mut events)?;
     let (claims, _, _) = attribution::transfer_claims_tx(tx, from, to, policy, now, &mut events)?;
+    if let Some(path) = &value.assignment.workspace {
+        workspace::transfer_workspace_custody(tx, path, from, to, now, &mut events)?;
+    }
     write_next_assignment(tx, &value.assignment, Some((to_num, to.generation)), None)?;
-    // The path binding follows the assignment. The workspace creator receipt stays intact.
+    capacity::require_assignment_fits(tx, &from.project, capacity_policy)?;
     delete_intent(tx, &from.project)?;
     let assignment = read_assignment(tx, &from.project)?;
     events.push(insert_daemon_event(

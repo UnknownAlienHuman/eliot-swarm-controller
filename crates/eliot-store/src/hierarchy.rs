@@ -88,18 +88,39 @@ pub(crate) fn subtree_member_nums(
     root_num: i64,
     limit: i64,
 ) -> Result<Vec<i64>> {
+    subtree_member_nums_inner(connection, root_num, limit, false)
+}
+
+pub(super) fn controlled_subtree_member_nums(
+    connection: &Connection,
+    root_num: i64,
+    limit: i64,
+) -> Result<Vec<i64>> {
+    subtree_member_nums_inner(connection, root_num, limit, true)
+}
+
+fn subtree_member_nums_inner(
+    connection: &Connection,
+    root_num: i64,
+    limit: i64,
+    controlled_only: bool,
+) -> Result<Vec<i64>> {
     let mut statement = connection
         .prepare(
             "WITH RECURSIVE subtree(id) AS (
                  SELECT ?1
                  UNION
                  SELECT a.id FROM agents a JOIN subtree s ON a.parent = s.id
+                 WHERE NOT ?3 OR a.observe_only = 0
              )
              SELECT id FROM subtree ORDER BY id LIMIT ?2",
         )
         .map_err(sql_error)?;
     let rows = statement
-        .query_map(params![root_num, limit.saturating_add(1)], |row| row.get(0))
+        .query_map(
+            params![root_num, limit.saturating_add(1), controlled_only],
+            |row| row.get(0),
+        )
         .map_err(sql_error)?;
     let mut members = Vec::new();
     for row in rows {
@@ -1717,7 +1738,8 @@ mod tests {
                 .execute_batch(
                     "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
-                 DROP TABLE project_transfers; DELETE FROM schema_migrations WHERE version=60;
+                 ALTER TABLE workspaces DROP COLUMN original_preparation;
+                 DROP TABLE project_transfers; DELETE FROM schema_migrations WHERE version IN (60,61);
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;

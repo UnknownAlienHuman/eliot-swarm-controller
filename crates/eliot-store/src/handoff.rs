@@ -312,6 +312,7 @@ pub(super) fn handoff_tx(
         },
         limits,
         now,
+        false,
     )?;
     events.extend(moved.events);
     let brief_command = Ulid::new().to_string();

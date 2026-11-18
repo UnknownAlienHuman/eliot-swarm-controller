@@ -166,7 +166,8 @@ fn schema_51_upgrade_records_the_legacy_generation_name_before_reminting() {
     store.dispatch(&id, now).unwrap();
     store.connection.execute_batch("ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
-                 DROP TABLE project_transfers; DELETE FROM schema_migrations WHERE version=60;
+                 ALTER TABLE workspaces DROP COLUMN original_preparation;
+                 DROP TABLE project_transfers; DELETE FROM schema_migrations WHERE version IN (60,61);
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
@@ -666,7 +667,8 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
         .execute_batch(
             "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
-                 DROP TABLE project_transfers; DELETE FROM schema_migrations WHERE version=60;
+                 ALTER TABLE workspaces DROP COLUMN original_preparation;
+                 DROP TABLE project_transfers; DELETE FROM schema_migrations WHERE version IN (60,61);
                  DELETE FROM schema_migrations WHERE version=59;
                  DROP INDEX IF EXISTS commands_prune_roots; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS workspaces_start_command; DELETE FROM schema_migrations WHERE version=58; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;

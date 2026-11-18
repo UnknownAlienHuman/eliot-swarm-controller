@@ -518,7 +518,7 @@ fn frozen_scope_usage(conn: &Connection, id: i64, scope: &str) -> Result<usize> 
     .map_err(sql_error)
 }
 
-pub(super) fn require_free(conn: &Connection, agent: &Agent, id: i64) -> Result<()> {
+fn require_free(conn: &Connection, agent: &Agent, id: i64) -> Result<()> {
     for scope in scopes(agent)? {
         if let Some(max_live) = scope.max_live
             && !CapacityScope::is_daemon_owned(&scope.scope)
@@ -530,10 +530,36 @@ pub(super) fn require_free(conn: &Connection, agent: &Agent, id: i64) -> Result<
     Ok(())
 }
 
+pub(super) fn require_assignment_fits(
+    tx: &Transaction<'_>,
+    project: &str,
+    policy: Option<&PolicyLoader>,
+) -> Result<()> {
+    if let Some(load) = policy
+        && let Some(limit) = load()?
+            .projects
+            .get(project)
+            .and_then(|limits| limits.manager_assignment)
+    {
+        let usage = assignment_usage(tx, project, None)?.0;
+        if usage as u64 > limit {
+            return Err(scope_capacity_error(
+                &CapacityScope::manager_assignment_scope(project),
+                limit,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn require_scope_free(scope: &str, max_live: u64, usage: usize) -> Result<()> {
     if (usage as u64) < max_live {
         return Ok(());
     }
+    Err(scope_capacity_error(scope, max_live))
+}
+
+fn scope_capacity_error(scope: &str, max_live: u64) -> Error {
     let (kind, name) = scope.split_once(':').unwrap_or_default();
     let name = toml_key(name);
     let setting = match kind {
@@ -544,7 +570,7 @@ fn require_scope_free(scope: &str, max_live: u64, usage: usize) -> Result<()> {
         "manager_assignment" => format!("[capacity.projects.{name}] manager_max_live"),
         _ => "[capacity] global_max_live".to_owned(),
     };
-    Err(Error::new(
+    Error::new(
         "capacity_unavailable",
         format!("configured capacity bound {scope} max_live={max_live} is reserved; Owner may raise it in config.toml {setting}"),
     )
@@ -552,7 +578,7 @@ fn require_scope_free(scope: &str, max_live: u64, usage: usize) -> Result<()> {
     .with_origin(
         core::FailureOrigin::Swarm,
         "configured local capacity bound is reserved",
-    ))
+    )
 }
 
 fn toml_key(name: &str) -> String {

@@ -3233,6 +3233,16 @@ fn close_finished_workspace_process_source(
     {
         return Ok(());
     }
+    close_drained_workspace_process_source(tx, agent, generation, now, events)
+}
+
+fn close_drained_workspace_process_source(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
     let Some(source) = load_source_state(tx, agent, generation, WORKSPACE_PROCESS_SOURCE)? else {
         return Ok(());
     };
