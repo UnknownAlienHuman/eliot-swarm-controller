@@ -592,20 +592,25 @@ pub(crate) fn adhoc_snapshot(
     if let Some(access) = access.as_deref() {
         apply_adhoc_access(&mut snapshot, &harness, access, &profile_name)?;
     }
-    // Safe defaults shared by every ad-hoc snapshot: an explicit `inherit`
-    // MCP opt-in (ad-hoc spans harnesses without a minimal mapping, so the
-    // new minimal default cannot apply here), no allow list, no child
-    // allow-list (children reuse the parent snapshot only), empty pass_env,
-    // default scratch, and a profile-only capacity scope. No setup, route,
-    // account, proxy, or elevated permissions are ever frozen here.
-    snapshot.insert("mcp".to_owned(), Value::String("inherit".to_owned()));
+    // Claude can enforce the same isolated MCP policy as a saved profile.
+    let mcp = if harness == "claude" {
+        "minimal"
+    } else {
+        "inherit"
+    };
+    snapshot.insert("mcp".to_owned(), Value::String(mcp.to_owned()));
     snapshot.insert("mcp_allow".to_owned(), Value::Array(Vec::new()));
     snapshot.insert("child_profiles".to_owned(), Value::Array(Vec::new()));
     snapshot.insert(
         "native_subagents".to_owned(),
         Value::String("allow".to_owned()),
     );
-    snapshot.insert("pass_env".to_owned(), Value::Array(Vec::new()));
+    let pass_env = if harness == "claude" {
+        json!(["CLAUDE_CONFIG_DIR"])
+    } else {
+        json!([])
+    };
+    snapshot.insert("pass_env".to_owned(), pass_env);
     snapshot.insert("scratch".to_owned(), json!(["target/", "node_modules/"]));
     snapshot.insert(
         "capacity_scopes".to_owned(),
@@ -830,30 +835,18 @@ fn roaming_roots() -> Vec<PathBuf> {
     )
 }
 
-fn sorted_child_dirs(parent: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(parent) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                dirs.push(path);
-            }
-        }
-    }
-    dirs.sort();
-    dirs
-}
-
-/// Desktop-app bundles under one roaming root:
-/// `<root>/Claude/claude-code/<version>/<hash>/claude.exe`.
-fn claude_bundle_exes(roaming: &Path) -> Vec<PathBuf> {
-    let mut exes = Vec::new();
-    for version in sorted_child_dirs(&roaming.join("Claude").join("claude-code")) {
-        for bundle in sorted_child_dirs(&version) {
-            exes.push(bundle.join("claude.exe"));
-        }
-    }
-    exes
+/// Desktop-managed payloads are available through an explicit command.
+fn is_claude_desktop_bundle(path: &Path) -> bool {
+    let Some(bundle_root) = path.ancestors().nth(3) else {
+        return false;
+    };
+    bundle_root
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("claude-code"))
+        && bundle_root
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name.eq_ignore_ascii_case("Claude"))
 }
 
 /// Newest-first ordering key for `<exe> --version` output: the first
@@ -880,18 +873,28 @@ fn parse_cli_version(text: &str) -> Option<(u64, u64, u64)> {
     None
 }
 
-/// Every discovered `claude.exe` install, newest first: `claude.exe` hits on
-/// `PATH` (stable order), the standard user locations, then the desktop-app
-/// bundles. Each entry carries its own bounded `--version`.
+/// Discover standalone Claude installations and probe their versions.
 pub(crate) fn discover_claude_candidates(deadline: Instant) -> Vec<core::api::HarnessCandidate> {
-    probe_candidate_paths_with(claude_candidate_paths(), |cmd| {
+    probe_claude_candidates(claude_candidate_paths(), |cmd| {
         probe_native_version(cmd, false, deadline).ok().flatten()
     })
 }
 
-/// Filesystem hits in priority order, before versioning: `claude` hits on
-/// `PATH` (stable order), the standard user locations, then (Windows only)
-/// the desktop-app bundles. Unix layouts follow the vendors' installers:
+fn probe_claude_candidates(
+    mut paths: Vec<PathBuf>,
+    probe: impl FnMut(&str) -> Option<String>,
+) -> Vec<core::api::HarnessCandidate> {
+    if cfg!(windows) {
+        paths.retain(|path| {
+            !is_claude_desktop_bundle(path)
+                && !std::fs::canonicalize(path).is_ok_and(|path| is_claude_desktop_bundle(&path))
+        });
+    }
+    probe_candidate_paths_with(paths, probe)
+}
+
+/// Standalone CLI locations before versioning: PATH (stable order), followed
+/// by standard user locations. Unix layouts follow the vendors' installers:
 /// the supported Linux image symlinks `/usr/local/bin/claude` at the
 /// official installer root (see docker/Dockerfile).
 fn claude_candidate_paths() -> Vec<PathBuf> {
@@ -928,11 +931,6 @@ fn claude_candidate_paths() -> Vec<PathBuf> {
                     .join("claude")
                     .join(native_exe_name("claude")),
             );
-        }
-        for roaming in roaming_roots() {
-            for exe in claude_bundle_exes(&roaming) {
-                push(exe);
-            }
         }
     } else {
         for dir in path_search_dirs() {
@@ -1069,18 +1067,6 @@ fn claude_search_locations() -> Vec<String> {
                 .into_owned(),
         );
     }
-    for roaming in roaming_roots() {
-        searched.push(
-            roaming
-                .join("Claude")
-                .join("claude-code")
-                .join("<version>")
-                .join("<hash>")
-                .join("claude.exe")
-                .to_string_lossy()
-                .into_owned(),
-        );
-    }
     searched.dedup();
     searched
 }
@@ -1092,7 +1078,7 @@ fn claude_cmd_from_candidates(candidates: &[core::api::HarnessCandidate]) -> cor
     Err(core::Error::new(
         "profile_error",
         format!(
-            "claude native executable was not found; searched {}",
+            "Standalone Claude CLI was not found; searched {}. Install Claude Code or select a native executable explicitly with --cmd",
             claude_search_locations().join(", ")
         ),
     ))
@@ -2201,6 +2187,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(snapshot["effort"], json!(level));
+            assert_eq!(snapshot["mcp"], json!("minimal"));
+            assert_eq!(snapshot["pass_env"], json!(["CLAUDE_CONFIG_DIR"]));
         }
         let error = adhoc_snapshot(
             "claude",
@@ -3113,32 +3101,27 @@ mod tests {
         assert_eq!(error.code, "invalid");
     }
 
+    #[cfg(windows)]
     #[test]
-    fn claude_bundle_exes_enumerate_the_versioned_layout() {
-        let dir = std::env::temp_dir().join(format!(
-            "eliot-adhoc-claude-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _temp_4 = crate::test_support::TempDir::own(dir.clone());
-        let first = dir
-            .join("Claude")
-            .join("claude-code")
-            .join("2.1.321")
-            .join("d020ce1b5d30");
-        let second = dir
-            .join("Claude")
-            .join("claude-code")
-            .join("2.1.325")
-            .join("806e0a45e6f5");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
-        let exes = claude_bundle_exes(&dir);
+    fn claude_discovery_excludes_desktop_bundles_even_on_path() {
+        let dir = std::env::temp_dir().join(format!("eliot-adhoc-claude-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(dir.clone());
+        let bundled = dir.join("Claude/claude-code/2.1.325/build/claude.exe");
+        let standalone = dir.join("bin/claude.exe");
+        for path in [&bundled, &standalone] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"MZ").unwrap();
+        }
+        let candidates =
+            probe_claude_candidates(vec![bundled.clone(), standalone.clone()], |cmd| {
+                assert_eq!(Path::new(cmd), standalone);
+                Some("2.1.278".to_owned())
+            });
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(claude_installation(&candidates)["cmd"], json!(standalone));
         assert_eq!(
-            exes,
-            vec![first.join("claude.exe"), second.join("claude.exe"),]
+            validate_claude_cmd("explicit", bundled.to_str().unwrap()).unwrap(),
+            bundled.to_str().unwrap()
         );
     }
 }

@@ -572,8 +572,12 @@ event and context response.
 
 Errors include
 `not_found`, `unsupported`, `not_allowed`, `bad_state`, `stale_generation`, `invalid`,
-`busy`, `unavailable`, `capacity_unavailable`, `provider_held`, `history_gap`, `source_integrity`,
+`busy`, `unavailable`, `auth_required`, `capacity_unavailable`, `provider_held`, `history_gap`, `source_integrity`,
 `secret_in_payload`, `frame_too_large`, `mailbox_full`, `version_conflict`, `claim_limit`, `internal`.
+
+`auth_required` on a failed Claude start means the native CLI reported it
+was signed out before any session or prompt was dispatched. The retained
+message names the executable and the command the owner can run to sign in.
 
 `capacity_unavailable` is a pre-effect rejection from a retained prior-generation
 reservation or a configured Eliot `max_live` scope, not a vendor quota or entitlement

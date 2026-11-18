@@ -22,6 +22,7 @@ pub fn reason_words(code: &str) -> String {
         "not_allowed" => "This action is not permitted here",
         "invalid" => "Check the supplied values",
         "profile_error" => "The settings are not valid",
+        "auth_required" => "Sign-in required",
         "not_found" => "The requested item no longer exists",
         "timeout" => "The request took too long",
         "internal" => "Swarm could not complete the request",

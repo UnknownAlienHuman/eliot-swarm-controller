@@ -1600,6 +1600,20 @@ mod tests {
         assert!(!parts.iter().any(|part| part.kind == PartKind::Working));
         assert!(chat.waiting_locals().is_empty());
         assert_eq!(chat.local_text("c9/send").as_deref(), Some("hello"));
+        let hint = "Run 'C:/Tools/Claude Code/claude.exe' auth login in a terminal.";
+        chat.set_local_failure(
+            "c9/send",
+            InputFailure {
+                code: "auth_required".to_owned(),
+                message: hint.to_owned(),
+                origin: "environment".to_owned(),
+                definite: true,
+            },
+        );
+        assert_eq!(
+            chat.items()[0].parts[1].text,
+            format!("Sign-in required: {hint}")
+        );
         // An uncertain outcome shows without Retry.
         chat.set_local_failure(
             "c9/send",

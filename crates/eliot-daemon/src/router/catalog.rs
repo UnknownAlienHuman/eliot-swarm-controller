@@ -45,9 +45,7 @@ impl Router {
                     } else {
                         crate::adhoc::harness_installation(harness, deadline)
                     };
-                    // Claude keeps several native installs (PATH, user locations,
-                    // desktop-app bundles): report every candidate newest first so
-                    // the controller can see which install was preferred and why.
+                    // Report eligible standalone Claude installs newest first.
                     let candidates = if *harness == "claude" {
                         (!claude_candidates.is_empty()).then(|| claude_candidates.clone())
                     } else {

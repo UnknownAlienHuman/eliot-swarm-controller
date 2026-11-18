@@ -317,14 +317,13 @@ user turn. Resumed cumulative cost is session scope, not a turn delta.
 
 ## Login
 
-The CLI keeps its own login in its config directory; the Claude desktop app's
-session is host-managed and is not shared with other processes. Before every
-launch or resume the plugin runs `claude auth status` with the frozen
-environment. When the CLI is logged out it runs the CLI's own
-`claude auth login --claudeai` (the owner completes it in the browser) and waits
-up to five minutes; an unfinished login rejects the start with
-`native_not_dispatched` before any session exists. The plugin never sees or
-stores credentials.
+The standalone CLI uses its own authentication. Before launch or resume,
+Eliot runs `claude auth status --json` with the selected executable, workspace,
+and frozen environment. An explicit signed-out result settles the start as
+failed with `auth_required` before creating a session or sending input.
+The CLI and desktop display the exact executable and terminal sign-in command
+for the owner to run. Eliot checks status only.
+[Claude Code CLI authentication commands](https://code.claude.com/docs/en/cli-reference#cli-commands).
 
 ## Proxy and qualification
 
@@ -337,25 +336,37 @@ proxy/native billing in L7. Common generation/ack/custody rules remain in the pl
 
 `swarm launch --harness claude [--model M] [--effort E] [--cmd PATH] --workspace W "prompt"`
 is Owner-only and freezes a profile-equivalent snapshot from safe defaults
-(`workspace-write`, `never`, explicit MCP `inherit`) plus flags. An omitted `--model`
-omits `--model` so the CLI default applies; the effective model is read back
-from initialize/stream. `--effort` maps to the CLI `--effort` flag in the
-closed vocabulary `low|medium|high|xhigh|max` (validated at the same boundary
-profiles use); an omitted effort keeps the CLI default. `cmd` is
-discovered deterministically by preferring the newest install by `--version`
-(`claude.exe` on `PATH`, the standard user install locations, and the
-desktop-app bundles under `%APPDATA%\Claude\claude-code\<version>\<hash>`;
-`.cmd`/`.bat`/`.ps1` wrappers are refused and never frozen); `--cmd` pins one
-explicit install instead. On Linux the bare `claude` binary is used instead
-(`claude` on `PATH`, `/usr/local/bin/claude`, `~/.local/bin/claude`); the
-`.exe` names and desktop-app bundle layouts are Windows-only. An
-extensionless Unix candidate counts as native only after an ELF or Mach-O
-header check (`#!` scripts never qualify), and every candidate must be an
-absolute path before any `--version` probe runs. `swarm harnesses` reports every discovered install
-newest first in `candidates`. `swarm models --harness claude` reports the
-native initialize inventory when the reader proves one: selectable values with
-display names and per-model effort levels, each entry without a provenance
-marker. Only when the native read is unavailable does it fall back to the
+(`workspace-write`, `never`, MCP `minimal`) plus flags. Minimal uses
+`--strict-mcp-config` with the per-session Swarm MCP config and works when
+the Claude install has plugins or cached remote settings. The ad-hoc
+profile accepts the daemon's `CLAUDE_CONFIG_DIR` as a route selector,
+checking its identity again before dispatch. For a named profile
+whose explicit `inherit` preflight is refused, set `mcp = "minimal"`
+in that profile or start an ad-hoc Claude chat.
+
+An omitted `--model` omits the native flag so the CLI default applies; the
+effective model is read back from initialize/stream. `--effort` maps to the
+CLI `--effort` flag in the closed vocabulary `low|medium|high|xhigh|max`
+(validated at the same boundary profiles use); an omitted effort keeps the
+CLI default.
+
+Discovery picks the newest standalone CLI by `--version` from `PATH` and
+standard user install locations (`claude.exe` on Windows, bare `claude` on
+Unix, also checking `/usr/local/bin/claude` and `~/.local/bin/claude`).
+`.cmd`/`.bat`/`.ps1` wrappers are refused and never frozen; an extensionless
+Unix candidate counts as native only after an ELF or Mach-O header check
+(`#!` scripts never qualify), and every candidate must be an absolute path
+before any `--version` probe runs. The Windows Claude Desktop payload under
+`%APPDATA%/Claude/claude-code/<version>/<hash>` requires an explicit
+`--cmd` or profile `cmd`. Anthropic documents standalone terminal
+installation separately from the Desktop Code tab.
+[Claude Code setup](https://code.claude.com/docs/en/setup).
+`swarm harnesses` shows the selected absolute `cmd` and lists eligible
+standalone `candidates` newest first. `swarm models --harness claude`
+reports the native initialize inventory first when the reader proves one:
+selectable values with display names and per-model effort levels, each entry
+without a provenance marker. Only when the native read is unavailable does
+it fall back to the
 frozen documented `--model` aliases (`best`, `fable`, `sonnet`, `opus`,
 `haiku`, `sonnet[1m]`, `opus[1m]`, `opusplan`, `opusplan[1m]`) and full model
 ids (for example `claude-haiku-5-5`, `claude-opus-5-5`), each fallback entry
