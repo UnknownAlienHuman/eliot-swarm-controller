@@ -204,25 +204,29 @@ impl Router {
             }
             return Ok(Err(reason));
         }
-        if matches!(harness.as_str(), "codex" | "muse") {
-            if let Ok(raw) = self
-                .quota_for_snapshot(harness.clone(), Some(snapshot.clone()), name.to_owned())
-                .await
+        // Every harness with an implemented quota reader is probed through
+        // the one normalized projection, so retained Muse windows and other
+        // adapters' limits skip routes exactly like live reads. Unsupported
+        // readers keep `Unknown`/`Unsupported` without skipping.
+        if let Ok(raw) = self
+            .quota_for_snapshot(harness.clone(), Some(snapshot.clone()), name.to_owned())
+            .await
+        {
+            *quota_status = match raw.get("status").and_then(Value::as_str) {
+                Some("supported") => RouteQuotaStatus::Supported,
+                Some("unsupported") => RouteQuotaStatus::Unsupported,
+                _ => RouteQuotaStatus::Unknown,
+            };
+            if *quota_status == RouteQuotaStatus::Supported
+                && quota_exhausted(
+                    &harness,
+                    raw.get("details").unwrap_or(&Value::Null),
+                    snapshot.get("model").and_then(Value::as_str),
+                )
             {
-                *quota_status = match raw.get("status").and_then(Value::as_str) {
-                    Some("supported") => RouteQuotaStatus::Supported,
-                    Some("unsupported") => RouteQuotaStatus::Unsupported,
-                    _ => RouteQuotaStatus::Unknown,
-                };
-                if *quota_status == RouteQuotaStatus::Supported
-                    && quota_exhausted(&harness, raw.get("details").unwrap_or(&Value::Null))
-                {
-                    held_accounts.insert(harness, account);
-                    return Ok(Err(RouteSkipReason::QuotaExhausted));
-                }
+                held_accounts.insert(harness, account);
+                return Ok(Err(RouteSkipReason::QuotaExhausted));
             }
-        } else {
-            *quota_status = RouteQuotaStatus::Unsupported;
         }
         // Passive reads can take time. Recheck live state before freezing.
         if let Some(reason) = self
@@ -267,59 +271,15 @@ fn native_installed(harness: &str, snapshot: &Value) -> bool {
 }
 
 /// Only the installed, projected native schemas establish exhaustion. No
-/// generic numeric search or model inference probe is used. For Codex only
-/// the explicit limit state of the bucket the request actually uses settles
-/// exhaustion: the primary window, `spendControlReached`,
-/// `rateLimitReachedType`, or a depleted `individualLimit`. Metered
-/// `rateLimitsByLimitId` buckets never exhaust a route: their keys and
-/// `limitId` values are metered limit ids and `normalModelSlug` only names
-/// display and reasoning options (Codex 0.167.1 account.rs), so no alias or
-/// metered bucket proves the request's own quota is spent. When the primary
-/// bucket's explicit state is unknown, the route stays.
-fn quota_exhausted(harness: &str, details: &Value) -> bool {
-    let full = |window: &Value| {
-        window
-            .get("usedPercent")
-            .and_then(Value::as_f64)
-            .is_some_and(|used| used >= 100.0)
-            && window
-                .get("resetsAtMs")
-                .and_then(Value::as_i64)
-                .or_else(|| {
-                    window
-                        .get("resetsAt")
-                        .and_then(Value::as_i64)
-                        .map(|seconds| seconds.saturating_mul(1000))
-                })
-                .is_none_or(|reset| reset > now_ms())
-    };
-    if harness == "muse" {
-        let usage = details.get("usage").unwrap_or(details);
-        return ["window", "weekly"].iter().any(|key| full(&usage[key]));
-    }
-    if harness == "codex" {
-        let rates = &details["rateLimits"];
-        if rates.get("spendControlReached").and_then(Value::as_bool) == Some(true)
-            || rates
-                .get("rateLimitReachedType")
-                .is_some_and(|reached| !reached.is_null())
-            || rates
-                .get("individualLimit")
-                .and_then(|limit| limit.get("remainingPercent"))
-                .and_then(Value::as_i64)
-                .is_some_and(|remaining| remaining <= 0)
-        {
-            return true;
-        }
-        // Only the primary window counts: a full secondary window or an
-        // exhausted metered/alias bucket never proves the request's own quota
-        // is spent, so neither skips the route.
-        let credits = &rates["credits"];
-        let credit_available = credits["unlimited"].as_bool() == Some(true)
-            || credits["hasCredits"].as_bool() == Some(true);
-        return !credit_available && full(&rates["primary"]);
-    }
-    false
+/// generic numeric search or model inference probe is used. Routing shares
+/// the catalogue's normalized projection, so an exhausted route is skipped
+/// exactly when the catalogue would refuse to call it available. For Codex
+/// only the explicit limit state of the bucket the request actually uses
+/// settles exhaustion: the primary window, `spendControlReached`,
+/// `rateLimitReachedType`, or a depleted `individualLimit`.
+fn quota_exhausted(harness: &str, details: &Value, model: Option<&str>) -> bool {
+    catalog::project_quota(harness, details, model, now_ms())
+        .is_some_and(|projection| projection.exhausted)
 }
 
 #[cfg(test)]
@@ -414,6 +374,48 @@ mod tests {
             &json!({"rateLimits":{"primary":{"usedPercent":100,"resetsAt":1}}})
         ));
     }
+    #[test]
+    fn quota_exhaustion_covers_retained_windows_and_all_adapters() {
+        // Retained Muse `windows[]` observations skip the route like live reads.
+        assert!(quota_exhausted(
+            "muse",
+            &json!({"windows": [{"label": "Weekly", "usedPercent": 100.0, "resetsAtMs": i64::MAX}]}),
+            None,
+        ));
+        for harness in ["claude", "opencode", "antigravity"] {
+            assert!(
+                quota_exhausted(
+                    harness,
+                    &json!({"windows": [{"label": "Weekly", "usedPercent": 100.0, "resetsAtMs": i64::MAX}]}),
+                    None,
+                ),
+                "{harness} exhausted windows skip"
+            );
+            assert!(
+                !quota_exhausted(
+                    harness,
+                    &json!({"windows": [{"label": "Weekly", "usedPercent": 10.0, "resetsAtMs": i64::MAX}]}),
+                    None,
+                ),
+                "{harness} headroom does not skip"
+            );
+        }
+        // A model-scoped window never skips an unrelated model: account quota
+        // alone invents no per-model entitlement.
+        assert!(!quota_exhausted(
+            "claude",
+            &json!({"windows": [{"label": "Opus weekly", "usedPercent": 100.0, "resetsAtMs": i64::MAX}]}),
+            Some("sonnet-4"),
+        ));
+        // Unmapped shapes never skip.
+        assert!(!quota_exhausted("muse", &json!({}), None));
+        assert!(!quota_exhausted(
+            "opencode",
+            &json!({"rateLimits": {}}),
+            None
+        ));
+    }
+
     #[test]
     fn quota_checks_only_known_native_windows_and_preserves_unknown() {
         assert!(quota_exhausted(

@@ -379,11 +379,17 @@ impl Router {
     /// Starts no model turn, performs no inference and never polls per
     /// Agent. Codex reads `account/rateLimits/read` (plus `account/usage/read`
     /// when useful) and Muse reads `usage/read` through a dedicated metadata
-    /// reader; OpenCode/Claude/Antigravity expose no read-only quota surface,
-    /// so those report `unsupported` naming the checked surface. A method-not-
-    /// found or schema mismatch stays `unsupported` or `unknown` naming the
-    /// checked method; no numbers are fabricated. A quota failure never
-    /// selects another model or account.
+    /// reader; Claude reads the CLI OAuth usage endpoint, OpenCode reads the
+    /// Go account usage endpoint, and Antigravity reads
+    /// `retrieveUserQuotaSummary`. Every reader projects provider quota
+    /// signals into `details`: Codex keeps its `rateLimits` shape, the other
+    /// four use `windows[]` with `usedPercent`/`resetsAtMs` (Muse live reads
+    /// nest the same windows under `usage`, retained Muse observations carry
+    /// `windows[]` directly). Routing and the catalogue consume all five
+    /// through one normalized projection ([`catalog::project_quota`]).
+    /// A method-not-found or schema mismatch stays `unsupported` or `unknown`
+    /// naming the checked method; no numbers are fabricated. A quota failure
+    /// never selects another model or account.
     pub(super) async fn harness_quota(
         &self,
         params: &Value,
@@ -1150,6 +1156,230 @@ pub(crate) fn catalog_entry(
 /// Catalogue membership establishes identity, not account availability.
 /// Only complete hold readback plus affirmative, fresh native quota signals
 /// can establish availability. Unsupported and missing signals stay unknown.
+/// Normalized provider quota projection: one typed, scoped observation
+/// per read, consumed identically by routing (skip exhausted routes) and the
+/// catalogue (availability needs affirmative headroom on every recognized
+/// window).
+///
+/// - `exhausted`: a recognized window is full with a future (or unknown)
+///   reset, Codex denies ordinary usage, or a provider-scoped per-model
+///   limit is full.
+/// - `available`: every recognized window for this model shows headroom
+///   (used below 100% with a future reset; Codex additionally requires
+///   `ordinaryUsageAllowed` and per-model limits when the provider scopes
+///   them). Account quota alone never invents per-model entitlement: a
+///   model-scoped window only constrains matching models.
+/// - `provenance`: which provider shape was consumed (`muse:usage`,
+///   `muse:windows`, `muse:window/weekly`, `codex:rateLimits`, `windows`).
+///
+/// Unmapped, missing or unsupported signals yield `None`: callers keep
+/// `unknown` and never skip a route or assert availability from them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QuotaProjection {
+    pub exhausted: bool,
+    pub available: bool,
+    pub provenance: &'static str,
+}
+
+/// Normalize provider-specific quota `details` into one projection.
+/// `model` scopes model-named windows; `None` applies every window.
+/// Returns `None` when no signal maps to this harness (missing, stale,
+/// unsupported or unmapped shapes stay `unknown` at the caller).
+pub(crate) fn project_quota(
+    harness: &str,
+    details: &Value,
+    model: Option<&str>,
+    now: i64,
+) -> Option<QuotaProjection> {
+    if !details.is_object() {
+        return None;
+    }
+    match harness {
+        "muse" => {
+            let (windows, complete, provenance) = muse_window_set(details)?;
+            windows_projection(&windows, complete, model, now, provenance)
+        }
+        "codex" => codex_projection(details, model, now),
+        "claude" | "opencode" | "antigravity" => {
+            let windows = details
+                .get("windows")
+                .and_then(Value::as_array)
+                .filter(|windows| !windows.is_empty())?;
+            let windows: Vec<&Value> = windows.iter().collect();
+            windows_projection(&windows, true, model, now, "windows")
+        }
+        _ => None,
+    }
+}
+
+/// Muse contributes three shapes over time: retained `windows[]`
+/// observations, live `usage{window,weekly}` reads, and the older top-level
+/// `window`/`weekly` pair. The legacy pair is complete only when both halves
+/// are present; a lone half is not headroom.
+fn muse_window_set(details: &Value) -> Option<(Vec<&Value>, bool, &'static str)> {
+    if let Some(windows) = details
+        .get("windows")
+        .and_then(Value::as_array)
+        .filter(|windows| !windows.is_empty())
+    {
+        return Some((windows.iter().collect(), true, "muse:windows"));
+    }
+    if let Some(usage) = details.get("usage").and_then(Value::as_object) {
+        let mut windows = Vec::new();
+        for key in ["window", "weekly"] {
+            if let Some(window) = usage.get(key).filter(|window| window.is_object()) {
+                windows.push(window);
+            }
+        }
+        if windows.is_empty() {
+            return None;
+        }
+        let complete = windows.len() == 2;
+        return Some((windows, complete, "muse:usage"));
+    }
+    let mut windows = Vec::new();
+    for key in ["window", "weekly"] {
+        if let Some(window) = details.get(key).filter(|window| window.is_object()) {
+            windows.push(window);
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    let complete = windows.len() == 2;
+    Some((windows, complete, "muse:window/weekly"))
+}
+
+fn window_used_percent(window: &Value) -> Option<f64> {
+    window
+        .get("usedPercent")
+        .and_then(Value::as_f64)
+        .filter(|used| used.is_finite() && *used >= 0.0)
+}
+
+fn window_reset_ms(window: &Value) -> Option<i64> {
+    window
+        .get("resetsAtMs")
+        .and_then(Value::as_i64)
+        .filter(|reset| *reset >= 0)
+        .or_else(|| {
+            window
+                .get("resetsAt")
+                .and_then(Value::as_i64)
+                .filter(|reset| *reset >= 0)
+                .and_then(|reset| reset.checked_mul(1000))
+        })
+}
+
+/// Full with a future (or unknown) reset: without reset evidence the window
+/// may already have rolled, so callers treat it as exhausted only when the
+/// provider gives no earlier reset.
+fn window_exhausted(window: &Value, now: i64) -> bool {
+    window_used_percent(window).is_some_and(|used| used >= 100.0)
+        && window_reset_ms(window).is_none_or(|reset| reset > now)
+}
+
+/// Affirmative headroom: below 100% with a future reset. The future reset
+/// is required: a full or reset-less window is never availability evidence.
+fn window_headroom(window: &Value, now: i64) -> bool {
+    window_used_percent(window).is_some_and(|used| used < 100.0)
+        && window_reset_ms(window).is_some_and(|reset| reset > now)
+}
+
+/// Model families named by provider window labels (`Opus weekly`, `Gemini
+/// 5-hour`, `Claude/GPT weekly`). A window naming families only constrains
+/// models of those families; account-level windows (no family in the label)
+/// constrain every model.
+const WINDOW_MODEL_FAMILIES: &[&str] = &[
+    "opus", "sonnet", "haiku", "fable", "gemini", "argon", "gpt", "claude",
+];
+
+fn window_applies_to_model(window: &Value, model: Option<&str>) -> bool {
+    let (Some(label), Some(model)) = (window.get("label").and_then(Value::as_str), model) else {
+        return true;
+    };
+    let label = label.to_ascii_lowercase();
+    let families: Vec<&&str> = WINDOW_MODEL_FAMILIES
+        .iter()
+        .filter(|family| label.contains(**family))
+        .collect();
+    if families.is_empty() {
+        return true;
+    }
+    let model = model.to_ascii_lowercase();
+    families.iter().any(|family| model.contains(**family))
+}
+
+fn windows_projection(
+    windows: &[&Value],
+    complete: bool,
+    model: Option<&str>,
+    now: i64,
+    provenance: &'static str,
+) -> Option<QuotaProjection> {
+    let applicable: Vec<&&Value> = windows
+        .iter()
+        .filter(|window| window_applies_to_model(window, model))
+        .collect();
+    if applicable.is_empty() {
+        return None;
+    }
+    Some(QuotaProjection {
+        exhausted: applicable
+            .iter()
+            .any(|window| window_exhausted(window, now)),
+        available: complete && applicable.iter().all(|window| window_headroom(window, now)),
+        provenance,
+    })
+}
+
+fn codex_projection(details: &Value, model: Option<&str>, now: i64) -> Option<QuotaProjection> {
+    let rates = details
+        .get("rateLimits")
+        .filter(|rates| rates.is_object())?;
+    let exhausted_window = |rates: &Value| {
+        let credits = &rates["credits"];
+        let credit_available = credits["unlimited"].as_bool() == Some(true)
+            || credits["hasCredits"].as_bool() == Some(true);
+        !credit_available
+            && ["primary", "secondary"]
+                .iter()
+                .any(|key| window_exhausted(&rates[key], now))
+    };
+    let mut exhausted = exhausted_window(rates);
+    // Per-limit windows are relevant only when their id is the exact
+    // requested model. An unrelated exhausted model never blocks this one.
+    if let Some(limits) = details.get("rateLimitsByLimitId")
+        && let Some(by_model) = model.and_then(|model| limits.get(model))
+    {
+        exhausted |= exhausted_window(by_model);
+    }
+    let available = details["ordinaryUsageAllowed"].as_bool() == Some(true)
+        && ["primary", "secondary"]
+            .iter()
+            .all(|key| window_headroom(&rates[key], now))
+        && match details.get("rateLimitsByLimitId") {
+            None | Some(Value::Null) => true,
+            Some(Value::Object(limits)) if limits.is_empty() => true,
+            Some(Value::Object(limits)) => model.is_some_and(|model| {
+                limits.get(model).is_some_and(|rates| {
+                    ["primary", "secondary"]
+                        .iter()
+                        .all(|key| window_headroom(&rates[key], now))
+                })
+            }),
+            _ => false,
+        };
+    Some(QuotaProjection {
+        exhausted,
+        available,
+        provenance: "codex:rateLimits",
+    })
+}
+
+/// Catalogue membership establishes identity, not account availability.
+/// Only complete hold readback plus affirmative, fresh native quota signals
+/// can establish availability. Unsupported and missing signals stay unknown.
 pub(crate) fn availability(
     held: Option<bool>,
     quota: Option<&HarnessQuotaResponse>,
@@ -1170,38 +1400,12 @@ pub(crate) fn availability(
     let Some(details) = quota.details.as_ref() else {
         return CATALOG_UNKNOWN;
     };
-    let headroom = |window: &Value| {
-        window["usedPercent"]
-            .as_i64()
-            .is_some_and(|used| (0..100).contains(&used))
-            && window["resetsAtMs"]
-                .as_i64()
-                .or_else(|| {
-                    window["resetsAt"]
-                        .as_i64()
-                        .map(|time| time.saturating_mul(1000))
-                })
-                .is_some_and(|reset| reset > now)
-    };
-    let available = match quota.harness.as_str() {
-        "muse" => headroom(&details["window"]) && headroom(&details["weekly"]),
-        "codex" => {
-            let rates = &details["rateLimits"];
-            details["ordinaryUsageAllowed"].as_bool() == Some(true)
-                && headroom(&rates["primary"])
-                && headroom(&rates["secondary"])
-                && match details.get("rateLimitsByLimitId") {
-                    None | Some(Value::Null) => true,
-                    Some(Value::Object(limits)) if limits.is_empty() => true,
-                    Some(Value::Object(limits)) => limits.get(model).is_some_and(|rates| {
-                        headroom(&rates["primary"]) && headroom(&rates["secondary"])
-                    }),
-                    _ => false,
-                }
-        }
-        _ => false,
-    };
-    if available {
+    // One normalized projection serves every harness: affirmative headroom
+    // on every recognized window establishes availability, anything else
+    // stays unknown. Membership alone never proves availability.
+    if project_quota(quota.harness.as_str(), details, Some(model), now)
+        .is_some_and(|projection| projection.available)
+    {
         CATALOG_AVAILABLE
     } else {
         CATALOG_UNKNOWN
@@ -1351,6 +1555,68 @@ mod tests {
             assert!(cache.get_models(&changed, 1_001).is_none());
         }
         assert!(models_key(scope, "C:/v1/codex.exe", None).is_none());
+    }
+
+    #[test]
+    fn quota_projection_normalizes_all_provider_shapes() {
+        let now = 1_000;
+        // Retained Muse `windows[]` observation: a full window with a future
+        // reset is exhausted, so routing must skip it.
+        let retained = json!({"windows": [
+            {"label": "Weekly", "usedPercent": 100.0, "resetsAtMs": 2_000},
+        ]});
+        let projection = project_quota("muse", &retained, Some("m"), now)
+            .expect("retained muse windows project");
+        assert_eq!(projection.provenance, "muse:windows");
+        assert!(projection.exhausted);
+        assert!(!projection.available);
+        // Live Muse `usage{window,weekly}` read with headroom: available.
+        let live = json!({"usage": {
+            "window": {"usedPercent": 10.0, "resetsAtMs": 2_000},
+            "weekly": {"usedPercent": 20.0, "resetsAtMs": 3_000},
+        }});
+        let projection =
+            project_quota("muse", &live, Some("m"), now).expect("live muse usage projects");
+        assert_eq!(projection.provenance, "muse:usage");
+        assert!(!projection.exhausted);
+        assert!(projection.available);
+        // Live Muse usage with an exhausted weekly window.
+        let live = json!({"usage": {
+            "window": {"usedPercent": 10.0, "resetsAtMs": 2_000},
+            "weekly": {"usedPercent": 100.0, "resetsAtMs": 3_000},
+        }});
+        let projection =
+            project_quota("muse", &live, Some("m"), now).expect("exhausted muse usage projects");
+        assert!(projection.exhausted);
+        assert!(!projection.available);
+        // Other adapters' `windows[]` now establish availability too.
+        let windows = json!({"windows": [
+            {"label": "5-hour", "usedPercent": 10.0, "resetsAtMs": 2_000},
+            {"label": "Weekly", "usedPercent": 20.0, "resetsAtMs": 3_000},
+        ]});
+        for harness in ["claude", "opencode", "antigravity"] {
+            let projection = project_quota(harness, &windows, Some("m"), now)
+                .unwrap_or_else(|| panic!("{harness} windows project"));
+            assert_eq!(projection.provenance, "windows");
+            assert!(!projection.exhausted);
+            assert!(projection.available);
+        }
+        // A model-scoped window only constrains matching models: account
+        // quota alone never invents per-model entitlement.
+        let scoped = json!({"windows": [
+            {"label": "Opus weekly", "usedPercent": 100.0, "resetsAtMs": 2_000},
+        ]});
+        let projection = project_quota("claude", &scoped, Some("opus-4"), now)
+            .expect("matching model sees its window");
+        assert!(projection.exhausted);
+        assert!(!projection.available);
+        assert!(project_quota("claude", &scoped, Some("sonnet-4"), now).is_none());
+        // Unmapped shapes stay unknown: empty muse usage, missing windows,
+        // and a foreign harness shape never cross-talk.
+        assert!(project_quota("muse", &json!({}), None, now).is_none());
+        assert!(project_quota("muse", &json!({"usage": {}}), None, now).is_none());
+        assert!(project_quota("opencode", &json!({"rateLimits": {}}), None, now).is_none());
+        assert!(project_quota("unknown-harness", &windows, None, now).is_none());
     }
 
     #[test]

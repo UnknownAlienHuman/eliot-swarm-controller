@@ -1627,7 +1627,11 @@ session-family `quota.observed` event; Store retains the typed observation, and
 `harness.quota` selects the latest observation under the exact frozen profile.
 Its `fetched_at_ms` remains the native `observedAtMs`, and `note` says "observed
 during a turn". `usage/read` can also return that last native observation, exposed
-under `details.usage`. With no observation, or no installed MSP method, Muse
+under `details.usage`. Routing and `models.catalog` consume the retained
+`windows[]`, live `usage` and legacy `window`/`weekly` shapes through one
+normalized projection, alongside the other four harnesses' readers, so an
+exhausted window skips the route exactly when the catalogue would refuse to
+call it available. With no observation, or no installed MSP method, Muse
 returns `unsupported` and its reason. No quota query starts a turn, performs
 inference or polls Agents. CLI: `swarm quota --harness H [--profile P]`.
 
