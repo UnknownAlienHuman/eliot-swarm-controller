@@ -1656,6 +1656,10 @@ fn known_rollout_kind(kind: &str) -> bool {
             | "world_state"
             | "security_risk_score"
             | "retained_context"
+            // Upstream 0.167.1 persists the complete dynamic-tool catalog
+            // (`RolloutItem::DynamicToolsUpdated`, rollout `policy.rs`):
+            // model-invisible catalog data, ignorable without binding change.
+            | "dynamic_tools_updated"
             | "event_msg"
             | "realtime_item"
     )
@@ -2131,6 +2135,76 @@ mod live_tests {
         );
     }
 
+    #[test]
+    fn historical_dynamic_tools_updated_is_ignorable_without_binding_change() {
+        // Audit #644: upstream 0.167.1 persists `RolloutItem::DynamicToolsUpdated`
+        // as `{"type": "dynamic_tools_updated", ...}` (rollout `policy.rs`).
+        // The model-invisible tool catalog projects nothing and mutates no
+        // binding in any view.
+        #[cfg(windows)]
+        let identity = eliot_plugin::FileIdentity::Windows {
+            volume: 0,
+            file_id: [0; 16],
+        };
+        #[cfg(not(windows))]
+        let identity = eliot_plugin::FileIdentity::Unix {
+            device: 0,
+            inode: 0,
+        };
+        let mut state = super::RolloutCursor {
+            version: 1,
+            binding: String::new(),
+            file_identity: identity,
+            offset: 0,
+            anchor_sha256: String::new(),
+            current_turn_id: Some("turn-1".to_owned()),
+            active_turn: Some(super::ActiveTurn {
+                turn_id: "turn-1".to_owned(),
+                started_at: None,
+            }),
+            last_completed_turn_id: None,
+            pending_turn_context: false,
+            requested_turn_seen: true,
+            requested_turn_complete: false,
+            any_turn_complete: false,
+            turn_anomaly: false,
+        };
+        let raw = serde_json::to_vec(&json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "ordinal": 2,
+            "type": "dynamic_tools_updated",
+            "payload": {"thread_id": "thread-1", "tools": []},
+        }))
+        .expect("catalog row encodes");
+        let parsed = super::parse_line(&raw).expect("catalog kind parses");
+        assert_eq!(parsed.kind, "dynamic_tools_updated");
+        let catalog = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:01Z".to_owned(),
+            ordinal: Some(2),
+            kind: "dynamic_tools_updated".to_owned(),
+            payload: json!({"thread_id": "thread-1", "tools": []}),
+            metadata: None,
+        };
+        for view in ["turns", "items"] {
+            let entries = super::project_line(&mut state, &catalog, 1, view, Some("turn-1"))
+                .expect("catalog row is ignorable");
+            assert!(
+                entries.is_empty(),
+                "catalog projects nothing in {view} view"
+            );
+        }
+        assert_eq!(
+            state.current_turn_id.as_deref(),
+            Some("turn-1"),
+            "catalog leaves the turn binding intact"
+        );
+        assert!(
+            state.active_turn.is_some(),
+            "catalog leaves the active turn intact"
+        );
+        assert!(!state.requested_turn_complete, "catalog completes no turn");
+    }
+
     #[tokio::test]
     async fn token_count_is_ignorable_without_clearing_tool_binding() {
         // Audit #644: routine usage updates on qualified 0.161.0 must not
@@ -2224,6 +2298,44 @@ mod live_tests {
         assert_eq!(
             page.records[2].events[0].data["item_id"], "call-1",
             "output keeps its call binding after persisted metadata"
+        );
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dynamic_tools_updated_is_ignorable_without_clearing_tool_binding() {
+        // Audit #644: upstream 0.167.1 persists the complete dynamic-tool
+        // catalog between lifecycle records. Like other persisted metadata it
+        // must gap nothing and clear neither turn nor tool binding.
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"task_started","turn_id":"turn-1"}),
+        ));
+        fixture.append(line("response_item", json!({"type":"function_call","name":"exec_command","call_id":"call-1","id":"call-item","arguments":"{}"})));
+        fixture.append(line(
+            "dynamic_tools_updated",
+            json!({"thread_id":"thread-1","tools":[]}),
+        ));
+        fixture.append(line("response_item", json!({"type":"function_call_output","call_id":"call-1","id":"output-item","output":"ok"})));
+        let page = reader.read_page(&baseline, 100, deadline()).await.unwrap();
+        assert!(page.gap.is_none(), "tool catalog must not gap");
+        let kinds: Vec<_> = page
+            .records
+            .iter()
+            .flat_map(|record| &record.events)
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["turn.started", "tool.started", "tool.completed"]);
+        assert_eq!(
+            page.records[2].events[0].data["turn_id"], "turn-1",
+            "output keeps its native turn after the tool catalog"
+        );
+        assert_eq!(
+            page.records[2].events[0].data["item_id"], "call-1",
+            "output keeps its call binding after the tool catalog"
         );
         reader.close().await.unwrap();
     }

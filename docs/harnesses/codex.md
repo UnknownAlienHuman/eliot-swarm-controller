@@ -601,10 +601,10 @@ For the pinned Codex 0.161.0 rollout format at upstream commit
 `task_started`/`turn_started`, `task_complete`/`turn_complete` and
 `task_aborted`/`turn_aborted` records. Persisted usage/thread metadata
 (`token_count`, `thread_settings_applied`, `thread_goal_updated`,
-`thread_rolled_back`, `item_completed`), legacy message/tool echoes and
+`thread_rolled_back`, `item_completed`) and the upstream 0.167.1 persisted dynamic-tool catalog (`dynamic_tools_updated`, rollout `policy.rs`), legacy message/tool echoes and
 legacy-mode records are ignorable without clearing binding; only
 lifecycle records mutate binding. An aborted turn emits an interrupted
-(`reason: interrupted`) or failed terminal turn with its native reason; it
+(`reason: interrupted`) or failed terminal turn with its native reason; the abort row itself still resolves to the aborted turn (a schema-valid abort carries no `turn_id` upstream), then it
 clears the active binding and releases the aborted turn id, so a following
 start is not an anomaly and later items cannot attach to the aborted turn.
 Only legacy message/tool echoes are otherwise suppressed; `FinalAnswer` and EOF are not terminal evidence.
