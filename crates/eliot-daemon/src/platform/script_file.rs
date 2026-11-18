@@ -142,6 +142,17 @@ impl Directory {
         let stage_name = format!(".{}.stage", ulid::Ulid::new());
         #[cfg(unix)]
         let stage = native::open(self.handle(), stage_name.as_ref(), true, true).map_err(io)?;
+        // The staging mkdir and open are separate operations, and another
+        // writer on the shared scripts directory can substitute a real
+        // directory between them (`O_NOFOLLOW` accepts that directory).
+        // Verify the opened directory is a private directory this process
+        // owns before writing anything into it; a substituted entry fails
+        // here and is never staged into.
+        #[cfg(unix)]
+        if !native::stage_is_private(&stage).map_err(io)? {
+            native::remove_stage_dir(self.handle(), &stage, &stage_name);
+            return Err(refused());
+        }
         #[cfg(unix)]
         let temp_name = "data";
         #[cfg(unix)]
@@ -205,7 +216,7 @@ impl Directory {
             if result.is_err() && !replaced {
                 native::remove_staged(self.handle(), &stage, &stage_name, temp_name);
             } else {
-                native::remove_stage_dir(self.handle(), &stage_name);
+                native::remove_stage_dir(self.handle(), &stage, &stage_name);
             }
         }
         #[cfg(not(unix))]
@@ -951,22 +962,72 @@ mod native {
         // unlink still races another directory writer; leave a failed temp for
         // explicit owner cleanup rather than possibly deleting their entry.
     }
-    /// Remove a failed staged replacement: the staging directory name is a
-    /// fresh ULID, so no other writer can hold the same names and both
-    /// unlinks are safe. Best-effort; failures leave the private stage for
-    /// explicit owner cleanup.
+    /// True when the held staging directory is a private directory owned by
+    /// this process: a real directory substituted by another writer between
+    /// the staging mkdir and the open (or with widened mode) fails this
+    /// check and is never written into. The caller verifies before creating
+    /// the staged file inside it.
+    pub(super) fn stage_is_private(stage: &File) -> io::Result<bool> {
+        let meta = stage.metadata()?;
+        Ok(meta.file_type().is_dir()
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.mode() & 0o7777 == 0o700)
+    }
+    /// True when `stage_name` under `parent` still names the held staging
+    /// directory: same device and inode, still a directory owned by this
+    /// process. Name-based cleanup runs only inside this daemon-created
+    /// namespace, so an entry another writer substituted is left for its
+    /// owner instead of being removed.
+    pub(super) fn stage_matches(parent: &File, stage_name: &str, stage: &File) -> bool {
+        let expected = match stage.metadata() {
+            Ok(meta) => meta,
+            Err(_) => return false,
+        };
+        let name = match name(OsStr::new(stage_name)) {
+            Ok(name) => name,
+            Err(_) => return false,
+        };
+        let flags = libc::O_RDONLY
+            | libc::O_DIRECTORY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK;
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0) };
+        if fd < 0 {
+            return false;
+        }
+        let current = unsafe { File::from_raw_fd(fd) };
+        let actual = match current.metadata() {
+            Ok(meta) => meta,
+            Err(_) => return false,
+        };
+        actual.file_type().is_dir()
+            && actual.dev() == expected.dev()
+            && actual.ino() == expected.ino()
+            && actual.uid() == unsafe { libc::geteuid() }
+    }
+    /// Remove a failed staged replacement. Unlinking the staged file through
+    /// the held directory handle is safe; removing the staging directory by
+    /// name runs only when the name still resolves to that held directory.
+    /// Best-effort; failures leave the private stage for explicit owner
+    /// cleanup.
     pub(super) fn remove_staged(parent: &File, stage: &File, stage_name: &str, temp: &str) {
         if let Ok(temp_name) = name(OsStr::new(temp)) {
             unsafe {
                 libc::unlinkat(stage.as_raw_fd(), temp_name.as_ptr(), 0);
             }
         }
-        remove_stage_dir(parent, stage_name);
+        remove_stage_dir(parent, stage, stage_name);
     }
-    /// Remove the (now empty) staging directory after a successful rename.
-    /// Best-effort; a leftover private 0700 directory never exposes entry
-    /// bytes.
-    pub(super) fn remove_stage_dir(parent: &File, stage_name: &str) {
+    /// Remove the (now empty) staging directory after a successful rename,
+    /// or an ours-but-unusable staging directory before any write. Runs only
+    /// when the name still resolves to the held directory: a substituted
+    /// entry belongs to its owner, not to this cleanup. Best-effort; a
+    /// leftover private 0700 directory never exposes entry bytes.
+    pub(super) fn remove_stage_dir(parent: &File, stage: &File, stage_name: &str) {
+        if !stage_matches(parent, stage_name, stage) {
+            return;
+        }
         if let Ok(dir_name) = name(OsStr::new(stage_name)) {
             unsafe {
                 libc::unlinkat(parent.as_raw_fd(), dir_name.as_ptr(), libc::AT_REMOVEDIR);

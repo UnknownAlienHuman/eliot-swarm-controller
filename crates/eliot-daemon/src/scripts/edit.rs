@@ -839,6 +839,44 @@ mod tests {
         );
     }
 
+    /// A stale loaded handle fails inside `Directory::replace`, past the
+    /// save-level revision gate: the test calls `replace` directly with the
+    /// loaded handle and bytes after another writer changed the entry, so
+    /// the handle recheck (not the revision check) refuses it. The other
+    /// writer's bytes stay installed and the failed staging directory is
+    /// removed, leaving no stage or temp artifact behind.
+    #[cfg(unix)]
+    #[test]
+    fn stale_handle_replace_keeps_target_and_cleans_staging() {
+        let files = Files::new();
+        files.put("stale.txt", "old");
+        let root = root_for(&files.0, &[], None).unwrap();
+        let loaded = load(&root, "stale.txt").unwrap();
+        let original = loaded.bytes.clone().unwrap();
+        // Another writer changes the entry after this handle loaded it.
+        std::fs::write(root.join("stale.txt"), "other").unwrap();
+        let error = loaded
+            .parent
+            .replace(&loaded.name, &loaded.file, &original, b"proposed")
+            .unwrap_err();
+        assert_eq!(error.code, "conflict");
+        let scripts = files.0.join("scripts");
+        assert_eq!(std::fs::read(scripts.join("stale.txt")).unwrap(), b"other");
+        for entry in std::fs::read_dir(&scripts).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().expect("UTF-8 entry");
+            assert!(!name.ends_with(".stage"), "leftover stage {name}");
+            assert!(!name.ends_with(".tmp"), "leftover temp {name}");
+            if entry.file_type().unwrap().is_file() {
+                assert_ne!(
+                    std::fs::read(entry.path()).unwrap(),
+                    b"proposed",
+                    "rejected bytes leaked into {name}"
+                );
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn real_junctions_are_refused_and_pinned_ancestors_cannot_be_swapped() {
