@@ -1350,6 +1350,11 @@ fn project_line(
         }
     }
 
+    // The release below runs after the items projection: the abort row
+    // itself must still resolve to the aborted turn (upstream
+    // `TurnAbortedEvent.turn_id` is optional, so a schema-valid abort may
+    // carry no turn id and only the current binding names the turn).
+    let mut release_aborted_turn = false;
     if matches!(event_type, Some("task_aborted" | "turn_aborted")) {
         let aborted_turn_id = explicit_turn
             .or(state.current_turn_id.as_deref())
@@ -1386,10 +1391,9 @@ fn project_line(
                     "ordinal": line.ordinal,
                 }));
             }
-            // An aborted turn is terminal and releases its turn binding, so a
-            // following task_started is not an anomaly and later items cannot attach.
-            state.current_turn_id = None;
-            state.active_turn = None;
+            // Defer the release past the items projection below: the abort
+            // row itself still belongs to the aborted turn.
+            release_aborted_turn = true;
         }
     }
 
@@ -1453,6 +1457,12 @@ fn project_line(
             }));
             state.requested_turn_seen = true;
         }
+    }
+    if release_aborted_turn {
+        // An aborted turn is terminal and releases its turn binding, so a
+        // following task_started is not an anomaly and later items cannot attach.
+        state.current_turn_id = None;
+        state.active_turn = None;
     }
     Ok(entries)
 }
@@ -2051,6 +2061,74 @@ mod live_tests {
         super::project_line(&mut state, &next, 0, "turns", Some("turn-2"))
             .expect("next start projects");
         assert!(!state.turn_anomaly, "abort must not poison the next turn");
+    }
+
+    #[test]
+    fn historical_abort_without_turn_id_still_projects_items_row() {
+        // Audit #645: upstream `TurnAbortedEvent.turn_id` is optional
+        // (`turn_aborted_event_deserializes_without_turn_id`), so a
+        // schema-valid abort may carry no turn id. The abort row resolves
+        // through the current binding and still projects in the items view;
+        // the release applies to subsequent rows only.
+        #[cfg(windows)]
+        let identity = eliot_plugin::FileIdentity::Windows {
+            volume: 0,
+            file_id: [0; 16],
+        };
+        #[cfg(not(windows))]
+        let identity = eliot_plugin::FileIdentity::Unix {
+            device: 0,
+            inode: 0,
+        };
+        let mut state = super::RolloutCursor {
+            version: 1,
+            binding: String::new(),
+            file_identity: identity,
+            offset: 0,
+            anchor_sha256: String::new(),
+            current_turn_id: Some("turn-1".to_owned()),
+            active_turn: Some(super::ActiveTurn {
+                turn_id: "turn-1".to_owned(),
+                started_at: None,
+            }),
+            last_completed_turn_id: None,
+            pending_turn_context: false,
+            requested_turn_seen: true,
+            requested_turn_complete: false,
+            any_turn_complete: false,
+            turn_anomaly: false,
+        };
+        let aborted = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:01Z".to_owned(),
+            ordinal: Some(2),
+            kind: "event_msg".to_owned(),
+            payload: json!({"type": "turn_aborted", "reason": "interrupted"}),
+            metadata: None,
+        };
+        let entries = super::project_line(&mut state, &aborted, 1, "items", Some("turn-1"))
+            .expect("abort row projects");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["turn_id"], "turn-1");
+        assert_eq!(entries[0]["status"], "interrupted");
+        assert!(state.active_turn.is_none(), "abort clears active binding");
+        assert!(
+            state.current_turn_id.is_none(),
+            "abort releases the turn binding for subsequent rows"
+        );
+        assert!(state.requested_turn_complete);
+        let orphan = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:02Z".to_owned(),
+            ordinal: Some(3),
+            kind: "response_item".to_owned(),
+            payload: json!({"type": "message", "role": "assistant"}),
+            metadata: None,
+        };
+        let entries = super::project_line(&mut state, &orphan, 2, "items", Some("turn-1"))
+            .expect("later row projects");
+        assert!(
+            entries.is_empty(),
+            "a later item without a turn id cannot attach to the aborted turn"
+        );
     }
 
     #[tokio::test]
