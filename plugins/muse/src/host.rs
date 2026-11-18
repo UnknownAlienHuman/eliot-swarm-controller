@@ -95,6 +95,19 @@ fn quota_read_error(error: Error) -> Error {
     }
 }
 
+/// MSP `usedPercent` contract (`SubscriptionUsageWindow`/`SubscriptionUsageWeekly`):
+/// an integer >= 0 with no upper bound. Over-quota values above 100 are valid
+/// measurements, never a schema mismatch; only a negative value rejects.
+fn validate_usage_read_percent(used: i64) -> Result<()> {
+    if used < 0 {
+        return Err(Error::new(
+            "profile_error",
+            "Muse usage/read percent did not match the installed schema",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[test]
 fn model_catalog_projects_native_default_only_when_supplied() {
@@ -144,6 +157,18 @@ fn quota_read_keeps_method_not_found_classification() {
         quota_read_error(Error::new("unknown", "lost reply")).code,
         "unknown"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn usage_read_percent_has_no_upper_bound() {
+    // Audit #640: MSP usedPercent is an integer >= 0 with no upper bound;
+    // over-quota values above 100 (and 1000) are valid, only a negative
+    // measurement mismatches the installed schema.
+    for used in [0, 100, 101, 150, 1001, 100_000] {
+        assert!(validate_usage_read_percent(used).is_ok());
+    }
+    assert!(validate_usage_read_percent(-1).is_err());
 }
 
 /// A failed read is safe to refuse before input dispatch. It is never a
@@ -2421,12 +2446,7 @@ impl MusePlugin {
                         ));
                     }
                     for used in [usage.window.used_percent, usage.weekly.used_percent] {
-                        if !(0..=1000).contains(&used) {
-                            return Err(Error::new(
-                                "profile_error",
-                                "Muse usage/read percent did not match the installed schema",
-                            ));
-                        }
+                        validate_usage_read_percent(used)?;
                     }
                     if usage.window.window_duration_mins <= 0
                         || usage.window.resets_at_ms < 0
