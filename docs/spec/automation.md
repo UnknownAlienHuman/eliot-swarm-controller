@@ -71,9 +71,12 @@ uses the native `NtSetInformationFile(FileRenameInformationEx)` form of
 relative form with error 87 on the qualification host); no path-based fallback is used.
 Global temporaries inherit the private data-directory boundary. On Unix, existing libc
 `openat(O_NOFOLLOW)` / `renameat` keep operations relative to retained file descriptors;
-temporaries have mode 0600 and the directory is synced after rename. Unix reopens the
-installed target after rename and verifies it against the temporary's inode and bytes;
-a mismatch or inability to verify is `unknown`. Failed Unix temporaries remain for
+temporaries have mode 0600 and the directory is synced after rename. A replacement
+inherits the existing entry's owner/group/other read/write/execute bits onto the new
+inode before syncing (set-user-ID, set-group-ID and sticky bits are never copied);
+new private artifacts keep their restrictive creation mode. Unix reopens the
+installed target after rename and verifies it against the temporary's inode, bytes
+and inherited permission bits; a mismatch or inability to verify is `unknown`. Failed Unix temporaries remain for
 explicit owner cleanup: pathname-based `unlinkat` could delete another writer's substitute.
 
 The conflict guarantee is daemon-save exclusion plus an immediate handle-based recheck,

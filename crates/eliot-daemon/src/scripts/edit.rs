@@ -762,6 +762,43 @@ mod tests {
         );
     }
 
+    /// Saving an existing entry keeps its owner/group/other permission bits
+    /// (the replacement inode would otherwise be 0600) and never copies
+    /// set-user-ID, set-group-ID or sticky bits onto the edit.
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_permission_bits_and_drops_privilege_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let files = Files::new();
+        let policy = SecretPolicy::default();
+        for (start, kept) in [
+            (0o755, 0o755),
+            (0o644, 0o644),
+            (0o4755, 0o755),
+            (0o2755, 0o755),
+        ] {
+            let name = format!("mode-{start:o}.txt");
+            files.put(&name, "old");
+            std::fs::set_permissions(
+                files.0.join("scripts").join(&name),
+                std::fs::Permissions::from_mode(start),
+            )
+            .unwrap();
+            let revision = files.read(&name, &policy).unwrap().revision;
+            files.save(&name, revision, "new", &policy).unwrap();
+            let mode = std::fs::metadata(files.0.join("scripts").join(&name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, kept, "start {start:o}");
+            assert_eq!(
+                std::fs::read(files.0.join("scripts").join(&name)).unwrap(),
+                b"new"
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn real_junctions_are_refused_and_pinned_ancestors_cannot_be_swapped() {

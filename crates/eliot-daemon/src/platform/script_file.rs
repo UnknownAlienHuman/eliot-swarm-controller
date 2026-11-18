@@ -126,11 +126,22 @@ impl Directory {
         expected: &[u8],
         bytes: &[u8],
     ) -> Result<()> {
+        // Preserve the existing entry's permission bits on the replacement
+        // inode: the temporary starts 0600 (private by construction) and
+        // would otherwise strip execute and group/other readability on
+        // rename. Only owner/group/other read/write/execute carry over;
+        // set-user-ID, set-group-ID and sticky bits are never copied onto a
+        // saved edit. New private artifacts keep their restrictive creation
+        // mode; this path only replaces an existing project script.
+        #[cfg(unix)]
+        let preserved = native::permission_bits(original).map_err(io)?;
         let temporary = format!(".{}.tmp", ulid::Ulid::new());
         let mut temp = native::open(self.handle(), temporary.as_ref(), false, true).map_err(io)?;
         let mut replaced = false;
         let result = (|| {
             temp.write_all(bytes).map_err(io)?;
+            #[cfg(unix)]
+            native::apply_mode(&temp, preserved).map_err(io)?;
             temp.sync_all().map_err(io)?;
             let mut current = self.file(name).map_err(|_| conflict())?;
             if !native::same(original, &current).map_err(io)? || read(&mut current)? != expected {
@@ -148,6 +159,7 @@ impl Directory {
                     let mut installed = self.file(name)?;
                     if !native::same(&temp, &installed).map_err(io)?
                         || read(&mut installed)? != bytes
+                        || native::permission_bits(&installed).map_err(io)? != preserved
                     {
                         return Err(conflict());
                     }
@@ -864,6 +876,16 @@ mod native {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+    /// Permission bits a replacement inherits from the existing entry:
+    /// owner/group/other read/write/execute only. Set-user-ID, set-group-ID
+    /// and sticky bits are never carried onto a saved edit.
+    pub(super) fn permission_bits(file: &File) -> io::Result<u32> {
+        Ok(file.metadata()?.mode() & 0o777)
+    }
+    pub(super) fn apply_mode(file: &File, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
     }
     pub(super) fn remove(_: &File, _: &File, _: &str) {
         // unlinkat cannot consume the open inode. A name recheck followed by
