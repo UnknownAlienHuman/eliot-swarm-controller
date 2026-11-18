@@ -1,114 +1,124 @@
 ---
 name: eliot-swarm
-description: Split work and delegate through Swarm children, with identity, mail and ack, who and advisory claims, shared variables with CAS, launch/wait/digest, and honest unknown results. Use whenever splitting work among agents, editing shared areas, contacting another agent, or finishing delegated work.
+description: Use Eliot Swarm to coordinate Agents, claim shared work, delegate to children, exchange mail, collect results, or run an authorized private live proof.
 ---
 
-# Eliot Swarm coordination
+# Eliot Swarm
 
-You run inside Eliot Swarm alongside other agents. Coordinate through the
-controller's live surface, never through files other agents own. Names below
-are canonical methods (`api.methods` / `api.help` on the MCP `swarm` tool)
-or CLI commands (`swarm <cmd> --help`). Field details always come from those
-surfaces, never from memory.
+Use the inherited `swarm` MCP tool with `{method, params}`. Use `api.methods`
+to find canonical names and `api.help` with `{method: "mail.send"}` (or the
+method you need) for fields and limits. If MCP is unavailable, set `$swarm`
+to the full path of the approved release binary and use the PowerShell
+examples below. Append `--help` to check the installed CLI. Keep your
+inherited Agent identity and never pass tokens in arguments. If you received
+this skill as first-turn text, find its companion at
+`$env:ELIOT_HOME/skills/skills/eliot-swarm/reference.md`.
 
-## Who you are
+## Quick start
 
-Your agent id is in `ELIOT_AGENT_ID`. Confirm it with `api.identity`
-(`swarm identity`): it returns your id, generation and allowed scopes.
-`swarm who` lists every worker with the caller's own row marked.
+1. **Identity.** Call `api.identity {}` or run `& $swarm identity`. Record your
+   Agent ID and generation and check your scope.
+2. **Who.** Call `who {}` or run `& $swarm who`. Find your marked row and check
+   who is working in the same area.
+3. **Claim.** Before shared edits, call `claim.set` with a project-relative
+   glob or run `& $swarm claim set 'src/area/**'`. Claims are advisory.
+   Coordinate overlaps by mail and give workers disjoint paths.
+4. **Work.** Read and acknowledge addressed mail, delegate via Swarm children
+   where authorized, and collect exact outcomes while this turn is active.
+5. **Finish and report.** Register your artifacts, settle and clean up owned
+   work within scope, and release your glob with `claim.release` or
+   `& $swarm claim release 'src/area/**'`. Report changes, verified outcomes,
+   and open or `unknown` work. See [artifact and cleanup rules](reference.md#artifacts-and-cleanup).
 
-## Mail: read it, then ack it
+## Common tasks
 
-An attention notice means addressed mail arrived. Read it with `mail.inbox`
-(`swarm inbox`), open one delivery with `mail.read` (`swarm msg show`),
-and acknowledge exactly what you consumed with `mail.ack`
-(`swarm msg ack`). Reading never acknowledges: unacked mail stays pending.
+The examples use IDs, generations, paths, versions and turn IDs obtained
+from your own reads. Assign those values to the PowerShell variables first.
 
-## Before editing a shared area
+### Launch a child and wait
 
-1. Run `who` (`swarm who`) and look for workers on the same files.
-2. Set an advisory claim with `claim.set`
-   (`swarm claim set --glob '<area>/**'`). Claims warn, they never lock.
-3. Tell the other agent what you are doing with `mail.send`
-   (`swarm msg send --to <agent> -- <text>`). Only `queue` mode is live.
-4. Edit, then release with `claim.release` (`swarm claim release`).
+- Read your own `agent.get` snapshot with your Agent ID, or run
+  `& $swarm show $myAgent --json`. Use the retained workspace and
+  `profile_snapshot.child_profiles`. Same-harness profiles may differ
+  only in model and effort. See [child profile and wait details](reference.md#children-and-results).
+- Launch a child with `command.submit`, verb `launch`, or run
+  `& $swarm launch --parent $myAgent --profile $childProfile --workspace $parentWorkspace --wait --timeout-seconds 30 $task`.
+  Give the child an explicit task and file scope. With a prompt, CLI
+  `--wait` waits for the first turn. Keep the write ID for readback.
+- Use `swarm.wait` for a captured child turn or set of turns.
+  `& $swarm wait --all --timeout-seconds 30 "$child/$childGeneration/$turnId"`
+  waits on one exact turn. A timeout only ends the wait.
+  `& $swarm digest --all --to $myAgent "$child/$childGeneration/$turnId"`
+  registers a durable mailbox summary via `swarm.digest`.
 
-## Shared variables
+### Send, steer and interrupt
 
-`var.get` / `var.set` (`swarm var get`, `swarm var set`) share small
-state. Guard a read-modify-write with compare-and-swap: pass the
-`expect_version` you read. On a version conflict, re-read and retry with
-the new version; never blindly overwrite.
+Use `command.submit` with the verb in the first column. For live turn
+controls, read the generation and active turn with `agent.get` first,
+then supply `expected_generation` and `expected_turn_id` to MCP.
 
-## Children, waiting and handoff
+| Verb | PowerShell |
+| --- | --- |
+| `send` | `& $swarm send $child $text --generation $childGeneration` |
+| `steer` | `& $swarm steer $child $text --generation $childGeneration --turn $turnId` |
+| `interrupt` | `& $swarm interrupt $child --generation $childGeneration --turn $turnId` |
 
-When splitting work among agents, **launch Swarm children**, using
-`command.submit` with verb `launch` (`swarm launch`) and `role: "worker"`
-or an allowed profile. Use different installed harnesses when available;
-the parent's frozen `child_profiles` grants access to their own policies.
-Use `api.help` for launch fields; get allowed profile names from your own
-`agent.get` frozen snapshot, never guess them.
-Do not use native subagents for delegated implementation or shared-file work:
-they bypass Swarm claims, mail and completion tracking. Native subagents are
-fine for private, read-only exploration touching no shared files.
-Give each child disjoint files and require `who`, a claim before editing,
-and mail or an exact ack. Wait with `swarm.wait` or register `swarm.digest`,
-then collect the durable results before integrating.
-Managers: collect child results with `wait`, or `digest` for many children.
-Inspect one child with `command.children` (`swarm cmd children`).
-A manager moves task inputs, claims and children with `swarm.handoff`;
-only the owner moves agents (`swarm.reparent`, `swarm.switch`).
+### Mail and acknowledgment
 
-## Finishing
+| MCP method | PowerShell |
+| --- | --- |
+| `mail.send` | `& $swarm msg send --to $recipient -- $text` |
+| `mail.inbox` | `& $swarm inbox` |
+| `mail.read` | `& $swarm msg show $deliveryId` |
+| `mail.ack` | `& $swarm msg ack --delivery $deliveryId` |
 
-Register directories you create for an assignment with `artifact.register`
-(`swarm artifact register <absolute-path> --kind build|data_dir|temp|other`
-`--purpose <short-description>`). Register your own `CARGO_TARGET_DIR` when
-it lies outside your checkout, temporary folders, screenshots, and any
-private daemon data directory you start through the `swarm` CLI. The
-directory must be one you create under `ELIOT_ARTIFACT_ROOT`, the new directory
-Swarm exclusively creates and durably binds before native startup. Use a child
-such as `$env:ELIOT_ARTIFACT_ROOT/target`; never register the root itself. A
-workspace or shared `daemon.artifact_roots` location alone is not ownership.
-Data directories stay `keep` while a private daemon lock or a live process
-holds them. Never register user/native configuration or stores. Swarm
-records managed worktrees and branches, declared scratch directories, and
-the frozen `CARGO_TARGET_DIR` passed through your profile from retained
-launch facts only when inside this generation's bound root. Hard-linked files,
-nested repositories, `.git` and protected configuration keep the whole tree.
+Use queue mail for coordination. Read the message, then acknowledge its exact
+delivery ID. After a finished task, a mail-only wake needs a brief read and ack.
 
-A manager can review its subtree with `cleanup.plan {scope:"self_tree"}`
-(`swarm cleanup plan`), then consume that exact plan with
-`cleanup.apply {id,plan_id}` (`swarm cleanup apply <plan-id>`). Review `keep`
-reasons and sizes. Stop children before cleanup. Preserve an uncertain apply
-id; retry only that identical id/payload to read its retained result.
-`unknown` never authorizes another deletion attempt. The Owner can select
-`project` or `all`; an Agent cannot broaden its cleanup scope. Native
-stores are never raw filesystem cleanup targets. A terminal Codex session
-is archived through the harness `thread/archive` method at apply; every
-other harness stays `keep(no_native_archive)`. A branch is `safe` only
-after a fresh upstream fetch proves it merged into the upstream default
-with no unpushed commits; apply re-verifies and deletes locally with the
-safe `-d` form. Remote branch deletion is Owner-only
-(`swarm cleanup apply <plan-id> --delete-remote`) and never automatic.
-State plainly what you changed and what remains open.
+### Shared variables with compare-and-swap
 
-## Honest unknown
+Read with `var.get` or `& $swarm var get $key`. Write with `var.set` using
+`expect_version` or `& $swarm var set $key $value --expect-version $version`.
+Use version zero for an absent key. On a confirmed version conflict, re-read
+and recompute the change.
 
-If an effect is uncertain (timeout, lost reply, interrupted call), report
-`unknown` and never replay it: retry with the same mutation `id`, or read
-the retained result back. Never invent a success, a delivery or a
-readback you did not observe.
+### Register artifacts and read results
 
-## Off limits
+- Register a directory you own under `ELIOT_ARTIFACT_ROOT` with
+  `artifact.register` or `& $swarm artifact register $artifactDir --kind temp --purpose $purpose`.
+- Read another Agent's retained result within your scope with `agent.result`
+  or `& $swarm result $child --generation $childGeneration --turn-id $turnId`.
+  Check the retained outcome and final text before reporting completion.
 
-Settings, rules, timers, goals, projects, discovery, reparenting and
-switching are owner-only (`not_allowed` for agents). Do not attempt them:
-propose changes in your final report instead.
+### Run a private live proof
 
-## No MCP tool? Use the CLI
+Follow the [private daemon procedure](reference.md#private-live-proof-on-windows)
+for ACLs, registration and cleanup. Use an authorized private data directory.
+Agent launches require a fresh one. Pass its exact path to every private command.
 
-Without the MCP `swarm` tool the same surface is the `swarm` binary on
-`PATH`: `swarm identity`, `swarm who`, `swarm inbox`, `swarm msg`,
-`swarm var`, `swarm claim`, `swarm launch`, `swarm wait`,
-`swarm digest`, `swarm result`. Append `--help` to any command.
+| Step | PowerShell | MCP method |
+| --- | --- | --- |
+| Start | `& $swarm daemon --data-dir $proofDir` | CLI startup only |
+| Read status | `& $swarm status --data-dir $proofDir` | `daemon.status` (private Owner) |
+| Stop | `& $swarm daemon stop --data-dir $proofDir --drain` | `daemon.shutdown` with `mode: "drain"` (private Owner) |
+
+## Do not
+
+- Do not end your turn waiting on a shell job or native Monitor. Run long commands in the foreground or poll them to completion.
+- Do not retry a refused Owner operation as Owner on prod, change inherited identity, or read the Owner token.
+- Do not guess child profiles or bypass a same-harness permission mismatch. Read your frozen `child_profiles`.
+- Do not start a private daemon on an unprotected data directory, leave it undrained, or omit its artifact registration.
+- Do not launch Agents from a copy of production data. Copied stores can share production process custody names.
+- Do not leave a test desktop open after its screenshots. Use plain test repo names under one `qa-…` folder.
+- Do not accept a black screenshot as UI evidence. Check whether the console display is off.
+- Do not redo finished work on a mail-only wake. Read, acknowledge the exact delivery, and finish briefly.
+- Do not replay uncertain effects. Keep `unknown`, read back, or reuse only the same mutation ID with identical input.
+
+## Owner-only surfaces
+
+Harness catalogues, models and quota, projects, settings and profiles, rules,
+timers, goals, native discovery, diagnosis, daemon administration, the production
+desktop as Owner, handoff, reparenting and switching, manual outcome
+resolution, and broader or remote cleanup require Owner authority.
+If a change needs one of these surfaces, propose it in your report.
+See the [method map](reference.md#method-to-cli-map) for details.
