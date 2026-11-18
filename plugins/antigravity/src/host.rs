@@ -35,7 +35,6 @@ enum DispatchOutcome {
 
 struct DeferredCompletion {
     request_id: Value,
-    seq: i64,
     generation: i64,
     command_id: String,
     turn_id: String,
@@ -141,7 +140,6 @@ pub(crate) async fn run() -> Result<()> {
                     }
                     Ok(DispatchOutcome::Deferred(deferred)) => {
                         let request_id = request.id;
-                        let seq = deferred.seq;
                         let generation = deferred.generation;
                         let command_id = deferred.command_id.clone();
                         let turn_id = deferred.turn_id.clone();
@@ -159,7 +157,6 @@ pub(crate) async fn run() -> Result<()> {
                             let _ = sender
                                 .send(DeferredCompletion {
                                     request_id,
-                                    seq,
                                     generation,
                                     command_id,
                                     turn_id,
@@ -187,7 +184,6 @@ pub(crate) async fn run() -> Result<()> {
             Next::Deferred(Some(completion)) => {
                 deferred_count = deferred_count.saturating_sub(1);
                 let outcome = plugin.settle_steer(
-                    completion.seq,
                     completion.generation,
                     &completion.command_id,
                     &completion.turn_id,
@@ -262,8 +258,6 @@ impl Plugin {
                 let session = self.bound(&params.agent_id, params.generation)?;
                 if params.verb == "steer" {
                     match session.begin_steer(params).await? {
-                        SteerStart::Immediate(Ok(value)) => Ok(DispatchOutcome::Immediate(value)),
-                        SteerStart::Immediate(Err(error)) => Err(error),
                         SteerStart::Deferred(waiter) => Ok(DispatchOutcome::Deferred(waiter)),
                     }
                 } else {
@@ -315,7 +309,6 @@ impl Plugin {
 
     fn settle_steer(
         &mut self,
-        seq: i64,
         generation: i64,
         command_id: &str,
         turn_id: &str,
@@ -324,7 +317,7 @@ impl Plugin {
         self.session
             .as_mut()
             .ok_or_else(|| Error::new("unknown", "Antigravity session is no longer retained"))?
-            .settle_steer(seq, generation, command_id, turn_id, outcome)
+            .settle_steer(generation, command_id, turn_id, outcome)
     }
 
     /// Read-only native model catalogue for `harness.models`. A dedicated

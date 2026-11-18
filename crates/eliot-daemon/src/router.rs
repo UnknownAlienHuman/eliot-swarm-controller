@@ -6,7 +6,6 @@ mod cleanup;
 mod command;
 mod command_verbs;
 mod config_ops;
-mod context;
 mod coordination;
 mod diagnose;
 mod digests;

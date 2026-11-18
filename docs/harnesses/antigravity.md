@@ -86,8 +86,8 @@ A `session/request_permission` ask (`{sessionId, toolCall, options}`)
 opens a Swarm approval request with a distinct bounded local id for each
 native JSON-RPC request, bound to the exact generation and turn. The
 native JSON-RPC id, tool call id and options remain separately retained
-inside the plugin; repeated asks for one tool call stay independently
-answerable. The request has kind `approval` and the shared `ApprovalRequest`
+inside the plugin only while the native request is live. The request has kind
+`approval` and the shared `ApprovalRequest`
 public details: a redacted plain-text summary (title plus tool
 name/kind and compact raw input, never the native record) and one
 choice per usable offered option, `approve` for `allow_once`/
@@ -151,9 +151,10 @@ deadline for preparation, the native write and committed association,
 inside the daemon's 30 s plugin RPC. Proven local no-write failures settle
 as `rejected` (`native_not_dispatched`). A correlated ACP validation refusal
 before any committed association also settles as `rejected` (`native_rejected`).
-If the deadline elapses after a possible write, the send returns retained
-`unknown` and the pending input and terminal fence remain live. An ambiguous
-native response opens a stream gap. Neither case resends input.
+If the deadline elapses after a possible write, the send returns `unknown` and
+the pending input and terminal fence remain live. An ambiguous native response
+opens a stream gap. Neither case resends input; command retry and settlement
+are owned by the daemon router and Store.
 
 Tool calls map from `tool_call` and `tool_call_update` using the native
 `toolCallId`. A delta can change only a tool introduced by a `tool_call` or

@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -7,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use eliot_core::{Error, InjectPoint, Result, canonical_json_sha256};
+use eliot_core::{Error, InjectPoint, Result};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, MAX_FRAME_BYTES,
     MAX_TEXT_BYTES, PeerClient,
@@ -45,20 +44,12 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// an empty diagnostic snapshot.
 const SEND_TIMEOUT: Duration = Duration::from_secs(25);
 
-fn admit_cancel(
-    state: &events::State,
-    turn_id: &str,
-    highwater_seq: &mut i64,
-    seq: Option<i64>,
-) -> Result<()> {
+fn admit_cancel(state: &events::State, turn_id: &str) -> Result<()> {
     if state.active_turn() != Some(turn_id) || state.source_unknown || state.batch_unknown {
         return Err(Error::new(
             "stale_turn",
             "cancel does not match a healthy exact native turn",
         ));
-    }
-    if let Some(seq) = seq {
-        *highwater_seq = seq;
     }
     Ok(())
 }
@@ -88,24 +79,6 @@ fn send_preparation_error(error: Error) -> Error {
     error
         .with_code("native_not_dispatched")
         .with_where("plugin.antigravity.send.prepare")
-}
-
-struct RetainedCommand {
-    seq: i64,
-    command_id: String,
-    payload_sha256: [u8; 32],
-    turn: String,
-    outcome: Result<Value>,
-}
-
-/// Retained approve/deny outcome for exact command-id replay. The stored
-/// verb plus request and turn ids reject a reused command id bound to a
-/// different reply, mirroring the sibling harnesses.
-struct ReplyOutcome {
-    verb: String,
-    request_id: String,
-    turn_id: String,
-    result: Value,
 }
 
 pub(crate) struct OwnedHookConfig {
@@ -145,7 +118,6 @@ impl Drop for HookConfigGuard {
 }
 
 pub(crate) struct DeferredSteer {
-    pub seq: i64,
     pub generation: i64,
     pub command_id: String,
     pub turn_id: String,
@@ -153,40 +125,7 @@ pub(crate) struct DeferredSteer {
 }
 
 pub(crate) enum SteerStart {
-    Immediate(Result<Value>),
     Deferred(DeferredSteer),
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum HistoryDecision<'a> {
-    RetainedOutcome(&'a Result<Value>),
-    Conflict,
-    EvictedHistory,
-    Advance,
-}
-
-fn check_history<'a>(
-    retained: &'a Option<RetainedCommand>,
-    highwater_seq: i64,
-    seq: i64,
-    command_id: &str,
-    payload_sha256: [u8; 32],
-) -> HistoryDecision<'a> {
-    if let Some(retained) = retained {
-        if retained.seq == seq
-            && retained.command_id == command_id
-            && retained.payload_sha256 == payload_sha256
-        {
-            return HistoryDecision::RetainedOutcome(&retained.outcome);
-        }
-        if retained.seq == seq || retained.command_id == command_id {
-            return HistoryDecision::Conflict;
-        }
-    }
-    if seq <= highwater_seq {
-        return HistoryDecision::EvictedHistory;
-    }
-    HistoryDecision::Advance
 }
 
 /// Advertised values for one config option id from a session open
@@ -221,11 +160,6 @@ pub(crate) struct Session {
     hook_config: Option<OwnedHookConfig>,
     mcp_config: Option<crate::mcp::OwnedConfig>,
     ready: bool,
-    highwater_seq: i64,
-    retained: Option<RetainedCommand>,
-    interrupt_retained: Option<RetainedCommand>,
-    steer_retained: Option<RetainedCommand>,
-    reply_outcomes: HashMap<String, ReplyOutcome>,
     steer_inflight: Option<i64>,
     stop: Option<(String, bool, Result<Value>)>,
     /// Advertised `model` option values from the latest session open
@@ -316,11 +250,6 @@ impl Session {
             hook_config: hook_config.0.take(),
             mcp_config,
             ready: false,
-            highwater_seq: 0,
-            retained: None,
-            interrupt_retained: None,
-            steer_retained: None,
-            reply_outcomes: HashMap::new(),
             steer_inflight: None,
             stop: None,
             advertised_models: Vec::new(),
@@ -601,18 +530,6 @@ impl Session {
                     "Antigravity request reply needs its captured request id",
                 )
             })?;
-        if let Some(previous) = self.reply_outcomes.get(&params.command_id) {
-            if previous.verb != params.verb
-                || previous.request_id != request_id
-                || previous.turn_id != turn_id
-            {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Antigravity command id was reused for another request reply",
-                ));
-            }
-            return Ok(previous.result.clone());
-        }
         // The event task owns no transport client: the native decision
         // travels on this call, serialized behind queued frames. A dead
         // native process latches unknown without attempting a write.
@@ -643,15 +560,6 @@ impl Session {
                 "Antigravity request reply outcome is unknown",
             ),
         };
-        self.reply_outcomes.insert(
-            params.command_id.clone(),
-            ReplyOutcome {
-                verb: params.verb,
-                request_id: request_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                result: result.clone(),
-            },
-        );
         Ok(result)
     }
 
@@ -800,56 +708,11 @@ impl Session {
         }
         if params.command_id == self.start_command
             || self.stop.as_ref().is_some_and(|s| s.0 == params.command_id)
-            || self
-                .interrupt_retained
-                .as_ref()
-                .is_some_and(|retained| retained.command_id == params.command_id)
-            || self
-                .steer_retained
-                .as_ref()
-                .is_some_and(|retained| retained.command_id == params.command_id)
         {
             return Err(Error::new(
                 "source_integrity",
                 "Antigravity command id belongs to another operation",
             ));
-        }
-        let seq = match params.dispatch_seq {
-            Some(seq) if seq > 0 => seq,
-            _ => {
-                return Err(Error::new(
-                    "invalid",
-                    "Antigravity send requires a positive dispatch sequence",
-                ));
-            }
-        };
-        let payload_sha256 = canonical_json_sha256(&params.args).map_err(|_| {
-            Error::new(
-                "invalid",
-                "Antigravity command arguments cannot be canonicalized",
-            )
-        })?;
-        match check_history(
-            &self.retained,
-            self.highwater_seq,
-            seq,
-            &params.command_id,
-            payload_sha256,
-        ) {
-            HistoryDecision::RetainedOutcome(outcome) => return outcome.clone(),
-            HistoryDecision::Conflict => {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Antigravity command binding conflicts with retained record",
-                ));
-            }
-            HistoryDecision::EvictedHistory => {
-                return Err(Error::new(
-                    "unknown",
-                    "Antigravity command private history is unavailable",
-                ));
-            }
-            HistoryDecision::Advance => {}
         }
         if self.native.transport.process_exit_observed() {
             return Err(Error::new(
@@ -895,22 +758,14 @@ impl Session {
             state.arm_fenced(registration, &turn);
             association
         };
-        self.highwater_seq = seq;
         let unknown = Err(Error::new(
             "unknown",
             "Antigravity input may have applied and will not be resent",
         ));
-        self.retained = Some(RetainedCommand {
-            seq,
-            command_id: params.command_id.clone(),
-            payload_sha256,
-            turn: turn.clone(),
-            outcome: unknown.clone(),
-        });
         // Native write acceptance is transport delivery only. The event
         // owner acknowledges after committing correlated native evidence.
         let dispatched = self.client.dispatch_fenced_write(write, deadline).await;
-        let result = match dispatched {
+        match dispatched {
             Ok(_) => wait_for_association(association, deadline, &turn).await,
             Err(error) if native_no_write(&error.code) => {
                 match timeout_at(deadline, self.state.lock()).await {
@@ -924,11 +779,7 @@ impl Session {
             // Retain the pending input and its fence: dispatch may have
             // happened, and neither this error nor the wait permits replay.
             Err(_) => unknown,
-        };
-        if let Some(retained) = self.retained.as_mut().filter(|r| r.seq == seq) {
-            retained.outcome = result.clone();
         }
-        result
     }
 
     pub async fn begin_steer(&mut self, params: AgentCommandParams) -> Result<SteerStart> {
@@ -980,14 +831,6 @@ impl Session {
                 .stop
                 .as_ref()
                 .is_some_and(|stop| stop.0 == params.command_id)
-            || self
-                .retained
-                .as_ref()
-                .is_some_and(|retained| retained.command_id == params.command_id)
-            || self
-                .interrupt_retained
-                .as_ref()
-                .is_some_and(|retained| retained.command_id == params.command_id)
         {
             return Err(Error::new(
                 "source_integrity",
@@ -999,55 +842,6 @@ impl Session {
                 "unknown",
                 "Antigravity steer session readiness is unresolved",
             ));
-        }
-        let seq = match params.dispatch_seq {
-            Some(seq) if seq > 0 => seq,
-            _ => {
-                return Err(Error::new(
-                    "invalid",
-                    "Antigravity steer requires a positive dispatch sequence",
-                ));
-            }
-        };
-        let payload_sha256 = canonical_json_sha256(&params.args).map_err(|_| {
-            Error::new(
-                "invalid",
-                "Antigravity steer arguments cannot be canonicalized",
-            )
-        })?;
-        match check_history(
-            &self.steer_retained,
-            self.highwater_seq,
-            seq,
-            &params.command_id,
-            payload_sha256,
-        ) {
-            HistoryDecision::RetainedOutcome(outcome) => {
-                if self
-                    .steer_retained
-                    .as_ref()
-                    .is_some_and(|retained| retained.turn == turn_id)
-                {
-                    return Ok(SteerStart::Immediate(outcome.clone()));
-                }
-                return Err(Error::new(
-                    "source_integrity",
-                    "Antigravity steer replay changed its captured turn",
-                ));
-            }
-            HistoryDecision::Conflict => {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Antigravity steer command binding conflicts with retained history",
-                ));
-            }
-            HistoryDecision::EvictedHistory => {
-                return Err(Error::new(
-                    "unknown",
-                    "Antigravity steer private history is unavailable",
-                ));
-            }
-            HistoryDecision::Advance => {}
         }
         if self.steer_inflight.is_some() {
             return Err(Error::new(
@@ -1061,21 +855,8 @@ impl Session {
             turn_id.to_owned(),
             text.to_owned(),
         )?;
-        self.highwater_seq = seq;
-        self.steer_retained = Some(RetainedCommand {
-            seq,
-            command_id: params.command_id.clone(),
-            payload_sha256,
-            turn: turn_id.to_owned(),
-            outcome: Ok(unknown_steer(
-                &params.command_id,
-                turn_id,
-                "PreInvocation has not confirmed application",
-            )),
-        });
-        self.steer_inflight = Some(seq);
+        self.steer_inflight = Some(0);
         Ok(SteerStart::Deferred(DeferredSteer {
-            seq,
             generation: self.generation,
             command_id: params.command_id,
             turn_id: turn_id.to_owned(),
@@ -1085,10 +866,9 @@ impl Session {
 
     pub fn settle_steer(
         &mut self,
-        seq: i64,
         generation: i64,
-        command_id: &str,
-        turn_id: &str,
+        _command_id: &str,
+        _turn_id: &str,
         outcome: Result<Value>,
     ) -> Result<Value> {
         if generation != self.generation {
@@ -1097,18 +877,13 @@ impl Session {
                 "Antigravity deferred steer receipt crossed generations",
             ));
         }
-        let Some(retained) = self.steer_retained.as_mut().filter(|retained| {
-            retained.seq == seq && retained.command_id == command_id && retained.turn == turn_id
-        }) else {
+        if self.steer_inflight.is_none() {
             return Err(Error::new(
                 "source_integrity",
-                "Antigravity deferred steer receipt lost its retained identity",
+                "Antigravity steer receipt is not live",
             ));
-        };
-        retained.outcome = outcome.clone();
-        if self.steer_inflight == Some(seq) {
-            self.steer_inflight = None;
         }
+        self.steer_inflight = None;
         outcome
     }
 
@@ -1146,68 +921,18 @@ impl Session {
         }
         if params.command_id == self.start_command
             || self.stop.as_ref().is_some_and(|s| s.0 == params.command_id)
-            || self
-                .retained
-                .as_ref()
-                .is_some_and(|retained| retained.command_id == params.command_id)
-            || self
-                .steer_retained
-                .as_ref()
-                .is_some_and(|retained| retained.command_id == params.command_id)
         {
             return Err(Error::new(
                 "source_integrity",
                 "Antigravity command id belongs to another operation",
             ));
         }
-        let seq = match params.dispatch_seq {
-            Some(seq) if seq > 0 => seq,
-            _ => {
-                return Err(Error::new(
-                    "invalid",
-                    "Antigravity interrupt requires a positive dispatch sequence",
-                ));
-            }
-        };
-        let payload_sha256 = canonical_json_sha256(&params.args).map_err(|_| {
-            Error::new(
-                "invalid",
-                "Antigravity command arguments cannot be canonicalized",
-            )
-        })?;
-        match check_history(
-            &self.interrupt_retained,
-            self.highwater_seq,
-            seq,
-            &params.command_id,
-            payload_sha256,
-        ) {
-            HistoryDecision::RetainedOutcome(outcome) => return outcome.clone(),
-            HistoryDecision::Conflict => {
-                return Err(Error::new(
-                    "source_integrity",
-                    "Antigravity interrupt binding conflicts with retained record",
-                ));
-            }
-            HistoryDecision::EvictedHistory => {
-                return Err(Error::new(
-                    "unknown",
-                    "Antigravity interrupt private history is unavailable",
-                ));
-            }
-            HistoryDecision::Advance => {}
-        }
         // Re-check the exact turn under the same lock discipline as send:
         // a turn that ended since the first check was never interrupted.
         let dispatched = self
-            .cancel_turn(
-                &params.command_id,
-                turn_id,
-                Instant::now() + TIMEOUT,
-                Some(seq),
-            )
+            .cancel_turn(&params.command_id, turn_id, Instant::now() + TIMEOUT, None)
             .await;
-        let result = match dispatched {
+        match dispatched {
             Ok(()) => {
                 // Per the ACP cancellation contract, answer every pending
                 // permission ask of this exact turn with `cancelled`
@@ -1251,20 +976,12 @@ impl Session {
             }
             // The locked re-check refused before native I/O. Preserve that
             // refusal and leave private history available for the next command.
-            Err(error) if error.code == "stale_turn" => return Err(error),
+            Err(error) if error.code == "stale_turn" => Err(error),
             Err(error) if native_no_write(&error.code) => Ok(
                 json!({"state": "rejected", "reason": "Antigravity interrupt was not dispatched"}),
             ),
             Err(error) => Err(self.client.diagnostic_error(error.with_code("unknown"))),
-        };
-        self.interrupt_retained = Some(RetainedCommand {
-            seq,
-            command_id: params.command_id.clone(),
-            payload_sha256,
-            turn: turn_id.to_owned(),
-            outcome: result.clone(),
-        });
-        result
+        }
     }
 
     async fn cancel_turn(
@@ -1272,10 +989,10 @@ impl Session {
         command_id: &str,
         turn_id: &str,
         until: Instant,
-        seq: Option<i64>,
+        _seq: Option<i64>,
     ) -> Result<()> {
         let mut state = self.state.lock().await;
-        admit_cancel(&state, turn_id, &mut self.highwater_seq, seq)?;
+        admit_cancel(&state, turn_id)?;
         // Hold the event lock across write and latch so late asks observe intent.
         let dispatched = self
             .client
@@ -1297,43 +1014,18 @@ impl Session {
     pub async fn snapshot(&self, params: AgentSnapshotParams) -> Result<Value> {
         let state = self.state.lock().await;
         let process_exited = self.native.transport.process_exit_observed();
-        let retained = self
-            .retained
-            .as_ref()
-            .filter(|r| r.command_id == params.command_id);
-        let interrupt = self
-            .interrupt_retained
-            .as_ref()
-            .filter(|r| r.command_id == params.command_id);
-        let steer = self
-            .steer_retained
-            .as_ref()
-            .filter(|r| r.command_id == params.command_id);
         let stop = self.stop.as_ref().is_some_and(|s| s.0 == params.command_id);
-        if params.command_id != self.start_command
-            && retained.is_none()
-            && interrupt.is_none()
-            && steer.is_none()
-            && !stop
-        {
-            return unknown_snapshot(&params, "Antigravity command identity is not retained");
+        let live_turn = state
+            .live_turn_for_command(&params.command_id)
+            .or_else(|| state.latest_terminal_turn_for_command(&params.command_id));
+        if params.command_id != self.start_command && !stop && live_turn.is_none() {
+            return unknown_snapshot(&params, "Antigravity command identity is not live");
         }
-        let turn = params
-            .turn_id
-            .as_deref()
-            .or_else(|| retained.map(|r| r.turn.as_str()))
-            .or_else(|| interrupt.map(|r| r.turn.as_str()))
-            .or_else(|| steer.map(|r| r.turn.as_str()));
-        if let Some(turn) = turn {
-            let proven = retained.is_some_and(|r| r.turn == turn)
-                || interrupt.is_some_and(|r| r.turn == turn)
-                || steer.is_some_and(|r| r.turn == turn);
-            if !proven {
-                return unknown_snapshot(
-                    &params,
-                    "Antigravity snapshot cannot prove the exact requested turn",
-                );
-            }
+        let turn = params.turn_id.as_deref().or(live_turn);
+        if let (Some(requested), Some(bound)) = (params.turn_id.as_deref(), live_turn)
+            && requested != bound
+        {
+            return unknown_snapshot(&params, "Antigravity snapshot turn binding is not live");
         }
         let last = state
             .last_turn
@@ -1372,20 +1064,7 @@ impl Session {
             }
             return result.clone();
         }
-        if params.command_id == self.start_command
-            || self
-                .interrupt_retained
-                .as_ref()
-                .is_some_and(|retained| retained.command_id == params.command_id)
-            || self
-                .retained
-                .as_ref()
-                .is_some_and(|r| r.command_id == params.command_id)
-            || self
-                .steer_retained
-                .as_ref()
-                .is_some_and(|retained| retained.command_id == params.command_id)
-        {
+        if params.command_id == self.start_command {
             return Err(Error::new(
                 "source_integrity",
                 "Antigravity command id belongs to another operation",
@@ -1880,44 +1559,6 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn cancel_refusal_does_not_consume_dispatch_sequence() {
-        let peer = eliot_plugin::Peer::stdio();
-        let mut state = events::State::new(
-            peer.client(),
-            "credential".into(),
-            "a1".into(),
-            1,
-            eliot_core::SecretPolicy::default(),
-            "session-1".into(),
-        );
-        let mut highwater = 3;
-        // The turn ended between the caller's first check and this locked gate.
-        assert_eq!(
-            admit_cancel(&state, "turn-1", &mut highwater, Some(4))
-                .unwrap_err()
-                .code,
-            "stale_turn"
-        );
-        assert_eq!(highwater, 3);
-        let _association = state.prepare("send-1".into(), "turn-1".into()).unwrap();
-        for (source_unknown, batch_unknown) in [(true, false), (false, true)] {
-            state.source_unknown = source_unknown;
-            state.batch_unknown = batch_unknown;
-            assert_eq!(
-                admit_cancel(&state, "turn-1", &mut highwater, Some(4))
-                    .unwrap_err()
-                    .code,
-                "stale_turn"
-            );
-            assert_eq!(highwater, 3);
-        }
-        state.source_unknown = false;
-        state.batch_unknown = false;
-        admit_cancel(&state, "turn-1", &mut highwater, Some(4)).unwrap();
-        assert_eq!(highwater, 4);
-    }
-
-    #[tokio::test]
     async fn send_wait_requires_committed_native_association() {
         let (reply, association) = oneshot::channel();
         let wait = wait_for_association(
@@ -1975,107 +1616,6 @@ mod tests {
                 .code,
             "unknown"
         );
-    }
-
-    #[test]
-    fn command_history_tracking_and_conflicts() {
-        let payload = json!({"text": "hello world"});
-        let payload_sha256 = canonical_json_sha256(&payload).unwrap();
-        let outcome: Result<Value> = Ok(json!({"state": "applied", "turn_id": "turn-1"}));
-
-        let retained = Some(RetainedCommand {
-            seq: 10,
-            command_id: "cmd-1".to_owned(),
-            payload_sha256,
-            turn: "turn-1".to_owned(),
-            outcome: outcome.clone(),
-        });
-
-        // Exact match
-        let decision = check_history(&retained, 10, 10, "cmd-1", payload_sha256);
-        match decision {
-            HistoryDecision::RetainedOutcome(out) => {
-                assert_eq!(out.as_ref().unwrap()["state"], "applied");
-            }
-            _ => panic!("expected exact retained outcome"),
-        }
-
-        // Conflict: same seq, different command_id
-        let decision = check_history(&retained, 10, 10, "cmd-diff", payload_sha256);
-        assert!(matches!(decision, HistoryDecision::Conflict));
-
-        // Conflict: same command_id, different seq
-        let decision = check_history(&retained, 10, 15, "cmd-1", payload_sha256);
-        assert!(matches!(decision, HistoryDecision::Conflict));
-
-        // Conflict: same seq and command_id, different payload
-        let other_payload = json!({"text": "tampered"});
-        let other_sha256 = canonical_json_sha256(&other_payload).unwrap();
-        let decision = check_history(&retained, 10, 10, "cmd-1", other_sha256);
-        assert!(matches!(decision, HistoryDecision::Conflict));
-
-        // Evicted history: seq <= highwater_seq (not retained)
-        let decision = check_history(&retained, 10, 5, "cmd-old", other_sha256);
-        assert!(matches!(decision, HistoryDecision::EvictedHistory));
-
-        // Advance: higher seq > highwater_seq
-        let decision = check_history(&retained, 10, 20, "cmd-new", other_sha256);
-        assert!(matches!(decision, HistoryDecision::Advance));
-    }
-
-    #[test]
-    fn thousands_of_commands_keep_constant_memory_and_evict_old() {
-        let mut highwater_seq = 0;
-        let mut retained: Option<RetainedCommand> = None;
-
-        for i in 1..=2000 {
-            let seq = i * 10;
-            let cmd_id = format!("cmd-{seq}");
-            let payload = json!({"text": format!("prompt {seq}")});
-            let payload_sha256 = canonical_json_sha256(&payload).unwrap();
-
-            let decision = check_history(&retained, highwater_seq, seq, &cmd_id, payload_sha256);
-            assert!(matches!(decision, HistoryDecision::Advance));
-
-            highwater_seq = seq;
-            retained = Some(RetainedCommand {
-                seq,
-                command_id: cmd_id,
-                payload_sha256,
-                turn: format!("turn-{seq}"),
-                outcome: Ok(json!({"state": "applied"})),
-            });
-        }
-
-        assert_eq!(retained.as_ref().unwrap().seq, 20_000);
-        assert_eq!(retained.as_ref().unwrap().command_id, "cmd-20000");
-
-        let old_payload = json!({"text": "prompt 10"});
-        let old_sha256 = canonical_json_sha256(&old_payload).unwrap();
-        let decision = check_history(&retained, highwater_seq, 10, "cmd-10", old_sha256);
-        assert!(matches!(decision, HistoryDecision::EvictedHistory));
-    }
-
-    #[test]
-    fn lost_write_unknown_returns_same_outcome_without_retry() {
-        let payload = json!({"text": "lost prompt"});
-        let payload_sha256 = canonical_json_sha256(&payload).unwrap();
-        let unknown_outcome: Result<Value> = Err(Error::new("unknown", "input may have applied"));
-
-        let retained = Some(RetainedCommand {
-            seq: 42,
-            command_id: "cmd-lost".to_owned(),
-            payload_sha256,
-            turn: "turn-lost".to_owned(),
-            outcome: unknown_outcome,
-        });
-        let decision = check_history(&retained, 42, 42, "cmd-lost", payload_sha256);
-        match decision {
-            HistoryDecision::RetainedOutcome(Err(err)) => {
-                assert_eq!(err.code, "unknown");
-            }
-            _ => panic!("expected retained unknown error outcome"),
-        }
     }
 
     fn stage_dirs(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {

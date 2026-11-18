@@ -16,7 +16,10 @@ use eliot_core::{
     Agent, Command, ContextItem, Error, InjectArgs, InjectPoint, Result, SecretPolicy, SourceBatch,
     SourceGap, SourceGapAck, StderrSource,
 };
-use eliot_plugin::{PluginManifest, StderrCapture, StderrView, spawn_plugin_stderr, sync::LockExt};
+use eliot_plugin::{
+    AgentCommandParams, PluginManifest, StderrCapture, StderrView, spawn_plugin_stderr,
+    sync::LockExt,
+};
 
 use serde_json::{Map, Value, json};
 use source_intake::serve_plugin_requests;
@@ -225,7 +228,7 @@ struct RuntimeEntry {
 enum RuntimeMessage {
     Command {
         command: Command,
-        dispatch_seq: Option<i64>,
+        context: Vec<ContextItem>,
         reply: oneshot::Sender<Result<Value>>,
     },
     Snapshot {
@@ -245,6 +248,39 @@ enum RuntimeMessage {
     DaemonForce {
         reply: oneshot::Sender<Result<()>>,
     },
+}
+
+pub(crate) struct PendingCommand {
+    response: oneshot::Receiver<Result<Value>>,
+    stderr: StderrView,
+    credentials: Arc<[String]>,
+    wait_for_steer: bool,
+}
+
+impl PendingCommand {
+    pub(crate) async fn wait(self) -> Result<Value> {
+        let result = if self.wait_for_steer {
+            self.response.await
+        } else {
+            match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, self.response).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(Error::new(
+                        "unknown",
+                        "Agent plugin command exceeded its absolute deadline",
+                    ));
+                }
+            }
+        };
+        result
+            .unwrap_or_else(|_| {
+                Err(Error::new(
+                    "unknown",
+                    "Agent plugin ended before the command outcome was returned",
+                ))
+            })
+            .map_err(|error| diagnose_error(error, &self.stderr, &self.credentials))
+    }
 }
 
 struct HostState {
@@ -793,12 +829,14 @@ impl PluginHost {
         result.map_err(|error| diagnose_error(error, &stderr_view, &source_credentials))
     }
 
-    pub(crate) async fn command(
+    /// Enqueue under the router's Store writer lock, immediately after commit.
+    /// The actor performs all native I/O after this nonblocking handoff.
+    pub(crate) fn enqueue_command(
         &self,
         agent: &Agent,
         command: Command,
-        dispatch_seq: Option<i64>,
-    ) -> Result<Value> {
+        context: Vec<ContextItem>,
+    ) -> Result<PendingCommand> {
         let key = AgentKey {
             id: agent.id.clone(),
             generation: agent.generation,
@@ -807,14 +845,14 @@ impl PluginHost {
             || command.generation != Some(agent.generation)
         {
             return Err(Error::new(
-                "stale_generation",
+                "native_not_dispatched",
                 "command does not match the owned Agent generation",
             ));
         }
         match command.verb.as_str() {
             "steer" | "interrupt" if command.turn_id.is_none() => {
                 return Err(Error::new(
-                    "stale_generation",
+                    "native_not_dispatched",
                     "turn control requires the captured active turn",
                 ));
             }
@@ -822,7 +860,7 @@ impl PluginHost {
                 if command.request_id.is_none() || command.turn_id.is_none() =>
             {
                 return Err(Error::new(
-                    "bad_state",
+                    "native_not_dispatched",
                     "request reply requires its captured request and turn ids",
                 ));
             }
@@ -831,39 +869,56 @@ impl PluginHost {
         let (sender, stderr, credentials) = self.sender(&key, &command.verb)?;
         let wait_for_steer = command.verb == "steer";
         let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + RPC_DEADLINE,
-            sender.send(RuntimeMessage::Command {
+        sender
+            .try_send(RuntimeMessage::Command {
                 command,
-                dispatch_seq,
+                context,
                 reply,
-            }),
+            })
+            .map_err(|error| {
+                let message = match error {
+                    mpsc::error::TrySendError::Full(_) => "Agent plugin command queue is full",
+                    mpsc::error::TrySendError::Closed(_) => "Agent plugin command queue is closed",
+                };
+                Error::new("native_not_dispatched", message)
+            })?;
+        Ok(PendingCommand {
+            response,
+            stderr,
+            credentials,
+            wait_for_steer,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_command_queue(&self, agent: &str) -> impl FnMut() -> Option<String> {
+        let (sender, mut receiver) = mpsc::channel(16);
+        let client = PluginConnection::new(tokio::io::empty(), tokio::io::sink()).client();
+        let stderr = eliot_plugin::spawn_stderr(
+            tokio::io::empty(),
+            Arc::new(SecretPolicy::new([] as [&str; 0])),
         )
-        .await
-        .map_err(|_| Error::new("busy", "Agent plugin command queue is full"))?
-        .map_err(|_| Error::new("unknown", "owned Agent plugin is no longer available"))?;
-        let result = if wait_for_steer {
-            match response.await {
-                Ok(result) => result,
-                Err(_) => Err(Error::new(
-                    "unknown",
-                    "Agent plugin ended before the steer outcome was returned",
-                )),
-            }
-        } else {
-            match timeout_at(Instant::now() + RPC_DEADLINE + RPC_GRACE, response).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(Error::new(
-                    "unknown",
-                    "Agent plugin ended before the command outcome was returned",
-                )),
-                Err(_) => Err(Error::new(
-                    "unknown",
-                    "Agent plugin command exceeded its absolute deadline",
-                )),
-            }
-        };
-        result.map_err(|error| diagnose_error(error, &stderr, &credentials))
+        .view();
+        self.state.running.lock_recover().insert(
+            AgentKey {
+                id: agent.to_owned(),
+                generation: 1,
+            },
+            RuntimeEntry {
+                sender,
+                client,
+                start_command_id: String::new(),
+                verbs: HashSet::from(["steer".to_owned()]),
+                stderr,
+                source_credentials: Arc::from([]),
+            },
+        );
+        move || match receiver.try_recv() {
+            Ok(RuntimeMessage::Command { command, .. }) => Some(command.id),
+            Ok(_) => panic!("expected an agent.command"),
+            Err(mpsc::error::TryRecvError::Empty) => None,
+            Err(error) => panic!("command mailbox disconnected: {error}"),
+        }
     }
 
     pub(crate) async fn stop(
@@ -2235,50 +2290,36 @@ async fn resolve_resume_config(
         })
 }
 
-/// Build the `agent.command` wire params for one dispatched command, relaying
-/// Store-committed FIFO `next_input` items as top-level `context` (omitted
-/// when empty). The reserved `context_items` member is stripped so `args`
-/// stays the original send input. A resolved configuration overlay adds the
-/// effective model/effort overrides for `send` only; every other verb keeps
-/// its exact historical params.
 fn agent_command_params(
     agent: &Agent,
     command: &Command,
-    dispatch_seq: Option<i64>,
+    context: Vec<ContextItem>,
     config: Option<&eliot_store::AgentConfig>,
 ) -> Result<Value> {
     let mut args = plugin_command_args(command)?;
-    let context = args
-        .as_object_mut()
-        .and_then(|object| object.remove("context_items"))
-        .map(serde_json::from_value::<Vec<ContextItem>>)
-        .transpose()
-        .map_err(|_| Error::new("source_integrity", "send context_items are malformed"))?
-        .unwrap_or_default();
-    let mut params = json!({
-        "agent_id": agent.id,
-        "generation": agent.generation,
-        "command_id": command.id,
-        "verb": command.verb,
-        "turn_id": command.turn_id,
-        "request_id": command.request_id,
-        "args": args,
-        "dispatch_seq": dispatch_seq,
-    });
-    if !context.is_empty() {
-        params["context"] = serde_json::to_value(&context)
-            .map_err(|_| Error::new("internal", "context items could not be encoded"))?;
+    if let Some(args) = args.as_object_mut() {
+        args.remove("context_items");
     }
-    if let Some(config) = config.filter(|_| command.verb == "send") {
-        if let Some(model) = config.model.as_deref() {
-            params["model_override"] = Value::String(model.to_owned());
-        }
-        if let Some(effort) = config.effort.as_deref() {
-            params["effort_override"] = Value::String(effort.to_owned());
-        }
-        params["config_revision"] = json!(config.revision);
-    }
-    Ok(params)
+    let config = config.filter(|_| command.verb == "send");
+    serde_json::to_value(AgentCommandParams {
+        agent_id: agent.id.clone(),
+        generation: agent.generation,
+        command_id: command.id.clone(),
+        verb: command.verb.clone(),
+        turn_id: command.turn_id.clone(),
+        request_id: command.request_id.clone(),
+        args,
+        context,
+        model_override: config.and_then(|config| config.model.clone()),
+        effort_override: config.and_then(|config| config.effort.clone()),
+        config_revision: config.map(|config| config.revision),
+    })
+    .map_err(|_| {
+        Error::new(
+            "native_not_dispatched",
+            "plugin command could not be encoded",
+        )
+    })
 }
 
 fn validate_agent_command_result(value: Value, harness: &str, command: &Command) -> Result<Value> {
@@ -3718,13 +3759,12 @@ mod tests {
             command_id: "configure-1".to_owned(),
             created_at: 0,
         };
-        let params = agent_command_params(&agent, &command, Some(7), Some(&config)).unwrap();
+        let params = agent_command_params(&agent, &command, Vec::new(), Some(&config)).unwrap();
         assert_eq!(params["model_override"], json!("m1"));
         assert_eq!(params["effort_override"], json!("low"));
         assert_eq!(params["config_revision"], json!(2));
-        assert_eq!(params["dispatch_seq"], json!(7));
         // Frozen sends keep their exact historical params.
-        let plain = agent_command_params(&agent, &command, None, None).unwrap();
+        let plain = agent_command_params(&agent, &command, Vec::new(), None).unwrap();
         assert!(plain.get("model_override").is_none());
         assert!(plain.get("effort_override").is_none());
         assert!(plain.get("config_revision").is_none());
@@ -3734,7 +3774,7 @@ mod tests {
             turn_id: Some("turn-1".to_owned()),
             ..command.clone()
         };
-        let steered = agent_command_params(&agent, &steer, None, Some(&config)).unwrap();
+        let steered = agent_command_params(&agent, &steer, Vec::new(), Some(&config)).unwrap();
         assert!(steered.get("model_override").is_none());
         assert!(steered.get("config_revision").is_none());
     }

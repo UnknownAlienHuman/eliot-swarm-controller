@@ -49,6 +49,30 @@ pub(crate) type Shared = Arc<Mutex<State>>;
 const MAX_TURN_TEXT_BYTES: usize = 256 * 1024;
 const MAX_UNBOUND_UPDATES: usize = 32;
 const MAX_UNBOUND_UPDATE_BYTES: usize = 256 * 1024;
+const MAX_TOOL_ID_BYTES: usize = 96;
+const MAX_TOOL_TITLE_BYTES: usize = 2048;
+const MAX_LIVE_TOOLS: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+    Unknown,
+}
+
+impl ToolStatus {
+    fn parse(value: &str) -> Self {
+        match value {
+            "pending" => Self::Pending,
+            "in_progress" => Self::InProgress,
+            "completed" => Self::Completed,
+            "failed" => Self::Failed,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 pub(crate) type LoadOutcome = (String, Result<Value>);
 
@@ -184,7 +208,7 @@ pub(crate) struct State {
     /// Partial tool-call deltas merged per vendor id before any event is
     /// derived: `(title, status)` as last known. Updates may omit either
     /// field, so absence alone is never a protocol gap.
-    tools: HashMap<String, (String, String)>,
+    tools: HashMap<String, (String, ToolStatus)>,
     /// RAII registration of the outstanding fenced prompt call. Exactly
     /// one owner (this state); clearing it retires both transport maps.
     /// Held until the actual in-band terminal reply, an error, a stream
@@ -244,6 +268,26 @@ pub(crate) struct State {
 }
 
 impl State {
+    pub fn live_turn_for_command(&self, command_id: &str) -> Option<&str> {
+        self.pending
+            .as_ref()
+            .filter(|pending| pending.command == command_id)
+            .map(|pending| pending.turn.as_str())
+            .or_else(|| {
+                self.pending_steer
+                    .as_ref()
+                    .filter(|pending| pending.command_id == command_id)
+                    .map(|pending| pending.turn_id.as_str())
+            })
+    }
+
+    pub fn latest_terminal_turn_for_command(&self, command_id: &str) -> Option<&str> {
+        self.last_turn
+            .as_ref()
+            .filter(|turn| turn.command_id == command_id && turn.terminal)
+            .map(|turn| turn.turn_id.as_str())
+    }
+
     pub fn new(
         host: PeerClient,
         credential: String,
@@ -715,6 +759,16 @@ impl State {
                 )
                 .await;
         }
+        if !self.valid_tool_id(&ask.tool_call_id, &turn_id) {
+            return self
+                .stray_permission_request(
+                    client,
+                    native_id,
+                    Some(&ask),
+                    "Antigravity permission tool correlation is invalid",
+                )
+                .await;
+        }
         if let Some(entry) = self
             .pending_requests
             .values()
@@ -813,9 +867,13 @@ impl State {
                 .await;
         }
         publication?;
-        self.tools
-            .entry(ask.tool_call_id)
-            .or_insert((ask.title, "pending".to_owned()));
+        if !self.tools.contains_key(&ask.tool_call_id) {
+            if self.tools.len() < MAX_LIVE_TOOLS {
+                self.merge_tool(&ask.tool_call_id, &ask.title, "pending");
+            } else {
+                self.record_unattributed_tool().await?;
+            }
+        }
         if let Some(command_id) = self.cancellation_for_pending().map(str::to_owned) {
             self.answer_pending_cancelled(client, &command_id, Some(&turn_id))
                 .await;
@@ -828,6 +886,12 @@ impl State {
         mut data: Value,
         entry: PendingNativeRequest,
     ) -> Result<()> {
+        if !self.valid_tool_id(&entry.tool_call_id, &entry.turn_id) {
+            return Err(Error::new(
+                "native_protocol",
+                "Antigravity permission tool correlation is invalid",
+            ));
+        }
         if self.pending.as_ref().is_none_or(|pending| {
             pending.turn != entry.turn_id
                 || data["turn_id"] != pending.turn
@@ -897,6 +961,7 @@ impl State {
                 serde_json::to_string(&ask.raw_input).unwrap_or_default()
             }
         };
+        let raw = self.policy.redact_text(&raw);
         let raw: String = raw.chars().take(2048).collect();
         if !raw.trim().is_empty() {
             parts.push(format!("input: {raw}"));
@@ -1418,6 +1483,13 @@ impl State {
                 title,
                 status,
             } => {
+                let turn = &self.pending.as_ref().expect("prepared tool call").turn;
+                if !self.valid_tool_id(&tool_call_id, turn)
+                    || (!self.tools.contains_key(&tool_call_id)
+                        && self.tools.len() >= MAX_LIVE_TOOLS)
+                {
+                    return self.record_unattributed_tool().await;
+                }
                 self.merge_tool(&tool_call_id, &title, &status);
                 self.tool_event(&tool_call_id, "tool.started", "running")
                     .await
@@ -1441,17 +1513,17 @@ impl State {
                     return self.record_unattributed_tool().await;
                 }
                 self.merge_tool(&tool_call_id, title.as_deref().unwrap_or(""), &status);
-                match self.tools[&tool_call_id].1.as_str() {
-                    "pending" => Ok(()),
-                    "in_progress" => {
+                match self.tools[&tool_call_id].1 {
+                    ToolStatus::Pending => Ok(()),
+                    ToolStatus::InProgress => {
                         self.tool_event(&tool_call_id, "tool.started", "running")
                             .await
                     }
-                    "completed" => {
+                    ToolStatus::Completed => {
                         self.tool_event(&tool_call_id, "tool.completed", "completed")
                             .await
                     }
-                    "failed" => {
+                    ToolStatus::Failed => {
                         self.tool_event(&tool_call_id, "tool.completed", "failed")
                             .await
                     }
@@ -1523,25 +1595,38 @@ impl State {
     /// that omits a field inherits the last known value, so only a delta
     /// that still has no known status is a real protocol gap.
     fn merge_tool(&mut self, tool_call_id: &str, title: &str, status: &str) {
-        if tool_call_id.trim().is_empty() {
-            return;
-        }
-        let known = self.tools.entry(tool_call_id.to_owned()).or_default();
+        let known = self
+            .tools
+            .entry(tool_call_id.to_owned())
+            .or_insert_with(|| (String::new(), ToolStatus::Unknown));
         if !title.is_empty() {
-            known.0 = title.to_owned();
+            let mut redacted = self.policy.redact_text(title);
+            redacted.truncate(redacted.floor_char_boundary(MAX_TOOL_TITLE_BYTES));
+            known.0 = redacted;
         }
         if !status.is_empty() {
-            known.1 = status.to_owned();
+            known.1 = ToolStatus::parse(status);
         }
     }
 
+    fn valid_tool_id(&self, tool_call_id: &str, turn: &str) -> bool {
+        !tool_call_id.trim().is_empty()
+            && tool_call_id.len() <= MAX_TOOL_ID_BYTES
+            && !tool_call_id.chars().any(char::is_control)
+            && !self.policy.contains_text(tool_call_id)
+            && event_id(
+                &self.conversation,
+                turn,
+                &format!("tool-{tool_call_id}"),
+                "tool.completed",
+                "agy",
+                "Antigravity",
+            )
+            .is_ok_and(|id| !self.policy.contains_text(&id))
+    }
+
     async fn tool_event(&mut self, tool_call_id: &str, kind: &str, status: &str) -> Result<()> {
-        if tool_call_id.trim().is_empty() {
-            return Err(Error::new(
-                "native_protocol",
-                "Antigravity tool call id is absent",
-            ));
-        }
+        let item = format!("tool-{tool_call_id}");
         // Each lifecycle transition is emitted once per tool call. A
         // later delta for an already-emitted transition is metadata
         // only (already merged) and never re-emits or poisons the
@@ -1560,7 +1645,6 @@ impl State {
             .get(tool_call_id)
             .map(|(title, _)| title.clone())
             .unwrap_or_default();
-        let item = format!("tool-{tool_call_id}");
         let mut data = json!({"command_id": pending.command, "turn_id": turn,
             "item_id": item, "tool": title, "status": status});
         self.policy.redact_values(&mut data);
