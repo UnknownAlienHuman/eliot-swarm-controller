@@ -252,16 +252,19 @@ process, turn or reader behind its generation (for example an observer attach
 fenced by a later detach) does not block drain; the drain receipt lists it as
 retained-unresolved instead, and the stored outcome stays `unknown`.
 
-Retirement follows the same evidence. An ended native observed child
-(`stopped`, grant revoked, custody drained) retires through `agent.archive` or
-`agent.delete` with its unknown turn retained as ended-observation evidence,
-never resolved or completed. A detached external observer (`unknown`, no live
-reader, custody drained) retires the same way without taking a native
-lifecycle state. Live observation (an attached observer with an open source,
-or a native child whose producer generation is still live) still blocks both.
+Retirement follows the same evidence. Archive preserves retained unknown evidence while
+delete removes the tree's turns and events without resolving them. An ended native
+observed child (`stopped`, grant revoked, custody drained) retires through
+`agent.archive` or `agent.delete` with its unknown turn retained as ended-observation
+evidence under archive, never resolved or completed; delete removes it with the tree
+instead. A detached external observer (`unknown`, no live reader, custody drained)
+retires the same way without taking a native lifecycle state.
 
-Compute `apply(state,input) -> (next_state,effects)` without I/O or mutating published
-state. Store commits event, next projection and derived facts atomically, then publishes.
+Live observation (an attached observer with an open source, or a native child whose
+producer generation is still live) still blocks both.
+Compute `apply(state,input) -> (next_state,effects)` without I/O or mutating published state.
+
+The Store commits event, next projection and derived facts atomically, then publishes.
 
 ## Profile
 
@@ -929,23 +932,28 @@ read paths; a retried ack over it succeeds as already acked. An unset
 ## Explicit Agent tree presentation and removal
 
 `archived` is a durable presentation flag independent of lifecycle state; archiving
-never stops a generation. Archive/unarchive requires idle or ended (stopped, failed
-or lost) descendants, no active or unknown turns, pending requests or open commands,
-so a lost tree that cannot be deleted can still be hidden. Archive never hides custody
-the owner must still resolve (an unexited owned process, `unknown` artifact or open
-native source): archiving an ended member requires its custody resolved, and the
-default list still shows an archived ended Agent while its custody is unresolved, as
-when an archived idle Agent is lost with its process left running. Eliot's own `os`, `git` and `workspace_process` observers of a resumable Agent may
-stay open; delete's drain waits for them. An idle member keeps its live custody, and
-unarchive only reveals. A refusal names the Agent and its first blocker.
+never stops a generation. Archive/unarchive requires idle, ended (stopped, failed or
+lost), a detached external observer, or an ended native observation, with no active
+turn, no other uncertain turn, and no pending request or open command, so a lost tree
+that cannot be deleted can still be hidden. Archive never hides custody the owner
+must still resolve (an unexited owned process, `unknown` artifact or open native
+source): archiving an ended member requires its custody resolved, and the default list
+still shows an archived ended Agent while its custody is unresolved. Eliot's own `os`,
+`git` and `workspace_process` observers of a resumable Agent may stay open; delete's
+drain waits for them. An idle member keeps its live custody, and unarchive only
+reveals. A refusal names the Agent and its first blocker. Reattaching an archived
+observer opens a new `observe` source and clears the flag, so a live reader is never hidden.
 Send, resume, steer and inject admission atomically clears the target's archive flag.
-Deletion requires every descendant stopped or failed and drained, and shares retention's leaf-first command
-row cleanup. Store removes dependent records in one transaction and retains
-mutation replies plus deleted command identities through the retry window. It
-advances the conservative retained-history floor before removing event rows,
-refusing a live rule cursor pin or an applicable unconsumed cleanup plan. Other
-Agents' Git/stream sources cannot pin the selected tree's events. Live sources
-inside the selected tree already prevent deletion under the drained-custody guard.
+Deletion requires every descendant stopped or failed, a detached external observer, or
+an ended native observation, all drained, and shares retention's leaf-first command row
+cleanup. Archive preserves retained unknown evidence; delete removes the tree's turns
+and events without resolving them: no resolution is recorded and no `turn.resolved`
+event is emitted. The Store still removes dependent records in one transaction and
+retains mutation replies plus deleted command identities through the retry window. It advances
+the conservative retained-history floor before removing event rows, refusing a live rule
+cursor pin or an applicable unconsumed cleanup plan. Other Agents' Git/stream sources
+cannot pin the selected tree's events. An attached observer with an open source still
+prevents deletion under the drained-custody guard.
 Process records are removed across every generation; consumed cleanup-plan replay
 remains retained. No uncertain native effect is replayed.
 Neither operation touches native stores, workspaces or branches; artifact cleanup

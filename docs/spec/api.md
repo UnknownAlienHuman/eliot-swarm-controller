@@ -690,39 +690,48 @@ optional members are omitted when requests are serialized.
 
 `agent.archive {id, agent:"aN", archived:bool}` is Owner-only and atomically
 archives or unarchives the selected Agent and all current descendants. Every
-member must be idle or ended (stopped, failed or lost), with no active/uncertain
-turn, pending request or open command, and archiving an ended member also needs its
-custody resolved: no unexited owned process, `unknown` artifact or open native source
-(Eliot's `os`/`git`/`workspace_process` observers may stay open). Otherwise it returns
-typed `busy`, naming the blocking Agent and its state, request, command, turn,
-process, source or artifact, and stops nothing. Unarchive needs no drain. The flag is
-durable. Admission of send, resume, steer or inject atomically unarchives its
-target, including selector members, so new activity appears in the default list.
+member must be idle, ended (stopped, failed or lost), a detached external observer
+(`unknown` with no live reader), or an ended native observation (a stopped observed
+child keeping its `unknown` turn as retained ended-observation evidence), with no
+active turn, no other uncertain turn, no pending request and no open command.
+Archiving an ended member also needs its custody resolved: no unexited owned process,
+`unknown` artifact or open native source (Eliot's `os`/`git`/`workspace_process`
+observers may stay open); a live observation (an attached observer with an open source)
+still blocks on custody. Otherwise it returns typed `busy`, naming the blocking Agent and its state, request, command, turn,
+process, source or artifact, and stops nothing. Archive preserves retained unknown evidence.
+Unarchive needs no drain. The flag is durable. Admission of send, resume, steer or inject
+atomically unarchives its target, including selector members, so new activity appears in
+the default list. Reattaching an archived observer opens a new `observe` source and
+clears the flag, so a live reader is never hidden.
 `agent.list` accepts `archived:"exclude"` (default), `"only"` or `"include"`;
 totals and cursors use the same filter. The default also lists an archived ended
 (stopped, failed or lost) Agent while its custody is unresolved, as when an archived
 idle Agent is lost with its process left running; `"only"` lists it too. Summaries and full Agents expose `archived`.
 CLI: `swarm archive aN`, `swarm unarchive aN`, `swarm ls --archived include`.
 
-`agent.delete {id, agent:"aN"}` is Owner-only and removes a tree whose Agents are
-stopped or failed, using retention's leaf-first command cleanup. A failed launch
-can be removed after its sources and custody drain; an already-terminal `stop`
-does not need to rewrite its failure state. Delete removes a retained tree-selector,
-rule, or timer admission parent with its full member command set in the same
-transaction. Each member must pass the ordinary deletion checks. A set with commands
-outside the requested Agent tree returns `busy`. A `busy` refusal names the blocking
-Agent and its actual state, pending requests, command, turn (including generation
-and retained state) or undrained process, source or artifact, rather than treating stopped lifecycle as proof of drained
-history. A retained `unknown` turn still blocks deletion after stop. Live custody, open
+`agent.delete {id, agent:"aN"}` is Owner-only and removes a tree whose Agents are ended
+(stopped or failed), a detached external observer, or an ended native observation with
+its `unknown` turn retained as ended-observation evidence, using retention's leaf-first
+command cleanup. A failed launch can be removed after its sources and custody drain; an
+already-terminal `stop` does not need to rewrite its failure state. Delete removes a
+retained tree-selector, rule, or timer admission parent with its full member command
+set in the same transaction. Each member must pass the ordinary deletion checks. A set
+with commands outside the requested Agent tree returns `busy`. A `busy` refusal names
+the blocking Agent and its actual state, pending requests, command, turn (including
+generation and retained state) or undrained process, source or artifact, rather than
+treating stopped lifecycle as proof of drained history. An ordinary retained `unknown`
+turn still blocks deletion after stop; the ended-observation evidence retires with its
+tree instead. Delete removes the tree's turns and events without resolving them: no
+resolution is recorded and no `turn.resolved` event is emitted. Live custody, open
 commands, uncertain turns, active or uncertain cleanup attempts, or a pinned history
 floor return `busy`; oversized operations return `unavailable` atomically. An unapplied
-[cleanup review](coordination.md#registered-artifacts-and-cleanup-k69) is superseded
-for the deleted tree's items. Delete never stops an Agent or deletes
-workspace files, native stores or Git branches. Run artifact cleanup separately
-before removing its ownership records. Process records for every generation of the
-tree are removed; consumed cleanup plans and their exact apply replay remain retained.
-Deleted command IDs remain bound until the retry window expires, preventing a deleted
-native effect from being readmitted.
+[cleanup review](coordination.md#registered-artifacts-and-cleanup-k69) is superseded for
+the deleted tree's items. Delete never stops an Agent or deletes workspace files,
+native stores or Git branches. Run artifact cleanup separately before removing its
+ownership records. Process records for every generation of the tree are removed;
+consumed cleanup plans and their exact apply replay remain retained. Deleted command IDs
+remain bound until the retry window expires, preventing a deleted native effect from
+being readmitted.
 Archive/delete replies are `{agent, affected, archived:bool|null, deleted:bool}`;
 mutation ID, result and changes commit together. Exact retries return the retained
 reply even after deletion; changed payloads return `id_conflict`. MCP mints `id`
@@ -1300,8 +1309,12 @@ ahead of the Agent's current generation is `stale_generation`. A superseded
 generation resolves without a readback and touches only that exact turn. The
 turn completes with the asserted status, and a `turn.resolved` event carrying
 `resolution_source=owner` is emitted; no native `turn.completed` receipt is
-invented and no command row is touched. The current `Turn` read object does not
-expose the resolution source.
+invented and no command row is touched. The resolved `Turn` row carries
+`resolution_source=owner`. That provenance is kept in every readback.
+
+`Turn` readers (`turn.get`, `agent.result`) return it on the row, while `swarm.wait`
+and result readbacks never report an owner-resolved turn as native success: an
+owner-asserted `completed` reads back as `unknown` until native evidence arrives.
 
 ## Provider holds
 
