@@ -1330,6 +1330,8 @@ impl Store {
                     ON completion_digests(delivered_at, created_at, id);
                  CREATE INDEX IF NOT EXISTS agents_list_archived_state
                     ON agents(archived, state, id);
+                 CREATE INDEX IF NOT EXISTS workspaces_start_command
+                    ON workspaces(start_command_id);
                    INSERT INTO schema_migrations(version) VALUES (56);",
             )
             .map_err(sql_error)?;
@@ -1463,7 +1465,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX IF EXISTS workspaces_start_command; DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1533,7 +1535,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX IF EXISTS workspaces_start_command; DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1588,7 +1590,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX IF EXISTS workspaces_start_command; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1686,7 +1688,7 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
+                "DROP INDEX IF EXISTS workspaces_start_command; DROP INDEX IF EXISTS agents_list_archived_state; DROP INDEX IF EXISTS completion_digests_pending_cursor; DROP INDEX commands_prune_roots; ALTER TABLE project_assignments DROP COLUMN workspace_adopted;
                  ALTER TABLE project_assignments DROP COLUMN workspace_path;
                  DELETE FROM schema_migrations WHERE version=57;
                  ALTER TABLE turns DROP COLUMN resolution_source;
@@ -1849,7 +1851,7 @@ mod continuity_tests {
         main_upgraded
             .connection
             .execute_batch(
-                "DROP INDEX commands_prune_roots; DELETE FROM schema_migrations WHERE version=56;",
+                "DROP INDEX IF EXISTS workspaces_start_command; DROP INDEX commands_prune_roots; DELETE FROM schema_migrations WHERE version=56;",
             )
             .unwrap();
         main_upgraded.migrate().unwrap();

@@ -1440,6 +1440,46 @@ mod tests {
     }
 
     #[test]
+    fn workspace_pin_lookup_seeks_start_command_index() {
+        let store = store();
+        // The per-candidate workspace pin check runs once per examined
+        // command under the Store lock: v56 must carry an index on
+        // workspaces(start_command_id) so it seeks instead of scanning the
+        // retained workspaces table per candidate.
+        let indexed: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='workspaces_start_command')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            indexed,
+            "v56 must index workspaces(start_command_id) for the bounded pin check"
+        );
+        let plan: String = store
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM workspaces w WHERE w.start_command_id = ?1)",
+            )
+            .unwrap()
+            .query_map(["x"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ");
+        assert!(
+            plan.contains("workspaces_start_command"),
+            "workspace pin must seek the pin index: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN w") && !plan.contains("SCAN workspaces"),
+            "workspace pin must not scan the workspaces table: {plan}"
+        );
+    }
+
+    #[test]
     fn prune_commands_keeps_agent_config_references() {
         let mut store = store();
         let old = NOW - 31 * DAY_MS;
