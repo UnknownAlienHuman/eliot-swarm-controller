@@ -184,8 +184,11 @@ exit; see [Process observation and terminal ordering](monitoring.md#process-obse
 Readers accept persisted rows carrying any of these reasons.
 
 An open stop/transition is a command beside the observed state, not another state
-machine. Generation transition blocks ordinary turn work. Terminal settlement cancels
-undispatched work, revokes token/own identity, releases claims and pauses Goals atomically.
+machine. Generation transition blocks ordinary turn work. A stop in `dispatched`
+or `unknown` fences sends, active-turn injection, turn controls, and native
+configuration for its generation. Its own interrupt is the only turn control
+that can dispatch during the stop. Terminal settlement cancels undispatched work,
+revokes token/own identity, releases claims and pauses Goals atomically.
 
 The handoff brief gate preserves withheld successor SENDs across automatic native loss
 and restart until Owner resolution or cancellation; explicit lifecycle cancellation
@@ -194,18 +197,15 @@ If a running turn has no terminal evidence, retain it as `unknown` before cleari
 active-turn pointer; do not erase or fabricate its result. Dispatched/unknown commands
 remain historical and are never reissued.
 
-A graceful stop captures the generation's active turn and first invokes the
-adapter's native interrupt for that exact turn. Give native terminal evidence
-up to `eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT` (five seconds),
-including interrupt dispatch. Commit the observed terminal before session teardown;
-a cancellation terminal settles `interrupted`, while natural completion/failure
-keeps its actual outcome. Then stop the owned session and settle process custody.
-An interrupt acknowledgement alone is not a turn result. If interrupt is unsupported,
-the source is uncertain, or no terminal arrives within the bound, continue session
-stop and retain the unresolved turn as `unknown`. Force stop skips the cooperative
-window. This is one dispatched stop with one interrupt attempt, never a replay or
-a synthesized terminal. `AgentStopParams.turn_id` carries the captured turn; a stale
-turn must never fall back to a newer active turn.
+A graceful stop captures the dispatched generation's active turn. Its one
+interrupt attempt uses the stop's authority and binds to that generation and turn.
+After the attempt, wait up to five seconds for committed readback that the turn is
+no longer running or the generation has ended. A cancellation terminal settles
+`interrupted`, while natural completion/failure keeps its actual outcome.
+A pre-native refusal skips the wait and proceeds to session closure. An interrupt
+acknowledgement or timeout supplies no turn result. Stop the owned session and
+retain the unresolved turn as `unknown` if terminal evidence is absent. Force stop
+skips the cooperative window.
 
 Diagnosis of a stopped, failed or lost Agent names retained unknown commands and
 turns across all generations, including history outside the recent-turn page.

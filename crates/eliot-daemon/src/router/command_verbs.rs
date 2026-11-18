@@ -1,7 +1,7 @@
 //! Per-verb execution of Store-dispatched commands and their settlement.
 
 use super::{
-    PreparedSubmission, Router,
+    Router,
     command::{
         RunWorkerStart, classify_start_result, coordination_commit_error_state,
         validate_observer_command_result,
@@ -9,7 +9,7 @@ use super::{
 };
 use crate::common::now_ms;
 use eliot_core::{
-    Agent, Command, CommandState, Error, FailureOrigin, Result, SubmitCommand, TurnState,
+    Agent, Command, CommandState, Error, Event, FailureOrigin, Result, TurnState,
     api::{FrozenGitFetch, ProjectRegistrationView},
 };
 use serde_json::{Value, json};
@@ -850,14 +850,8 @@ impl Router {
             .get("force")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !force
-            && let Some(turn_id) = agent.active_turn.as_deref()
-            && let Err(error) = self
-                .interrupt_before_stop(agent, turn_id, &dispatched)
-                .await
-        {
-            self.settle_plugin_error(id, &error).await;
-            return true;
+        if !force && let Some(turn_id) = agent.active_turn.as_deref() {
+            self.interrupt_before_stop(agent, turn_id, id).await;
         }
         match self
             .inner
@@ -897,38 +891,50 @@ impl Router {
         true
     }
 
-    async fn interrupt_before_stop(
+    async fn interrupt_before_stop(&self, agent: &Agent, turn_id: &str, stop_id: &str) {
+        let events = self.inner.bus.subscribe();
+        let (id, pending) = {
+            let mut store = self.inner.store.lock().await;
+            if self.check_command_admission_mode("interrupt").is_err() {
+                return;
+            }
+            // A missing prelude (including a turn that ended after capture)
+            // leaves the dispatched stop responsible for session closure.
+            let Ok(change) = store.dispatch_stop_interrupt(stop_id, turn_id, now_ms()) else {
+                return;
+            };
+            self.publish_locked(&change.events);
+            let id = change.value.id.clone();
+            let pending = self
+                .inner
+                .plugin_host
+                .enqueue_command(agent, change.value, Vec::new());
+            (id, pending)
+        };
+        let response = match pending {
+            Ok(pending) => pending.wait().await,
+            Err(error) => {
+                self.settle_plugin_error(&id, &error).await;
+                return;
+            }
+        };
+        let refused = response
+            .as_ref()
+            .is_err_and(|error| error.code == "native_not_dispatched");
+        if self.execute_control_command(&id, agent, response).await {
+            self.signal_progress();
+        }
+        if !refused {
+            let _ = self.wait_for_stop_turn(agent, turn_id, events).await;
+        }
+    }
+
+    async fn wait_for_stop_turn(
         &self,
         agent: &Agent,
         turn_id: &str,
-        stop: &Command,
+        mut events: broadcast::Receiver<Event>,
     ) -> Result<()> {
-        let mut events = self.inner.bus.subscribe();
-        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "interrupt");
-        request.target = Some(agent.id.clone());
-        request.expected_generation = stop.generation;
-        request.expected_turn_id = Some(turn_id.to_owned());
-        let interrupt = {
-            let mut store = self.inner.store.lock().await;
-            let prepared = PreparedSubmission {
-                request,
-                workspace: None,
-            };
-            match self.admit_prepared_submission(&mut store, &stop.principal, prepared, None) {
-                Ok(admission) => {
-                    self.publish_locked(&admission.events);
-                    Some(admission.command.id)
-                }
-                // The exact turn can end between capturing it and admission.
-                Err(error) if matches!(error.code.as_str(), "bad_state" | "stale_generation") => {
-                    None
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        if let Some(id) = interrupt {
-            self.clone().process_command(id, None).await;
-        }
         // An interrupt acknowledgment does not prove the turn ended. The
         // budget expiring permits session closure without inventing a result.
         timeout(STOP_TURN_GRACE, async {
@@ -936,9 +942,11 @@ impl Router {
                 {
                     let store = self.inner.store.lock().await;
                     store.ensure_committed_reads()?;
-                    if store
+                    if store.get_agent(&agent.id)?.is_none_or(|current| {
+                        current.generation != agent.generation || current.is_terminal()
+                    }) || store
                         .get_turn(&agent.id, agent.generation, turn_id)?
-                        .is_some_and(|turn| turn.state == TurnState::Completed)
+                        .is_none_or(|turn| turn.state != TurnState::Running)
                     {
                         return Ok(());
                     }
@@ -948,9 +956,20 @@ impl Router {
                         Ok(event)
                             if event.agent.as_deref() == Some(agent.id.as_str())
                                 && event.generation == Some(agent.generation)
-                                && event.kind == "turn.completed"
-                                && event.data.get("turn_id").and_then(Value::as_str)
-                                    == Some(turn_id) =>
+                                && (matches!(
+                                    event.kind.as_str(),
+                                    "agent.lost"
+                                        | "agent.failed"
+                                        | "agent.stopped"
+                                        | "session.ended"
+                                ) || (matches!(
+                                    event.kind.as_str(),
+                                    "turn.completed" | "turn.unknown"
+                                ) && event
+                                    .data
+                                    .get("turn_id")
+                                    .and_then(Value::as_str)
+                                    == Some(turn_id))) =>
                         {
                             break;
                         }
@@ -1052,6 +1071,93 @@ impl Router {
             Err(error) => {
                 self.settle_plugin_error(id, &error).await;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    use crate::router::{
+        MODE_FORCE,
+        tests::{read_fixture_event, result_fixture, router},
+    };
+    use eliot_core::SubmitCommand;
+    use std::sync::atomic::Ordering;
+    use ulid::Ulid;
+
+    #[tokio::test]
+    async fn stop_reaches_the_plugin_host_after_force_mode_refuses_its_prelude() {
+        let router = router();
+        let (agent, stop) = {
+            let mut store = router.inner.store.lock().await;
+            let (agent_id, _) = result_fixture(&mut store);
+            let mut request = SubmitCommand::new(Ulid::new().to_string(), "stop");
+            request.target = Some(agent_id.clone());
+            request.expected_generation = Some(1);
+            let id = store.submit("owner", request, now_ms()).unwrap().command.id;
+            let stop = store.dispatch(&id, now_ms()).unwrap().value;
+            let agent = store.get_agent(&agent_id).unwrap().unwrap();
+            assert!(agent.active_turn.is_some());
+            (agent, stop)
+        };
+        router.inner.mode.store(MODE_FORCE, Ordering::SeqCst);
+        router
+            .execute_stop_command(&stop.id, &agent, stop.clone())
+            .await;
+        let store = router.inner.store.lock().await;
+        let retained = store.get_command(&stop.id).unwrap().unwrap();
+        assert_eq!(retained.state, CommandState::Rejected);
+        let outcome = retained.outcome.unwrap();
+        assert_eq!(outcome["code"], "native_not_dispatched");
+        assert!(
+            outcome["message"]
+                .as_str()
+                .unwrap()
+                .contains("no owned plugin")
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_wait_wakes_on_unknown_turn_or_terminal_generation() {
+        for kind in ["turn.unknown", "agent.lost"] {
+            let router = router();
+            let (agent, send_id) = {
+                let mut store = router.inner.store.lock().await;
+                let (agent_id, send_id) = result_fixture(&mut store);
+                (store.get_agent(&agent_id).unwrap().unwrap(), send_id)
+            };
+            let turn_id = agent.active_turn.as_deref().unwrap();
+            let wait = router.wait_for_stop_turn(&agent, turn_id, router.inner.bus.subscribe());
+            tokio::pin!(wait);
+            tokio::select! {
+                biased;
+                _ = &mut wait => panic!("wait returned while the turn was running"),
+                _ = std::future::ready(()) => {}
+            }
+            {
+                let mut store = router.inner.store.lock().await;
+                let events = if kind == "turn.unknown" {
+                    let after = store.high_water().unwrap();
+                    read_fixture_event(
+                        &mut store,
+                        &agent.id,
+                        kind,
+                        json!({"command_id":send_id, "turn_id":turn_id, "reason":"source_gap"}),
+                    );
+                    store.read_events(after, 10, None).unwrap()
+                } else {
+                    store
+                        .mark_lost(&agent.id, agent.generation, now_ms())
+                        .unwrap()
+                };
+                let wake = events.into_iter().find(|event| event.kind == kind).unwrap();
+                router.publish_locked(&[wake]);
+            }
+            timeout(Duration::from_secs(1), wait)
+                .await
+                .unwrap()
+                .unwrap();
         }
     }
 }

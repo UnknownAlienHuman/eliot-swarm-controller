@@ -1407,11 +1407,12 @@ pub(super) fn require_reply_authority(principal: &str, verb: &str, agent: &Agent
 }
 
 /// Admit one turn-control command: authority, generation, state, turn and request.
-fn admit_control_tx(
+pub(super) fn admit_control_tx(
     tx: &Transaction<'_>,
     principal: &str,
     request: &SubmitCommand,
     payload_digest: &[u8],
+    stop_id: Option<&str>,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
@@ -1550,6 +1551,9 @@ fn admit_control_tx(
         &CommandInsert {
             turn_id: Some(&turn_id),
             request_id: request_id.as_deref(),
+            parent_command: stop_id,
+            link_kind: stop_id.map(|_| "stop_interrupt"),
+            ordinal: stop_id.map(|_| 0),
             ..CommandInsert::admitted(
                 principal,
                 request,
@@ -1744,7 +1748,15 @@ pub(super) fn submit_tx(
             None
         }
         "steer" | "interrupt" | "approve" | "deny" | "answer" => {
-            admit_control_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
+            admit_control_tx(
+                tx,
+                principal,
+                &request,
+                &payload_digest,
+                None,
+                now,
+                &mut events,
+            )?;
             None
         }
         verb => {

@@ -115,10 +115,9 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return [`ProfileStoreResult`](../../crates/eliot-plugin/src/protocol.rs): the effective `NativeStoreBinding` and optional plugin-owned startup projection, using the caller's actual prepared workspace and one bounded, owned metadata reader. Store freezes both with the exact launch dispatch; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
 
-For an ordinary stop with an active turn, the router dispatches a separate
-`interrupt` command bound to that generation and turn. It waits up to five
-seconds for the exact turn to complete in Store before sending `agent.stop`.
-An interrupt acknowledgement or wait timeout supplies no terminal turn evidence.
+For an ordinary stop with an active turn, the router attempts `agent.command`
+with `interrupt` under the stop's authority. It then sends `agent.stop` following
+the [generation and turn rules](core.md#states-and-reducer).
 The daemon alone terminates owned custody when needed, using the generation's
 Windows Job or the weaker Unix process custody. Explicit force bypasses plugin
 stop. Unproven stop effects stay unknown even after confirmed custody exit, and

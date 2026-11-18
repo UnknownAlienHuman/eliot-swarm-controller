@@ -310,6 +310,25 @@ pub(super) fn capture_project_command_binding_tx(
     let Some(project_id) = project_id_from_principal(command.principal)? else {
         return Ok(None);
     };
+    if command.link_kind == Some("stop_interrupt") {
+        // The Store creates this child in the same transaction that verifies
+        // the dispatched stop and its exact generation/turn binding.
+        let binding: Option<String> = tx
+            .query_row(
+                "SELECT project_binding FROM commands WHERE id = ?1",
+                [command.parent_command],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?
+            .flatten();
+        return binding.map(Some).ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "stop interrupt has no parent project binding",
+            )
+        });
+    }
     let registration = load_project_registration(tx, &project_id)?
         .ok_or_else(|| Error::new("not_allowed", "project registration is absent"))?
         .view;
