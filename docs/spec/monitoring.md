@@ -670,6 +670,17 @@ so a post-restart re-report of the same loss reuses the same ids and the
 existing command/delivery idempotency makes it a no-op without a second
 incident ledger. This covers losses published before attention subscribed as
 well as a crash between the recovery commit and consumer startup.
+The same identity survives a saturated pending-check map at runtime: a loss
+that cannot enter the full map parks its exact Agent/generation/sequence in
+a bounded resumable loss queue instead of degrading to a generic sweep, and
+the next reconcile promotes it through the existing `AgentLost` handling
+(only advancing a loss once its key is retained in the map) and re-pages
+retained loss evidence from the Store when the queue or a lagged event bus
+may have missed it. Sweeps skip Agents with queued loss evidence so a
+generic check cannot preempt the loss-anchored report with a different
+incident id. Only genuinely unrecoverable saturation (queue and map both
+full) drops a loss, and the retained Store evidence re-pages it on the next
+reconcile.
 Each attention escalation thread wakes its recipient only once per thread
 (recorded durably when the notice is claimed); an unchanged unread incident
 set cannot generate further wakes until new evidence arrives on a new thread.

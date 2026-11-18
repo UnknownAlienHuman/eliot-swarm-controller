@@ -17,6 +17,8 @@ const MAX_CHECKS_IN_FLIGHT: usize = 32;
 const MAX_SWEEP_CHECKS: usize = 8;
 const MAX_RETAINED_INCIDENTS: usize = 512;
 const MAX_PENDING_CHECKS: usize = 512;
+/// Bound for overflowed loss identities parked outside the check map.
+const MAX_PENDING_LOSSES: usize = 512;
 const MAX_STARTUP_LOSSES: usize = 32;
 
 pub(super) fn launch_sweep(
@@ -105,9 +107,84 @@ fn queue_check(state: &Arc<Mutex<AttentionState>>, key: AgentKey, trigger: Trigg
         *pending = merge_trigger(*pending, trigger);
     } else if state.pending_checks.len() < MAX_PENDING_CHECKS {
         state.pending_checks.insert(key, trigger);
+    } else if let Trigger::AgentLost { event_seq } = trigger {
+        // A full check map must never silently drop a loss identity: the
+        // fallback full scan would only revisit the Agent as a generic
+        // sweep and derive a different incident id. Park the exact
+        // Agent/generation/sequence in the bounded loss queue instead.
+        push_pending_loss(&mut state, key, event_seq);
     } else {
         state.reconcile_all = true;
     }
+}
+
+/// Park one overflowed loss in the bounded resumable queue. A repeat loss
+/// for an already-queued Agent refreshes its sequence; when the queue itself
+/// is saturated the loss is dropped but `losses_overflow` forces the next
+/// reconcile to re-page retained evidence instead of losing it silently.
+fn push_pending_loss(state: &mut AttentionState, key: AgentKey, event_seq: i64) {
+    if let Some(queued) = state
+        .pending_losses
+        .iter_mut()
+        .find(|(pending, _)| *pending == key)
+    {
+        queued.1 = event_seq;
+    } else if state.pending_losses.len() < MAX_PENDING_LOSSES {
+        state.pending_losses.push_back((key, event_seq));
+    } else {
+        state.losses_overflow = true;
+    }
+}
+
+/// Move queued losses into the check map with their exact `AgentLost`
+/// trigger, evicting one ordinary sweep per loss when the map is full so
+/// the bound still holds. A loss moves only once its key is retained in the
+/// map; when the map holds nothing evictable the remainder waits for the
+/// next reconcile instead of degrading to a sweep.
+fn promote_pending_losses(state: &Arc<Mutex<AttentionState>>) {
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    while let Some((key, event_seq)) = state.pending_losses.front().cloned() {
+        let loss = Trigger::AgentLost { event_seq };
+        if let Some(pending) = state.pending_checks.get_mut(&key) {
+            *pending = merge_trigger(*pending, loss);
+            state.pending_losses.pop_front();
+        } else if state.pending_checks.len() < MAX_PENDING_CHECKS {
+            state.pending_checks.insert(key, loss);
+            state.pending_losses.pop_front();
+        } else if let Some(evicted) =
+            state
+                .pending_checks
+                .iter()
+                .find_map(|(candidate, trigger)| {
+                    matches!(trigger, Trigger::Sweep).then(|| candidate.clone())
+                })
+        {
+            state.pending_checks.remove(&evicted);
+            state.pending_checks.insert(key, loss);
+            state.pending_losses.pop_front();
+            // The evicted sweep still needs its visit: fall back to a full
+            // scan rather than dropping the check.
+            state.reconcile_all = true;
+        } else {
+            break;
+        }
+    }
+}
+
+/// Whether the Agent already has queued loss evidence: either parked in the
+/// overflow queue or retained in the check map with its exact `AgentLost`
+/// trigger. Sweeps must skip such keys so a generic check cannot win the
+/// incident-id race against the loss-anchored report.
+fn has_queued_loss(state: &Arc<Mutex<AttentionState>>, key: &AgentKey) -> bool {
+    let state = state.lock().unwrap_or_else(|error| error.into_inner());
+    state
+        .pending_losses
+        .iter()
+        .any(|(pending, _)| pending == key)
+        || matches!(
+            state.pending_checks.get(key),
+            Some(Trigger::AgentLost { .. })
+        )
 }
 
 fn merge_trigger(current: Trigger, incoming: Trigger) -> Trigger {
@@ -325,6 +402,11 @@ async fn scan_attention_agents(
                 agent: agent.id.clone(),
                 generation: agent.generation,
             };
+            if has_queued_loss(&state, &key) {
+                // Loss evidence is already queued with its exact identity;
+                // a generic sweep here could win the incident-id race.
+                continue;
+            }
             if !reserve_check(&state, &key) {
                 queue_check(&state, key, Trigger::Sweep);
                 continue;
@@ -357,6 +439,24 @@ async fn reconcile_attention_state(
         let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
         std::mem::take(&mut state.reconcile_all)
     };
+    let losses_pending = {
+        let state = state.lock().unwrap_or_else(|error| error.into_inner());
+        state.losses_overflow || !state.pending_losses.is_empty()
+    };
+    if reconcile_all || losses_pending {
+        // Re-page retained loss evidence before the scan: overflow, lag, or
+        // a crash window may have missed the live `agent.lost` event, and
+        // only the exact Agent/generation/sequence reproduces the
+        // deterministic loss identity. A saturated map parks losses in the
+        // bounded queue instead of dropping them; the flag clears on every
+        // re-page and returns if saturation persists.
+        {
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            state.losses_overflow = false;
+        }
+        queue_startup_losses(router, &state).await;
+        promote_pending_losses(&state);
+    }
     if reconcile_all {
         scan_all_agents(router, Arc::clone(&state), suspicion_window).await?;
     }
@@ -512,6 +612,12 @@ async fn scan_all_agents(
                 agent: agent.id,
                 generation: agent.generation,
             };
+            if has_queued_loss(&state, &key) {
+                // Retained loss evidence is already queued (or re-paged
+                // above) with its exact identity; only `AgentLost`
+                // handling may report it.
+                continue;
+            }
             if reserve_check(&state, &key) {
                 checks.spawn(run_check(
                     router.clone(),
@@ -546,4 +652,136 @@ pub(super) fn reserve_incident(
         state: Arc::clone(state),
         committed: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> Arc<Mutex<AttentionState>> {
+        Arc::new(Mutex::new(AttentionState::default()))
+    }
+
+    fn key(n: u32) -> AgentKey {
+        AgentKey {
+            agent: format!("a{n}"),
+            generation: 1,
+        }
+    }
+
+    fn lock_loss_identity(state: &Arc<Mutex<AttentionState>>, agent: &str) -> Option<i64> {
+        let guard = state.lock().unwrap_or_else(|error| error.into_inner());
+        match guard.pending_checks.get(&AgentKey {
+            agent: agent.to_owned(),
+            generation: 1,
+        }) {
+            Some(Trigger::AgentLost { event_seq }) => Some(*event_seq),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn overflowed_loss_keeps_exact_identity_in_loss_queue() {
+        let state = state();
+        for n in 0..MAX_PENDING_CHECKS as u32 {
+            queue_check(&state, key(n), Trigger::Sweep);
+        }
+        {
+            let guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            assert_eq!(guard.pending_checks.len(), MAX_PENDING_CHECKS);
+            assert!(!guard.reconcile_all);
+        }
+        // The full map must not drop the loss identity into a generic sweep.
+        queue_check(&state, key(600), Trigger::AgentLost { event_seq: 42 });
+        {
+            let guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            assert_eq!(guard.pending_checks.len(), MAX_PENDING_CHECKS);
+            assert!(!guard.pending_checks.contains_key(&key(600)));
+            assert!(!guard.reconcile_all);
+            assert_eq!(guard.pending_losses.len(), 1);
+            assert_eq!(guard.pending_losses[0], (key(600), 42));
+        }
+        assert!(has_queued_loss(&state, &key(600)));
+        assert!(!has_queued_loss(&state, &key(0)));
+    }
+
+    #[test]
+    fn repeat_loss_refreshes_queued_sequence_without_duplicates() {
+        let state = state();
+        for n in 0..MAX_PENDING_CHECKS as u32 {
+            queue_check(&state, key(n), Trigger::Sweep);
+        }
+        queue_check(&state, key(600), Trigger::AgentLost { event_seq: 7 });
+        queue_check(&state, key(600), Trigger::AgentLost { event_seq: 9 });
+        let guard = state.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(guard.pending_losses.len(), 1);
+        assert_eq!(guard.pending_losses[0], (key(600), 9));
+        assert_eq!(guard.pending_checks.len(), MAX_PENDING_CHECKS);
+    }
+
+    #[test]
+    fn saturated_queues_set_losses_overflow() {
+        let state = state();
+        for n in 0..MAX_PENDING_CHECKS as u32 {
+            queue_check(&state, key(n), Trigger::Sweep);
+        }
+        {
+            let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            for n in 0..MAX_PENDING_LOSSES as u32 {
+                guard.pending_losses.push_back((key(1000 + n), n as i64));
+            }
+        }
+        queue_check(&state, key(999_999), Trigger::AgentLost { event_seq: 1 });
+        let guard = state.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(guard.losses_overflow);
+        assert_eq!(guard.pending_losses.len(), MAX_PENDING_LOSSES);
+        assert_eq!(guard.pending_checks.len(), MAX_PENDING_CHECKS);
+    }
+
+    #[test]
+    fn promote_retains_loss_trigger_and_evicts_one_sweep() {
+        let state = state();
+        for n in 0..MAX_PENDING_CHECKS as u32 {
+            queue_check(&state, key(n), Trigger::Sweep);
+        }
+        queue_check(&state, key(600), Trigger::AgentLost { event_seq: 42 });
+        promote_pending_losses(&state);
+        {
+            let guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            // The loss moved into the map with its exact trigger; one sweep
+            // left to make room and will be revisited by the requested scan.
+            assert!(guard.pending_losses.is_empty());
+            assert_eq!(guard.pending_checks.len(), MAX_PENDING_CHECKS);
+            assert!(guard.reconcile_all);
+        }
+        assert_eq!(lock_loss_identity(&state, "a600"), Some(42));
+    }
+
+    #[test]
+    fn promote_merges_into_existing_sweep_without_eviction() {
+        let state = state();
+        queue_check(&state, key(7), Trigger::Sweep);
+        {
+            let mut guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            guard.pending_losses.push_back((key(7), 42));
+        }
+        promote_pending_losses(&state);
+        {
+            let guard = state.lock().unwrap_or_else(|error| error.into_inner());
+            assert!(guard.pending_losses.is_empty());
+            assert_eq!(guard.pending_checks.len(), 1);
+            assert!(!guard.reconcile_all);
+        }
+        assert_eq!(lock_loss_identity(&state, "a7"), Some(42));
+    }
+
+    #[test]
+    fn sweeps_skip_only_agents_with_queued_loss() {
+        let state = state();
+        queue_check(&state, key(1), Trigger::Sweep);
+        queue_check(&state, key(2), Trigger::AgentLost { event_seq: 11 });
+        assert!(!has_queued_loss(&state, &key(0)));
+        assert!(!has_queued_loss(&state, &key(1)));
+        assert!(has_queued_loss(&state, &key(2)));
+    }
 }

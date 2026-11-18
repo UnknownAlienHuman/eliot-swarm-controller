@@ -79,6 +79,15 @@ struct AttentionState {
     active: HashMap<IncidentKey, ActiveIncident>,
     in_flight: HashSet<AgentKey>,
     pending_checks: HashMap<AgentKey, Trigger>,
+    /// Overflowed `AgentLost` triggers the bounded check map could not hold.
+    /// Drained through `AgentLost` handling on the next reconcile (never as
+    /// a generic sweep), so the deterministic loss identity survives a full
+    /// pending map. Keys stay unique; a repeat loss refreshes the sequence.
+    pending_losses: std::collections::VecDeque<(AgentKey, i64)>,
+    /// A loss was dropped because both the check map and the loss queue were
+    /// saturated. The next reconcile re-pages retained loss evidence from
+    /// the Store instead of synthesizing an identity.
+    losses_overflow: bool,
     reconcile_all: bool,
     active_reconcile_cursor: usize,
     reserved_incidents: usize,
