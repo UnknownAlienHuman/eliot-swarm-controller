@@ -739,4 +739,46 @@ mod tests {
             Some(utc_ms(2024, 3, 11, 6, 0))
         );
     }
+
+    #[test]
+    fn timer_schedule_persisted_json_shape_is_stable() {
+        // Audit 670 retention pin: a future migration off the
+        // chrono, chrono-tz and humantime stack must preserve this exact
+        // persisted JSON shape and the whole-millisecond grammar.
+        assert_eq!(parse_positive_duration_ms("90m").unwrap(), 5_400_000);
+        let anchored = TimerSchedule::Interval {
+            period_ms: 3_600_000,
+            anchor: Some(100),
+        };
+        let value = serde_json::to_value(&anchored).expect("serialize interval");
+        assert_eq!(
+            value,
+            serde_json::json!({"kind": "interval", "period_ms": 3600000, "anchor": 100})
+        );
+        assert_eq!(
+            serde_json::from_value::<TimerSchedule>(value).expect("round trip"),
+            anchored
+        );
+        let bare = TimerSchedule::Interval {
+            period_ms: 10,
+            anchor: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&bare).expect("serialize bare interval"),
+            serde_json::json!({"kind": "interval", "period_ms": 10})
+        );
+        let cron = TimerSchedule::Cron {
+            expression: "30 1 * * *".to_owned(),
+            tz: "UTC".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(&cron).expect("serialize cron"),
+            serde_json::json!({"kind": "cron", "expression": "30 1 * * *", "tz": "UTC"})
+        );
+        let once = TimerSchedule::Once { at: -500 };
+        assert_eq!(
+            serde_json::to_value(&once).expect("serialize once"),
+            serde_json::json!({"kind": "once", "at": -500})
+        );
+    }
 }

@@ -47,6 +47,8 @@ owning specs; do not reproduce them in every page. Existing IDs remain stable fo
 | D-38 | M1 uses one scoped Memory text profile through fresh tool-free Claude print mode, with native retries disabled. | Owner brought #199 into scope on 2026-11-14. Claude 2.1.325 exposes explicit tool/session/retry controls. The Codex Agent adapter is not an inference adapter. [API](spec/api.md#memory-one-shot-inference-m1-199) |
 | D-39 | Memory credentials use random private files plus Store version/hash, with exact idempotent staged rotation and retirement. | Recoverable publication needs no key hierarchy. Stable client owns calls across rotation. M1.2 fences old hashes before file cleanup after current-credential old-call read/release and restart; Memory owns backup dependency assertions for bounded release/retention. |
 
+| D-40 | Retain chrono 0.4.45, chrono-tz 0.10.4 and humantime 2.4.0 with owner review by 2027-05-18. | Latest published releases; the unmaintained notices name no patched version, and a jiff/time migration would rewrite timer civil-time, DST, interval-grammar and millisecond semantics without a compatibility plan. Audit 670. |
+
 ## Defaults
 
 Direct Codex first; configured native model only. Optional vendors do not block the
