@@ -274,8 +274,10 @@ fn native_installed(harness: &str, snapshot: &Value) -> bool {
 /// generic numeric search or model inference probe is used. For Codex the
 /// explicit backend limit state (`spendControlReached`, `rateLimitReachedType`,
 /// a depleted `individualLimit`) settles exhaustion before window math, and
-/// metered `rateLimitsByLimitId` buckets map through their limit id or
-/// `normalModelSlug`, never by assuming the bucket key is a model slug.
+/// metered `rateLimitsByLimitId` buckets map only through their projected
+/// `normalModelSlug`: bucket keys and `limitId` values are metered limit ids,
+/// never model evidence, so their string equality with a requested slug is
+/// not a mapping.
 fn quota_exhausted(harness: &str, details: &Value, model: Option<&str>) -> bool {
     let full = |window: &Value| {
         window
@@ -322,20 +324,19 @@ fn quota_exhausted(harness: &str, details: &Value, model: Option<&str>) -> bool 
             return true;
         }
         // Metered buckets are keyed by limit_id, never model slugs: a bucket
-        // is relevant only when its key, `limitId`, or `normalModelSlug`
-        // names the requested model. An unrelated exhausted bucket never
-        // blocks this model.
+        // is relevant only when its projected `normalModelSlug` proves it
+        // meters the requested model. Key or `limitId` string equality is
+        // not a mapping, so an unrelated exhausted bucket never blocks this
+        // model even when its key names the request.
         let Some(buckets) = details
             .get("rateLimitsByLimitId")
             .and_then(Value::as_object)
         else {
             return false;
         };
-        return buckets.iter().any(|(limit_id, snapshot)| {
+        return buckets.values().any(|snapshot| {
             let relevant = model.is_some_and(|model| {
-                limit_id.as_str() == model
-                    || snapshot.get("limitId").and_then(Value::as_str) == Some(model)
-                    || snapshot.get("normalModelSlug").and_then(Value::as_str) == Some(model)
+                snapshot.get("normalModelSlug").and_then(Value::as_str) == Some(model)
             });
             relevant && exhausted(snapshot)
         });
@@ -485,19 +486,25 @@ mod tests {
             &json!({"rateLimits":{"primary":{"usedPercent":10},"spendControlReached":false,"individualLimit":{"remainingPercent":40}}}),
             None
         ));
-        // Metered buckets map through normalModelSlug, never the key: the
-        // exhausted `codex` bucket blocks its normal model but not others.
+        // Metered buckets map only through normalModelSlug: the exhausted
+        // `codex` bucket blocks its normal model but not others.
         let details = json!({"rateLimits":{"primary":{"usedPercent":1}},
             "rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":100},"normalModelSlug":"gpt-5.4"}}});
         assert!(quota_exhausted("codex", &details, Some("gpt-5.4")));
         assert!(!quota_exhausted("codex", &details, Some("other-model")));
-        // A request naming the limit id itself still matches by key.
+        // A request naming the limit id itself is not a mapping: the
+        // exhausted `codex` bucket carries no normalModelSlug, so it blocks
+        // no model.
         let by_key = json!({"rateLimits":{"primary":{"usedPercent":1}},
             "rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":100}}}});
-        assert!(quota_exhausted("codex", &by_key, Some("codex")));
-        // An exhausted bucket whose limit state is unknown but whose mapping
-        // is unknown never blocks: relevance needs the key, limitId, or
-        // normalModelSlug to name the request.
+        assert!(!quota_exhausted("codex", &by_key, Some("codex")));
         assert!(!quota_exhausted("codex", &by_key, Some("gpt-5.4")));
+        // An equal string never exhausts through key or limitId when the
+        // bucket maps elsewhere: the exhausted bucket names the request as
+        // its key yet proves it meters a different model.
+        let aliased = json!({"rateLimits":{"primary":{"usedPercent":1}},
+            "rateLimitsByLimitId":{"gpt-5.4":{"primary":{"usedPercent":100},"limitId":"gpt-5.4","normalModelSlug":"other"}}});
+        assert!(!quota_exhausted("codex", &aliased, Some("gpt-5.4")));
+        assert!(quota_exhausted("codex", &aliased, Some("other")));
     }
 }
