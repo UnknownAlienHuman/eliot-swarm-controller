@@ -4822,6 +4822,27 @@ fn encoded_event_cost(event: &Event) -> Result<usize> {
     Ok(encoded.len().saturating_add(1))
 }
 
+/// Project-rule verbs that address a live Agent: authorization and
+/// catch-up preparation both require their frozen target and generation.
+/// Every other project verb (`run`, `launch`, `git.fetch`, `notify`,
+/// `emit`, `mail.send`, `var.set`) is targetless on both paths. A newly
+/// authorized Agent-bound verb must extend this one list, never a second
+/// copy.
+pub(crate) fn project_rule_action_binds_agent_target(verb: &str) -> bool {
+    matches!(
+        verb,
+        "resume"
+            | "stop"
+            | "send"
+            | "steer"
+            | "inject"
+            | "interrupt"
+            | "approve"
+            | "deny"
+            | "answer"
+    )
+}
+
 fn validate_rule_launch_action(
     request: &SubmitCommand,
     project: Option<&ProjectRegistrationView>,

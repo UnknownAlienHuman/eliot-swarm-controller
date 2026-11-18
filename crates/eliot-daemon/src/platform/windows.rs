@@ -1874,6 +1874,47 @@ fn verbatim_file_path(path: &Path) -> Vec<u16> {
         .collect()
 }
 
+/// Stable identity for a watched directory: the volume serial plus file
+/// index of the open handle, so a rename-away plus fresh-directory
+/// replacement is detectable even though the path never goes absent. `None`
+/// when the path cannot be opened (it raced a removal) or is not a
+/// directory.
+pub(crate) fn directory_identity(path: &Path) -> Option<(u64, u64)> {
+    let verbatim = verbatim_file_path(path);
+    // SAFETY: verbatim is NUL-terminated and lives through the call; zero
+    // access only queries metadata, backup semantics allow opening
+    // directories, and the handle is uniquely owned when valid.
+    let handle = unsafe {
+        CreateFileW(
+            verbatim.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is valid and info is writable storage for the call.
+    let identity = if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0
+        || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        None
+    } else {
+        Some((
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    };
+    // SAFETY: the handle came from CreateFileW and closes exactly once here.
+    unsafe { CloseHandle(handle) };
+    identity
+}
+
 /// Uniquely owned handle for a handle-based private-data security call.
 struct SecurityHandle(HANDLE);
 

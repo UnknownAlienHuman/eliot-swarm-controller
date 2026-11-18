@@ -1166,6 +1166,12 @@ pub(crate) async fn run_global_rules(
                 }
             } => {}
         }
+        if let Some(watcher) = &mut watcher {
+            // Re-arm the rules-directory watch after creation or
+            // replacement; the periodic reconciliation below reloads from
+            // disk regardless.
+            watcher.ensure_watches();
+        }
         if recover_rule_children {
             router
                 .recover_rule_children(RULE_CHILD_RECOVERY_PAGE_SIZE)
@@ -1791,6 +1797,11 @@ async fn reconcile_due_timers(
                             continue;
                         }
 
+                        // A per-assignment briefs failure (for example a missing
+                        // briefs folder, `unavailable`) fails only this slot, so
+                        // the worker keeps running every other automation. The
+                        // code is recorded as the slot skip reason below.
+                        let mut assignment_unavailable: Option<String> = None;
                         let prepared = match rule.definition.evaluate_timer() {
                             Ok(action) if action.verb == "run" => {
                                 router
@@ -1825,6 +1836,10 @@ async fn reconcile_due_timers(
                                             }
                                             None => router.prepare_owner_submission(action).await,
                                         },
+                                        Err(error) if error.code == "unavailable" => {
+                                            assignment_unavailable = Some(error.code.clone());
+                                            Err(error)
+                                        }
                                         Err(error) => Err(error),
                                     }
                                 }
@@ -1834,25 +1849,34 @@ async fn reconcile_due_timers(
                             }
                             Err(error) => return Err(error),
                         };
-                        match prepared {
-                            Ok(prepared) => (
-                                scheduled_at_ms,
-                                next_due_at_ms,
-                                Some(prepared.request),
-                                None,
-                                live_armed.then_some(scheduled_at_ms),
-                            ),
-                            Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                                (
+                        if let Some(code) = assignment_unavailable {
+                            if !router.rule_firings_open() {
+                                return Ok(false);
+                            }
+                            (scheduled_at_ms, next_due_at_ms, None, Some(code), None)
+                        } else {
+                            match prepared {
+                                Ok(prepared) => (
                                     scheduled_at_ms,
                                     next_due_at_ms,
+                                    Some(prepared.request),
                                     None,
-                                    Some(error.code),
-                                    None,
-                                )
+                                    live_armed.then_some(scheduled_at_ms),
+                                ),
+                                Err(error)
+                                    if is_deterministic_pre_admission_rejection(&error.code) =>
+                                {
+                                    (
+                                        scheduled_at_ms,
+                                        next_due_at_ms,
+                                        None,
+                                        Some(error.code),
+                                        None,
+                                    )
+                                }
+                                Err(_error) if !router.rule_firings_open() => return Ok(false),
+                                Err(error) => return Err(error),
                             }
-                            Err(_error) if !router.rule_firings_open() => return Ok(false),
-                            Err(error) => return Err(error),
                         }
                     }
                 };
@@ -1957,6 +1981,18 @@ fn timer_wake_delay(timer: &ActiveTimer, now: i64) -> Option<Duration> {
     ))
 }
 
+/// Catch-up preparation must verify the frozen Agent target and generation
+/// before admission exactly for the Agent-bound project verbs. This is the
+/// single closed project-rule verb classification enforced by
+/// `authorize_command` (router/auth.rs): targetless coordination actions
+/// (`run`, `launch`, `notify`, `emit`, `mail.send`, `var.set`) and project
+/// Git actions (`git.fetch`) skip Agent scope checks here exactly as they
+/// do on the live path. Unknown verbs stay fail-closed at ordinary
+/// admission.
+fn project_rule_catch_up_binds_agent(verb: &str) -> bool {
+    crate::router::project_rule_action_binds_agent_target(verb)
+}
+
 pub(crate) async fn prepare_rule_catch_up_actions(
     router: &Router,
     definition: &RuleDefinition,
@@ -1996,7 +2032,7 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     for (event, request) in rendered {
         let event_seq = event.seq;
         if let Some(project) = project
-            && !matches!(request.verb.as_str(), "run" | "launch")
+            && project_rule_catch_up_binds_agent(request.verb.as_str())
         {
             let target = request
                 .target
@@ -2567,6 +2603,122 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(timer_wake_delay(&timer, 135), None);
     }
     #[tokio::test]
+    async fn missing_briefs_folder_fails_only_its_assignment_slot() {
+        use eliot_core::api::TimerSchedule;
+        use std::{fs, io::Cursor, path::Path};
+
+        let root =
+            std::env::temp_dir().join(format!("eliot-assignment-isolation-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        let data_root = root.join("owner-data");
+        fs::create_dir_all(&data_root).unwrap();
+
+        let store = std::sync::Arc::new(tokio::sync::Mutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let router = Router::new(
+            data_root.clone(),
+            "assignment-isolation-fixture".to_owned(),
+            store.clone(),
+            crate::bus::Bus::new(16),
+        );
+
+        let now = 1_700_000_000_000_i64;
+        let missing_folder = root.join("no-such-briefs");
+        assert!(!missing_folder.exists());
+        let missing_folder = missing_folder.to_string_lossy().replace('\\', "/");
+
+        let sources = [
+            (
+                "broken-assignment",
+                format!(
+                    "[[rule]]\nid = 'broken-assignment'\non = {{ every = '1s' }}\ndo = [{{ action = 'launch', workspace = 'C:/work', role = 'worker', assignment = {{ key = 'broken', folder = '{missing_folder}', max_busy = 1 }} }}]\n",
+                ),
+            ),
+            (
+                "healthy-notify",
+                "[[rule]]\nid = 'healthy-notify'\non = { every = '1s' }\ndo = [{ action = 'notify', message = 'still running' }]\n"
+                    .to_owned(),
+            ),
+        ];
+        let mut rules = Vec::new();
+        for (id, source) in &sources {
+            let definition = definition::load(Cursor::new(source)).unwrap().remove(0);
+            let canonical = serde_json::to_value(&definition).unwrap();
+            let input = eliot_store::RuleDefinitionInput {
+                id: id.to_string(),
+                canonical_definition: serde_json::to_string(&canonical).unwrap(),
+                definition_digest: definition.semantic_digest().unwrap(),
+                enabled: true,
+            };
+            let state = store
+                .lock()
+                .await
+                .ensure_rule_state("owner", &input, now - 10_000)
+                .unwrap();
+            let timer_state = store
+                .lock()
+                .await
+                .ensure_timer_state(
+                    "owner",
+                    &eliot_store::TimerDefinitionInput {
+                        id: id.to_string(),
+                        schedule_revision: 1,
+                        schedule: TimerSchedule::Interval {
+                            period_ms: 1_000,
+                            anchor: None,
+                        },
+                        enabled: true,
+                        initial_next_due_at: Some(now - 9_000),
+                    },
+                    now - 10_000,
+                )
+                .unwrap();
+            rules.push(ActiveRule {
+                principal: "owner".to_owned(),
+                project: None,
+                definition,
+                source_present: true,
+                state,
+                retiring: None,
+                timer: Some(ActiveTimer {
+                    state: timer_state,
+                    catch_up: CatchUp::Latest,
+                    armed_due_at_ms: None,
+                    blocked: false,
+                }),
+            });
+        }
+
+        let worker_continues = reconcile_due_timers(&router, "owner", &mut rules, now)
+            .await
+            .expect("worker keeps running past a missing briefs folder");
+        assert!(worker_continues);
+
+        for id in ["broken-assignment", "healthy-notify"] {
+            let timer = store
+                .lock()
+                .await
+                .get_timer_state("owner", id)
+                .unwrap()
+                .expect("timer state remains stored");
+            assert!(
+                timer.last_key.is_some(),
+                "{id} slot committed instead of stalling the worker"
+            );
+        }
+        let skipped = store
+            .lock()
+            .await
+            .read_events(0, 1_000, None)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "rule.skipped" && event.data["rule"] == "broken-assignment")
+            .expect("missing folder is reported on its assignment slot");
+        assert_eq!(skipped.data["reason"], "unavailable");
+    }
+
+    #[tokio::test]
     async fn event_run_catch_up_prepares_project_and_granted_global_commands() {
         use eliot_core::{
             AgentState, EventSubject, FrozenScriptRun, RunDefinitionArgs, ScriptInputContext,
@@ -2930,6 +3082,105 @@ do = [{ action = "run", cmd = ["pwsh", ".eliot/scripts/check.ps1", "-Changed"], 
                 "revoked project Run approval fails request-wide before admission"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn project_catch_up_prepares_targetless_var_set_without_agent_target() {
+        use eliot_core::{AgentState, EventSubject};
+        use std::{fs, io::Cursor, path::Path};
+
+        let root =
+            std::env::temp_dir().join(format!("eliot-project-var-catch-up-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        let checkout = root.join("checkout");
+        let data_root = root.join("owner-data");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&data_root).unwrap();
+        let git_init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&checkout)
+            .status()
+            .unwrap();
+        assert!(git_init.success(), "initialize project fixture repository");
+
+        fs::write(
+            data_root.join("config.toml"),
+            format!(
+                concat!(
+                    "[profiles.fixture]\n",
+                    "harness = \"codex\"\n",
+                    "model = \"fixture-model\"\n",
+                    "[projects.var-catch-up]\n",
+                    "path = {checkout:?}\n",
+                    "profiles = [\"fixture\"]\n",
+                    "actions = [\"var.set\"]\n",
+                    "run_env = [\"CI\"]\n",
+                ),
+                checkout = checkout.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let store = std::sync::Arc::new(tokio::sync::Mutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).unwrap(),
+        ));
+        let router = Router::new(
+            data_root.clone(),
+            "catch-up-var-fixture-owner".to_owned(),
+            store,
+            crate::bus::Bus::new(16),
+        );
+        let (_, loaded) = projects::load_registrations(&data_root).await.unwrap();
+        let input = project_registration_input(&loaded[0]);
+        let registration = router
+            .reconcile_project_registrations(&[input])
+            .await
+            .unwrap()
+            .remove(0);
+
+        let definition = definition::load(Cursor::new(
+            "[[rule]]\nid = 'project-catch-up-var'\non = { event = 'turn.completed' }\ndo = [{ action = 'var.set', scope = 'project:app', key = 'k', value = 'v' }]\n",
+        ))
+        .unwrap()
+        .remove(0);
+        let event = Event {
+            seq: 41,
+            ts: 100,
+            kind: "turn.completed".to_owned(),
+            agent: Some("a1".to_owned()),
+            subject: Some(EventSubject {
+                project: registration.id.clone(),
+                harness: "fake".to_owned(),
+                profile: "fake".to_owned(),
+                state: AgentState::Busy,
+                workspace: Some(registration.checkout.clone()),
+            }),
+            generation: Some(3),
+            source: "stream".to_owned(),
+            native_id: Some("fixture:turn.completed".to_owned()),
+            data: serde_json::json!({"status": "complete"}),
+            cause: None,
+        };
+
+        let actions = prepare_rule_catch_up_actions(
+            &router,
+            &definition,
+            17,
+            std::slice::from_ref(&event),
+            Some(&registration),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].event_seq, event.seq);
+        let request = match &actions[0].outcome {
+            eliot_store::RuleCatchUpActionOutcome::Command(request) => request,
+            outcome => panic!("expected prepared var.set command, got {outcome:?}"),
+        };
+        assert_eq!(request.verb, "var.set");
+        assert_eq!(request.target, None);
+        assert_eq!(request.expected_generation, None);
     }
 
     #[tokio::test]

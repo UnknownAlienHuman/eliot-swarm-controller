@@ -369,6 +369,19 @@ impl OwnedChild {
         Ok(status)
     }
 
+    /// Bounded reap for the spontaneous-exit path. A failed exit observation
+    /// can leave the child live (`/proc` loss also defeats birth-checked
+    /// termination), so an unbounded `wait()` would hang the actor before
+    /// source settlement. A timeout reports `unknown` so the caller settles
+    /// through the unknown-custody path instead of waiting indefinitely.
+    #[cfg(target_os = "linux")]
+    pub async fn wait_bounded(&mut self, timeout: Duration) -> Result<ExitStatus> {
+        match tokio::time::timeout(timeout, self.wait()).await {
+            Ok(status) => status,
+            Err(_) => Err(Error::new("unknown", "bounded owned-child reap timed out")),
+        }
+    }
+
     pub fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.child.stdin.take()
     }

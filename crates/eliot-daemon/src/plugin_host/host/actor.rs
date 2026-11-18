@@ -19,8 +19,9 @@ use super::{
     shutdown_and_wait_child, snapshot_future, start_deadline, validate_applied,
     validate_start_result, wait_child, wait_stop_child,
 };
+use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
-use eliot_core::{AgentStartParams, Error, Result};
+use eliot_core::{Agent, AgentStartParams, Error, Result};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -28,6 +29,33 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout_at};
+
+/// Linux spontaneous root-exit observation only: report the plugin process
+/// exit without reaping while its birth identity still anchors group
+/// signals. The `select!` caller fences routing once this wins, then runs
+/// the bounded group drain and the reap to completion outside the select so
+/// a queued message cannot cancel the drain and restart the grace period.
+/// Never signals a bare reused PGID: every group signal goes through the
+/// birth-checked leader identity.
+#[cfg(target_os = "linux")]
+async fn spontaneous_root_wait(
+    child: &mut OwnedChild,
+    _monitoring: &Monitoring,
+    _agent: &Agent,
+) -> Result<()> {
+    child.wait_exit_unreaped().await
+}
+
+/// Non-Linux spontaneous root-exit wait: plain reap; group proof stays with
+/// the platform observer (Windows Job) or is unavailable (other Unix).
+#[cfg(not(target_os = "linux"))]
+async fn spontaneous_root_wait(
+    child: &mut OwnedChild,
+    _: &Monitoring,
+    _: &Agent,
+) -> (Result<std::process::ExitStatus>, bool) {
+    (child.wait().await, false)
+}
 
 pub(super) async fn run_agent_inner(
     actor: AgentActorConfig,
@@ -198,7 +226,43 @@ pub(super) async fn run_agent_inner(
     let mut pending_snapshots: FuturesUnordered<PendingSnapshotFuture> = FuturesUnordered::new();
     loop {
         tokio::select! {
-            status = child.wait() => {
+            root_exit = spontaneous_root_wait(&mut child, &monitoring, &agent) => {
+                // The exit observation alone won the select. Fence routing
+                // before the bounded cleanup so no racing dispatch enters.
+                #[cfg(target_os = "linux")]
+                if let Some(state) = state.upgrade() {
+                    fence_command_routing(&state, &key);
+                }
+                #[cfg(target_os = "linux")]
+                let (status, _group_drained) = {
+                    let observed = root_exit;
+                    let _ = monitoring.sample_generation(&agent).await;
+                    // A failed observation proves nothing about the group:
+                    // still terminate and drain before reaping so surviving
+                    // descendants get a signal, then report unknown via the
+                    // drained=false below.
+                    let group_drained = if observed.is_err() {
+                        let _ = child.terminate();
+                        let _ = super::linux_drain_owned_group(&mut child, STOP_GRACE).await;
+                        false
+                    } else {
+                        super::linux_drain_owned_group(&mut child, STOP_GRACE).await
+                    };
+                    if group_drained {
+                        let _ = monitoring.sample_generation(&agent).await;
+                    }
+                    // Reap only after the bounded cleanup: the numeric PGID
+                    // cannot be reused between the final observation and this
+                    // reap because the exited leader is still unreaped. The
+                    // reap itself is bounded: a failed observation may leave
+                    // the child live (/proc loss also defeats birth-checked
+                    // termination), and an unbounded wait would hang before
+                    // source settlement. A timeout keeps status Err so the
+                    // unknown-custody settlement below reports it.
+                    (child.wait_bounded(STOP_GRACE).await, group_drained)
+                };
+                #[cfg(not(target_os = "linux"))]
+                let (status, _group_drained) = root_exit;
                 // The plugin process exit is process evidence: its numeric
                 // code (and NTSTATUS for crash statuses) with the redacted
                 // stderr tail is recorded on `agent.lost` below. A killed
@@ -241,8 +305,10 @@ pub(super) async fn run_agent_inner(
                 };
                 // Unix custody remains degraded: leader exit proves native
                 // control loss, not that every descendant has been contained.
-                #[cfg(not(windows))]
+                #[cfg(all(unix, not(target_os = "linux")))]
                 let control_gone = status.is_ok();
+                #[cfg(target_os = "linux")]
+                let control_gone = status.is_ok() && _group_drained;
                 if control_gone {
                     let _ = monitoring.sample_generation(&agent).await;
                 }

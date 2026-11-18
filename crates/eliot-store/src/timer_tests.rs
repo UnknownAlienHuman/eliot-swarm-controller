@@ -1220,6 +1220,78 @@ fn once_at_registration_allows_manual_run_without_consuming_schedule() {
 }
 
 #[test]
+fn scheduled_timer_run_output_uses_parent_saved_rate_policy() {
+    let mut store = store();
+    let registration_ms = now_ms();
+    let agent = ready_agent(&mut store, "timer-saved-policy", registration_ms);
+    let rule = store
+        .ensure_rule_state(
+            "owner",
+            &rule_input_with_limit("timer-saved-policy", 100),
+            registration_ms,
+        )
+        .unwrap();
+    let state = store
+        .ensure_timer_state(
+            "owner",
+            &TimerDefinitionInput {
+                id: "timer-saved-policy".to_owned(),
+                schedule_revision: 1,
+                schedule: TimerSchedule::Interval {
+                    period_ms: 60_000,
+                    anchor: None,
+                },
+                enabled: true,
+                initial_next_due_at: Some(registration_ms + 60_000),
+            },
+            registration_ms,
+        )
+        .unwrap();
+    let scheduled_at_ms = state.next_due_at.expect("scheduled timer has a slot");
+    let action = timer_run_action(
+        &state,
+        rule.revision,
+        ScriptTimerInvocation::Scheduled { scheduled_at_ms },
+    );
+    let admission = store
+        .commit_timer_slot(
+            "owner",
+            &state,
+            TimerSlotCommit {
+                scheduled_at_ms,
+                next_due_at_ms: Some(scheduled_at_ms + 60_000),
+                action: Some(action),
+                skip_code: None,
+            },
+            scheduled_at_ms,
+        )
+        .unwrap();
+    let parent = admission.parent.expect("scheduled timer parent");
+    assert_eq!(parent.outcome.as_ref().unwrap()["rate_limit"]["max"], 100);
+    let run = admission.child.expect("scheduled timer Run child").command;
+    store.dispatch(&run.id, scheduled_at_ms + 1).unwrap();
+    // A later semantic edit replaces the rule revision before the Run output
+    // arrives; the saved parent policy still governs output validation.
+    let updated = store
+        .ensure_rule_state(
+            "owner",
+            &rule_input_with_limit("timer-saved-policy", 1),
+            scheduled_at_ms + 2,
+        )
+        .unwrap();
+    assert_ne!(updated.revision, rule.revision);
+    let output = store
+        .admit_script_output(
+            &run.id,
+            vec![send_request(&agent)],
+            exact_script_result(),
+            scheduled_at_ms + 3,
+        )
+        .unwrap();
+    assert_eq!(output.children.len(), 1);
+}
+
+#[test]
 fn rate_limit_counts_each_admitted_child_once_and_excludes_parents() {
     let mut store = store();
     let registration_ms = now_ms();

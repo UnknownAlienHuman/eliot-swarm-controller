@@ -1084,6 +1084,59 @@ fn retiring_revision_admits_with_its_own_deterministic_key() {
 }
 
 #[test]
+fn retiring_event_rate_limits_against_its_own_definition() {
+    let mut store = store();
+    let (agent, agent_id) = insert_test_agent(&mut store);
+    let mut old = definition("retire-limit-rule", true);
+    let mut old_canonical: Value = serde_json::from_str(&old.canonical_definition).unwrap();
+    old_canonical["limit"] = json!({
+        "max": 1,
+        "per": "rule",
+        "window_ms": RULE_ACTION_WINDOW_MS,
+    });
+    old.canonical_definition = serde_json::to_string(&old_canonical).unwrap();
+    old.definition_digest = core::canonical_json_sha256(&old_canonical).unwrap();
+    let old_view = store.ensure_rule_state("owner", &old, 1).unwrap();
+
+    let first = insert_test_turn_completed(&mut store, agent, 2);
+    let admitted = store
+        .admit_rule_action("owner", &old_view, first, stop_request(&agent_id), 3)
+        .unwrap();
+    assert!(admitted.child.is_some());
+
+    // A semantic edit raises the cap while a pre-edit event is still queued,
+    // retiring the max-1 definition through the new high-water.
+    let second = insert_test_turn_completed(&mut store, agent, 4);
+    let changed_value = json!({
+        "id": "retire-limit-rule",
+        "enabled": true,
+        "limit": {"max": 100, "per": "rule", "window_ms": RULE_ACTION_WINDOW_MS},
+        "updated": true,
+    });
+    let changed = RuleDefinitionInput {
+        canonical_definition: serde_json::to_string(&changed_value).unwrap(),
+        definition_digest: core::canonical_json_sha256(&changed_value).unwrap(),
+        ..old
+    };
+    let current = store.ensure_rule_state("owner", &changed, 5).unwrap();
+    assert_eq!(current.retiring_revision, Some(old_view.revision));
+
+    // The retiring event still counts against its own max-1 policy, so the
+    // second firing is rejected even though the new definition allows 100.
+    let rejected = store
+        .admit_rule_action("owner", &current, second, stop_request(&agent_id), 6)
+        .unwrap();
+    assert!(rejected.child.is_none());
+    let rejected_parent = rejected.parent.as_ref().expect("rejected rule parent");
+    assert_eq!(rejected_parent.state, CommandState::Rejected);
+    assert_eq!(
+        rejected_parent.outcome.as_ref().unwrap()["code"],
+        "rate_limited"
+    );
+    assert_eq!(rejected_parent.args["revision"], old_view.revision);
+}
+
+#[test]
 fn no_match_and_disabled_range_bookkeeping_reaches_quiescence() {
     let mut store = store();
     let enabled = store

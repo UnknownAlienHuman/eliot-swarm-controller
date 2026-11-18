@@ -356,13 +356,11 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
         if request.verb == "resume" {
             return validate_rule_resume_action(request, Some(registration));
         }
-        if !matches!(
-            request.verb.as_str(),
-            "stop" | "send" | "steer" | "inject" | "interrupt" | "approve" | "deny" | "answer"
-        ) || !registration
-            .actions
-            .iter()
-            .any(|action| action == &request.verb)
+        if !super::project_rule_action_binds_agent_target(request.verb.as_str())
+            || !registration
+                .actions
+                .iter()
+                .any(|action| action == &request.verb)
         {
             return Err(Error::new(
                 "not_allowed",

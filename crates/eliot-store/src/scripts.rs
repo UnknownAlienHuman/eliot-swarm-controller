@@ -1375,6 +1375,67 @@ mod tests {
     }
 
     #[test]
+    fn retired_run_output_validates_against_parent_saved_rate_policy() {
+        let mut store = store();
+        let (_, agent_id) = insert_agent(&mut store, "retire-output", 10);
+        let old_view = store
+            .ensure_rule_state(
+                "owner",
+                &rule_input(
+                    "retire-output-rule",
+                    Some(json!({"max": 100, "per": "rule", "window_ms": 60_000})),
+                ),
+                11,
+            )
+            .expect("ensure retiring Run rule");
+        let first = insert_event(&mut store, 12, None, None);
+        let second = insert_event(&mut store, 13, None, None);
+        assert!(first.seq < second.seq);
+        // Semantic edit with queued backlog retires the max-100 definition.
+        let changed = store
+            .ensure_rule_state(
+                "owner",
+                &rule_input(
+                    "retire-output-rule",
+                    Some(json!({"max": 1, "per": "rule", "window_ms": 60_000})),
+                ),
+                14,
+            )
+            .expect("retire old definition");
+        assert_eq!(changed.retiring_revision, Some(old_view.revision));
+        // Admit the Run for the boundary event under the retiring revision;
+        // the same transaction clears retirement, so output cannot recover the
+        // definition from the live rule pair afterwards.
+        let admission = store
+            .admit_rule_action(
+                "owner",
+                &changed,
+                second.seq,
+                run_request(&second, "retire-output-rule", old_view.revision),
+                15,
+            )
+            .expect("admit retiring Run");
+        assert!(admission.state.retiring_revision.is_none());
+        let run_parent = admission.parent.expect("retiring Run parent");
+        assert_eq!(
+            run_parent.outcome.as_ref().unwrap()["rate_limit"]["max"],
+            100
+        );
+        let run = dispatch_run(&mut store, &admission.child.expect("Run child").command, 16);
+        // The saved max-100 policy allows the Run plus one child; the edited
+        // max-1 definition would already be consumed by the Run itself.
+        let output = store
+            .admit_script_output(
+                &run.id,
+                vec![stop_action(&agent_id)],
+                process_result(core::ScriptCustody::Exact),
+                17,
+            )
+            .expect("retired output validates against saved policy");
+        assert_eq!(output.children.len(), 1);
+    }
+
+    #[test]
     fn script_children_count_once_under_the_saved_rule_rate_limit() {
         let mut store = store();
         let (_, first_agent) = insert_agent(&mut store, "script-rate-a", 10);
@@ -1567,6 +1628,73 @@ mod tests {
             )
             .expect_err("open output below the Run parent blocks new catch-up work");
         assert_eq!(blocked.code, "bad_state");
+    }
+
+    #[test]
+    fn catch_up_run_output_validates_against_parent_saved_rate_policy() {
+        let mut store = store();
+        let request_id = ulid::Ulid::new();
+        let request_ms = i64::try_from(request_id.timestamp_ms()).expect("timestamp fits");
+        let now = request_ms + 100;
+        let (agent_num, agent_id) = insert_agent(&mut store, "catchup-saved-policy", now - 10);
+
+        let event = insert_event(&mut store, now - 8, Some((agent_num, 1)), None);
+        let old_view = store
+            .ensure_rule_state(
+                "owner",
+                &rule_input(
+                    "catchup-saved-policy",
+                    Some(json!({"max": 100, "per": "rule", "window_ms": 60_000})),
+                ),
+                now - 7,
+            )
+            .expect("ensure catch-up Run rule");
+        let through_seq = old_view.current_cursor;
+        assert!(event.seq <= through_seq);
+        let request = core::api::RuleCatchUpRequest::new(
+            request_id.to_string(),
+            "catchup-saved-policy",
+            event.seq - 1,
+            Some(through_seq),
+        );
+        let actions = [RuleCatchUpAction::command(
+            event.seq,
+            run_request(&event, "catchup-saved-policy", old_view.revision),
+        )];
+        let admitted = store
+            .admit_rule_catch_up("owner", &request, &old_view, through_seq, &actions, now - 6)
+            .expect("admit catch-up Run");
+        assert_eq!(admitted.parent.verb, "rule.catch_up");
+        assert_eq!(
+            admitted.parent.outcome.as_ref().unwrap()["rate_limit"]["max"],
+            100
+        );
+        let run = admitted.children[0].command.clone();
+
+        // A later semantic edit replaces the revision before the Run output
+        // arrives; the saved parent policy still governs output validation.
+        let updated = store
+            .ensure_rule_state(
+                "owner",
+                &rule_input(
+                    "catchup-saved-policy",
+                    Some(json!({"max": 1, "per": "rule", "window_ms": 60_000})),
+                ),
+                now - 5,
+            )
+            .expect("replace catch-up rule definition");
+        assert_ne!(updated.revision, old_view.revision);
+
+        let run = dispatch_run(&mut store, &run, now - 4);
+        let output = store
+            .admit_script_output(
+                &run.id,
+                vec![stop_action(&agent_id)],
+                process_result(core::ScriptCustody::Exact),
+                now - 3,
+            )
+            .expect("catch-up output validates against saved policy");
+        assert_eq!(output.children.len(), 1);
     }
 
     #[test]

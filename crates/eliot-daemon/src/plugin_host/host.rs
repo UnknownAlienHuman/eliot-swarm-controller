@@ -2784,6 +2784,86 @@ async fn wait_child_family(
     monitoring: &Monitoring,
     agent: &Agent,
 ) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_wait_child_family(child, leader, family, monitoring, agent).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        legacy_wait_child_family(child, leader, family, monitoring, agent).await
+    }
+}
+
+/// Linux family wait: observe the leader exit without reaping while its birth
+/// identity still anchors the group signal, drain the owned group, terminate
+/// what remains, verify the group is empty except the leader, and only then
+/// reap. Returns false unless the leader exited and the group drained; the
+/// caller then terminates and retries. Never signals a bare reused PGID:
+/// every group signal goes through the birth-checked leader identity, which
+/// `wait()` clears only after the group is proven empty.
+#[cfg(target_os = "linux")]
+async fn linux_wait_child_family(
+    child: &mut OwnedChild,
+    leader: Duration,
+    family: Duration,
+    monitoring: &Monitoring,
+    agent: &Agent,
+) -> bool {
+    if !matches!(
+        timeout_at(Instant::now() + leader, child.wait_exit_unreaped()).await,
+        Ok(Ok(()))
+    ) {
+        return false;
+    }
+    let _ = monitoring.sample_generation(agent).await;
+    if !linux_drain_owned_group(child, family).await {
+        return false;
+    }
+    let _ = monitoring.sample_generation(agent).await;
+    // Reap only after the group is proven empty except the leader: the
+    // numeric PGID cannot be reused between the final observation and this
+    // reap because the exited leader is still unreaped.
+    matches!(
+        timeout_at(Instant::now() + family, child.wait()).await,
+        Ok(Ok(_))
+    )
+}
+
+/// Linux owned-group drain after the leader exit was observed without
+/// reaping: bounded drain, terminate leftovers while the unreaped leader
+/// anchors the birth-checked group signal, verify the group is empty except
+/// the leader, and close the fork race with one more birth-checked signal
+/// plus a zero-delay observation. Escaped descendants (setsid) stay
+/// degraded/orphan_possible at settlement; only the still-owned ordinary
+/// group is cleaned here.
+#[cfg(target_os = "linux")]
+pub(super) async fn linux_drain_owned_group(child: &mut OwnedChild, family: Duration) -> bool {
+    let mut group_empty = matches!(child.wait_group_empty_except_leader(family).await, Ok(true));
+    if !group_empty {
+        let _ = child.terminate();
+        group_empty = matches!(child.wait_group_empty_except_leader(family).await, Ok(true));
+    }
+    if group_empty {
+        // An empty observation grants no signal authority by itself. Reuse
+        // the retained leader's birth check, then observe the group again
+        // pre-reap.
+        let _ = child.terminate();
+        group_empty = matches!(
+            child.wait_group_empty_except_leader(Duration::ZERO).await,
+            Ok(true)
+        );
+    }
+    group_empty
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn legacy_wait_child_family(
+    child: &mut OwnedChild,
+    leader: Duration,
+    family: Duration,
+    monitoring: &Monitoring,
+    agent: &Agent,
+) -> bool {
     if !matches!(
         timeout_at(Instant::now() + leader, child.wait()).await,
         Ok(Ok(_))
@@ -5801,5 +5881,113 @@ mod tests {
         remove_empty_instance_dir(&nonempty);
         assert!(nonempty.join("plugin-data").is_file());
         remove_empty_instance_dir(&root.join("missing"));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_family_tests {
+    use super::*;
+
+    /// The leader exits immediately while a same-group grandchild lingers:
+    /// the shared family stop path must terminate the owned group before
+    /// reaping, so no owned member outlives the stop. Reaping first (the old
+    /// order) would clear the birth-checked identity and leave the
+    /// grandchild running with no group signal authority.
+    #[tokio::test]
+    async fn lingering_grandchild_does_not_outlive_linux_family_stop() {
+        let dir = std::env::temp_dir().join(format!("eliot-linux-family-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _temp = crate::test_support::TempDir::own(dir.clone());
+        let pidfile = dir.join("grandchild.pid");
+        let mut command = tokio::process::Command::new("sh");
+        // The pidfile travels as a separate argument: interpolating it into
+        // the program would break on directories containing an apostrophe.
+        command
+            .arg("-c")
+            .arg("sleep 120 & echo $! > \"$1\"; exec sleep 0")
+            .arg("sh")
+            .arg(&pidfile)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = OwnedChild::spawn(command).unwrap();
+        // Capture the grandchild identity before the stop: the shell writes
+        // the pidfile right after the background sleep forks.
+        let grandchild: u32 = {
+            let mut found = None;
+            for _ in 0..100 {
+                if let Ok(body) = std::fs::read_to_string(&pidfile)
+                    && let Ok(pid) = body.trim().parse::<u32>()
+                {
+                    found = Some(pid);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            found.expect("the shell records its background grandchild")
+        };
+        let start_ticks = crate::platform::unix::linux_start_ticks(grandchild);
+        let store = Arc::new(AsyncMutex::new(
+            eliot_store::Store::open(Path::new(":memory:")).expect("open store"),
+        ));
+        let monitoring = Monitoring::new(store, Bus::new(16), Arc::new(Mutex::new(HashSet::new())));
+        let agent = Agent::new("a1", "proj", "opencode", "fake", 0);
+        // The actual stop path: observe the leader exit without reaping,
+        // drain the owned group while the birth identity still anchors
+        // group signals, then reap.
+        assert!(
+            wait_child_family(&mut child, STOP_GRACE, FAMILY_GRACE, &monitoring, &agent).await,
+            "owned group drains before reap"
+        );
+        // Assert process exit, not /proc disappearance: a container init that
+        // never reaps leaves the killed grandchild as a zombie with its
+        // /proc entry still present.
+        let mut exited = false;
+        for _ in 0..100 {
+            match crate::platform::unix::recorded_process_alive(grandchild, start_ticks) {
+                Ok(alive) if !alive => {
+                    exited = true;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        assert!(exited, "owned grandchild outlived the family stop");
+    }
+
+    /// A failed exit observation must not hang the reap: the bounded reap
+    /// times out on a live child (routing to unknown-custody settlement) and
+    /// still reaps an exited child.
+    #[tokio::test]
+    async fn bounded_reap_times_out_on_live_child() {
+        fn sleep_command(secs: &str) -> tokio::process::Command {
+            let mut command = tokio::process::Command::new("sleep");
+            command
+                .arg(secs)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command
+        }
+
+        let mut live = OwnedChild::spawn(sleep_command("30")).expect("spawn live child");
+        let start = tokio::time::Instant::now();
+        let error = live
+            .wait_bounded(Duration::from_millis(100))
+            .await
+            .expect_err("a live child must not reap within the bound");
+        assert_eq!(error.code, "unknown");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the bounded reap must not wait indefinitely"
+        );
+        let _ = live.terminate();
+        let _ = tokio::time::timeout(Duration::from_secs(10), live.wait()).await;
+
+        let mut exited = OwnedChild::spawn(sleep_command("0")).expect("spawn exiting child");
+        assert!(
+            exited.wait_bounded(Duration::from_secs(10)).await.is_ok(),
+            "the bounded reap still reaps an exited child"
+        );
     }
 }

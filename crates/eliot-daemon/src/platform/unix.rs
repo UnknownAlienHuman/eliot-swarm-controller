@@ -557,10 +557,21 @@ pub(crate) fn process_group_empty_except_leader(identity: &ProcessGroupIdentity)
             validate_process_group_leader(identity)?;
             continue;
         }
-        match read_linux_process_identity(pid) {
-            Ok((pgid, _)) if pgid == identity.pgid => return Ok(false),
+        // Only live members retain the group: an unreaped zombie (a grandchild
+        // adopted by an init that never reaps) is already dead, so it must not
+        // pin custody closure after SIGKILL.
+        match read_linux_process_stat(pid) {
+            Ok(stat) if stat.pgid == identity.pgid && stat.state != ProcessState::Exited => {
+                return Ok(false);
+            }
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // A member that exits after its /proc/<pid>/stat is opened
+            // reports ESRCH on read instead of NotFound on open; either way
+            // it is gone, not unobservable. The leader checks below stay
+            // strict: only this non-leader scan treats ESRCH as exited.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) => {}
             Err(error) => {
                 return Err(unknown_process_identity(
                     "cannot observe a retained process-group member",
@@ -653,33 +664,38 @@ fn process_group_empty(pgid: i32) -> Result<bool> {
 
 #[cfg(target_os = "linux")]
 fn read_linux_process_stat(pid: u32) -> std::io::Result<LinuxProcessStat> {
-    use std::io::{Error as IoError, ErrorKind};
-
     if pid == 0 {
-        return Err(IoError::new(
-            ErrorKind::InvalidInput,
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
             "PID must be positive",
         ));
     }
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    parse_linux_process_stat(pid, &stat)
+    // The record is read as bytes: a comm truncated mid-character is not
+    // valid UTF-8, but only the ASCII fields around it are ever decoded.
+    let stat = fs::read(format!("/proc/{pid}/stat"))?;
+    parse_linux_process_stat_bytes(pid, &stat)
 }
 
 #[cfg(target_os = "linux")]
-fn parse_linux_process_stat(pid: u32, stat: &str) -> std::io::Result<LinuxProcessStat> {
+fn parse_linux_process_stat_bytes(pid: u32, stat: &[u8]) -> std::io::Result<LinuxProcessStat> {
     use std::io::{Error as IoError, ErrorKind};
 
+    // The comm field may hold any bytes (spaces, parentheses, truncated
+    // multibyte characters), so the PID is the ASCII run before the first
+    // '(' and the fixed fields follow the last ')'.
     let open = stat
-        .find('(')
+        .iter()
+        .position(|byte| *byte == b'(')
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "malformed process stat"))?;
     let close = stat
-        .rfind(')')
+        .iter()
+        .rposition(|byte| *byte == b')')
         .filter(|close| *close > open)
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "malformed process stat"))?;
-    let reported_pid = stat[..open]
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| IoError::new(ErrorKind::InvalidData, "malformed process PID"))?;
+    let reported_pid = std::str::from_utf8(&stat[..open])
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "malformed process PID"))?;
     if reported_pid != pid {
         return Err(IoError::new(
             ErrorKind::InvalidData,
@@ -688,20 +704,26 @@ fn parse_linux_process_stat(pid: u32, stat: &str) -> std::io::Result<LinuxProces
     }
     // Fields after the final ')' start at field 3: pgrp is field 5 (index 2)
     // and starttime is field 22 (index 19). The comm field may contain spaces.
-    let fields: Vec<_> = stat[close + 1..].split_whitespace().collect();
-    let pgid = fields
-        .get(2)
+    let fields: Vec<_> = stat[close + 1..]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect();
+    let field = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|value| std::str::from_utf8(value).ok())
+    };
+    let pgid = field(2)
         .and_then(|value| value.parse::<i32>().ok())
         // Generic procfs census includes tasks without a process group, which
         // Linux represents as PGID 0. Owned group capture applies its own
         // positive, birth-checked leader validation.
         .filter(|value| *value >= 0)
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid process PGID"))?;
-    let start_ticks = fields
-        .get(19)
+    let start_ticks = field(19)
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid process start time"))?;
-    let state = match fields.first().copied() {
+    let state = match field(0) {
         Some("Z" | "X" | "x") => ProcessState::Exited,
         Some(_) => ProcessState::Running,
         None => {
@@ -718,17 +740,15 @@ fn parse_linux_process_stat(pid: u32, stat: &str) -> std::io::Result<LinuxProces
     let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
         .ok()
         .filter(|size| *size > 0);
-    let cpu_time_ns = fields
-        .get(11)
+    let cpu_time_ns = field(11)
         .and_then(|v| v.parse::<u64>().ok())
-        .zip(fields.get(12).and_then(|v| v.parse::<u64>().ok()))
+        .zip(field(12).and_then(|v| v.parse::<u64>().ok()))
         .and_then(|(user, system)| user.checked_add(system))
         .zip(ticks_per_second)
         .and_then(|(ticks, frequency)| {
             u64::try_from(u128::from(ticks) * 1_000_000_000 / u128::from(frequency)).ok()
         });
-    let rss_bytes = fields
-        .get(21)
+    let rss_bytes = field(21)
         .and_then(|v| v.parse::<u64>().ok())
         .zip(page_size)
         .and_then(|(pages, size)| pages.checked_mul(size));
@@ -1205,22 +1225,99 @@ mod linux_process_stat_tests {
 
     #[test]
     fn parses_zero_pgid_nonmember_and_positive_owned_group() {
-        let nonmember = parse_linux_process_stat(42, &stat_line(42, "0"))
+        let nonmember = parse_linux_process_stat_bytes(42, stat_line(42, "0").as_bytes())
             .expect("zero PGID is a valid procfs value");
         assert_eq!(nonmember.pgid, 0);
 
-        let owned = parse_linux_process_stat(73, &stat_line(73, "73"))
+        let owned = parse_linux_process_stat_bytes(73, stat_line(73, "73").as_bytes())
             .expect("positive owned PGID remains valid");
         assert_eq!(owned.pgid, 73);
     }
 
     #[test]
     fn rejects_negative_pgid_as_invalid_data() {
-        let error = match parse_linux_process_stat(42, &stat_line(42, "-1")) {
+        let error = match parse_linux_process_stat_bytes(42, stat_line(42, "-1").as_bytes()) {
             Err(error) => error,
             Ok(_) => panic!("negative PGID is not a valid namespace process-group ID"),
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    fn byte_stat_line(pid: u32, comm: &[u8], pgid: &str, state: &str) -> Vec<u8> {
+        let mut fields = ["0"; 22];
+        fields[0] = state;
+        fields[1] = "1";
+        fields[2] = pgid;
+        fields[11] = "2";
+        fields[12] = "3";
+        fields[19] = "1234";
+        fields[21] = "4";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(pid.to_string().as_bytes());
+        raw.extend_from_slice(b" (");
+        raw.extend_from_slice(comm);
+        raw.extend_from_slice(b") ");
+        raw.extend_from_slice(fields.join(" ").as_bytes());
+        raw
+    }
+
+    #[test]
+    fn truncated_multibyte_comm_still_parses_ascii_fields() {
+        // A comm truncated mid-character is not valid UTF-8. The scan must
+        // still decode the ASCII fields to place the process instead of
+        // failing the whole group observation.
+        let pid = 4242u32;
+        let other = byte_stat_line(pid, &[0xE2, 0x82], "9999", "S");
+        assert!(
+            std::str::from_utf8(&other).is_err(),
+            "the fixture must not be valid UTF-8"
+        );
+        let stat = parse_linux_process_stat_bytes(pid, &other)
+            .expect("ASCII fields parse despite the comm bytes");
+        assert_eq!(stat.pgid, 9999);
+        assert_eq!(stat.state, ProcessState::Running);
+        assert_eq!(stat.start_ticks, 1234);
+
+        let own = byte_stat_line(pid, &[0xE2, 0x82], "4242", "S");
+        let stat = parse_linux_process_stat_bytes(pid, &own)
+            .expect("ASCII fields parse despite the comm bytes");
+        assert_eq!(stat.pgid, 4242);
+
+        let zombie = byte_stat_line(pid, &[0xE2, 0x82], "4242", "Z");
+        let stat = parse_linux_process_stat_bytes(pid, &zombie)
+            .expect("a zombie with comm bytes still parses");
+        assert_eq!(stat.state, ProcessState::Exited);
+    }
+
+    #[test]
+    fn unreaped_exited_child_is_not_alive() {
+        // The test process is the parent here, so the exited child stays a
+        // zombie until the explicit reap below: no init reaping behavior is
+        // involved.
+        let mut child = std::process::Command::new("sleep")
+            .arg("0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn exiting child");
+        let pid = child.id();
+        let mut start_ticks = None;
+        for _ in 0..100 {
+            match read_linux_process_stat(pid) {
+                Ok(stat) if stat.state == ProcessState::Exited => {
+                    start_ticks = Some(stat.start_ticks);
+                    break;
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        let start_ticks = start_ticks.expect("the exited child stays observable as a zombie");
+        assert!(
+            !recorded_process_alive(pid, start_ticks).expect("a zombie reads as not alive"),
+            "an unreaped zombie must not count as a live member"
+        );
+        let _ = child.wait();
     }
 
     #[test]

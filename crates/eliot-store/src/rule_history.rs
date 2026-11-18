@@ -54,6 +54,7 @@ struct CatchUpParentInput<'a> {
     through_seq: i64,
     children: Vec<String>,
     suppressed: Vec<i64>,
+    rate_limit: core::api::RuleLimit,
     payload_digest: &'a [u8],
     now: i64,
 }
@@ -406,6 +407,7 @@ impl Store {
                 through_seq: captured_through_seq,
                 children: child_ids,
                 suppressed: suppressed.clone(),
+                rate_limit: limit,
                 payload_digest: &payload_digest,
                 now,
             },
@@ -533,6 +535,7 @@ fn insert_catch_up_parent(
         through_seq,
         children,
         suppressed,
+        rate_limit,
         payload_digest,
         now,
     } = input;
@@ -551,10 +554,16 @@ fn insert_catch_up_parent(
     if let Some(project) = &request.project {
         args["project"] = json!(project);
     }
+    // Freeze the admission rate policy in the committed catch-up parent:
+    // catch-up Run output validates against this saved policy plus current
+    // authority, without requiring the definition revision to remain retained.
+    let rate_limit = serde_json::to_value(rate_limit)
+        .map_err(|_| Error::new("internal", "rule rate policy cannot be encoded"))?;
     let outcome = json!({
         "children": children,
         "through_seq": through_seq,
         "suppressed_event_seqs": suppressed,
+        "rate_limit": rate_limit,
     });
     let command = CommandInsert {
         id: &request.id,

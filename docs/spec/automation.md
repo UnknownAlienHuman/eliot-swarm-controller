@@ -7,9 +7,11 @@ does not add a second executor or a generic run/action graph.
 
 Global rules load from `<data_dir>/rules/*.toml`. Project rules load only from the
 owner-registered canonical checkout's `.eliot/rules/*.toml`, under project-scoped
-authority and its approved profiles/actions. Connected rule loading watches those files
-for changes. Invalid reload keeps the last valid definition and reports the error through
-bounded daemon diagnostics.
+authority and its approved profiles/actions. Connected rule loading watches the rules
+directory non-recursively (plus the config source that also feeds generated rules)
+for changes, with periodic reconciliation as the fallback. Managed worktrees, plugin
+data and other subtrees are never watched. Invalid reload keeps the last valid definition
+and reports the error through bounded daemon diagnostics.
 
 ```toml
 [[rule]]
@@ -450,7 +452,7 @@ retained cursor. New queue entries must sort after the cursor. The folder scan i
 to 500 entries per firing; overflow fails closed rather than skipping an unseen earlier
 brief. Each brief is
 limited to the ordinary 64 KiB launch-text bound. Unsafe, oversized or invalid UTF-8
-briefs fail the slot visibly. At capacity or when no next brief exists, the timer slot is
+briefs fail the slot visibly. An unreadable or missing briefs folder fails only that assignment's slot with its code while the rule worker keeps running every other automation. At capacity or when no next brief exists, the timer slot is
 skipped and a later interval checks again. Settings generate a global interval timer
 rule and an ordinary completion rule. Before admitting cleanup, Store verifies that
 the captured Agent/generation was launched by this assignment's own launch for the
@@ -990,8 +992,12 @@ literal and must pass ordinary command validation. Records cannot supply command
 `executable`, `cmd`, `cwd`, `timeout`, `env` or token fields.
 
 After successful exit, validate each actually emitted record separately against its saved
-scope: project Run uses the project action allowlist and Router generation/turn fences;
-global Run uses ordinary Owner Router checks. All records must pass before atomic admission;
+scope and the admission rate policy frozen in the committed rule parent: project Run uses
+the project action allowlist and Router generation/turn fences;
+global Run uses ordinary Owner Router checks. For parents with frozen policy this
+validation must not depend on the definition revision remaining retained; rows
+committed before the parent policy freeze still resolve their limit through the
+existing retained-definition lookup. All records must pass before atomic admission;
 the rule loader does not statically analyze possible script output. Admitted children use the
 saved rule principal—Owner for global Run, project principal for project Run—even after the
 Run token is revoked.
