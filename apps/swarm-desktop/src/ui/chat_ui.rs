@@ -30,7 +30,6 @@ pub(super) enum ChatMsg {
     ComposerChanged(String),
     AnswerChanged(String, String, Vec<String>),
     AnswerUnchanged,
-    AnswerOptionChanged(String, String, String, bool),
     SnapshotLoaded(u64, eliot_core::Result<Box<Snapshot>>),
     Delivered(u64, eliot_core::Result<Option<Box<Delivery>>>),
     BackoffDone(u64, bool),
@@ -301,22 +300,6 @@ impl DesktopApp {
                     answers.remove(&question);
                 } else if values != [""] || answers.contains_key(&question) {
                     answers.insert(question, eliot_core::requests::Answer { answers: values });
-                }
-            }
-            ChatMsg::AnswerOptionChanged(request, question, option, selected) => {
-                let answers = self.chat.answers.entry(request).or_default();
-                let values = &mut answers
-                    .entry(question.clone())
-                    .or_insert_with(|| eliot_core::requests::Answer {
-                        answers: Vec::new(),
-                    })
-                    .answers;
-                values.retain(|value| value != &option);
-                if selected {
-                    values.push(option);
-                }
-                if values.is_empty() {
-                    answers.remove(&question);
                 }
             }
             ChatMsg::SnapshotLoaded(epoch, result) => {

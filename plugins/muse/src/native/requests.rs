@@ -1156,6 +1156,46 @@ mod tests {
     }
 
     #[test]
+    fn multiple_answers_mix_is_rejected() {
+        // Audit #639: the MSP wire carries exactly one of selectedLabels or
+        // freeText per question, so selections mixed with free text fail.
+        // The desktop submits either selections or one text answer.
+        let params = serde_json::json!({
+            "itemId": "item-2",
+            "questions": [{
+                "header": "Deploy",
+                "id": "q1",
+                "options": [{"label": "staging"}, {"label": "production"}],
+                "question": "Where?",
+                "selection": {"mode": "multiple"},
+            }],
+            "sessionId": "session-1",
+            "toolCallId": "call-2",
+            "toolName": "ask",
+            "turnId": "turn-1",
+            "userInputId": "prompt-1",
+            "viewCursor": "cursor-4",
+        });
+        let offered: OfferedQuestion =
+            serde_json::from_value(params["questions"][0].clone()).expect("offered decodes");
+        let picked =
+            answer_for_canonical(&offered, &["staging".to_owned(), "production".to_owned()])
+                .expect("selections map");
+        assert_eq!(
+            picked.selected_labels.as_deref(),
+            Some(&["staging".to_owned(), "production".to_owned()][..])
+        );
+        assert!(picked.free_text.is_none());
+        assert!(
+            answer_for_canonical(&offered, &["staging".to_owned(), "other".to_owned()]).is_err()
+        );
+        let free =
+            answer_for_canonical(&offered, &["my own wording".to_owned()]).expect("free text maps");
+        assert_eq!(free.free_text.as_deref(), Some("my own wording"));
+        assert!(free.selected_labels.is_none());
+    }
+
+    #[test]
     fn approval_describe_binds_exact_session_turn_and_offer() {
         let pending = describe_request(
             "approval/request",
