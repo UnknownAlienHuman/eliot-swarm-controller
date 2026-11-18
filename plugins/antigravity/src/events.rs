@@ -2363,14 +2363,6 @@ mod tests {
         });
         started.unwrap();
         state.stopping = true;
-        state.latch_cancellation("stop-1", Some("turn-1"));
-        eliot_plugin::native_lifecycle::wait_for_stop_turn(Instant::now(), || {
-            state
-                .last_turn
-                .as_ref()
-                .is_some_and(|turn| turn.turn_id == "turn-1" && turn.terminal)
-        })
-        .await;
         assert!(state.last_turn.is_none());
         let (ended, ()) = tokio::join!(state.ended(), async {
             ack_gap(&mut commits, FAMILIES).await;

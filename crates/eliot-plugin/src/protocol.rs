@@ -275,37 +275,6 @@ pub struct AgentStopParams {
     pub agent_id: String,
     pub generation: i64,
     pub command_id: String,
-    #[serde(default)]
-    pub force: bool,
-    /// Exact active turn captured for this stop; never infer a newer turn.
-    #[serde(default)]
-    pub turn_id: Option<String>,
-}
-
-impl AgentStopParams {
-    /// The cooperative interrupt is part of this one stop, not a new command.
-    pub fn interrupt(&self) -> Option<AgentCommandParams> {
-        let turn_id = self
-            .turn_id
-            .as_ref()
-            .filter(|turn| !turn.trim().is_empty())?;
-        if self.force {
-            return None;
-        }
-        Some(AgentCommandParams {
-            agent_id: self.agent_id.clone(),
-            generation: self.generation,
-            command_id: self.command_id.clone(),
-            verb: "interrupt".to_owned(),
-            args: empty_object(),
-            turn_id: Some(turn_id.clone()),
-            request_id: None,
-            context: Vec::new(),
-            model_override: None,
-            effort_override: None,
-            config_revision: None,
-        })
-    }
 }
 
 #[derive(Deserialize)]

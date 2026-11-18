@@ -85,11 +85,8 @@ struct StopDeadlines {
 impl StopDeadlines {
     fn new(now: Instant) -> Self {
         let queued_until = now + RPC_DEADLINE;
-        // agent.stop + shutdown; the force snapshot fits the second RPC window.
-        let rpc_until = queued_until
-            + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT
-            + RPC_DEADLINE
-            + RPC_DEADLINE;
+        // agent.stop + shutdown. The router has already waited for the turn.
+        let rpc_until = queued_until + RPC_DEADLINE + RPC_DEADLINE;
         // close_input, then two attempts, each with leader and family waits.
         let custody_until = rpc_until + STOP_GRACE + (STOP_GRACE + STOP_GRACE) * 2;
         // Callback drain/abort-join and one bounded Store settlement.
@@ -240,7 +237,6 @@ enum RuntimeMessage {
     },
     Stop {
         command: Command,
-        turn_id: Option<String>,
         force: bool,
         deadlines: StopDeadlines,
         reply: oneshot::Sender<Result<Value>>,
@@ -956,7 +952,6 @@ impl PluginHost {
             &sender,
             RuntimeMessage::Stop {
                 command,
-                turn_id: agent.active_turn.clone(),
                 force,
                 deadlines,
                 reply,
@@ -3028,12 +3023,7 @@ fn prepare_queued_stop_call(
             "stop queue deadline elapsed before native dispatch",
         ));
     }
-    Ok(client.call(
-        "agent.stop",
-        params,
-        deadlines
-            .rpc_deadline(RPC_DEADLINE + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT),
-    ))
+    Ok(client.call("agent.stop", params, deadlines.rpc_deadline(RPC_DEADLINE)))
 }
 
 async fn wait_child(
@@ -3177,38 +3167,9 @@ async fn terminate_child(mut child: OwnedChild, monitoring: &Monitoring, agent: 
     exited
 }
 
-/// True when the Store's current controlled projection proves the captured
-/// generation ended normally: exact generation still current, state exactly
-/// Stopped (committed native session end or applied stop), controlled
-/// authority. Failed/Lost and advanced generations do not count; ack
-/// uncertainty stays separate from this durable logical-End readback.
-/// Terminal settlement revokes the token, so derived own_identity is always
-/// false here and is not checked.
-async fn has_committed_session_ended(
-    state: &Weak<HostState>,
-    key: &AgentKey,
-    until: Instant,
-) -> bool {
-    let Some(host) = state.upgrade() else {
-        return false;
-    };
-    let Ok(store) = timeout_at(until, host.store.lock()).await else {
-        return false;
-    };
-    match store.get_agent(&key.id) {
-        Ok(Some(agent)) => {
-            agent.generation == key.generation
-                && agent.state == eliot_core::AgentState::Stopped
-                && !agent.observe_only
-        }
-        _ => false,
-    }
-}
-
 /// Private shutdown, input close, then graceful wait with one
 /// terminate-and-wait fallback. Returns (graceful, exited); callers settle
-/// sources, fence, and reply. Shared by the Applied path and an ordinary
-/// Unknown stop whose captured generation has durable logical End.
+/// sources, fence, and reply.
 async fn shutdown_and_wait_child(
     client: &PluginClient,
     child: &mut OwnedChild,
@@ -6186,9 +6147,7 @@ mod tests {
         let now = Instant::now();
         let deadlines = StopDeadlines::new(now);
         assert_eq!(deadlines.queued_until - now, RPC_DEADLINE);
-        let second_rpc_starts = deadlines.queued_until
-            + RPC_DEADLINE
-            + eliot_plugin::native_lifecycle::STOP_INTERRUPT_TIMEOUT;
+        let second_rpc_starts = deadlines.queued_until + RPC_DEADLINE;
         assert_eq!(
             deadlines.rpc_deadline_at(second_rpc_starts, RPC_DEADLINE),
             deadlines.rpc_until
@@ -6268,8 +6227,7 @@ mod tests {
             &sender,
             RuntimeMessage::Stop {
                 command: command.clone(),
-                turn_id: None,
-                force: true,
+                force: false,
                 deadlines,
                 reply,
             },
@@ -6299,8 +6257,7 @@ mod tests {
             &sender,
             RuntimeMessage::Stop {
                 command,
-                turn_id: None,
-                force: true,
+                force: false,
                 deadlines,
                 reply,
             },
@@ -6328,7 +6285,7 @@ mod tests {
         let error = match prepare_queued_stop_call(
             &client,
             json!({
-                "agent_id":"a1", "generation":1, "command_id":Ulid::new().to_string(), "force":true,
+                "agent_id":"a1", "generation":1, "command_id":Ulid::new().to_string(),
             }),
             deadlines,
         ) {

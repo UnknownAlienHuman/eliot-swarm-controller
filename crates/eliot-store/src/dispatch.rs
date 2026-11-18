@@ -542,15 +542,14 @@ fn dispatch_stop_tx(
             "stop command's captured turn is no longer current",
         ));
     }
-    check_rpc_frame(
-        "agent.stop",
-        &json!({
-            "agent_id": agent.id,
-            "generation": agent.generation,
-            "command_id": id,
-            "force": command.command.args.get("force").and_then(Value::as_bool).unwrap_or(false),
-        }),
-    )?;
+    if command.command.args.get("force").and_then(Value::as_bool) != Some(true)
+        && has_in_flight_stop_tx(tx, agent_num, agent.generation)?
+    {
+        return Err(Error::new(
+            "bad_state",
+            "another stop is unresolved for this generation",
+        ));
+    }
     update_command_state(tx, id, CommandState::Dispatched, None, None, now)?;
     events.push(insert_daemon_command_event(
         tx,
@@ -603,6 +602,11 @@ fn dispatch_configure_tx(
             "configure requires a live Agent generation with a native session",
         ));
     }
+    let uses_native_session =
+        eliot_core::api::configure_uses_native_session(&agent.harness, &command.command.args);
+    if uses_native_session {
+        require_no_in_flight_stop(tx, agent_num, agent.generation)?;
+    }
     // Shared admission order: an earlier configure still pending
     // holds the lane, and earlier send input that has not frozen
     // its revision or association holds it too. The Router waits
@@ -614,9 +618,7 @@ fn dispatch_configure_tx(
     let earlier_configure = earliest.as_ref().is_some_and(|(first, _, _)| first != id);
     let earlier_send = earliest_unresolved_send_key(tx, agent_num, agent.generation)?
         .is_some_and(|(_, created_at, rowid)| (created_at, rowid) < own_key);
-    if earlier_send
-        && eliot_core::api::configure_uses_native_session(&agent.harness, &command.command.args)
-    {
+    if earlier_send && uses_native_session {
         return Err(Error::new(
             "busy",
             "native configure requires no pending input; retry between turns",
@@ -662,6 +664,16 @@ fn dispatch_configure_tx(
     Ok(None)
 }
 
+fn require_no_in_flight_stop(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<()> {
+    if has_in_flight_stop_tx(tx, agent, generation)? {
+        return Err(Error::new(
+            "bad_state",
+            "native control is fenced by an unresolved stop for this generation",
+        ));
+    }
+    Ok(())
+}
+
 /// Dispatch one active-turn `inject`: expiry settles rejected, otherwise the
 /// context is claimed. Queued injects are never dispatched directly.
 #[allow(clippy::too_many_arguments)]
@@ -693,6 +705,7 @@ fn dispatch_inject_tx(
             "active_turn inject targets a stale Agent generation",
         ));
     }
+    require_no_in_flight_stop(tx, agent_num, agent.generation)?;
     if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
         return Err(Error::new(
             "bad_state",
@@ -776,6 +789,7 @@ fn dispatch_control_tx(
     agent: &Agent,
     agent_num: i64,
     command_generation: i64,
+    stop_prelude: bool,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
@@ -790,6 +804,9 @@ fn dispatch_control_tx(
             "stale_generation",
             "control command targets a stale Agent generation",
         ));
+    }
+    if !stop_prelude {
+        require_no_in_flight_stop(tx, agent_num, agent.generation)?;
     }
     // Control-verb support is owned by the PluginHost manifest
     // check; only generation, state, turn and request are rechecked.
@@ -881,6 +898,96 @@ fn dispatch_control_tx(
 }
 
 impl Store {
+    /// Admit and dispatch the one interrupt authorized by an already-dispatched
+    /// graceful stop. Public command submission cannot create this child.
+    pub fn dispatch_stop_interrupt(
+        &mut self,
+        stop_id: &str,
+        turn_id: &str,
+        now: i64,
+    ) -> Result<Change<Command>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let stop = load_command_record(&tx, stop_id)?
+                .ok_or_else(|| Error::new("not_found", "stop command was not found"))?;
+            let (Some(agent_num), Some(generation)) = (stop.target, stop.command.generation) else {
+                return Err(Error::new("bad_state", "stop has no captured generation"));
+            };
+            if stop.command.verb != "stop"
+                || stop.state != CommandState::Dispatched
+                || stop.command.args.get("force").and_then(Value::as_bool) == Some(true)
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "interrupt requires a dispatched graceful stop",
+                ));
+            }
+            if stop
+                .expected_turn_id
+                .as_deref()
+                .is_some_and(|expected| expected != turn_id)
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    "stop interrupt targets a different turn",
+                ));
+            }
+            let already_attempted: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM commands
+                     WHERE parent_command = ?1 AND link_kind = 'stop_interrupt')",
+                    [stop_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if already_attempted {
+                return Err(Error::new(
+                    "bad_state",
+                    "stop interrupt was already dispatched",
+                ));
+            }
+            let agent = load_agent_by_num(&tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", "stop target Agent was not found"))?;
+            observer::require_controlled(&agent)?;
+            let mut request = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+            request.target = Some(agent.id.clone());
+            request.expected_generation = Some(generation);
+            request.expected_turn_id = Some(turn_id.to_owned());
+            let mut events = Vec::new();
+            admission::admit_control_tx(
+                &tx,
+                &stop.command.principal,
+                &request,
+                &admission::command_payload_digest(&request)?,
+                Some(stop_id),
+                now,
+                &mut events,
+            )?;
+            let interrupt = load_dispatchable_tx(&tx, &request.id)?;
+            dispatch_control_tx(
+                &tx,
+                &request.id,
+                &interrupt,
+                &agent,
+                agent_num,
+                generation,
+                true,
+                now,
+                &mut events,
+            )?;
+            let value = load_command(&tx, &request.id)?
+                .ok_or_else(|| Error::new("source_integrity", "stop interrupt disappeared"))?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Change { value, events })
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     pub(super) fn dispatch_inner(
         &mut self,
         id: &str,
@@ -1017,6 +1124,7 @@ impl Store {
                     &agent,
                     agent_num,
                     command_generation,
+                    false,
                     now,
                     &mut events,
                 )?;

@@ -530,7 +530,11 @@ impl OwnedServer {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+            // Normal Agent stop preserves the native session and hands any
+            // lingering serve process to the daemon's generation Job. The
+            // plugin's explicit startup cleanup still terminates failures;
+            // dropping this handle must not perform a second force stop.
+            .kill_on_drop(false);
         let mut child = command.spawn().map_err(|error| {
             Error::new(
                 "native_spawn",
@@ -670,9 +674,8 @@ impl OwnedServer {
         error.with_stderr(eliot_core::StderrSource::Harness, self.stderr_snapshot())
     }
 
-    /// End the owned server after native session-control work. `serve` exposes
-    /// no shutdown RPC, so both paths end the process; the generation Job ends
-    /// any grandchildren. Ordinary Stop retains the native session.
+    /// End the owned server during cleanup. The generation Job owns any
+    /// remaining descendants.
     pub async fn terminate(&mut self, force: bool, deadline: Instant) -> Result<()> {
         let exit = self.terminate_leader(force, deadline).await;
         if exit.is_ok() {

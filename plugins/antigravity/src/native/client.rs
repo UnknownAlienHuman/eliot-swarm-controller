@@ -244,6 +244,13 @@ impl AgyProcess {
         self.stream.clone()
     }
 
+    /// Close the owned ACP process gracefully without falling back to a kill.
+    /// The daemon's Job remains the sole force-custody path if this cannot be
+    /// proven before the deadline.
+    pub async fn close_gracefully(&mut self, deadline: Instant) -> Result<ExitStatus> {
+        self.transport.close_gracefully(deadline, true).await
+    }
+
     pub async fn terminate(&mut self, force: bool, deadline: Instant) -> Result<ExitStatus> {
         self.transport.terminate(force, deadline).await
     }

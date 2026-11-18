@@ -1,6 +1,118 @@
 use super::*;
 
 #[test]
+fn project_stop_dispatches_one_interrupt_under_its_own_authority() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let checkout = "/synthetic-stop-only";
+    let profile = "stop-only-profile";
+    let (agent, workspace) = ready_managed_codex_agent(&mut store, checkout, profile, now);
+    let turn = start_fake_turn(&mut store, &agent, now + 5);
+    let registration = ProjectRegistrationInput {
+        id: "stop-only".to_owned(),
+        checkout: checkout.to_owned(),
+        repo_common_dir: workspace.repo_common_dir,
+        git: None,
+        profiles: vec![profile.to_owned()],
+        actions: vec!["stop".to_owned()],
+        interpreters: BTreeMap::new(),
+        run_env: Vec::new(),
+    };
+    store
+        .upsert_project_registration("owner", &registration, now + 8)
+        .unwrap();
+    let principal = "project:stop-only";
+    let mut direct_interrupt = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
+    direct_interrupt.target = Some(agent.clone());
+    direct_interrupt.expected_generation = Some(1);
+    direct_interrupt.expected_turn_id = Some(turn.clone());
+    assert_eq!(
+        store
+            .submit(principal, direct_interrupt, now + 9)
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(agent.clone());
+    stop.expected_generation = Some(1);
+    let stop_id = store.submit(principal, stop, now + 10).unwrap().command.id;
+    store.dispatch(&stop_id, now + 11).unwrap();
+
+    let prelude = store
+        .dispatch_stop_interrupt(&stop_id, &turn, now + 12)
+        .unwrap();
+    assert_eq!(prelude.value.state, CommandState::Dispatched);
+    assert_eq!(prelude.value.principal, principal);
+    assert_eq!(prelude.value.verb, "interrupt");
+    assert_eq!(prelude.value.target.as_deref(), Some(agent.as_str()));
+    assert_eq!(prelude.value.generation, Some(1));
+    assert_eq!(prelude.value.turn_id.as_deref(), Some(turn.as_str()));
+    assert_eq!(prelude.events.last().unwrap().kind, "command.dispatched");
+    assert_eq!(
+        store
+            .dispatch_stop_interrupt(&stop_id, &turn, now + 13)
+            .unwrap_err()
+            .code,
+        "bad_state"
+    );
+    assert!(!store.is_write_faulted());
+}
+
+#[test]
+fn dispatched_stop_fences_native_controls_that_were_already_admitted() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let agent = ready_agent(&mut store, "stop-control-fence", now);
+    store
+        .connection
+        .execute(
+            "UPDATE agents SET effective = ?1 WHERE id = ?2",
+            rusqlite::params![
+                r#"{"context_points":["active_turn"]}"#,
+                eliot_core::parse_agent_id(&agent).unwrap()
+            ],
+        )
+        .unwrap();
+    let turn = start_fake_turn(&mut store, &agent, now + 1);
+    let controls: Vec<_> = [
+        ("steer", json!({"text":"late steer"})),
+        (
+            "inject",
+            json!({"point":"active_turn","text":"late context"}),
+        ),
+        ("interrupt", json!({"stop_interrupt":"caller-supplied"})),
+    ]
+    .into_iter()
+    .map(|(verb, args)| {
+        let mut request = SubmitCommand::new(Ulid::new().to_string(), verb);
+        request.target = Some(agent.clone());
+        request.expected_generation = Some(1);
+        request.expected_turn_id = Some(turn.clone());
+        request.args = args;
+        store.submit("owner", request, now + 4).unwrap().command.id
+    })
+    .collect();
+
+    let mut stop = SubmitCommand::new(Ulid::new().to_string(), "stop");
+    stop.target = Some(agent);
+    stop.expected_generation = Some(1);
+    let stop_id = store.submit("owner", stop, now + 5).unwrap().command.id;
+    store.dispatch(&stop_id, now + 6).unwrap();
+
+    for id in controls {
+        let error = store.dispatch(&id, now + 7).unwrap_err();
+        assert_eq!(error.code, "bad_state");
+        assert!(error.message.contains("fenced by an unresolved stop"));
+        assert_eq!(
+            store.get_command(&id).unwrap().unwrap().state,
+            CommandState::Accepted
+        );
+    }
+}
+
+#[test]
 fn fake_interrupt_admits_and_dispatches_only_for_its_exact_active_turn() {
     let mut store = Store::open(Path::new(":memory:")).expect("open Store");
     let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
