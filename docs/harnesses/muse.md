@@ -319,8 +319,15 @@ canonical option ids (upstream carries no ids); option-bearing single/multiple
 modes map to `single`/`multiple`, option-less questions to `text` with free
 entry. Natively stated selection bounds pass through, absent bounds stay
 absent, and negative bounds reject at describe. Canonical strings map back to
-the wire shape the offered question requires (`selected_label`,
-`selected_labels` or `free_text`); unknown future approval decisions stay out
+the wire shape the offered question requires: a `single` answer matching an
+offered label travels as `selected_label`, anything else as `free_text`; a
+`multiple` answer whose every string matches an offered label travels as
+`selected_labels` (even one selection, within the offered minimum and maximum),
+a single non-matching string as `free_text`, and mixes or empty answers reject.
+The desktop keeps the two `multiple` shapes apart at input: typing an offered
+label checks that option instead of submitting label-identical free text, so a
+checked option and typed text never share a payload; unknown future approval
+decisions stay out
 of the public offer and no verb decides them. Resume pulls `approval/listPending` once
 for its pointer set and opens only what still binds to the live turn; anything
 naming the dead generation's turn is receipted and dropped as an orphan, never
@@ -674,15 +681,17 @@ No adapter-specific journal, proof receipts or secondary workflow model is impor
 `swarm launch --harness muse [--model M] [--effort E] [--cmd PATH]
 --workspace W "prompt"` is Owner-only and freezes a profile-equivalent
 snapshot from safe defaults (`workspace-write`, `never`, explicit MCP `inherit`) plus
-flags. An omitted `--model` defers to the server default (the catalogue names
-no default marker; an empty catalogue, e.g. Muse 1.4.20's `bundledCatalog`
-with zero models, fails honestly); the effective id is read back from the
-session. An unavailable requested model fails without substitution. `cmd` is
-discovered from the launcher dir version the launcher marks current
-(`muse.cmd` wrappers are never frozen); `--cmd` pins one explicit binary
-version instead (e.g. the 1.4.0 binary while the launcher marks 1.4.20).
-`swarm models --harness muse` returns the live native catalogue; note it
-carries no default marker. An empty native read reports
+flags. An omitted `--model` defers to the server default whether or not the
+catalogue marks a row with `isDefault` (an empty catalogue,
+e.g. Muse 1.4.20's `bundledCatalog` with zero models, fails honestly); the
+effective id is read back from the session. An unavailable requested model
+fails without substitution. `cmd` is discovered from the launcher dir version
+the launcher marks current (`muse.cmd` wrappers are never frozen); `--cmd`
+pins one explicit binary version instead (e.g. the 1.4.0 binary while the
+launcher marks 1.4.20). `swarm models --harness muse` returns the live native
+catalogue; its note names the `isDefault`-marked row when the server marks
+one, and an omitted `--model` still launches with the server default. An empty native read
+reports
 `catalogue: "empty"` with a note naming the binary and the `--cmd` / profile
 remedy.
 ## Agent skill delivery (`eliot-swarm`): first-turn fallback

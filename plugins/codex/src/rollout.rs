@@ -472,8 +472,13 @@ fn live_gap(cursor: &str, error: &Error) -> LiveRolloutPage {
 }
 
 // Pinned format: openai/codex 979011409de0a60b52f179721948e65531d26144,
-// protocol/src/{protocol,models}.rs and rollout/src/policy.rs. Lifecycle
-// EventMsg records are canonical; legacy message/tool echoes are not republished.
+// protocol/src/protocol.rs and rollout/src/policy.rs (`should_persist_event_msg`).
+// Lifecycle EventMsg records (`task_started`/`turn_started`, `task_complete`/`turn_complete`,
+// `task_aborted`/`turn_aborted`) are canonical. Every other EventMsg the pinned
+// writer persists (usage/thread metadata, completion bookkeeping, legacy echoes
+// and legacy-mode records) is ignorable without clearing binding. A never-
+// persisted, genuinely unknown EventMsg gaps without resetting binding unless
+// identity is lost or corrupt.
 fn normalize_live_line(
     state: &mut LiveCursor,
     line: &RolloutLine,
@@ -574,7 +579,30 @@ fn normalize_live_event(
         .and_then(Value::as_str)
         .ok_or_else(integrity)?;
     match event_type {
-        "agent_message" | "user_message" | "exec_command_end" => return Ok(None),
+        "agent_message"
+        | "user_message"
+        | "exec_command_end"
+        | "token_count"
+        | "thread_settings_applied"
+        | "thread_goal_updated"
+        | "thread_rolled_back"
+        | "item_completed"
+        | "agent_reasoning"
+        | "agent_reasoning_raw_content"
+        | "entered_review_mode"
+        | "exited_review_mode"
+        | "patch_apply_end"
+        | "context_compacted"
+        | "mcp_tool_call_end"
+        | "web_search_end"
+        | "image_generation_end"
+        | "sub_agent_activity" => {
+            // Persisted rollout metadata per the pinned policy (`should_persist_event_msg`):
+            // usage, thread settings/goal/rollback, completion bookkeeping, legacy
+            // echoes/mode records. Ignorable without clearing turn/tool binding;
+            // only lifecycle records below mutate binding, the rest still gaps on lost identity.
+            return Ok(None);
+        }
         "task_started" | "turn_started" | "task_complete" | "turn_complete" | "task_aborted"
         | "turn_aborted" => {}
         _ => return Err(live_unsupported()),
@@ -1322,6 +1350,53 @@ fn project_line(
         }
     }
 
+    // The release below runs after the items projection: the abort row
+    // itself must still resolve to the aborted turn (upstream
+    // `TurnAbortedEvent.turn_id` is optional, so a schema-valid abort may
+    // carry no turn id and only the current binding names the turn).
+    let mut release_aborted_turn = false;
+    if matches!(event_type, Some("task_aborted" | "turn_aborted")) {
+        let aborted_turn_id = explicit_turn
+            .or(state.current_turn_id.as_deref())
+            .map(str::to_owned);
+        if let Some(turn_id) = aborted_turn_id {
+            validate_text(&turn_id, 256)?;
+            state.any_turn_complete = true;
+            state.last_completed_turn_id = Some(turn_id.clone());
+            state.pending_turn_context = false;
+            state.requested_turn_seen |= requested_turn == Some(turn_id.as_str());
+            state.requested_turn_complete |= requested_turn == Some(turn_id.as_str());
+            let active = state
+                .active_turn
+                .as_ref()
+                .filter(|active| active.turn_id.as_str() == turn_id.as_str())
+                .cloned();
+            let started_at = optional_i64(&line.payload, "started_at")?
+                .or_else(|| active.as_ref().and_then(|active| active.started_at));
+            let completed_at = optional_i64(&line.payload, "completed_at")?;
+            let duration_ms = optional_i64(&line.payload, "duration_ms")?;
+            if duration_ms.is_some_and(|duration| duration < 0) {
+                return Err(integrity());
+            }
+            let reason = line.payload.get("reason").and_then(Value::as_str);
+            let interrupted = reason.is_some_and(|reason| reason == "interrupted");
+            if view == "turns" {
+                entries.push(json!({
+                    "turn_id": turn_id,
+                    "status": if interrupted { "interrupted" } else { "failed" },
+                    "reason": reason,
+                    "started_at": started_at.map(super::milliseconds).transpose()?,
+                    "completed_at": completed_at.map(super::milliseconds).transpose()?,
+                    "duration_ms": duration_ms,
+                    "ordinal": line.ordinal,
+                }));
+            }
+            // Defer the release past the items projection below: the abort
+            // row itself still belongs to the aborted turn.
+            release_aborted_turn = true;
+        }
+    }
+
     if view == "items" && matches!(line.kind.as_str(), "response_item" | "event_msg") {
         let item_turn = explicit_turn.or(state.current_turn_id.as_deref());
         if item_turn == requested_turn
@@ -1358,6 +1433,13 @@ fn project_line(
                     Some("failed")
                 }
                 "task_complete" | "turn_complete" => Some("completed"),
+                "task_aborted" | "turn_aborted"
+                    if line.payload.get("reason").and_then(Value::as_str)
+                        == Some("interrupted") =>
+                {
+                    Some("interrupted")
+                }
+                "task_aborted" | "turn_aborted" => Some("failed"),
                 _ => None,
             });
             let rollout_id = line
@@ -1375,6 +1457,12 @@ fn project_line(
             }));
             state.requested_turn_seen = true;
         }
+    }
+    if release_aborted_turn {
+        // An aborted turn is terminal and releases its turn binding, so a
+        // following task_started is not an anomaly and later items cannot attach.
+        state.current_turn_id = None;
+        state.active_turn = None;
     }
     Ok(entries)
 }
@@ -1568,6 +1656,10 @@ fn known_rollout_kind(kind: &str) -> bool {
             | "world_state"
             | "security_risk_score"
             | "retained_context"
+            // Upstream 0.167.1 persists the complete dynamic-tool catalog
+            // (`RolloutItem::DynamicToolsUpdated`, rollout `policy.rs`):
+            // model-invisible catalog data, ignorable without binding change.
+            | "dynamic_tools_updated"
             | "event_msg"
             | "realtime_item"
     )
@@ -1903,6 +1995,347 @@ mod live_tests {
         assert_eq!(
             replaced.records[0].events[0].data["native_status"],
             "replaced"
+        );
+        reader.close().await.unwrap();
+    }
+
+    #[test]
+    fn historical_abort_clears_active_turn_and_emits_terminal() {
+        #[cfg(windows)]
+        let identity = eliot_plugin::FileIdentity::Windows {
+            volume: 0,
+            file_id: [0; 16],
+        };
+        #[cfg(not(windows))]
+        let identity = eliot_plugin::FileIdentity::Unix {
+            device: 0,
+            inode: 0,
+        };
+        let mut state = super::RolloutCursor {
+            version: 1,
+            binding: String::new(),
+            file_identity: identity,
+            offset: 0,
+            anchor_sha256: String::new(),
+            current_turn_id: None,
+            active_turn: None,
+            last_completed_turn_id: None,
+            pending_turn_context: false,
+            requested_turn_seen: false,
+            requested_turn_complete: false,
+            any_turn_complete: false,
+            turn_anomaly: false,
+        };
+        let started = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:00Z".to_owned(),
+            ordinal: Some(1),
+            kind: "event_msg".to_owned(),
+            payload: json!({"type": "task_started", "turn_id": "turn-1"}),
+            metadata: None,
+        };
+        let entries = super::project_line(&mut state, &started, 0, "turns", Some("turn-1"))
+            .expect("start projects");
+        assert!(entries.is_empty());
+        assert!(state.active_turn.is_some());
+        let aborted = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:01Z".to_owned(),
+            ordinal: Some(2),
+            kind: "event_msg".to_owned(),
+            payload: json!({"type": "turn_aborted", "turn_id": "turn-1", "reason": "interrupted"}),
+            metadata: None,
+        };
+        let entries = super::project_line(&mut state, &aborted, 0, "turns", Some("turn-1"))
+            .expect("abort projects");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["status"], "interrupted");
+        assert_eq!(entries[0]["reason"], "interrupted");
+        assert!(state.active_turn.is_none(), "abort clears active binding");
+        assert!(
+            state.current_turn_id.is_none(),
+            "abort releases the turn binding"
+        );
+        assert!(state.requested_turn_complete);
+        let next = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:02Z".to_owned(),
+            ordinal: Some(3),
+            kind: "event_msg".to_owned(),
+            payload: json!({"type": "task_started", "turn_id": "turn-2"}),
+            metadata: None,
+        };
+        super::project_line(&mut state, &next, 0, "turns", Some("turn-2"))
+            .expect("next start projects");
+        assert!(!state.turn_anomaly, "abort must not poison the next turn");
+    }
+
+    #[test]
+    fn historical_abort_without_turn_id_still_projects_items_row() {
+        // Audit #645: upstream `TurnAbortedEvent.turn_id` is optional
+        // (`turn_aborted_event_deserializes_without_turn_id`), so a
+        // schema-valid abort may carry no turn id. The abort row resolves
+        // through the current binding and still projects in the items view;
+        // the release applies to subsequent rows only.
+        #[cfg(windows)]
+        let identity = eliot_plugin::FileIdentity::Windows {
+            volume: 0,
+            file_id: [0; 16],
+        };
+        #[cfg(not(windows))]
+        let identity = eliot_plugin::FileIdentity::Unix {
+            device: 0,
+            inode: 0,
+        };
+        let mut state = super::RolloutCursor {
+            version: 1,
+            binding: String::new(),
+            file_identity: identity,
+            offset: 0,
+            anchor_sha256: String::new(),
+            current_turn_id: Some("turn-1".to_owned()),
+            active_turn: Some(super::ActiveTurn {
+                turn_id: "turn-1".to_owned(),
+                started_at: None,
+            }),
+            last_completed_turn_id: None,
+            pending_turn_context: false,
+            requested_turn_seen: true,
+            requested_turn_complete: false,
+            any_turn_complete: false,
+            turn_anomaly: false,
+        };
+        let aborted = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:01Z".to_owned(),
+            ordinal: Some(2),
+            kind: "event_msg".to_owned(),
+            payload: json!({"type": "turn_aborted", "reason": "interrupted"}),
+            metadata: None,
+        };
+        let entries = super::project_line(&mut state, &aborted, 1, "items", Some("turn-1"))
+            .expect("abort row projects");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["turn_id"], "turn-1");
+        assert_eq!(entries[0]["status"], "interrupted");
+        assert!(state.active_turn.is_none(), "abort clears active binding");
+        assert!(
+            state.current_turn_id.is_none(),
+            "abort releases the turn binding for subsequent rows"
+        );
+        assert!(state.requested_turn_complete);
+        let orphan = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:02Z".to_owned(),
+            ordinal: Some(3),
+            kind: "response_item".to_owned(),
+            payload: json!({"type": "message", "role": "assistant"}),
+            metadata: None,
+        };
+        let entries = super::project_line(&mut state, &orphan, 2, "items", Some("turn-1"))
+            .expect("later row projects");
+        assert!(
+            entries.is_empty(),
+            "a later item without a turn id cannot attach to the aborted turn"
+        );
+    }
+
+    #[test]
+    fn historical_dynamic_tools_updated_is_ignorable_without_binding_change() {
+        // Audit #644: upstream 0.167.1 persists `RolloutItem::DynamicToolsUpdated`
+        // as `{"type": "dynamic_tools_updated", ...}` (rollout `policy.rs`).
+        // The model-invisible tool catalog projects nothing and mutates no
+        // binding in any view.
+        #[cfg(windows)]
+        let identity = eliot_plugin::FileIdentity::Windows {
+            volume: 0,
+            file_id: [0; 16],
+        };
+        #[cfg(not(windows))]
+        let identity = eliot_plugin::FileIdentity::Unix {
+            device: 0,
+            inode: 0,
+        };
+        let mut state = super::RolloutCursor {
+            version: 1,
+            binding: String::new(),
+            file_identity: identity,
+            offset: 0,
+            anchor_sha256: String::new(),
+            current_turn_id: Some("turn-1".to_owned()),
+            active_turn: Some(super::ActiveTurn {
+                turn_id: "turn-1".to_owned(),
+                started_at: None,
+            }),
+            last_completed_turn_id: None,
+            pending_turn_context: false,
+            requested_turn_seen: true,
+            requested_turn_complete: false,
+            any_turn_complete: false,
+            turn_anomaly: false,
+        };
+        let raw = serde_json::to_vec(&json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "ordinal": 2,
+            "type": "dynamic_tools_updated",
+            "payload": {"thread_id": "thread-1", "tools": []},
+        }))
+        .expect("catalog row encodes");
+        let parsed = super::parse_line(&raw).expect("catalog kind parses");
+        assert_eq!(parsed.kind, "dynamic_tools_updated");
+        let catalog = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:01Z".to_owned(),
+            ordinal: Some(2),
+            kind: "dynamic_tools_updated".to_owned(),
+            payload: json!({"thread_id": "thread-1", "tools": []}),
+            metadata: None,
+        };
+        for view in ["turns", "items"] {
+            let entries = super::project_line(&mut state, &catalog, 1, view, Some("turn-1"))
+                .expect("catalog row is ignorable");
+            assert!(
+                entries.is_empty(),
+                "catalog projects nothing in {view} view"
+            );
+        }
+        assert_eq!(
+            state.current_turn_id.as_deref(),
+            Some("turn-1"),
+            "catalog leaves the turn binding intact"
+        );
+        assert!(
+            state.active_turn.is_some(),
+            "catalog leaves the active turn intact"
+        );
+        assert!(!state.requested_turn_complete, "catalog completes no turn");
+    }
+
+    #[tokio::test]
+    async fn token_count_is_ignorable_without_clearing_tool_binding() {
+        // Audit #644: routine usage updates on qualified 0.161.0 must not
+        // gap nor erase in-flight tool binding.
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"task_started","turn_id":"turn-1"}),
+        ));
+        fixture.append(line("response_item", json!({"type":"function_call","name":"exec_command","call_id":"call-1","id":"call-item","arguments":"{}"})));
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"token_count","turn_id":"turn-1","usage":{"input_tokens":10}}),
+        ));
+        fixture.append(line("response_item", json!({"type":"function_call_output","call_id":"call-1","id":"output-item","output":"ok"})));
+        let page = reader.read_page(&baseline, 100, deadline()).await.unwrap();
+        assert!(page.gap.is_none(), "token_count must not gap");
+        let kinds: Vec<_> = page
+            .records
+            .iter()
+            .flat_map(|record| &record.events)
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["turn.started", "tool.started", "tool.completed"]);
+        assert_eq!(
+            page.records[2].events[0].data["turn_id"], "turn-1",
+            "output keeps its native turn after token_count"
+        );
+        assert_eq!(
+            page.records[2].events[0].data["item_id"], "call-1",
+            "output keeps its call binding after token_count"
+        );
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_rollout_metadata_is_ignorable_without_clearing_tool_binding() {
+        // Audit #644: every EventMsg the pinned rollout policy persists
+        // outside lifecycle (thread settings/goal/rollback, completion
+        // bookkeeping, legacy echoes/mode records) is ignorable metadata:
+        // no gap and no cleared turn/tool binding.
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"task_started","turn_id":"turn-1"}),
+        ));
+        fixture.append(line("response_item", json!({"type":"function_call","name":"exec_command","call_id":"call-1","id":"call-item","arguments":"{}"})));
+        for event_type in [
+            "token_count",
+            "thread_settings_applied",
+            "thread_goal_updated",
+            "thread_rolled_back",
+            "item_completed",
+            "agent_message",
+            "user_message",
+            "exec_command_end",
+            "agent_reasoning",
+            "agent_reasoning_raw_content",
+            "entered_review_mode",
+            "exited_review_mode",
+            "patch_apply_end",
+            "context_compacted",
+            "mcp_tool_call_end",
+            "web_search_end",
+            "image_generation_end",
+            "sub_agent_activity",
+        ] {
+            fixture.append(line(
+                "event_msg",
+                json!({"type":event_type,"turn_id":"turn-1"}),
+            ));
+        }
+        fixture.append(line("response_item", json!({"type":"function_call_output","call_id":"call-1","id":"output-item","output":"ok"})));
+        let page = reader.read_page(&baseline, 100, deadline()).await.unwrap();
+        assert!(page.gap.is_none(), "persisted metadata must not gap");
+        let kinds: Vec<_> = page
+            .records
+            .iter()
+            .flat_map(|record| &record.events)
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["turn.started", "tool.started", "tool.completed"]);
+        assert_eq!(
+            page.records[2].events[0].data["turn_id"], "turn-1",
+            "output keeps its native turn after persisted metadata"
+        );
+        assert_eq!(
+            page.records[2].events[0].data["item_id"], "call-1",
+            "output keeps its call binding after persisted metadata"
+        );
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dynamic_tools_updated_is_ignorable_without_clearing_tool_binding() {
+        // Audit #644: upstream 0.167.1 persists the complete dynamic-tool
+        // catalog between lifecycle records. Like other persisted metadata it
+        // must gap nothing and clear neither turn nor tool binding.
+        let fixture = Fixture::new(&[]);
+        let mut reader = fixture.reader(SecretPolicy::default());
+        let baseline = reader.baseline_cursor().to_owned();
+        fixture.append(line(
+            "event_msg",
+            json!({"type":"task_started","turn_id":"turn-1"}),
+        ));
+        fixture.append(line("response_item", json!({"type":"function_call","name":"exec_command","call_id":"call-1","id":"call-item","arguments":"{}"})));
+        fixture.append(line(
+            "dynamic_tools_updated",
+            json!({"thread_id":"thread-1","tools":[]}),
+        ));
+        fixture.append(line("response_item", json!({"type":"function_call_output","call_id":"call-1","id":"output-item","output":"ok"})));
+        let page = reader.read_page(&baseline, 100, deadline()).await.unwrap();
+        assert!(page.gap.is_none(), "tool catalog must not gap");
+        let kinds: Vec<_> = page
+            .records
+            .iter()
+            .flat_map(|record| &record.events)
+            .map(|event| event.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["turn.started", "tool.started", "tool.completed"]);
+        assert_eq!(
+            page.records[2].events[0].data["turn_id"], "turn-1",
+            "output keeps its native turn after the tool catalog"
+        );
+        assert_eq!(
+            page.records[2].events[0].data["item_id"], "call-1",
+            "output keeps its call binding after the tool catalog"
         );
         reader.close().await.unwrap();
     }

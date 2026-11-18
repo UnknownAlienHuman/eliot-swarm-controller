@@ -326,20 +326,36 @@ impl DesktopApp {
                 } else { pick.into() }
             }
             QuestionKind::Multiple => {
+                // One answer per question: the wire carries either the
+                // selected labels or one free text, never a mix the adapter
+                // must reject. Toggling an option keeps selections only;
+                // typing an offered label checks that option (it joins the
+                // selections, still subject to the prompt bounds), while
+                // typing anything else replaces the selections with the one
+                // free-text answer.
+                let selected: Vec<String> = values
+                    .iter()
+                    .filter(|value| {
+                        question.options.iter().any(|option| &option.id == *value)
+                    })
+                    .cloned()
+                    .collect();
                 let mut controls: Vec<KeyedView> = question.options.iter().map(|option| {
-                    let request = request.clone(); let id = id.clone(); let option_id = option.id.clone();
+                    let request = request.clone(); let id = id.clone(); let option_id = option.id.clone(); let selected = selected.clone();
                     KeyedView::new(option.id.clone(), CheckBox::new()
                         .is_checked(values.contains(&option.id)).automation_name(option.label.clone())
-                        .on_is_checked_changed(context.callback(move |on| Message::Chat(ChatMsg::AnswerOptionChanged(request.clone(), id.clone(), option_id.clone(), on)))).content(m3::label(&option.label)))
+                        .on_is_checked_changed(context.callback(move |on| {
+                            Message::Chat(ChatMsg::AnswerChanged(request.clone(), id.clone(), multiple_toggle(selected.clone(), &option_id, on)))
+                        })).content(m3::label(&option.label)))
                 }).collect();
                 if question.free_entry {
-                    let selected: Vec<String> = values.iter().filter(|value| question.options.iter().any(|option| &option.id == *value)).cloned().collect();
                     let other = values.iter().filter(|value| !selected.contains(value)).cloned().collect::<Vec<_>>().join("\n");
+                    let option_ids: Vec<String> = question.options.iter().map(|option| option.id.clone()).collect();
                     controls.push(KeyedView::new("free", m3::field().text(other.clone()).accepts_return(true)
-                        .placeholder_text("Other answers, one per line").automation_name("Other answers")
+                        .placeholder_text("Or enter another answer").automation_name("Other answer")
                         .on_text_changed(context.callback(move |text: String| {
                             if text == other { return Message::Chat(ChatMsg::AnswerUnchanged); }
-                            let mut values = selected.clone(); values.extend(text.lines().map(str::to_owned)); changed(values)
+                            changed(multiple_submission(selected.clone(), &option_ids, &text))
                         }))));
                 }
                 StackPanel::new().spacing(tokens::spacing::SM).keyed_children(controls)
@@ -399,4 +415,92 @@ pub(super) fn starting_view(
                         .horizontal_alignment(HorizontalAlignment::Left),
                 )),
         ))
+}
+
+/// Multiple-choice submission rule: the MSP wire carries exactly one of
+/// `selectedLabels` or `freeText` per question, so the UI submits either
+/// the current selections or one free-text answer, never a mix. Typing an
+/// offered label checks that option: it joins the selections (still subject
+/// to the prompt bounds) instead of submitting label-identical free text, so
+/// a checked option and typed text never share a payload and the adapter can
+/// map selections apart from free text. Typing anything else replaces the
+/// selections with the one free-text answer.
+fn multiple_submission(selected: Vec<String>, option_ids: &[String], text: &str) -> Vec<String> {
+    if text.is_empty() {
+        selected
+    } else if option_ids.iter().any(|id| id == text) {
+        let mut picked = selected;
+        if !picked.iter().any(|value| value == text) {
+            picked.push(text.to_owned());
+        }
+        picked
+    } else {
+        vec![text.to_owned()]
+    }
+}
+
+/// Multiple-choice toggle rule: (un)checking an option keeps selections
+/// only, dropping any free text so a later submit cannot mix.
+fn multiple_toggle(mut selected: Vec<String>, option: &str, on: bool) -> Vec<String> {
+    selected.retain(|value| value != option);
+    if on {
+        selected.push(option.to_owned());
+    }
+    selected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{multiple_submission, multiple_toggle};
+
+    #[test]
+    fn multiple_choice_submits_either_selections_or_one_text() {
+        // Audit #639: typing after checking an option must not mix the
+        // selections with free text; the wire accepts exactly one shape.
+        let options = ["a".to_owned(), "b".to_owned()];
+        assert_eq!(
+            multiple_submission(vec!["a".to_owned(), "b".to_owned()], &options, ""),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        assert_eq!(
+            multiple_submission(vec!["a".to_owned()], &options, "my own wording"),
+            vec!["my own wording".to_owned()]
+        );
+        // Multi-line typing stays one text answer, not one answer per line.
+        assert_eq!(
+            multiple_submission(vec!["a".to_owned()], &options, "first\nsecond"),
+            vec!["first\nsecond".to_owned()]
+        );
+    }
+
+    #[test]
+    fn multiple_choice_typed_label_checks_the_option() {
+        // Audit #639: typing an offered label joins the selections (the view
+        // shows it checked; the adapter maps it to `selectedLabels`), so a
+        // checked option and typed text never share one payload. Typing a
+        // label must keep the existing checks, never drop them or become
+        // label-identical free text.
+        let options = ["a".to_owned(), "b".to_owned()];
+        assert_eq!(
+            multiple_submission(vec!["a".to_owned()], &options, "b"),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        // Re-typing an already checked label keeps one entry.
+        assert_eq!(
+            multiple_submission(vec!["a".to_owned()], &options, "a"),
+            vec!["a".to_owned()]
+        );
+    }
+
+    #[test]
+    fn multiple_choice_toggle_keeps_selections_only() {
+        assert_eq!(
+            multiple_toggle(vec!["a".to_owned()], "b", true),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        assert_eq!(
+            multiple_toggle(vec!["a".to_owned(), "b".to_owned()], "a", false),
+            vec!["b".to_owned()]
+        );
+    }
 }

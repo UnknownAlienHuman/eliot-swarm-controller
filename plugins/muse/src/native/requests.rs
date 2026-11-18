@@ -452,13 +452,14 @@ fn public_question_details(details: &Map<String, Value>) -> Result<Value> {
     for question in &offered {
         // The native offer carries labels but no option ids, so the label is
         // the canonical option id; it carries no secrecy marker either.
+        // Native option descriptions are preserved verbatim for display.
         let options = question
             .options
             .iter()
             .map(|option| QuestionOption {
                 id: option.label.clone(),
                 label: option.label.clone(),
-                description: None,
+                description: option.description.clone(),
             })
             .collect::<Vec<_>>();
         let kind = if options.is_empty() {
@@ -481,7 +482,10 @@ fn public_question_details(details: &Map<String, Value>) -> Result<Value> {
             title: Some(question.header.clone()),
             prompt: Some(question.question.clone()),
             options,
-            free_entry: question.options.is_empty(),
+            // The MSP wire always allows the free-text alternative
+            // (`freeText` <=500 chars) alongside offered options, so the
+            // public surface always exposes free entry.
+            free_entry: true,
             is_secret: false,
             min_selections: question
                 .selection
@@ -759,6 +763,8 @@ struct OfferedQuestion {
 #[serde(rename_all = "camelCase")]
 struct OfferedOption {
     label: String,
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -806,14 +812,38 @@ fn answer_for_canonical(
                 "a single-mode question takes exactly one answer",
             ));
         };
-        if !labels.contains(&label.as_str()) {
+        if labels.contains(&label.as_str()) {
+            wire.selected_label = Some(label.clone());
+        } else {
+            // Upstream-supported free-text alternative: a non-option
+            // string answers with the user's own wording.
+            if label.chars().count() > 500 || label.is_empty() {
+                return Err(Error::new("invalid", "answer text exceeds 500 chars"));
+            }
+            wire.free_text = Some(label.clone());
+        }
+    } else if question.selection.mode == "multiple" {
+        // Answer-type rule: every offered label is a checked option and
+        // travels as `selectedLabels`, even one: a single checkbox selection
+        // stays a selection, subject to the offered bounds. Only a single
+        // non-option string is typed text and travels as `freeText`. The
+        // desktop upholds the other half (typing a label checks that option
+        // instead of submitting label-identical free text), so the two shapes
+        // never share a payload and neither is conflated with the other.
+        if answers.len() == 1 && !labels.contains(&answers[0].as_str()) {
+            let text = &answers[0];
+            if text.is_empty() || text.chars().count() > 500 {
+                return Err(Error::new("invalid", "answer text exceeds 500 chars"));
+            }
+            wire.free_text = Some(text.clone());
+            return Ok(wire);
+        }
+        if answers.is_empty() {
             return Err(Error::new(
                 "invalid",
-                "answer names an option that was not offered",
+                "a multiple-mode answer takes at least one answer",
             ));
         }
-        wire.selected_label = Some(label.clone());
-    } else if question.selection.mode == "multiple" {
         let mut picked: Vec<String> = Vec::with_capacity(answers.len());
         for label in answers {
             if !labels.contains(&label.as_str()) {
@@ -1091,6 +1121,175 @@ mod tests {
             "userInputId": "prompt-1",
             "viewCursor": "cursor-4",
         })
+    }
+
+    #[test]
+    fn user_input_free_text_alternative_and_descriptions() {
+        // Audit #639: MSP allows freeText alongside 2-3 options; the
+        // public surface exposes free entry and preserves descriptions.
+        let params = serde_json::json!({
+            "itemId": "item-2",
+            "questions": [{
+                "header": "Deploy",
+                "id": "q1",
+                "options": [
+                    {"label": "staging", "description": "Stage env"},
+                    {"label": "production", "description": "Prod env"}
+                ],
+                "question": "Where?",
+                "selection": {"mode": "single"},
+            }],
+            "sessionId": "session-1",
+            "toolCallId": "call-2",
+            "toolName": "ask",
+            "turnId": "turn-1",
+            "userInputId": "prompt-1",
+            "viewCursor": "cursor-4",
+        });
+        let pending = describe_request("userInput/request", &params, "session-1", "turn-1")
+            .expect("user input describes");
+        let details = pending.details.as_object().expect("details");
+        let public = public_question_details(details).expect("public projects");
+        let q = &public["questions"][0];
+        assert_eq!(q["free_entry"], true);
+        assert_eq!(q["options"][0]["description"], "Stage env");
+        // Exact option still maps to selectedLabel.
+        let offered: OfferedQuestion =
+            serde_json::from_value(params["questions"][0].clone()).expect("offered decodes");
+        let exact = answer_for_canonical(&offered, &["staging".to_owned()]).expect("exact maps");
+        assert_eq!(exact.selected_label.as_deref(), Some("staging"));
+        assert!(exact.free_text.is_none());
+        // Non-option wording maps to freeText (<=500 chars).
+        let free =
+            answer_for_canonical(&offered, &["my own wording".to_owned()]).expect("free text maps");
+        assert_eq!(free.free_text.as_deref(), Some("my own wording"));
+        assert!(free.selected_label.is_none());
+    }
+
+    #[test]
+    fn multiple_answers_mix_is_rejected() {
+        // Audit #639: the MSP wire carries exactly one of selectedLabels or
+        // freeText per question, so selections mixed with free text fail.
+        // The desktop submits either selections or one text answer.
+        let params = serde_json::json!({
+            "itemId": "item-2",
+            "questions": [{
+                "header": "Deploy",
+                "id": "q1",
+                "options": [{"label": "staging"}, {"label": "production"}],
+                "question": "Where?",
+                "selection": {"mode": "multiple"},
+            }],
+            "sessionId": "session-1",
+            "toolCallId": "call-2",
+            "toolName": "ask",
+            "turnId": "turn-1",
+            "userInputId": "prompt-1",
+            "viewCursor": "cursor-4",
+        });
+        let offered: OfferedQuestion =
+            serde_json::from_value(params["questions"][0].clone()).expect("offered decodes");
+        let picked =
+            answer_for_canonical(&offered, &["staging".to_owned(), "production".to_owned()])
+                .expect("selections map");
+        assert_eq!(
+            picked.selected_labels.as_deref(),
+            Some(&["staging".to_owned(), "production".to_owned()][..])
+        );
+        assert!(picked.free_text.is_none());
+        assert!(
+            answer_for_canonical(&offered, &["staging".to_owned(), "other".to_owned()]).is_err()
+        );
+        let free =
+            answer_for_canonical(&offered, &["my own wording".to_owned()]).expect("free text maps");
+        assert_eq!(free.free_text.as_deref(), Some("my own wording"));
+        assert!(free.selected_labels.is_none());
+    }
+
+    #[test]
+    fn multiple_single_selection_maps_to_selected_labels() {
+        // Audit #639: a single checked option is a selection, not free text:
+        // it must reach Muse as `selectedLabels`, never as `freeText`.
+        let offered = OfferedQuestion {
+            id: "q1".to_owned(),
+            header: "Deploy".to_owned(),
+            question: "Where?".to_owned(),
+            options: vec![
+                OfferedOption {
+                    label: "staging".to_owned(),
+                    description: None,
+                },
+                OfferedOption {
+                    label: "production".to_owned(),
+                    description: None,
+                },
+            ],
+            selection: OfferedSelection {
+                mode: "multiple".to_owned(),
+                min_selections: None,
+                max_selections: None,
+            },
+        };
+        let picked =
+            answer_for_canonical(&offered, &["staging".to_owned()]).expect("single selection maps");
+        assert_eq!(
+            picked.selected_labels.as_deref(),
+            Some(&["staging".to_owned()][..])
+        );
+        assert!(picked.free_text.is_none());
+    }
+
+    #[test]
+    fn multiple_bounds_apply_to_selections() {
+        // Audit #639: the prompt minimum and maximum bind selections. One
+        // checked option on a min=2 prompt rejects; two satisfy it; a max=1
+        // prompt rejects two.
+        let min_two = OfferedQuestion {
+            id: "q1".to_owned(),
+            header: "Deploy".to_owned(),
+            question: "Where?".to_owned(),
+            options: vec![
+                OfferedOption {
+                    label: "staging".to_owned(),
+                    description: None,
+                },
+                OfferedOption {
+                    label: "production".to_owned(),
+                    description: None,
+                },
+            ],
+            selection: OfferedSelection {
+                mode: "multiple".to_owned(),
+                min_selections: Some(2),
+                max_selections: None,
+            },
+        };
+        assert!(answer_for_canonical(&min_two, &["staging".to_owned()]).is_err());
+        let picked =
+            answer_for_canonical(&min_two, &["staging".to_owned(), "production".to_owned()])
+                .expect("two selections satisfy min=2");
+        assert_eq!(
+            picked.selected_labels.as_deref(),
+            Some(&["staging".to_owned(), "production".to_owned()][..])
+        );
+        let max_one = OfferedQuestion {
+            selection: OfferedSelection {
+                mode: "multiple".to_owned(),
+                min_selections: None,
+                max_selections: Some(1),
+            },
+            ..min_two
+        };
+        assert!(
+            answer_for_canonical(&max_one, &["staging".to_owned(), "production".to_owned()])
+                .is_err()
+        );
+        let one = answer_for_canonical(&max_one, &["staging".to_owned()])
+            .expect("one selection satisfies max=1");
+        assert_eq!(
+            one.selected_labels.as_deref(),
+            Some(&["staging".to_owned()][..])
+        );
     }
 
     #[test]

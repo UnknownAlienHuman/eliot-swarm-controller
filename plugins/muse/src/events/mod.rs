@@ -2406,10 +2406,23 @@ impl EventProcessor {
                 self.complete_turn(params, false).await?;
             }
             "usage/changed" => {
+                // Optional quota sample: a malformed sample is dropped
+                // without invalidating unrelated lifecycle evidence. Valid
+                // over-quota measurements (usedPercent > 100) are retained.
                 let usage: crate::native::types::NativeSubscriptionUsage =
-                    serde_json::from_value(params).map_err(|_| {
-                        Error::new("native_protocol", "Muse usage/changed schema unavailable")
-                    })?;
+                    match serde_json::from_value(params) {
+                        Ok(usage) => usage,
+                        Err(_) => return Ok(()),
+                    };
+                if usage.observed_at_ms < 0
+                    || usage.window.window_duration_mins <= 0
+                    || usage.window.resets_at_ms < 0
+                    || usage.weekly.resets_at_ms < 0
+                    || usage.window.used_percent < 0
+                    || usage.weekly.used_percent < 0
+                {
+                    return Ok(());
+                }
                 let observation = eliot_core::api::harness::QuotaObservation {
                     observed_at_ms: usage.observed_at_ms,
                     windows: vec![
@@ -2427,7 +2440,9 @@ impl EventProcessor {
                         },
                     ],
                 };
-                observation.validate()?;
+                if observation.validate().is_err() {
+                    return Ok(());
+                }
                 self.commit_event(
                     "quota.observed",
                     ulid::Ulid::new().to_string(),

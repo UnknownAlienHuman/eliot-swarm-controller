@@ -501,8 +501,8 @@ into the retained `SessionUsage` snapshot and commits it as `session.usage`
 when accepted (source `codex:thread/tokenUsage/updated`), with `observed_at`
 captured at acceptance: the cumulative `total` replaces
 the retained input/output/cache counters (never a derived total),
-`total.totalTokens` projects to `context_used_tokens` (the installed schema's
-only occupancy signal, read against `modelContextWindow`), and
+`last.totalTokens` projects to `context_used_tokens` (the latest active context size,
+per upstream TUI `tokens_in_context_window`) read against `modelContextWindow`, and
 `modelContextWindow` replaces the retained capacity; account-level
 cost/credits (`GetAccountTokenUsage`) stay account scope. Missing per-turn
 counters stay null. Idle updates merge and commit without waiting for a
@@ -598,8 +598,16 @@ does not scan the whole file in one call.
 
 For the pinned Codex 0.161.0 rollout format at upstream commit
 `979011409de0a60b52f179721948e65531d26144`, task/turn lifecycle uses canonical
-`TaskStartedEventMsg`, `TaskComplete` and `TurnAbortedEventMsg` records. Only legacy
-message/tool echoes are suppressed; `FinalAnswer` and EOF are not terminal evidence.
+`task_started`/`turn_started`, `task_complete`/`turn_complete` and
+`task_aborted`/`turn_aborted` records. Persisted usage/thread metadata
+(`token_count`, `thread_settings_applied`, `thread_goal_updated`,
+`thread_rolled_back`, `item_completed`) and the upstream 0.167.1 persisted dynamic-tool catalog (`dynamic_tools_updated`, rollout `policy.rs`), legacy message/tool echoes and
+legacy-mode records are ignorable without clearing binding; only
+lifecycle records mutate binding. An aborted turn emits an interrupted
+(`reason: interrupted`) or failed terminal turn with its native reason; the abort row itself still resolves to the aborted turn (a schema-valid abort carries no `turn_id` upstream), then it
+clears the active binding and releases the aborted turn id, so a following
+start is not an anomaly and later items cannot attach to the aborted turn.
+Only legacy message/tool echoes are otherwise suppressed; `FinalAnswer` and EOF are not terminal evidence.
 The outer JSONL record timestamp is retained as epoch milliseconds in `NativeEvent.ts`.
 Optional lifecycle `data.started_at` and `data.completed_at` are integer epoch seconds
 from the native payload, converted with checked multiplication to epoch milliseconds;

@@ -56,6 +56,34 @@ fn request_deadline(method: &str, received_at: Instant) -> Instant {
 }
 const STEER_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+fn project_model_catalog(
+    models: Vec<crate::native::types::NativeModelCatalogEntry>,
+) -> (Vec<serde_json::Value>, Option<String>) {
+    let default_id = models
+        .iter()
+        .find(|entry| entry.is_default == Some(true))
+        .map(|entry| entry.model_id.clone());
+    let projected = models
+        .into_iter()
+        .map(|entry| {
+            let efforts = match entry.variants {
+                Some(crate::native::types::NativeModelEffortVariants::Known(variants)) => {
+                    Some(variants)
+                }
+                _ => None,
+            };
+            let is_default = entry.is_default == Some(true);
+            serde_json::json!({
+                "id": entry.model_id,
+                "display_name": entry.display_label.as_deref().and_then(eliot_core::api::harness::native_model_display_name),
+                "default": is_default,
+                "efforts": efforts,
+            })
+        })
+        .collect();
+    (projected, default_id)
+}
+
 fn quota_read_error(error: Error) -> Error {
     if error.failure_where.as_deref() == Some("plugin.muse.native.response.method_not_found") {
         error
@@ -65,6 +93,55 @@ fn quota_read_error(error: Error) -> Error {
         let detail = error.message.clone();
         error.with_message(format!("Muse usage/read did not return quota: {detail}"))
     }
+}
+
+/// MSP `usedPercent` contract (`SubscriptionUsageWindow`/`SubscriptionUsageWeekly`):
+/// an integer >= 0 with no upper bound. Over-quota values above 100 are valid
+/// measurements, never a schema mismatch; only a negative value rejects.
+fn validate_usage_read_percent(used: i64) -> Result<()> {
+    if used < 0 {
+        return Err(Error::new(
+            "profile_error",
+            "Muse usage/read percent did not match the installed schema",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn model_catalog_projects_native_default_only_when_supplied() {
+    use crate::native::types::NativeModelCatalogEntry;
+    let with_default = vec![
+        NativeModelCatalogEntry {
+            model_id: "m1".to_owned(),
+            provider_id: "p".to_owned(),
+            display_label: None,
+            variants: None,
+            is_default: Some(false),
+        },
+        NativeModelCatalogEntry {
+            model_id: "m2".to_owned(),
+            provider_id: "p".to_owned(),
+            display_label: None,
+            variants: None,
+            is_default: Some(true),
+        },
+    ];
+    let (models, default_id) = project_model_catalog(with_default);
+    assert_eq!(default_id.as_deref(), Some("m2"));
+    assert_eq!(models[0]["default"], false);
+    assert_eq!(models[1]["default"], true);
+    let unknown = vec![NativeModelCatalogEntry {
+        model_id: "m1".to_owned(),
+        provider_id: "p".to_owned(),
+        display_label: None,
+        variants: None,
+        is_default: None,
+    }];
+    let (models, default_id) = project_model_catalog(unknown);
+    assert!(default_id.is_none());
+    assert_eq!(models[0]["default"], false);
 }
 
 #[cfg(test)]
@@ -80,6 +157,18 @@ fn quota_read_keeps_method_not_found_classification() {
         quota_read_error(Error::new("unknown", "lost reply")).code,
         "unknown"
     );
+}
+
+#[cfg(test)]
+#[test]
+fn usage_read_percent_has_no_upper_bound() {
+    // Audit #640: MSP usedPercent is an integer >= 0 with no upper bound;
+    // over-quota values above 100 (and 1000) are valid, only a negative
+    // measurement mismatches the installed schema.
+    for used in [0, 100, 101, 150, 1001, 100_000] {
+        assert!(validate_usage_read_percent(used).is_ok());
+    }
+    assert!(validate_usage_read_percent(-1).is_err());
 }
 
 /// A failed read is safe to refuse before input dispatch. It is never a
@@ -2116,8 +2205,9 @@ impl MusePlugin {
     /// Read-only native model catalogue for `harness.models`. A dedicated
     /// reader instance spawns a transient `muse serve`, runs initialize
     /// plus `model/list`, then terminates. No session, no turn, no input
-    /// and no inference. The catalogue names no default marker; the server
-    /// default applies at launch and is read back from the session.
+    /// and no inference. The native `isDefault` marker (when the installed
+    /// host supplies it) projects as the catalogue default; absent or
+    /// all-false stays unknown and is never invented by list order.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
         if self.session.is_some() || self.failed_start.is_some() {
             return Err(Error::new(
@@ -2212,25 +2302,8 @@ impl MusePlugin {
                         "Muse model/list result did not match the installed schema",
                     )
                 })?;
-            let models: Vec<Value> = catalog
-                .models
-                .into_iter()
-                .map(|entry| {
-                    let efforts = match entry.variants {
-                        Some(crate::native::types::NativeModelEffortVariants::Known(variants)) => {
-                            Some(variants)
-                        }
-                        _ => None,
-                    };
-                    json!({
-                        "id": entry.model_id,
-                        "display_name": entry.display_label.as_deref().and_then(eliot_core::api::harness::native_model_display_name),
-                        "default": false,
-                        "efforts": efforts,
-                    })
-                })
-                .collect();
-            Ok(json!({"models": models, "default": Value::Null}))
+            let (models, default_id) = project_model_catalog(catalog.models);
+            Ok(json!({"models": models, "default": default_id}))
         }
         .await;
         let result = result.map_err(|error| client.diagnostic_error(error));
@@ -2373,12 +2446,7 @@ impl MusePlugin {
                         ));
                     }
                     for used in [usage.window.used_percent, usage.weekly.used_percent] {
-                        if !(0..=1000).contains(&used) {
-                            return Err(Error::new(
-                                "profile_error",
-                                "Muse usage/read percent did not match the installed schema",
-                            ));
-                        }
+                        validate_usage_read_percent(used)?;
                     }
                     if usage.window.window_duration_mins <= 0
                         || usage.window.resets_at_ms < 0

@@ -215,11 +215,7 @@ impl Router {
                     _ => RouteQuotaStatus::Unknown,
                 };
                 if *quota_status == RouteQuotaStatus::Supported
-                    && quota_exhausted(
-                        &harness,
-                        raw.get("details").unwrap_or(&Value::Null),
-                        snapshot.get("model").and_then(Value::as_str),
-                    )
+                    && quota_exhausted(&harness, raw.get("details").unwrap_or(&Value::Null))
                 {
                     held_accounts.insert(harness, account);
                     return Ok(Err(RouteSkipReason::QuotaExhausted));
@@ -271,8 +267,16 @@ fn native_installed(harness: &str, snapshot: &Value) -> bool {
 }
 
 /// Only the installed, projected native schemas establish exhaustion. No
-/// generic numeric search or model inference probe is used.
-fn quota_exhausted(harness: &str, details: &Value, model: Option<&str>) -> bool {
+/// generic numeric search or model inference probe is used. For Codex only
+/// the explicit limit state of the bucket the request actually uses settles
+/// exhaustion: the primary window, `spendControlReached`,
+/// `rateLimitReachedType`, or a depleted `individualLimit`. Metered
+/// `rateLimitsByLimitId` buckets never exhaust a route: their keys and
+/// `limitId` values are metered limit ids and `normalModelSlug` only names
+/// display and reasoning options (Codex 0.167.1 account.rs), so no alias or
+/// metered bucket proves the request's own quota is spent. When the primary
+/// bucket's explicit state is unknown, the route stays.
+fn quota_exhausted(harness: &str, details: &Value) -> bool {
     let full = |window: &Value| {
         window
             .get("usedPercent")
@@ -294,20 +298,26 @@ fn quota_exhausted(harness: &str, details: &Value, model: Option<&str>) -> bool 
         return ["window", "weekly"].iter().any(|key| full(&usage[key]));
     }
     if harness == "codex" {
-        let exhausted = |rates: &Value| {
-            let credits = &rates["credits"];
-            let credit_available = credits["unlimited"].as_bool() == Some(true)
-                || credits["hasCredits"].as_bool() == Some(true);
-            !credit_available && ["primary", "secondary"].iter().any(|key| full(&rates[key]))
-        };
-        if exhausted(&details["rateLimits"]) {
+        let rates = &details["rateLimits"];
+        if rates.get("spendControlReached").and_then(Value::as_bool) == Some(true)
+            || rates
+                .get("rateLimitReachedType")
+                .is_some_and(|reached| !reached.is_null())
+            || rates
+                .get("individualLimit")
+                .and_then(|limit| limit.get("remainingPercent"))
+                .and_then(Value::as_i64)
+                .is_some_and(|remaining| remaining <= 0)
+        {
             return true;
         }
-        // Per-limit windows are relevant only when their id is the exact
-        // requested model. An unrelated exhausted model never blocks this one.
-        return model
-            .and_then(|model| details["rateLimitsByLimitId"].get(model))
-            .is_some_and(exhausted);
+        // Only the primary window counts: a full secondary window or an
+        // exhausted metered/alias bucket never proves the request's own quota
+        // is spent, so neither skips the route.
+        let credits = &rates["credits"];
+        let credit_available = credits["unlimited"].as_bool() == Some(true)
+            || credits["hasCredits"].as_bool() == Some(true);
+        return !credit_available && full(&rates["primary"]);
     }
     false
 }
@@ -401,32 +411,66 @@ mod tests {
         );
         assert!(!quota_exhausted(
             "codex",
-            &json!({"rateLimits":{"primary":{"usedPercent":100,"resetsAt":1}}}),
-            None
+            &json!({"rateLimits":{"primary":{"usedPercent":100,"resetsAt":1}}})
         ));
     }
     #[test]
     fn quota_checks_only_known_native_windows_and_preserves_unknown() {
         assert!(quota_exhausted(
             "codex",
-            &json!({"rateLimits":{"primary":{"usedPercent":100}}}),
-            None
+            &json!({"rateLimits":{"primary":{"usedPercent":100}}})
         ));
         assert!(!quota_exhausted(
             "codex",
-            &json!({"rateLimits":{"primary":{"usedPercent":100},"credits":{"hasCredits":true}}}),
-            None
+            &json!({"rateLimits":{"primary":{"usedPercent":100},"credits":{"hasCredits":true}}})
         ));
         assert!(quota_exhausted(
             "muse",
-            &json!({"usage":{"weekly":{"usedPercent":100}}}),
-            None
+            &json!({"usage":{"weekly":{"usedPercent":100}}})
         ));
-        assert!(!quota_exhausted("muse", &json!({}), None));
+        assert!(!quota_exhausted("muse", &json!({})));
         assert!(!quota_exhausted(
             "codex",
-            &json!({"rateLimitsByLimitId":{"other":{"primary":{"usedPercent":100}}}}),
-            Some("mine")
+            &json!({"rateLimitsByLimitId":{"other":{"primary":{"usedPercent":100}}}})
         ));
+    }
+    #[test]
+    fn codex_quota_uses_primary_limit_state_only() {
+        // Audit #630: explicit backend limit state exhausts even with
+        // healthy windows.
+        assert!(quota_exhausted(
+            "codex",
+            &json!({"rateLimits":{"primary":{"usedPercent":10},"spendControlReached":true}})
+        ));
+        assert!(quota_exhausted(
+            "codex",
+            &json!({"rateLimits":{"primary":{"usedPercent":10},"rateLimitReachedType":"rate_limit_reached"}})
+        ));
+        assert!(quota_exhausted(
+            "codex",
+            &json!({"rateLimits":{"primary":{"usedPercent":10},"individualLimit":{"remainingPercent":0}}})
+        ));
+        // Healthy limit state with healthy windows is not exhausted.
+        assert!(!quota_exhausted(
+            "codex",
+            &json!({"rateLimits":{"primary":{"usedPercent":10},"spendControlReached":false,"individualLimit":{"remainingPercent":40}}})
+        ));
+        // A full secondary window alone does not exhaust the primary route:
+        // the request uses the primary bucket, not the secondary one.
+        assert!(!quota_exhausted(
+            "codex",
+            &json!({"rateLimits":{"primary":{"usedPercent":10},"secondary":{"usedPercent":100}}})
+        ));
+        // Metered buckets never exhaust a route, even when their projected
+        // slug names the requested model: `normalModelSlug` only names
+        // display and reasoning options, never the metered model.
+        let details = json!({"rateLimits":{"primary":{"usedPercent":1}},
+            "rateLimitsByLimitId":{"codex":{"primary":{"usedPercent":100},"normalModelSlug":"gpt-5.4"}}});
+        assert!(!quota_exhausted("codex", &details));
+        // Luna Reserve-style alias bucket: an exhausted Reserve allowance
+        // must not skip ordinary Luna when ordinary quota is healthy.
+        let reserve = json!({"rateLimits":{"primary":{"usedPercent":10}},
+            "rateLimitsByLimitId":{"luna-reserve":{"primary":{"usedPercent":100},"normalModelSlug":"gpt-5.4","limitId":"luna-reserve"}}});
+        assert!(!quota_exhausted("codex", &reserve));
     }
 }

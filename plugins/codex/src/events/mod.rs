@@ -1868,11 +1868,13 @@ fn turn_usage_from_delta(delta: &NativeTokenUsageDelta) -> Option<TurnUsage> {
 
 /// Merge one `thread/tokenUsage/updated` body into the retained session
 /// snapshot: the cumulative per-thread `total` replaces the retained
-/// cumulative counters (input/output/cache only, never a derived total) and
+/// cumulative counters (input/output/cache only, never a derived total),
+/// `last.total_tokens` (the latest active context size per upstream TUI
+/// `tokens_in_context_window`) replaces the retained occupancy, and
 /// `modelContextWindow` replaces the retained capacity. Yields `None` when
 /// the update contributes nothing new, so repeats commit nothing. Negative
 /// counters stay null (never zero); an update with no usable cumulative
-/// content keeps the retained snapshot.
+/// or occupancy content keeps the retained snapshot.
 fn session_usage_from_token_usage(
     token_usage: &NativeThreadTokenUsage,
     previous: Option<&SessionUsage>,
@@ -1904,15 +1906,14 @@ fn session_usage_from_token_usage(
             merged.cumulative_tokens = Some(totals);
             changed = true;
         }
-        // The cumulative per-thread `total` is the installed schema's only
-        // occupancy signal, so it projects to `context_used_tokens` against
-        // `modelContextWindow` (never derived into turn expenditure above).
-        if let Some(used) = counter(total.total_tokens)
-            && merged.context_used_tokens != Some(used)
-        {
-            merged.context_used_tokens = Some(used);
-            changed = true;
-        }
+    }
+    // Occupancy is the latest active context size from `last.total_tokens`
+    // (upstream TUI `last_token_usage`), never the accumulated `total`.
+    if let Some(used) = counter(token_usage.last.total_tokens)
+        && merged.context_used_tokens != Some(used)
+    {
+        merged.context_used_tokens = Some(used);
+        changed = true;
     }
     if let Some(window) = counter(token_usage.model_context_window)
         && merged.context_window_tokens != Some(window)
@@ -2429,13 +2430,20 @@ mod tests {
     #[test]
     fn session_usage_from_token_usage_maps_cumulative_capacity_and_occupancy() {
         let body = NativeThreadTokenUsage {
-            last: breakdown(Some(1), Some(1)),
+            last: NativeTokenUsageDelta {
+                input_tokens: Some(1),
+                cached_input_tokens: None,
+                output_tokens: Some(1),
+                reasoning_output_tokens: None,
+                total_tokens: Some(100),
+                cache_write_input_tokens: None,
+            },
             total: Some(NativeTokenUsageDelta {
                 input_tokens: Some(110),
                 cached_input_tokens: Some(53),
                 output_tokens: Some(55),
                 reasoning_output_tokens: Some(7),
-                total_tokens: Some(165),
+                total_tokens: Some(900),
                 cache_write_input_tokens: Some(9),
             }),
             model_context_window: Some(200_000),
@@ -2450,7 +2458,11 @@ mod tests {
         assert_eq!(totals.cache_read_tokens, Some(53));
         assert_eq!(totals.cache_write_tokens, Some(9));
         assert_eq!(merged.context_window_tokens, Some(200_000));
-        assert_eq!(merged.context_used_tokens, Some(165));
+        assert_eq!(
+            merged.context_used_tokens,
+            Some(100),
+            "occupancy reads last.total_tokens, never accumulated total"
+        );
         assert_eq!(merged.cumulative_cost, None);
         assert_eq!(
             merged.source.as_deref(),
@@ -2470,7 +2482,7 @@ mod tests {
         assert_eq!(resized.context_window_tokens, Some(100_000));
         assert_eq!(
             resized.context_used_tokens,
-            Some(165),
+            Some(100),
             "capacity update must keep the retained occupancy"
         );
         assert_eq!(
@@ -2495,6 +2507,37 @@ mod tests {
             model_context_window: Some(-1),
         };
         assert_eq!(session_usage_from_token_usage(&negative, None), None);
+    }
+
+    #[test]
+    fn session_occupancy_uses_last_not_accumulated_total() {
+        // Audit #627: total=900k accumulated spend with last=100k active
+        // context on a 200k window must report 100k occupied, not 900k.
+        let body = NativeThreadTokenUsage {
+            last: NativeTokenUsageDelta {
+                input_tokens: None,
+                cached_input_tokens: None,
+                output_tokens: None,
+                reasoning_output_tokens: None,
+                total_tokens: Some(100_000),
+                cache_write_input_tokens: None,
+            },
+            total: Some(NativeTokenUsageDelta {
+                input_tokens: Some(800_000),
+                cached_input_tokens: None,
+                output_tokens: Some(100_000),
+                reasoning_output_tokens: None,
+                total_tokens: Some(900_000),
+                cache_write_input_tokens: None,
+            }),
+            model_context_window: Some(200_000),
+        };
+        let merged = session_usage_from_token_usage(&body, None).expect("occupancy maps");
+        assert_eq!(merged.context_used_tokens, Some(100_000));
+        assert_eq!(merged.context_window_tokens, Some(200_000));
+        let totals = merged.cumulative_tokens.as_ref().expect("cumulative maps");
+        assert_eq!(totals.input_tokens, Some(800_000));
+        assert_eq!(totals.output_tokens, Some(100_000));
     }
 
     #[test]
