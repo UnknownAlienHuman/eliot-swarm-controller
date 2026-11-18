@@ -362,7 +362,11 @@ is the registration's age), so a digest stays deliverable however long its
 child set takes. Mail and delivered mark commit in one Store transaction, so a
 restart never recomputes a changed body: the registration reads delivered
 immediately, an exact same-body replay returns the retained mail, and a changed
-body under the consumed id conflicts instead of overwriting. Delivered digests are pruned under
+body under the consumed id conflicts instead of overwriting. A retained receipt
+advances the delivered mark only with evidence it was that digest's conversion:
+the same mail body to the frozen parent recipient on the frozen
+`completion-<id-prefix>` thread; a legacy receipt on another thread leaves the
+digest pending. Delivered digests are pruned under
 the commands retention window (see [core](core.md#retention)), oldest delivery
 first; pending digests are never pruned.
 

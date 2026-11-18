@@ -321,14 +321,24 @@ impl Store {
                 "mail write id is already used by a completion digest",
             ));
         }
-        if let Some(retained) = retained_write_binding(
-            &self.connection,
-            principal,
-            &request.id,
-            MAIL_SEND_METHOD,
-            &prepared.payload_digest,
-            "mail write id is bound to another principal, method, or payload",
-        )? {
+        // A digest-bound id never takes the generic retained replay on the
+        // digest path: the digest branch below admits a retained receipt
+        // as the delivery only with evidence it was this digest's
+        // conversion (exact mail payload plus the frozen completion
+        // thread). A legacy receipt whose payload happens to match but
+        // whose delivery thread differs would otherwise replay here and
+        // the driver would advance the delivered mark off it.
+        let digest_bound = allow_digest_id && digest_id_bound(&self.connection, &request.id)?;
+        if !digest_bound
+            && let Some(retained) = retained_write_binding(
+                &self.connection,
+                principal,
+                &request.id,
+                MAIL_SEND_METHOD,
+                &prepared.payload_digest,
+                "mail write id is bound to another principal, method, or payload",
+            )?
+        {
             let value = serde_json::from_value::<MailSendResponse>(decode_json(&retained)?)
                 .map_err(|error| Error::new("internal", error.to_string()))?;
             request.validate_response(&value)?;
@@ -965,7 +975,7 @@ impl Store {
             match Self::pending_digest_recipient(&tx, &request.id)? {
                 Some(parent) => {
                     let expected_thread = digest_thread(&request.id);
-                    if request.to != [parent]
+                    if request.to != [parent.clone()]
                         || request.thread.as_deref() != Some(expected_thread.as_str())
                     {
                         return Err(Error::new(
@@ -974,18 +984,45 @@ impl Store {
                         ));
                     }
                     // Exact pending conversion. A retained mail binding under
-                    // this id is the already-committed delivery: replay it
-                    // verbatim (even if the recomputed body changed across a
-                    // restart) and ensure the delivered mark, all in this
-                    // transaction. A principal/method mismatch is still a
-                    // conflicting rebinding.
-                    if let Some((old_principal, old_method, _, old_result)) =
+                    // this id is the already-committed delivery only with
+                    // evidence it was this digest's conversion: the exact
+                    // mail payload and the frozen completion thread. A
+                    // legacy receipt (ordinary mail admitted under this id
+                    // before the digest reservation, on another thread or
+                    // with another body) never marks the digest delivered;
+                    // the digest stays pending. Replay it verbatim (even if
+                    // the recomputed body changed across a restart) and
+                    // ensure the delivered mark, all in this transaction.
+                    // A principal/method mismatch is still a conflicting
+                    // rebinding.
+                    if let Some((old_principal, old_method, old_digest, old_result)) =
                         write_binding(&tx, &request.id)?
                     {
                         if old_principal != principal || old_method != MAIL_SEND_METHOD {
                             return Err(Error::new(
                                 "id_conflict",
                                 "mail write id is bound to another principal, method, or payload",
+                            ));
+                        }
+                        if old_digest != *payload_digest {
+                            return Err(Error::new(
+                                "id_conflict",
+                                "retained mail is not this digest's conversion",
+                            ));
+                        }
+                        let delivery_id = format!("{}/{}", request.id, parent);
+                        let stored_thread: Option<Option<String>> = tx
+                            .query_row(
+                                "SELECT thread FROM messages WHERE delivery_id = ?1",
+                                params![delivery_id],
+                                |row| row.get(0),
+                            )
+                            .optional()
+                            .map_err(sql_error)?;
+                        if stored_thread.flatten().as_deref() != Some(expected_thread.as_str()) {
+                            return Err(Error::new(
+                                "id_conflict",
+                                "retained mail is not this digest's conversion",
                             ));
                         }
                         let value =

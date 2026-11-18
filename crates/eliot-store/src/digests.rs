@@ -647,6 +647,118 @@ mod tests {
     }
 
     #[test]
+    fn digest_legacy_receipt_on_another_thread_leaves_digest_pending() {
+        // Simulates a pre-#473 store: a pending digest whose id is also
+        // bound by ordinary mail admitted before the digest reservation
+        // existed. Neither receipt may advance the delivered mark.
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let parent_num: i64 = parent[1..].parse().expect("parent agent number");
+
+        // Case 1: legacy receipt with a different body on another thread.
+        let legacy_id = ulid::Ulid::new().to_string();
+        store
+            .digest_register("owner", &digest_request(&legacy_id, &parent), &[false], now)
+            .expect("register");
+        let legacy_result = json!({"deliveries": [{
+            "delivery_id": format!("{legacy_id}/{parent}"),
+            "recipient": parent,
+            "recipient_generation": 1,
+        }]});
+        store
+            .connection
+            .execute(
+                "INSERT INTO writes(id, principal, method, payload_digest, result, created_at) VALUES (?1, 'owner', 'mail.send', zeroblob(32), ?2, ?3)",
+                params![legacy_id, legacy_result.to_string(), now],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO messages(delivery_id, sender, sender_generation, recipient, recipient_generation, thread, reply_to_delivery, mode, text, content_digest, admitted_at) VALUES (?1, 'owner', NULL, ?2, 1, 'legacy-thread', NULL, 'queue', 'legacy body', x'00', ?3)",
+                params![format!("{legacy_id}/{parent}"), parent_num, now],
+            )
+            .unwrap();
+        let exact = MailSendRequest {
+            id: legacy_id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "digest body".to_owned(),
+            thread: Some(eliot_core::api::digest_thread(&legacy_id)),
+            reply_to_delivery: None,
+        };
+        let err = store
+            .mail_send_digest_delivery("owner", &exact, MailLimits::default(), now)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        assert!(
+            store
+                .pending_completion_digests_after(None, 10)
+                .expect("pending digests")
+                .iter()
+                .any(|row| row.id == legacy_id),
+            "legacy receipt on another thread leaves the digest pending"
+        );
+
+        // Case 2: retained payload matches the conversion but the stored
+        // delivery thread does not. The thread check still keeps pending.
+        let thread_id = ulid::Ulid::new().to_string();
+        store
+            .digest_register("owner", &digest_request(&thread_id, &parent), &[false], now)
+            .expect("register");
+        let thread = eliot_core::api::digest_thread(&thread_id);
+        let payload = crate::canonical::digest(&json!({
+            "to": [parent.clone()],
+            "mode": "queue",
+            "text": "digest body",
+            "thread": thread,
+            "reply_to_delivery": Option::<String>::None,
+        }))
+        .expect("conversion payload digest");
+        let converted = json!({"deliveries": [{
+            "delivery_id": format!("{thread_id}/{parent}"),
+            "recipient": parent,
+            "recipient_generation": 1,
+        }]});
+        store
+            .connection
+            .execute(
+                "INSERT INTO writes(id, principal, method, payload_digest, result, created_at) VALUES (?1, 'owner', 'mail.send', ?2, ?3, ?4)",
+                params![thread_id, payload, converted.to_string(), now],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO messages(delivery_id, sender, sender_generation, recipient, recipient_generation, thread, reply_to_delivery, mode, text, content_digest, admitted_at) VALUES (?1, 'owner', NULL, ?2, 1, 'other-thread', NULL, 'queue', 'digest body', x'00', ?3)",
+                params![format!("{thread_id}/{parent}"), parent_num, now],
+            )
+            .unwrap();
+        let exact = MailSendRequest {
+            id: thread_id.clone(),
+            to: vec![parent.clone()],
+            mode: eliot_core::api::MailMode::Queue,
+            text: "digest body".to_owned(),
+            thread: Some(thread),
+            reply_to_delivery: None,
+        };
+        let err = store
+            .mail_send_digest_delivery("owner", &exact, MailLimits::default(), now)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        assert!(
+            store
+                .get_completion_digest(&thread_id)
+                .expect("read digest")
+                .expect("digest present")
+                .delivered_at
+                .is_none(),
+            "thread-mismatched receipt leaves the digest pending"
+        );
+    }
+
+    #[test]
     fn submit_and_record_write_reject_digest_bound_id() {
         use eliot_core::SubmitCommand;
 
