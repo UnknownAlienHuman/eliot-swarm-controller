@@ -964,6 +964,7 @@ impl DesktopApp {
                 self.settings.saving = None;
                 let sent = self.settings.sending.take().unwrap_or_default();
                 let sent_draft = self.editor.sending.take();
+                let sent_edit = self.editor.sending_edit.take();
                 self.settings.notes.insert(page, Note::of(dry_run, &result));
                 if dry_run {
                     self.drain_saves(context);
@@ -988,7 +989,7 @@ impl DesktopApp {
                             // normalised; the drafts that sent them follow it.
                             self.settings.sent.extend(sent);
                             if page == Page::Models {
-                                self.editor.saved(sent_draft);
+                                self.editor.saved(sent_draft, sent_edit);
                             }
                         }
                         if page == Page::Automations
@@ -1300,9 +1301,9 @@ impl DesktopApp {
         match model::profiles_toml(&section) {
             Ok(text) => {
                 // A draft a save wrote follows the read's formatting.
-                let edited = editor.draft != editor.base
-                    && editor.draft != text
-                    && sent.as_ref() != Some(&editor.draft);
+                // A draft edited after the last submission stays, even
+                // when the edit undid back to the old text.
+                let edited = editor.keep_draft(&text, sent.as_deref());
                 let saves = &self.settings;
                 let ours = saved_here(
                     Section::Profiles,
@@ -1368,6 +1369,7 @@ impl DesktopApp {
         };
         self.settings.sending = Some(sections.clone());
         self.editor.sending = (page == Page::Models).then(|| self.editor.draft.clone());
+        self.editor.sending_edit = (page == Page::Models).then_some(self.editor.edit);
         let request = SettingsSaveRequest {
             expected_revision: self.settings.revision.clone(),
             sections,
