@@ -2784,6 +2784,86 @@ async fn wait_child_family(
     monitoring: &Monitoring,
     agent: &Agent,
 ) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux_wait_child_family(child, leader, family, monitoring, agent).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        legacy_wait_child_family(child, leader, family, monitoring, agent).await
+    }
+}
+
+/// Linux family wait: observe the leader exit without reaping while its birth
+/// identity still anchors the group signal, drain the owned group, terminate
+/// what remains, verify the group is empty except the leader, and only then
+/// reap. Returns false unless the leader exited and the group drained; the
+/// caller then terminates and retries. Never signals a bare reused PGID:
+/// every group signal goes through the birth-checked leader identity, which
+/// `wait()` clears only after the group is proven empty.
+#[cfg(target_os = "linux")]
+async fn linux_wait_child_family(
+    child: &mut OwnedChild,
+    leader: Duration,
+    family: Duration,
+    monitoring: &Monitoring,
+    agent: &Agent,
+) -> bool {
+    if !matches!(
+        timeout_at(Instant::now() + leader, child.wait_exit_unreaped()).await,
+        Ok(Ok(()))
+    ) {
+        return false;
+    }
+    let _ = monitoring.sample_generation(agent).await;
+    if !linux_drain_owned_group(child, family).await {
+        return false;
+    }
+    let _ = monitoring.sample_generation(agent).await;
+    // Reap only after the group is proven empty except the leader: the
+    // numeric PGID cannot be reused between the final observation and this
+    // reap because the exited leader is still unreaped.
+    matches!(
+        timeout_at(Instant::now() + family, child.wait()).await,
+        Ok(Ok(_))
+    )
+}
+
+/// Linux owned-group drain after the leader exit was observed without
+/// reaping: bounded drain, terminate leftovers while the unreaped leader
+/// anchors the birth-checked group signal, verify the group is empty except
+/// the leader, and close the fork race with one more birth-checked signal
+/// plus a zero-delay observation. Escaped descendants (setsid) stay
+/// degraded/orphan_possible at settlement; only the still-owned ordinary
+/// group is cleaned here.
+#[cfg(target_os = "linux")]
+pub(super) async fn linux_drain_owned_group(child: &mut OwnedChild, family: Duration) -> bool {
+    let mut group_empty = matches!(child.wait_group_empty_except_leader(family).await, Ok(true));
+    if !group_empty {
+        let _ = child.terminate();
+        group_empty = matches!(child.wait_group_empty_except_leader(family).await, Ok(true));
+    }
+    if group_empty {
+        // An empty observation grants no signal authority by itself. Reuse
+        // the retained leader's birth check, then observe the group again
+        // pre-reap.
+        let _ = child.terminate();
+        group_empty = matches!(
+            child.wait_group_empty_except_leader(Duration::ZERO).await,
+            Ok(true)
+        );
+    }
+    group_empty
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn legacy_wait_child_family(
+    child: &mut OwnedChild,
+    leader: Duration,
+    family: Duration,
+    monitoring: &Monitoring,
+    agent: &Agent,
+) -> bool {
     if !matches!(
         timeout_at(Instant::now() + leader, child.wait()).await,
         Ok(Ok(_))
@@ -5801,5 +5881,55 @@ mod tests {
         remove_empty_instance_dir(&nonempty);
         assert!(nonempty.join("plugin-data").is_file());
         remove_empty_instance_dir(&root.join("missing"));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_family_tests {
+    use super::*;
+
+    /// The leader exits immediately while a same-group grandchild lingers:
+    /// the Linux stop ordering must terminate the owned group before
+    /// reaping, so no owned member outlives the stop. Reaping first (the old
+    /// order) would clear the birth-checked identity and leave the
+    /// grandchild running with no group signal authority.
+    #[tokio::test]
+    async fn lingering_grandchild_does_not_outlive_linux_family_stop() {
+        let dir = std::env::temp_dir().join(format!("eliot-linux-family-{}", ulid::Ulid::new()));
+        let _temp = crate::test_support::TempDir::own(dir.clone());
+        let pidfile = dir.join("grandchild.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "sleep 120 & echo $! > {}; exec sleep 0",
+                pidfile.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = OwnedChild::spawn(command).unwrap();
+        // Observe the leader exit without reaping, exactly as the stop path
+        // does while the birth identity still anchors group signals.
+        child.wait_exit_unreaped().await.unwrap();
+        assert!(
+            linux_drain_owned_group(&mut child, Duration::from_secs(5)).await,
+            "owned group drains before reap"
+        );
+        child.wait().await.unwrap();
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = false;
+        for _ in 0..100 {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(gone, "owned grandchild outlived the family stop");
     }
 }
