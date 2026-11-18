@@ -252,6 +252,11 @@ process, turn or reader behind its generation (for example an observer attach
 fenced by a later detach) does not block drain; the drain receipt lists it as
 retained-unresolved instead, and the stored outcome stays `unknown`.
 
+Retirement follows the same evidence. An ended native observed child
+(`stopped`, grant revoked, custody drained) retires through `agent.archive` or
+`agent.delete` with its unknown turn retained as ended-observation evidence,
+never resolved or completed.
+
 Compute `apply(state,input) -> (next_state,effects)` without I/O or mutating published
 state. Store commits event, next projection and derived facts atomically, then publishes.
 

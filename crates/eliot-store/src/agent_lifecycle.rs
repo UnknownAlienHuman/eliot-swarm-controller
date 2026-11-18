@@ -161,13 +161,26 @@ impl Store {
                 [num], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             ).optional().map_err(sql_error)?;
             if let Some((turn, state, generation)) = turn {
-                return Err(Error::new(
-                    "busy",
-                    format!(
-                        "{} generation {generation} has {state} turn {turn}; stopped lifecycle does not resolve an uncertain turn",
-                        row.id
-                    ),
-                ));
+                // Ended native observation keeps its unknown turn as retained
+                // evidence, not a live gate: the child reaches stopped only
+                // through the ended-with-parent sweep, whose producer check
+                // proves the granting generation ended, so no live source
+                // remains to complete it. The other guards (no active turn,
+                // no pending or live commands, drained custody) still apply,
+                // and running turns still block everywhere.
+                let ended_observation = state == "unknown"
+                    && row.observe_only
+                    && row.origin == core::AgentOrigin::Native
+                    && row.state == AgentState::Stopped;
+                if !ended_observation {
+                    return Err(Error::new(
+                        "busy",
+                        format!(
+                            "{} generation {generation} has {state} turn {turn}; stopped lifecycle does not resolve an uncertain turn",
+                            row.id
+                        ),
+                    ));
+                }
             }
             // Delete needs drained custody. Archive of an ended member needs
             // resolved custody, so it never hides a process, artifact or
