@@ -614,6 +614,14 @@ fn dispatch_configure_tx(
     let earlier_configure = earliest.as_ref().is_some_and(|(first, _, _)| first != id);
     let earlier_send = earliest_unresolved_send_key(tx, agent_num, agent.generation)?
         .is_some_and(|(_, created_at, rowid)| (created_at, rowid) < own_key);
+    if earlier_send
+        && eliot_core::api::configure_uses_native_session(&agent.harness, &command.command.args)
+    {
+        return Err(Error::new(
+            "busy",
+            "native configure requires no pending input; retry between turns",
+        ));
+    }
     if earlier_configure || earlier_send {
         if command.state == CommandState::Accepted {
             update_command_state(tx, id, CommandState::Queued, None, None, now)?;

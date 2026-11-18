@@ -199,6 +199,7 @@ enum Control {
         turn_id: String,
         context: Vec<ContextItem>,
         effort: Option<String>,
+        model: Option<String>,
         reply: oneshot::Sender<Result<()>>,
     },
     ReplyRequest {
@@ -523,12 +524,14 @@ impl EventHandle {
         turn_id: String,
         context: Vec<ContextItem>,
         effort: Option<String>,
+        model: Option<String>,
     ) -> Result<()> {
         self.send(|reply| Control::AssociateTurn {
             command_id,
             turn_id,
             context,
             effort,
+            model,
             reply,
         })
         .await
@@ -766,10 +769,11 @@ impl EventProcessor {
                 turn_id,
                 context,
                 effort,
+                model,
                 reply,
             } => {
                 let result = self
-                    .associate_turn(command_id, turn_id, context, effort)
+                    .associate_turn(command_id, turn_id, context, effort, model)
                     .await;
                 let _ = reply.send(result);
                 true
@@ -1104,6 +1108,7 @@ impl EventProcessor {
         turn_id: String,
         context: Vec<ContextItem>,
         effort: Option<String>,
+        model: Option<String>,
     ) -> Result<()> {
         if !self.status.ready
             || self.status.session_id.is_none()
@@ -1137,6 +1142,12 @@ impl EventProcessor {
         // absent override. Omitted when unknown: nothing is invented.
         if let Some(effort) = effort.as_deref().filter(|effort| !effort.trim().is_empty()) {
             data["effort"] = json!(effort);
+        }
+        // Report the session-verified model the owned native session runs,
+        // refreshed by `configure` after its readback proof. Omitted when
+        // never verified: nothing is invented.
+        if let Some(model) = model.as_deref().filter(|model| !model.trim().is_empty()) {
+            data["model"] = json!(model);
         }
         if !context.is_empty() {
             data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));

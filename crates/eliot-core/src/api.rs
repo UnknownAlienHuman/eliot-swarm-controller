@@ -100,9 +100,9 @@ pub use harness::{
     HARNESS_READ_TTL_MS, HarnessCandidate, HarnessEntry, HarnessListRequest, HarnessListResponse,
     HarnessModelEntry, HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest,
     HarnessQuotaResponse, MAX_HARNESS_CREDENTIAL_BYTES, MAX_HARNESS_PROFILE_BYTES,
-    MAX_HARNESS_QUOTA_NOTE_BYTES, MAX_HARNESS_SCOPE_BYTES, ModelsCatalogEntry,
-    ModelsCatalogFailure, ModelsCatalogRequest, ModelsCatalogResponse, catalog_cursor,
-    catalog_matches, catalog_provider,
+    MAX_HARNESS_QUOTA_NOTE_BYTES, MAX_HARNESS_SCOPE_BYTES, MUSE_REASONING_EFFORT_TIERS,
+    ModelsCatalogEntry, ModelsCatalogFailure, ModelsCatalogRequest, ModelsCatalogResponse,
+    catalog_cursor, catalog_matches, catalog_provider, configure_uses_native_session,
 };
 pub use hierarchy::{
     DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,

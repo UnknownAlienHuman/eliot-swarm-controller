@@ -689,7 +689,8 @@ readback sets them, and a `configure` revision's turn refreshes them when the
 harness proves what its native turn request carried (Codex reports the
 carried model/effort and Muse reports the carried effort through the
 exact-turn association, which acknowledges native admission of those values;
-`effort_verified`/`model_verified` mark that admission). Values no turn
+`effort_verified`/`model_verified` mark that admission). Claude refreshes the verified serving model from a main-thread assistant
+record on the bound turn. Values no turn
 re-proves stay at their admission readback; no value is ever presented as
 verified without that admission.
 
@@ -929,27 +930,29 @@ field is `unsupported`, while authority-adjacent fields (`permissions`,
 catalog/provider/billing siblings) are rejected outright as `not_allowed`.
 Only the Owner principal may submit it. Codex carries both values as per-turn
 `turn/start` overrides and Muse carries effort the same way; a Muse `model`
-change needs a new native session and returns `unsupported`
-(`restart_required`) storing nothing, as does Claude, which has no verified
-mechanism. OpenCode switches the retained session model through the native
+switch runs live through `session/setModel` (durable for subsequent model
+calls) with `session/read` proof, and a Claude `model` switch runs live
+through the stream-json `set_model` control request between turns, each
+refusing before any write while a turn is active. Claude `effort` has no
+live switch and stays `unsupported` (`launch_only`). OpenCode switches the
+retained session model through the native
 `POST /api/session/{id}/model` setter at configure time and proves it with
 a fresh `session.get` (`--effort` stays `unsupported`: the native API has
 no effort knob); Antigravity switches `model` and `thought_level` through
 ACP `session/set_config_option` at configure time and proves each write
-with its echoed current value. On those two harnesses the Router switches
-the live native session through the owned plugin first and stores the
-overlay only after that proof, then settles `applied` with the requested
-and effective values, the monotonically increasing `config_revision` for
-the generation, `application:\"next_turn\"`, provenance `\"configure\"`,
-and the native `model_verified` (plus `effort_verified` on Antigravity)
-flags, each set only from the native echo or `GET`. A refused or unproven
-switch stores nothing and never claims `applied`; it never selects another
-model on failure. A validation failure before the first native write
-(malformed args, an unknown model, an unadvertised value) settles
-`rejected` and holds nothing; only an ambiguous outcome at or after a
-write settles `unknown` and holds the settings lane. Settlement happens
-only after the Store commit, so an applied configure always has a
-retained row to read back.
+with its echoed current value. On the natively-switching harnesses the
+Router switches the live native session through the owned plugin first and
+stores the overlay only after native proof, then settles `applied` with the
+requested values, the monotonically increasing `config_revision` for the
+generation and `application:"next_turn"`. Claude retains `accepted_model`
+as the next-turn selector, with `effective.model` null and `model_verified`
+false in the configure outcome. The next bound assistant record updates
+the Agent's last observed serving model. Muse proves the session model at
+configure and reports carried effort at the next turn association.
+OpenCode and Antigravity report verified native values from their readback
+or echo. A proven validation refusal settles `rejected`. An ambiguous
+native effect or a Store commit failure after the effect settles
+`unknown` and holds the settings lane. Neither path retries the setter.
 Each admitted native command (`launch`, `resume`, `send`) records the
 configuration it runs under as the retained profile-snapshot identity plus
 its stamped `config_revision`; each turn records the revision it ran under.
@@ -970,9 +973,10 @@ revision does not match the stamped revision. A `resume` explicitly inherits
 the previous generation's latest overlay as its new generation's revision 1
 with provenance `\"inherited_from\"` (the frozen snapshot is unchanged;
 generations without an overlay start at 0). The lane is ordered by shared admission order: a
-configure does not apply while an earlier-admitted send is still queued or
-undispatched, an earlier queued send passes a later configure, and a later
-input waits for an earlier configure. When the native turn request carries a
+Store-only configure waits behind earlier queued or undispatched input,
+and later input waits for an earlier configure. A native configure
+submitted while input is pending is refused and must be requested again
+between turns. When the native turn request carries a
 resolved effort the overlay left absent (for example a model-only configure on
 a profile with omitted effort), the turn association records it on the
 overlay, so the turn and the generation readback show the effort actually
@@ -1308,7 +1312,12 @@ command to be stored `unknown`. The one additional Owner assertion is
 `failed -> applied` for an exact handoff brief; ordinary terminal commands,
 dispatched, queued and accepted commands refuse with `bad_state`. `launch` and `resume` resolve as `failed`
 only: `applied` is refused with `bad_state`, since an applied start without its
-Agent transition is inconsistent. The command keeps any committed turn
+Agent transition is inconsistent. An unknown native configure resolves as `applied`
+only when the owned session proves the requested configuration and the
+Store commits its overlay in the resolution transaction. Muse supports
+this with exact idle-session model readback. When the adapter cannot
+prove the requested native setting, the command stays `unknown` unless
+the Owner resolves it as `failed`. The command keeps any committed turn
 association and gains no invented one — including a send whose native turn
 association was lost, which resolves without creating a turn. The outcome
 carries `resolution_source=owner`, as does the emitted `command.resolved`

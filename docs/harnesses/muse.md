@@ -59,7 +59,7 @@ native refusal alone does not prove a contract mismatch or an upstream failure.
 | inject | exact supported steer or explicit next-send prepend, mechanism reported; active_turn uses the actual turn/steer mechanism with the exact expected turn (`muse.turn/steer`), other points unsupported here |
 | stop/resume | interrupt the captured busy turn and await native terminal evidence within the core bound, then clear/pause native Goal as necessary and close owned host; missing evidence retains an unknown turn; resume exact session without old input |
 | approve/deny/answer | exact session/child request id and offered choice/requirement; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
-| configure | effort rides per-turn `reasoningEffort` in `turn/start`, resolved from the retained revision at send dispatch; a model change needs a new native session and is refused as `unsupported` (the frozen snapshot never changes) |
+| configure | The model switches through `session/setModel` between turns. The exact setter acknowledgment and `session/read` prove the requested model before the overlay commits. Effort is carried through per-turn `reasoningEffort` in `turn/start`, including mixed requests and after resume. An effort-only revision keeps the last session model. |
 | goal | native set/edit/pause/resume/clear where installed schema supports them |
 | compact/fork/background | native-only, advertised after implementation |
 

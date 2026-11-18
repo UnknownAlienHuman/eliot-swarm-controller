@@ -243,15 +243,17 @@ fn configure_value(
 /// turn carries, and the application point. Only `model` and `effort` are
 /// supported; authority fields are rejected outright and anything else is
 /// unsupported. Codex carries both as per-turn `turn/start` overrides;
-/// Muse carries effort per turn while a model change needs a new native
-/// session (`restart_required`, refused with `unsupported`, never
-/// restarted silently); OpenCode switches its retained session model
-/// through the native `POST /api/session/{id}/model` setter at configure
-/// time (effort has no native knob and is refused); Antigravity switches
-/// `model` and `thought_level` through ACP `session/set_config_option` at
-/// configure time; adapters without a verified mechanism (Claude) refuse
-/// the whole command. Shared by admission and by the Router-side apply so
-/// both agree on what was requested and what takes effect.
+/// Muse switches the live session model through `session/setModel` and
+/// carries effort per turn; Claude switches the live session model
+/// through the stream-json `set_model` control request between turns
+/// (effort applies only at launch and is refused); OpenCode switches its
+/// retained session model through the native `POST /api/session/{id}/model`
+/// setter at configure time (effort has no native knob and is refused);
+/// Antigravity switches `model` and `thought_level` through ACP
+/// `session/set_config_option` at configure time; adapters without a
+/// verified mechanism refuse the whole command. Shared by admission and by
+/// the Router-side apply so both agree on what was requested and what
+/// takes effect.
 pub(super) fn resolve_configure(
     args: &Value,
     harness: &str,
@@ -292,6 +294,15 @@ pub(super) fn resolve_configure(
     };
     if let Some(reason) = refusal {
         return Err(Error::new("unsupported", reason));
+    }
+    if harness == "muse"
+        && let Some(effort) = effort.as_deref()
+        && !eliot_core::api::MUSE_REASONING_EFFORT_TIERS.contains(&effort)
+    {
+        return Err(Error::new(
+            "invalid",
+            "Muse effort is not a supported reasoning tier",
+        ));
     }
     let original_model = snapshot
         .get("model")
@@ -1348,6 +1359,20 @@ fn admit_configure_tx(
     // overlay itself is stored by the Router after dispatch, which
     // settles the command applied only once the values are stored.
     let _ = resolve_configure(&request.args, &agent.harness, &agent.profile_snapshot)?;
+    if eliot_core::api::configure_uses_native_session(&agent.harness, &request.args) {
+        if matches!(agent.harness.as_str(), "claude" | "muse") && agent.active_turn.is_some() {
+            return Err(Error::new(
+                "busy",
+                "Agent already has an active turn; configure the model between turns",
+            ));
+        }
+        if has_pending_send_input(tx, agent_num, agent.generation)? {
+            return Err(Error::new(
+                "busy",
+                "native configure requires no pending input; retry between turns",
+            ));
+        }
+    }
     events.push(admit_command(
         tx,
         &CommandInsert::admitted(

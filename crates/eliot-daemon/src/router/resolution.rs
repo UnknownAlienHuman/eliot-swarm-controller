@@ -97,15 +97,79 @@ impl Router {
             "command resolution",
             CommandResolveRequest::validate,
         )?;
+        let live_agent = if request.resolution == eliot_core::api::CommandResolution::Applied {
+            let store = self.inner.store.lock().await;
+            if let Some(value) = store.stored_command_resolution("owner", &request)? {
+                return serde_json::to_value(value).map_err(|_| {
+                    Error::new("internal", "command resolution could not be encoded")
+                });
+            }
+            match store.get_command(&request.command_id)? {
+                Some(command)
+                    if command.verb == "configure"
+                        && command.state == eliot_core::CommandState::Unknown =>
+                {
+                    match command.target.as_deref() {
+                        Some(target) => store.get_agent(target)?.filter(|agent| {
+                            agent.harness == "muse"
+                                && Some(agent.generation) == command.generation
+                                && agent.state == eliot_core::AgentState::Idle
+                                && eliot_core::api::configure_uses_native_session(
+                                    &agent.harness,
+                                    &command.args,
+                                )
+                        }),
+                        None => None,
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let readback = match live_agent {
+            Some(agent) => self.configure_readback(&agent).await,
+            None => None,
+        };
         let change = {
             let mut store = self.inner.store.lock().await;
-            let change = store.resolve_command("owner", &request, now_ms())?;
+            let change = store.resolve_command_with_readback(
+                "owner",
+                &request,
+                readback.as_ref(),
+                now_ms(),
+            )?;
             self.publish_locked(&change.events);
             change
         };
         self.signal_progress();
         serde_json::to_value(change.value)
             .map_err(|_| Error::new("internal", "command resolution could not be encoded"))
+    }
+
+    async fn configure_readback(
+        &self,
+        agent: &eliot_core::Agent,
+    ) -> Option<eliot_store::ConfigureReadback> {
+        let snapshot = self
+            .inner
+            .plugin_host
+            .probe_snapshot(agent, None)
+            .await
+            .ok()?;
+        if snapshot["agent_id"].as_str() != Some(agent.id.as_str())
+            || snapshot["generation"].as_i64() != Some(agent.generation)
+            || snapshot["state"].as_str() != Some("idle")
+            || !snapshot.get("active_turn").is_some_and(Value::is_null)
+        {
+            return None;
+        }
+        Some(eliot_store::ConfigureReadback {
+            agent: agent.id.clone(),
+            generation: agent.generation,
+            native_ref: snapshot["native_ref"].as_str()?.to_owned(),
+            model: snapshot["native_model"].as_str()?.to_owned(),
+        })
     }
 
     pub(super) async fn turn_resolve(

@@ -1041,9 +1041,7 @@ pub struct NativeViewSubscribeResult {
 
 /// The closed reasoning-effort tier vocabulary (SS3.2), spelled identically
 /// on the fresh-turn and steer lanes and in `session/setReasoningEffort`.
-pub const REASONING_EFFORT_TIERS: [&str; 8] = [
-    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-];
+pub use eliot_core::api::MUSE_REASONING_EFFORT_TIERS as REASONING_EFFORT_TIERS;
 
 // ---------------------------------------------------------------------------
 // Native requests: approvals and user input (SS5.x)

@@ -285,152 +285,179 @@ impl Store {
         let record = load_command_record(&tx, command_id)?.ok_or_else(|| {
             Error::new("not_found", format!("command {command_id} was not found"))
         })?;
-        if record.command.verb != "configure" {
-            return Err(Error::new(
-                "invalid",
-                "agent configuration applies only to configure commands",
-            ));
-        }
         if record.state != CommandState::Dispatched {
             return Err(Error::new(
                 "bad_state",
                 "configure applies only after a committed dispatch",
             ));
         }
-        if let Some(existing) = tx
-            .query_row(
-                "SELECT agent, generation, revision FROM agent_config WHERE command_id = ?1",
-                [command_id],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(sql_error)?
-        {
-            let (agent, generation, revision) = existing;
-            let config = get_agent_config_tx(&tx, agent, generation, revision)?
-                .ok_or_else(|| Error::new("internal", "retained agent_config row disappeared"))?;
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(config);
-        }
-        let agent_num = record.target.ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "configure command has no retained Agent target",
-            )
-        })?;
-        let agent = load_agent_by_num(&tx, agent_num)?
-            .ok_or_else(|| Error::new("not_found", "configure Agent was not found"))?;
-        let generation = record.command.generation.ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "configure command has no retained generation",
-            )
-        })?;
-        if generation != agent.generation {
-            return Err(Error::new(
-                "stale_generation",
-                format!(
-                    "configure targets generation {generation}, current is {}",
-                    agent.generation
-                ),
-            ));
-        }
-        if agent.is_terminal()
-            || !matches!(
-                agent.state,
-                AgentState::Idle | AgentState::Busy | AgentState::Waiting
-            )
-        {
-            return Err(Error::new(
-                "bad_state",
-                "configure requires a live Agent generation with a native session",
-            ));
-        }
-        let (requested, resolved_effective, application) = admission::resolve_configure(
-            &record.command.args,
-            &agent.harness,
-            &agent.profile_snapshot,
-        )?;
-        // A native proof replaces the resolved fill exactly where the
-        // harness proved it; anything else keeps the resolved value (an
-        // unrequested field, or a knob the harness does not have, such as
-        // OpenCode effort). A requested field without proof stores nothing.
-        let effective = match native {
-            None => resolved_effective,
-            Some((native_model, native_effort)) => {
-                if requested.get("model").and_then(Value::as_str).is_some()
-                    && native_model.is_none()
-                {
-                    return Err(Error::new(
-                        "source_integrity",
-                        "configure stored no proven native model for its requested model",
-                    ));
-                }
-                if requested.get("effort").and_then(Value::as_str).is_some()
-                    && native_effort.is_none()
-                {
-                    return Err(Error::new(
-                        "source_integrity",
-                        "configure stored no proven native effort for its requested effort",
-                    ));
-                }
-                let model = admission::check_native_effective(
-                    native_model,
-                    "model",
-                    admission::MAX_CONFIGURE_MODEL_LEN,
-                )?
-                .or_else(|| {
-                    resolved_effective
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                });
-                let effort = admission::check_native_effective(
-                    native_effort,
-                    "effort",
-                    admission::MAX_CONFIGURE_EFFORT_LEN,
-                )?
-                .or_else(|| {
-                    resolved_effective
-                        .get("effort")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                });
-                json!({"model": model, "effort": effort})
-            }
-        };
-        let revision = current_config_revision_tx(&tx, agent_num, generation)? + 1;
-        let requested_json = encode_json(&requested)?;
-        let effective_json = encode_json(&effective)?;
-        db!(tx.execute(
-            "INSERT INTO agent_config(agent, generation, revision, requested, effective, application, provenance, command_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'configure', ?7, ?8)",
-            params![
-                agent_num,
-                generation,
-                revision,
-                requested_json,
-                effective_json,
-                application,
-                command_id,
-                now,
-            ],
-        ));
-        db!(tx.execute(
-            "UPDATE commands SET config_revision = ?1 WHERE id = ?2",
-            params![revision, command_id],
-        ));
-        let config = get_agent_config_tx(&tx, agent_num, generation, revision)?
-            .ok_or_else(|| Error::new("internal", "new agent_config row was not visible"))?;
+        let config = apply_agent_config_tx(&tx, &record, native, now)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(config)
     }
+}
+
+pub(super) fn apply_agent_config_tx(
+    tx: &Transaction<'_>,
+    record: &CommandRecord,
+    native: Option<(Option<String>, Option<String>)>,
+    now: i64,
+) -> Result<AgentConfig> {
+    if record.command.verb != "configure" {
+        return Err(Error::new(
+            "invalid",
+            "agent configuration applies only to configure commands",
+        ));
+    }
+    let command_id = record.command.id.as_str();
+    if let Some(existing) = tx
+        .query_row(
+            "SELECT agent, generation, revision FROM agent_config WHERE command_id = ?1",
+            [command_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error)?
+    {
+        let (agent, generation, revision) = existing;
+        return get_agent_config_tx(tx, agent, generation, revision)?
+            .ok_or_else(|| Error::new("internal", "retained agent_config row disappeared"));
+    }
+    let agent_num = record.target.ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "configure command has no retained Agent target",
+        )
+    })?;
+    let agent = load_agent_by_num(tx, agent_num)?
+        .ok_or_else(|| Error::new("not_found", "configure Agent was not found"))?;
+    let generation = record.command.generation.ok_or_else(|| {
+        Error::new(
+            "source_integrity",
+            "configure command has no retained generation",
+        )
+    })?;
+    if generation != agent.generation {
+        return Err(Error::new(
+            "stale_generation",
+            format!(
+                "configure targets generation {generation}, current is {}",
+                agent.generation
+            ),
+        ));
+    }
+    if agent.is_terminal()
+        || !matches!(
+            agent.state,
+            AgentState::Idle | AgentState::Busy | AgentState::Waiting
+        )
+    {
+        return Err(Error::new(
+            "bad_state",
+            "configure requires a live Agent generation with a native session",
+        ));
+    }
+    let (requested, mut resolved_effective, application) = admission::resolve_configure(
+        &record.command.args,
+        &agent.harness,
+        &agent.profile_snapshot,
+    )?;
+    let previous_revision = current_config_revision_tx(tx, agent_num, generation)?;
+    if agent.harness == "muse" {
+        let previous = get_agent_config_tx(tx, agent_num, generation, previous_revision)?;
+        if requested["model"].is_null() {
+            let model = previous
+                .as_ref()
+                .and_then(|config| config.model.as_deref())
+                .or_else(|| agent.effective.as_ref()?.get("model")?.as_str());
+            if let Some(model) = model {
+                resolved_effective["model"] = json!(model);
+            }
+        }
+        if requested["effort"].is_null()
+            && let Some(effort) = previous
+                .as_ref()
+                .and_then(|config| config.effort.as_deref())
+        {
+            resolved_effective["effort"] = json!(effort);
+        }
+    }
+    // A native proof replaces the resolved fill exactly where the
+    // harness proved it; anything else keeps the resolved value (an
+    // unrequested field, or a knob the harness does not have, such as
+    // OpenCode effort). A requested field without proof stores nothing.
+    let effective = match native {
+        None => resolved_effective,
+        Some((native_model, native_effort)) => {
+            if requested.get("model").and_then(Value::as_str).is_some() && native_model.is_none() {
+                return Err(Error::new(
+                    "source_integrity",
+                    "configure stored no proven native model for its requested model",
+                ));
+            }
+            if agent.harness != "muse"
+                && requested.get("effort").and_then(Value::as_str).is_some()
+                && native_effort.is_none()
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "configure stored no proven native effort for its requested effort",
+                ));
+            }
+            let model = admission::check_native_effective(
+                native_model,
+                "model",
+                admission::MAX_CONFIGURE_MODEL_LEN,
+            )?
+            .or_else(|| {
+                resolved_effective
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            });
+            let effort = admission::check_native_effective(
+                native_effort,
+                "effort",
+                admission::MAX_CONFIGURE_EFFORT_LEN,
+            )?
+            .or_else(|| {
+                resolved_effective
+                    .get("effort")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            });
+            json!({"model": model, "effort": effort})
+        }
+    };
+    let revision = previous_revision + 1;
+    let requested_json = encode_json(&requested)?;
+    let effective_json = encode_json(&effective)?;
+    db!(tx.execute(
+        "INSERT INTO agent_config(agent, generation, revision, requested, effective, application, provenance, command_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'configure', ?7, ?8)",
+        params![
+            agent_num,
+            generation,
+            revision,
+            requested_json,
+            effective_json,
+            application,
+            command_id,
+            now,
+        ],
+    ));
+    db!(tx.execute(
+        "UPDATE commands SET config_revision = ?1 WHERE id = ?2",
+        params![revision, command_id],
+    ));
+    get_agent_config_tx(tx, agent_num, generation, revision)?
+        .ok_or_else(|| Error::new("internal", "new agent_config row was not visible"))
 }
 
 #[cfg(test)]
@@ -501,6 +528,140 @@ mod tests {
         request.args = args;
         request.expected_generation = Some(generation);
         request
+    }
+
+    #[test]
+    fn muse_configure_preserves_model_across_effort_only_revision() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let agent = ready_configure_agent(
+            &mut store,
+            "muse-config",
+            "muse",
+            json!({"model":"m0","effort":"low"}),
+            now,
+        );
+        let request = configure_request(&agent, 1, json!({"model":"m1", "effort":"medium"}));
+        let id = request.id.clone();
+        store.submit("owner", request, now).unwrap();
+        store.dispatch(&id, now).unwrap();
+        let config = store
+            .apply_agent_config_native(&id, now, Some("m1".into()), None)
+            .unwrap();
+        assert_eq!(config.effort.as_deref(), Some("medium"));
+        store.settle(&id, CommandState::Applied, None, now).unwrap();
+
+        let invalid = configure_request(&agent, 1, json!({"effort":"invented-tier"}));
+        assert_eq!(
+            store.submit("owner", invalid, now).unwrap_err().code,
+            "invalid"
+        );
+        let request = configure_request(&agent, 1, json!({"effort":"high"}));
+        let id = request.id.clone();
+        store.submit("owner", request, now).unwrap();
+        store.dispatch(&id, now).unwrap();
+        let config = store.apply_agent_config(&id, now).unwrap();
+        assert_eq!(config.revision, 2);
+        assert_eq!(config.model.as_deref(), Some("m1"));
+        assert_eq!(config.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn owner_applies_unknown_muse_configure_only_with_matching_live_readback() {
+        use eliot_core::api::{CommandResolution, CommandResolveRequest};
+
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let agent = ready_configure_agent(
+            &mut store,
+            "muse-resolve",
+            "muse",
+            json!({"model":"m0"}),
+            now,
+        );
+        let number = parse_agent_id(&agent).unwrap();
+        let mut retained = store.get_agent(&agent).unwrap().unwrap();
+        retained.native_ref = Some("muse-session".into());
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET native_ref = ?1 WHERE id = ?2",
+                params![retained.native_ref, number],
+            )
+            .unwrap();
+        let request = configure_request(&agent, 1, json!({"model":"m1", "effort":"low"}));
+        let id = request.id.clone();
+        store.submit("owner", request, now).unwrap();
+        store.dispatch(&id, now).unwrap();
+        store.settle(&id, CommandState::Unknown, None, now).unwrap();
+        let resolve = CommandResolveRequest {
+            id: Ulid::new().to_string(),
+            command_id: id.clone(),
+            resolution: CommandResolution::Applied,
+            reason: "Check native selection".into(),
+        };
+        assert_eq!(
+            store
+                .resolve_command("owner", &resolve, now)
+                .unwrap_err()
+                .code,
+            "bad_state"
+        );
+        let mut proof = ConfigureReadback {
+            agent: agent.clone(),
+            generation: 1,
+            native_ref: "muse-session".into(),
+            model: "m0".into(),
+        };
+        assert_eq!(
+            store
+                .resolve_command_with_readback("owner", &resolve, Some(&proof), now)
+                .unwrap_err()
+                .code,
+            "bad_state"
+        );
+        assert_eq!(
+            store.get_command(&id).unwrap().unwrap().state,
+            CommandState::Unknown
+        );
+        assert!(store.get_agent_config_current(&agent, 1).unwrap().is_none());
+        proof.model = "m1".into();
+        let applied = store
+            .resolve_command_with_readback("owner", &resolve, Some(&proof), now)
+            .unwrap();
+        assert_eq!(applied.value.state, CommandState::Applied);
+        let command = store.get_command(&id).unwrap().unwrap();
+        assert_eq!(command.config_revision, 1);
+        let config = store.get_agent_config(&agent, 1, 1).unwrap().unwrap();
+        assert_eq!(config.model.as_deref(), Some("m1"));
+        assert_eq!(config.effort.as_deref(), Some("low"));
+        assert_eq!(
+            store.resolve_command("owner", &resolve, now).unwrap().value,
+            applied.value
+        );
+    }
+
+    #[test]
+    fn native_configure_refuses_pending_input_at_admission() {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+        let agent = ready_configure_agent(
+            &mut store,
+            "claude-pending-config",
+            "claude",
+            json!({"model":"haiku"}),
+            now,
+        );
+        let mut send = SubmitCommand::new(Ulid::new().to_string(), "send");
+        send.target = Some(agent.clone());
+        send.args = json!({"text":"pending"});
+        store.submit("owner", send, now).unwrap();
+        let request = configure_request(&agent, 1, json!({"model":"claude-haiku-4-5"}));
+        assert_eq!(
+            store.submit("owner", request, now).unwrap_err().code,
+            "busy"
+        );
+        assert!(store.get_agent_config_current(&agent, 1).unwrap().is_none());
     }
 
     #[test]
@@ -784,8 +945,10 @@ mod tests {
             now + 4,
         );
 
-        // Muse effort is a per-turn override; a Muse model change needs a new
-        // native session, so it is refused as unsupported and stores nothing.
+        // Muse effort is a per-turn override and the Muse model switches
+        // the live session through `session/setModel`, so both admit here;
+        // the model overlay itself is stored by the Router only after
+        // native proof.
         store
             .submit(
                 "owner",
@@ -793,41 +956,41 @@ mod tests {
                 now + 10,
             )
             .expect("admit Muse effort configure");
-        assert_eq!(
-            store
-                .submit(
-                    "owner",
-                    configure_request(&muse, 1, json!({"model": "m9"})),
-                    now + 11
-                )
-                .unwrap_err()
-                .code,
-            "unsupported",
-            "Muse model needs a new native session"
-        );
-        assert_eq!(
-            store
-                .submit(
-                    "owner",
-                    configure_request(&muse, 1, json!({"model": "m9", "effort": "high"})),
-                    now + 12
-                )
-                .unwrap_err()
-                .code,
-            "unsupported",
-            "mixed Muse configure is atomic: nothing applies"
-        );
+        store
+            .submit(
+                "owner",
+                configure_request(&muse, 1, json!({"model": "m9"})),
+                now + 11,
+            )
+            .expect("admit Muse model configure");
+        store
+            .submit(
+                "owner",
+                configure_request(&muse, 1, json!({"model": "m9", "effort": "high"})),
+                now + 12,
+            )
+            .expect("admit mixed Muse configure");
+        // Claude switches the live session model through `set_model`
+        // between turns, so a model configure admits; effort has no live
+        // switch and stays refused.
+        store
+            .submit(
+                "owner",
+                configure_request(&claude, 1, json!({"model": "m9"})),
+                now + 13,
+            )
+            .expect("admit Claude model configure");
         assert_eq!(
             store
                 .submit(
                     "owner",
                     configure_request(&claude, 1, json!({"effort": "high"})),
-                    now + 13
+                    now + 14
                 )
                 .unwrap_err()
                 .code,
             "unsupported",
-            "adapters without a verified mechanism refuse configure"
+            "Claude effort has no live switch (launch_only)"
         );
         // OpenCode model and effort (a native model variant) and Antigravity
         // model/effort ride their proven native setters, so admission accepts
@@ -837,7 +1000,7 @@ mod tests {
             .submit(
                 "owner",
                 configure_request(&opencode, 1, json!({"model": "p/m1", "effort": "high"})),
-                now + 14,
+                now + 15,
             )
             .expect("admit OpenCode model and effort configure");
         store
@@ -848,7 +1011,7 @@ mod tests {
                     1,
                     json!({"model": "base-low", "effort": "high"}),
                 ),
-                now + 15,
+                now + 16,
             )
             .expect("admit Antigravity model and effort configure");
         assert_eq!(
@@ -856,7 +1019,7 @@ mod tests {
                 .get_agent_config_current(&muse, 1)
                 .expect("read Muse overlay"),
             None,
-            "refused Muse model configure stores nothing"
+            "admitted Muse model configure stores nothing before dispatch apply"
         );
 
         // Stale bindings, non-Owner principals and dead sessions are rejected.

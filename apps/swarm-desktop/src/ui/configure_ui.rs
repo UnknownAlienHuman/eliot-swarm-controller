@@ -133,10 +133,7 @@ impl DesktopApp {
                     Ok(Ok(command)) => {
                         self.configure.status = configure::outcome_words(&command);
                         if command.state != eliot_core::CommandState::Applied {
-                            self.alert(format!(
-                                "Model or effort not changed: {}",
-                                self.configure.status
-                            ));
+                            self.alert(configure::failure_alert(&command, &self.configure.status));
                         }
                     }
                     Ok(Err(error)) => {

@@ -1743,8 +1743,11 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             next.state = AgentState::Busy;
             next.active_turn = Some(turn_id.clone());
             // Refresh the admitted native settings when the harness reports
-            // what its turn request carried (Codex reports model/effort and
-            // Muse reports effort, only under a `configure` overlay): the
+            // what the native turn runs under (Codex reports the model and
+            // effort its turn request carried, only under a `configure`
+            // overlay; Muse reports its session-verified model on every
+            // association once verified, plus the carried effort under an
+            // overlay): the
             // exact-turn association acknowledges native admission of those
             // values, so they read back verified as carried. Absent fields
             // invent nothing and a missing `effective` object is never
@@ -1765,23 +1768,17 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 effort,
             });
         }
+        "turn.model_observed" => {
+            require_live_turn(agent, event)?;
+            record_serving_model(&mut next, required_text(event, "model")?);
+        }
         "message.completed" => {
             require_live_turn(agent, event)?;
             let command_id = required_text(event, "command_id")?;
             let turn_id = required_text(event, "turn_id")?;
             let text = required_text(event, "text")?;
             if let Some(model) = optional_observed_model(event)? {
-                match &mut next.effective {
-                    Some(Value::Object(effective)) => {
-                        effective.insert("model".to_owned(), Value::String(model));
-                    }
-                    None => {
-                        let mut effective = serde_json::Map::new();
-                        effective.insert("model".to_owned(), Value::String(model));
-                        next.effective = Some(Value::Object(effective));
-                    }
-                    Some(_) => {}
-                }
+                record_serving_model(&mut next, model);
             }
             effects.push(Effect::MessageCompleted {
                 command_id,
@@ -2034,6 +2031,16 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
 
     next.updated_at = now;
     Ok((next, effects))
+}
+
+fn record_serving_model(agent: &mut Agent, model: String) {
+    if let Value::Object(effective) = agent
+        .effective
+        .get_or_insert_with(|| Value::Object(serde_json::Map::new()))
+    {
+        effective.insert("model".to_owned(), Value::String(model));
+        effective.insert("model_verified".to_owned(), Value::Bool(true));
+    }
 }
 
 fn require_live_turn(agent: &Agent, event: &NativeEvent) -> Result<()> {
@@ -2586,6 +2593,73 @@ mod mcp_readback_tests {
             data: full,
             ts: None,
         }
+    }
+
+    #[test]
+    fn claude_serving_model_is_verified_only_from_the_bound_turn() {
+        let mut agent = busy_agent();
+        agent.harness = "claude".into();
+        agent.effective = Some(json!({"model": null, "permission_mode":"default"}));
+        let turn = agent.active_turn.clone().unwrap();
+        let mut observation = NativeEvent {
+            kind: "turn.model_observed".into(),
+            native_id: "assistant-model".into(),
+            data: json!({"turn_id":"foreign","model":"claude-haiku-4-5"}),
+            ts: None,
+        };
+        assert_eq!(
+            apply(&agent, &observation, 42).unwrap_err().code,
+            "source_integrity"
+        );
+        observation.data["turn_id"] = json!(turn);
+        let (observed, _) = apply(&agent, &observation, 42).unwrap();
+        assert_eq!(
+            observed.effective.unwrap(),
+            json!({
+                "model":"claude-haiku-4-5", "model_verified":true, "permission_mode":"default"
+            })
+        );
+    }
+
+    #[test]
+    fn turn_started_merges_the_reported_model_as_verified() {
+        fn idle_agent() -> Agent {
+            let mut agent = Agent::new("a1", "project", "muse", "fake", 0);
+            agent.state = AgentState::Idle;
+            agent.effective = Some(json!({"model": "m0"}));
+            agent
+        }
+        fn started(data: Value) -> NativeEvent {
+            let mut full = json!({"command_id": "c1", "turn_id": "t1"});
+            for (key, value) in data.as_object().expect("object data") {
+                full[key] = value.clone();
+            }
+            NativeEvent {
+                kind: "turn.started".to_owned(),
+                native_id: "n1".to_owned(),
+                data: full,
+                ts: None,
+            }
+        }
+        // A harness-reported model (Muse reports its session-verified
+        // model on association) refreshes the readback as verified.
+        let (next, _) = apply(
+            &idle_agent(),
+            &started(json!({"model": "m9", "effort": "high"})),
+            42,
+        )
+        .unwrap();
+        let effective = next.effective.expect("effective kept");
+        assert_eq!(effective["model"], json!("m9"));
+        assert_eq!(effective["model_verified"], json!(true));
+        assert_eq!(effective["effort"], json!("high"));
+        assert_eq!(next.state, AgentState::Busy);
+        // Absent fields invent nothing.
+        let (next, _) = apply(&idle_agent(), &started(json!({})), 42).unwrap();
+        assert_eq!(
+            next.effective.expect("effective kept")["model"],
+            json!("m0")
+        );
     }
 
     #[test]

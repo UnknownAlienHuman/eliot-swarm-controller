@@ -11,7 +11,7 @@ use super::{
 use crate::common::now_ms;
 use eliot_core::{
     Agent, Command, CommandState, ContextItem, Error, FailureOrigin, Result,
-    api::{FrozenGitFetch, ProjectRegistrationView},
+    api::{FrozenGitFetch, ProjectRegistrationView, configure_uses_native_session},
 };
 use serde_json::{Value, json};
 
@@ -615,16 +615,17 @@ impl Router {
 
     /// Apply a dispatched `configure`: store the model/effort overlay, then
     /// settle applied with the requested and effective values, the assigned
-    /// revision and the application point. Codex and Muse stay Store-only
-    /// here (no native I/O runs; the next send carries the effective
-    /// values in its native turn request). OpenCode and Antigravity first
-    /// switch the live native session through the owned plugin and prove
-    /// the switch with the native echo or `GET` before the Router stores
-    /// anything: the outcome carries the native `model_verified` (and
-    /// Antigravity `effort_verified`) flags, set only from that proof, and
-    /// an unverified or refused switch never stores an overlay. Settlement
-    /// happens only after the Store commit, so an applied configure always
-    /// has a retained row to read back.
+    /// revision and the application point. Codex stays Store-only here (no
+    /// native I/O runs; the next send carries the effective values in its
+    /// native turn request), as does a Muse effort-only configure. A model
+    /// switch on OpenCode, Antigravity, Claude or Muse first switches the
+    /// live native session through the owned plugin and proves the switch
+    /// with the native echo or readback before the Router stores anything:
+    /// the outcome carries the native `model_verified` (and, where the
+    /// harness proves it, `effort_verified`) flags, set only from that
+    /// proof, and an unverified or refused switch never stores an overlay.
+    /// Settlement happens only after the Store commit, so an applied
+    /// configure always has a retained row to read back.
     pub(super) async fn execute_configure_command(
         &self,
         id: &str,
@@ -632,7 +633,7 @@ impl Router {
         dispatched: Command,
         dispatch_seq: Option<i64>,
     ) {
-        if matches!(agent.harness.as_str(), "opencode" | "antigravity") {
+        if configure_uses_native_session(&agent.harness, &dispatched.args) {
             self.execute_native_configure_command(id, agent, dispatched, dispatch_seq)
                 .await;
             return;
@@ -703,10 +704,7 @@ impl Router {
                 Some("rejected") | Some("failed") => {
                     let mut value = value;
                     self.redact_native_value(&mut value);
-                    Self::ensure_outcome_failure_fields(
-                        &mut value,
-                        &format!("plugin.{}.command.configure", agent.harness),
-                    );
+                    self.normalize_configure_failure(&mut value, &agent.harness);
                     let state = if value.get("state").and_then(Value::as_str) == Some("failed") {
                         CommandState::Failed
                     } else {
@@ -725,10 +723,7 @@ impl Router {
                         value["cause"] = Value::String(cause);
                     }
                     self.redact_native_value(&mut value);
-                    Self::ensure_outcome_failure_fields(
-                        &mut value,
-                        &format!("plugin.{}.command.configure", agent.harness),
-                    );
+                    self.normalize_configure_failure(&mut value, &agent.harness);
                     let _ = self.settle(id, CommandState::Unknown, Some(value)).await;
                     return;
                 }
@@ -756,7 +751,11 @@ impl Router {
             return;
         };
         let native_model = proven
-            .get("model")
+            .get(if agent.harness == "claude" {
+                "accepted_model"
+            } else {
+                "model"
+            })
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
         let native_effort = proven
@@ -792,28 +791,57 @@ impl Router {
                     "harness": agent.harness,
                     "model_verified": model_verified,
                 });
-                if agent.harness == "antigravity" {
+                if agent.harness == "claude" {
+                    outcome["accepted_model"] = json!(config.model);
+                    outcome["effective"]["model"] = Value::Null;
+                }
+                if matches!(agent.harness.as_str(), "antigravity" | "muse") {
                     outcome["effort_verified"] = json!(effort_verified);
                 }
                 let _ = self.settle(id, CommandState::Applied, Some(outcome)).await;
             }
             Err(error) => {
                 let error = self.sanitized_failure(
-                    &error.with_where("store.dispatch.config_apply").with_origin(
+                    &Error::new(
+                        "unknown",
+                        format!(
+                            "Native configure may have applied; overlay commit failed: {}",
+                            error.message
+                        ),
+                    )
+                    .with_where("store.dispatch.config_apply")
+                    .with_origin(
                         FailureOrigin::Swarm,
-                        "agent config Store gate refused the command",
+                        "Store did not confirm the overlay commit",
                     ),
                     "store.dispatch.config_apply",
                 );
                 let _ = self
                     .settle(
                         id,
-                        CommandState::Rejected,
-                        Some(self.command_error_outcome(&error, "reason")),
+                        CommandState::Unknown,
+                        Some(self.command_error_outcome(&error, "code")),
                     )
                     .await;
             }
         }
+    }
+
+    fn normalize_configure_failure(&self, value: &mut Value, harness: &str) {
+        if value.get("message").is_none()
+            && let Some(reason) = value.get("reason").and_then(Value::as_str)
+        {
+            value["message"] = json!(reason);
+        }
+        if value.get("code").is_none() {
+            value["code"] = json!(
+                value
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            );
+        }
+        Self::ensure_outcome_failure_fields(value, &format!("plugin.{harness}.command.configure"));
     }
 
     /// Stop an Agent: a latched preparation cancel settles through the

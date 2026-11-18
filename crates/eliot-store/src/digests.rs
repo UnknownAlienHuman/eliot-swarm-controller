@@ -808,6 +808,35 @@ mod tests {
     }
 
     #[test]
+    fn command_resolution_precheck_and_write_reject_reserved_digest_id() {
+        use eliot_core::api::{CommandResolution, CommandResolveRequest};
+
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let id = ulid::Ulid::new().to_string();
+        let digest = digest_request(&id, &parent);
+        store
+            .digest_register("owner", &digest, &[false], now)
+            .expect("register");
+        let request = CommandResolveRequest {
+            id,
+            command_id: "c-missing".to_owned(),
+            resolution: CommandResolution::Applied,
+            reason: "Native readback".to_owned(),
+        };
+
+        let err = store
+            .stored_command_resolution("owner", &request)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+        let err = store
+            .resolve_command_with_readback("owner", &request, None, now)
+            .unwrap_err();
+        assert_eq!(err.code, "id_conflict");
+    }
+
+    #[test]
     fn digest_restart_keeps_single_mail_identity() {
         let mut store = open_store();
         let now = now_ms();

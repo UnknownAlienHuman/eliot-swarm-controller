@@ -150,6 +150,8 @@ pub(crate) struct ControlResponseBody {
     pub request_id: String,
     #[serde(default)]
     pub response: Option<Value>,
+    #[serde(default)]
+    pub error: Option<Value>,
 }
 
 /// Successful `initialize` readback: the effective profile.
@@ -177,6 +179,8 @@ pub(crate) struct InitializeModel {
     pub display_name: Option<String>,
     #[serde(rename = "supportedEffortLevels", default)]
     pub supported_effort_levels: Option<Vec<String>>,
+    #[serde(rename = "supportsAutoMode", default)]
+    pub supports_auto_mode: Option<bool>,
 }
 
 /// `command_lifecycle` association record.

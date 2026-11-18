@@ -54,6 +54,7 @@ const DENY_CHOICE_ID: &str = "deny";
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventStatus {
     pub native_drained: bool,
+    pub background_continuation: bool,
     pub ready: bool,
     pub session_id: Option<String>,
     pub active_command_id: Option<String>,
@@ -1281,6 +1282,8 @@ impl EventProcessor {
             }
             _ => {}
         }
+        self.status.background_continuation =
+            self.task_notification_pending || self.autonomous_output;
     }
 
     /// Retain the proven MCP surface from the owned session's
@@ -1493,11 +1496,30 @@ impl EventProcessor {
             self.bind_tool_uses(record, &turn_id);
             self.observe_tool_uses(record).await?;
         }
+        let observed_model = if record.get("error").is_none_or(Value::is_null) {
+            assistant_model(record).filter(|model| model != "<synthetic>")
+        } else {
+            None
+        };
         let text = assistant_text(record);
         if text.is_empty() {
+            if let Some(model) = observed_model {
+                self.message_seq = self.message_seq.saturating_add(1);
+                let session_id = self.status.session_id.as_deref().unwrap_or_default();
+                let native_id = format!("claude:{session_id}:{turn_id}:model:{}", self.message_seq);
+                self.commit_event(
+                    "turn.model_observed",
+                    native_id,
+                    json!({
+                        "command_id": self.status.active_command_id,
+                        "turn_id": turn_id,
+                        "model": model,
+                    }),
+                )
+                .await?;
+            }
             return Ok(());
         }
-        let observed_model = assistant_model(record);
         let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_text(&text);
         let command_id = self.status.active_command_id.as_deref().unwrap_or_default();
         let mut data = json!({
@@ -2884,6 +2906,7 @@ impl EventProcessor {
         let omitted_output = self.autonomous_output;
         self.autonomous_output = false;
         self.task_notification_pending = false;
+        self.status.background_continuation = false;
         if parsed
             .origin
             .as_ref()
@@ -3649,6 +3672,7 @@ mod tests {
             .await
             .expect("wakeup omitted");
         assert!(processor.autonomous_output);
+        assert!(processor.status.background_continuation);
         assert!(processor.buffer.is_empty());
         assert!(processor.final_text.is_none());
         assert_eq!(

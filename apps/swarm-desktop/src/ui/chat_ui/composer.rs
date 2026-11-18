@@ -365,7 +365,11 @@ impl DesktopApp {
             }
         };
         let note = match read {
-            Some(Ok(_)) => locked_words(harness, model_locked, effort_locked)
+            Some(Ok(reply)) => reply
+                .configure
+                .effort_refusal
+                .clone()
+                .or_else(|| locked_words(harness, model_locked, effort_locked))
                 .unwrap_or_else(|| "Applies from the next turn.".to_owned()),
             None => "Checking what this task can change…".to_owned(),
             Some(Err(_)) => String::new(),
