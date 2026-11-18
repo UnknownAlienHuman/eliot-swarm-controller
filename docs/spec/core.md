@@ -837,9 +837,13 @@ supply it, grouped by native scope (`turn`, `main_loop_turn`, `message`,
 `turns_counted`, `turns_without_usage`, and per-counter `turns_missing`
 gaps, plus the retained non-terminal turns the sums skip
 (`turns_unknown_excluded`, `turns_running_excluded`): an unknown turn may
-have spent tokens the readback cannot see. Session facts sum cumulative counters only where every included
-snapshot supplies them (otherwise the subtotal and its gap read back), group
-cost by verbatim unit without converting, and never sum context occupancy.
+have spent tokens the readback cannot see. Session facts contribute per-Agent
+resume-chain deltas: generations of one Agent continue the same native subject, so
+each snapshot adds only its advance past the previous retained cumulative for the
+same source (a cumulative below the retained baseline proves a counter reset and
+contributes in full with a fresh baseline; coverage still reads back where a
+snapshot is missing), group cost by verbatim unit without converting, and never
+sum context occupancy.
 `history_complete` is false with its reason when the retained-event
 watermark (`rule_history_coverage.pruned_through`) shows history was pruned;
 scope expansion stops at the hierarchy fanout bound with `truncated` set and

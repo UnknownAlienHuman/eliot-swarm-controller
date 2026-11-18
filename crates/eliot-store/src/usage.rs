@@ -5,8 +5,10 @@
 //! scope (`turn`, `main_loop_turn`, `message`, `unknown`) reports its own
 //! subtotals with the turns counted and the per-counter gaps. Session facts
 //! read the latest `session_usage` snapshot per Agent generation in scope;
-//! cumulative counters sum only where every included snapshot supplies them,
-//! and cost sums only within one verbatim unit, never converted. Scope
+//! each generation contributes only its advance past the previously retained
+//! cumulative for the same source (a cumulative below the retained baseline
+//! proves a counter reset and contributes in full), and cost sums only within
+//! one verbatim unit, never converted. Scope
 //! expansion reuses the hierarchy fanout bound and reports truncation; the
 //! retained-event watermark names the retention floor instead of implying
 //! full totals.
@@ -19,7 +21,7 @@ use eliot_core::api::{
     UsageSummaryRequest, UsageSummaryResponse,
 };
 use rusqlite::params_from_iter;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// One resolved usage scope: retained (agent, generation) pairs with the
 /// expansion bound already applied.
@@ -351,6 +353,12 @@ impl Store {
         let mut capacity = 0_usize;
         let mut costs: BTreeMap<String, (f64, usize)> = BTreeMap::new();
         let mut snapshots_without_cost = 0_usize;
+        // Consecutive generations of one Agent continue the same native
+        // subject (resume enforces subject equality at its transaction
+        // boundary), so each snapshot contributes only its advance past the
+        // previously retained cumulative. Collect first, then walk oldest
+        // generation first.
+        let mut chain: Vec<(i64, i64, SessionUsage)> = Vec::new();
         if !wanted.is_empty() {
             let nums: BTreeSet<i64> = wanted.iter().map(|(num, _)| *num).collect();
             let nums: Vec<i64> = nums.into_iter().collect();
@@ -374,55 +382,71 @@ impl Store {
                     continue;
                 }
                 let usage = decode_session_usage(&snapshot)?;
-                snapshots += 1;
-                if usage.context_used_tokens.is_some() {
-                    occupancy += 1;
+                chain.push((agent, generation, usage));
+            }
+        }
+        chain.sort_by(|first, second| (first.0, first.1).cmp(&(second.0, second.1)));
+        // A cumulative below the retained baseline proves a counter reset
+        // (or a genuinely new native subject) and contributes in full with a
+        // fresh baseline. Baselines split by snapshot source, so cumulative
+        // namespaces from different provider pipelines never subtract.
+        let mut token_baseline: HashMap<(i64, String, usize), i64> = HashMap::new();
+        let mut cost_baseline: HashMap<(i64, String, String), f64> = HashMap::new();
+        for (agent, _generation, usage) in &chain {
+            snapshots += 1;
+            if usage.context_used_tokens.is_some() {
+                occupancy += 1;
+            }
+            if usage.context_window_tokens.is_some() {
+                capacity += 1;
+            }
+            let source = usage.source.clone().unwrap_or_default();
+            let counters = [
+                usage
+                    .cumulative_tokens
+                    .as_ref()
+                    .and_then(|cumulative| cumulative.input_tokens),
+                usage
+                    .cumulative_tokens
+                    .as_ref()
+                    .and_then(|cumulative| cumulative.output_tokens),
+                usage
+                    .cumulative_tokens
+                    .as_ref()
+                    .and_then(|cumulative| cumulative.cache_read_tokens),
+                usage
+                    .cumulative_tokens
+                    .as_ref()
+                    .and_then(|cumulative| cumulative.cache_write_tokens),
+            ];
+            for (index, value) in counters.into_iter().enumerate() {
+                if let Some(value) = value {
+                    let delta = match token_baseline.get(&(*agent, source.clone(), index)) {
+                        Some(&baseline) if value >= baseline => value - baseline,
+                        _ => value,
+                    };
+                    token_baseline.insert((*agent, source.clone(), index), value);
+                    sums[index] += i128::from(delta);
+                    supplied[index] += 1;
                 }
-                if usage.context_window_tokens.is_some() {
-                    capacity += 1;
+            }
+            match usage.cumulative_cost.as_ref() {
+                Some(cost)
+                    if cost.unit.as_ref().is_some_and(|unit| !unit.is_empty())
+                        && cost.amount.is_some() =>
+                {
+                    let unit = cost.unit.clone().expect("cost unit present");
+                    let amount = cost.amount.expect("cost amount present");
+                    let delta = match cost_baseline.get(&(*agent, source.clone(), unit.clone())) {
+                        Some(&baseline) if amount >= baseline => amount - baseline,
+                        _ => amount,
+                    };
+                    cost_baseline.insert((*agent, source.clone(), unit.clone()), amount);
+                    let entry = costs.entry(unit).or_insert((0.0, 0));
+                    entry.0 += delta;
+                    entry.1 += 1;
                 }
-                let counters = [
-                    usage
-                        .cumulative_tokens
-                        .as_ref()
-                        .and_then(|tokens| tokens.input_tokens),
-                    usage
-                        .cumulative_tokens
-                        .as_ref()
-                        .and_then(|tokens| tokens.output_tokens),
-                    usage
-                        .cumulative_tokens
-                        .as_ref()
-                        .and_then(|tokens| tokens.cache_read_tokens),
-                    usage
-                        .cumulative_tokens
-                        .as_ref()
-                        .and_then(|tokens| tokens.cache_write_tokens),
-                ];
-                for (index, value) in counters.into_iter().enumerate() {
-                    if let Some(value) = value {
-                        sums[index] += i128::from(value);
-                        supplied[index] += 1;
-                    }
-                }
-                match usage.cumulative_cost.as_ref() {
-                    Some(cost)
-                        if cost
-                            .amount
-                            .is_some_and(|amount| amount.is_finite() && amount >= 0.0)
-                            && cost
-                                .unit
-                                .as_deref()
-                                .is_some_and(|unit| !unit.trim().is_empty()) =>
-                    {
-                        let entry = costs
-                            .entry(cost.unit.clone().expect("cost unit present"))
-                            .or_insert((0.0, 0));
-                        entry.0 += cost.amount.expect("cost amount present");
-                        entry.1 += 1;
-                    }
-                    _ => snapshots_without_cost += 1,
-                }
+                _ => snapshots_without_cost += 1,
             }
         }
         let subtotal = |index: usize| {
@@ -764,6 +788,77 @@ mod tests {
         assert_eq!(response.sessions.context_occupancy_supplied, 1);
         assert_eq!(response.sessions.context_capacity_supplied, 1);
         let _ = third;
+    }
+
+    #[test]
+    fn resumed_generations_contribute_deltas_not_repeated_cumulatives() {
+        let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+        let now = now_ms();
+        let resumed = launch(&mut store, "usage-resume", now);
+        let other = launch(&mut store, "usage-resume", now);
+        // One native session continued across three generations: each
+        // snapshot repeats the session cumulative, so a plain sum would
+        // triple-count it. The third generation proves a counter reset and
+        // contributes in full with a fresh baseline.
+        for (generation, input, output, amount) in
+            [(1, 1000, 300, 1.5), (2, 1500, 500, 2.0), (3, 200, 100, 0.3)]
+        {
+            insert_session(
+                &store,
+                &resumed,
+                generation,
+                json!({
+                    "cumulative_tokens": {"input_tokens": input, "output_tokens": output},
+                    "cumulative_cost": {"amount": amount, "unit": "usd_estimate"},
+                    "source": "codex:thread/tokenUsage/updated",
+                }),
+            );
+        }
+        // A different provider pipeline is never subtracted against the
+        // first: incomparable cumulative namespaces contribute in full.
+        insert_session(
+            &store,
+            &other,
+            1,
+            json!({
+                "cumulative_tokens": {"input_tokens": 5000, "output_tokens": 50},
+                "cumulative_cost": {"amount": 7.0, "unit": "credits"},
+                "source": "antigravity:usage_update",
+            }),
+        );
+        let request = UsageSummaryRequest {
+            agent: None,
+            generation: None,
+            project: Some("usage-resume".to_owned()),
+            root: None,
+        };
+        let response = summarize(&store, &request);
+        assert_eq!(response.agents_included, 2);
+        assert_eq!(response.generations_included, 4);
+        assert_eq!(response.sessions.snapshots, 4);
+        assert_eq!(response.sessions.generations_without_snapshot, 0);
+        let tokens = &response.sessions.cumulative_tokens;
+        assert_eq!(tokens.input_tokens.total, Some(1000 + 500 + 200 + 5000));
+        assert_eq!(tokens.input_tokens.supplied, 4);
+        assert_eq!(tokens.input_tokens.missing, 0);
+        assert!(tokens.input_tokens.complete);
+        assert_eq!(tokens.output_tokens.total, Some(300 + 200 + 100 + 50));
+        let usd = response
+            .sessions
+            .cost_by_unit
+            .iter()
+            .find(|cost| cost.unit == "usd_estimate")
+            .expect("usd cost");
+        assert_eq!(usd.total_amount, 2.3);
+        assert_eq!(usd.snapshots, 3);
+        let credits = response
+            .sessions
+            .cost_by_unit
+            .iter()
+            .find(|cost| cost.unit == "credits")
+            .expect("credits cost");
+        assert_eq!(credits.total_amount, 7.0);
+        assert_eq!(response.sessions.snapshots_without_cost, 0);
     }
 
     #[test]
