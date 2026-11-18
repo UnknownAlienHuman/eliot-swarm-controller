@@ -102,7 +102,7 @@ pub fn set_text(text: &str) -> Result<(), String> {
         }
         // Success transfers the block's ownership to the
         // clipboard; only the close can still fail.
-        return close(None);
+        close(None)
     }
 }
 

@@ -430,20 +430,20 @@ mod tests {
         editor.edit += 1;
         editor.draft = a.to_owned();
         editor.raw_dirty = true;
-        let submitted = Some(editor.edit);
+        let submitted = editor.edit;
         // Undo back to the base text: the handler sees no base diff.
         editor.edit += 1;
         editor.draft = base.to_owned();
         editor.raw_dirty = false;
         // A's acknowledgement: the newer undo keeps the dirty flag.
-        editor.saved(Some(a.to_owned()), submitted);
+        editor.saved(Some(a.to_owned()), Some(submitted));
         assert!(editor.raw_dirty);
         assert_eq!(editor.draft, base);
         // The readback showing A must not overwrite the undo either.
         assert!(editor.keep_draft(a, Some(a)));
         assert!(editor.keep_draft(base, Some(a)));
         // Nothing newer than the submission: the readback adopts.
-        editor.edit = submitted.unwrap_or_default();
+        editor.edit = submitted;
         assert!(!editor.keep_draft(a, Some(a)));
     }
 }
