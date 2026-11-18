@@ -670,7 +670,8 @@ Authority never widens: the Owner hands off anywhere, while a manager may hand o
 only between two workers in its own controlled scope (both endpoints pass the
 frozen `control` scope check, and neither endpoint is the caller itself). An
 Agent handoff transfers only task inputs the caller issued itself (Owner-issued
-or other-principal SENDs refuse) and never moves children, claims or Goals;
+or other-principal SENDs refuse; each successor keeps the original issuer's
+principal and rights) and never moves children, claims or Goals;
 moving children stays Owner-only. `reparent` and `switch` stay Owner-only.
 
 Only plain `send` commands in `accepted|queued` state are transferable. Never transfer

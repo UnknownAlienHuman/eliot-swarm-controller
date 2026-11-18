@@ -1100,7 +1100,7 @@ fn manager_handoff_leaves_children_claims_and_goal_put() {
 
 #[test]
 fn manager_handoff_refuses_owner_issued_sends() {
-    let (mut s, manager, a, b, task, _queued) = managed_setup();
+    let (mut s, manager, a, b, task, queued) = managed_setup();
     let principal = manager_principal(&manager);
     let owner_selected = send(&mut s, &a, "owner queued work");
     let bad = HandoffRequest {
@@ -1110,7 +1110,7 @@ fn manager_handoff_refuses_owner_issued_sends() {
         to: b.clone(),
         to_generation: 1,
         task_command: task.clone(),
-        commands: vec![owner_selected],
+        commands: vec![owner_selected.clone()],
     };
     assert_eq!(
         s.handoff(&principal, &bad, &core::SecretPolicy::default(), now())
@@ -1133,6 +1133,61 @@ fn manager_handoff_refuses_owner_issued_sends() {
             .unwrap_err()
             .code,
         "not_allowed"
+    );
+    // An Owner handoff preserves each successor's original issuer principal and rights.
+    let owner_handoff = HandoffRequest {
+        id: Ulid::new().to_string(),
+        from: a.clone(),
+        from_generation: 1,
+        to: b.clone(),
+        to_generation: 1,
+        task_command: task,
+        commands: vec![queued, owner_selected],
+    };
+    let result = s
+        .handoff(
+            "owner",
+            &owner_handoff,
+            &core::SecretPolicy::default(),
+            now(),
+        )
+        .unwrap();
+    let manager_successor = &result.value.transfers[0].successor;
+    let owner_successor = &result.value.transfers[1].successor;
+    assert_eq!(
+        s.get_command(manager_successor).unwrap().unwrap().principal,
+        principal
+    );
+    assert_eq!(
+        s.get_command(owner_successor).unwrap().unwrap().principal,
+        "owner"
+    );
+    assert_eq!(
+        s.cancel_handoff_input(
+            &principal,
+            &CommandCancelRequest {
+                id: Ulid::new().to_string(),
+                command_id: owner_successor.clone(),
+            },
+            now(),
+        )
+        .unwrap_err()
+        .code,
+        "not_allowed"
+    );
+    assert_eq!(
+        s.cancel_handoff_input(
+            &principal,
+            &CommandCancelRequest {
+                id: Ulid::new().to_string(),
+                command_id: manager_successor.clone(),
+            },
+            now(),
+        )
+        .unwrap()
+        .value
+        .state,
+        CommandState::Cancelled
     );
 }
 

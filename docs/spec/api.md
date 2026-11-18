@@ -1536,7 +1536,8 @@ endpoint is the caller itself), and `reparent`/`switch` stay Owner-only. The cal
 names one retained original-task SEND on A's generation, and at most 64 distinct plain
 accepted/queued SEND IDs in successor order (also subject to the configured
 selector-target bound). An Agent handoff transfers only SENDs the caller issued
-itself and never moves children, claims or Goals; an Owner handoff transfers all
+itself (each successor keeps the original issuer's principal and rights) and
+never moves children, claims or Goals; an Owner handoff transfers all
 current live claims, the transferable Eliot Goal (paused on B), and all children
 together. Active/unknown turns, pending requests, dispatched/unknown commands,
 transitions or unresolved Goal rounds refuse; B must have no open work. When a Goal

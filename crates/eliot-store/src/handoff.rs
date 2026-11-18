@@ -502,13 +502,23 @@ pub(super) fn handoff_tx(
         let mut child = SubmitCommand::new(id.clone(), "send");
         child.target = Some(to.id.clone());
         child.expected_generation = Some(to.generation);
-        child.args = if ordinal == 0 {
-            json!({"text":brief_text})
+        let (child_principal, args) = if ordinal == 0 {
+            (principal, json!({"text":brief_text}))
         } else {
-            originals[ordinal - 1].args.clone()
+            let original = &originals[ordinal - 1];
+            (original.principal.as_str(), original.args.clone())
         };
+        child.args = args;
         let child_digest = admission::command_payload_digest(&child)?;
-        admission::admit_send_member(tx, principal, &child, &child_digest, &to, now, &mut events)?;
+        admission::admit_send_member(
+            tx,
+            child_principal,
+            &child,
+            &child_digest,
+            &to,
+            now,
+            &mut events,
+        )?;
         tx.execute(
             "UPDATE commands SET parent_command=?1,link_kind='handoff',ordinal=?2 WHERE id=?3",
             params![request.id, ordinal as i64, id],
