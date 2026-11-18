@@ -29,7 +29,9 @@ fn catalog_read_allowed(
 
 #[derive(Clone, Debug)]
 pub(super) enum ConfigureMsg {
-    CatalogLoaded(Box<configure::Catalog>),
+    /// The catalogue for one read: the request id of the read that asked,
+    /// so a reply for an earlier read is dropped (#681).
+    CatalogLoaded(u64, Box<configure::Catalog>),
     /// Re-read the open Agent's catalogue after a failure (the effort
     /// error view's Retry, the Agent picker's Retry while it shows the
     /// Agent's route): one more bounded round for the same generation.
@@ -58,20 +60,43 @@ pub(super) struct ConfigureState {
     /// Reads started for the failed generation (bounded by
     /// [`MAX_CATALOG_ATTEMPTS`], reset by success, retry or refresh).
     pub(super) failed_attempts: u8,
-    /// Agent and generation whose catalogue read is in flight.
-    pub(super) loading: Option<(String, i64)>,
+    /// The catalogue read in flight: its request id, Agent and
+    /// generation. Leaving and reopening the Agent starts a new read
+    /// with a new id; the older reply then matches nothing (#681).
+    pub(super) loading: Option<(u64, String, i64)>,
     pub(super) status: String,
+}
+
+impl ConfigureState {
+    /// Whether a catalogue reply answers the read in flight: its request
+    /// id, Agent and generation must all match (#681). A reply for an
+    /// earlier read (same Agent and generation, older id) changes nothing.
+    fn reply_current(&self, request: u64, agent: &str, generation: i64) -> bool {
+        self.loading.as_ref().is_some_and(
+            |(pending, pending_agent, pending_generation)| {
+                *pending == request
+                    && pending_agent == agent
+                    && *pending_generation == generation
+            },
+        )
+    }
 }
 
 impl DesktopApp {
     pub(super) fn configure_update(&mut self, msg: ConfigureMsg, context: &ComponentContext<Self>) {
         match msg {
-            ConfigureMsg::CatalogLoaded(catalog) => {
+            ConfigureMsg::CatalogLoaded(request, catalog) => {
                 let catalog = *catalog;
-                let loaded = (catalog.agent.clone(), catalog.generation);
-                if self.configure.loading.as_ref() == Some(&loaded) {
-                    self.configure.loading = None;
+                // An earlier read's reply changes nothing: not the loading
+                // state, the catalogue, the failure, or the picker (#681).
+                if !self
+                    .configure
+                    .reply_current(request, &catalog.agent, catalog.generation)
+                {
+                    return;
                 }
+                self.configure.loading = None;
+                let loaded = (catalog.agent.clone(), catalog.generation);
                 let current = self
                     .selected_agent_id()
                     .zip(self.chat.detail.as_ref().map(|detail| detail.generation));
@@ -231,18 +256,24 @@ impl DesktopApp {
         ) else {
             return;
         };
-        let key = (agent, detail.generation);
+        let generation = detail.generation;
         let success = self
             .configure
             .catalog
             .as_ref()
-            .is_some_and(|catalog| catalog.is_for(&key.0, key.1) && catalog.reply.is_ok());
-        let loading = self.configure.loading.as_ref() == Some(&key);
+            .is_some_and(|catalog| catalog.is_for(&agent, generation) && catalog.reply.is_ok());
+        // A read for this Agent and generation is already in flight when
+        // one is loading for them under any request id (#681).
+        let loading = self.configure.loading.as_ref().is_some_and(
+            |(_, pending_agent, pending_generation)| {
+                pending_agent == &agent && *pending_generation == generation
+            },
+        );
         let failed_here = self
             .configure
             .failed
             .as_ref()
-            .is_some_and(|catalog| catalog.is_for(&key.0, key.1));
+            .is_some_and(|catalog| catalog.is_for(&agent, generation));
         if !failed_here {
             // A failure for another Agent or generation never blocks.
             self.configure.failed = None;
@@ -260,16 +291,21 @@ impl DesktopApp {
             return;
         }
         self.configure.failed_attempts += 1;
-        self.configure.loading = Some(key.clone());
+        self.catalog_seq += 1;
+        let request = self.catalog_seq;
+        self.configure.loading = Some((request, agent.clone(), generation));
         let harness = detail.harness.clone();
         let _task = context.spawn_background(move |_| {
-            let reply = client::block_on(client::harness_models(&data_dir, &harness, Some(&key.0)))
+            let reply = client::block_on(client::harness_models(&data_dir, &harness, Some(&agent)))
                 .map_err(|error| error.to_string());
-            Message::Configure(ConfigureMsg::CatalogLoaded(Box::new(configure::Catalog {
-                agent: key.0,
-                generation: key.1,
-                reply,
-            })))
+            Message::Configure(ConfigureMsg::CatalogLoaded(
+                request,
+                Box::new(configure::Catalog {
+                    agent,
+                    generation,
+                    reply,
+                }),
+            ))
         });
     }
 }
@@ -277,6 +313,22 @@ impl DesktopApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_catalog_reply_matches_nothing() {
+        // #681: leaving and reopening the Agent starts a new read; the old
+        // reply (same Agent and generation, older request id) must match
+        // nothing, so it clears no loading state and installs nothing.
+        let state = ConfigureState {
+            loading: Some((2, "agent".to_owned(), 7)),
+            ..Default::default()
+        };
+        assert!(!state.reply_current(1, "agent", 7));
+        assert!(!state.reply_current(2, "other", 7));
+        assert!(!state.reply_current(2, "agent", 8));
+        assert!(state.reply_current(2, "agent", 7));
+        assert!(!ConfigureState::default().reply_current(2, "agent", 7));
+    }
 
     #[test]
     fn a_cached_failure_retries_boundedly_until_forced() {

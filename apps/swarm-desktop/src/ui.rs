@@ -329,6 +329,12 @@ struct DesktopApp {
     panel: Panel,
     settings_page: Page,
     configure: configure_ui::ConfigureState,
+    /// Catalogue read ids handed out by `read_catalog`: each read's
+    /// reply carries the id of the read that started it, so a reply
+    /// for an earlier read never clears or fills a later one (#681).
+    /// Unlike `ConfigureState`, this survives opening another
+    /// conversation.
+    catalog_seq: u64,
     editor: profiles_ui::ProfilesEditor,
     /// The unified settings: the read sections, the page's drafts and
     /// each section's last save result.
@@ -664,6 +670,7 @@ impl Component for DesktopApp {
             panel: Panel::Closed,
             settings_page: Page::General,
             configure: configure_ui::ConfigureState::default(),
+            catalog_seq: 0,
             editor: profiles_ui::ProfilesEditor::default(),
             settings: settings_ui::SettingsState::default(),
             startup_error: false,
