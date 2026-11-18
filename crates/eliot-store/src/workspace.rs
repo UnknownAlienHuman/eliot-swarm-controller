@@ -1841,11 +1841,16 @@ impl Store {
                     && pending
                     && unknown;
                 let manager_identity_unknown = command.command.verb == "launch"
-                    && command
+                    && (command
                         .command
                         .args
                         .get(project_assignment::MANAGER_LAUNCH_ARG)
                         .is_some()
+                        || command
+                            .command
+                            .args
+                            .get(core::api::SWITCH_PROJECT_REVISION_ARG)
+                            .is_some())
                     && matches!(
                         workspace.phase,
                         WorkspacePhase::Ready | WorkspacePhase::SetupReady
@@ -1909,6 +1914,11 @@ impl Store {
                                 .args
                                 .get(project_assignment::MANAGER_LAUNCH_ARG)
                                 .is_some()
+                                || command
+                                    .command
+                                    .args
+                                    .get(core::api::SWITCH_PROJECT_REVISION_ARG)
+                                    .is_some()
                             {
                                 project_assignment::check_dispatch(&tx, &command)?;
                             }

@@ -120,16 +120,10 @@ impl Router {
                     })?
                     .to_owned(),
             };
+            launch.args = request.launch.args(&workspace)?;
             // A targeted continuation explicitly requests standard worktree
             // preparation, even in a `shared` project: B never starts in the
             // checkout itself.
-            if target.is_some() && request.launch.worktree.is_none() {
-                launch.args["worktree"] = json!("");
-            }
-            launch.args = request.launch.args(&workspace)?;
-            // `request.launch.args` rebuilds from the switch selectors and
-            // would drop the explicit preparation request above; re-assert it
-            // so a `shared` target still mints its standard worktree.
             if target.is_some() && request.launch.worktree.is_none() {
                 launch.args["worktree"] = json!("");
             }
@@ -180,6 +174,28 @@ impl Router {
                         "switch target project differs from prepared registration",
                     ));
                 }
+                if prepared
+                    .request
+                    .args
+                    .get("workspace")
+                    .and_then(Value::as_str)
+                    != Some(target.checkout.as_str())
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "switch workspace differs from its target registration",
+                    ));
+                }
+                if let Some(workspace) = prepared.workspace.as_ref()
+                    && (workspace.repo_path != target.checkout
+                        || workspace.repo_common_dir != target.repo_common_dir
+                        || workspace.project != target.checkout)
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "switch workspace preparation differs from its target registration",
+                    ));
+                }
                 let current = {
                     let store = self.inner.store.lock().await;
                     store
@@ -199,20 +215,11 @@ impl Router {
                 }
                 prepared.request.args["registered_project"] = json!(target.id);
                 prepared.request.args[SWITCH_PROJECT_REVISION_ARG] = json!(target.revision);
+            } else {
+                prepared.request.args["registered_project"] = json!(source.project);
             }
             if scope.is_empty() {
                 prepared.request.args[SWITCH_BLANK_SCOPE_ARG] = json!(true);
-            }
-            if let Some(workspace) = &mut prepared.workspace {
-                // The frozen preparation belongs to the target execution
-                // project (it must stay non-blank); the authorization scope
-                // stays on the launch args for handoff.
-                workspace.project = target
-                    .as_ref()
-                    .map(|registration| registration.id.clone())
-                    .unwrap_or_else(|| scope.clone());
-                prepared.request.args["workspace_preparation"] = serde_json::to_value(workspace)
-                    .map_err(|_| Error::new("internal", "cannot encode switch workspace"))?;
             }
             let policy = self.secret_policy_snapshot();
             if policy.contains_value(&prepared.request.args) {
@@ -358,6 +365,94 @@ mod tests {
             Some("/elsewhere"),
             &Some(prepared_input(None))
         ));
+    }
+
+    #[tokio::test]
+    async fn targeted_continuation_requests_standard_worktree_in_shared_project_and_keeps_canonical_checkout()
+     {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("eliot-k185b-shared-continue-{}", ulid::Ulid::new()));
+        let _guard = crate::test_support::TempDir::own(root.clone());
+        let checkout_path = root.join("checkout");
+        let data_root = root.join("data");
+        std::fs::create_dir_all(&checkout_path).unwrap();
+        std::fs::create_dir_all(&data_root).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&checkout_path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.name", "ELIOT test"]);
+        git(&["config", "user.email", "eliot-test@example.invalid"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "base"]);
+        let (checkout, repo_common_dir) = crate::workspace_git::WorkspaceGit::new()
+            .unwrap()
+            .repository_identity(&checkout_path.to_string_lossy())
+            .await
+            .unwrap();
+        std::fs::write(
+            data_root.join("config.toml"),
+            format!(
+                "[profiles.fixture]\nharness = \"codex\"\nmodel = \"fixture-model\"\n[projects.shared_app]\npath = {checkout:?}\nworkspace = \"shared\"\nprofiles = [\"fixture\"]\nactions = [\"launch\"]\n"
+            ),
+        )
+        .unwrap();
+        let router = super::super::tests::router_with_data_root(data_root);
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .upsert_project_registration(
+                    "owner",
+                    &ProjectRegistrationInput {
+                        id: "shared_app".to_owned(),
+                        checkout: checkout.clone(),
+                        repo_common_dir: repo_common_dir.clone(),
+                        git: None,
+                        profiles: vec!["fixture".to_owned()],
+                        actions: vec!["launch".to_owned()],
+                        interpreters: std::collections::BTreeMap::new(),
+                        run_env: Vec::new(),
+                    },
+                    now_ms(),
+                )
+                .unwrap();
+        }
+        let launch_spec = eliot_core::api::SwitchLaunch {
+            profile: Some("fixture".to_owned()),
+            harness: None,
+            model: None,
+            effort: None,
+            auth: None,
+            cmd: None,
+            access: None,
+            project: Some("shared_app".to_owned()),
+            workspace: None,
+            worktree: None,
+            base: None,
+        };
+        let mut launch = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        launch.args = launch_spec.args(&checkout).unwrap();
+        launch.args["worktree"] = json!("");
+        let prepared = router
+            .prepare_submission_after_authorization(launch, &Principal::Owner, false, false)
+            .await
+            .unwrap();
+        let workspace = prepared
+            .workspace
+            .expect("shared project continuation still prepares a standard worktree");
+        assert_eq!(workspace.project, checkout);
+        assert_eq!(workspace.repo_path, checkout);
+        assert_eq!(workspace.repo_common_dir, repo_common_dir);
+        assert_eq!(
+            prepared.request.args["registered_project"].as_str(),
+            Some("shared_app")
+        );
     }
 
     #[tokio::test]

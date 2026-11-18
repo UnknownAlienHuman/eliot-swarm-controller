@@ -621,8 +621,14 @@ fn admit_target(
     blank_scope: bool,
     preparation: Option<core::WorkspacePreparationInput>,
 ) -> String {
+    let workspace = s
+        .get_project_registration("owner", registered_project)
+        .ok()
+        .flatten()
+        .map(|registration| registration.checkout)
+        .unwrap_or_else(|| format!("/managed/{registered_project}"));
     let mut c = SubmitCommand::new(plan.launch_command.clone(), "launch");
-    c.args = json!({"project":scope,"workspace":"switch-unit","harness":"antigravity","model":"gemini-4-hydrogen-low","profile":"new","profile_snapshot":{"control":"tree","model":"gemini-4-hydrogen-low"},"registered_project":registered_project});
+    c.args = json!({"project":scope,"workspace":workspace,"harness":"antigravity","model":"gemini-4-hydrogen-low","profile":"new","profile_snapshot":{"control":"tree","model":"gemini-4-hydrogen-low"},"registered_project":registered_project});
     if let Some(revision) = revision {
         c.args[core::api::SWITCH_PROJECT_REVISION_ARG] = json!(revision);
     }
@@ -813,11 +819,27 @@ fn switch_chat_source_continues_into_a_project_with_blank_scope() {
 #[test]
 fn switch_continue_accepts_preparation_bound_to_the_target_project() {
     let mut s = Store::open(Path::new(":memory:")).unwrap();
-    register_project(&mut s, "app");
+    let root = std::env::temp_dir().join(format!("eliot-k185-{}", Ulid::new()));
+    let repo = root.join("repo");
+    let checkout = repo.to_string_lossy().into_owned();
+    let common_dir = repo.join(".git").to_string_lossy().into_owned();
     let revision = s
-        .get_project_registration("owner", "app")
+        .upsert_project_registration(
+            "owner",
+            &ProjectRegistrationInput {
+                id: "app".into(),
+                checkout: checkout.clone(),
+                repo_common_dir: common_dir.clone(),
+                git: None,
+                profiles: vec!["approved".into()],
+                actions: vec!["launch".into()],
+                interpreters: std::collections::BTreeMap::new(),
+                run_env: Vec::new(),
+            },
+            now(),
+        )
         .unwrap()
-        .unwrap()
+        .value
         .revision;
     let (a, task) = chat_source(&mut s);
     let request = SwitchRequest {
@@ -832,14 +854,14 @@ fn switch_continue_accepts_preparation_bound_to_the_target_project() {
         .unwrap(),
     };
     let plan = begin(&mut s, &request);
-    // The worker freezes the target worktree before admission; the frozen
-    // preparation carries the target project, not the blank source scope.
-    let root = std::env::temp_dir().join(format!("eliot-k185-{}", Ulid::new()));
-    let repo = root.join("repo");
+    // The workspace record keeps the canonical checkout, and P's ID travels
+    // separately in `registered_project`, so project-scoped automation accepts
+    // B's ready worktree. A preparation whose project, checkout, or common dir
+    // differs from the selected registration is refused before admission.
     let preparation = core::WorkspacePreparationInput {
-        project: "app".to_owned(),
-        repo_path: repo.to_string_lossy().into_owned(),
-        repo_common_dir: repo.join(".git").to_string_lossy().into_owned(),
+        project: checkout.clone(),
+        repo_path: checkout.clone(),
+        repo_common_dir: common_dir.clone(),
         requested_branch: "swarm/k185-continue".to_owned(),
         base_ref: None,
         base_oid: "0".repeat(40),
@@ -847,6 +869,39 @@ fn switch_continue_accepts_preparation_bound_to_the_target_project() {
         frozen_setup: Vec::new(),
         generated: None,
     };
+    for bad in [
+        core::WorkspacePreparationInput {
+            project: "app".to_owned(),
+            ..preparation.clone()
+        },
+        core::WorkspacePreparationInput {
+            repo_path: root.join("other").to_string_lossy().into_owned(),
+            ..preparation.clone()
+        },
+        core::WorkspacePreparationInput {
+            repo_common_dir: root.join("other/.git").to_string_lossy().into_owned(),
+            ..preparation.clone()
+        },
+    ] {
+        let mut c = SubmitCommand::new(plan.launch_command.clone(), "launch");
+        c.args = json!({
+            "project": "",
+            "workspace": checkout,
+            "harness": "antigravity",
+            "model": "gemini-4-hydrogen-low",
+            "profile": "new",
+            "profile_snapshot": {"control": "tree", "model": "gemini-4-hydrogen-low"},
+            "registered_project": "app",
+            core::api::SWITCH_PROJECT_REVISION_ARG: revision,
+            core::api::SWITCH_BLANK_SCOPE_ARG: true,
+        });
+        assert_eq!(
+            s.admit_switch_launch(&request.id, c, Some(bad), now())
+                .unwrap_err()
+                .code,
+            "not_allowed"
+        );
+    }
     let b = admit_target(
         &mut s,
         &request.id,
@@ -889,7 +944,7 @@ fn switch_continue_accepts_preparation_bound_to_the_target_project() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(stored, "app");
+    assert_eq!(stored, checkout);
     let continued: Option<String> = s
         .connection
         .query_row(
@@ -899,4 +954,319 @@ fn switch_continue_accepts_preparation_bound_to_the_target_project() {
         )
         .unwrap();
     assert_eq!(continued.as_deref(), Some(a.as_str()));
+}
+
+#[test]
+fn switch_marker_rechecks_registration_revision_and_identity_before_git_setup_and_dispatch() {
+    let mut s = Store::open(Path::new(":memory:")).unwrap();
+    let root = std::env::temp_dir().join(format!("eliot-k185b-gate-{}", Ulid::new()));
+    let repo = root.join("repo");
+    let checkout = repo.to_string_lossy().into_owned();
+    let common_dir = repo.join(".git").to_string_lossy().into_owned();
+    let input = ProjectRegistrationInput {
+        id: "app".into(),
+        checkout: checkout.clone(),
+        repo_common_dir: common_dir.clone(),
+        git: None,
+        profiles: vec!["approved".into()],
+        actions: vec!["launch".into()],
+        interpreters: std::collections::BTreeMap::new(),
+        run_env: Vec::new(),
+    };
+    let revision = s
+        .upsert_project_registration("owner", &input, now())
+        .unwrap()
+        .value
+        .revision;
+    let (a, task) = chat_source(&mut s);
+    let request = SwitchRequest {
+        id: Ulid::new().to_string(),
+        from: a,
+        from_generation: 1,
+        task_command: task.clone(),
+        commands: vec![task],
+        launch: serde_json::from_value::<SwitchLaunch>(
+            json!({"harness":"antigravity","model":"gemini-4-hydrogen-low","project":"app"}),
+        )
+        .unwrap(),
+    };
+    let plan = begin(&mut s, &request);
+    let setup_step = core::WorkspaceSetup {
+        program: core::FrozenSetupFile {
+            canonical_path: repo
+                .join("scripts/setup.cmd")
+                .to_string_lossy()
+                .into_owned(),
+            size: 12,
+            sha256: "a".repeat(64),
+        },
+        args: Vec::new(),
+        timeout_ms: 5_000,
+    };
+    let preparation = core::WorkspacePreparationInput {
+        project: checkout.clone(),
+        repo_path: checkout.clone(),
+        repo_common_dir: common_dir.clone(),
+        requested_branch: "swarm/k185b-gate".to_owned(),
+        base_ref: None,
+        base_oid: "0".repeat(40),
+        worktree_path: root.join("wt").to_string_lossy().into_owned(),
+        frozen_setup: vec![setup_step],
+        generated: None,
+    };
+    let b = admit_target(
+        &mut s,
+        &request.id,
+        &plan,
+        "",
+        "app",
+        Some(revision),
+        true,
+        Some(preparation.clone()),
+    );
+    let current = s.get_workspace(&b).unwrap().unwrap();
+
+    // 1. A registration revision change before Git refuses `begin_workspace_git_effect`.
+    let mut bumped = input.clone();
+    bumped.actions.push("send".into());
+    s.upsert_project_registration("owner", &bumped, now())
+        .unwrap();
+    assert_eq!(
+        s.begin_workspace_git_effect(&plan.launch_command, &current, now())
+            .unwrap_err()
+            .code,
+        "stale_assignment"
+    );
+    // Restore the expected revision and reserve Git, then settle creation to SetupReady.
+    s.connection
+        .execute(
+            "UPDATE project_registrations SET revision=?1 WHERE id='app'",
+            [revision],
+        )
+        .unwrap();
+    assert_eq!(
+        s.begin_workspace_git_effect(&plan.launch_command, &current, now())
+            .unwrap(),
+        crate::WorkspaceGitReservation::Reserved
+    );
+    let setup_ready = s
+        .settle_workspace_creation(
+            &plan.launch_command,
+            1,
+            core::WorkspaceCreationOutcome::Verified {
+                repo_path: preparation.repo_path.clone(),
+                repo_common_dir: preparation.repo_common_dir.clone(),
+                worktree_path: preparation.worktree_path.clone(),
+                branch: preparation.requested_branch.clone(),
+                head: preparation.base_oid.clone(),
+            },
+            now(),
+        )
+        .unwrap()
+        .value;
+    assert_eq!(setup_ready.phase, core::WorkspacePhase::SetupReady);
+
+    // 2. A registration change before setup refuses `begin_workspace_setup`.
+    s.upsert_project_registration("owner", &input, now())
+        .unwrap();
+    assert_eq!(
+        s.begin_workspace_setup(&plan.launch_command, 1, 0, now())
+            .unwrap_err()
+            .code,
+        "stale_assignment"
+    );
+    s.connection
+        .execute(
+            "UPDATE project_registrations SET revision=?1 WHERE id='app'",
+            [revision],
+        )
+        .unwrap();
+    s.begin_workspace_setup(&plan.launch_command, 1, 0, now())
+        .unwrap();
+
+    // 3. A registration change while setup is running stops native dispatch,
+    // and pre-dispatch rejection settles the launch and its workspace cleanly.
+    s.upsert_project_registration("owner", &bumped, now())
+        .unwrap();
+    let ready_ws = s
+        .settle_workspace_setup(
+            &plan.launch_command,
+            1,
+            0,
+            core::WorkspaceSetupOutcome::Succeeded,
+            now(),
+        )
+        .unwrap()
+        .value;
+    assert_eq!(ready_ws.phase, core::WorkspacePhase::Ready);
+    assert_eq!(
+        s.dispatch(&plan.launch_command, now()).unwrap_err().code,
+        "stale_assignment"
+    );
+    // Identity drift at the same revision also refuses before dispatch.
+    s.connection
+        .execute(
+            "UPDATE project_registrations SET revision=?1, repo_common_dir=?2 WHERE id='app'",
+            params![
+                revision,
+                root.join(" swapped/.git").to_string_lossy().into_owned()
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        s.dispatch(&plan.launch_command, now()).unwrap_err().code,
+        "not_allowed"
+    );
+    let settled = s
+        .settle(
+            &plan.launch_command,
+            CommandState::Rejected,
+            Some(json!({"reason": "stale_assignment"})),
+            now(),
+        )
+        .unwrap()
+        .value;
+    assert_eq!(settled.state, CommandState::Rejected);
+    assert_eq!(
+        s.get_workspace(&b).unwrap().unwrap().phase,
+        core::WorkspacePhase::Failed
+    );
+    assert_eq!(s.get_agent(&b).unwrap().unwrap().state, AgentState::Failed);
+}
+
+#[test]
+fn pre_v65_switch_without_project_field_replays_with_identical_digest() {
+    let (mut s, mut r) = setup();
+    r.launch.project = None;
+    let encoded = serde_json::to_value(&r).unwrap();
+    assert!(encoded["launch"].get("project").is_none());
+    let first = s
+        .reserve_switch("owner", &r, &core::SecretPolicy::default(), now())
+        .unwrap()
+        .value;
+    let replayed = s.replay_switch("owner", &r).unwrap().unwrap();
+    assert_eq!(replayed.launch_command, first.launch_command);
+    assert_eq!(replayed.handoff_command, first.handoff_command);
+}
+
+#[test]
+fn ordinary_switch_after_continuation_uses_execution_project_and_preserves_both_fields() {
+    let mut s = Store::open(Path::new(":memory:")).unwrap();
+    register_project(&mut s, "app");
+    let revision = s
+        .get_project_registration("owner", "app")
+        .unwrap()
+        .unwrap()
+        .revision;
+    let (a, task) = chat_source(&mut s);
+    let first = SwitchRequest {
+        id: Ulid::new().to_string(),
+        from: a,
+        from_generation: 1,
+        task_command: task.clone(),
+        commands: vec![task],
+        launch: serde_json::from_value::<SwitchLaunch>(
+            json!({"harness":"antigravity","model":"gemini-4-hydrogen-low","project":"app"}),
+        )
+        .unwrap(),
+    };
+    let plan1 = begin(&mut s, &first);
+    let b = admit_target(
+        &mut s,
+        &first.id,
+        &plan1,
+        "",
+        "app",
+        Some(revision),
+        true,
+        None,
+    );
+    ready(&mut s, &plan1.launch_command, &b);
+    let finished1 = s
+        .finish_switch(&first.id, &core::SecretPolicy::default(), now())
+        .unwrap()
+        .value;
+    assert_eq!(finished1.state, CommandState::Applied);
+    let b_task = finished1.handoff.unwrap().children[0].clone();
+    let b_agent = s.get_agent(&b).unwrap().unwrap();
+    assert_eq!(b_agent.project, "app");
+    assert_eq!(b_agent.project_scope(), "");
+
+    // Settle B's transferred brief so B is quiescent for the next ordinary switch.
+    s.dispatch(&b_task, now()).unwrap();
+    s.put_batch(
+        SourceBatch {
+            batch_id: Ulid::new().to_string(),
+            agent_id: b.clone(),
+            generation: 1,
+            source: "stream".into(),
+            cursor: None,
+            events: vec![
+                NativeEvent {
+                    ts: None,
+                    kind: "turn.started".into(),
+                    native_id: "b-turn-start".into(),
+                    data: json!({"turn_id": "t1", "command_id": b_task}),
+                },
+                NativeEvent {
+                    ts: None,
+                    kind: "turn.completed".into(),
+                    native_id: "b-turn-done".into(),
+                    data: json!({"turn_id": "t1", "command_id": b_task, "status": "ok", "final_text": "ready"}),
+                },
+            ],
+        },
+        now(),
+    )
+    .unwrap();
+    s.settle(
+        &b_task,
+        CommandState::Applied,
+        Some(json!({"turn_id": "t1"})),
+        now(),
+    )
+    .unwrap();
+
+    // Ordinary switch of B (launch.project is None): B's execution project is
+    // "app" and its authorization namespace is "", so no target is required
+    // and C preserves both fields.
+    let second = SwitchRequest {
+        id: Ulid::new().to_string(),
+        from: b.clone(),
+        from_generation: 1,
+        task_command: b_task,
+        commands: Vec::new(),
+        launch: serde_json::from_value::<SwitchLaunch>(
+            json!({"harness":"antigravity","model":"gemini-4-hydrogen-low"}),
+        )
+        .unwrap(),
+    };
+    let plan2 = begin(&mut s, &second);
+    let mut wrong_project = SubmitCommand::new(plan2.launch_command.clone(), "launch");
+    wrong_project.args = json!({
+        "project": "",
+        "workspace": "/managed/app",
+        "harness": "antigravity",
+        "model": "gemini-4-hydrogen-low",
+        "profile": "new",
+        "profile_snapshot": {"control": "tree", "model": "gemini-4-hydrogen-low"},
+        core::api::SWITCH_BLANK_SCOPE_ARG: true,
+    });
+    assert_eq!(
+        s.admit_switch_launch(&second.id, wrong_project, None, now())
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+    let c = admit_target(&mut s, &second.id, &plan2, "", "app", None, true, None);
+    let c_agent = s.get_agent(&c).unwrap().unwrap();
+    assert_eq!(c_agent.project, "app");
+    assert_eq!(c_agent.project_scope(), "");
+    ready(&mut s, &plan2.launch_command, &c);
+    let finished2 = s
+        .finish_switch(&second.id, &core::SecretPolicy::default(), now())
+        .unwrap()
+        .value;
+    assert_eq!(finished2.state, CommandState::Applied);
+    assert_eq!(finished2.handoff.unwrap().to, c);
 }

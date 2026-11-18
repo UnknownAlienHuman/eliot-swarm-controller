@@ -261,10 +261,24 @@ impl Store {
                         "switch workspace differs from its target registration",
                     ));
                 }
-                if let Some(input) = preparation.as_ref() {
-                    if input.repo_path != registration.checkout
+                if let Some(input) = preparation.as_ref()
+                    && (input.repo_path != registration.checkout
                         || input.repo_common_dir != registration.repo_common_dir
-                        || input.project != registration.checkout
+                        || input.project != registration.checkout)
+                {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "switch workspace preparation differs from its target registration",
+                    ));
+                }
+                if let Some(preparation) = request.args.get("workspace_preparation") {
+                    let repo_path = preparation.get("repo_path").and_then(Value::as_str);
+                    let repo_common_dir =
+                        preparation.get("repo_common_dir").and_then(Value::as_str);
+                    let preparation_project = preparation.get("project").and_then(Value::as_str);
+                    if repo_path != Some(registration.checkout.as_str())
+                        || repo_common_dir != Some(registration.repo_common_dir.as_str())
+                        || preparation_project != Some(registration.checkout.as_str())
                     {
                         return Err(Error::new(
                             "not_allowed",
@@ -272,20 +286,24 @@ impl Store {
                         ));
                     }
                 }
-            } else if agent.project != agent.project_scope() {
-                // An ordinary switch after a continuation preserves both the
-                // execution project and the authorization scope.
-                if request
-                    .args
-                    .get("registered_project")
-                    .and_then(Value::as_str)
-                    != Some(agent.project.as_str())
-                {
-                    return Err(Error::new(
-                        "not_allowed",
-                        "switch must keep the source execution project",
-                    ));
-                }
+            } else if request
+                .args
+                .get("registered_project")
+                .and_then(Value::as_str)
+                .is_some_and(|project| project != agent.project)
+                || (agent.project != agent.project_scope()
+                    && request
+                        .args
+                        .get("registered_project")
+                        .and_then(Value::as_str)
+                        != Some(agent.project.as_str()))
+            {
+                // An ordinary switch preserves both the execution project and
+                // the authorization scope.
+                return Err(Error::new(
+                    "not_allowed",
+                    "switch must keep the source execution project",
+                ));
             }
             if load_command(&tx, &request.id)?.is_some()
                 && component(&tx, id, &request.id, 0)?.is_none()

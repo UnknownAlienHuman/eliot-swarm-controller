@@ -886,13 +886,20 @@ pub(super) fn check_dispatch(conn: &Connection, command: &CommandRecord) -> Resu
                 "switch workspace differs from its target registration",
             ));
         }
+        if let Some(agent_num) = command.target
+            && let Some(workspace) = workspace::load_workspace(conn, agent_num)?
+            && (workspace.repo_path != registration.checkout
+                || workspace.repo_common_dir != registration.repo_common_dir
+                || workspace.project != registration.checkout)
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "switch workspace preparation differs from its target registration",
+            ));
+        }
         if let Some(preparation) = command.command.args.get("workspace_preparation") {
-            let repo_path = preparation
-                .get("repo_path")
-                .and_then(Value::as_str);
-            let repo_common_dir = preparation
-                .get("repo_common_dir")
-                .and_then(Value::as_str);
+            let repo_path = preparation.get("repo_path").and_then(Value::as_str);
+            let repo_common_dir = preparation.get("repo_common_dir").and_then(Value::as_str);
             let preparation_project = preparation.get("project").and_then(Value::as_str);
             if repo_path != Some(registration.checkout.as_str())
                 || repo_common_dir != Some(registration.repo_common_dir.as_str())
