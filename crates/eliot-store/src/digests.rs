@@ -57,6 +57,14 @@ pub enum DigestRegisterOutcome {
     Retained,
 }
 
+/// One pending digest page plus the cycle high-water read in the same Store
+/// transaction, so the bound and the rows can never disagree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingDigestPage {
+    pub rows: Vec<DigestRow>,
+    pub high_water: Option<(i64, String)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DigestRegistered {
     pub row: DigestRow,
@@ -84,6 +92,57 @@ struct StoredDigestRow {
     delivered_at: Option<i64>,
     payload_digest: Vec<u8>,
     hidden_json: String,
+}
+
+/// One pending page of stored rows after a keyset cursor, oldest first.
+/// Takes the connection (or an open read transaction dereferencing to one) so
+/// the standalone page read and the atomic high-water-plus-page snapshot
+/// share one query shape: seek from the cursor by key, never from the start
+/// of the pending partition.
+fn pending_page_rows(
+    connection: &rusqlite::Connection,
+    after: Option<(i64, &str)>,
+    limit: usize,
+) -> Result<Vec<StoredDigestRow>> {
+    let limit = limit.clamp(1, 256) as i64;
+    let mut sql = String::from(
+        "SELECT id, parent, mode, commands, turns, requester, created_at, delivered_mail_id, delivered_at, payload_digest, hidden
+         FROM completion_digests INDEXED BY completion_digests_pending_cursor WHERE delivered_at IS NULL",
+    );
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some((created_at, id)) = after {
+        sql.push_str(" AND (created_at > ?1 OR (created_at = ?2 AND id > ?3))");
+        params.push(rusqlite::types::Value::from(created_at));
+        params.push(rusqlite::types::Value::from(created_at));
+        params.push(rusqlite::types::Value::from(id.to_owned()));
+        sql.push_str(" ORDER BY created_at ASC, id ASC LIMIT ?4");
+    } else {
+        sql.push_str(" ORDER BY created_at ASC, id ASC LIMIT ?1");
+    }
+    params.push(rusqlite::types::Value::from(limit));
+    let mut stmt = connection.prepare(&sql).map_err(sql_error)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(StoredDigestRow {
+                id: row.get(0)?,
+                parent: row.get(1)?,
+                mode: row.get(2)?,
+                commands_json: row.get(3)?,
+                turns_json: row.get(4)?,
+                requester: row.get(5)?,
+                created_at: row.get(6)?,
+                delivered_mail_id: row.get(7)?,
+                delivered_at: row.get(8)?,
+                payload_digest: row.get(9)?,
+                hidden_json: row.get(10)?,
+            })
+        })
+        .map_err(sql_error)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(sql_error)?);
+    }
+    Ok(out)
 }
 
 fn parse_row(stored: StoredDigestRow) -> Result<DigestRow> {
@@ -307,6 +366,12 @@ impl Store {
     /// snapshots this at sweep start so the sweep wraps when the cursor
     /// passes the end of the eligible set observed at that tick, instead of
     /// chasing newly arriving registrations forever.
+    ///
+    /// The high-water and the page below must be read together with
+    /// [`Self::pending_completion_digests_page`]: separate locks let the
+    /// queue change between the two reads (an empty high-water with rows on
+    /// the page leaves the sweep with no wrap bound, so full pages of new
+    /// registrations prevent wrapping indefinitely).
     pub fn pending_completion_digests_max(&self) -> Result<Option<(i64, String)>> {
         self.ensure_committed_reads()?;
         let row: Option<(i64, String)> = self
@@ -329,46 +394,45 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<DigestRow>> {
         self.ensure_committed_reads()?;
-        let limit = limit.clamp(1, 256) as i64;
-        let mut sql = String::from(
-            "SELECT id, parent, mode, commands, turns, requester, created_at, delivered_mail_id, delivered_at, payload_digest, hidden
-             FROM completion_digests INDEXED BY completion_digests_pending_cursor WHERE delivered_at IS NULL",
-        );
-        let mut params: Vec<rusqlite::types::Value> = Vec::new();
-        if let Some((created_at, id)) = after {
-            sql.push_str(" AND (created_at > ?1 OR (created_at = ?2 AND id > ?3))");
-            params.push(rusqlite::types::Value::from(created_at));
-            params.push(rusqlite::types::Value::from(created_at));
-            params.push(rusqlite::types::Value::from(id.to_owned()));
-            sql.push_str(" ORDER BY created_at ASC, id ASC LIMIT ?4");
-        } else {
-            sql.push_str(" ORDER BY created_at ASC, id ASC LIMIT ?1");
-        }
-        params.push(rusqlite::types::Value::from(limit));
-        let mut stmt = self.connection.prepare(&sql).map_err(sql_error)?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                Ok(StoredDigestRow {
-                    id: row.get(0)?,
-                    parent: row.get(1)?,
-                    mode: row.get(2)?,
-                    commands_json: row.get(3)?,
-                    turns_json: row.get(4)?,
-                    requester: row.get(5)?,
-                    created_at: row.get(6)?,
-                    delivered_mail_id: row.get(7)?,
-                    delivered_at: row.get(8)?,
-                    payload_digest: row.get(9)?,
-                    hidden_json: row.get(10)?,
-                })
-            })
-            .map_err(sql_error)?;
         let mut out = Vec::new();
-        for row in rows {
-            let stored = row.map_err(sql_error)?;
+        for stored in pending_page_rows(&self.connection, after, limit)? {
             out.push(parse_row(stored)?);
         }
         Ok(out)
+    }
+
+    /// High-water plus one pending page in a single read transaction. The
+    /// driver snapshots the cycle high-water and reads its first page here,
+    /// and re-reads the head page here when a sweep wraps, so the bound and
+    /// the rows can never disagree: a non-empty page always carries a
+    /// high-water, and an empty queue always reads back empty. Continuation
+    /// ticks within a sweep keep the captured bound and read only the page
+    /// with [`Self::pending_completion_digests_after`].
+    pub fn pending_completion_digests_page(
+        &mut self,
+        after: Option<(i64, &str)>,
+        limit: usize,
+    ) -> Result<PendingDigestPage> {
+        self.ensure_committed_reads()?;
+        let tx = self.connection.transaction().map_err(sql_error)?;
+        let high_water: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT created_at, id FROM completion_digests
+                 WHERE delivered_at IS NULL
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let mut rows = Vec::new();
+        for stored in pending_page_rows(&tx, after, limit)? {
+            rows.push(parse_row(stored)?);
+        }
+        // Read-only snapshot: rolling back releases the shared lock with no
+        // writes to persist.
+        drop(tx);
+        Ok(PendingDigestPage { rows, high_water })
     }
 
     /// Mark a pending digest delivered inside the caller's transaction.
@@ -951,6 +1015,51 @@ mod tests {
             .expect("live max")
             .expect("pending");
         assert!(live_max >= end);
+    }
+
+    #[test]
+    fn pending_page_snapshots_high_water_with_first_page_atomically() {
+        let mut store = open_store();
+        let now = now_ms();
+        let parent = ready_agent(&mut store, "p", now);
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let id = ulid::Ulid::new().to_string();
+            let req = digest_request(&id, &parent);
+            store
+                .digest_register("owner", &req, &[false], now + index)
+                .expect("register");
+            ids.push(id);
+        }
+        // High-water and first page come from one transaction: the bound
+        // always agrees with the rows, so a non-empty page carries a
+        // high-water and an empty queue reads back empty with none. The
+        // page starts at the oldest row and seeks past the cursor by key.
+        let snapshot = store
+            .pending_completion_digests_page(None, 50)
+            .expect("snapshot page");
+        assert_eq!(snapshot.rows.len(), 3);
+        assert_eq!(snapshot.rows[0].id, ids[0]);
+        let end = snapshot
+            .high_water
+            .expect("non-empty page carries a high-water");
+        assert_eq!(end.1, ids[2]);
+        let cursor = snapshot
+            .rows
+            .last()
+            .map(|row| (row.created_at, row.id.clone()))
+            .expect("cursor");
+        let tail = store
+            .pending_completion_digests_page(Some((cursor.0, cursor.1.as_str())), 50)
+            .expect("tail page");
+        assert!(tail.rows.is_empty());
+        assert_eq!(tail.high_water.map(|end| end.1), Some(ids[2].clone()));
+        let mut empty = Store::open(std::path::Path::new(":memory:")).expect("open Store");
+        let snapshot = empty
+            .pending_completion_digests_page(None, 50)
+            .expect("empty snapshot");
+        assert!(snapshot.rows.is_empty());
+        assert_eq!(snapshot.high_water, None);
     }
 
     #[test]

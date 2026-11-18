@@ -27,6 +27,38 @@ use tokio::{
 const DIGEST_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const DIGEST_POLL_PAGE: usize = 50;
 
+/// Pending digest keyset position: `(created_at, id)`.
+type DigestCursorKey = (i64, String);
+
+/// Next sweep cursor and high-water after one page read. `last` is the last
+/// key of the page just read (`None` for an empty page) and `end` is the
+/// cycle high-water captured with the sweep's first page.
+///
+/// Wrap (reset both to `None`) when the page is empty, when the cursor
+/// reaches or passes the captured high-water, or when the page is short
+/// before the bound (rows delivered mid-sweep drained it): each of those ends
+/// the cycle at the head. A non-empty page with no bound also wraps so the
+/// next tick re-snapshots instead of chasing without a bound. Otherwise the
+/// cursor advances past the page and the bound is kept. A sweep therefore
+/// always ends within a bounded number of pages however fast new rows arrive,
+/// and the head is revisited every cycle.
+fn advance_digest_poll(
+    last: Option<DigestCursorKey>,
+    page_len: usize,
+    end: Option<DigestCursorKey>,
+) -> (Option<DigestCursorKey>, Option<DigestCursorKey>) {
+    let Some(last_key) = last else {
+        return (None, None);
+    };
+    if end.as_ref().is_none_or(|end| last_key >= *end) {
+        return (None, None);
+    }
+    if page_len < DIGEST_POLL_PAGE {
+        return (None, None);
+    }
+    (Some(last_key), end)
+}
+
 fn wait_request_for_digest(request: &SwarmDigestRequest) -> SwarmWaitRequest {
     SwarmWaitRequest::new(
         request.commands.clone(),
@@ -253,23 +285,28 @@ impl Router {
     /// full mailbox stays pending for the next tick. The page seeks after the
     /// last examined registration through the pending keyset cursor and the
     /// cursor advances past every examined row, wrapping once it passes the
-    /// sweep high-water observed at sweep start. New registrations that arrive
-    /// mid-sweep join the next sweep, so a continuously growing tail cannot
-    /// starve an older registration that becomes eligible behind the cursor:
-    /// every registration observed at sweep start is revisited once per sweep.
+    /// sweep high-water snapshotted with the first page of the sweep. The
+    /// high-water and each cycle-start page are read in one Store transaction,
+    /// so an empty high-water can never pair with a populated page (the race
+    /// that left a sweep with no wrap bound while full pages of new
+    /// registrations kept arriving). New registrations that arrive mid-sweep
+    /// join the next sweep, so a continuously growing tail cannot starve an
+    /// older registration that becomes eligible behind the cursor: every
+    /// registration observed at sweep start is revisited once per sweep, and
+    /// every sweep ends within one bounded cycle.
     pub(crate) async fn poll_completion_digests_once(&self) -> Result<usize> {
         let after: Option<(i64, String)> = self.inner.digest_poll_cursor.lock_recover().clone();
-        // Snapshot the sweep high-water when starting a new sweep so the wrap
-        // bound is the eligible set observed at that tick, not a tail that
-        // keeps growing while the sweep runs.
-        if after.is_none() && self.inner.digest_sweep_end.lock_recover().is_none() {
-            let end = {
-                let store = self.inner.store.lock().await;
-                store.pending_completion_digests_max()?
+        // A new sweep snapshots its high-water together with its first page
+        // in one Store transaction; continuation ticks keep the captured
+        // bound and read only the page.
+        let mut pending: Vec<DigestRow> = if after.is_none() {
+            let snapshot = {
+                let mut store = self.inner.store.lock().await;
+                store.pending_completion_digests_page(None, DIGEST_POLL_PAGE)?
             };
-            *self.inner.digest_sweep_end.lock_recover() = end;
-        }
-        let mut pending: Vec<DigestRow> = {
+            *self.inner.digest_sweep_end.lock_recover() = snapshot.high_water;
+            snapshot.rows
+        } else {
             let store = self.inner.store.lock().await;
             let after = after
                 .as_ref()
@@ -280,48 +317,19 @@ impl Router {
             // Swept past the newest row: wrap to the oldest so registrations
             // behind the old cursor are examined on this same tick, starting
             // a new sweep with a fresh high-water below.
-            *self.inner.digest_sweep_end.lock_recover() = None;
-            pending = {
-                let store = self.inner.store.lock().await;
-                store.pending_completion_digests_after(None, DIGEST_POLL_PAGE)?
+            let snapshot = {
+                let mut store = self.inner.store.lock().await;
+                store.pending_completion_digests_page(None, DIGEST_POLL_PAGE)?
             };
-            if pending.is_empty() {
-                *self.inner.digest_poll_cursor.lock_recover() = None;
-            } else if let Some(last) = pending.last() {
-                *self.inner.digest_poll_cursor.lock_recover() =
-                    Some((last.created_at, last.id.clone()));
-                // A single-page sweep that already reached its end wraps next
-                // tick: seed the high-water when the page is short or at the
-                // bound observed at sweep start.
-                let end = {
-                    let store = self.inner.store.lock().await;
-                    store.pending_completion_digests_max()?
-                };
-                *self.inner.digest_sweep_end.lock_recover() = end;
-            }
-        } else if let Some(last) = pending.last() {
-            let last_key = (last.created_at, last.id.clone());
-            *self.inner.digest_poll_cursor.lock_recover() = Some(last_key.clone());
-            // Wrap once the cursor passes the sweep high-water: the next tick
-            // restarts at the oldest row even though later pages are still
-            // populated by registrations that arrived after the sweep began.
-            let wrapped = {
-                let end = self.inner.digest_sweep_end.lock_recover().clone();
-                end.is_some_and(|end| last_key >= end)
-            };
-            if wrapped {
-                *self.inner.digest_poll_cursor.lock_recover() = None;
-                *self.inner.digest_sweep_end.lock_recover() = None;
-            } else if pending.len() < DIGEST_POLL_PAGE {
-                // Short page before the recorded high-water (deliveries
-                // drained rows mid-sweep): wrap next tick as well so the head
-                // is revisited without waiting for an empty page.
-                *self.inner.digest_poll_cursor.lock_recover() = None;
-                *self.inner.digest_sweep_end.lock_recover() = None;
-            }
-        } else {
-            *self.inner.digest_poll_cursor.lock_recover() = None;
-            *self.inner.digest_sweep_end.lock_recover() = None;
+            *self.inner.digest_sweep_end.lock_recover() = snapshot.high_water;
+            pending = snapshot.rows;
+        }
+        {
+            let end = self.inner.digest_sweep_end.lock_recover().clone();
+            let last = pending.last().map(|row| (row.created_at, row.id.clone()));
+            let (cursor, sweep_end) = advance_digest_poll(last, pending.len(), end);
+            *self.inner.digest_poll_cursor.lock_recover() = cursor;
+            *self.inner.digest_sweep_end.lock_recover() = sweep_end;
         }
         let mut delivered = 0;
         for row in pending {
@@ -405,6 +413,90 @@ mod tests {
         // Owner recomputation never clears a registration-time mask.
         let masked = masked_results(masked, &[false, true]);
         assert_eq!(masked[1].status, "not_visible");
+    }
+
+    #[test]
+    fn digest_poll_advance_wraps_at_bound_and_on_short_pages() {
+        let key = |created_at: i64| Some((created_at, format!("id-{created_at:05}")));
+        let end = || Some((120, "id-00120".to_owned()));
+        // Full page below the bound advances with the bound kept.
+        assert_eq!(
+            advance_digest_poll(key(50), 50, end()),
+            (key(50), end()),
+            "full page below the bound advances"
+        );
+        // Reaching or passing the captured high-water wraps.
+        assert_eq!(
+            advance_digest_poll(key(120), 50, end()),
+            (None, None),
+            "cursor at the high-water wraps"
+        );
+        assert_eq!(
+            advance_digest_poll(key(150), 50, end()),
+            (None, None),
+            "cursor past the high-water wraps"
+        );
+        // A short page before the bound wraps: deliveries drained rows
+        // mid-sweep, so the head is revisited without waiting for an empty
+        // page.
+        assert_eq!(
+            advance_digest_poll(key(80), 30, end()),
+            (None, None),
+            "short page wraps"
+        );
+        // Empty pages always wrap, and a page without a bound re-snapshots
+        // instead of chasing without one.
+        assert_eq!(
+            advance_digest_poll(None, 0, end()),
+            (None, None),
+            "empty page wraps"
+        );
+        assert_eq!(
+            advance_digest_poll(key(50), 50, None),
+            (None, None),
+            "page without a bound wraps"
+        );
+    }
+
+    #[test]
+    fn digest_sweep_reaches_eligible_registration_within_one_cycle() {
+        // 120 registrations pending at sweep start; 60 more arrive after the
+        // first tick. The sweep must still wrap within the pages covering the
+        // sweep set and page the eligible row (key 110, seated behind the
+        // first cursor) inside that same cycle.
+        let mut rows: Vec<(i64, String)> = (1..=120).map(|i| (i, format!("id-{i:05}"))).collect();
+        let eligible = (110, "id-00110".to_owned());
+        let mut cursor: Option<(i64, String)> = None;
+        let mut end: Option<(i64, String)> = None;
+        let mut paged_eligible = false;
+        let mut wrap_tick = None;
+        for tick in 0..10 {
+            if cursor.is_none() {
+                end = rows.last().cloned();
+            }
+            let page: Vec<(i64, String)> = rows
+                .iter()
+                .filter(|row| cursor.as_ref().is_none_or(|at| **row > *at))
+                .take(DIGEST_POLL_PAGE)
+                .cloned()
+                .collect();
+            if page.contains(&eligible) {
+                paged_eligible = true;
+            }
+            if tick == 0 {
+                rows.extend((121..=180).map(|i| (i, format!("id-{i:05}"))));
+            }
+            let last = page.last().cloned();
+            (cursor, end) = advance_digest_poll(last, page.len(), end);
+            if cursor.is_none() {
+                wrap_tick = Some(tick);
+                break;
+            }
+        }
+        assert!(paged_eligible, "eligible row paged within the cycle");
+        // The sweep set holds 120 rows at 50 per page: the cycle ends on the
+        // third tick even though 60 more rows arrived mid-sweep.
+        assert_eq!(wrap_tick, Some(2), "sweep wraps within one bounded cycle");
     }
 
     #[test]
