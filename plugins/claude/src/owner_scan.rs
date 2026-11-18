@@ -1,31 +1,13 @@
 //! Owner MCP source scan for the Claude `inherit` policy.
 //!
-//! `inherit` keeps Claude Code's normal MCP precedence, and the installed
-//! 2.1.325 CLI offers no per-server disable or deny switch for the
-//! per-run config surface: `claude --help` shows only the all-or-nothing
-//! `--strict-mcp-config` ("Only use MCP servers from `--mcp-config`,
-//! ignoring all other MCP configurations", reserved for `minimal`),
-//! `--setting-sources` selects whole settings sources (user, project,
-//! local) rather than servers, and `claude mcp --help` shows no deny
-//! list. Using `--setting-sources` to drop sources would also drop the
-//! owner's legitimate surface that `inherit` explicitly opts into, and
-//! `.mcp.json` project servers sit outside the settings sources entirely;
-//! the per-project disable state (`mcp reset-project-choices`) is
-//! interactive approval state, not a per-run mechanism Eliot can set.
-//! So there is no safe native filter for `inherit`: when an owner Swarm
-//! entry is reachable under `inherit`, the start fails closed with the
-//! entry and source named, in the same way `minimal` relies on the strict
-//! config. The Agent-scoped entry Eliot generates is the only Swarm server
-//! a worker gets.
+//! `inherit` keeps ordinary native MCP precedence. Preflight refuses
+//! recognizable owner Swarm stdio/HTTP servers and sources it cannot scan.
+//! The native launch additionally denies the configured owner HTTP hostname
+//! across settings scopes; the daemon-generated Agent server stays stdio.
 //!
-//! Scanned sources, in read order: the workspace `.mcp.json` project
-//! servers, the workspace `.claude/settings.json` and
-//! `.claude/settings.local.json` project/local settings, and the user
-//! `~/.claude/settings.json` plus legacy `~/.claude.json` (both carry an
-//! `mcpServers` table on this machine, verified 2026-11-16). Missing files
-//! contribute nothing; a present file must read within bounds and parse
-//! (JSONC tolerated) or the start fails closed with the source named. No
-//! file is ever edited.
+//! The scan covers the effective user settings/config root and the native
+//! workspace project/local scopes. Managed files, installed plugins and
+//! enabled account connectors are refused when they cannot be enumerated.
 
 use std::path::{Path, PathBuf};
 
@@ -52,51 +34,81 @@ pub struct OwnerMcpEntry {
     pub source: &'static str,
 }
 
-/// Scan the owner MCP sources for server entries with an explicit home
-/// root (tests pin a scratch home; production passes [`owner_home`]). See
-/// the module docs for the source list and the fail-closed read contract.
-/// Owner home for the user-level sources: `%USERPROFILE%`, else `$HOME`.
-/// `None` skips the user files without failing the scan.
+/// Windows Claude uses USERPROFILE; Unix uses HOME.
 fn owner_home() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
-        .filter(|home| !home.as_os_str().is_empty())
+        .filter(|home| home.is_absolute())
 }
 
-/// Scan with an explicit home root (tests pin a scratch home; production
-/// passes [`owner_home`]).
-fn scan_owner_mcp_sources_with_home(
+fn scan_owner_mcp_sources(
     workspace: &Path,
-    home: Option<PathBuf>,
+    root: &Path,
+    config_file: &Path,
 ) -> Result<Vec<OwnerMcpEntry>> {
     let mut entries = Vec::new();
-    entries.extend(read_source(
-        &workspace.join(".mcp.json"),
-        "project .mcp.json",
-    )?);
-    entries.extend(read_source(
-        &workspace.join(".claude").join("settings.json"),
-        "project settings",
-    )?);
-    entries.extend(read_source(
-        &workspace.join(".claude").join("settings.local.json"),
-        "project local settings",
-    )?);
-    if let Some(home) = home.as_ref() {
-        entries.extend(read_source(
-            &home.join(".claude").join("settings.json"),
-            "user settings",
-        )?);
-        entries.extend(read_source(&home.join(".claude.json"), "user config")?);
-    }
-    shared_scan::ensure_total_entries(
-        entries.len(),
-        MAX_OWNER_SERVERS,
-        "Claude owner MCP sources exceed their bound",
+    collect_source(
+        &mut entries,
+        &root.join("settings.json"),
+        "user settings",
+        None,
     )?;
+    let project = workspace
+        .ancestors()
+        .find(|directory| directory.join(".git").exists())
+        .unwrap_or(workspace);
+    collect_source(
+        &mut entries,
+        config_file,
+        "user config",
+        Some((workspace, project)),
+    )?;
+    collect_source(
+        &mut entries,
+        &project.join(".mcp.json"),
+        "project .mcp.json",
+        None,
+    )?;
+    collect_source(
+        &mut entries,
+        &workspace.join(".claude/settings.json"),
+        "project settings",
+        None,
+    )?;
+    collect_source(
+        &mut entries,
+        &workspace.join(".claude/settings.local.json"),
+        "project local settings",
+        None,
+    )?;
+    if project != workspace {
+        collect_source(
+            &mut entries,
+            &project.join(".claude/settings.local.json"),
+            "repository local settings",
+            None,
+        )?;
+    }
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(entries)
+}
+
+fn same_project_scope(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let normalize = |path: &Path| {
+            let text = path.to_string_lossy().replace('\\', "/");
+            text.strip_prefix("//?/")
+                .unwrap_or(&text)
+                .trim_end_matches('/')
+                .to_lowercase()
+        };
+        normalize(left) == normalize(right)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 /// Owner-identity entries among the scanned sources: stdio entries
@@ -126,25 +138,41 @@ pub fn find_owner_entries<'a>(
 /// Names the entry and its source kind; paths stay out of the message.
 pub fn refuse_owner_mcp_sources(
     workspace: &Path,
+    config_dir: Option<&str>,
+    connectors: Option<&str>,
     controller_executable: &Path,
     cloud_mcp_hostname: Option<&str>,
 ) -> Result<()> {
-    refuse_owner_mcp_sources_with_home(
+    let (root, config_file) = match config_dir.filter(|dir| !dir.is_empty()) {
+        Some(dir) if Path::new(dir).is_absolute() => {
+            let root = PathBuf::from(dir);
+            let config_file = root.join(".claude.json");
+            (root, config_file)
+        }
+        Some(_) => return Err(incomplete("a relative CLAUDE_CONFIG_DIR")),
+        None => {
+            let home = owner_home().ok_or_else(|| incomplete("the native home directory"))?;
+            (home.join(".claude"), home.join(".claude.json"))
+        }
+    };
+    refuse_owner_entries(
         workspace,
-        owner_home(),
+        &root,
+        &config_file,
         controller_executable,
         cloud_mcp_hostname,
-    )
+    )?;
+    refuse_unscanned_sources(&root, connectors)
 }
 
-/// Refusal with an explicit home root (tests pin a scratch home).
-fn refuse_owner_mcp_sources_with_home(
+fn refuse_owner_entries(
     workspace: &Path,
-    home: Option<PathBuf>,
+    root: &Path,
+    config_file: &Path,
     controller_executable: &Path,
     cloud_mcp_hostname: Option<&str>,
 ) -> Result<()> {
-    let entries = scan_owner_mcp_sources_with_home(workspace, home)?;
+    let entries = scan_owner_mcp_sources(workspace, root, config_file)?;
     let hits = find_owner_entries(&entries, controller_executable.to_str(), cloud_mcp_hostname);
     if let Some(hit) = hits.first() {
         return Err(shared_scan::refusal_error(
@@ -156,14 +184,109 @@ fn refuse_owner_mcp_sources_with_home(
     Ok(())
 }
 
-/// Read one owner MCP source file. Absent files contribute nothing.
-fn read_source(path: &Path, source: &'static str) -> Result<Vec<OwnerMcpEntry>> {
+fn incomplete(source: &str) -> eliot_core::Error {
+    eliot_core::Error::new(
+        "profile_error",
+        format!("Claude cannot verify inherit MCP sources: {source}; use minimal MCP"),
+    )
+}
+
+fn refuse_unscanned_sources(root: &Path, connectors: Option<&str>) -> Result<()> {
+    // The native client fetches connector endpoints itself. Require the
+    // documented launch-environment opt-out rather than contacting them to
+    // discover what would have loaded.
+    if connectors != Some("false") {
+        return Err(incomplete(
+            "claude.ai connectors are not explicitly disabled",
+        ));
+    }
+    for (path, source) in [
+        (
+            root.join("plugins/installed_plugins.json"),
+            "installed plugins",
+        ),
+        (root.join("remote-settings.json"), "cached managed settings"),
+    ] {
+        if path.try_exists().map_err(|_| incomplete(source))? {
+            return Err(incomplete(source));
+        }
+    }
+    let managed = if cfg!(windows) {
+        Path::new(r"C:\Program Files\ClaudeCode")
+    } else if cfg!(target_os = "macos") {
+        Path::new("/Library/Application Support/ClaudeCode")
+    } else {
+        Path::new("/etc/claude-code")
+    };
+    for name in [
+        "managed-mcp.json",
+        "managed-settings.json",
+        "managed-settings.d",
+    ] {
+        if managed
+            .join(name)
+            .try_exists()
+            .map_err(|_| incomplete("system managed settings"))?
+        {
+            return Err(incomplete("system managed settings"));
+        }
+    }
+    Ok(())
+}
+
+/// Read bounded source data without invoking the CLI or contacting servers.
+fn collect_source(
+    entries: &mut Vec<OwnerMcpEntry>,
+    path: &Path,
+    source: &'static str,
+    project_scope: Option<(&Path, &Path)>,
+) -> Result<()> {
     let label = format!("Claude owner MCP source {source}");
     let Some(document) = shared_scan::read_jsonc_document(path, &label, MAX_OWNER_SCAN_BYTES)?
     else {
-        return Ok(Vec::new());
+        return Ok(());
     };
-    source_entries(&document, source)
+    if document.get("enabledPlugins").is_some_and(|plugins| {
+        plugins.as_object().is_none_or(|plugins| {
+            plugins
+                .values()
+                .any(|enabled| enabled.as_bool() != Some(false))
+        })
+    }) || document.get("managedMcpServers").is_some()
+        || document
+            .get("env")
+            .and_then(Value::as_object)
+            .is_some_and(|env| {
+                env.keys().any(|key| {
+                    key.eq_ignore_ascii_case("CLAUDE_CONFIG_DIR")
+                        || key.eq_ignore_ascii_case("ENABLE_CLAUDEAI_MCP_SERVERS")
+                })
+            })
+    {
+        return Err(incomplete(source));
+    }
+
+    entries.extend(source_entries(&document, source)?);
+    if let Some((workspace, repository)) = project_scope
+        && let Some(projects) = shared_scan::table_object(document.get("projects"), &label)?
+    {
+        for (project, document) in projects {
+            let project = Path::new(project);
+            if same_project_scope(project, workspace) || same_project_scope(project, repository) {
+                entries.extend(source_entries(document, "workspace local config")?);
+                bound_entries(entries)?;
+            }
+        }
+    }
+    bound_entries(entries)
+}
+
+fn bound_entries(entries: &[OwnerMcpEntry]) -> Result<()> {
+    shared_scan::ensure_total_entries(
+        entries.len(),
+        MAX_OWNER_SERVERS,
+        "Claude owner MCP sources exceed their bound",
+    )
 }
 
 /// Project the `mcpServers` table of one owner source. Absent or null
@@ -175,11 +298,33 @@ fn source_entries(document: &Value, source: &'static str) -> Result<Vec<OwnerMcp
     let Some(table) = shared_scan::table_object(document.get("mcpServers"), &label)? else {
         return Ok(Vec::new());
     };
-    let mut entries = Vec::with_capacity(table.len().min(MAX_OWNER_SERVERS));
+    shared_scan::ensure_total_entries(
+        table.len(),
+        MAX_OWNER_SERVERS,
+        "Claude owner MCP source exceeds its bound",
+    )?;
+    let mut entries = Vec::with_capacity(table.len());
     for (name, entry) in table {
         let Some(object) = entry.as_object() else {
             continue;
         };
+        if ["command", "url"].iter().any(|field| {
+            object
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("${"))
+        }) || object
+            .get("args")
+            .and_then(Value::as_array)
+            .is_some_and(|args| {
+                args.iter()
+                    .any(|arg| arg.as_str().is_some_and(|text| text.contains("${")))
+            })
+        {
+            return Err(incomplete(
+                "an MCP command, argument, or URL uses native environment expansion",
+            ));
+        }
         let (command, args) = project_command(object.get("command"), object.get("args"));
         entries.push(OwnerMcpEntry {
             name: name.clone(),
@@ -235,7 +380,12 @@ mod tests {
     fn scan_absent_sources_contributes_nothing() {
         let (scratch_root, workspace, home) = scratch_pair();
         let _scratch = crate::test_temp::TempDir::own(scratch_root.clone());
-        let entries = scan_owner_mcp_sources_with_home(&workspace, Some(home)).expect("scan");
+        let entries = scan_owner_mcp_sources(
+            &workspace,
+            &home.join(".claude"),
+            &home.join(".claude.json"),
+        )
+        .expect("scan");
         assert!(entries.is_empty());
     }
 
@@ -259,8 +409,12 @@ mod tests {
             &home.join(".claude.json"),
             r#"{"mcpServers": {"user-search": {"command": "search.exe", "args": []}}}"#,
         );
-        let entries =
-            scan_owner_mcp_sources_with_home(&workspace, Some(home.clone())).expect("scan");
+        let entries = scan_owner_mcp_sources(
+            &workspace,
+            &home.join(".claude"),
+            &home.join(".claude.json"),
+        )
+        .expect("scan");
         assert_eq!(
             entries
                 .iter()
@@ -285,8 +439,12 @@ mod tests {
             &workspace.join(".claude").join("settings.json"),
             "{not json",
         );
-        let error = scan_owner_mcp_sources_with_home(&workspace, Some(home))
-            .expect_err("unparseable source fails");
+        let error = scan_owner_mcp_sources(
+            &workspace,
+            &home.join(".claude"),
+            &home.join(".claude.json"),
+        )
+        .expect_err("unparseable source fails");
         assert_eq!(error.code, "profile_error");
         assert!(error.message.contains("project settings"));
     }
@@ -343,9 +501,10 @@ mod tests {
             &workspace.join(".mcp.json"),
             r#"{"mcpServers": {"swarm": {"command": "C:\\Tools\\Eliot\\swarm.exe", "args": ["mcp"]}}}"#,
         );
-        let error = refuse_owner_mcp_sources_with_home(
+        let error = refuse_owner_entries(
             &workspace,
-            Some(home),
+            &home.join(".claude"),
+            &home.join(".claude.json"),
             Path::new(r"C:\Tools\Eliot\other.exe"),
             None,
         )
@@ -356,7 +515,51 @@ mod tests {
         // A clean layer passes.
         let (scratch_root, workspace, home) = scratch_pair();
         let _scratch = crate::test_temp::TempDir::own(scratch_root.clone());
-        refuse_owner_mcp_sources_with_home(&workspace, Some(home), Path::new("swarm"), None)
-            .expect("clean layer passes");
+        refuse_owner_entries(
+            &workspace,
+            &home.join(".claude"),
+            &home.join(".claude.json"),
+            Path::new("swarm"),
+            None,
+        )
+        .expect("clean layer passes");
+    }
+    #[test]
+    fn inherit_checks_workspace_local_scope_in_frozen_custom_root() {
+        let (scratch_root, workspace, home) = scratch_pair();
+        let _scratch = crate::test_temp::TempDir::own(scratch_root);
+        let config_dir = home.join("custom");
+        let config_file = config_dir.join(".claude.json");
+        write(
+            &config_file,
+            &serde_json::json!({
+                "projects": {
+                    (workspace.to_string_lossy()): {
+                        "mcpServers": {"renamed": {"url": "https://mcp.example.com/mcp"}}
+                    }
+                }
+            })
+            .to_string(),
+        );
+        std::fs::create_dir(workspace.join(".git")).expect("repository marker");
+        let nested = workspace.join("nested");
+        std::fs::create_dir(&nested).expect("nested working directory");
+        let error = refuse_owner_mcp_sources(
+            &nested,
+            config_dir.to_str(),
+            Some("false"),
+            Path::new("swarm"),
+            Some("mcp.example.com"),
+        )
+        .expect_err("workspace-local owner transport must be refused pre-spawn");
+        assert_eq!(error.code, "profile_error");
+        assert!(error.message.contains("renamed"));
+        assert!(error.message.contains("workspace local config"));
+        let unrelated = workspace.with_file_name("other");
+        assert!(
+            scan_owner_mcp_sources(&unrelated, &config_dir, &config_file)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

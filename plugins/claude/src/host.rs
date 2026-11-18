@@ -312,6 +312,7 @@ struct StartPlan {
     /// Frozen Claude Code `--effort` level (closed CLI vocabulary); absent
     /// keeps the CLI default.
     requested_effort: Option<String>,
+    inherit_cloud_hostname: Option<String>,
     requested_mcp_policy: McpPolicy,
     requested_mcp_allow: Vec<String>,
     /// Frozen native-subagent switch: `deny` disables the native subagent
@@ -983,19 +984,23 @@ impl ClaudePlugin {
                 "the current Eliot executable for Claude MCP is unavailable",
             ));
         }
-        // Inherit keeps the CLI normal MCP precedence, which no per-run
-        // flag narrows per server (installed 2.1.325: only the
-        // all-or-nothing `--strict-mcp-config`, reserved for minimal; see
-        // `owner_scan`). An owner Swarm entry reachable under inherit
-        // therefore fails the start closed with its name instead of
-        // leaking the owner daemon identity to the worker.
-        if requested_mcp_policy == McpPolicy::Inherit {
+        let inherit_cloud_hostname = if requested_mcp_policy == McpPolicy::Inherit {
+            let hostname = eliot_core::parse_snapshot_cloud_hostname(profile);
             crate::owner_scan::refuse_owner_mcp_sources(
                 &workspace,
+                config_dir.as_deref(),
+                environment.iter().find_map(|(name, value)| {
+                    name.eq_ignore_ascii_case("ENABLE_CLAUDEAI_MCP_SERVERS")
+                        .then(|| value.to_str())
+                        .flatten()
+                }),
                 &swarm_binary,
-                eliot_core::parse_snapshot_cloud_hostname(profile).as_deref(),
+                hostname.as_deref(),
             )?;
-        }
+            hostname
+        } else {
+            None
+        };
         secrets.push(initialized.credential.clone());
         if let Some(subject) = resume_subject.as_ref()
             && subject.native_scope != claude_scope(config_dir.as_deref())
@@ -1028,6 +1033,7 @@ impl ClaudePlugin {
             requested_model,
             requested_permission_mode,
             requested_effort,
+            inherit_cloud_hostname,
             requested_mcp_policy,
             requested_mcp_allow,
             native_subagents_deny,
@@ -2437,6 +2443,17 @@ async fn launch_session(
         plan.requested_mcp_policy,
         mcp_config.path().as_os_str(),
     ));
+    if let Some(hostname) = &plan.inherit_cloud_hostname {
+        // Native policy also covers remote servers fetched after preflight.
+        // Per-scope deny entries merge, including with managed settings.
+        argv.push(OsString::from("--settings"));
+        argv.push(OsString::from(
+            json!({
+                "deniedMcpServers": [{"serverUrl": format!("*://{hostname}:*/*")}],
+            })
+            .to_string(),
+        ));
+    }
     // Expose the daemon-materialized coordination skill through the CLI's
     // own plugin mechanism: the materialized skill root doubles as the
     // plugin directory, so no checkout or global skill location changes.
