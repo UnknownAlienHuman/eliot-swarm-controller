@@ -569,6 +569,25 @@ pub async fn save_preferences(
 /// Attempts for the one window-size write at close.
 const CLOSE_SAVE_ATTEMPTS: usize = 4;
 
+/// The window-size update for one settings read: the read's own revision
+/// with its preferences carried over and only the size replaced. Built from
+/// a single read so a concurrent preference write between two reads cannot
+/// be silently overwritten: it reports `conflict` instead (#641).
+pub fn window_close_request(read: &SettingsReadResponse, size: (u32, u32)) -> SettingsSaveRequest {
+    let preferences = Preferences::from_reply(read);
+    let desktop = crate::settings_model::desktop_section(
+        read.sections.get(&SettingsSection::Desktop),
+        &preferences,
+        Some(size),
+    );
+    SettingsSaveRequest {
+        expected_revision: read.revision.clone(),
+        sections: [(SettingsSection::Desktop, desktop)].into(),
+        dry_run: false,
+        client: SettingsClientSource::Desktop,
+    }
+}
+
 /// Persist the last observed window size into `[desktop]` once, at close: a
 /// revision-guarded write only when it differs from the saved value, keeping
 /// the saved theme and startup. A concurrent save (for example an in-flight
@@ -581,8 +600,10 @@ pub async fn save_window_on_close(data_dir: &Path, size: (u32, u32)) -> eliot_co
         if window(&read) == Some(size) {
             return Ok(false);
         }
-        let preferences = Preferences::from_reply(&read);
-        match save_preferences(data_dir, preferences, Some(size)).await {
+        // One read, one revision: never re-read inside `save_preferences`,
+        // whose fresh revision would overwrite the concurrent change.
+        let request = window_close_request(&read, size);
+        match save(data_dir, &request).await {
             Ok(_) => return Ok(true),
             Err(error) if error.code == "conflict" => continue,
             Err(error) => return Err(error),
@@ -606,6 +627,39 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(choice).unwrap(), text);
         }
+    }
+
+    #[test]
+    fn close_write_keeps_the_read_revision_and_preferences() {
+        // #641: the close write must guard the exact revision its
+        // preferences were read at, so a concurrent preference save
+        // reports `conflict` instead of being silently overwritten.
+        let read = SettingsReadResponse {
+            revision: Some("rev-A".to_owned()),
+            sections: [(
+                SettingsSection::Desktop,
+                serde_json::json!({
+                    "theme": "dark",
+                    "startup": "last_conversation",
+                    "window": {"width": 800, "height": 600},
+                }),
+            )]
+            .into(),
+            restart_required: Vec::new(),
+            history: Vec::new(),
+        };
+        let request = window_close_request(&read, (1024, 768));
+        assert_eq!(request.expected_revision.as_deref(), Some("rev-A"));
+        let desktop = request.sections.get(&SettingsSection::Desktop).unwrap();
+        assert_eq!(
+            desktop.get("window").unwrap(),
+            &serde_json::json!({"width": 1024, "height": 768})
+        );
+        assert_eq!(desktop.get("theme").unwrap(), &serde_json::json!("dark"));
+        assert_eq!(
+            desktop.get("startup").unwrap(),
+            &serde_json::json!("last_conversation")
+        );
     }
 
     #[test]
