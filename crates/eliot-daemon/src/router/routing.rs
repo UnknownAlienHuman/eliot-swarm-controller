@@ -4,6 +4,7 @@ use eliot_core::{RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision};
 
 #[derive(Default)]
 struct RoutePreflight {
+    arbitrated: bool,
     held_accounts: HashMap<String, Value>,
     capacity_refusal: Option<Error>,
 }
@@ -37,7 +38,10 @@ impl Router {
         if let Some(role) = &request.role {
             probe.args = json!({ "role": role });
         }
-        let decision = match self.route_launch_profile(principal, &mut probe).await {
+        let decision = match self
+            .route_launch_profile(principal, &mut probe, false)
+            .await
+        {
             Ok(_) => serde_json::from_value(probe.args["profile_choice"].take())
                 .map_err(|_| Error::new("internal", "routing preview decision is malformed"))?,
             Err(error) if error.routing.is_some() => *error
@@ -55,6 +59,7 @@ impl Router {
         &self,
         principal: &Principal,
         request: &mut SubmitCommand,
+        arbitrated: bool,
     ) -> Result<(String, String, Value)> {
         let role = request
             .args
@@ -99,7 +104,10 @@ impl Router {
         };
         // A held account is never replaced with another account of the same
         // harness. Policy may still select a different native harness.
-        let mut preflight = RoutePreflight::default();
+        let mut preflight = RoutePreflight {
+            arbitrated,
+            ..RoutePreflight::default()
+        };
         for name in candidates {
             let mut quota_status = RouteQuotaStatus::Unknown;
             let evaluated = self
@@ -115,7 +123,12 @@ impl Router {
             match evaluated {
                 Ok((harness, snapshot)) => {
                     decision.profile = Some(name.clone());
-                    decision.reason = "first available candidate".into();
+                    decision.reason = if arbitrated {
+                        "first policy candidate for the selected project"
+                    } else {
+                        "first available candidate"
+                    }
+                    .into();
                     decision.quota_status = quota_status;
                     request.args["profile_choice"] = serde_json::to_value(decision)
                         .map_err(|_| Error::new("internal", "routing decision encoding failed"))?;
@@ -213,6 +226,9 @@ impl Router {
         }
         if !native_installed(&harness, &snapshot) {
             return Ok(Err(RouteSkipReason::NotInstalled));
+        }
+        if preflight.arbitrated {
+            return Ok(Ok((harness, snapshot)));
         }
         {
             let store = self.inner.store.lock().await;
@@ -335,7 +351,7 @@ mod tests {
         let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
         request.args = json!({"role":"worker","workspace":"w","project":"p"});
         router
-            .freeze_launch_profile(&Principal::Owner, &mut request)
+            .freeze_launch_profile(&Principal::Owner, &mut request, false)
             .await
             .unwrap();
         assert_eq!(request.args["profile"], "free");
@@ -413,7 +429,7 @@ mod tests {
         let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
         request.args = json!({"role":"worker","workspace":"w","project":"p"});
         let error = router
-            .freeze_launch_profile(&Principal::Owner, &mut request)
+            .freeze_launch_profile(&Principal::Owner, &mut request, false)
             .await
             .unwrap_err();
         assert_eq!(error.code, "capacity_unavailable");

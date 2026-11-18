@@ -441,6 +441,10 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `swarm.handoff`, `command.cancel` | atomic task transfer to an existing Agent; Owner withdrawal of undispatched handoff input |
 | `command.children` | implemented scoped, paged child readback for a retained expansion |
 | `project.list/get` | owner-only read of registered project authority |
+| `launch.enqueue` | Owner or Agent submits an explicit durable launch intent |
+| `launch.intent.get` | Read the exact intent and its current state |
+| `launch.queue` | Read one page of scoped interactive intents and assignment waits |
+| `project.budget.set` | Current manager adjusts free budget or priority within the Owner's grant |
 | `project.overview` | Owner or Agent read of one project team or every team with workspaces, queue, capacity and whole-fleet totals; a manager sees its own team in full and aggregates for other projects |
 | `rule.list/get/catch_up` | owner-only paged rule list (state, timer state, canonical definition), one rule read, and finite committed-history catch-up |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
@@ -907,6 +911,23 @@ a Git dirty set alone never proves Agent authorship. Git polling alone updates n
 process statistics nor model progress.
 
 ## Command admission
+
+`swarm launch --queue` calls `launch.enqueue` with a mutation ID and ordinary launch
+arguments. A queued intent has no Agent or command until admitted. Exact retry
+returns the current intent. When admission succeeds, the receipt gives the
+ordinary launch command ID. Use `swarm launch-queue [INTENT]` for exact readback or
+the pending page. The queue reports the wait code, scope and actor who can
+change that scope. `project.overview` reports live harnesses, active turns, queued
+work and retained unknown reservations as distinct counts.
+
+A direct `launch` either admits immediately or returns `capacity_unavailable`
+before creating a command, Agent or event. Fairness covers scheduled assignments
+and explicit interactive intents admitted by the arbiter. A direct Owner launch may
+use `--owner-override` to mark the command and its admission event as outside that
+fair ordering. It still checks all admission limits.
+
+A manager uses `swarm project budget PROJECT --revision REV` with `--max-live`
+or `--priority` to apply an Owner-granted change to its current assignment.
 
 `command.submit` uses `CommandSubmitRequest` (the Core `SubmitCommand` alias) and
 `CommandSubmitResponse` from the canonical mutation DTOs. `id` and `verb` are required;

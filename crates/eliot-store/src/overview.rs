@@ -100,6 +100,13 @@ impl DetailAccess {
     }
 }
 
+pub(super) fn queue_detail_access(conn: &Connection, principal: &str) -> Result<Option<String>> {
+    Ok(match DetailAccess::resolve(conn, principal)? {
+        DetailAccess::Manager { project, .. } => Some(project),
+        _ => None,
+    })
+}
+
 fn member_sql(alias: &str, root: u8, scope: u8, slf: u8) -> String {
     format!(
         "(?{root} IS NULL OR ({alias}.root = ?{root}
@@ -256,6 +263,7 @@ fn project_team(
     let project_scope = core::CapacityScope::project_scope(project);
     let manager_scope = core::CapacityScope::manager_assignment_scope(project);
     let lifecycle = lifecycle(conn, Some(project))?;
+    let manager_limit = launch_queue::effective_manager_limit(conn, project, &project_limits)?;
     Ok(ProjectOverviewEntry {
         project: project.to_owned(),
         detail,
@@ -285,7 +293,7 @@ fn project_team(
             ScopeUsage {
                 usage: capacity::capacity_scope_usage(conn, &manager_scope)?,
                 scope: manager_scope,
-                limit: project_limits.manager_assignment,
+                limit: manager_limit,
             },
         ],
     })
@@ -443,7 +451,7 @@ fn lifecycle(conn: &Connection, project: Option<&str>) -> Result<LifecycleTotals
         starting,
         stopping,
         active,
-        queued,
+        queued: queued + launch_queue::queue_usage(conn, project)?,
         retained_unknown,
     })
 }

@@ -40,6 +40,9 @@ pub(crate) const RULE_EVENT_PAGE_SIZE: usize = 128;
 const TIMER_PAGE_SIZE: usize = 128;
 const RULE_CHILD_RECOVERY_PAGE_SIZE: usize = 1_000;
 const RULE_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+// Temporary priority changes can reorder fresh heads. Older heads use a
+// stable project ring so repeated priority changes cannot keep overtaking them.
+const PRIORITY_WAIT_LIMIT_MS: i64 = 30_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReloadNoticeKey {
@@ -1759,207 +1762,379 @@ async fn reconcile_due_timers(
     rules: &mut [ActiveRule],
     now: i64,
 ) -> Result<bool> {
-    let mut after_id = None;
+    enum Head {
+        Timer(usize, TimerStateView, Option<String>),
+        Interactive(Box<eliot_store::PendingLaunch>),
+    }
+
+    let mut after = None;
+    let mut deferred_timers = Vec::new();
+    let mut heads = std::collections::BTreeMap::<String, (i64, Head)>::new();
+    let (cursor, priorities, intents) = if principal == "owner" {
+        router.launch_arbitration().await?
+    } else {
+        Default::default()
+    };
+    // Store returns intents in commit order within each millisecond.
+    for intent in intents {
+        heads
+            .entry(intent.view.project.clone())
+            .or_insert_with(|| (intent.created_at, Head::Interactive(Box::new(intent))));
+    }
     loop {
         let page = router
-            .list_due_rule_timers(principal, after_id.as_deref(), now, TIMER_PAGE_SIZE)
+            .list_due_rule_timers(principal, after.as_deref(), now, TIMER_PAGE_SIZE)
             .await?;
-        let page_len = page.len();
-        if page_len == 0 {
-            return Ok(true);
-        }
-
+        let Some(last) = page.last() else { break };
+        after = Some(last.id.clone());
         for state in page {
-            after_id = Some(state.id.clone());
-            let rule = rules
-                .iter_mut()
-                .find(|rule| {
-                    rule.timer
-                        .as_ref()
-                        .is_some_and(|timer| timer.state.id == state.id)
-                        && rule.principal == principal
+            let index = rules
+                .iter()
+                .position(|rule| {
+                    rule.principal == principal
+                        && rule
+                            .timer
+                            .as_ref()
+                            .is_some_and(|timer| timer.state.id == state.id)
                 })
                 .ok_or_else(|| {
-                    Error::new(
-                        "source_integrity",
-                        "stored timer has no loaded rule definition",
-                    )
+                    Error::new("source_integrity", "stored timer has no loaded definition")
                 })?;
-            let Some(timer) = rule.timer.as_mut() else {
-                return Err(Error::new(
-                    "source_integrity",
-                    "stored timer has no loaded rule definition",
-                ));
-            };
-            if timer.state.next_due_at != state.next_due_at {
-                timer.armed_due_at_ms = None;
-            }
-            timer.state = state;
-            if !timer.state.enabled || timer.blocked {
+            if !state.enabled
+                || rules[index]
+                    .timer
+                    .as_ref()
+                    .is_some_and(|timer| timer.blocked)
+            {
                 continue;
             }
-
-            let (
-                scheduled_at_ms,
-                next_due_at_ms,
-                action,
-                skip_code,
-                skip_capacity_message,
-                armed_slot,
-            ) = match timer_decision(timer, now)? {
-                TimerDecision::NotDue => continue,
-                TimerDecision::Skip {
-                    scheduled_at_ms,
-                    next_due_at_ms,
-                    code,
-                } => (
-                    scheduled_at_ms,
-                    next_due_at_ms,
-                    None,
-                    Some(code),
-                    None,
-                    None,
-                ),
-                TimerDecision::Fire {
-                    scheduled_at_ms,
-                    next_due_at_ms,
-                    live_armed,
-                } => {
-                    if let Some(admission) = router
-                        .replay_rule_timer_slot(&rule.principal, &timer.state, scheduled_at_ms)
-                        .await?
-                    {
-                        timer.state = admission.state;
-                        timer.blocked = admission.blocked;
-                        timer.armed_due_at_ms = timer.state.next_due_at.filter(|due| *due > now);
-                        continue;
+            let assignment = (principal == "owner")
+                .then(|| rules[index].definition.evaluate_timer())
+                .and_then(std::result::Result::ok)
+                .filter(|action| action.args.get("assignment").is_some());
+            if let Some(action) = assignment {
+                if router.rule_has_open_actions(principal, &state.id).await? {
+                    deferred_timers.push(index);
+                    continue;
+                }
+                let retained = router.arbitration_timer_wait(&state).await?;
+                let route = retained.as_ref().and_then(|(_, wait)| wait.route.clone());
+                let project = match router.queued_launch_project(&action).await {
+                    Ok(project) => project,
+                    Err(error) => {
+                        if error.code != "workspace_unavailable" {
+                            crate::logging::record(
+                                &router.secret_policy_snapshot(),
+                                "assignment.project_wait",
+                                &[("rule", &state.id)],
+                                Some(&error),
+                            );
+                        }
+                        retained.map(|(project, _)| project).unwrap_or_else(|| {
+                            action.args["workspace"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned()
+                        })
                     }
-
-                    // A per-assignment briefs failure (for example a missing
-                    // briefs folder, `unavailable`) fails only this slot, so
-                    // the worker keeps running every other automation. The
-                    // code is recorded as the slot skip reason below.
-                    let mut assignment_unavailable: Option<String> = None;
-                    let prepared = match rule.definition.evaluate_timer() {
-                        Ok(action) if action.verb == "run" => {
-                            router
-                                .prepare_timer_rule_run_submission(
-                                    action,
-                                    rule.project.as_ref(),
-                                    timer_script_context(
-                                        &rule.definition.id,
-                                        rule.state.revision,
-                                        &timer.state,
-                                        ScriptTimerInvocation::Scheduled { scheduled_at_ms },
-                                    ),
-                                )
-                                .await
-                        }
-                        Ok(action) => {
-                            if action.args.get("assignment").is_some() && rule.project.is_some() {
-                                Err(Error::new(
-                                    "not_allowed",
-                                    "assignments require an Owner timer",
-                                ))
-                            } else {
-                                match assignment::prepare(router, action).await {
-                                    Ok(action) => match rule.project.as_ref() {
-                                        Some(project) => {
-                                            router
-                                                .prepare_project_rule_submission(action, project)
-                                                .await
-                                        }
-                                        None => router.prepare_owner_submission(action).await,
-                                    },
-                                    Err(error) if error.code == "unavailable" => {
-                                        assignment_unavailable = Some(error.code.clone());
-                                        Err(error)
-                                    }
-                                    Err(error) => Err(error),
-                                }
+                };
+                let due = state.next_due_at.unwrap_or(now);
+                match heads.entry(project) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert((due, Head::Timer(index, state, route)));
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        if due < entry.get().0 {
+                            if let (_, Head::Timer(previous, _, _)) =
+                                entry.insert((due, Head::Timer(index, state, route)))
+                            {
+                                deferred_timers.push(previous);
                             }
-                        }
-                        Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                            Err(error)
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    if let Some(code) = assignment_unavailable {
-                        if !router.rule_firings_open() {
-                            return Ok(false);
-                        }
-                        (
-                            scheduled_at_ms,
-                            next_due_at_ms,
-                            None,
-                            Some(code),
-                            None,
-                            None,
-                        )
-                    } else {
-                        match prepared {
-                            Ok(prepared) => (
-                                scheduled_at_ms,
-                                next_due_at_ms,
-                                Some(prepared.request),
-                                None,
-                                None,
-                                live_armed.then_some(scheduled_at_ms),
-                            ),
-                            Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
-                                (
-                                    scheduled_at_ms,
-                                    next_due_at_ms,
-                                    None,
-                                    Some(error.code.clone()),
-                                    (error.code == "capacity_unavailable"
-                                        && error.failure_where.as_deref()
-                                            == Some("store.admission.capacity"))
-                                    .then_some(*error.message),
-                                    None,
-                                )
-                            }
-                            Err(_error) if !router.rule_firings_open() => return Ok(false),
-                            Err(error) => return Err(error),
+                        } else {
+                            deferred_timers.push(index);
                         }
                     }
                 }
-            };
-
-            let slot = TimerSlotCommit {
-                scheduled_at_ms,
-                next_due_at_ms,
-                action,
-                skip_code,
-                skip_capacity_message,
-            };
-            let Some(admission) = router
-                .commit_rule_timer_slot(
-                    &rule.principal,
-                    rule.project.as_ref(),
-                    &timer.state,
-                    slot,
-                    now,
-                )
-                .await?
-            else {
+            } else if !reconcile_timer(router, &mut rules[index], state, now, None).await? {
                 return Ok(false);
-            };
-            timer.state = admission.state;
-            timer.blocked = admission.blocked;
-            timer.armed_due_at_ms = if timer.blocked {
-                armed_slot
-                    .or(timer.armed_due_at_ms)
-                    .filter(|due| timer.state.next_due_at == Some(*due))
-            } else {
-                timer.state.next_due_at.filter(|due| *due > now)
-            };
-        }
-
-        if page_len < TIMER_PAGE_SIZE {
-            return Ok(true);
+            }
         }
     }
+    for index in deferred_timers {
+        if let Some(timer) = rules[index].timer.as_mut() {
+            timer.blocked = true;
+        }
+    }
+    let mut heads = heads.into_iter().collect::<Vec<_>>();
+    heads.sort_by_cached_key(|(project, (due, _))| {
+        arbitration_order(project, *due, now, cursor.as_deref(), &priorities)
+    });
+    for (project, (_, head)) in heads {
+        match head {
+            Head::Interactive(intent) => router.try_launch_intent(&intent).await?,
+            Head::Timer(index, state, route) => {
+                let arb = eliot_store::ArbitratedTimer {
+                    project,
+                    route,
+                    wait: None,
+                };
+                if !reconcile_timer(router, &mut rules[index], state, now, Some(arb)).await? {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn arbitration_order(
+    project: &str,
+    ready_at: i64,
+    now: i64,
+    cursor: Option<&str>,
+    priorities: &std::collections::HashMap<String, u8>,
+) -> (bool, std::cmp::Reverse<u8>, bool, String) {
+    let protected = priorities.values().any(|&priority| priority > 0)
+        && now.saturating_sub(ready_at) >= PRIORITY_WAIT_LIMIT_MS;
+    let priority = if protected {
+        0
+    } else {
+        priorities.get(project).copied().unwrap_or(0)
+    };
+    let wrapped = cursor.is_some_and(|cursor| project <= cursor);
+    (
+        !protected,
+        std::cmp::Reverse(priority),
+        wrapped,
+        project.to_owned(),
+    )
+}
+
+async fn reconcile_timer(
+    router: &Router,
+    rule: &mut ActiveRule,
+    state: TimerStateView,
+    now: i64,
+    mut arbitration: Option<eliot_store::ArbitratedTimer>,
+) -> Result<bool> {
+    let Some(timer) = rule.timer.as_mut() else {
+        return Err(Error::new(
+            "source_integrity",
+            "stored timer has no loaded rule definition",
+        ));
+    };
+    if timer.state.next_due_at != state.next_due_at {
+        timer.armed_due_at_ms = None;
+    }
+    timer.state = state;
+    if arbitration.is_some() {
+        // The due timer is the durable waiting head. Do not turn a wait
+        // into a missed schedule on restart or a later reconciliation.
+        timer.armed_due_at_ms = timer.state.next_due_at;
+    }
+    if !timer.state.enabled || timer.blocked {
+        return Ok(true);
+    }
+
+    let (scheduled_at_ms, next_due_at_ms, action, skip_code, skip_capacity_message, armed_slot) =
+        match timer_decision(timer, now)? {
+            TimerDecision::NotDue => return Ok(true),
+            TimerDecision::Skip {
+                scheduled_at_ms,
+                next_due_at_ms,
+                code,
+            } => (
+                scheduled_at_ms,
+                next_due_at_ms,
+                None,
+                Some(code),
+                None,
+                None,
+            ),
+            TimerDecision::Fire {
+                scheduled_at_ms,
+                next_due_at_ms,
+                live_armed,
+            } => {
+                if let Some(admission) = router
+                    .replay_rule_timer_slot(&rule.principal, &timer.state, scheduled_at_ms)
+                    .await?
+                {
+                    timer.state = admission.state;
+                    timer.blocked = admission.blocked;
+                    timer.armed_due_at_ms = timer.state.next_due_at.filter(|due| *due > now);
+                    return Ok(true);
+                }
+
+                // A per-assignment briefs failure (for example a missing
+                // briefs folder, `unavailable`) fails only this slot, so
+                // the worker keeps running every other automation. The
+                // code is recorded as the slot skip reason below.
+                let mut assignment_unavailable: Option<String> = None;
+                let prepared = match rule.definition.evaluate_timer() {
+                    Ok(action) if action.verb == "run" => {
+                        router
+                            .prepare_timer_rule_run_submission(
+                                action,
+                                rule.project.as_ref(),
+                                timer_script_context(
+                                    &rule.definition.id,
+                                    rule.state.revision,
+                                    &timer.state,
+                                    ScriptTimerInvocation::Scheduled { scheduled_at_ms },
+                                ),
+                            )
+                            .await
+                    }
+                    Ok(action) => {
+                        if action.args.get("assignment").is_some() && rule.project.is_some() {
+                            Err(Error::new(
+                                "not_allowed",
+                                "assignments require an Owner timer",
+                            ))
+                        } else {
+                            match assignment::prepare(router, action).await {
+                                Ok(action) => match rule.project.as_ref() {
+                                    Some(project) => {
+                                        router
+                                            .prepare_project_rule_submission(action, project)
+                                            .await
+                                    }
+                                    None if arbitration.is_some() => {
+                                        router.prepare_assignment_launch(action).await
+                                    }
+                                    None => router.prepare_owner_submission(action).await,
+                                },
+                                Err(error) if error.code == "unavailable" => {
+                                    assignment_unavailable = Some(error.code.clone());
+                                    Err(error)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                    }
+                    Err(error) if is_deterministic_pre_admission_rejection(&error.code) => {
+                        Err(error)
+                    }
+                    Err(error) => return Err(error),
+                };
+                let prepared = match (prepared, arbitration.as_mut()) {
+                    (Ok(prepared), Some(arb))
+                        if prepared.request.args["registered_project"]
+                            .as_str()
+                            .or_else(|| prepared.request.args["project"].as_str())
+                            != Some(arb.project.as_str()) =>
+                    {
+                        Err(Error::new(
+                            "workspace_unavailable",
+                            "assignment project changed during route preparation",
+                        ))
+                    }
+                    (Ok(prepared), Some(arb)) => {
+                        match crate::router::launch_queue::checked_route(
+                            &prepared.request,
+                            arb.route.as_deref(),
+                        ) {
+                            Ok(route) => {
+                                arb.route = Some(route);
+                                Ok(prepared)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    (result, _) => result,
+                };
+                if let Some(arb) = arbitration.as_mut()
+                    && let Err(error) = &prepared
+                    && assignment_unavailable.is_none()
+                {
+                    arb.wait = eliot_store::TimerWait::from_error(error, arb.route.clone())
+                        .map(|wait| wait.reason)
+                        .or_else(|| {
+                            (!is_deterministic_pre_admission_rejection(&error.code)
+                                && router.rule_firings_open())
+                            .then(|| eliot_core::api::LaunchWaitReason {
+                                code: error.code.clone(),
+                                scope: "assignment".into(),
+                                changed_by: "owner".into(),
+                            })
+                        });
+                }
+                if let Some(code) = assignment_unavailable {
+                    if !router.rule_firings_open() {
+                        return Ok(false);
+                    }
+                    (
+                        scheduled_at_ms,
+                        next_due_at_ms,
+                        None,
+                        Some(code),
+                        None,
+                        None,
+                    )
+                } else {
+                    match prepared {
+                        Ok(prepared) => (
+                            scheduled_at_ms,
+                            next_due_at_ms,
+                            Some(prepared.request),
+                            None,
+                            None,
+                            live_armed.then_some(scheduled_at_ms),
+                        ),
+                        Err(error)
+                            if arbitration.as_ref().is_some_and(|arb| arb.wait.is_some())
+                                || is_deterministic_pre_admission_rejection(&error.code) =>
+                        {
+                            (
+                                scheduled_at_ms,
+                                next_due_at_ms,
+                                None,
+                                Some(error.code.clone()),
+                                (error.code == "capacity_unavailable"
+                                    && error.failure_where.as_deref()
+                                        == Some("store.admission.capacity"))
+                                .then_some(*error.message),
+                                None,
+                            )
+                        }
+                        Err(_error) if !router.rule_firings_open() => return Ok(false),
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        };
+
+    let slot = TimerSlotCommit {
+        scheduled_at_ms,
+        next_due_at_ms,
+        action,
+        skip_code,
+        skip_capacity_message,
+    };
+    let Some(admission) = router
+        .commit_rule_timer_slot(
+            &rule.principal,
+            rule.project.as_ref(),
+            &timer.state,
+            slot,
+            arbitration,
+            now,
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    timer.state = admission.state;
+    timer.blocked = admission.blocked;
+    timer.armed_due_at_ms = if timer.blocked {
+        armed_slot
+            .or(timer.armed_due_at_ms)
+            .filter(|due| timer.state.next_due_at == Some(*due))
+    } else {
+        timer.state.next_due_at.filter(|due| *due > now)
+    };
+    Ok(true)
 }
 
 fn timer_decision(timer: &ActiveTimer, now: i64) -> Result<TimerDecision> {
@@ -2168,6 +2343,34 @@ pub(crate) async fn prepare_rule_catch_up_actions(
 mod timer_tests {
     use super::*;
     use eliot_core::SubmitCommand;
+
+    #[test]
+    fn assignment_priority_precedes_rotation_for_fresh_projects() {
+        let priorities = std::collections::HashMap::from([
+            ("b".to_owned(), 1),
+            ("c".to_owned(), 2),
+            ("d".to_owned(), 2),
+        ]);
+        let mut projects = ["a", "b", "c", "d"];
+        projects
+            .sort_by_cached_key(|project| arbitration_order(project, 0, 1, Some("b"), &priorities));
+        assert_eq!(projects, ["c", "d", "b", "a"]);
+        projects
+            .sort_by_cached_key(|project| arbitration_order(project, 0, 1, Some("c"), &priorities));
+        assert_eq!(projects, ["d", "c", "b", "a"]);
+    }
+
+    #[test]
+    fn assignment_priority_cannot_overtake_a_waiting_project_indefinitely() {
+        let priorities =
+            std::collections::HashMap::from([("c".to_owned(), 3), ("b".to_owned(), 2)]);
+        let now = PRIORITY_WAIT_LIMIT_MS;
+        let key =
+            |project, ready_at| arbitration_order(project, ready_at, now, Some("c"), &priorities);
+        assert!(key("b", 1) < key("a", 1));
+        assert!(key("a", 0) < key("b", 1));
+        assert!(key("a", 0) < key("b", 0));
+    }
 
     #[test]
     fn assignment_cleanup_candidate_is_owner_global_only() {
@@ -2643,7 +2846,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         assert_eq!(timer_wake_delay(&timer, 135), None);
     }
     #[tokio::test]
-    async fn missing_briefs_folder_fails_only_its_assignment_slot() {
+    async fn assignment_with_open_action_yields_to_later_timer_in_its_project() {
         use eliot_core::api::TimerSchedule;
         use std::{fs, io::Cursor, path::Path};
 
@@ -2669,6 +2872,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let missing_folder = missing_folder.to_string_lossy().replace('\\', "/");
 
         let sources = [
+            (
+                "blocked-assignment",
+                format!(
+                    "[[rule]]\nid = 'blocked-assignment'\non = {{ every = '1s' }}\ndo = [{{ action = 'launch', workspace = 'C:/work', role = 'worker', assignment = {{ key = 'blocked', folder = '{missing_folder}', max_busy = 1 }} }}]\n",
+                ),
+            ),
             (
                 "broken-assignment",
                 format!(
@@ -2696,7 +2905,12 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 .await
                 .ensure_rule_state("owner", &input, now - 10_000)
                 .unwrap();
-            let timer_state = store
+            let due = if *id == "blocked-assignment" {
+                now - 9_000
+            } else {
+                now - 7_000
+            };
+            let mut timer_state = store
                 .lock()
                 .await
                 .ensure_timer_state(
@@ -2709,11 +2923,33 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                             anchor: None,
                         },
                         enabled: true,
-                        initial_next_due_at: Some(now - 9_000),
+                        initial_next_due_at: Some(due),
                     },
-                    now - 10_000,
+                    due - 1_000,
                 )
                 .unwrap();
+            if *id == "blocked-assignment" {
+                let mut action = SubmitCommand::new(ulid::Ulid::new().to_string(), "notify");
+                action.args = serde_json::json!({ "message": "open action" });
+                let admission = store
+                    .lock()
+                    .await
+                    .commit_timer_slot(
+                        "owner",
+                        &timer_state,
+                        TimerSlotCommit {
+                            scheduled_at_ms: due,
+                            next_due_at_ms: Some(due + 1_000),
+                            action: Some(action),
+                            skip_code: None,
+                            skip_capacity_message: None,
+                        },
+                        due,
+                    )
+                    .unwrap();
+                assert!(admission.child.is_some());
+                timer_state = admission.state;
+            }
             rules.push(ActiveRule {
                 principal: "owner".to_owned(),
                 project: None,
@@ -2730,10 +2966,19 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             });
         }
 
+        let blocked = rules[0].timer.as_ref().unwrap().state.clone();
         let worker_continues = reconcile_due_timers(&router, "owner", &mut rules, now)
             .await
             .expect("worker keeps running past a missing briefs folder");
         assert!(worker_continues);
+        assert_eq!(
+            store
+                .lock()
+                .await
+                .get_timer_state("owner", &blocked.id)
+                .unwrap(),
+            Some(blocked)
+        );
 
         for id in ["broken-assignment", "healthy-notify"] {
             let timer = store

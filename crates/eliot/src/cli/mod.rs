@@ -50,6 +50,9 @@ pub(crate) async fn dispatch(
             agents::run_tree_change(args.agent, None, data_dir, json_output, id).await
         }
         CliCommand::Launch(args) => agents::run_launch(args, data_dir, json_output, id).await,
+        CliCommand::LaunchQueue(args) => {
+            agents::run_launch_queue(args, data_dir, json_output).await
+        }
         CliCommand::Send(args) => agents::run_send(args, data_dir, json_output, id).await,
         CliCommand::Resume(args) => agents::run_resume(args, data_dir, json_output, id).await,
         CliCommand::Steer(args) => agents::run_steer(args, data_dir, json_output, id).await,

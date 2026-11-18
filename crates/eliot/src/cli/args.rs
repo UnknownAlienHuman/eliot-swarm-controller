@@ -94,6 +94,8 @@ pub(crate) enum CliCommand {
     Attach(AttachArgs),
     /// Start an Agent using the named profile.
     Launch(LaunchArgs),
+    /// Read one queued launch intent or list pending launches and assignment waits.
+    LaunchQueue(LaunchQueueArgs),
     /// Send text to an existing Agent.
     Send(SendArgs),
     /// Resume a retained native session, optionally with new input.
@@ -432,10 +434,27 @@ pub(crate) struct LaunchArgs {
     pub(crate) parent: Option<String>,
     #[arg(value_name = "PROMPT")]
     pub(crate) prompt: Option<String>,
+    /// Enqueue durable launch intent and return its receipt immediately.
+    #[arg(long, conflicts_with_all = ["wait", "owner_override"])]
+    pub(crate) queue: bool,
+    /// Explicitly mark a direct Owner launch outside fair arbitration.
+    #[arg(long)]
+    pub(crate) owner_override: bool,
     #[arg(long)]
     pub(crate) wait: bool,
     #[arg(long, default_value_t = DEFAULT_WAIT_SECONDS, value_name = "SECONDS")]
     pub(crate) timeout_seconds: u64,
+}
+
+#[derive(Args)]
+pub(crate) struct LaunchQueueArgs {
+    /// Exact launch intent ULID. Omit to list pending work.
+    #[arg(value_name = "INTENT", conflicts_with_all = ["project", "after"])]
+    pub(crate) intent: Option<String>,
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+    #[arg(long)]
+    pub(crate) after: Option<String>,
 }
 
 #[derive(Args)]
@@ -1330,6 +1349,16 @@ pub(crate) enum ProjectCommand {
     },
     /// Read or change current project manager assignments.
     Assignment(ProjectAssignmentArgs),
+    /// Change unused manager capacity or priority within the Owner grant.
+    Budget {
+        project: String,
+        #[arg(long)]
+        revision: i64,
+        #[arg(long)]
+        max_live: Option<u64>,
+        #[arg(long)]
+        priority: Option<u8>,
+    },
     /// Transfer an assignment to another manager.
     Transfer(ProjectTransferArgs),
 }

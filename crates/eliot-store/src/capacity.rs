@@ -434,11 +434,23 @@ pub(super) fn reserve_tx(
                 let scope = CapacityScope::project_scope(&agent.project);
                 require_scope_free(&scope, limit, capacity_scope_usage(tx, &scope)?)?;
             }
-            if let Some(limit) = limits.manager_assignment {
+            if let Some(limit) = launch_queue::effective_manager_limit(tx, &agent.project, limits)?
+            {
                 let (usage, member) = assignment_usage(tx, &agent.project, Some((id, generation)))?;
                 if member {
                     let scope = CapacityScope::manager_assignment_scope(&agent.project);
-                    require_scope_free(&scope, limit, usage)?;
+                    require_scope_free(&scope, limit, usage).map_err(|mut error| {
+                        if limits.manager_min_live.is_some()
+                            && limits
+                                .manager_assignment
+                                .is_some_and(|ceiling| limit < ceiling)
+                        {
+                            error
+                                .message
+                                .push_str("; current manager can change the delegated limit");
+                        }
+                        error
+                    })?;
                 }
             }
         }

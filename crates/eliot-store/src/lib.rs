@@ -5,6 +5,8 @@
 mod assignment;
 mod canonical;
 mod capacity;
+mod launch_queue;
+pub use launch_queue::{ArbitratedTimer, PendingLaunch, TimerWait};
 mod cleanup;
 mod projects;
 mod provider_holds;
@@ -527,11 +529,7 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            let previous_command_rowid: i64 = tx
-                .query_row("SELECT COALESCE(MAX(rowid), 0) FROM commands", [], |row| {
-                    row.get(0)
-                })
-                .map_err(sql_error)?;
+            let previous_command_rowid = latest_command_rowid(&tx)?;
             let mut admission = admission::submit_tx(
                 &tx,
                 principal,
@@ -543,19 +541,7 @@ impl Store {
                 self.capacity_policy.as_deref(),
             )?;
             if admission.is_new {
-                let root_cause =
-                    command_cause_tx(&tx, &admission.command.id)?.ok_or_else(|| {
-                        Error::new("source_integrity", "new admission has no command cause")
-                    })?;
-                for event in &mut admission.events {
-                    annotate_remote_admission_event_tx(
-                        &tx,
-                        event,
-                        &root_cause,
-                        remote,
-                        previous_command_rowid,
-                    )?;
-                }
+                annotate_remote_submission(&tx, &mut admission, remote, previous_command_rowid)?;
             }
             commit_transaction(tx, &self.write_faulted)?;
             Ok(admission)
@@ -4284,6 +4270,27 @@ fn annotate_new_event_cause_tx(
         }
     }
     event.cause = Some(cause);
+    Ok(())
+}
+
+fn latest_command_rowid(tx: &Transaction<'_>) -> Result<i64> {
+    tx.query_row("SELECT COALESCE(MAX(rowid), 0) FROM commands", [], |row| {
+        row.get(0)
+    })
+    .map_err(sql_error)
+}
+
+fn annotate_remote_submission(
+    tx: &Transaction<'_>,
+    admission: &mut Admission,
+    remote: &core::RemoteCallContext,
+    previous_command_rowid: i64,
+) -> Result<()> {
+    let root_cause = command_cause_tx(tx, &admission.command.id)?
+        .ok_or_else(|| Error::new("source_integrity", "new admission has no command cause"))?;
+    for event in &mut admission.events {
+        annotate_remote_admission_event_tx(tx, event, &root_cause, remote, previous_command_rowid)?;
+    }
     Ok(())
 }
 

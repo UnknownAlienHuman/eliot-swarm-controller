@@ -1295,6 +1295,8 @@ global_max_live = 3
 [capacity.projects.app]
 max_live = 2
 manager_max_live = 2
+manager_min_live = 1
+manager_priority_max = 3
 ```
 
 A missing bound is unlimited; zero disables new admissions to that scope.
@@ -1314,10 +1316,21 @@ uses the same reservation membership as admission.
 A full scope refuses admission with `capacity_unavailable` and names the
 blocking scope and its Owner setting in `config.toml`. A directly refused
 request creates no command, Agent, event or reservation and can be submitted
-with the same ID after capacity changes. Automation retains its refusal for
-the existing firing with the same scope and remedy. Lowering a limit stops nothing running: existing
-reservations keep running and only new admissions are refused until usage
-drops. Retained unknown reservations keep occupying their scopes. An already admitted command retains its result under its ID, and
+with the same ID after capacity changes. A scheduled assignment or explicit launch
+intent in the arbiter retains its place and wait reason. The wait readback names the
+blocking scope and who can change it. Profile, account, proxy, project, global,
+workspace and transfer gates are Owner-controlled. The current manager can change
+a manager-assignment limit only within the Owner's delegated range.
+
+`manager_min_live` enables adjustment within the inclusive range through
+`manager_max_live`. A current manager can release unused budget or request an
+increase when the project and daemon have room. `manager_priority_max` delegates
+priority from zero through that value. The Store binds both settings to the exact
+manager generation and verifies the current assignment revision. A budget change
+affects future eligibility. A slot is reserved when a launch is admitted.
+
+Lowering a limit keeps current generations running and blocks new admissions until
+usage drops. Retained unknown reservations keep occupying their scopes. An already admitted command retains its result under its ID, and
 replay never starts another native generation or reservation. A capacity reservation is
 released only after the owned generation is proven closed: the OS source closed
 with every recorded process of the generation exited (at least one plugin or

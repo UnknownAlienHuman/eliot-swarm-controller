@@ -164,7 +164,7 @@ fn schema_51_upgrade_records_the_legacy_generation_name_before_reminting() {
         .target
         .unwrap();
     store.dispatch(&id, now).unwrap();
-    store.connection.execute_batch("ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
+    store.connection.execute_batch("DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  ALTER TABLE workspaces DROP COLUMN original_preparation;
                  DROP TABLE project_transfers; DELETE FROM schema_migrations WHERE version IN (60,61);
@@ -665,7 +665,7 @@ fn generations_started_before_the_custody_namespace_are_not_named() {
     store
         .connection
         .execute_batch(
-            "ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
+            "DROP TABLE launch_intents; DROP TABLE assignment_waits; DROP TABLE arbitration_cursor; DROP TABLE manager_budgets; DELETE FROM schema_migrations WHERE version=62; ALTER TABLE artifacts DROP COLUMN seq; DELETE FROM schema_migrations WHERE version=60; ALTER TABLE turns DROP COLUMN effective_model;
                  ALTER TABLE turns DROP COLUMN native_error_message;
                  ALTER TABLE workspaces DROP COLUMN original_preparation;
                  DROP TABLE project_transfers; DELETE FROM schema_migrations WHERE version IN (60,61);
@@ -1451,6 +1451,7 @@ fn install_2c_policy(
                 eliot_core::api::ProjectScopeLimits {
                     project: project_cap,
                     manager_assignment: manager_cap,
+                    ..Default::default()
                 },
             )
         })
@@ -1921,6 +1922,60 @@ fn concurrent_admissions_race_under_overlapping_project_and_global_caps() {
 }
 
 #[test]
+fn queued_and_immediate_admissions_share_overlapping_caps() {
+    let path = capacity_store_path();
+    let now = Ulid::new().timestamp_ms() as i64;
+    let open = || {
+        let mut store = Store::open(&path).unwrap();
+        install_2c_policy(&mut store, Some(2), [("race-a", Some(1), None)]);
+        store
+    };
+    let mut preparer = open();
+    let queued = capacity_launch_request("race-a", "interactive", json!([]));
+    let intent = eliot_core::api::LaunchQueueRequest {
+        id: queued.id.clone(),
+        args: queued.args.clone(),
+    };
+    preparer
+        .enqueue_launch("owner", &intent, queued.clone(), "race-a", None, now)
+        .unwrap();
+    let pending = preparer.pending_launches().unwrap().pop().unwrap();
+    let mut queued_writer = open();
+    let mut direct_writer = open();
+    let direct = capacity_launch_request("race-a", "direct", json!([]));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let second_barrier = barrier.clone();
+    let queued_thread = std::thread::spawn(move || {
+        barrier.wait();
+        queued_writer.admit_launch_intent(&pending, queued, None, now)
+    });
+    let direct_thread = std::thread::spawn(move || {
+        second_barrier.wait();
+        direct_writer.submit("owner", direct, now)
+    });
+    let queued = queued_thread.join().unwrap();
+    let direct = direct_thread.join().unwrap();
+    assert_ne!(queued.is_ok(), direct.is_ok());
+    let queued_won = queued.is_ok();
+    let error = queued.err().or_else(|| direct.err()).unwrap();
+    assert_eq!(error.code, "capacity_unavailable");
+    assert!(error.message.contains("project:race-a"));
+    assert_eq!(
+        crate::capacity::capacity_scope_usage(&preparer.connection, "global:swarm").unwrap(),
+        1
+    );
+    let receipt = preparer.launch_intent("owner", &intent.id).unwrap();
+    assert_eq!(receipt.command_id.is_some(), queued_won);
+    assert_eq!(preparer.arbitration_cursor().unwrap().is_some(), queued_won);
+    assert_eq!(
+        preparer.pending_launches().unwrap().len(),
+        usize::from(!queued_won)
+    );
+    drop(preparer);
+    remove_capacity_store_files(&path);
+}
+
+#[test]
 fn overview_totals_match_team_and_fleet_rows() {
     let root = std::env::temp_dir().join(format!("eliot-overview-{}", Ulid::new()));
     for name in ["checkout-a", "checkout-b", "common"] {
@@ -2050,6 +2105,7 @@ fn overview_totals_match_team_and_fleet_rows() {
                 eliot_core::api::ProjectScopeLimits {
                     project: Some(2),
                     manager_assignment: Some(3),
+                    ..Default::default()
                 },
             ),
             (
@@ -2057,6 +2113,7 @@ fn overview_totals_match_team_and_fleet_rows() {
                 eliot_core::api::ProjectScopeLimits {
                     project: Some(1),
                     manager_assignment: Some(1),
+                    ..Default::default()
                 },
             ),
         ]

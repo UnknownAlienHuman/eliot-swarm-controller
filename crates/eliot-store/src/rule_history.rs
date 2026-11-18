@@ -228,7 +228,7 @@ impl Store {
             ));
         }
         validate_id_age(&request.id, now)?;
-        if !actions.is_empty() && has_open_rule_actions_tx(&tx, principal, &request.rule)? {
+        if !actions.is_empty() && has_open_rule_actions(&tx, principal, &request.rule)? {
             return Err(Error::new(
                 "bad_state",
                 "an open or unknown rule child blocks catch-up actions",

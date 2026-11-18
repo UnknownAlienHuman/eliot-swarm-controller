@@ -466,7 +466,7 @@ mod tests {
             skip_capacity_message: None,
         };
         let late = router
-            .commit_rule_timer_slot("owner", None, &before, slot, scheduled_at_ms)
+            .commit_rule_timer_slot("owner", None, &before, slot, None, scheduled_at_ms)
             .await
             .unwrap()
             .unwrap();

@@ -67,6 +67,8 @@ pub struct ScopeLimits {
 pub struct ProjectScopeLimits {
     pub project: Option<u64>,
     pub manager_assignment: Option<u64>,
+    pub manager_min_live: Option<u64>,
+    pub manager_priority_max: Option<u8>,
 }
 
 /// One scope's live usage beside its current Owner limit.
