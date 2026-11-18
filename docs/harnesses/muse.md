@@ -319,8 +319,15 @@ canonical option ids (upstream carries no ids); option-bearing single/multiple
 modes map to `single`/`multiple`, option-less questions to `text` with free
 entry. Natively stated selection bounds pass through, absent bounds stay
 absent, and negative bounds reject at describe. Canonical strings map back to
-the wire shape the offered question requires (`selected_label`,
-`selected_labels` or `free_text`); unknown future approval decisions stay out
+the wire shape the offered question requires: a `single` answer matching an
+offered label travels as `selected_label`, anything else as `free_text`; a
+`multiple` answer whose every string matches an offered label travels as
+`selected_labels` (even one selection, within the offered minimum and maximum),
+a single non-matching string as `free_text`, and mixes or empty answers reject.
+The desktop keeps the two `multiple` shapes apart at input: typing an offered
+label checks that option instead of submitting label-identical free text, so a
+checked option and typed text never share a payload; unknown future approval
+decisions stay out
 of the public offer and no verb decides them. Resume pulls `approval/listPending` once
 for its pointer set and opens only what still binds to the live turn; anything
 naming the dead generation's turn is receipted and dropped as an orphan, never
