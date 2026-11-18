@@ -7,8 +7,12 @@
 //!   allowance of the signed-in workspace, or null when it is not signed in.
 //! - `packages/core/src/usage-limits.ts`: the operation reads the ACTIVE
 //!   `opencode` integration connection and resolves it (refreshing a stale
-//!   credential) before deriving the workspace binding, so a stored export
-//!   read directly can fail where the native operation succeeds.
+//!   credential once the Console plugin has registered its OAuth refresh)
+//!   before deriving the workspace binding, so a stored export read
+//!   directly can fail where the native operation succeeds. A one-shot
+//!   cold boot can serve the operation before that registration lands (see
+//!   `native::usage`); that failure surfaces here as `quota_unavailable`
+//!   (unknown), never as ready windows.
 //! - `packages/cli/src/commands/commands.ts`: `opencode api <operation>
 //!   --standalone` runs the operation against a private server, so quota
 //!   custody (which has no running serve) still resolves natively.
@@ -68,9 +72,12 @@ async fn read_go_legacy(profile: &Value, environment: &Value) -> Result<Value> {
 /// The Console sign-in path: the installed
 /// `api experimental.usage.limits --standalone` operation answers the
 /// Console budgets plus the Go allowance with native connection resolution
-/// (active connection plus credential refresh), or null when the location
-/// is not signed in. Null maps to `unsupported`: there is no workspace to
-/// show quotas for.
+/// (active connection plus credential refresh once registered), or null
+/// when the location is not signed in. Null maps to `unsupported`: there
+/// is no workspace to show quotas for. Any other failure (cold-start
+/// refresh race, boot failure, malformed output) maps to
+/// `quota_unavailable`: an unread quota is unknown, never a ready or
+/// unsupported answer.
 async fn read_console(profile: &Value, environment: &Value) -> Result<Value> {
     let program = profile
         .get("cmd")
@@ -123,5 +130,18 @@ mod tests {
             value.get("status").and_then(Value::as_str),
             Some("unsupported")
         );
+    }
+
+    #[tokio::test]
+    async fn unreadable_console_quota_reports_unknown() {
+        // A one-shot boot that never starts (missing binary) is an
+        // unknown read, never a ready or unsupported answer: the adapter
+        // must not trust what it could not read.
+        let raw = json!({
+            "profile": {"auth_integration": "opencode", "cmd": "/definitely/not/here/eliot-opencode-stub"},
+            "environment": {},
+        });
+        let error = read(&raw).await.expect_err("unreadable quota fails");
+        assert_eq!(error.code, "quota_unavailable");
     }
 }

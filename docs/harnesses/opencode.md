@@ -438,14 +438,16 @@ sign-in path (pinned v2.2.7 `packages/protocol/src/groups/usage.ts`,
 quota custody has no running serve, so `--standalone` runs the operation
 against a private server). The native operation reads the active
 `opencode` integration connection and resolves it (refreshing a stale
-credential) before deriving the workspace binding, so a stored export
-read directly could fail where the native call succeeds. The adapter
+credential once the Console plugin has registered its OAuth refresh)
+before deriving the workspace binding, so a stored export read directly
+could fail where the native call succeeds. A one-shot cold boot can serve
+the operation before that registration lands; that failure surfaces as
+`quota_unavailable` (unknown), never as ready windows, and only an
+explicit null answer (not signed in) reports `unsupported`. The adapter
 projects Go rolling/weekly/monthly windows and one window per budget
-spend share from the operation's answer; a null answer (not signed in)
-reports `unsupported`. The legacy `opencode-go` selector keeps the
-Go-only public-URL path (OpenCodex 2.84.0 pattern, without copied code).
-Selectors without a verified read-only path report `unsupported`. No
-inference probe, native auth import, login, switch or global-config edit
-occurs. Failures retain supported error states and provider/environment
-origin; native stderr is discarded.
-native stderr is discarded.
+spend share from the operation's answer. The legacy `opencode-go`
+selector keeps the Go-only public-URL path (OpenCodex 2.84.0 pattern,
+without copied code). Selectors without a verified read-only path report
+`unsupported`. No inference probe, native auth import, login, switch or
+global-config edit occurs. Failures retain supported error states and
+provider/environment origin; native stderr is discarded.

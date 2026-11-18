@@ -17,6 +17,19 @@
 //!   --standalone` runs the operation against a private server, so quota
 //!   custody (which has no running serve) still resolves natively.
 //!
+//! Cold-start honesty (pinned `packages/core/src/integration.ts`
+//! `connection.resolve`): the resolver returns the stored OAuth credential
+//! unchanged while the OAuth method implementation is not registered, and
+//! a one-shot `--standalone` boot can serve the operation before the
+//! Console provider plugin finishes registering its refresh. The adapter
+//! cannot observe that registration, so its contract is deliberately
+//! narrow: a successful read means the live Console calls accepted the
+//! credential (both fetches run against the live service with it, so the
+//! data is current as of the read); any failure — an expired-token 401, a
+//! boot failure, malformed output — maps to a typed unknown
+//! (`native_spawn`/`native_readback`), never to ready windows; only an
+//! explicit `data: null` (no active connection) maps to unsupported.
+//!
 //! The projection keeps the adapter's existing window labels: Go meters map
 //! to 5-hour/Weekly/Monthly windows, each Console budget contributes its
 //! spend share of its dollar limit. Entries without usable numbers are
@@ -169,7 +182,9 @@ pub(crate) async fn run_usage_limits(
 /// installed `{"data": UsageLimits.Info | null}` envelope. `null` means the
 /// location is not signed in. Go meters keep `percent` plus `resetsAt`;
 /// budgets keep the dollar `limit`/`spent` plus `per` and `resetsAt`.
-/// Anything else malformed fails the read instead of guessed.
+/// Anything else malformed fails the read instead of guessed: a body
+/// without `data` (for example an error envelope on a failed call the
+/// exit-code gate somehow missed) is unknown, never "not signed in".
 pub(crate) fn parse_usage_limits_output(text: &str) -> Result<Option<UsageInfo>> {
     let value: Value = serde_json::from_str(text).map_err(|_| {
         Error::new(
@@ -177,7 +192,12 @@ pub(crate) fn parse_usage_limits_output(text: &str) -> Result<Option<UsageInfo>>
             "OpenCode usage.limits output was unreadable",
         )
     })?;
-    let data = value.get("data").unwrap_or(&Value::Null);
+    let Some(data) = value.get("data") else {
+        return Err(Error::new(
+            "native_readback",
+            "OpenCode usage.limits output was unreadable",
+        ));
+    };
     if data.is_null() {
         return Ok(None);
     }
@@ -321,6 +341,19 @@ mod tests {
         assert_eq!(windows[2]["label"], "Monthly");
         assert_eq!(windows[3]["label"], "Console set");
         assert_eq!(windows[3]["usedPercent"], 25.0);
+    }
+
+    #[test]
+    fn error_envelope_without_data_fails_the_read() {
+        // A body without `data` (for example an error envelope) is an
+        // unknown read, never "not signed in": only an explicit
+        // `data: null` means the location is not signed in.
+        let error = parse_usage_limits_output(r#"{"error": "UsageLimits.UnavailableError"}"#)
+            .expect_err("error envelope fails");
+        assert_eq!(error.code, "native_readback");
+        let error = parse_usage_limits_output(r#"{"location": {"directory": "C:\\w"}}"#)
+            .expect_err("missing data fails");
+        assert_eq!(error.code, "native_readback");
     }
 
     #[test]
