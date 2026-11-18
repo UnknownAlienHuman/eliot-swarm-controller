@@ -736,12 +736,20 @@ fn switch_continue_binds_target_registration_and_records_continuation() {
         .finish_switch(&t.id, &core::SecretPolicy::default(), now())
         .unwrap();
     assert_eq!(change.value.state, CommandState::Applied);
-    assert!(
-        change
-            .events
-            .iter()
-            .any(|event| event.kind == "organization.changed")
-    );
+    // The completion's overlay event is the typed one every menu write
+    // emits: B's row at its revision, so a loaded sidebar refreshes B.
+    let event = change
+        .events
+        .iter()
+        .find(|event| event.kind == core::api::ORGANIZATION_CHANGED_KIND)
+        .expect("switch organization event");
+    let event: core::api::OrganizationChangedEvent =
+        serde_json::from_value(event.data.clone()).unwrap();
+    event.validate().unwrap();
+    assert_eq!(event.method, "swarm.switch");
+    assert_eq!(event.rows.len(), 1);
+    assert_eq!(event.rows[0].agent, b);
+    assert_eq!(event.rows[0].revision, 1);
     let continued: Option<String> = s
         .connection
         .query_row(

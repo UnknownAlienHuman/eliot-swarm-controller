@@ -281,7 +281,8 @@ A conversation association links an existing Agent or chat to a project or
 display group. It leaves native session, execution workspace, permissions and
 historical command attribution intact: association is placement, never
 authority. The headless association API stores the overlay and its link
-revision beside the existing Agent or chat identity (schema v64 and v65).
+revision beside the existing Agent or chat identity (schema v64 and v65; v66
+adds the switch's `continued_from` pointer).
 
 - `chat.organization` returns the grouped projection: teams by project
   assignment, manager, repository or worktree, and ancestry, with
@@ -827,7 +828,8 @@ same preparation, admission, revision, readiness and unknown handling above, wit
 no new tables or state machine. The frozen preparation is bound to the target
 registration while B keeps A's authorization scope, so the handoff stays in one
 namespace; the H2 brief carries the source reference, and the switch completion
-records `continued_from` (A) on B's existing organization link, which
+records `continued_from` (A) on B's existing organization link as an ordinary
+overlay write (a new link revision and its `organization.changed` row), which
 attach/detach/tag preserve and `chat.organization` reads back. Source history and
 usage attribution never change, and a deleted source leaves the plain-text pointer
 dangling without faulting the Store.

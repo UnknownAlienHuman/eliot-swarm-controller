@@ -1,6 +1,9 @@
 //! Switch orchestration uses only existing command rows and normal launch/handoff admission.
 use super::*;
-use eliot_core::api::{SwitchAgent, SwitchRequest, SwitchResponse};
+use eliot_core::api::{
+    ORGANIZATION_CHANGED_KIND, OrgRowChange, OrganizationChangedEvent, SwitchAgent, SwitchRequest,
+    SwitchResponse,
+};
 
 const METHOD: &str = "swarm.switch";
 
@@ -416,20 +419,43 @@ impl Store {
                         parse_agent_id(&request.from).map_err(|_| {
                             Error::new("source_integrity", "switch source id malformed")
                         })?;
+                        // An existing row (a menu write raced the handoff)
+                        // moves to a new revision like any overlay write, so
+                        // a menu that read it before the switch is refused.
                         db!(tx.execute(
                             "INSERT INTO chat_organization(agent, project_link, tags, continued_from)
                              VALUES (?1, NULL, '[]', ?2)
-                             ON CONFLICT(agent) DO UPDATE SET continued_from = excluded.continued_from",
+                             ON CONFLICT(agent) DO UPDATE SET continued_from = excluded.continued_from,
+                                 revision = chat_organization.revision + 1",
                             params![created, request.from],
                         ));
+                        // The event names B's row as this write left it, so a
+                        // loaded sidebar refreshes B by id at its revision.
+                        let (organization, tags, revision) =
+                            organization::agent_organization(&tx, created)?;
+                        let change = OrganizationChangedEvent {
+                            id: id.to_owned(),
+                            method: METHOD.to_owned(),
+                            rows: vec![OrgRowChange {
+                                agent: format_agent_id(created),
+                                organization,
+                                tags,
+                                revision: revision.ok_or_else(|| {
+                                    Error::new("internal", "switch overlay row is missing")
+                                })?,
+                            }],
+                        };
+                        change.validate()?;
                         events.push(insert_daemon_event(
                             &tx,
                             now,
-                            "organization.changed",
+                            ORGANIZATION_CHANGED_KIND,
                             "organization",
                             None,
                             None,
-                            json!({"id": id, "method": "swarm.switch"}),
+                            serde_json::to_value(&change).map_err(|_| {
+                                Error::new("internal", "cannot encode organization event")
+                            })?,
                         )?);
                         state = CommandState::Applied;
                     }
