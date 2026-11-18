@@ -2229,8 +2229,10 @@ model = \"gpt-6\"
         // #678: a fresh template must never be sent (the daemon would
         // refuse it and discard the new page); only a complete draft
         // and the empty (off) section go out.
-        let mut state = SettingsState::default();
-        state.cloud = model::cloud_template();
+        let mut state = SettingsState {
+            cloud: model::cloud_template(),
+            ..SettingsState::default()
+        };
         let refused = state
             .request_sections(Page::CloudMcp, "")
             .expect_err("bare template is not sent");
@@ -2239,7 +2241,10 @@ model = \"gpt-6\"
             model::set_cloud_field(&mut state.cloud, key, "x");
         }
         assert!(state.request_sections(Page::CloudMcp, "").is_ok());
-        state.cloud = serde_json::json!({});
-        assert!(state.request_sections(Page::CloudMcp, "").is_ok());
+        let off = SettingsState {
+            cloud: serde_json::json!({}),
+            ..SettingsState::default()
+        };
+        assert!(off.request_sections(Page::CloudMcp, "").is_ok());
     }
 }
