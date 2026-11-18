@@ -287,25 +287,30 @@ fn validate_git_hint_batch<'a>(
 struct GitView {
     data: Value,
     changed: bool,
-    deliver_commits: bool,
+    undelivered: Vec<GitCommit>,
 }
 
 /// The canonical persisted `git.changed` representation: the full snapshot
 /// identity plus the given dirty and committed-path coverage and completion
 /// flags. Built in one place so the Store budget and the persisted bytes
-/// share exact serialization rules.
+/// share exact serialization rules. `view_digest` is the digest of the full
+/// canonical view (untruncated coverage, observed flags), so a change wholly
+/// outside the retained prefix still compares different instead of hiding
+/// behind an equal truncation.
 fn git_changed_data(
     snapshot: &GitSnapshot,
     dirty: &[GitPathStatus],
     committed_paths: &[String],
     complete: bool,
     base_complete: bool,
+    view_digest: &str,
 ) -> Value {
     json!({
         "workspace": snapshot.workspace, "head": snapshot.head, "branch": snapshot.branch,
         "dirty": dirty, "complete": complete,
         "history_complete": snapshot.history_complete, "history_gap": snapshot.history_gap,
         "base_oid": snapshot.base_oid, "committed_paths": committed_paths, "base_complete": base_complete,
+        "view_digest": view_digest,
     })
 }
 
@@ -365,9 +370,29 @@ fn compute_git_view(
     // always truncates to the same bytes, so a repeat poll compares equal
     // and writes nothing instead of failing again. Only an identity that
     // alone exceeds the bound still refuses, honestly, as frame_too_large.
+    // Digest the full canonical coverage before budgeting: the persisted
+    // prefix can drop any suffix, but the digest still witnesses it.
+    let view_digest: String = canonical::digest(&git_changed_data(
+        snapshot,
+        &dirty,
+        &committed_paths,
+        snapshot.complete,
+        snapshot.base_complete,
+        "",
+    ))?
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
     let mut complete = snapshot.complete;
     let mut base_complete = snapshot.base_complete;
-    let mut data = git_changed_data(snapshot, &dirty, &committed_paths, complete, base_complete);
+    let mut data = git_changed_data(
+        snapshot,
+        &dirty,
+        &committed_paths,
+        complete,
+        base_complete,
+        &view_digest,
+    );
     while encode_json(&data)?.len() > MAX_EVENT_BYTES {
         if !dirty.is_empty() {
             dirty.truncate(dirty.len() / 2);
@@ -381,7 +406,14 @@ fn compute_git_view(
             ));
         }
         complete = false;
-        data = git_changed_data(snapshot, &dirty, &committed_paths, complete, base_complete);
+        data = git_changed_data(
+            snapshot,
+            &dirty,
+            &committed_paths,
+            complete,
+            base_complete,
+            &view_digest,
+        );
     }
     let previous: Option<(String, i64)> = tx
         .query_row(
@@ -405,28 +437,27 @@ fn compute_git_view(
         .as_ref()
         .map(|(data, _)| decode_json(data))
         .transpose()?;
-    // Delivery belongs to this binding. A partial view is not a commit receipt.
-    let delivered = if previous
-        .as_ref()
-        .is_some_and(|view| view.get("complete").and_then(Value::as_bool) == Some(true))
-    {
-        previous.clone()
-    } else {
-        let complete: Option<String> = tx
-            .query_row(
-                "SELECT data FROM events WHERE agent = ?1 AND generation = ?2
-                 AND source = 'git' AND kind = 'git.changed'
-                 AND json_extract(data, '$.complete') = 1 ORDER BY seq DESC LIMIT 1",
-                params![agent_num, generation],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        complete.as_deref().map(decode_json).transpose()?
-    };
-    let deliver_commits = delivered
-        .as_ref()
-        .is_none_or(|view| view.get("head") != data.get("head"));
+    // Commit delivery is tracked per commit oid against retained
+    // `git.committed` events, never derived from dirty coverage: a partial
+    // persisted view must neither replay a delivered commit nor gate one the
+    // truncation hid.
+    let mut undelivered = Vec::new();
+    if snapshot.complete {
+        for commit in &snapshot.commits {
+            let seen: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE agent = ?1 AND generation = ?2
+                     AND source = 'git' AND kind = 'git.committed'
+                     AND json_extract(data, '$.oid') = ?3)",
+                    params![agent_num, generation, commit.oid],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if !seen {
+                undelivered.push(commit.clone());
+            }
+        }
+    }
     let changed = match previous {
         Some(previous) => canonical::digest(&previous)? != canonical::digest(&data)?,
         None => true,
@@ -434,7 +465,7 @@ fn compute_git_view(
     Ok(GitView {
         data,
         changed,
-        deliver_commits,
+        undelivered,
     })
 }
 
@@ -458,8 +489,8 @@ fn persist_git_observation_events(
             view.data,
         )?);
     }
-    if snapshot.complete && view.deliver_commits {
-        for commit in &snapshot.commits {
+    if snapshot.complete {
+        for commit in &view.undelivered {
             events.push(insert_git_event(
                 tx,
                 agent_num,
@@ -907,5 +938,147 @@ mod tests {
             .record_git_observation("a1", 1, &snapshot, &[], 0, 101)
             .unwrap();
         assert!(!replay.iter().any(|event| event.kind == "git.changed"));
+    }
+}
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    fn observation_store() -> Store {
+        let mut store = Store::open(Path::new(":memory:")).unwrap();
+        store.connection.execute("INSERT INTO agents(project,harness,profile,workspace,state,generation,created_at,updated_at) VALUES ('','codex','p','workspace','idle',1,100,100)", []).unwrap();
+        store.ensure_git_source("a1", 1, "workspace", 100).unwrap();
+        store
+    }
+
+    fn large_dirty() -> Vec<GitPathStatus> {
+        (0..500)
+            .map(|i| GitPathStatus {
+                path: format!("untracked/{i:03}-{}.rs", "f".repeat(130)),
+                status: "??".to_owned(),
+                original_path: None,
+            })
+            .collect()
+    }
+
+    fn complete_snapshot(dirty: Vec<GitPathStatus>, observed_at: i64) -> GitSnapshot {
+        GitSnapshot {
+            workspace: "workspace".to_owned(),
+            head: Some("a".repeat(40)),
+            branch: Some("main".to_owned()),
+            dirty,
+            commits: vec![GitCommit {
+                oid: "c".repeat(40),
+                paths: vec!["src/main.rs".to_owned()],
+            }],
+            clean_paths: Vec::new(),
+            observed_at,
+            complete: true,
+            history_complete: true,
+            history_gap: false,
+            base_oid: None,
+            committed_paths: Vec::new(),
+            base_complete: false,
+        }
+    }
+
+    #[test]
+    fn committed_commits_are_not_replayed_when_changed_view_is_partial() {
+        // Review #665: a complete scan emits git.committed while its
+        // persisted git.changed is partial. Reusing that snapshot on the
+        // next hint page must not emit the commit again.
+        let mut store = observation_store();
+        let snapshot = complete_snapshot(large_dirty(), 100);
+        let events = store
+            .record_git_observation("a1", 1, &snapshot, &[], 0, 100)
+            .unwrap();
+        assert!(events.iter().any(|event| event.kind == "git.changed"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "git.committed")
+                .count(),
+            1
+        );
+        let data = events
+            .iter()
+            .find(|event| event.kind == "git.changed")
+            .expect("partial git.changed view")
+            .data
+            .clone();
+        assert_eq!(data.get("complete"), Some(&Value::Bool(false)));
+        let replay = store
+            .record_git_observation("a1", 1, &snapshot, &[], 0, 101)
+            .unwrap();
+        assert!(replay.is_empty());
+    }
+
+    #[test]
+    fn change_outside_retained_prefix_still_commits_a_view() {
+        // Review #665: a rename wholly outside the retained dirty prefix
+        // leaves the truncated comparison equal while the live view
+        // changed. The bounded event carries the full-view digest, so the
+        // change still commits a new view.
+        let mut store = observation_store();
+        let dirty = large_dirty();
+        let snapshot = complete_snapshot(dirty.clone(), 100);
+        let events = store
+            .record_git_observation("a1", 1, &snapshot, &[], 0, 100)
+            .unwrap();
+        let data = events
+            .iter()
+            .find(|event| event.kind == "git.changed")
+            .expect("partial git.changed view")
+            .data
+            .clone();
+        let retained: Vec<String> = data
+            .get("dirty")
+            .and_then(Value::as_array)
+            .expect("dirty list")
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert!(!retained.is_empty());
+        assert!(retained.len() < dirty.len());
+        // A new path that sorts after every retained row changes the live
+        // view without touching the persisted prefix.
+        let mut evolved = dirty;
+        evolved.push(GitPathStatus {
+            path: "zzzz-tail.rs".to_owned(),
+            status: "??".to_owned(),
+            original_path: None,
+        });
+        let next = complete_snapshot(evolved, 101);
+        let events = store
+            .record_git_observation("a1", 1, &next, &[], 0, 101)
+            .unwrap();
+        let changed = events
+            .iter()
+            .find(|event| event.kind == "git.changed")
+            .expect("evolved view commits a git.changed");
+        let retained_next: Vec<String> = changed
+            .data
+            .get("dirty")
+            .and_then(Value::as_array)
+            .expect("dirty list")
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(retained_next, retained);
+        assert_ne!(changed.data.get("view_digest"), data.get("view_digest"));
+        // The commit was already delivered on the first observation.
+        assert!(!events.iter().any(|event| event.kind == "git.committed"));
     }
 }
