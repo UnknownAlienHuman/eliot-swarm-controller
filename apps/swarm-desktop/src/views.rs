@@ -489,8 +489,9 @@ pub fn key_revision(items: &[Rc<RenderedItem>]) -> u64 {
     })
 }
 
-/// Reactor 0.100.0 hyperlinks only navigate URIs. Native file-reference
-/// buttons use the existing Explorer path instead, preserving prose selection.
+/// Reactor 0.100.0 hyperlinks only navigate URIs. Native path buttons under
+/// the prose open the file or folder in Explorer (`ui::reveal`), preserving
+/// prose selection.
 fn path_actions(paths: &[String], callbacks: &RowCallbacks, palette: Palette) -> View {
     StackPanel::new().keyed_children(
         paths
@@ -511,12 +512,12 @@ fn path_actions(paths: &[String], callbacks: &RowCallbacks, palette: Palette) ->
                     reference.clone(),
                     crate::m3::text_button(palette)
                         .horizontal_alignment(HorizontalAlignment::Left)
-                        .automation_name(format!("Reveal file {reference}"))
+                        .automation_name(format!("Open {reference} in Explorer"))
                         .on_click(move || {
                             let _ = open.call(resolved.clone());
                         })
                         .content(crate::m3::icon_label(crate::m3::glyph::FOLDER, reference))
-                        .tooltip("Reveal in File Explorer"),
+                        .tooltip("Open in Explorer"),
                 ))
             })
             .collect::<Vec<_>>(),

@@ -489,21 +489,10 @@ impl DesktopApp {
             ChatMsg::PathOpened(path) => {
                 // The callback carries an absolute resolved reference from its own
                 // transcript, so a selection change cannot retarget a stale click.
-                match std::fs::canonicalize(&path) {
-                    Ok(path) if path.is_file() => {
-                        let text = path.to_string_lossy();
-                        let path = nav::display_path(&text);
-                        // Explorer requires the switch outside the quoted path.
-                        // Canonical Windows file names cannot contain a quote.
-                        use std::os::windows::process::CommandExt;
-                        if let Err(error) = std::process::Command::new("explorer.exe")
-                            .raw_arg(format!("/select,\"{path}\""))
-                            .spawn()
-                        {
-                            self.set_status(format!("Could not reveal file: {error}"));
-                        }
-                    }
-                    _ => self.set_status("This file is not available on this computer."),
+                // A transcript row has no line of its own for the failure, so
+                // it shows above the composer.
+                if let Err(note) = super::reveal::reveal(&path) {
+                    self.alert(note);
                 }
             }
             ChatMsg::ToolsToggled(key, expanded) => {

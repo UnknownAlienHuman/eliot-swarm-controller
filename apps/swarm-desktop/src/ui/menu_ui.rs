@@ -629,8 +629,14 @@ impl DesktopApp {
             (Action::NewTaskHere, Target::Project { checkout, .. }) => {
                 self.shell_update(ShellMsg::ProjectPicked(checkout.clone()), context);
             }
-            (Action::OpenFolder, Target::Project { checkout, .. }) => open_folder(checkout),
-            (Action::OpenFolder, Target::Agent(agent)) => open_folder(&agent.project),
+            (Action::OpenFolder, Target::Project { checkout, .. }) => {
+                let checkout = checkout.clone();
+                self.open_folder(&checkout);
+            }
+            (Action::OpenFolder, Target::Agent(agent)) => {
+                let project = agent.project.clone();
+                self.open_folder(&project);
+            }
             (Action::ToggleCollapse, Target::Project { key, .. }) => {
                 self.shell_update(ShellMsg::ProjectToggled(key.clone()), context);
             }
@@ -1264,13 +1270,14 @@ pub(super) fn with_menu(row: View, target: Target, context: &mut ViewContext<Des
         .content(row)
 }
 
-/// Open a folder in Explorer (the verbatim `\\?\` prefix dropped).
-fn open_folder(path: &str) {
-    let path = nav::display_path(path);
-    if path.trim().is_empty() {
-        return;
+impl DesktopApp {
+    /// The menu's Open folder: a folder that is gone says so above the
+    /// composer (the menu has closed).
+    fn open_folder(&mut self, path: &str) {
+        if let Err(note) = super::reveal::reveal(path) {
+            self.alert(note);
+        }
     }
-    let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
 }
 
 #[cfg(test)]

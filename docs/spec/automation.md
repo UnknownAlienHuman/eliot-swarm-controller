@@ -102,8 +102,8 @@ editor process may retain the environment it was originally launched with.
 
 `rule.list` reads one namespace's stored rule states, timer states and canonical
 definitions for owner screens. No operation pauses, resumes, enables or disables a rule or
-timer: `enabled` comes from the rule file and `paused_reason` is set only by the daemon
-(the backlog policy below).
+timer: `enabled` comes from the rule file (for a settings assignment, from its `enabled`
+key below) and `paused_reason` is set only by the daemon (the backlog policy below).
 
 Required keys are `id`, `on`, `do`; optional keys are `enabled`, `limit`, `catch_up` and
 `allow_self`. `catch_up` configures timer-slot recovery; committed-history catch-up is an
@@ -441,6 +441,7 @@ workspace = "C:/Development/Rust/worktrees/main-20261113"
 role = "worker"
 max_busy = 2
 interval = "30s"
+enabled = true
 ```
 
 `key` is a stable identity; changing it starts a separate cursor. On each interval the
@@ -462,6 +463,9 @@ When the assignment sets `cleanup_on_retire = true` (default false), the
 applied stop also cleans that Agent's build, temp and managed-worktree
 artifacts inline in the stop worker: same authority check, same quiescence
 gate and guarded deletion, with retained receipts, and no second executor.
+`enabled = false` (default true) pauses the assignment through the generated launch
+timer's `enabled` value: no brief starts on schedule or by a manual run, and the cursor is
+kept. The completion rule stays enabled, so Agents already running still retire.
 Manual timer runs use the same admission and cursor checks. Multiple firings race
 through the same retained cursor and are serialized by Store's cursor compare-and-swap.
 The ordinary command ID remains the timer child ID, preserving exact same-ID replay.

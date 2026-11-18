@@ -114,13 +114,13 @@ const INDEX: [(Page, &str, &str); 18] = [
     (Page::Projects, "Add a project", "new checkout"),
     (
         Page::Automations,
-        "Assignments",
-        "automation brief busy folder",
+        "Automations",
+        "assignment brief busy folder schedule rule timer pause resume run now",
     ),
     (
         Page::Automations,
-        "Rules and timers",
-        "automation schedule rule timer",
+        "New automation",
+        "add create assignment queue briefs",
     ),
     (Page::Automations, "Scripts", "automation script run"),
     (
@@ -175,7 +175,7 @@ impl Page {
             Self::Routing => "How Auto chooses a preset when a task starts.",
             Self::Usage => "Remaining quota of each agent app, and what Swarm is running.",
             Self::Projects => "The checkouts tasks start in.",
-            Self::Automations => "Assignments, rules, timers and scripts that start work for you.",
+            Self::Automations => "Work Swarm starts for you: briefs from a folder, on a schedule.",
             Self::Worktrees => "Worktrees Swarm created for tasks, by project.",
             Self::CloudMcp => "Reach Swarm's MCP endpoint from the cloud.",
             Self::Advanced => "Every section of config.toml as JSON, and who changed what.",
@@ -278,13 +278,6 @@ pub(super) enum SettingsMsg {
     /// Check every project (true) or none.
     ProjectsSelectAll(bool),
     ProjectBrowse,
-    AssignmentText(String, AssignmentField, String),
-    AssignmentBusy(String, Option<f64>),
-    /// Assignment key and the index picked in its role list.
-    AssignmentRole(String, Option<usize>),
-    AssignmentRemoved(String),
-    NewAssignment(String),
-    AssignmentAdded,
     /// Index into [`model::CLOUD_FIELDS`] and its text.
     CloudField(usize, String),
     /// Configure (true) or remove Cloud MCP.
@@ -296,8 +289,6 @@ pub(super) enum SettingsMsg {
     AccessChosen(Option<usize>),
     /// Open config.toml with its default app.
     OpenConfig,
-    /// Open a folder in File Explorer.
-    OpenFolder(String),
     /// Read every installed harness's quota again.
     UsageRefresh,
     QuotaLoaded(String, Box<Fallible<HarnessQuotaResponse>>),
@@ -453,7 +444,6 @@ pub(super) struct SettingsState {
     project_open: Option<String>,
     /// Projects checked for Remove selected (registration IDs).
     pub(super) project_selected: std::collections::BTreeSet<String>,
-    new_assignment: String,
     history_open: bool,
     /// The navigation's search text.
     pub(super) query: String,
@@ -1079,60 +1069,6 @@ impl DesktopApp {
                         .insert(Page::Projects, Note::error(error));
                 }
             },
-            SettingsMsg::AssignmentText(key, field, text) => {
-                if nav::display_path(&model::assignment_text(&s.automation, &key, field)) != text {
-                    model::set_assignment_text(&mut s.automation, &key, field, &text);
-                    self.autosave_later(Page::Automations, context);
-                }
-            }
-            SettingsMsg::AssignmentBusy(key, value) => {
-                if let Some(value) = value
-                    .filter(|value| value.is_finite() && *value >= 1.0)
-                    .map(|value| value.round() as u64)
-                    .filter(|value| model::assignment_busy(&s.automation, &key) != Some(*value))
-                {
-                    model::set_assignment_busy(&mut s.automation, &key, value);
-                    self.autosave(Page::Automations, context);
-                }
-            }
-            SettingsMsg::AssignmentRole(key, index) => {
-                let mut roles = model::routing_roles(&s.routing);
-                let current = model::assignment_role(&s.automation, &key);
-                if !roles.contains(&current) {
-                    roles.push(current.clone());
-                }
-                if let Some(role) = index
-                    .and_then(|index| roles.get(index))
-                    .filter(|role| **role != current)
-                {
-                    model::set_assignment_role(&mut s.automation, &key, role);
-                    self.autosave(Page::Automations, context);
-                }
-            }
-            SettingsMsg::AssignmentRemoved(key) => {
-                model::remove_assignment(&mut s.automation, &key);
-                self.autosave(Page::Automations, context);
-            }
-            SettingsMsg::NewAssignment(text) => s.new_assignment = text,
-            SettingsMsg::AssignmentAdded => {
-                let workspace = self
-                    .nav
-                    .projects
-                    .first()
-                    .map(|project| nav::display_path(&project.workspace).to_owned())
-                    .unwrap_or_default();
-                let s = &mut self.settings;
-                let key = s.new_assignment.trim().to_owned();
-                match model::add_assignment(&mut s.automation, &key, &workspace) {
-                    Ok(()) => {
-                        s.new_assignment.clear();
-                        self.autosave(Page::Automations, context);
-                    }
-                    Err(error) => {
-                        s.notes.insert(Page::Automations, Note::error(error));
-                    }
-                }
-            }
             SettingsMsg::CloudField(index, text) => {
                 if let Some((key, _)) = model::CLOUD_FIELDS.get(index)
                     && model::cloud_field(&s.cloud, key) != text
@@ -1179,10 +1115,9 @@ impl DesktopApp {
             SettingsMsg::OpenConfig => {
                 if let Ok(data_dir) = self.data_dir.clone() {
                     let config = data_dir.join("config.toml");
-                    open_with_shell(&config.to_string_lossy());
+                    let _ = super::reveal::open_with_default_app(&config);
                 }
             }
-            SettingsMsg::OpenFolder(path) => open_with_shell(&path),
             SettingsMsg::UsageRefresh => {
                 self.load_quotas(context);
                 self.load_fleet(context);
@@ -1824,15 +1759,6 @@ fn nav_label(text: &str) -> TextBlock {
         0.0,
         tokens::spacing::XS,
     ))
-}
-
-/// Open a file or folder the way File Explorer does (explicit argv; the
-/// shell picks the default app). Nothing is waited for.
-fn open_with_shell(path: &str) {
-    if path.trim().is_empty() {
-        return;
-    }
-    let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
 }
 
 #[cfg(test)]

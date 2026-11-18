@@ -7,6 +7,7 @@
 //! reads and file-owned APIs the settings document does not cover:
 //! `profile.list` (launchability), `project.list` (resolved registrations),
 //! `routing.preview`, `rule.list`, `script.list/read/save`, `timer.run`,
+//! the rule worker's health (`daemon.status`),
 //! `workspace.list` (managed worktrees) and the fleet totals for Usage
 //! (`agent.list` counts and the `daemon.status` retention view).
 //! Each runs the same request/response validators the CLI runs.
@@ -167,6 +168,31 @@ pub async fn fleet_totals(data_dir: &Path) -> Result<FleetTotals> {
         agents,
         retention: status.retention,
     })
+}
+
+/// How the daemon's rule worker (every rule and timer, settings
+/// assignments included) is not running, from `daemon.status` ("stopped
+/// after an error (unavailable)"); `None` while it runs.
+pub async fn rule_worker_down(data_dir: &Path) -> Result<Option<String>> {
+    use eliot_core::api::WorkerTaskHealth;
+    let request = DaemonStatusRequest::default();
+    request.validate()?;
+    let status: DaemonStatusResponse =
+        eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
+    request.validate_response(&status)?;
+    Ok(status
+        .automation_tasks
+        .iter()
+        .find(|task| task.name == "rule_worker")
+        .and_then(|task| match task.health {
+            WorkerTaskHealth::Running => None,
+            WorkerTaskHealth::Starting => Some("is starting".to_owned()),
+            WorkerTaskHealth::Stopped => Some("stopped".to_owned()),
+            WorkerTaskHealth::Failed => Some(task.failure_code.as_deref().map_or_else(
+                || "stopped after an error".to_owned(),
+                |code| format!("stopped after an error ({code})"),
+            )),
+        }))
 }
 
 /// The decision routing would record for the next launch of `role`

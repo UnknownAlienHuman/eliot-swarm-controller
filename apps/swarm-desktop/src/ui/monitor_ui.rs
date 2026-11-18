@@ -1077,6 +1077,46 @@ impl DesktopApp {
             spoken_section(palette, "Summary", &agent_lines, &agent_spoken),
         ));
 
+        // Where it works: its project's checkout and, on a worktree, that
+        // worktree; each row opens in Explorer.
+        let (project, workspace) = match (detail, read) {
+            (Some(detail), _) => (Some(detail.project.clone()), detail.workspace.clone()),
+            (None, Some(read)) => (
+                Some(read.agent.agent.project.clone()),
+                read.agent.agent.workspace.clone(),
+            ),
+            (None, None) => (
+                self.find_agent(&id).map(|agent| agent.project.clone()),
+                None,
+            ),
+        };
+        let mut folders: Vec<KeyedView> = Vec::new();
+        if let Some(project) = project.filter(|project| !project.is_empty()) {
+            folders.push(KeyedView::new(
+                "project",
+                self.path_row(context, palette, "Project folder", "", &project),
+            ));
+            if let Some(worktree) =
+                workspace.filter(|workspace| nav::path_key(workspace) != nav::path_key(&project))
+            {
+                folders.push(KeyedView::new(
+                    "worktree",
+                    self.path_row(context, palette, "Worktree", "", &worktree),
+                ));
+            }
+        }
+        if !folders.is_empty() {
+            sections.push(KeyedView::new(
+                "folders",
+                m3::card_high(palette).content(
+                    StackPanel::new().spacing(tokens::spacing::XS).children((
+                        m3::section_title("Folders"),
+                        StackPanel::new().keyed_children(folders),
+                    )),
+                ),
+            ));
+        }
+
         // The failure diagnosis summary: why and where the Agent last
         // failed, from the same monitor read as the identity above. The
         // full causal chain lives behind `swarm why`.

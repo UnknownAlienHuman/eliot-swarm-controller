@@ -316,39 +316,67 @@ pub fn assignment_busy(automation: &Value, key: &str) -> Option<u64> {
     assignment(automation, key)?.get("max_busy")?.as_u64()
 }
 
-pub fn set_assignment_text(automation: &mut Value, key: &str, field: AssignmentField, text: &str) {
+/// Whether an assignment starts briefs (`enabled`, default on); off is
+/// paused.
+pub fn assignment_enabled(automation: &Value, key: &str) -> bool {
+    assignment(automation, key)
+        .and_then(|entry| entry.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Pause (false) or resume an assignment. On is the default, so resuming
+/// drops the key instead of writing it.
+pub fn set_assignment_enabled(automation: &mut Value, key: &str, on: bool) {
     if let Some(entry) = assignment_mut(automation, key) {
-        entry.insert(field.key().to_owned(), json!(text.trim()));
+        if on {
+            entry.remove("enabled");
+        } else {
+            entry.insert("enabled".to_owned(), json!(false));
+        }
     }
 }
 
-pub fn set_assignment_role(automation: &mut Value, key: &str, role: &str) {
-    if let Some(entry) = assignment_mut(automation, key) {
-        entry.insert("role".to_owned(), json!(role));
-    }
+/// What the Automations form writes for one assignment.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssignmentDraft {
+    pub folder: String,
+    pub workspace: String,
+    pub role: String,
+    pub max_busy: u64,
+    pub interval: String,
 }
 
-pub fn set_assignment_busy(automation: &mut Value, key: &str, busy: u64) {
-    if let Some(entry) = assignment_mut(automation, key) {
-        entry.insert("max_busy".to_owned(), json!(busy));
-    }
-}
-
-/// A new "keep 1 busy" assignment launching `worker` Agents every 30 s.
-pub fn add_assignment(automation: &mut Value, key: &str, workspace: &str) -> Result<(), String> {
-    if !valid_name(key) {
-        return Err("Assignment names use letters, digits, - and _.".to_owned());
-    }
-    if assignment(automation, key).is_some() {
-        return Err(format!("{key} already exists."));
+/// Create an assignment or replace its form fields; its other keys
+/// (`enabled`, `cleanup_on_retire`) stay. A new name must be valid and
+/// unused.
+pub fn put_assignment(
+    automation: &mut Value,
+    key: &str,
+    draft: &AssignmentDraft,
+    new: bool,
+) -> Result<(), String> {
+    if new {
+        if !valid_name(key) {
+            return Err("A name uses only letters, digits, - and _.".to_owned());
+        }
+        if assignment(automation, key).is_some() {
+            return Err(format!("An automation named {key} already exists."));
+        }
     }
     let assignments = object(automation)
         .entry("assignments")
         .or_insert_with(|| Value::Object(Map::new()));
-    object(assignments).insert(
-        key.to_owned(),
-        json!({"folder": "", "workspace": workspace, "role": "worker", "max_busy": 1, "interval": "30s"}),
+    let entry = object(
+        object(assignments)
+            .entry(key.to_owned())
+            .or_insert(json!({})),
     );
+    entry.insert("folder".to_owned(), json!(draft.folder.trim()));
+    entry.insert("workspace".to_owned(), json!(draft.workspace.trim()));
+    entry.insert("role".to_owned(), json!(draft.role));
+    entry.insert("max_busy".to_owned(), json!(draft.max_busy));
+    entry.insert("interval".to_owned(), json!(draft.interval.trim()));
     Ok(())
 }
 
@@ -748,16 +776,16 @@ mod tests {
     #[test]
     fn assignments_live_inside_the_automation_section() {
         let mut automation = json!({"max_event_backlog": 100000, "run": {"run_env": []}});
-        add_assignment(&mut automation, "backlog", "C:/w").unwrap();
-        assert!(add_assignment(&mut automation, "backlog", "C:/w").is_err());
-        set_assignment_text(
-            &mut automation,
-            "backlog",
-            AssignmentField::Folder,
-            "C:/briefs",
-        );
-        set_assignment_busy(&mut automation, "backlog", 2);
-        set_assignment_role(&mut automation, "backlog", "audit");
+        let draft = AssignmentDraft {
+            folder: " C:/briefs ".to_owned(),
+            workspace: "C:/w".to_owned(),
+            role: "audit".to_owned(),
+            max_busy: 2,
+            interval: "30s".to_owned(),
+        };
+        put_assignment(&mut automation, "backlog", &draft, true).unwrap();
+        assert!(put_assignment(&mut automation, "backlog", &draft, true).is_err());
+        assert!(put_assignment(&mut automation, "bad name", &draft, true).is_err());
         assert_eq!(assignment_keys(&automation), ["backlog"]);
         assert_eq!(
             assignment_text(&automation, "backlog", AssignmentField::Folder),
@@ -766,6 +794,29 @@ mod tests {
         assert_eq!(assignment_busy(&automation, "backlog"), Some(2));
         assert_eq!(assignment_role(&automation, "backlog"), "audit");
         assert_eq!(automation["max_event_backlog"], 100000);
+
+        // Paused, then edited: the edit keeps the pause and other keys.
+        assert!(assignment_enabled(&automation, "backlog"));
+        set_assignment_enabled(&mut automation, "backlog", false);
+        automation["assignments"]["backlog"]["cleanup_on_retire"] = json!(true);
+        let edited = AssignmentDraft {
+            max_busy: 3,
+            ..draft
+        };
+        put_assignment(&mut automation, "backlog", &edited, false).unwrap();
+        assert!(!assignment_enabled(&automation, "backlog"));
+        assert_eq!(
+            automation["assignments"]["backlog"]["cleanup_on_retire"],
+            true
+        );
+        assert_eq!(assignment_busy(&automation, "backlog"), Some(3));
+        // Resuming drops the key (on is the daemon's default).
+        set_assignment_enabled(&mut automation, "backlog", true);
+        assert!(
+            automation["assignments"]["backlog"]
+                .get("enabled")
+                .is_none()
+        );
         remove_assignment(&mut automation, "backlog");
         assert!(assignment_keys(&automation).is_empty());
     }

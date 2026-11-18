@@ -138,7 +138,11 @@ impl DesktopApp {
                                 Message::Settings(SettingsMsg::ProjectPath(path_id.clone(), text))
                             }))
                             .into(),
-                        None,
+                        Some(super::super::reveal::path_button(
+                            palette,
+                            &name,
+                            self.reveal_message(context, &path),
+                        )),
                     ),
                     m3::form_row(
                         "Rule profiles",

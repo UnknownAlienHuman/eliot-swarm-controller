@@ -1,4 +1,5 @@
 use super::*;
+use eliot_core::api::ArtifactKind;
 
 impl DesktopApp {
     /// The cleanup review under its row: the plan by kind (a checkbox per
@@ -131,23 +132,45 @@ impl DesktopApp {
                         )),
                 ));
                 let mut details = Vec::new();
-                let item_row = |item: &eliot_core::api::CleanupCandidate| {
+                // A folder or file item opens in Explorer; a branch,
+                // session or registration has no path to show.
+                let item_row = |item: &eliot_core::api::CleanupCandidate,
+                                context: &mut ViewContext<Self>| {
                     let (name, line) =
                         crate::worktrees::item_line(item, title(&item.artifact.agent).as_deref());
-                    KeyedView::new(
-                        item.artifact.id.clone(),
+                    let on_disk = matches!(
+                        item.artifact.kind,
+                        ArtifactKind::Build
+                            | ArtifactKind::DataDir
+                            | ArtifactKind::Temp
+                            | ArtifactKind::Worktree
+                    );
+                    let lines = StackPanel::new().children((
+                        m3::body(name.clone()).text_trimming(TextTrimming::CharacterEllipsis),
+                        m3::secondary(line)
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(!on_disk),
+                    ));
+                    let path = &item.artifact.path;
+                    let view = if on_disk {
                         StackPanel::new().children((
-                            m3::body(name).text_trimming(TextTrimming::CharacterEllipsis),
-                            m3::secondary(line)
-                                .text_wrapping(TextWrapping::Wrap)
-                                .is_text_selection_enabled(true),
-                        )),
-                    )
+                            super::super::reveal::path_item(
+                                palette,
+                                &name,
+                                lines,
+                                self.reveal_message(context, path),
+                            ),
+                            self.reveal_note(path, palette),
+                        ))
+                    } else {
+                        lines
+                    };
+                    KeyedView::new(item.artifact.id.clone(), view)
                 };
                 // What Remove takes comes first; the kept items fold under
                 // one "N kept" row.
                 let (removable, kept_items) = view.split();
-                details.extend(removable.iter().map(|item| item_row(item)));
+                details.extend(removable.iter().map(|item| item_row(item, context)));
                 if !kept_items.is_empty() {
                     let open = state.cleanup_kept_open.contains(&group);
                     let label = format!("{} kept", kept_items.len());
@@ -176,7 +199,7 @@ impl DesktopApp {
                             )),
                     ));
                     if open {
-                        details.extend(kept_items.iter().map(|item| item_row(item)));
+                        details.extend(kept_items.iter().map(|item| item_row(item, context)));
                     }
                 }
                 if expanded {
@@ -319,19 +342,7 @@ impl DesktopApp {
             vec![
                 KeyedView::new(
                     "root",
-                    m3::setting_row(
-                        "Worktree root",
-                        nav::display_path(&root),
-                        m3::outlined(palette)
-                            .automation_name("Open the worktree root")
-                            .is_enabled(!root.is_empty())
-                            .on_click(
-                                context.message(Message::Settings(SettingsMsg::OpenFolder(
-                                    root.clone(),
-                                ))),
-                            )
-                            .content(m3::icon_label(m3::glyph::OPEN_FOLDER, "Open")),
-                    ),
+                    self.path_row(context, palette, "Worktree root", "", &root),
                 ),
                 KeyedView::new(
                     "cleanup",
@@ -408,16 +419,7 @@ impl DesktopApp {
                     );
                     KeyedView::new(
                         format!("{}:{detail}", worktree.path),
-                        m3::setting_row(
-                            &name,
-                            &detail,
-                            m3::icon_button(palette)
-                                .automation_name(format!("Open {name} in File Explorer"))
-                                .on_click(context.message(Message::Settings(
-                                    SettingsMsg::OpenFolder(worktree.path.clone()),
-                                )))
-                                .content(m3::icon(m3::glyph::OPEN_FOLDER)),
-                        ),
+                        self.path_row(context, palette, &name, &detail, &worktree.path),
                     )
                 })
                 .collect();

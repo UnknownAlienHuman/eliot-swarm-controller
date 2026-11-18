@@ -49,6 +49,10 @@ pub(crate) struct AssignmentConfig {
     /// completion-rule stop path. Off by default; not a second executor.
     #[serde(default)]
     pub(crate) cleanup_on_retire: bool,
+    /// Off pauses the assignment: its launch timer starts no brief, while
+    /// the completion rule still retires the Agents already running.
+    #[serde(default = "default_assignment_enabled")]
+    pub(crate) enabled: bool,
 }
 
 impl Default for AutomationConfig {
@@ -112,6 +116,10 @@ impl AutomationConfig {
 
 fn default_max_event_backlog() -> i64 {
     100_000
+}
+
+fn default_assignment_enabled() -> bool {
+    true
 }
 
 fn default_assignment_role() -> String {

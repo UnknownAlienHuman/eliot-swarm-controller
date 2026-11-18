@@ -1140,8 +1140,10 @@ fn tools_summary(total: usize, done: usize, failed: usize) -> String {
     parts.join(" · ")
 }
 
-/// Bounded file references in prose, Markdown destinations, code and tool details.
-/// Resolution and existence checks belong to the click's native I/O boundary.
+/// Bounded file and folder references in prose, Markdown destinations, code
+/// and tool details: a name with a known extension, or any absolute drive
+/// path (a folder has no extension). Resolution and existence checks belong
+/// to the click's native I/O boundary.
 pub fn file_references(text: &str) -> Vec<String> {
     let mut paths = Vec::new();
     // Only paired backticks/double quotes preserve spaces. Apostrophes in
@@ -1212,7 +1214,12 @@ pub fn file_references(text: &str) -> Vec<String> {
                         | "log"
                         | "sql"
                 ));
-        if file && path != ".." && !paths.iter().any(|p| p == path) {
+        let bytes = path.as_bytes();
+        let absolute = bytes.len() > 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/');
+        if (file || absolute) && path != ".." && !paths.iter().any(|p| p == path) {
             paths.push(path.to_owned());
             if paths.len() == 24 {
                 break;
@@ -1704,6 +1711,17 @@ mod file_reference_tests {
         assert!(refs.contains(&"docs/vision.md".to_owned()));
         assert!(refs.contains(&"apps/main.rs".to_owned()));
         assert!(refs.contains(&r"C:\My Project\note.txt".to_owned()));
+        // A folder has no extension: only an absolute drive path names one.
+        let folders = file_references(
+            r"Work in C:\Development\Rust\worktrees\wt-k143, then `C:/briefs/queue 10`. and/or C: a\b",
+        );
+        assert_eq!(
+            folders,
+            [
+                r"C:/briefs/queue 10",
+                r"C:\Development\Rust\worktrees\wt-k143"
+            ]
+        );
         assert!(
             !refs
                 .iter()

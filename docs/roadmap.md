@@ -489,9 +489,14 @@ of the explicitly selected release scope.
       permissions and approval policy, keeping a value outside the documented set)
       and the source view both edit it. Validate and Save go through
       `settings.save` (D8). An invalid draft is never written and stays in the
-      editor. The section states that running Agents keep their frozen settings. Settings › Automation lists rules
-      and timers read-only through `rule.list`; no pause or resume operation
-      exists. (Refs #407)
+      editor. The section states that running Agents keep their frozen settings. Settings › Automations shows
+      each automation as one card in plain words: what it does, its state
+      (Running, Paused, Off, or Failed with the reason, including a rule
+      worker that `daemon.status` reports down), its last scheduled and next
+      run, its folders, and Technical details with the raw keys. Rules-file
+      rules and timers are read-only (`rule.list`) with Run now (`timer.run`);
+      a settings assignment also has Pause/Resume (its `enabled` key) and Edit
+      in a short labelled form. A removed rule is not listed. (Refs #407)
 
 - [x] **D5 Scripts.** Existing script entries under the approved Run roots
       (`<data_dir>/scripts/`, registered `.eliot/scripts/`) open in a native
@@ -589,9 +594,9 @@ of the explicitly selected release scope.
       General writes `[desktop]` theme and
       startup ("reopen the last task" opens the most recently active Agent),
       and Default access `last_access`, each when chosen. Routing edits each role's ordered candidates; Projects edits
-      path, allowed profiles and Agent actions; Automations edits assignments
-      ("keep N busy from folder X", S4) above the read-only rules and timers,
-      and the script entries; Cloud MCP edits its six fields; Advanced holds
+      path, allowed profiles and Agent actions; Automations creates, edits,
+      pauses and removes assignments (S4) through a short form beside the
+      rules and timers (D4), and the script entries; Cloud MCP edits its six fields; Advanced holds
       every section as JSON and the settings history (author, time, sections,
       revision). A control change saves at once (a typed one when typing
       rests), one revision-checked save at a time; the line under the page
@@ -651,11 +656,17 @@ of the explicitly selected release scope.
       `harness.quota` reports them, "Not supported" otherwise), running Agents
       and the tokens of Agents active today; the store's size and retention are
       in Advanced. Worktrees & cleanup lists the managed worktrees
-      under the data directory by project with Open, and Clean up finished work
+      under the data directory by project, and Clean up finished work
       reviews a `cleanup.plan` by kind (sizes, keep or remove reasons, a checkbox
       per group) and applies the checked groups' safe items through
       `cleanup.apply` after one confirmation. Automations show times on the
-      local clock. Shortcuts: Ctrl+N, Ctrl+K, Ctrl+M,
+      local clock. Every row that shows a path (chat messages and tool cards,
+      Details' project folder and worktree, Projects, Automations, Worktrees &
+      cleanup, the settings file) opens it in File Explorer on click or
+      Enter/Space, with a hover state and the tooltip "Open in Explorer": a
+      file selected in its folder, a folder opened, through
+      `%SystemRoot%\explorer.exe` with explicit argv; a path that is gone says
+      so under its row. Shortcuts: Ctrl+N, Ctrl+K, Ctrl+M,
       Ctrl+,. (Refs #407)
 - [x] **D10 The owner's second pass (2026-11-16).** Picker groups (each
       harness, and each OpenCode provider) collapse, remembered in `[desktop]

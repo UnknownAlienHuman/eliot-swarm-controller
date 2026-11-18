@@ -48,8 +48,9 @@ pub(crate) fn load(data_root: &Path) -> Result<RuleSnapshot> {
         for (key, assignment) in config.assignments {
             let id = format!("assignment-{key}");
             let toml = format!(
-                "[[rule]]\nid = {}\non = {{ every = {} }}\ndo = [{{ action = 'launch', workspace = {}, role = {}, assignment = {{ key = {}, folder = {}, max_busy = {} }} }}]\n",
+                "[[rule]]\nid = {}\nenabled = {}\non = {{ every = {} }}\ndo = [{{ action = 'launch', workspace = {}, role = {}, assignment = {{ key = {}, folder = {}, max_busy = {} }} }}]\n",
                 quote_toml(&id),
+                assignment.enabled,
                 quote_toml(&assignment.interval),
                 quote_toml(&assignment.workspace),
                 quote_toml(&assignment.role),
@@ -316,5 +317,24 @@ mod assignment_tests {
         assert_eq!(value["on"]["match"]["event.cause.rule"], "assignment-pool");
         assert_eq!(value["do"][0]["action"], "stop");
         assert_eq!(value["do"][0]["expected_generation"], "${event.generation}");
+        let enabled = |snapshot: &RuleSnapshot, id: &str| {
+            snapshot
+                .definitions
+                .iter()
+                .find(|rule| rule.id == id)
+                .unwrap()
+                .enabled
+        };
+        assert!(enabled(&snapshot, "assignment-pool"));
+
+        // Paused: the launch timer is off, the completion rule still retires.
+        fs::write(root.join("config.toml"), format!(
+            "[automation.assignments.pool]\nfolder={}\nworkspace={}\nmax_busy=2\ninterval='2s'\nenabled=false\n",
+            quote_toml(&root.to_string_lossy()), quote_toml(&root.to_string_lossy()),
+        )).unwrap();
+        let paused = load(&root).unwrap();
+        assert!(!enabled(&paused, "assignment-pool"));
+        assert!(enabled(&paused, "assignment-pool.complete"));
+        assert!(!paused.matches(&snapshot.definitions).unwrap());
     }
 }
