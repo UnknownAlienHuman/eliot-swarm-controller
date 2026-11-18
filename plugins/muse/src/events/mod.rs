@@ -150,6 +150,20 @@ pub(crate) struct EventStatus {
     pub source_unknown: bool,
     /// Lost live view; a private history read cannot re-arm that producer.
     pub view_unavailable: bool,
+    /// A turn settled from a bounded durable-view readback while the live
+    /// projection was unavailable (k167b): the live source is still
+    /// unproven, so the next send keeps its gate until the owned session
+    /// proves idle with a fresh `session/read`, even when the actor
+    /// readback itself succeeds. Set at terminal commit, cleared by a live
+    /// terminal or by `reestablish_idle` after exact idle proof; never
+    /// cleared by `clear_stale_idle_latch`.
+    pub needs_idle_proof: bool,
+    /// The owned native host failed its MCP startup audit (E47): a
+    /// host-level posture that persists across turns on that host. Latched
+    /// at terminal commit and never cleared by idle recovery; only a fresh
+    /// host (Agent restart) drops it. While set, follow-up sends are
+    /// rejected with the restart action instead of dispatching.
+    pub mcp_startup_audit_failed: bool,
     pub view_unavailable_reason: Option<NativeHistoryNoneReason>,
     pub stopped: bool,
     /// Local observation counter: bumped on every stream observation that
@@ -157,6 +171,101 @@ pub(crate) struct EventStatus {
     /// request snapshots (resume pointers, listPending pulls), never a
     /// persisted epoch.
     pub observation: u64,
+}
+
+impl EventStatus {
+    /// Clear a stale idle latch left by a settled turn (k167 E44). Historical
+    /// gaps stay in the journal; only the live latch resets so the next
+    /// follow-up send can re-prove observation. Returns true when anything
+    /// was cleared. Refuses to clear while a turn is still active. Never
+    /// clears `needs_idle_proof` (a readback-settled terminal keeps its
+    /// send gate until a fresh `session/read` proves the owned session
+    /// idle) or `mcp_startup_audit_failed` (host-scoped E47 posture).
+    pub(crate) fn clear_stale_idle_latch(&mut self) -> bool {
+        if self.active_turn_id.is_some() || self.active_command_id.is_some() {
+            return false;
+        }
+        let mut cleared = false;
+        if self.view_unavailable {
+            self.view_unavailable = false;
+            cleared = true;
+        }
+        if self.view_unavailable_reason.is_some() {
+            self.view_unavailable_reason = None;
+            cleared = true;
+        }
+        if self.source_unknown {
+            self.source_unknown = false;
+            cleared = true;
+        }
+        if self.failure.as_deref().is_some_and(is_view_related_failure) {
+            self.failure = None;
+            cleared = true;
+        }
+        cleared
+    }
+}
+
+/// View-related failure strings that must not block the next idle follow-up
+/// send once its turn has settled (k167 E44). Anything else is left intact.
+///
+/// The MCP startup-audit failure is deliberately not listed here: that
+/// failure names a host-level runtime posture, not a stale live-view latch,
+/// so the dedicated host-scoped latch keeps blocking until the Agent
+/// restarts on a fresh native host.
+pub(crate) fn is_view_related_failure(reason: &str) -> bool {
+    reason.contains("native view is unavailable")
+        || reason.contains("view recovery pending")
+        || reason.contains("unavailable-view terminal requires")
+        || reason.contains("native observation is unresolved")
+        || reason.contains("native view readback is unavailable")
+        || reason.contains("native observation remains unresolved")
+        || reason.contains(PROJECTION_GAP_SETTLEMENT_CAUSE)
+}
+
+/// Typed projection-gap cause shared with k170's `turn.unknown`
+/// settlement: bounded readbacks never proved live delivery. Recognizing
+/// the cause as view-related lets exact idle proof clear the live latch
+/// while the journal's `turn.unknown` stands untouched.
+pub(crate) const PROJECTION_GAP_SETTLEMENT_CAUSE: &str = "native view recovery did not prove";
+
+/// Host-level MCP posture failure (E47): the owned native host failed its
+/// MCP startup audit, so MCP stays disabled for that host's lifetime.
+/// Never a stale live-view latch: it is latched host-scoped at terminal
+/// commit and keeps rejecting follow-up sends until the host is replaced.
+pub(crate) const MCP_STARTUP_AUDIT_CAUSE: &str = "MCP startup audit failed";
+
+/// Whether free-form native failure text names the MCP startup-audit
+/// posture (E47). Matches the fixed native substring, never the redacted
+/// surroundings, so secret redaction cannot hide the posture.
+pub(crate) fn is_mcp_startup_audit_failure(text: &str) -> bool {
+    text.contains(MCP_STARTUP_AUDIT_CAUSE)
+}
+
+/// Exact idle proof for a follow-up send (k167b, #427): the raw
+/// `session/read` value must name the exact session, report status
+/// `idle`, and carry an explicitly null `activeTurnId`. A `running`
+/// status with a missing `activeTurnId` deserializes to the same `None`
+/// as an explicit null, so the raw value is checked for presence first:
+/// omission is never idle proof. The history envelope must also be
+/// healthy (no unavailable reason): an unavailable history cannot prove
+/// the live source idle.
+pub(crate) fn session_read_proves_idle(value: &Value, session_id: &str) -> bool {
+    let Some(active) = value
+        .get("session")
+        .and_then(|session| session.get("activeTurnId"))
+    else {
+        return false;
+    };
+    if !active.is_null() {
+        return false;
+    }
+    let Ok(readback) = serde_json::from_value::<NativeSessionReadResult>(value.clone()) else {
+        return false;
+    };
+    readback.session.session_id == session_id
+        && readback.session.status == "idle"
+        && readback.history.unavailable_reason().is_none()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -230,6 +339,10 @@ enum Control {
     RecordNativeExit {
         text: String,
         reply: oneshot::Sender<()>,
+    },
+    ReestablishIdle {
+        session_id: String,
+        reply: oneshot::Sender<Result<bool>>,
     },
     Close {
         reply: oneshot::Sender<()>,
@@ -512,6 +625,37 @@ impl EventHandle {
         .await
     }
 
+    /// Budget-bound `view_readback` (k167b): the queue wait and the outcome
+    /// wait share the caller's request `deadline` instead of minting a
+    /// fresh event deadline, so proof reads cannot outlive the budget
+    /// reserved for the typed rejection.
+    pub async fn view_readback_at(
+        &self,
+        session_id: String,
+        reason: Option<NativeHistoryNoneReason>,
+        deadline: Instant,
+    ) -> Result<EventStatus> {
+        self.send_at(
+            |reply| Control::ViewReadback {
+                session_id,
+                reason,
+                reply,
+            },
+            deadline,
+        )
+        .await
+    }
+
+    /// Budget-bound `reestablish_idle` (k167b): same shared-deadline
+    /// contract as `view_readback_at`.
+    pub async fn reestablish_idle_at(&self, session_id: String, deadline: Instant) -> Result<bool> {
+        self.send_at(
+            |reply| Control::ReestablishIdle { session_id, reply },
+            deadline,
+        )
+        .await
+    }
+
     pub async fn ready(
         &self,
         native_scope: String,
@@ -666,6 +810,25 @@ impl EventHandle {
         .map_err(|_| Error::new("unknown", "Muse event-control queue deadline elapsed"))?
         .map_err(|_| Error::new("unknown", "Muse event processor stopped"))?;
         timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            .await
+            .map_err(|_| Error::new("unknown", "Muse event-control outcome is unknown"))?
+            .map_err(|_| Error::new("unknown", "Muse event-control response was lost"))?
+    }
+
+    async fn send_at<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T>>) -> Control,
+        deadline: Instant,
+    ) -> Result<T> {
+        // One shared budget for both waits: the queue wait never borrows
+        // past the caller's deadline, and the outcome wait reuses whatever
+        // is left instead of minting a second full deadline.
+        let (reply, response) = oneshot::channel();
+        timeout_at(deadline, self.control.send(build(reply)))
+            .await
+            .map_err(|_| Error::new("unknown", "Muse event-control queue deadline elapsed"))?
+            .map_err(|_| Error::new("unknown", "Muse event processor stopped"))?;
+        timeout_at(deadline, response)
             .await
             .map_err(|_| Error::new("unknown", "Muse event-control outcome is unknown"))?
             .map_err(|_| Error::new("unknown", "Muse event-control response was lost"))?
@@ -847,6 +1010,11 @@ impl EventProcessor {
                     self.status.native_exit = Some(text);
                 }
                 let _ = reply.send(());
+                true
+            }
+            Control::ReestablishIdle { session_id, reply } => {
+                let result = self.reestablish_idle(&session_id);
+                let _ = reply.send(result);
                 true
             }
             Control::Close { reply } => {
@@ -3098,6 +3266,25 @@ impl EventProcessor {
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
         self.messages = TurnMessages::default();
+        self.status.clear_stale_idle_latch();
+        // k167b: a readback-settled terminal proves the durable view, not
+        // the live source, so it keeps the send gate until the owned
+        // session proves idle with a fresh `session/read`. A live terminal
+        // proves live delivery and drops the gate. The MCP startup-audit
+        // latch is host-scoped: once a terminal proves that posture it is
+        // only ever set here, never cleared by idle recovery.
+        self.status.needs_idle_proof = readback_recovery;
+        if self
+            .status
+            .last_turn
+            .as_ref()
+            .and_then(|turn| turn.native_error.as_deref())
+            .is_some_and(is_mcp_startup_audit_failure)
+        {
+            self.status.mcp_startup_audit_failed = true;
+        }
+        self.view_recovery = None;
+        self.gap_reported = false;
         // The turn's requests die with it: drop them locally (their Store
         // rows stay bound to the dead turn, so no later reply can address
         // them) and swallow their late resolutions. Resume orphans that never
