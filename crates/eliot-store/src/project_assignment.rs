@@ -194,23 +194,28 @@ impl Store {
                 ));
             }
             let adopted = request.adopt_worktree.as_deref();
-            let bound_path = match (adopted, &preparation) {
-                (None, Some(input)) => {
+            // An adopted checkout binds the validated request path. A
+            // prepared worktree binds nothing yet: the frozen placeholder
+            // (`pending-*`) is never stored. Admission finalizes the
+            // standard path with the admitted Agent ID in the same
+            // transaction, and the binding below reads that admitted row.
+            let adopted_path = match (adopted, preparation.is_some()) {
+                (None, true) => {
                     if launch.args["workspace"].as_str() != Some(registration.checkout.as_str()) {
                         return Err(Error::new(
                             "not_allowed",
                             "manager worktree must start from the registered checkout",
                         ));
                     }
-                    input.worktree_path.clone()
+                    None
                 }
-                (Some(_), None) => {
+                (Some(_), false) => {
                     // The router has normalized the request path and verified
                     // its Git identity before freezing this launch.
                     let workspace = required_string(&launch.args, "workspace")?;
                     workspace::require_absolute_workspace_path(&workspace)?;
                     require_no_adoption_writers(tx, &workspace)?;
-                    workspace
+                    Some(workspace)
                 }
                 _ => {
                     return Err(Error::new(
@@ -231,6 +236,22 @@ impl Store {
                 limits,
                 policy.as_deref(),
             )?;
+            let bound_path = match adopted_path {
+                Some(workspace) => workspace,
+                None => {
+                    let agent_id = admission.command.target.as_deref().ok_or_else(|| {
+                        Error::new("internal", "manager launch admitted no Agent")
+                    })?;
+                    workspace::load_workspace(tx, parse_agent_id(agent_id)?)?
+                        .map(|workspace| workspace.worktree_path)
+                        .ok_or_else(|| {
+                            Error::new(
+                                "source_integrity",
+                                "manager worktree record absent after admission",
+                            )
+                        })?
+                }
+            };
             bind_manager_workspace(tx, &request.project, &bound_path, adopted.is_some())?;
             let result = ProjectAssignmentResult {
                 assignment: read_assignment(tx, &request.project)?,

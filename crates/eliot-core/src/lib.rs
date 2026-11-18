@@ -116,14 +116,18 @@ pub struct WorkspaceSetup {
     pub timeout_ms: u64,
 }
 
-/// Naming parts for a daemon-generated standard worktree. The Store
-/// finalizes the branch and path with the admitted Agent ID, so the
-/// standard never derives from caller command-id syntax. An absent value
-/// means the caller requested the branch explicitly, which always wins.
+/// Naming parts for a daemon-prepared standard worktree directory. The
+/// Store finalizes the directory (and, for generated branches, the branch)
+/// with the admitted Agent ID, so the standard never derives from caller
+/// command-id syntax. An absent value means a legacy preparation without a
+/// standard directory. An explicitly requested branch always wins and is
+/// carried in `branch`; a `None` branch mints the standard branch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedWorktreeNaming {
     pub project_slug: String,
     pub task_slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

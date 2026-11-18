@@ -230,11 +230,13 @@ pub(super) fn validate_setup_file(file: &FrozenSetupFile) -> Result<()> {
     Ok(())
 }
 
-/// Finalize a daemon-generated standard worktree with the admitted Agent
+/// Finalize a daemon-prepared standard directory with the admitted Agent
 /// ID: `<project>/<agent>-<task-slug>` under the frozen worktrees parent.
 /// The Store is the only place that knows both the worktrees root (from the
 /// frozen placeholder's parent) and the admitted Agent ID, so the standard
 /// is implemented once here and never derives from caller command-id syntax.
+/// An explicitly requested branch always wins and is preserved; a `None`
+/// branch mints the standard branch.
 fn finalize_generated_naming(
     connection: &Connection,
     input: &WorkspacePreparationInput,
@@ -243,7 +245,16 @@ fn finalize_generated_naming(
 ) -> Result<(String, String)> {
     require_nonempty(&naming.project_slug, "generated project slug")?;
     require_nonempty(&naming.task_slug, "generated task slug")?;
-    let branch = core::standard_branch(&naming.project_slug, agent_id, &naming.task_slug);
+    let branch = match naming.branch.as_deref() {
+        Some(explicit) => {
+            require_nonempty(explicit, "requested workspace branch")?;
+            if explicit.starts_with('-') || explicit.contains('\0') {
+                return Err(Error::new("invalid", "invalid requested workspace branch"));
+            }
+            explicit.to_owned()
+        }
+        None => core::standard_branch(&naming.project_slug, agent_id, &naming.task_slug),
+    };
     let parent = std::path::Path::new(&input.worktree_path)
         .parent()
         .ok_or_else(|| Error::new("invalid", "generated worktree path has no parent"))?;

@@ -19,8 +19,22 @@ pub const MAX_TASK_SLUG_LEN: usize = 48;
 /// Fallback slug when the source text carries no usable characters.
 pub const FALLBACK_SLUG: &str = "task";
 
+/// Whether a slug would be an unusable path component on Windows: a
+/// reserved device name (`con`, `prn`, `aux`, `nul`, `com1`-`com9`,
+/// `lpt1`-`lpt9`), matched case-insensitively on the whole slug. Slugs
+/// carry no dots or colons, so the stem is the whole value.
+fn is_windows_device_slug(slug: &str) -> bool {
+    let upper = slug.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit())
+}
+
 /// Lowercase ASCII slug: every non `[a-z0-9]` run becomes one `-`, trimmed
 /// and bounded to `max_len`. Returns [`FALLBACK_SLUG`] when nothing remains.
+/// A slug that would be a Windows device name gains an `-x` suffix so the
+/// generated worktree directory stays launchable.
 fn slug_with_len(value: &str, max_len: usize) -> String {
     let mut slug = String::new();
     let mut dash = false;
@@ -44,6 +58,15 @@ fn slug_with_len(value: &str, max_len: usize) -> String {
     }
     if slug.is_empty() {
         slug.push_str(FALLBACK_SLUG);
+    }
+    if is_windows_device_slug(&slug) {
+        if slug.len() + 2 > max_len {
+            slug.truncate(max_len - 2);
+            while slug.ends_with('-') {
+                slug.pop();
+            }
+        }
+        slug.push_str("-x");
     }
     slug
 }
@@ -112,6 +135,26 @@ mod tests {
             "atlas/a12-fix-login-bug"
         );
         assert_eq!(standard_leaf("a12", "Fix login bug"), "a12-fix-login-bug");
+    }
+
+    #[test]
+    fn windows_device_slugs_are_escaped_and_bounded() {
+        for device in [
+            "aux", "AUX", "con", "nul", "prn", "com1", "COM9", "lpt1", "LPT9",
+        ] {
+            let slug = project_slug(device);
+            assert!(
+                !is_windows_device_slug(&slug),
+                "device slug escaped: {device} -> {slug}"
+            );
+            assert!(slug.len() <= MAX_PROJECT_SLUG_LEN);
+            let task = task_slug(device);
+            assert!(!is_windows_device_slug(&task));
+            assert!(task.len() <= MAX_TASK_SLUG_LEN);
+        }
+        assert_eq!(project_slug("aux"), "aux-x");
+        assert_eq!(project_slug("ATLAS"), "atlas");
+        assert_eq!(standard_branch("aux", "a12", "nul"), "aux-x/a12-nul-x");
     }
 
     #[test]

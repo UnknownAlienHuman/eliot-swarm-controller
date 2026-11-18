@@ -1587,6 +1587,7 @@ fn generated_standard_names_finalize_with_the_admitted_agent_id() {
         generated: Some(eliot_core::GeneratedWorktreeNaming {
             project_slug: "Atlas".to_owned(),
             task_slug: "Fix login BUG".to_owned(),
+            branch: None,
         }),
     };
     let start_id = Ulid::new().to_string();
@@ -1637,6 +1638,74 @@ fn generated_standard_names_finalize_with_the_admitted_agent_id() {
         loaded.branch.as_deref(),
         Some(workspace.requested_branch.as_str())
     );
+    assert_eq!(
+        loaded.workspace.as_deref(),
+        Some(workspace.worktree_path.as_str())
+    );
+}
+
+#[test]
+fn explicit_branch_finalize_keeps_the_branch_in_the_standard_directory() {
+    let mut store = Store::open(Path::new(":memory:")).expect("open Store");
+    let now = i64::try_from(Ulid::new().timestamp_ms()).expect("timestamp fits i64");
+    let checkout = "/synthetic-explicit";
+    // An explicitly requested branch lands in the standard directory: the
+    // branch wins, the directory is still finalized with the admitted Agent
+    // ID, and no `pending-*` placeholder is ever stored.
+    let input = WorkspacePreparationInput {
+        project: checkout.to_owned(),
+        repo_path: checkout.to_owned(),
+        repo_common_dir: format!("{checkout}/.git"),
+        requested_branch: "feature/manual-fix".to_owned(),
+        base_ref: Some("main".to_owned()),
+        base_oid: "d".repeat(40),
+        worktree_path: "/synthetic-data/worktrees/atlas/pending-01k178explicit".to_owned(),
+        frozen_setup: Vec::new(),
+        generated: Some(eliot_core::GeneratedWorktreeNaming {
+            project_slug: "Atlas".to_owned(),
+            task_slug: "Fix login BUG".to_owned(),
+            branch: Some("feature/manual-fix".to_owned()),
+        }),
+    };
+    let start_id = Ulid::new().to_string();
+    let launch = store
+        .submit_with_workspace(
+            "owner",
+            SubmitCommand {
+                id: start_id.clone(),
+                target: None,
+                selector: None,
+                verb: "launch".to_owned(),
+                args: json!({
+                    "project": checkout,
+                    "workspace": checkout,
+                    "worktree": "feature/manual-fix",
+                    "harness": "codex",
+                    "profile": "fake",
+                    "profile_snapshot": {}
+                }),
+                expected_generation: Some(0),
+                expected_turn_id: None,
+                request_id: None,
+                probe: false,
+            },
+            input,
+            now,
+        )
+        .expect("admit explicit-branch launch");
+    let agent = launch.command.target.expect("managed Agent");
+    let workspace = store
+        .get_workspace(&agent)
+        .expect("read workspace")
+        .expect("explicit workspace row");
+    assert_eq!(workspace.requested_branch, "feature/manual-fix");
+    assert_eq!(
+        workspace.worktree_path.replace('\\', "/"),
+        format!("/synthetic-data/worktrees/atlas/{agent}-fix-login-bug")
+    );
+    assert!(!workspace.worktree_path.contains("pending-"));
+    assert_eq!(workspace.base_ref.as_deref(), Some("main"));
+    let loaded = store.get_agent(&agent).unwrap().unwrap();
     assert_eq!(
         loaded.workspace.as_deref(),
         Some(workspace.worktree_path.as_str())

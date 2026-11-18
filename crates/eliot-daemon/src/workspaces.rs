@@ -201,23 +201,34 @@ impl WorkspaceManager {
         }
     }
 
+    /// Freeze an explicitly requested branch into the standard directory
+    /// (`<data_dir>/worktrees/<project>/<agent>-<task-slug>`). The branch
+    /// always wins; the directory is still finalized with the admitted Agent
+    /// ID by the Store, exactly like a generated worktree.
     pub(crate) async fn freeze_launch(
         &self,
         repo: &str,
         branch: &str,
         base_ref: Option<&str>,
+        project_slug: &str,
+        task_slug: &str,
         profile: &Value,
     ) -> Result<WorkspacePreparationInput> {
+        let project_slug = eliot_core::project_slug(project_slug);
+        let task_slug = eliot_core::task_slug(task_slug);
+        let pending = format!("pending-{}", Ulid::new().to_string().to_ascii_lowercase());
+        let branch = branch.to_owned();
         let target = self
             .inner
             .data_root
             .join("worktrees")
-            .join(Ulid::new().to_string());
+            .join(&project_slug)
+            .join(&pending);
         let target = target
             .to_str()
             .ok_or_else(|| problem("invalid", "managed workspace path is not UTF-8"))?;
         let frozen = WorkspaceGit::new()?
-            .freeze(repo, branch, base_ref, target)
+            .freeze(repo, &branch, base_ref, target)
             .await?;
         let frozen_setup = setup::freeze(profile, Path::new(&frozen.repo_path))?;
         let input = WorkspacePreparationInput {
@@ -225,11 +236,15 @@ impl WorkspaceManager {
             repo_path: frozen.repo_path,
             repo_common_dir: frozen.repo_common_dir,
             requested_branch: frozen.requested_branch,
-            base_ref: base_ref.map(str::to_owned),
+            base_ref: Some(frozen.base_ref),
             base_oid: frozen.base_oid,
             worktree_path: frozen.worktree_path,
             frozen_setup,
-            generated: None,
+            generated: Some(eliot_core::GeneratedWorktreeNaming {
+                project_slug,
+                task_slug,
+                branch: Some(branch),
+            }),
         };
         self.check_nonsecret(
             serde_json::to_value(&input)
@@ -273,13 +288,14 @@ impl WorkspaceManager {
             repo_path: frozen.repo_path,
             repo_common_dir: frozen.repo_common_dir,
             requested_branch: frozen.requested_branch,
-            base_ref: base_ref.map(str::to_owned),
+            base_ref: Some(frozen.base_ref),
             base_oid: frozen.base_oid,
             worktree_path: frozen.worktree_path,
             frozen_setup,
             generated: Some(eliot_core::GeneratedWorktreeNaming {
                 project_slug,
                 task_slug,
+                branch: None,
             }),
         };
         self.check_nonsecret(
@@ -621,6 +637,12 @@ impl WorkspaceManager {
         slot: &Arc<Slot>,
         git: &WorkspaceGit,
     ) -> WorkspaceRemovalOutcome {
+        // The shared merge and strict-clean gate runs before the first
+        // mutation: an unmerged, dirty or unreadable worktree is refused
+        // before any scratch file is touched, exactly like cleanup.
+        if let Err(error) = git.preflight_remove(preparation).await {
+            return removal_gate_error(&error);
+        }
         loop {
             let deadline = Instant::now() + GIT_TIME;
             if self
@@ -1795,6 +1817,16 @@ fn removal_refused() -> WorkspaceRemovalOutcome {
     WorkspaceRemovalOutcome::Failed {
         code: "workspace_remove_refused".to_owned(),
         message: "worktree removal was refused before destructive effects".to_owned(),
+    }
+}
+
+/// Map the shared pre-removal gate: unknown Git state stays unknown, every
+/// other refusal (unmerged, dirty, unreadable) settles before any mutation.
+fn removal_gate_error(error: &Error) -> WorkspaceRemovalOutcome {
+    if error.code.as_str() == "unknown" {
+        removal_unknown("workspace_remove_gate_unknown")
+    } else {
+        removal_refused()
     }
 }
 

@@ -287,23 +287,33 @@ Admission resolves `REF^{commit}` locally, without fetch, and freezes the result
 It also freezes each note/setup file as bounded bytes or canonical allowed
 `path+size+digest`; dispatch verifies the digest before executing.
 The current opt-in creates a new branch; an existing branch is rejected rather than
-reset or renamed. An explicit `--base` wins; an omitted `--base` resolves to the
-project's default branch as it is locally (`refs/remotes/origin/HEAD` when readable,
-else local `HEAD`). Repository common-directory identity is frozen alongside the
+reset or renamed, as is a branch that collides with the branch namespace (an
+existing `atlas` blocks `atlas/a1-task`, and vice versa). An explicit `--base`
+wins; an omitted `--base` resolves to the local default branch when one exists
+(the local counterpart of `refs/remotes/origin/HEAD`, else `main`, else
+`master`), else the launch-time branch, and the resolved ref is retained at
+admission: cleanup compares against the retained ref, never a freshly resolved
+default. Rows admitted without a retained base are kept, never removed.
+Repository common-directory identity is frozen alongside the
 source checkout.
 
 One naming standard, implemented once in the shared core and finalized in the
 Store with the admitted Agent ID:
 
 - `project`: the registration's logical name as a slug (the checkout folder
-  slug for unregistered checkouts);
+  slug for auto-discovered registrations, whose hashed ids are opaque, and
+  for unregistered checkouts);
 - `branch`: `<project>/<agent>-<task-slug>`, where the task slug is an ASCII,
   bounded slug of the launch prompt's first line (`task` when empty);
 - `worktree path`: `<data_dir>/worktrees/<project>/<agent>-<task-slug>`.
 
-A requested branch name still wins. Generated names are readable, unique per
+A requested branch name still wins, but even an explicit branch lands in the
+standard directory. Generated names are readable, unique per
 Agent, and never derived from caller command-id syntax: uniqueness comes from
-the admitted Agent ID, which no caller supplies. The daemon freezes a unique
+the admitted Agent ID, which no caller supplies. Windows device names
+(`aux`, `con`, `nul`, `com1` and the like) are escaped, and the complete
+destination path stays inside the Windows length limit, so generated names
+are always launchable. The daemon freezes a unique
 readable placeholder under the same parent; the Store finalizes the exact
 branch and leaf with the admitted Agent ID before the row is inserted, so
 same-ID retries read back the retained preparation instead of preparing a

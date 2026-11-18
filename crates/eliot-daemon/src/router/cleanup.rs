@@ -708,6 +708,8 @@ impl Router {
                     middle.push(candidate);
                     continue;
                 };
+                // The quiescence guard is dropped with the `if`: the fetch
+                // below never runs under it.
                 if !self
                     .inner
                     .store
@@ -734,79 +736,86 @@ impl Router {
             } else if candidate.artifact.kind == ArtifactKind::NativeSession {
                 if candidate.artifact.purpose.as_str() != "codex" {
                     candidate.reason = "no_native_archive".to_owned();
-                } else if !self
-                    .inner
-                    .store
-                    .lock()
-                    .await
-                    .cleanup_agent_quiescent(&candidate.artifact)?
-                {
-                    candidate.reason = "agent_not_quiescent".to_owned();
                 } else {
-                    candidate.verdict = "safe".to_owned();
-                    candidate.reason = "native_archive_pending".to_owned();
-                    candidate.bytes = None;
-                }
-            } else if let Some(reason) = self
-                .inner
-                .store
-                .lock()
-                .await
-                .cleanup_worktree_blocker(&candidate.artifact)?
-            {
-                candidate.reason = reason.to_owned();
-            } else if self
-                .inner
-                .store
-                .lock()
-                .await
-                .cleanup_agent_quiescent(&candidate.artifact)?
-            {
-                // A managed worktree is offered only when its branch is
-                // merged into its base. Dirty, unmerged or unknown worktrees
-                // stay kept: the clean preflight refuses dirt, and the merge
-                // check below refuses unmerged or unreadable branches.
-                let merged = if candidate.artifact.kind == ArtifactKind::Worktree {
-                    let workspace = self
+                    // Snapshot quiescence before branching: no Store guard
+                    // is held across the awaits below.
+                    let quiescent = self
                         .inner
                         .store
                         .lock()
                         .await
-                        .get_workspace(&candidate.artifact.agent)?
-                        .ok_or_else(|| {
-                            Error::new("source_integrity", "managed worktree record absent")
-                        })?;
-                    match self
-                        .worktree_merged_into_base(
-                            workspace.base_ref,
-                            workspace.worktree_path,
-                            workspace.requested_branch,
-                            &candidate.artifact,
-                        )
-                        .await
-                    {
-                        Ok(merged) => merged,
-                        Err(error) => {
-                            candidate.reason = error.code;
-                            middle.push(candidate);
-                            continue;
-                        }
-                    }
-                } else {
-                    true
-                };
-                if !merged {
-                    candidate.reason = "unmerged".to_owned();
-                    middle.push(candidate);
-                    continue;
-                }
-                match self.cleanup_preflight(&candidate.artifact).await {
-                    Ok(bytes) => {
+                        .cleanup_agent_quiescent(&candidate.artifact)?;
+                    if !quiescent {
+                        candidate.reason = "agent_not_quiescent".to_owned();
+                    } else {
                         candidate.verdict = "safe".to_owned();
-                        candidate.reason = "terminal_owned_artifact".to_owned();
-                        candidate.bytes = Some(bytes);
+                        candidate.reason = "native_archive_pending".to_owned();
+                        candidate.bytes = None;
                     }
-                    Err(error) => candidate.reason = error.code,
+                }
+            } else {
+                // Snapshot the Store verdicts before any async preflight:
+                // the merge and clean probes below reacquire the Store, so
+                // no guard is held across their awaits.
+                let (blocker, quiescent, workspace) = {
+                    let store = self.inner.store.lock().await;
+                    let blocker = store
+                        .cleanup_worktree_blocker(&candidate.artifact)?
+                        .map(str::to_owned);
+                    let quiescent = store.cleanup_agent_quiescent(&candidate.artifact)?;
+                    let workspace =
+                        if candidate.artifact.kind == ArtifactKind::Worktree {
+                            Some(store.get_workspace(&candidate.artifact.agent)?.ok_or_else(
+                                || Error::new("source_integrity", "managed worktree record absent"),
+                            )?)
+                        } else {
+                            None
+                        };
+                    (blocker, quiescent, workspace)
+                };
+                if let Some(reason) = blocker {
+                    candidate.reason = reason;
+                } else if !quiescent {
+                    candidate.reason = "agent_not_quiescent".to_owned();
+                } else {
+                    // A managed worktree is offered only when its branch is
+                    // merged into its base. Dirty, unmerged or unknown worktrees
+                    // stay kept: the clean preflight refuses dirt, and the merge
+                    // check below refuses unmerged or unreadable branches.
+                    let merged = match workspace {
+                        Some(workspace) => {
+                            match self
+                                .worktree_merged_into_base(
+                                    workspace.base_ref,
+                                    workspace.worktree_path,
+                                    workspace.requested_branch,
+                                    &candidate.artifact,
+                                )
+                                .await
+                            {
+                                Ok(merged) => merged,
+                                Err(error) => {
+                                    candidate.reason = error.code;
+                                    middle.push(candidate);
+                                    continue;
+                                }
+                            }
+                        }
+                        None => true,
+                    };
+                    if !merged {
+                        candidate.reason = "unmerged".to_owned();
+                        middle.push(candidate);
+                        continue;
+                    }
+                    match self.cleanup_preflight(&candidate.artifact).await {
+                        Ok(bytes) => {
+                            candidate.verdict = "safe".to_owned();
+                            candidate.reason = "terminal_owned_artifact".to_owned();
+                            candidate.bytes = Some(bytes);
+                        }
+                        Err(error) => candidate.reason = error.code,
+                    }
                 }
             }
             middle.push(candidate);
@@ -1110,6 +1119,9 @@ impl Router {
                 .map(|()| 0);
         }
         if artifact.kind == ArtifactKind::Worktree {
+            // Snapshot the Store, run the async Git preflight, then
+            // reacquire the lock for the final checks: no guard is held
+            // across an await anywhere below.
             let marker = self.cleanup_worktree_clean(artifact).await?;
             #[cfg(windows)]
             {
@@ -1117,39 +1129,41 @@ impl Router {
                     .git
                     .as_ref()
                     .ok_or_else(|| Error::new("source_integrity", "worktree binding absent"))?;
-                let root = CleanupTree::open_worktree(Path::new(&artifact.path), &marker)?;
-                let admin = CleanupTree::open(Path::new(&git.admin))?;
-                if root.identity != artifact.identity || admin.identity != git.admin_identity {
-                    return Err(Error::new("identity_changed", "worktree identity changed"));
-                }
-                let store = self.inner.store.lock().await;
-                if let Some(reason) = store.cleanup_worktree_blocker(artifact)? {
-                    return Err(Error::new(
-                        reason,
-                        "worktree acquired a binding or borrower",
-                    ));
-                }
-                if !store.cleanup_authorized(principal, artifact)?
-                    || !store.cleanup_agent_quiescent(artifact)?
-                {
-                    return Err(Error::new(
-                        "agent_not_quiescent",
-                        "worktree authority changed",
-                    ));
-                }
-                // Re-verify the merge at apply time: no plan-time verdict is
-                // trusted across the plan/apply gap. Unmerged or unreadable
-                // branches are never removed.
-                let workspace = store.get_workspace(&artifact.agent)?.ok_or_else(|| {
-                    Error::new("source_integrity", "managed worktree record absent")
-                })?;
-                if !self
-                    .worktree_merged_into_base(
+                // Verify identities and count bytes, then release every
+                // handle: open handles would block the Git removal below,
+                // and tracked files are never deleted through them.
+                let bytes = {
+                    let root = CleanupTree::open_worktree(Path::new(&artifact.path), &marker)?;
+                    let admin = CleanupTree::open(Path::new(&git.admin))?;
+                    if root.identity != artifact.identity || admin.identity != git.admin_identity {
+                        return Err(Error::new("identity_changed", "worktree identity changed"));
+                    }
+                    root.bytes + admin.bytes
+                };
+                // Retained record for the shared merge preflight.
+                let (base_ref, worktree_path, requested_branch) = {
+                    let store = self.inner.store.lock().await;
+                    let workspace = store.get_workspace(&artifact.agent)?.ok_or_else(|| {
+                        Error::new("source_integrity", "managed worktree record absent")
+                    })?;
+                    (
                         workspace.base_ref,
                         workspace.worktree_path,
                         workspace.requested_branch,
-                        artifact,
                     )
+                };
+                if worktree_path != artifact.path || requested_branch != git.branch {
+                    return Err(Error::new(
+                        "identity_changed",
+                        "worktree record changed since the plan backfill",
+                    ));
+                }
+                // Re-verify the merge at apply time through the shared
+                // preflight: no plan-time verdict is trusted across the
+                // plan/apply gap. Unmerged or unreadable branches are
+                // never removed.
+                if !self
+                    .worktree_merged_into_base(base_ref, worktree_path, requested_branch, artifact)
                     .await?
                 {
                     return Err(Error::new(
@@ -1157,13 +1171,37 @@ impl Router {
                         "worktree branch is not merged into its base",
                     ));
                 }
-                let bytes = root.remove()?;
-                return admin.remove().map(|extra| bytes + extra).map_err(|_| {
-                    Error::new(
+                // Final authority and borrower checks.
+                {
+                    let store = self.inner.store.lock().await;
+                    if let Some(reason) = store.cleanup_worktree_blocker(artifact)? {
+                        return Err(Error::new(
+                            reason,
+                            "worktree acquired a binding or borrower",
+                        ));
+                    }
+                    if !store.cleanup_authorized(principal, artifact)?
+                        || !store.cleanup_agent_quiescent(artifact)?
+                    {
+                        return Err(Error::new(
+                            "agent_not_quiescent",
+                            "worktree authority changed",
+                        ));
+                    }
+                }
+                // Plain `git worktree remove` (never `--force`) performs
+                // the final clean check itself: a file dirtied after the
+                // last probe refuses instead of being deleted.
+                crate::workspace_git::WorkspaceGit::new()?
+                    .remove_managed_worktree(&git.repo, &artifact.path, &git.branch)
+                    .await?;
+                if Path::new(&artifact.path).exists() || Path::new(&git.admin).exists() {
+                    return Err(Error::new(
                         "unknown",
-                        "worktree removed; administration cleanup uncertain",
-                    )
-                });
+                        "worktree removal is incomplete and was not retried",
+                    ));
+                }
+                return Ok(bytes);
             }
             #[cfg(not(windows))]
             {
@@ -2123,13 +2161,15 @@ impl Router {
             verdict: "keep".to_owned(),
             reason: "retirement_preflight".to_owned(),
         };
-        match self
+        // Snapshot the gate verdict first: the preflight below reacquires
+        // the Store, so the guard must not be held across the await.
+        let gate = self
             .inner
             .store
             .lock()
             .await
-            .retirement_plan_gate(&candidate.artifact)
-        {
+            .retirement_plan_gate(&candidate.artifact);
+        match gate {
             Ok(None) => match self.cleanup_preflight(&candidate.artifact).await {
                 Ok(bytes) => {
                     candidate.verdict = "safe".to_owned();

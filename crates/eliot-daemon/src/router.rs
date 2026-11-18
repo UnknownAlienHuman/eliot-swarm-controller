@@ -2077,36 +2077,37 @@ impl Router {
                 request.args["registered_project"] = json!(project);
             }
         }
-        // A requested branch name always wins. A bare `--worktree` (an empty
+        // A requested branch name always wins, but even an explicit branch
+        // lands in the standard directory. A bare `--worktree` (an empty
         // value) or a top-level launch in a `worktree`-mode project generates
         // the standard branch instead. Workers keep sharing their parent's
         // worktree through the parent link and never mint one.
-        let generated = match request.args.get("worktree").and_then(Value::as_str) {
-            Some(branch) if !branch.is_empty() => None,
-            Some(_) => Some(generated_naming(request)?),
-            None => {
-                if request.args.get("auto_worktree").is_some()
-                    || self.auto_worktree_for_top_level(principal, request).await?
-                {
-                    Some(generated_naming(request)?)
-                } else {
-                    if !parent_workspace_shared
-                        && request
-                            .args
-                            .get("profile_snapshot")
-                            .and_then(|profile| profile.get("setup"))
-                            .and_then(Value::as_array)
-                            .is_some_and(|setup| !setup.is_empty())
-                    {
-                        return Err(Error::new(
-                            "unsupported",
-                            "profile setup requires --worktree",
-                        ));
-                    }
-                    return Ok(None);
-                }
+        let requested = request
+            .args
+            .get("worktree")
+            .and_then(Value::as_str)
+            .filter(|branch| !branch.is_empty())
+            .map(str::to_owned);
+        if requested.is_none()
+            && request.args.get("auto_worktree").is_none()
+            && !self.auto_worktree_for_top_level(principal, request).await?
+        {
+            if !parent_workspace_shared
+                && request
+                    .args
+                    .get("profile_snapshot")
+                    .and_then(|profile| profile.get("setup"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|setup| !setup.is_empty())
+            {
+                return Err(Error::new(
+                    "unsupported",
+                    "profile setup requires --worktree",
+                ));
             }
-        };
+            return Ok(None);
+        }
+        let (project_slug, task_slug) = generated_naming(request)?;
         if contains_known_secret(&request.args, &self.inner.secrets) {
             return Err(Error::new(
                 "secret_in_payload",
@@ -2117,31 +2118,29 @@ impl Router {
             .args
             .get("profile_snapshot")
             .ok_or_else(|| Error::new("internal", "launch profile was not frozen"))?;
-        let input = match generated {
-            Some((project_slug, task_slug)) => {
+        let base = request.args.get("base").and_then(Value::as_str);
+        let input = match requested {
+            Some(branch) => {
+                self.inner
+                    .workspaces
+                    .freeze_launch(
+                        required_text(&request.args, "workspace")?,
+                        &branch,
+                        base,
+                        &project_slug,
+                        &task_slug,
+                        snapshot,
+                    )
+                    .await?
+            }
+            None => {
                 self.inner
                     .workspaces
                     .freeze_launch_generated(
                         required_text(&request.args, "workspace")?,
                         &project_slug,
                         &task_slug,
-                        request.args.get("base").and_then(Value::as_str),
-                        snapshot,
-                    )
-                    .await?
-            }
-            None => {
-                let branch = request
-                    .args
-                    .get("worktree")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| Error::new("internal", "launch worktree branch vanished"))?;
-                self.inner
-                    .workspaces
-                    .freeze_launch(
-                        required_text(&request.args, "workspace")?,
-                        branch,
-                        request.args.get("base").and_then(Value::as_str),
+                        base,
                         snapshot,
                     )
                     .await?
@@ -5468,8 +5467,28 @@ fn validate_project_rule_resume_command(
     Ok(())
 }
 
-/// Naming parts for a generated standard worktree: the registration's
-/// logical name (or the checkout folder for unregistered checkouts) and the
+/// Whether a registration id was minted by project auto-discovery
+/// (`project-<sha256>`): such ids are opaque, so the standard name uses the
+/// checkout's logical folder name instead.
+fn is_auto_project_id(id: &str) -> bool {
+    id.len() == "project-".len() + 64
+        && id.starts_with("project-")
+        && id["project-".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The checkout folder name for a launch workspace path.
+fn workspace_folder_name(workspace: &str) -> Option<String> {
+    std::path::Path::new(workspace)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+}
+
+/// Naming parts for a standard worktree directory: the registration's
+/// logical name (the checkout folder for auto-discovered registrations,
+/// whose hashed ids are opaque, and for unregistered checkouts) and the
 /// prompt text the Store slugs into `<project>/<agent>-<task-slug>`.
 /// A daemon-set `auto_worktree` hint (manager launches) wins when present.
 fn generated_naming(request: &SubmitCommand) -> Result<(String, String)> {
@@ -5483,24 +5502,32 @@ fn generated_naming(request: &SubmitCommand) -> Result<(String, String)> {
             .get("task")
             .and_then(Value::as_str)
             .unwrap_or("manager");
+        // Auto-discovered registrations carry an opaque hashed id; the
+        // standard directory uses the checkout's logical folder name.
+        if is_auto_project_id(project)
+            && let Some(folder) = request
+                .args
+                .get("workspace")
+                .and_then(Value::as_str)
+                .and_then(workspace_folder_name)
+        {
+            return Ok((folder, task.to_owned()));
+        }
         return Ok((project.to_owned(), task.to_owned()));
     }
-    let project = request
+    let registered = request
         .args
         .get("registered_project")
         .and_then(Value::as_str)
+        .filter(|project| !is_auto_project_id(project));
+    let project = registered
         .map(str::to_owned)
         .or_else(|| {
             request
                 .args
                 .get("workspace")
                 .and_then(Value::as_str)
-                .and_then(|workspace| {
-                    std::path::Path::new(workspace)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(str::to_owned)
-                })
+                .and_then(workspace_folder_name)
         })
         .filter(|project| !project.trim().is_empty())
         .ok_or_else(|| Error::new("invalid", "launch workspace has no project name"))?;
@@ -6432,6 +6459,44 @@ mod tests {
         assert_eq!(
             generated_naming(&folder).unwrap(),
             ("atlas".to_owned(), String::new())
+        );
+    }
+
+    #[test]
+    fn generated_naming_uses_the_logical_name_for_auto_discovered_projects() {
+        let auto = format!("project-{}", "ab".repeat(32));
+        assert!(is_auto_project_id(&auto));
+        assert!(!is_auto_project_id("Atlas"));
+        assert!(!is_auto_project_id("project-short"));
+        let mut registered = SubmitCommand::new("id-auto-reg", "launch");
+        registered.args = json!({
+            "workspace": "C:/src/atlas",
+            "registered_project": auto,
+            "text": "Fix login bug",
+        });
+        assert_eq!(
+            generated_naming(&registered).unwrap(),
+            ("atlas".to_owned(), "Fix login bug".to_owned())
+        );
+        // Manager hint with an auto-discovered id also falls back to the
+        // checkout folder; configured ids keep their logical name.
+        let mut hinted = SubmitCommand::new("id-auto-hint", "launch");
+        hinted.args = json!({
+            "workspace": "C:/src/atlas",
+            "auto_worktree": {"project": auto, "task": "manager"},
+        });
+        assert_eq!(
+            generated_naming(&hinted).unwrap(),
+            ("atlas".to_owned(), "manager".to_owned())
+        );
+        let mut named = SubmitCommand::new("id-named-hint", "launch");
+        named.args = json!({
+            "workspace": "C:/src/atlas",
+            "auto_worktree": {"project": "Atlas", "task": "manager"},
+        });
+        assert_eq!(
+            generated_naming(&named).unwrap(),
+            ("Atlas".to_owned(), "manager".to_owned())
         );
     }
 
