@@ -819,6 +819,13 @@ impl Router {
             .values()
             .any(|w| !w.is_finished())
     }
+    pub(super) fn run_workers_active(&self) -> bool {
+        self.inner
+            .run_workers
+            .lock_recover()
+            .values()
+            .any(|worker| !worker.task.is_finished())
+    }
     pub(super) async fn stop_inference_workers(&self) {
         self.inner.run_cancellation.send_replace(true);
         let workers = std::mem::take(&mut *self.inner.inference_workers.lock_recover());

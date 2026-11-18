@@ -34,6 +34,7 @@ mod native_binding;
 mod project_rules;
 mod provider_holds;
 mod query_performance;
+mod retained_drain;
 mod session_usage;
 mod storage;
 mod support;

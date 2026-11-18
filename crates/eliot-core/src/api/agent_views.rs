@@ -1054,6 +1054,19 @@ pub enum StatusBlocker {
         command_id: String,
         state: CommandState,
     },
+    /// Live unsettled commands beyond the bounded blocker list. Drain keeps
+    /// blocking while unlisted commands remain; the count is the exact
+    /// unlisted remainder, so a fleet of only retained unknowns (excluded
+    /// before the bound) never trips this fallback.
+    CommandUnsettledMore {
+        count: usize,
+    },
+    /// A live script Run worker with no unsettled command row of its own
+    /// (the row already settled while the worker finishes). Drain waits for
+    /// the worker instead of exiting early.
+    ScriptRunActive {
+        run_id: String,
+    },
     StoreWriteFaulted,
     CommandUnknown {
         command_id: String,

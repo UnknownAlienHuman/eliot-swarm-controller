@@ -262,6 +262,7 @@ mod child_attention_tests {
                 baseline_model_progress_at: None,
                 incident_delivery: None,
                 recovery_delivery: None,
+                is_loss: false,
             },
         );
         {
@@ -362,6 +363,7 @@ mod child_attention_tests {
             baseline_model_progress_at: captured.last_model_progress_at,
             incident_delivery: None,
             recovery_delivery: None,
+            is_loss: false,
         };
         reserve_incident(&state, &key)
             .unwrap()

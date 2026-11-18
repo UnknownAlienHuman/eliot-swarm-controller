@@ -228,15 +228,18 @@ pub(super) async fn persist_loss_report(
             }
             return Err(error);
         }
+        // Delivery is terminal for a loss (no recovery follows a lost
+        // Agent): drop the entry so the delivered report releases its
+        // reservation slot and retained losses behind it can still reserve.
         let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(incident) = state.active.get_mut(key)
-            && incident.incident_id == incident_id
-            && incident
-                .incident_delivery
-                .as_ref()
-                .is_some_and(|current| current.emit_command_id == delivery.emit_command_id)
-        {
-            incident.incident_delivery = None;
+        if state.active.get(key).is_some_and(|incident| {
+            incident.incident_id == incident_id
+                && incident
+                    .incident_delivery
+                    .as_ref()
+                    .is_some_and(|current| current.emit_command_id == delivery.emit_command_id)
+        }) {
+            state.active.remove(key);
         }
     }
     Ok(())

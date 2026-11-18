@@ -569,7 +569,12 @@ impl Router {
         match self.inner.mode.load(Ordering::SeqCst) {
             MODE_FORCE => Ok(self.inner.shutdown_ready.load(Ordering::SeqCst)),
             MODE_DRAIN if self.inner.shutdown_ready.load(Ordering::SeqCst) => {
-                Ok(self.status_blockers().await?.is_empty() && !self.inference_workers_active())
+                // The blocker list already names live Run workers, but the
+                // exit gate repeats the cheap registry check explicitly so a
+                // worker the bounded receipt omits can never end the drain.
+                Ok(self.status_blockers().await?.is_empty()
+                    && !self.inference_workers_active()
+                    && !self.run_workers_active())
             }
             MODE_DRAIN => Ok(false),
             _ => Ok(false),

@@ -670,6 +670,28 @@ so a post-restart re-report of the same loss reuses the same ids and the
 existing command/delivery idempotency makes it a no-op without a second
 incident ledger. This covers losses published before attention subscribed as
 well as a crash between the recovery commit and consumer startup.
+The same identity survives a saturated pending-check map at runtime: a loss
+that cannot enter the full map parks its exact Agent/generation/sequence in
+a bounded resumable loss queue instead of degrading to a generic sweep, and
+the next reconcile promotes it through the existing `AgentLost` handling
+(only advancing a loss once its key is retained in the map) and re-pages
+retained loss evidence from the Store when the queue or a lagged event bus
+may have missed it. Re-paging resumes from a retained cursor at the last
+fully-queued row instead of restarting at the newest, so the oldest loss
+cannot starve while newer rows refill freed slots. Sweeps skip Agents with
+queued loss evidence, and a sweep that meets an unqueued lost Agent reports
+through the same loss pipeline under the same deterministic identity (the
+retained sequence is re-paged; pruned evidence is skipped, never
+synthesized), so no generic check can preempt the loss-anchored report with
+a different incident id. Only genuinely unrecoverable saturation (queue and
+map both full) drops a loss, and the retained Store evidence re-pages it
+from the cursor on the next reconcile. A delivered loss report leaves the
+transient set at once: delivery is terminal for a lost generation (no
+recovery follows), so its reservation slot is freed for retained losses
+behind it. When a generic source-unhealthy incident is still open for a
+generation that is then reported lost, any pending delivery settles first
+and the entry is superseded by the deterministic loss report, so the loss
+identity is persisted before any restart and a re-report stays a no-op.
 Each attention escalation thread wakes its recipient only once per thread
 (recorded durably when the notice is claimed); an unchanged unread incident
 set cannot generate further wakes until new evidence arrives on a new thread.

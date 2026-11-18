@@ -6,6 +6,10 @@ mod incidents;
 mod observe;
 mod sweep;
 
+#[cfg(test)]
+#[path = "attention/tests.rs"]
+mod tests;
+
 use super::{Router, StoreHandle};
 use crate::common::now_ms;
 use eliot_core::api::SourceState;
@@ -79,6 +83,21 @@ struct AttentionState {
     active: HashMap<IncidentKey, ActiveIncident>,
     in_flight: HashSet<AgentKey>,
     pending_checks: HashMap<AgentKey, Trigger>,
+    /// Overflowed `AgentLost` triggers the bounded check map could not hold.
+    /// Drained through `AgentLost` handling on the next reconcile (never as
+    /// a generic sweep), so the deterministic loss identity survives a full
+    /// pending map. Keys stay unique; a repeat loss refreshes the sequence.
+    pending_losses: std::collections::VecDeque<(AgentKey, i64)>,
+    /// A loss was dropped because both the check map and the loss queue were
+    /// saturated. The next reconcile re-pages retained loss evidence from
+    /// the Store instead of synthesizing an identity.
+    losses_overflow: bool,
+    /// Resume cursor for retained loss re-paging: the last fully-queued
+    /// `(updated_at, agent_num)` of `startup_lost_agents` order, or `None`
+    /// to start at the newest. An interrupted pass resumes at the first
+    /// unqueued row instead of restarting at the newest, so the oldest loss
+    /// cannot starve behind saturation while newer rows refill freed slots.
+    loss_page_cursor: Option<(i64, i64)>,
     reconcile_all: bool,
     active_reconcile_cursor: usize,
     reserved_incidents: usize,
@@ -91,6 +110,10 @@ struct ActiveIncident {
     baseline_model_progress_at: Option<i64>,
     incident_delivery: Option<FrozenReport>,
     recovery_delivery: Option<FrozenReport>,
+    /// Deterministic loss-evidence report. Delivery is terminal (no recovery
+    /// follows a lost Agent), so a successful delivery drops the entry and
+    /// frees its reservation slot instead of retaining it.
+    is_loss: bool,
 }
 
 #[derive(Clone)]
@@ -365,9 +388,26 @@ async fn inspect_agent(
     if captured.agent.observe_only {
         return Ok(());
     }
-    if let Trigger::AgentLost { event_seq } = trigger
+    // A lost Agent always reports under its deterministic loss identity, no
+    // matter which trigger found it: a sweep that minted a random incident
+    // id would fork the identity, and a later restart re-report would mint
+    // the loss id again. Non-loss triggers re-page the retained `agent.lost`
+    // sequence; rows whose evidence was pruned are skipped, never
+    // synthesized. A lost manager with unfinished children still takes the
+    // generic child-cohort path below, matching the `AgentLost` trigger.
+    if captured.agent.state == AgentState::Lost
         && child_attention_activity(&captured, suspicion_window).is_none()
     {
+        let event_seq = match trigger {
+            Trigger::AgentLost { event_seq } => Some(event_seq),
+            Trigger::Sweep | Trigger::SourceEvent { .. } => {
+                let store = router.inner.store.lock().await;
+                store.latest_lost_event_seq(&captured.agent.id, captured.agent.generation)?
+            }
+        };
+        let Some(event_seq) = event_seq else {
+            return Ok(());
+        };
         return inspect_lost_agent(
             router,
             state,
@@ -446,6 +486,7 @@ async fn inspect_agent(
             baseline_model_progress_at,
             incident_delivery: Some(frozen),
             recovery_delivery: None,
+            is_loss: false,
         },
     );
     drop(child_guard);
@@ -491,8 +532,38 @@ async fn inspect_lost_agent(
         kind: IncidentKind::SourceUnhealthy,
         turn_id: None,
     };
-    if deliver_active_incident(router, &state, &key).await? {
-        return Ok(());
+    if let Some(existing_id) = {
+        let state = state.lock().unwrap_or_else(|error| error.into_inner());
+        state
+            .active
+            .get(&key)
+            .map(|incident| incident.incident_id.clone())
+    } {
+        if existing_id == incident_id {
+            // Already tracking this exact loss: settle any remaining
+            // delivery through the loss path, then return. A durably
+            // complete re-report no-ops above; a restart finds the same
+            // deterministic identity instead of a second one.
+            persist_loss_report(router, &state, &key).await?;
+            return Ok(());
+        }
+        // A generic incident occupies the loss key: settle its pending
+        // delivery, then drop it so the deterministic loss report is still
+        // persisted. The Agent is lost (terminal); no recovery follows a
+        // generic source incident for it. Returning here would swallow the
+        // loss identity, and a restart would then report it under a second
+        // identity.
+        deliver_active_incident(router, &state, &key).await?;
+        {
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if state
+                .active
+                .get(&key)
+                .is_some_and(|incident| incident.incident_id == existing_id)
+            {
+                state.active.remove(&key);
+            }
+        }
     }
     let Some(mut reservation) = reserve_incident(&state, &key) else {
         return Ok(());
@@ -535,6 +606,7 @@ async fn inspect_lost_agent(
             baseline_model_progress_at,
             incident_delivery: Some(frozen),
             recovery_delivery: None,
+            is_loss: true,
         },
     );
     persist_loss_report(router, &state, &key).await

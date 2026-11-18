@@ -2,7 +2,7 @@
 
 use super::{Router, STATUS_BLOCKER_MAX};
 use eliot_core::{
-    AgentState, CommandState, Error, Result, SecretPolicy,
+    AgentState, Command, CommandState, Error, Result, SecretPolicy,
     api::{
         DaemonStatusResponse, DrainReport, OwnedProcessKind, OwnedProcessSummary,
         RetainedUnknownSummary, RetentionView, RunningTurnSummary, StatusBlocker,
@@ -12,12 +12,6 @@ use eliot_core::{
 use eliot_plugin::sync::LockExt;
 use serde_json::Value;
 use std::collections::HashSet;
-
-/// Durable unknown-candidate scan bound for retained classification: the
-/// Store page limit (and ceiling) for stored-unknown ids examined per
-/// drain computation. Ids beyond the page keep blocking; they are never
-/// silently excused.
-const RETAINED_SCAN_MAX: usize = 1000;
 
 impl Router {
     pub(super) async fn status(&self) -> Result<Value> {
@@ -117,62 +111,40 @@ impl Router {
     /// commands with no live process, turn or reader behind them. An open
     /// source row counts as a reader only while its generation is the
     /// agent's current live generation; rows on fenced or terminal
-    /// generations are residue. Candidates come from the in-memory unknown
-    /// cache plus a bounded page of stored unknowns, so unknowns the daemon
-    /// never saw dispatched (for example across a restart, where the cache
-    /// starts empty) are still classified. Every other candidate keeps
-    /// blocking, including stored dispatched work with an uncertain
-    /// persistence outcome and any id beyond the durable page. The stored
-    /// outcome stays unknown; only the drain wait is retired, and the drain
-    /// receipt names each one with its resolvability and owner action.
-    async fn retained_unresolved_unknowns(&self) -> Result<Vec<RetainedUnknownSummary>> {
-        let mut candidates: HashSet<String> = self.unknown_ids().into_iter().collect();
-        let (paged, _total) = {
+    /// generations are residue. The Store classifies them with one SQL
+    /// predicate over durable facts, exhaustive over all stored unknowns
+    /// (no page cap, no id lists), so unknowns the daemon never saw
+    /// dispatched (for example across a restart, where the in-memory cache
+    /// starts empty) are still classified however old they are. The daemon
+    /// only adds its live plugin-reader check, which is not a durable fact.
+    /// The stored outcome stays unknown; only the drain wait is retired, and
+    /// the drain receipt names each one with its resolvability and owner
+    /// action. Returns the bounded receipt page plus the exact total.
+    async fn retained_unresolved_unknowns(&self) -> Result<(Vec<RetainedUnknownSummary>, i64)> {
+        let (page, total) = {
             let store = self.inner.store.lock().await;
-            store.list_unknown_command_ids_page(RETAINED_SCAN_MAX)?
+            (
+                store.list_retained_unknown_commands(STATUS_BLOCKER_MAX)?,
+                store.count_retained_unknown_commands()?,
+            )
         };
-        candidates.extend(paged);
-        let mut candidate_ids: Vec<String> = candidates.into_iter().collect();
-        candidate_ids.sort();
         let mut retained = Vec::new();
-        for id in candidate_ids {
-            if let Some(summary) = self.retained_unknown(&id).await {
+        for command in &page {
+            if let Some(summary) = self.retained_summary(command).await {
                 retained.push(summary);
             }
         }
         retained.sort_by(|left, right| left.id.cmp(&right.id));
-        Ok(retained)
+        Ok((retained, total))
     }
 
-    async fn retained_unknown(&self, id: &str) -> Option<RetainedUnknownSummary> {
-        let (command, agent, liveness) = {
-            let store = self.inner.store.lock().await;
-            let command = store.get_command(id).ok().flatten()?;
-            if command.state != CommandState::Unknown {
-                return None;
-            }
-            let target = command.target.clone()?;
-            let generation = command.generation?;
-            let agent = store.get_agent(&target).ok().flatten()?;
-            let liveness = store.generation_liveness(&target, generation).ok()?;
-            (command, agent, liveness)
-        };
+    /// Receipt entry for one SQL-classified retained unknown. Re-verifies
+    /// the predicate at summary time and returns `None` while a live plugin
+    /// reader still observes the generation: the in-memory reader is not a
+    /// durable fact, so it stays a daemon-side block, never a silent excuse.
+    async fn retained_summary(&self, command: &Command) -> Option<RetainedUnknownSummary> {
         let target = command.target.clone()?;
         let generation = command.generation?;
-        if liveness.live_process {
-            return None;
-        }
-        // An open source row only evidences a live reader while its
-        // generation is the agent's current live generation. Rows on a fenced
-        // or terminal generation are residue: no new reader can bind them,
-        // and the Host tracks genuinely live readers itself.
-        let terminal = matches!(
-            agent.state,
-            AgentState::Stopped | AgentState::Failed | AgentState::Lost
-        );
-        if !terminal && agent.generation == generation && liveness.open_source {
-            return None;
-        }
         if self
             .inner
             .plugin_host
@@ -180,12 +152,19 @@ impl Router {
         {
             return None;
         }
-        if command.turn_id.is_some() && agent.active_turn == command.turn_id {
-            return None;
-        }
-        if agent.generation == generation && agent.active_turn.is_some() {
-            return None;
-        }
+        let agent = {
+            let store = self.inner.store.lock().await;
+            // The page above and this read race live state; only a
+            // still-retained row may retire the drain wait.
+            if !store.is_retained_unknown(&command.id).ok()? {
+                return None;
+            }
+            store.get_agent(&target).ok().flatten()?
+        };
+        // The predicate already encodes the durable turn checks (only a
+        // recorded turn matching the live turn backs the command, and a
+        // live turn on the same generation blocks); the plugin check above
+        // covers the non-durable reader.
         let mut reason = command
             .outcome
             .as_ref()
@@ -194,7 +173,7 @@ impl Router {
             .map(str::to_owned)
             .filter(|reason| !reason.trim().is_empty())
             .or_else(|| {
-                self.unknown_cause(id)
+                self.unknown_cause(&command.id)
                     .filter(|cause| !cause.trim().is_empty())
             })
             .unwrap_or_else(|| "unknown".to_owned());
@@ -208,7 +187,7 @@ impl Router {
             "not owner-resolvable (observe-only commands cannot be resolved); retained for the record, no action needed; use --force only for live work".to_owned()
         };
         Some(RetainedUnknownSummary {
-            id: id.to_owned(),
+            id: command.id.clone(),
             verb: command.verb.clone(),
             agent: command.target.clone(),
             generation: command.generation,
@@ -230,17 +209,23 @@ impl Router {
     /// occurred. Stored unknowns with no live process, turn or reader are
     /// listed under `retained_unresolved` with their resolvability and owner
     /// action instead of blocking: the drain wait is retired, never the
-    /// outcome. The unsettled section excludes those same ids so the receipt
-    /// never double-lists them; its count covers the filtered list.
+    /// outcome. The unsettled section excludes the same predicate in SQL
+    /// before the bound so the receipt never double-lists them; its count
+    /// covers the excluding page.
     pub(super) async fn drain_report(&self) -> Result<DrainReport> {
         self.clear_terminal_unknown_cache().await;
+        // Retained unknowns leave the unsettled section in SQL before the
+        // bound (one predicate over durable facts, no id lists), so they can
+        // neither occupy the bounded prefix nor hide a live command in the
+        // receipt.
+        let (mut retained_unresolved, retained_total) = self.retained_unresolved_unknowns().await?;
         let (agents, agents_total, unsettled_commands, unsettled_total, custody) = {
             let store = self.inner.store.lock().await;
             (
                 store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?,
                 store.count_nonterminal_agents()?,
-                store.list_unsettled_commands(STATUS_BLOCKER_MAX)?,
-                store.count_unsettled_commands()?,
+                store.list_unsettled_commands_excluding_retained(STATUS_BLOCKER_MAX)?,
+                store.count_unsettled_commands_excluding_retained()?,
                 store.live_process_owners(STATUS_BLOCKER_MAX)?,
             )
         };
@@ -272,19 +257,13 @@ impl Router {
         });
         running_turns.truncate(STATUS_BLOCKER_MAX);
         let running_turns_count = running_turns.len();
-        let mut retained_unresolved: Vec<RetainedUnknownSummary> =
-            self.retained_unresolved_unknowns().await?;
-        let retained_ids: HashSet<String> = retained_unresolved
-            .iter()
-            .map(|summary| summary.id.clone())
-            .collect();
-        // The unsettled section mirrors the blockers: retained entries move
-        // to `retained_unresolved` instead of double-listing here. The count
-        // covers the filtered list and the flag stays true whenever the store
-        // total exceeds it for any reason, including that move.
+        // The unsettled section mirrors the blockers: retained entries were
+        // already excluded in SQL and live under `retained_unresolved`
+        // instead of double-listing here. The count covers the listed page
+        // and the flag stays true whenever the excluding store total exceeds
+        // it for any reason.
         let unsettled_details = unsettled_commands
             .iter()
-            .filter(|command| !retained_ids.contains(&command.id))
             .map(|command| UnsettledCommandSummary {
                 id: command.id.clone(),
                 agent: command.target.clone(),
@@ -321,8 +300,12 @@ impl Router {
         let owned_processes_truncated = owned_processes.len() < live_total;
         owned_processes.truncate(STATUS_BLOCKER_MAX);
         let owned_processes_count = owned_processes.len();
-        let retained_unresolved_count = retained_unresolved.len();
-        let retained_unresolved_truncated = retained_unresolved.len() > STATUS_BLOCKER_MAX;
+        // The total is the exact SQL count over all stored unknowns; the
+        // flag stays true whenever the bounded (or reader-filtered) page
+        // omits any of it.
+        let retained_unresolved_count =
+            usize::try_from(retained_total.max(0)).unwrap_or(usize::MAX);
+        let retained_unresolved_truncated = retained_unresolved.len() < retained_unresolved_count;
         retained_unresolved.truncate(STATUS_BLOCKER_MAX);
         Ok(DrainReport {
             running_turns_count,
@@ -345,7 +328,21 @@ impl Router {
 
     pub(super) async fn status_blockers(&self) -> Result<Vec<StatusBlocker>> {
         self.clear_terminal_unknown_cache().await;
-        let (agents, active_observers, unsettled_commands, write_faulted) = {
+        // Retained unknowns retire the drain wait everywhere: the Store
+        // excludes the predicate in SQL before the unsettled bound, so
+        // retained entries can neither occupy a blocker slot nor hide a
+        // live command behind the bounded prefix. The excluding total drives
+        // the overflow fallback below: any command the bound omits keeps
+        // blocking, while a fleet of only retained unknowns still drains
+        // because the predicate already excluded every one of them.
+        let (
+            agents,
+            active_observers,
+            unsettled_commands,
+            unsettled_total,
+            live_owners_total,
+            write_faulted,
+        ) = {
             let store = self.inner.store.lock().await;
             let agents = store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?;
             let active_observers = agents
@@ -358,16 +355,24 @@ impl Router {
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let unsettled_commands = store.list_unsettled_commands(STATUS_BLOCKER_MAX)?;
+            let unsettled_commands =
+                store.list_unsettled_commands_excluding_retained(STATUS_BLOCKER_MAX)?;
+            let unsettled_total = store.count_unsettled_commands_excluding_retained()?;
+            // Store custody is the owned-process source of truth beside the
+            // workspace slots: a live owned process record blocks even when
+            // no slot claims it.
+            let live_owners_total = store.live_process_owners(1)?.1;
             (
                 agents,
                 active_observers,
                 unsettled_commands,
+                unsettled_total,
+                live_owners_total,
                 store.is_write_faulted(),
             )
         };
         let mut blockers = Vec::new();
-        if self.inner.workspaces.has_owned_processes() {
+        if self.inner.workspaces.has_owned_processes() || live_owners_total > 0 {
             blockers.push(StatusBlocker::WorkspaceProcesses);
         }
         let discovery_readers = self.inner.plugin_host.reader_count();
@@ -395,37 +400,92 @@ impl Router {
                 active_turn: agent.active_turn.clone(),
             });
         }
-        // Retained unknowns retire the drain wait everywhere: they are
-        // excluded from the unsettled blockers below and from the unknown
-        // blockers after that, and the drain receipt lists them instead.
-        let retained_ids: HashSet<String> = self
-            .retained_unresolved_unknowns()
-            .await?
-            .into_iter()
-            .map(|summary| summary.id)
-            .collect();
         let mut unsettled_ids = HashSet::new();
         for command in unsettled_commands {
-            if retained_ids.contains(&command.id) {
-                continue;
-            }
             unsettled_ids.insert(command.id.clone());
             blockers.push(StatusBlocker::CommandUnsettled {
                 command_id: command.id,
                 state: command.state,
             });
         }
+        // Live script Run workers gate drain explicitly: the worker registry
+        // is separate from the command rows, and a worker can outlive its
+        // row settlement while output admission finishes. Workers whose
+        // command is still unsettled are already listed above (or counted in
+        // the overflow remainder below when the page omits them); only the
+        // settled-row remainder needs its own entry, and every unfinished
+        // worker either appears here or is counted, never silently dropped.
+        let run_workers: Vec<(String, bool)> = self
+            .inner
+            .run_workers
+            .lock_recover()
+            .iter()
+            .map(|(id, worker)| (id.clone(), worker.task.is_finished()))
+            .collect();
+        for (run_id, finished) in run_workers {
+            if finished || unsettled_ids.contains(&run_id) {
+                continue;
+            }
+            let row = {
+                let store = self.inner.store.lock().await;
+                store.get_command(&run_id)?
+            };
+            let live = row.as_ref().is_some_and(|command| {
+                matches!(
+                    command.state,
+                    CommandState::Accepted
+                        | CommandState::Queued
+                        | CommandState::Dispatched
+                        | CommandState::Unknown
+                )
+            });
+            match row.filter(|_| live) {
+                Some(command) => {
+                    // The excluding total below counts this row whether or
+                    // not the bounded page lists it, so only fill a still
+                    // free slot: the remainder counts exactly the omitted.
+                    if unsettled_ids.len() < STATUS_BLOCKER_MAX {
+                        unsettled_ids.insert(command.id.clone());
+                        blockers.push(StatusBlocker::CommandUnsettled {
+                            command_id: command.id,
+                            state: command.state,
+                        });
+                    }
+                }
+                None => blockers.push(StatusBlocker::ScriptRunActive { run_id }),
+            }
+        }
+        // The bounded list is diagnostic: the excluding total is the drain
+        // decision, so any live command the bound omits keeps blocking with
+        // its exact unlisted remainder. The remainder counts only entries
+        // the list omits: every listed id above is already in the total.
+        let unsettled_total = usize::try_from(unsettled_total.max(0)).unwrap_or(usize::MAX);
+        if unsettled_total > unsettled_ids.len() {
+            blockers.push(StatusBlocker::CommandUnsettledMore {
+                count: unsettled_total - unsettled_ids.len(),
+            });
+        }
         if write_faulted {
             blockers.push(StatusBlocker::StoreWriteFaulted);
         }
         // Filter retained and already-unsettled ids before the list bound and
-        // the overflow calculation, so retained entries can neither occupy a
-        // blocker slot nor trip the overflow counter.
-        let blocking_unknown: Vec<String> = self
-            .unknown_ids()
-            .into_iter()
-            .filter(|id| !retained_ids.contains(id) && !unsettled_ids.contains(id))
-            .collect();
+        // the overflow calculation, so retired entries can neither occupy a
+        // blocker slot nor trip the overflow counter. Retention is decided
+        // per id by the same SQL predicate that excluded the unsettled
+        // section; a Store error keeps the id blocking (fail closed).
+        let mut blocking_unknown = Vec::new();
+        {
+            let store = self.inner.store.lock().await;
+            for id in self.unknown_ids() {
+                if unsettled_ids.contains(&id) {
+                    continue;
+                }
+                if store.is_retained_unknown(&id).unwrap_or(false) {
+                    continue;
+                }
+                blocking_unknown.push(id);
+            }
+        }
         for id in blocking_unknown.iter().take(STATUS_BLOCKER_MAX) {
             blockers.push(StatusBlocker::CommandUnknown {
                 command_id: id.clone(),
@@ -526,8 +586,15 @@ mod tests {
                 .expect("re-settle unknown with a long reason");
             attach_id
         };
+        let command = {
+            let store = router.inner.store.lock().await;
+            store
+                .get_command(&attach_id)
+                .expect("read back attach")
+                .expect("attach row")
+        };
         let summary = router
-            .retained_unknown(&attach_id)
+            .retained_summary(&command)
             .await
             .expect("retained unknown summary");
         assert!(summary.reason.len() <= 128);
@@ -1093,6 +1160,423 @@ mod tests {
             STATUS_BLOCKER_MAX
         );
         assert_eq!(drain["retained_unresolved_truncated"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn drain_blockers_keep_live_command_visible_behind_retained_prefix() {
+        let router = router();
+        let now = now_ms();
+        // Fill the whole bounded unsettled prefix with retained controlled
+        // unknowns: dispatched launches fenced as lost by a restart, with
+        // no live process, turn or reader behind them.
+        let mut retained_ids = Vec::new();
+        let live_id = {
+            let mut store = router.inner.store.lock().await;
+            for i in 0..STATUS_BLOCKER_MAX {
+                let admitted = store
+                    .submit(
+                        "owner",
+                        SubmitCommand {
+                            id: ulid::Ulid::new().to_string(),
+                            target: None,
+                            selector: None,
+                            verb: "launch".to_owned(),
+                            args: json!({"project":"prefix-scope","workspace":"synthetic-workspace",
+                                "harness":"codex","profile":"synthetic","profile_snapshot":{}}),
+                            expected_generation: Some(0),
+                            expected_turn_id: None,
+                            request_id: None,
+                            probe: false,
+                        },
+                        now + i as i64,
+                    )
+                    .expect("admit prefix launch");
+                retained_ids.push(admitted.command.id.clone());
+                store
+                    .dispatch(&retained_ids[i], now + i as i64)
+                    .expect("dispatch prefix launch");
+            }
+            store
+                .recover_on_restart(now + 10_000)
+                .expect("restart recovery");
+            for id in &retained_ids {
+                assert_eq!(
+                    store.get_command(id).unwrap().unwrap().state,
+                    CommandState::Unknown
+                );
+            }
+            // A later live launch sorts behind the whole retained prefix and
+            // stays dispatched: it must still block even though the retained
+            // page used to cover the bound.
+            let live = store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args: json!({"project":"prefix-live","workspace":"synthetic-workspace",
+                            "harness":"codex","profile":"synthetic","profile_snapshot":{}}),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now + 20_000,
+                )
+                .expect("admit live launch")
+                .command
+                .id;
+            store
+                .dispatch(&live, now + 20_001)
+                .expect("dispatch live launch");
+            live
+        };
+        // The retained ids retire from the unsettled blockers, but the live
+        // command they used to hide behind the prefix must block.
+        let blockers = router.status_blockers().await.expect("blockers");
+        assert!(
+            blockers.iter().any(|blocker| matches!(
+                blocker,
+                StatusBlocker::CommandUnsettled { command_id, state }
+                    if command_id == &live_id && *state == CommandState::Dispatched
+            )),
+            "live command hidden behind retained prefix: {blockers:?}"
+        );
+        assert!(
+            !blockers.iter().any(|blocker| matches!(
+                blocker,
+                StatusBlocker::CommandUnsettled { command_id, .. }
+                    if retained_ids.contains(command_id)
+            )),
+            "retained unknowns must not block: {blockers:?}"
+        );
+        let drained = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(drained["state"], json!("dispatched"));
+        let drain = drained["drain"].as_object().expect("drain report");
+        let unsettled = drain["unsettled_commands"]
+            .as_array()
+            .expect("unsettled commands");
+        assert!(
+            unsettled
+                .iter()
+                .any(|command| command["id"] == json!(live_id)),
+            "live command missing from drain receipt"
+        );
+        assert_eq!(drain["unsettled_commands_count"], json!(unsettled.len()));
+        assert_eq!(
+            drain["retained_unresolved"]
+                .as_array()
+                .expect("retained unknowns")
+                .len(),
+            STATUS_BLOCKER_MAX
+        );
+        assert_eq!(drain["retained_unresolved_truncated"], json!(false));
+        // The live command still gates the exit: drain must not end early.
+        router.response_finished(true);
+        assert!(!router.should_exit().await.expect("should_exit"));
+    }
+
+    #[tokio::test]
+    async fn drain_blocks_live_command_hidden_behind_fully_retained_prefix() {
+        let router = router();
+        let now = now_ms();
+        // Fill the whole bounded unsettled prefix with retained controlled
+        // unknowns, exactly like the prefix test above, but the live command
+        // behind them is an observer attach: its Agent is observe-only, so
+        // no AgentLive blocker can mask a hidden command. Without the SQL
+        // exclusion this drain read back as applied (early exit) because
+        // the retained prefix occupied the whole bounded page.
+        let mut retained_ids = Vec::new();
+        {
+            let mut store = router.inner.store.lock().await;
+            for i in 0..STATUS_BLOCKER_MAX {
+                let admitted = store
+                    .submit(
+                        "owner",
+                        SubmitCommand {
+                            id: ulid::Ulid::new().to_string(),
+                            target: None,
+                            selector: None,
+                            verb: "launch".to_owned(),
+                            args: json!({"project":"prefix-scope","workspace":"synthetic-workspace",
+                                "harness":"codex","profile":"synthetic","profile_snapshot":{}}),
+                            expected_generation: Some(0),
+                            expected_turn_id: None,
+                            request_id: None,
+                            probe: false,
+                        },
+                        now + i as i64,
+                    )
+                    .expect("admit prefix launch");
+                retained_ids.push(admitted.command.id.clone());
+                store
+                    .dispatch(&retained_ids[i], now + i as i64)
+                    .expect("dispatch prefix launch");
+            }
+            store
+                .recover_on_restart(now + 10_000)
+                .expect("restart recovery");
+            for id in &retained_ids {
+                assert_eq!(
+                    store.get_command(id).unwrap().unwrap().state,
+                    CommandState::Unknown
+                );
+            }
+        }
+        // A live observer attach sorts behind the retained prefix and stays
+        // dispatched: observe-only Agents never list as AgentLive, so only
+        // the unsettled section can keep this command blocking.
+        let live_id = {
+            let mut store = router.inner.store.lock().await;
+            let live = store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: None,
+                        selector: None,
+                        verb: "attach".to_owned(),
+                        args: json!({"mode":"observe","profile":"fixture","harness":"codex",
+                            "native_scope":"prefix-live","native_ref":"prefix-live",
+                            "profile_snapshot":{"harness":"codex"}}),
+                        expected_generation: None,
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now + 20_000,
+                )
+                .expect("admit live attach")
+                .command
+                .id;
+            store
+                .dispatch(&live, now + 20_001)
+                .expect("dispatch live attach");
+            assert_eq!(
+                store.get_command(&live).unwrap().unwrap().state,
+                CommandState::Dispatched
+            );
+            live
+        };
+        let blockers = router.status_blockers().await.expect("blockers");
+        assert!(
+            blockers.iter().any(|blocker| matches!(
+                blocker,
+                StatusBlocker::CommandUnsettled { command_id, state }
+                    if command_id == &live_id && *state == CommandState::Dispatched
+            )),
+            "live command hidden behind retained prefix: {blockers:?}"
+        );
+        assert!(
+            !blockers.iter().any(|blocker| matches!(
+                blocker,
+                StatusBlocker::CommandUnsettled { command_id, .. }
+                    if retained_ids.contains(command_id)
+            )),
+            "retained unknowns must not block: {blockers:?}"
+        );
+        assert!(
+            !blockers
+                .iter()
+                .any(|blocker| matches!(blocker, StatusBlocker::CommandUnsettledMore { .. })),
+            "one listed live command needs no overflow remainder: {blockers:?}"
+        );
+        let drained = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(drained["state"], json!("dispatched"));
+        let drain = drained["drain"].as_object().expect("drain report");
+        let unsettled = drain["unsettled_commands"]
+            .as_array()
+            .expect("unsettled commands");
+        assert_eq!(unsettled.len(), 1);
+        assert_eq!(unsettled[0]["id"], json!(live_id));
+        assert_eq!(drain["unsettled_commands_count"], json!(1));
+        assert_eq!(drain["unsettled_commands_truncated"], json!(false));
+        assert_eq!(
+            drain["retained_unresolved_count"],
+            json!(STATUS_BLOCKER_MAX)
+        );
+        assert_eq!(drain["retained_unresolved_truncated"], json!(false));
+        // The live command still gates the exit: drain must not end early.
+        router.response_finished(true);
+        assert!(!router.should_exit().await.expect("should_exit"));
+    }
+
+    #[tokio::test]
+    async fn drain_blocks_for_active_run_worker_past_row_settlement() {
+        let router = router();
+        let now = now_ms();
+        // A dispatched launch whose row settles while its script worker is
+        // still registered: the worker outlives the row it used to block on.
+        let run_id = {
+            let mut store = router.inner.store.lock().await;
+            let admitted = store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: ulid::Ulid::new().to_string(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args: json!({"project":"run-worker","workspace":"synthetic-workspace",
+                            "harness":"codex","profile":"synthetic","profile_snapshot":{}}),
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now,
+                )
+                .expect("admit run command")
+                .command
+                .id;
+            store
+                .dispatch(&admitted, now)
+                .expect("dispatch run command");
+            admitted
+        };
+        // The registered worker stays unfinished until released, mirroring a
+        // script child that is still settling its output admission.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (completed_tx, completed_rx) = tokio::sync::watch::channel(false);
+        let worker_router = std::sync::Arc::downgrade(&router.inner);
+        let worker_id = run_id.clone();
+        let task = tokio::spawn(async move {
+            let mut completion = super::super::command::RunWorkerCompletion {
+                router: worker_router,
+                run_id: worker_id,
+                completed: completed_tx,
+                finished: false,
+            };
+            let _ = release_rx.await;
+            completion.finish();
+        });
+        router.inner.run_workers.lock_recover().insert(
+            run_id.clone(),
+            super::super::RunWorkerHandle {
+                task,
+                completed: completed_rx,
+            },
+        );
+        // Settle the row while the worker is still active: the worker must
+        // keep blocking under its own entry, without duplicating the row.
+        {
+            let mut store = router.inner.store.lock().await;
+            store
+                .settle(
+                    &run_id,
+                    CommandState::Failed,
+                    Some(json!({"code":"synthetic"})),
+                    now + 1,
+                )
+                .expect("settle run row");
+        }
+        let blockers = router.status_blockers().await.expect("blockers");
+        assert!(
+            blockers.iter().any(|blocker| matches!(
+                blocker,
+                StatusBlocker::ScriptRunActive { run_id: active } if active == &run_id
+            )),
+            "settled-row run worker must block explicitly: {blockers:?}"
+        );
+        assert!(
+            !blockers.iter().any(|blocker| matches!(
+                blocker,
+                StatusBlocker::CommandUnsettled { command_id, .. } if command_id == &run_id
+            )),
+            "settled row must not double-list: {blockers:?}"
+        );
+        let drained = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(drained["state"], json!("dispatched"));
+        router.response_finished(true);
+        assert!(!router.should_exit().await.expect("should_exit"));
+        // Releasing the worker retires the gate without touching the row.
+        release_tx.send(()).expect("release run worker");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            router.wait_run_worker(&run_id),
+        )
+        .await
+        .expect("worker restraint");
+        assert!(router.inner.run_workers.lock_recover().is_empty());
+        assert!(!router.run_workers_active());
+    }
+
+    #[tokio::test]
+    async fn drain_overflow_fallback_counts_live_commands_beyond_bound() {
+        let router = router();
+        let now = now_ms();
+        // More live unsettled commands than the bounded list holds: every
+        // command stays live, so the unlisted remainder must keep blocking
+        // with its exact count instead of reading back as drained.
+        {
+            let mut store = router.inner.store.lock().await;
+            for i in 0..=(STATUS_BLOCKER_MAX as i64) {
+                let admitted = store
+                    .submit(
+                        "owner",
+                        SubmitCommand {
+                            id: ulid::Ulid::new().to_string(),
+                            target: None,
+                            selector: None,
+                            verb: "launch".to_owned(),
+                            args: json!({"project":"overflow-live","workspace":"synthetic-workspace",
+                                "harness":"codex","profile":"synthetic","profile_snapshot":{}}),
+                            expected_generation: Some(0),
+                            expected_turn_id: None,
+                            request_id: None,
+                            probe: false,
+                        },
+                        now + i,
+                    )
+                    .expect("admit overflow launch");
+                store
+                    .dispatch(&admitted.command.id, now + i)
+                    .expect("dispatch overflow launch");
+            }
+        }
+        let blockers = router.status_blockers().await.expect("blockers");
+        let listed = blockers
+            .iter()
+            .filter(|blocker| matches!(blocker, StatusBlocker::CommandUnsettled { .. }))
+            .count();
+        assert_eq!(listed, STATUS_BLOCKER_MAX);
+        assert!(
+            blockers.iter().any(|blocker| matches!(
+                blocker,
+                StatusBlocker::CommandUnsettledMore { count } if *count == 1
+            )),
+            "unlisted live command must block with its remainder: {blockers:?}"
+        );
+        let drained = router
+            .shutdown(
+                &json!({"id":ulid::Ulid::new().to_string(), "mode":"drain"}),
+                &Principal::Owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(drained["state"], json!("dispatched"));
+        router.response_finished(true);
+        assert!(!router.should_exit().await.expect("should_exit"));
     }
 
     #[tokio::test]

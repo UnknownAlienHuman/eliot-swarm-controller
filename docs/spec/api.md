@@ -1927,8 +1927,21 @@ in the `drain` report under `retained_unresolved` instead, with its verb,
 Agent, generation, stored outcome reason, resolvability and owner action.
 An open source row counts as a reader only while its generation is the
 agent's current live generation; rows on fenced or terminal generations are
-residue. Retained ids are excluded from the receipt's unsettled section and
-its count as well, so the receipt never double-lists them.
+residue. Retention is one SQL predicate over durable Store facts (no live
+process, no open turn or reader for that generation), exhaustive over all
+stored unknowns: there is no classification page cap an older unknown can
+hide behind, and the exclusion binds no id lists, so no parameter limit can
+fail the drain readback at any retained scale. Retained unknowns are excluded
+from the receipt's unsettled section and its count as well, so the receipt
+never double-lists them. The exclusion applies in SQL before the list bound
+(not as a post-limit filter), so retained entries can neither occupy a
+blocker slot nor hide a live command behind the bounded prefix; the excluding
+total is the drain decision, and any live command the bound omits keeps
+blocking as `CommandUnsettledMore` with the exact unlisted remainder. The
+remainder counts only entries the list omits, never one it lists: a live Run
+worker whose row the page omits is counted, while a listed one is not
+counted again. A fleet of only retained unknowns still drains because the
+predicate already excluded every one of them.
 `resolvable` is false for observe-only commands, which `cmd resolve` refuses
 by design; those entries need no action and stay retained as the honest
 record (retention keeps sets containing `unknown` work). A `true` entry
@@ -1937,6 +1950,15 @@ names an owner-resolvable command the owner may still retire with
 outcome stays `unknown`: drain retires the wait, never the outcome.
 Unresolved dispatched/queued/accepted commands, live turns, live owned
 processes and live readers still block; `--force` stays their only escape.
+Live script Run workers gate drain explicitly beside their command rows: a
+worker whose row is still unsettled is already listed as `CommandUnsettled`,
+and a worker that outlives its row settlement blocks as `ScriptRunActive`.
+Every unfinished worker either appears in the blockers or is covered by the
+overflow remainder, and the exit gate additionally refuses while any worker
+is registered, so an omitted worker can never end the drain early.
+Live owned processes gate on the Store custody snapshot (process records not
+yet `exited`) as well as the workspace slots, never on routing eligibility
+or workspace operation locks.
 
 `daemon.status` carries the same bounded `drain` report; while draining it is the
 current blockers snapshot, while open it reflects the current fleet.
