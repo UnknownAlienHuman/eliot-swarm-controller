@@ -598,8 +598,13 @@ does not scan the whole file in one call.
 
 For the pinned Codex 0.161.0 rollout format at upstream commit
 `979011409de0a60b52f179721948e65531d26144`, task/turn lifecycle uses canonical
-`TaskStartedEventMsg`, `TaskComplete` and `TurnAbortedEventMsg` records. Only legacy
-message/tool echoes are suppressed; `FinalAnswer` and EOF are not terminal evidence.
+`task_started`/`turn_started`, `task_complete`/`turn_complete` and
+`task_aborted`/`turn_aborted` records. Routine `token_count` usage metadata
+and legacy message/tool echoes are ignorable without clearing binding; only
+lifecycle records mutate binding. An aborted turn emits an interrupted
+(`reason: interrupted`) or failed terminal turn with its native reason and
+clears the active binding, so a following start is not an anomaly. Only legacy
+message/tool echoes are otherwise suppressed; `FinalAnswer` and EOF are not terminal evidence.
 The outer JSONL record timestamp is retained as epoch milliseconds in `NativeEvent.ts`.
 Optional lifecycle `data.started_at` and `data.completed_at` are integer epoch seconds
 from the native payload, converted with checked multiplication to epoch milliseconds;

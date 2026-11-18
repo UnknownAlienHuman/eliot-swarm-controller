@@ -1333,6 +1333,48 @@ fn project_line(
         }
     }
 
+    if matches!(event_type, Some("task_aborted" | "turn_aborted")) {
+        let aborted_turn_id = explicit_turn
+            .or(state.current_turn_id.as_deref())
+            .map(str::to_owned);
+        if let Some(turn_id) = aborted_turn_id {
+            validate_text(&turn_id, 256)?;
+            state.current_turn_id = Some(turn_id.clone());
+            state.any_turn_complete = true;
+            state.last_completed_turn_id = Some(turn_id.clone());
+            state.pending_turn_context = false;
+            state.requested_turn_seen |= requested_turn == Some(turn_id.as_str());
+            state.requested_turn_complete |= requested_turn == Some(turn_id.as_str());
+            let active = state
+                .active_turn
+                .as_ref()
+                .filter(|active| active.turn_id.as_str() == turn_id.as_str())
+                .cloned();
+            let started_at = optional_i64(&line.payload, "started_at")?
+                .or_else(|| active.as_ref().and_then(|active| active.started_at));
+            let completed_at = optional_i64(&line.payload, "completed_at")?;
+            let duration_ms = optional_i64(&line.payload, "duration_ms")?;
+            if duration_ms.is_some_and(|duration| duration < 0) {
+                return Err(integrity());
+            }
+            let reason = line.payload.get("reason").and_then(Value::as_str);
+            let interrupted = reason.is_some_and(|reason| reason == "interrupted");
+            if view == "turns" {
+                entries.push(json!({
+                    "turn_id": turn_id,
+                    "status": if interrupted { "interrupted" } else { "failed" },
+                    "started_at": started_at.map(super::milliseconds).transpose()?,
+                    "completed_at": completed_at.map(super::milliseconds).transpose()?,
+                    "duration_ms": duration_ms,
+                    "ordinal": line.ordinal,
+                }));
+            }
+            // An aborted turn is terminal: a following task_started for a
+            // new turn must not be classified as an anomaly.
+            state.active_turn = None;
+        }
+    }
+
     if view == "items" && matches!(line.kind.as_str(), "response_item" | "event_msg") {
         let item_turn = explicit_turn.or(state.current_turn_id.as_deref());
         if item_turn == requested_turn
@@ -1369,6 +1411,13 @@ fn project_line(
                     Some("failed")
                 }
                 "task_complete" | "turn_complete" => Some("completed"),
+                "task_aborted" | "turn_aborted"
+                    if line.payload.get("reason").and_then(Value::as_str)
+                        == Some("interrupted") =>
+                {
+                    Some("interrupted")
+                }
+                "task_aborted" | "turn_aborted" => Some("failed"),
                 _ => None,
             });
             let rollout_id = line
@@ -1916,6 +1965,69 @@ mod live_tests {
             "replaced"
         );
         reader.close().await.unwrap();
+    }
+
+    #[test]
+    fn historical_abort_clears_active_turn_and_emits_terminal() {
+        #[cfg(windows)]
+        let identity = eliot_plugin::FileIdentity::Windows {
+            volume: 0,
+            file_id: [0; 16],
+        };
+        #[cfg(not(windows))]
+        let identity = eliot_plugin::FileIdentity::Unix {
+            device: 0,
+            inode: 0,
+        };
+        let mut state = super::RolloutCursor {
+            version: 1,
+            binding: String::new(),
+            file_identity: identity,
+            offset: 0,
+            anchor_sha256: String::new(),
+            current_turn_id: None,
+            active_turn: None,
+            last_completed_turn_id: None,
+            pending_turn_context: false,
+            requested_turn_seen: false,
+            requested_turn_complete: false,
+            any_turn_complete: false,
+            turn_anomaly: false,
+        };
+        let started = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:00Z".to_owned(),
+            ordinal: Some(1),
+            kind: "event_msg".to_owned(),
+            payload: json!({"type": "task_started", "turn_id": "turn-1"}),
+            metadata: None,
+        };
+        let entries = super::project_line(&mut state, &started, 0, "turns", Some("turn-1"))
+            .expect("start projects");
+        assert!(entries.is_empty());
+        assert!(state.active_turn.is_some());
+        let aborted = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:01Z".to_owned(),
+            ordinal: Some(2),
+            kind: "event_msg".to_owned(),
+            payload: json!({"type": "turn_aborted", "turn_id": "turn-1", "reason": "interrupted"}),
+            metadata: None,
+        };
+        let entries = super::project_line(&mut state, &aborted, 0, "turns", Some("turn-1"))
+            .expect("abort projects");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["status"], "interrupted");
+        assert!(state.active_turn.is_none(), "abort clears active binding");
+        assert!(state.requested_turn_complete);
+        let next = super::RolloutLine {
+            timestamp: "2026-01-01T00:00:02Z".to_owned(),
+            ordinal: Some(3),
+            kind: "event_msg".to_owned(),
+            payload: json!({"type": "task_started", "turn_id": "turn-2"}),
+            metadata: None,
+        };
+        super::project_line(&mut state, &next, 0, "turns", Some("turn-2"))
+            .expect("next start projects");
+        assert!(!state.turn_anomaly, "abort must not poison the next turn");
     }
 
     #[tokio::test]
