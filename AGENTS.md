@@ -22,8 +22,10 @@ runtime or tooling. Select the next unchecked increment in the roadmap.
    unconditional `--lib`.
 5. Runtime qualification uses actual installed vendor agents through Swarm on real tasks,
    not synthetic/fake execution, test harness loops, or test edits. **Prove each change
-   live** on a private daemon. A whole-workspace `cargo test` run is not the gate. Do not
-   build test frameworks or fake harnesses as detours.
+   live** on a private daemon; that live proof is the priority evidence.
+   - Local `cargo test` runs are allowed and useful: the touched crates, or the workspace
+     for a shared DTO change. They never replace the live proof.
+   - Do not build test frameworks or fake harnesses as detours.
    - CI enforces static validation only (formatting, warnings-denied Clippy, locked
      all-targets compilation). It runs on Linux **on demand** after a major stage, such as
      a new plugin, and not on every PR or push.
