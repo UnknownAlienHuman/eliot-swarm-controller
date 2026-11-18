@@ -1345,7 +1345,6 @@ mod tests {
         assert_eq!(second.summaries[0].id, held);
         assert!(!second.truncated);
     }
-    }
 
     #[test]
     fn tree_scope_listing_shares_bounded_depth_with_direct_reads() {
