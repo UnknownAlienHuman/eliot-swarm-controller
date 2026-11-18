@@ -1681,7 +1681,10 @@ owner and never widens scope. When the mode condition holds over terminal entrie
 (`still_running` is the only non-terminal status; `not_found`/`not_visible` count
 as settled honest outcomes), the daemon delivers exactly one coalesced `mail.send`
 (queue) result to the parent: mail id is the digest id, thread is
-`completion-<id-prefix>`, and the body lists every entry outcome. Same id plus same
+`completion-<id-prefix>`, and the body lists every entry outcome together with
+`agent`, `turn_id`, bounded `final_text` excerpt and `truncated` for completed
+bound turns within `MAX_MAIL_TEXT_BYTES` (32 KiB); `SwarmDigestResponse.results`
+uses `WaitEntryResult` with `not_visible` entries completely masked. Same id plus same
 payload replays the retained registration and mail without a second delivery; same
 id plus a different payload or principal rejects `id_conflict`. Reconnect or restart
 replays the same mail id, so the digest is never duplicated. The driver sweeps
@@ -1691,7 +1694,13 @@ observed at sweep start, so pending or undeliverable registrations at the front
 never starve later eligible ones even while new registrations keep arriving;
 new arrivals join the next sweep. The digest reuses the
 ordinary mail wake (one generic coalesced notice per minute, at most one open notice
-command) and emits no `x.user.agent.attention` event; a successful completion stays
+command), except that when the registrant and recipient are the same Agent at its
+current generation and the digest body fits within `MAX_EVENT_BYTES` (64 KiB),
+the wake `send` carries that body directly (with `N unread: mail.inbox, then mail.ack`
+appended if other unread mail remains) and `turn.started` of that wake marks the
+digest delivery read; otherwise (for example Owner-registered digests, other
+generations, or overflow) the generic count notice and `mail.inbox`/`mail.ack`
+apply. The digest emits no `x.user.agent.attention` event; a successful completion stays
 distinct from an attention incident and no model call is needed to poll. The CLI is
 `swarm digest --all|--any --to PARENT ID...` with the same `ID` shape as
 `swarm wait`; it exits 0 when the digest is accepted (pending or delivered).
@@ -2114,8 +2123,10 @@ line for every harness: `N unread: mail.inbox, then mail.ack`. An unread reply
 whose `reply_to_delivery` names mail the recipient itself sent, admitted after
 the last presentation, skips the one-minute cooldown once; the open-notice,
 busy, pending-input and unknown gates still apply.
-The notice never contains
-the body, is sent through the ordinary owner `send` path bound to the
+Ordinary mail notices never contain
+the body; only a self-registered completion digest at the recipient's current
+generation shows its body directly when it fits (`MAX_EVENT_BYTES`) and marks
+read on `turn.started`. Every notice is sent through the ordinary owner `send` path bound to the
 recipient's current generation, and is skipped — never retried — while a
 notice command is open or unknown, a provider hold, pending request or
 unknown command/turn stands, the daemon is draining, or no live plugin

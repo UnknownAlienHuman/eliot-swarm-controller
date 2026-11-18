@@ -2000,6 +2000,12 @@ impl Store {
                AND NOT EXISTS (SELECT 1 FROM commands WHERE commands.id = mail_notices.open_notice_command)",
             [],
         ));
+        db!(tx.execute(
+            "UPDATE messages SET presentation_command = NULL
+             WHERE presentation_command IS NOT NULL AND presented_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM commands WHERE commands.id = messages.presentation_command)",
+            [],
+        ));
         let mut dispatched_statement = tx
             .prepare(
                 "SELECT id, target, generation, verb, outcome FROM commands

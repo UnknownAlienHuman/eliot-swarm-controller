@@ -83,12 +83,12 @@ fn masked_results(results: Vec<WaitEntryResult>, hidden: &[bool]) -> Vec<WaitEnt
     results
         .into_iter()
         .enumerate()
-        .map(|(i, mut entry)| {
+        .map(|(i, entry)| {
             if hidden.get(i).copied().unwrap_or(false) {
-                entry.status = "not_visible".to_owned();
-                entry.resolution_source = None;
+                WaitEntryResult::new(entry.kind, entry.id, "not_visible")
+            } else {
+                entry
             }
-            entry
         })
         .collect()
 }
@@ -408,14 +408,24 @@ mod tests {
     #[test]
     fn digest_masks_scope_without_widening_reads() {
         let mut visible = vec![
-            WaitEntryResult::new("command", "c1", "succeeded"),
-            WaitEntryResult::new("command", "c2", "failed"),
+            WaitEntryResult::new("command", "c1", "succeeded")
+                .with_turn("a1", 1, "t1")
+                .with_final_text("ok", 1024),
+            WaitEntryResult::new("command", "c2", "failed")
+                .with_turn("a2", 1, "t2")
+                .with_final_text("secret out of scope", 1024),
         ];
         visible[1].resolution_source = Some(eliot_core::TurnResolutionSource::Owner);
         let masked = masked_results(visible, &[false, true]);
         assert_eq!(masked[0].status, "succeeded");
+        assert_eq!(masked[0].final_text.as_deref(), Some("ok"));
         assert_eq!(masked[1].status, "not_visible");
         assert_eq!(masked[1].resolution_source, None);
+        assert_eq!(masked[1].agent, None);
+        assert_eq!(masked[1].generation, None);
+        assert_eq!(masked[1].turn_id, None);
+        assert_eq!(masked[1].final_text, None);
+        assert!(!masked[1].truncated);
         // Owner recomputation never clears a registration-time mask.
         let masked = masked_results(masked, &[false, true]);
         assert_eq!(masked[1].status, "not_visible");
@@ -528,5 +538,217 @@ mod tests {
         });
         let req: SwarmDigestRequest = serde_json::from_value(example).unwrap();
         req.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn self_digest_wake_carries_answers_and_marks_read_on_turn_started() {
+        use crate::bus::Bus;
+        use eliot_core::{NativeEvent, SourceBatch, SubmitCommand, api::MailInboxResponse};
+        use std::path::PathBuf;
+        use tokio::sync::Mutex as AsyncMutex;
+
+        let store = eliot_store::Store::open(std::path::Path::new(":memory:")).unwrap();
+        let router = Router::new(
+            PathBuf::from("synthetic-data-root"),
+            "owner-credential".to_owned(),
+            std::sync::Arc::new(AsyncMutex::new(store)),
+            Bus::new(16),
+        );
+
+        let spawn_ready = |router: Router, parent: Option<String>| async move {
+            let store_handle = std::sync::Arc::clone(&router.inner.store);
+            let mut store = store_handle.lock().await;
+            let now = now_ms();
+            let launch_id = ulid::Ulid::new().to_string();
+            let mut args = json!({
+                "project": "app",
+                "workspace": "synthetic-workspace",
+                "harness": "codex",
+                "profile": "fixture",
+                "profile_snapshot": {"control": "tree"},
+            });
+            if let Some(parent_id) = parent {
+                args["parent"] = json!(parent_id);
+            }
+            let admission = store
+                .submit(
+                    "owner",
+                    SubmitCommand {
+                        id: launch_id.clone(),
+                        target: None,
+                        selector: None,
+                        verb: "launch".to_owned(),
+                        args,
+                        expected_generation: Some(0),
+                        expected_turn_id: None,
+                        request_id: None,
+                        probe: false,
+                    },
+                    now,
+                )
+                .expect("admit launch");
+            let agent = admission.command.target.expect("launch target");
+            store.dispatch(&launch_id, now).expect("dispatch launch");
+            crate::test_support::install_fixture_sources(&mut store, &agent, &launch_id, 1, now);
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: agent.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "session.ready".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({"command_id": launch_id}),
+                        }],
+                        cursor: None,
+                    },
+                    now,
+                )
+                .expect("session ready");
+            store
+                .settle(&launch_id, eliot_core::CommandState::Applied, None, now)
+                .expect("settle");
+            drop(store);
+            router
+                .inner
+                .plugin_host
+                .mark_generation_controlled_for_test(&agent, 1);
+            agent
+        };
+
+        let manager = spawn_ready(router.clone(), None).await;
+        let worker = spawn_ready(router.clone(), Some(manager.clone())).await;
+
+        // Complete one turn on the worker with final_text.
+        let worker_send_id = ulid::Ulid::new().to_string();
+        {
+            let mut store = router.inner.store.lock().await;
+            let now = now_ms();
+            let mut send = SubmitCommand::new(worker_send_id.clone(), "send");
+            send.target = Some(worker.clone());
+            send.expected_generation = Some(1);
+            send.args = json!({"text": "compute 2+2"});
+            store.submit("owner", send, now).expect("submit worker");
+            store.dispatch(&worker_send_id, now).expect("dispatch");
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: worker.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![
+                            NativeEvent {
+                                ts: None,
+                                kind: "turn.started".to_owned(),
+                                native_id: ulid::Ulid::new().to_string(),
+                                data: json!({"command_id": worker_send_id, "turn_id": "t-w1"}),
+                            },
+                            NativeEvent {
+                                ts: None,
+                                kind: "turn.completed".to_owned(),
+                                native_id: ulid::Ulid::new().to_string(),
+                                data: json!({
+                                    "command_id": worker_send_id,
+                                    "turn_id": "t-w1",
+                                    "status": "completed",
+                                    "final_text": "result is 4",
+                                }),
+                            },
+                        ],
+                        cursor: None,
+                    },
+                    now,
+                )
+                .expect("complete worker");
+        }
+
+        let digest_id = ulid::Ulid::new().to_string();
+        let manager_principal = Principal::Agent {
+            id: manager.clone(),
+            generation: 1,
+        };
+        let reply: SwarmDigestResponse = serde_json::from_value(
+            router
+                .swarm_digest(
+                    &json!({
+                        "id": digest_id,
+                        "to": manager,
+                        "mode": "all",
+                        "commands": [worker_send_id],
+                        "turns": []
+                    }),
+                    &manager_principal,
+                )
+                .await
+                .expect("register and deliver digest"),
+        )
+        .expect("decode digest response");
+        assert_eq!(reply.state, "delivered");
+
+        // offer_notice inside mail_send_impl submitted the wake `send` directly
+        // with the digest body (including agent, turn_id, final_text, truncated).
+        let open_notice_id = {
+            let store = router.inner.store.lock().await;
+            store
+                .notice_state(&manager)
+                .expect("notice state")
+                .expect("notice claimed")
+                .open_notice_command
+                .expect("open notice command")
+        };
+        let notice_cmd = {
+            let store = router.inner.store.lock().await;
+            store
+                .get_command(&open_notice_id)
+                .expect("get command")
+                .expect("notice command exists")
+        };
+        let wake_text = notice_cmd
+            .args
+            .get("text")
+            .and_then(Value::as_str)
+            .expect("wake text");
+        assert!(wake_text.contains(&format!("agent {worker}, turn_id t-w1, truncated=false")));
+        assert!(wake_text.contains("result is 4"));
+
+        // Simulating plugin turn.started on the wake command marks the digest read.
+        {
+            let mut store = router.inner.store.lock().await;
+            let now = now_ms();
+            store
+                .dispatch(&open_notice_id, now)
+                .expect("dispatch notice");
+            store
+                .put_batch(
+                    SourceBatch {
+                        batch_id: ulid::Ulid::new().to_string(),
+                        agent_id: manager.clone(),
+                        generation: 1,
+                        source: "stream".to_owned(),
+                        events: vec![NativeEvent {
+                            ts: None,
+                            kind: "turn.started".to_owned(),
+                            native_id: ulid::Ulid::new().to_string(),
+                            data: json!({"command_id": open_notice_id, "turn_id": "t-mgr-wake"}),
+                        }],
+                        cursor: None,
+                    },
+                    now,
+                )
+                .expect("turn.started marks digest read");
+        }
+
+        let inbox: MailInboxResponse = serde_json::from_value(
+            router
+                .mail_inbox(&json!({}), &manager_principal)
+                .await
+                .expect("inbox"),
+        )
+        .expect("decode inbox");
+        assert!(inbox.deliveries.is_empty());
     }
 }

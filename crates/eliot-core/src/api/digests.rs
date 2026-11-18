@@ -13,7 +13,7 @@ use crate::{Error, Result, parse_agent_id};
 use serde::{Deserialize, Serialize};
 
 use super::coordination::MAX_MAIL_TEXT_BYTES;
-use super::waits::{MAX_SWARM_WAIT_TARGETS, WaitEntryResult, WaitTurnRef};
+use super::waits::{MAX_SWARM_WAIT_TARGETS, WaitEntryResult, WaitTurnRef, truncate_bytes};
 
 /// Thread prefix for completion digests. Distinct from `attention-*` so a
 /// successful completion is never confused with an attention incident, and
@@ -214,9 +214,44 @@ pub fn digest_thread(id: &str) -> String {
     format!("{DIGEST_THREAD_PREFIX}{prefix}")
 }
 
-/// One coalesced parent mailbox body for a settled set. Bounded to the mail
-/// text limit with explicit truncation; distinct from attention reports and
-/// notes that no model turn was used.
+fn digest_entry_line(entry: &WaitEntryResult, truncated: bool) -> String {
+    match (entry.agent.as_deref(), entry.turn_id.as_deref()) {
+        (Some(agent), Some(turn_id)) if entry.final_text.is_some() || truncated => {
+            format!(
+                "- {} {}: {} (agent {agent}, turn_id {turn_id}, truncated={truncated})",
+                entry.kind, entry.id, entry.status
+            )
+        }
+        (Some(agent), Some(turn_id)) => {
+            format!(
+                "- {} {}: {} (agent {agent}, turn_id {turn_id})",
+                entry.kind, entry.id, entry.status
+            )
+        }
+        _ => format!("- {} {}: {}", entry.kind, entry.id, entry.status),
+    }
+}
+
+/// Fair water-fill per-entry byte cap across `lengths` within `usable` bytes.
+fn fair_excerpt_cap(lengths: &[usize], usable: usize) -> usize {
+    let mut sorted = lengths.to_vec();
+    sorted.sort_unstable();
+    let mut rem = usable;
+    for (pos, &len) in sorted.iter().enumerate() {
+        let left = sorted.len() - pos;
+        if len.saturating_mul(left) <= rem {
+            rem -= len;
+        } else {
+            return rem / left;
+        }
+    }
+    usize::MAX
+}
+
+/// One coalesced parent mailbox body for a settled set. Includes bounded
+/// `final_text` excerpts (with `agent`, `turn_id`, and `truncated`) within the
+/// mail text bound, distinct from attention reports and noting that no model
+/// turn was used.
 pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) -> String {
     let terminal = results.iter().filter(|entry| entry.is_terminal()).count();
     let succeeded = results.iter().filter(|entry| entry.succeeded()).count();
@@ -224,22 +259,69 @@ pub fn digest_text(id: &str, to: &str, mode: &str, results: &[WaitEntryResult]) 
         "Eliot completion digest {id} for {to} (mode {mode}): {terminal}/{} terminal, {succeeded} succeeded.",
         results.len()
     );
-    let footer = "Delivered once to the parent mailbox; run swarm inbox, then ack processed delivery IDs. No model turn was used. Successful completion is not an attention incident.";
+    let footer = "Delivered once to the parent mailbox. No model turn was used. Successful completion is not an attention incident.";
+    let base_max_len: usize = results
+        .iter()
+        .map(|entry| {
+            let actual = digest_entry_line(entry, entry.truncated).len();
+            if entry.final_text.is_some() {
+                actual.max(digest_entry_line(entry, false).len())
+            } else {
+                actual
+            }
+        })
+        .sum();
+    let base_frame_len = header
+        .len()
+        .saturating_add(1)
+        .saturating_add(base_max_len)
+        .saturating_add(results.len().saturating_sub(1))
+        .saturating_add(1)
+        .saturating_add(footer.len());
+    if base_frame_len <= MAX_MAIL_TEXT_BYTES {
+        let available = MAX_MAIL_TEXT_BYTES - base_frame_len;
+        let text_lens: Vec<usize> = results
+            .iter()
+            .filter_map(|entry| entry.final_text.as_deref())
+            .filter(|text| !text.is_empty())
+            .map(str::len)
+            .collect();
+        let cap = if text_lens.is_empty() {
+            usize::MAX
+        } else if available <= text_lens.len() {
+            0
+        } else {
+            fair_excerpt_cap(&text_lens, available - text_lens.len())
+        };
+        let mut blocks = Vec::with_capacity(results.len());
+        for entry in results {
+            match entry.final_text.as_deref() {
+                Some(text) if !text.is_empty() => {
+                    let (kept, cut) = truncate_bytes(text, cap);
+                    let truncated = entry.truncated || cut;
+                    let line = digest_entry_line(entry, truncated);
+                    if kept.is_empty() {
+                        blocks.push(line);
+                    } else {
+                        blocks.push(format!("{line}\n{kept}"));
+                    }
+                }
+                _ => blocks.push(digest_entry_line(entry, entry.truncated)),
+            }
+        }
+        return if blocks.is_empty() {
+            format!("{header}\n{footer}")
+        } else {
+            format!("{header}\n{}\n{footer}", blocks.join("\n"))
+        };
+    }
+
+    // Status lines alone exceed the mail bound: keep as many leading entry
+    // lines as fit, then mark truncation explicitly.
     let mut body = format!("{header}\n{footer}");
-    // Prepend per-entry lines while they fit; otherwise keep counts only.
-    let mut lines: Vec<String> = Vec::with_capacity(results.len());
-    for entry in results {
-        lines.push(format!("- {} {}: {}", entry.kind, entry.id, entry.status));
-    }
-    // Try full body first.
-    let full = format!("{header}\n{}\n{footer}", lines.join("\n"));
-    if full.len() <= MAX_MAIL_TEXT_BYTES {
-        return full;
-    }
-    // Keep as many leading entries as fit, then mark truncation explicitly.
-    body = format!("{header}\n{footer}");
     let mut kept: Vec<String> = Vec::new();
-    for line in lines {
+    for entry in results {
+        let line = digest_entry_line(entry, entry.truncated);
         let candidate = if kept.is_empty() {
             format!("{header}\n{line}\n... truncated to the mail text bound\n{footer}")
         } else {
@@ -365,6 +447,40 @@ mod tests {
         let text = digest_text("D1", "a3", "all", &results);
         assert!(text.len() <= MAX_MAIL_TEXT_BYTES);
         assert!(text.contains("truncated to the mail text bound"));
+    }
+
+    #[test]
+    fn digest_text_includes_bounded_final_text_excerpts_fairly() {
+        use crate::api::MAX_WAIT_FINAL_TEXT_BYTES;
+
+        let short = WaitEntryResult::new("command", "c1", "succeeded")
+            .with_turn("a1", 1, "t1")
+            .with_final_text("answer one", MAX_WAIT_FINAL_TEXT_BYTES);
+        let big_two = WaitEntryResult::new("command", "c2", "succeeded")
+            .with_turn("a2", 1, "t2")
+            .with_final_text(
+                &"é".repeat(MAX_WAIT_FINAL_TEXT_BYTES / 2),
+                MAX_WAIT_FINAL_TEXT_BYTES,
+            );
+        let big_three = WaitEntryResult::new("command", "c3", "succeeded")
+            .with_turn("a3", 1, "t3")
+            .with_final_text(
+                &"z".repeat(MAX_WAIT_FINAL_TEXT_BYTES),
+                MAX_WAIT_FINAL_TEXT_BYTES,
+            );
+        let withheld = WaitEntryResult::new("turn", "a4/1/t4", "succeeded")
+            .with_turn("a4", 1, "t4")
+            .with_final_text("ignored", 0);
+
+        let text = digest_text("D1", "a0", "all", &[short, big_two, big_three, withheld]);
+        assert!(text.len() <= MAX_MAIL_TEXT_BYTES);
+        assert!(text.contains(
+            "- command c1: succeeded (agent a1, turn_id t1, truncated=false)\nanswer one"
+        ));
+        assert!(text.contains("- command c2: succeeded (agent a2, turn_id t2, truncated=true)"));
+        assert!(text.contains("- command c3: succeeded (agent a3, turn_id t3, truncated=true)"));
+        assert!(text.contains("zzzz"));
+        assert!(text.contains("- turn a4/1/t4: succeeded (agent a4, turn_id t4, truncated=true)"));
     }
 
     #[test]
