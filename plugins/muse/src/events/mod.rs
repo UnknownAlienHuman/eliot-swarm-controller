@@ -8,7 +8,7 @@ mod workflow_child;
 
 use eliot_core::{
     ContextItem, Error, MUSE_VIEW_UNAVAILABLE_REASON_PREFIX, MUSE_VIEW_UNKNOWN_REASON_PREFIX,
-    ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceHealthUpdate,
+    ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceGap, SourceHealthUpdate,
     VIEW_RECOVERY_MARKER_FIELD, VIEW_RECOVERY_READBACK,
 };
 use eliot_plugin::{
@@ -403,6 +403,15 @@ struct EventProcessor {
     pending_end_stop: Option<oneshot::Sender<Result<()>>>,
     writes_blocked: bool,
     gap_reported: bool,
+    /// The exact gap body whose acknowledgement was lost. Retained across
+    /// the latch (never discarded) so a later expiry can reconcile its
+    /// acknowledgement and retry the write it blocked, instead of leaving
+    /// the turn busy forever behind `writes_blocked`.
+    retained_gap: Option<SourceGap>,
+    /// Exact (command, turn) settled `unknown` after a projection gap. A
+    /// late terminal or final message naming it is dropped against the
+    /// standing gap instead of buffering as a turn awaiting association.
+    settled_unknown_turn: Option<(String, String)>,
     /// The native transport itself was lost (queue overflow, unplanned close,
     /// malformed frame, unplanned reader end): facts may be missing, so the
     /// source is marked `stale` once drained, alongside any recorded gap.
@@ -685,6 +694,8 @@ impl EventProcessor {
             pending_end_stop: None,
             writes_blocked: false,
             gap_reported: false,
+            retained_gap: None,
+            settled_unknown_turn: None,
             transport_loss: false,
             source_health_attempted: false,
             last_view_cursor: None,
@@ -908,7 +919,7 @@ impl EventProcessor {
                     &method,
                     &params,
                 );
-                if !bypass_buffer && self.should_buffer(&method) {
+                if !bypass_buffer && self.buffer_notification(&method, &params) {
                     self.buffer_frame(BufferedNativeFrame::Notification { method, params });
                 } else if let Err(error) = self.process_notification(method, params, queues).await {
                     if error.code == RECOVERY_SHUTDOWN_CODE {
@@ -965,10 +976,12 @@ impl EventProcessor {
             && let Some(reason) = self.loss_reason.clone()
         {
             let health_deadline = Instant::now() + EVENT_DEADLINE;
+            let mut retained = self.retained_gap.take();
             let _ = self
                 .stream_source()
-                .record_gap_until(&reason, health_deadline)
+                .record_gap_range_with_retained(&reason, None, None, health_deadline, &mut retained)
                 .await;
+            self.retained_gap = retained;
             if self.transport_loss {
                 self.mark_source_stale(health_deadline).await;
             }
@@ -983,10 +996,14 @@ impl EventProcessor {
                 && self.status.active_turn_id.is_some()
                 && self.view_recovery.is_none()
             {
+                // Transport loss alone is not an unavailable-view episode:
+                // it retries with the source stale and never settles on
+                // the projection path with the counted prefix.
                 self.view_recovery = Some(ViewRecovery {
                     head: None,
                     head_seen: false,
                     deadline: Instant::now(),
+                    projection: false,
                     unproven_attempts: 0,
                 });
             }
@@ -1008,6 +1025,55 @@ impl EventProcessor {
                 | "approval/updated"
                 | "userInput/settled"
         ) && (!self.status.ready || self.status.active_turn_id.is_none())
+    }
+
+    /// Buffer gate with settled-turn routing: a terminal or final message
+    /// naming the turn already settled `unknown` is never buffered as a
+    /// turn awaiting association; it processes inline and drops against
+    /// the standing gap.
+    fn buffer_notification(&self, method: &str, params: &Value) -> bool {
+        if matches!(method, "turn/completed" | "item/completed")
+            && self.names_settled_turn(method, params)
+        {
+            return false;
+        }
+        self.should_buffer(method)
+    }
+
+    /// Whether this frame names the exact turn already settled `unknown`
+    /// after its projection gap. Shapes are read loosely (never decoded):
+    /// a frame that cannot name its turn is not a settled terminal.
+    fn names_settled_turn(&self, method: &str, params: &Value) -> bool {
+        let Some((_, turn_id)) = self.settled_unknown_turn.as_ref() else {
+            return false;
+        };
+        match method {
+            "turn/completed" => {
+                params.get("turnId").and_then(Value::as_str) == Some(turn_id.as_str())
+            }
+            "item/completed" => {
+                params
+                    .get("item")
+                    .and_then(|item| item.get("turnId"))
+                    .and_then(Value::as_str)
+                    == Some(turn_id.as_str())
+            }
+            _ => false,
+        }
+    }
+
+    /// Drop a late terminal for the settled turn against the standing
+    /// projection gap. The outcome stays `unknown`: a replayed terminal
+    /// never resurrects a settled turn, and the recorded gap already covers
+    /// the loss, so nothing is committed and no new gap is needed.
+    async fn drop_settled_frame(&mut self, what: &str) -> Result<()> {
+        if self.gap_reported {
+            return Ok(());
+        }
+        self.record_gap(&format!(
+            "Muse {what} arrived after its turn settled unknown"
+        ))
+        .await
     }
 
     fn buffer_frame(&mut self, frame: BufferedNativeFrame) {
@@ -1126,6 +1192,9 @@ impl EventProcessor {
                 "Muse already has an associated active turn",
             ));
         }
+        // A recovered channel unblocks the send: reconcile a latched batch
+        // and drive the retained gap before refusing for an old ack.
+        self.drive_writes().await;
         if self.writes_blocked {
             return Err(Error::new(
                 "unknown",
@@ -1159,7 +1228,12 @@ impl EventProcessor {
         // acknowledged, arm its settlement deadline when view loss is latched.
         self.arm_recovery_after_associate().await;
         self.flush_buffer().await?;
-        self.apply_stashed_entries().await
+        self.apply_stashed_entries().await?;
+        // A buffered terminal for a turn settled `unknown` drops against
+        // the standing gap during the flush above; a new association then
+        // retires the marker.
+        self.settled_unknown_turn = None;
+        Ok(())
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {
@@ -1173,7 +1247,7 @@ impl EventProcessor {
                         self.status.session_id.is_some(),
                         method,
                         params,
-                    ) && self.should_buffer(method)
+                    ) && self.buffer_notification(method, params)
                 }
                 BufferedNativeFrame::Request { .. } => {
                     !self.status.ready || self.status.active_turn_id.is_none()
@@ -2341,6 +2415,9 @@ impl EventProcessor {
                 )?;
             }
             "item/completed" => {
+                if self.names_settled_turn(&method, &params) {
+                    return self.drop_settled_frame("item/completed").await;
+                }
                 let notification: NativeItemCompletedNotification =
                     serde_json::from_value(params.clone()).map_err(|_| {
                         Error::new(
@@ -2364,6 +2441,9 @@ impl EventProcessor {
                 }
             }
             "turn/completed" => {
+                if self.names_settled_turn(&method, &params) {
+                    return self.drop_settled_frame("turn/completed").await;
+                }
                 if needs_terminal_fence(&self.status, &params) {
                     if !self.status.view_unavailable {
                         let session_id = self.status.session_id.clone().unwrap_or_default();
@@ -2407,6 +2487,7 @@ impl EventProcessor {
                         head: None,
                         head_seen: false,
                         deadline: Instant::now(),
+                        projection: self.projection_episode(),
                         unproven_attempts: fenced_recovery_attempts(self.view_recovery.as_ref()),
                     });
                     return Err(Error::new(
@@ -3824,9 +3905,87 @@ impl EventProcessor {
     }
 
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
-        self.stream_source()
-            .commit_event(kind, native_id, data)
+        // A lost acknowledgement latches `writes_blocked` with the exact
+        // gap body and batch retained. Drive them first so a recovered
+        // channel unblocks this commit instead of stranding the turn.
+        self.drive_writes().await;
+        let mut retained = self.retained_gap.take();
+        let result = self
+            .stream_source()
+            .commit_event_with_retained(kind, native_id, data, &mut retained)
+            .await;
+        self.retained_gap = retained;
+        result
+    }
+
+    /// Drive a retained gap acknowledgement, then reconcile a latched batch
+    /// against a private `source.state` readback: a proven batch clears the
+    /// latch, a batch proven absent is resubmitted as a first delivery.
+    /// Best-effort: a failed readback keeps the latch for the next expiry.
+    async fn drive_writes(&mut self) {
+        if self.retained_gap.is_some() {
+            let mut retained = self.retained_gap.take();
+            self.stream_source().drive_retained_gap(&mut retained).await;
+            self.retained_gap = retained;
+        }
+        self.reconcile_blocked_writes().await;
+    }
+
+    async fn reconcile_blocked_writes(&mut self) {
+        if !self.writes_blocked {
+            return;
+        }
+        let state = match self
+            .host
+            .call(
+                "source.state",
+                json!({
+                    "credential": self.credential,
+                    "agent_id": self.agent_id,
+                    "generation": self.generation,
+                    "source": "stream",
+                }),
+                Instant::now() + EVENT_DEADLINE,
+            )
             .await
+        {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        match self
+            .sink
+            .settle_unknown_from_state(&self.agent_id, self.generation, "stream", &state)
+        {
+            Ok(Some(_)) => {
+                self.writes_blocked = false;
+                self.status.batch_unknown = false;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                let Some(batch) =
+                    self.sink
+                        .take_unknown_batch(&self.agent_id, self.generation, "stream")
+                else {
+                    return;
+                };
+                match self
+                    .sink
+                    .commit(batch, Instant::now() + EVENT_DEADLINE)
+                    .await
+                {
+                    Ok(_) => {
+                        self.writes_blocked = false;
+                        self.status.batch_unknown = false;
+                    }
+                    Err(_) => {
+                        self.status.failure = Some(
+                            "Muse event batch acknowledgement is unknown; retrying the proven-absent write"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Persist a refreshed offer. Returns `Ok(true)` only after the actual
@@ -3941,7 +4100,13 @@ impl EventProcessor {
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {
         self.invalidate_view_recovery();
-        self.stream_source().record_gap(reason).await
+        let mut retained = self.retained_gap.take();
+        let result = self
+            .stream_source()
+            .record_gap_with_retained(reason, &mut retained)
+            .await;
+        self.retained_gap = retained;
+        result
     }
 
     /// The shared stream-commit half of this processor.

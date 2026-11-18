@@ -2176,6 +2176,16 @@ impl MusePlugin {
             return unknown_snapshot(&params, "Muse session identity was not acknowledged");
         };
         if event_status.view_unavailable {
+            // A fenced terminal readback proves the exact turn for owner
+            // resolution while the view latch stands: it reads the command
+            // plane and the durable view directly, never clears the latched
+            // gap, and leaves stream health stale.
+            if let Some(turn) = turn_id.clone()
+                && let Some(fenced) =
+                    read_fenced_terminal(session, &params, session_id, &turn).await
+            {
+                return Ok(fenced);
+            }
             return view_unknown_snapshot(
                 session,
                 &params,
@@ -2822,6 +2832,50 @@ async fn read_live_snapshot(
         "last_turn": last_turn, "native_exit": event_status.native_exit,
         "batch_unknown": event_status.batch_unknown,
         "source_unknown": event_status.source_unknown, "result_known": result_known,
+    }))
+}
+
+/// Fenced terminal readback for owner resolution while the view latch
+/// stands (#427). Reads the command plane (`session/read`) and the durable
+/// view (`view/page`) directly through the native client, never through the
+/// event actor: the latched gap, the stale health and the retained write
+/// latches are untouched. Returns `None` when nothing proves the exact
+/// turn, so the caller keeps the unknown snapshot. A still-running native
+/// turn yields a non-terminal snapshot (resolution keeps refusing); a proven
+/// terminal yields the exact `last_turn` proof `turn.resolve` needs.
+async fn read_fenced_terminal(
+    session: &AgentSession,
+    params: &AgentSnapshotParams,
+    session_id: &str,
+    turn_id: &str,
+) -> Option<Value> {
+    let readback = read_owned_session(&session.native_client, session_id)
+        .await
+        .ok()?;
+    if readback.history.unavailable_reason().is_some() {
+        return None;
+    }
+    let facts = read_owned_turn(
+        &session.native_client,
+        session_id,
+        turn_id,
+        &params.command_id,
+        readback.session.active_turn_id.as_deref(),
+        &session.secrets,
+    )
+    .await
+    .ok()?;
+    let event_status = session.events.status();
+    let result_known = facts.as_ref().is_some_and(|turn| turn.final_text.is_some());
+    Some(json!({
+        "agent_id": params.agent_id, "generation": params.generation,
+        "command_id": params.command_id, "state": session_state(&readback.session),
+        "native_scope": session.native_scope, "native_ref": session_id,
+        "native_model": readback.session.model_id,
+        "active_turn": readback.session.active_turn_id,
+        "last_turn": facts, "native_exit": event_status.native_exit,
+        "batch_unknown": event_status.batch_unknown,
+        "source_unknown": true, "result_known": result_known,
     }))
 }
 

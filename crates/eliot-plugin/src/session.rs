@@ -974,6 +974,21 @@ impl StreamSource<'_> {
         self.record_gap_inner(reason, retained).await
     }
 
+    /// Cursor-bounded gap with retained identity: when the acknowledgement
+    /// is lost the exact gap body stays in `retained` so a later opportunity
+    /// can reconcile it instead of latching writes with the body discarded.
+    pub async fn record_gap_range_with_retained(
+        &mut self,
+        reason: &str,
+        from: Option<String>,
+        to: Option<String>,
+        deadline: Instant,
+        retained: &mut Option<SourceGap>,
+    ) -> Result<()> {
+        self.record_gap_inner_until(reason, retained, (from, to), deadline, true)
+            .await
+    }
+
     /// Drive a retained child gap without recording a new loss. Returns true
     /// when no gap is retained or its canonical ACK just established it.
     pub async fn drive_retained_gap(&mut self, retained: &mut Option<SourceGap>) -> bool {

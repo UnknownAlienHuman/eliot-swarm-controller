@@ -237,11 +237,36 @@ write is acknowledged; a failed write keeps the binding at the cap and retries
 on the next opportunity instead of stranding the Store turn. A timer,
 subscription admission, or an exhausted read budget never proves completion or
 process death. A failed terminal commit keeps the binding for another attempt.
-Only acknowledged native terminal proof otherwise clears it in recovery. Actual endpoint
+Only acknowledged native terminal proof otherwise clears it in recovery. A proven
+terminal commits even when the optional final message cannot persist (an
+oversized message gaps but never discards the terminal proof). Before the
+capped readback settles, one bounded drain gives queued frames a chance to
+restore observation, and the binding is rechecked before writing
+`turn.unknown`. After acknowledgement, a late terminal or final message
+naming the settled turn drops against the standing gap instead of buffering
+as a turn awaiting association, so the next association never trips over it.
+Actual endpoint
 exit still uses the existing host/daemon custody and source-drain path: drain
 queued facts first, then preserve an unestablished outcome as unknown and settle
 loss only after exact generation custody is empty, per monitoring.md's Liveness
 table. A disconnected stream alone leaves source health stale and state unchanged.
+
+The cap and the counted projection prefix bind to an acknowledged
+unavailable-view episode only. Transport loss without one (queue overflow,
+unplanned close, malformed frame, unplanned reader end) arms the same
+bounded readbacks, but its retries never settle: the failure names
+transport recovery pending and the source stays stale with state unchanged.
+Only an episode whose view gap was acknowledged may settle `unknown` with
+the counted prefix.
+
+A lost gap or batch acknowledgement never strands the turn behind
+`writes_blocked`: the exact gap body stays retained and the exact
+unacked batch stays in the sink, and every later commit, expiry and send
+first reconciles them — a private `source.state` readback settles a proven
+batch and resubmits the exact batch only when the readback proves it
+absent. The turn binding clears only after the terminal write is
+acknowledged; until then the cap re-arms and the next opportunity settles
+instead of stranding the Store turn.
 
 Installed Muse 1.4.0-R4161.1 stable and experimental schemas (exported
 2026-11-16) expose only `sessionId` and `excludeItems` on `session/read`.
@@ -271,7 +296,11 @@ endpoint exit; projection unavailability alone cannot invoke that exit path.
 The projection path reuses the turn-unknown settlement without retiring the
 plugin or reporting a stopped session to stand in for lost observation: the host
 stays alive and the Agent is not marked lost, so stop, readback and owner
-resolution keep working after the settle.
+resolution keep working after the settle. While the view latch stands,
+`agent.snapshot` still serves a fenced terminal readback for the exact
+requested turn (command plane plus durable view, read directly): a proven
+terminal supplies the `last_turn` proof `turn.resolve` needs, a still-running
+turn keeps refusing, and the latched gap with its stale health is untouched.
 
 Guard a pending-request snapshot with a local observation counter so a newer stream
 resolution cannot be overwritten by stale snapshot data. This is an in-memory race guard,
