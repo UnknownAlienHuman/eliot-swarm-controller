@@ -1166,6 +1166,12 @@ pub(crate) async fn run_global_rules(
                 }
             } => {}
         }
+        if let Some(watcher) = &mut watcher {
+            // Re-arm the rules-directory watch after creation or
+            // replacement; the periodic reconciliation below reloads from
+            // disk regardless.
+            watcher.ensure_watches();
+        }
         if recover_rule_children {
             router
                 .recover_rule_children(RULE_CHILD_RECOVERY_PAGE_SIZE)

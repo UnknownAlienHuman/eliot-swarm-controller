@@ -7,9 +7,11 @@ does not add a second executor or a generic run/action graph.
 
 Global rules load from `<data_dir>/rules/*.toml`. Project rules load only from the
 owner-registered canonical checkout's `.eliot/rules/*.toml`, under project-scoped
-authority and its approved profiles/actions. Connected rule loading watches those files
-for changes. Invalid reload keeps the last valid definition and reports the error through
-bounded daemon diagnostics.
+authority and its approved profiles/actions. Connected rule loading watches the rules
+directory non-recursively (plus the config source that also feeds generated rules)
+for changes, with periodic reconciliation as the fallback. Managed worktrees, plugin
+data and other subtrees are never watched. Invalid reload keeps the last valid definition
+and reports the error through bounded daemon diagnostics.
 
 ```toml
 [[rule]]
