@@ -762,6 +762,181 @@ mod tests {
         );
     }
 
+    /// Saving an existing entry keeps its owner/group/other permission bits
+    /// (the replacement inode would otherwise be 0600) and never copies
+    /// set-user-ID, set-group-ID or sticky bits onto the edit.
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_permission_bits_and_drops_privilege_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let files = Files::new();
+        let policy = SecretPolicy::default();
+        for (start, kept) in [
+            (0o755, 0o755),
+            (0o644, 0o644),
+            (0o4755, 0o755),
+            (0o2755, 0o755),
+        ] {
+            let name = format!("mode-{start:o}.txt");
+            files.put(&name, "old");
+            std::fs::set_permissions(
+                files.0.join("scripts").join(&name),
+                std::fs::Permissions::from_mode(start),
+            )
+            .unwrap();
+            let revision = files.read(&name, &policy).unwrap().revision;
+            files.save(&name, revision, "new", &policy).unwrap();
+            let mode = std::fs::metadata(files.0.join("scripts").join(&name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, kept, "start {start:o}");
+            assert_eq!(
+                std::fs::read(files.0.join("scripts").join(&name)).unwrap(),
+                b"new"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_to_replace_a_script_with_a_different_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
+
+        let files = Files::new();
+        let policy = SecretPolicy::default();
+        files.put("restricted.txt", "old");
+        let path = files.0.join("scripts/restricted.txt");
+        let group = std::fs::metadata(&path).unwrap().gid();
+        let other_group = if group == 0 { 1 } else { 0 };
+        match chown(&path, None, Some(other_group)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("fixture chown: {error}"),
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let revision = files.read("restricted.txt", &policy).unwrap().revision;
+        let error = files
+            .save("restricted.txt", revision, "edit", &policy)
+            .unwrap_err();
+        assert_eq!(error.code, "not_allowed");
+        assert!(error.message.contains("original owner or group"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.gid(), other_group);
+        assert_eq!(metadata.mode() & 0o7777, 0o640);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn save_under_shared_setgid_parent_keeps_ownership_and_leaves_empty_stage() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let files = Files::new();
+        let policy = SecretPolicy::default();
+        let scripts = files.0.join("scripts");
+        std::fs::set_permissions(&scripts, std::fs::Permissions::from_mode(0o2775)).unwrap();
+        files.put("shared.txt", "old");
+        let path = scripts.join("shared.txt");
+        let original = std::fs::metadata(&path).unwrap();
+        let revision = files.read("shared.txt", &policy).unwrap().revision;
+        files.save("shared.txt", revision, "edit", &policy).unwrap();
+
+        let installed = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            (installed.uid(), installed.gid()),
+            (original.uid(), original.gid())
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"edit");
+        let stage = std::fs::read_dir(scripts)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "stage"))
+            .expect("leftover stage in shared parent");
+        assert_eq!(std::fs::metadata(&stage).unwrap().mode() & 0o7777, 0o2700);
+        assert!(std::fs::read_dir(stage).unwrap().next().is_none());
+    }
+
+    /// A rejected save stages in a private directory until rename, so no
+    /// group/other-readable `.tmp` with the rejected edit remains behind.
+    #[cfg(unix)]
+    #[test]
+    fn rejected_save_leaves_no_readable_temp() {
+        use std::os::unix::fs::PermissionsExt;
+        let files = Files::new();
+        let policy = SecretPolicy::default();
+        files.put("conflict.txt", "old");
+        std::fs::set_permissions(
+            files.0.join("scripts").join("conflict.txt"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let revision = files.read("conflict.txt", &policy).unwrap().revision;
+        // Another writer changes the entry before the save's final recheck.
+        std::fs::write(files.0.join("scripts").join("conflict.txt"), "other").unwrap();
+        let error = files
+            .save("conflict.txt", revision, "rejected-edit", &policy)
+            .unwrap_err();
+        assert_eq!(error.code, "conflict");
+        for entry in std::fs::read_dir(files.0.join("scripts")).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().expect("UTF-8 entry");
+            assert!(!name.ends_with(".tmp"), "leftover temp {name}");
+            assert!(!name.ends_with(".stage"), "leftover stage {name}");
+            if entry.file_type().unwrap().is_file() && name != "conflict.txt" {
+                assert_ne!(
+                    std::fs::read(entry.path()).unwrap(),
+                    b"rejected-edit",
+                    "rejected bytes leaked into {name}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read(files.0.join("scripts").join("conflict.txt")).unwrap(),
+            b"other"
+        );
+    }
+
+    /// A stale loaded handle fails inside `Directory::replace`, past the
+    /// save-level revision gate: the test calls `replace` directly with the
+    /// loaded handle and bytes after another writer changed the entry, so
+    /// the handle recheck (not the revision check) refuses it. The other
+    /// writer's bytes stay installed and the failed staging directory is
+    /// removed, leaving no stage or temp artifact behind.
+    #[cfg(unix)]
+    #[test]
+    fn stale_handle_replace_keeps_target_and_cleans_staging() {
+        let files = Files::new();
+        files.put("stale.txt", "old");
+        let root = root_for(&files.0, &[], None).unwrap();
+        let loaded = load(&root, "stale.txt").unwrap();
+        let original = loaded.bytes.clone().unwrap();
+        // Another writer changes the entry after this handle loaded it.
+        std::fs::write(root.join("stale.txt"), "other").unwrap();
+        let error = loaded
+            .parent
+            .replace(&loaded.name, &loaded.file, &original, b"proposed")
+            .unwrap_err();
+        assert_eq!(error.code, "conflict");
+        let scripts = files.0.join("scripts");
+        assert_eq!(std::fs::read(scripts.join("stale.txt")).unwrap(), b"other");
+        for entry in std::fs::read_dir(&scripts).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().expect("UTF-8 entry");
+            assert!(!name.ends_with(".stage"), "leftover stage {name}");
+            assert!(!name.ends_with(".tmp"), "leftover temp {name}");
+            if entry.file_type().unwrap().is_file() {
+                assert_ne!(
+                    std::fs::read(entry.path()).unwrap(),
+                    b"proposed",
+                    "rejected bytes leaked into {name}"
+                );
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn real_junctions_are_refused_and_pinned_ancestors_cannot_be_swapped() {

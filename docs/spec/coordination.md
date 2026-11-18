@@ -86,8 +86,11 @@ Native sessions are archived at apply through the harness documented archive
 method (Codex `thread/archive`) using the Agent's frozen profile and store
 binding. Artifact scope/reference must match that generation's native subject,
 and the initialized reader verifies its effective home/SQLite root against the
-frozen binding before dispatch. A malformed or secret-bearing acknowledgement
-after dispatch is `unknown` and retains the durable retry fence. Raw
+frozen binding before dispatch. A legacy Codex home scope derived from an
+alias missing from the frozen binding remains ineligible for Swarm archive.
+Only a new launch can capture a verified binding for its own session. A
+malformed or secret-bearing acknowledgement after dispatch is `unknown` and
+retains the durable retry fence. Raw
 native store files are never touched. Logical reclaimed bytes count only fully
 confirmed removed trees; partial attempts report unknown and zero confirmed
 bytes.

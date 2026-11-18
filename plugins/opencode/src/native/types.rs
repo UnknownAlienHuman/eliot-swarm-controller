@@ -15,6 +15,16 @@ use serde::{Deserialize, Serialize};
 // Sessions
 // ---------------------------------------------------------------------------
 
+/// One installed `Permission.Ruleset` entry: `{action, resource, effect}`.
+/// Only the deny entries the launch path sets are modelled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRule {
+    pub action: String,
+    pub resource: String,
+    pub effect: String,
+}
+
 /// `POST /api/session` (`session.create`) body. Only the fields the PR1
 /// launch path sets are modelled.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -26,6 +36,8 @@ pub struct SessionCreateRequest {
     pub model: Option<ModelRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<LocationRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<Vec<PermissionRule>>,
 }
 
 /// Installed `Model.Ref`: `{id, providerID, variant?}`. The frozen profile
@@ -49,9 +61,11 @@ pub struct LocationRef {
     pub directory: String,
 }
 
-/// `Session.Info` subset: identity, agent, model, location. Times,
-/// tokens, cost and the rest are ignored. `agent` and `model` are absent
-/// until set; PR2 reads both back after the resume setters.
+/// `Session.Info` subset: identity, agent, model, location, permissions.
+/// Times, tokens, cost and the rest are ignored. `agent` and `model` are
+/// absent until set; PR2 reads both back after the resume setters.
+/// `permissions` carries the stored per-session ruleset; the launch path
+/// reads it back to prove a `deny` profile's subagent denial is effective.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
@@ -62,6 +76,8 @@ pub struct SessionInfo {
     pub model: Option<ModelRef>,
     #[serde(default)]
     pub location: Option<LocationRef>,
+    #[serde(default)]
+    pub permissions: Option<Vec<PermissionRule>>,
 }
 
 /// Installed envelope: success bodies are `{"data": ...}`.

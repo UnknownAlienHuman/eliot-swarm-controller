@@ -70,11 +70,22 @@ uses the native `NtSetInformationFile(FileRenameInformationEx)` form of
 `FileRenameInfoEx` with the parent `RootDirectory` (the Win32 wrapper rejected this
 relative form with error 87 on the qualification host); no path-based fallback is used.
 Global temporaries inherit the private data-directory boundary. On Unix, existing libc
-`openat(O_NOFOLLOW)` / `renameat` keep operations relative to retained file descriptors;
-temporaries have mode 0600 and the directory is synced after rename. Unix reopens the
-installed target after rename and verifies it against the temporary's inode and bytes;
-a mismatch or inability to verify is `unknown`. Failed Unix temporaries remain for
-explicit owner cleanup: pathname-based `unlinkat` could delete another writer's substitute.
+`openat(O_NOFOLLOW)` / `renameat` keep operations relative to retained file descriptors.
+A replacement is staged on the same filesystem until rename. Before writing
+into the opened staging directory, the daemon verifies that its own user owns
+the directory and that it has `0700` access bits, allowing inherited set-group-ID.
+The staged file stays private through the final conflict check. A save is
+refused if the staged inode would change the original owner or group. The
+replacement keeps the existing owner's, group's and others' read, write and
+execute bits and clears set-user-ID, set-group-ID and sticky bits. New private
+artifacts keep their restrictive creation mode.
+Unix reopens the installed target after rename and verifies its inode, bytes,
+owner, group and all `0o7777` mode bits. A mismatch or inability to verify is
+`unknown`. The parent directory is synced after rename. A failed staged file
+is removed through the held private directory. The daemon removes the stage
+by name only if the parent is owned by the daemon user, group and others lack
+write access, and the name still resolves to the held stage. Shared parents
+can retain an empty private stage for owner cleanup.
 
 The conflict guarantee is daemon-save exclusion plus an immediate handle-based recheck,
 not atomic compare-and-swap against every external writer. Windows must permit target

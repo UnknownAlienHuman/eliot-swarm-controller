@@ -240,6 +240,12 @@ absent or null; when supplied, it must match the unique Resume command for that 
 generation. The plugin need not add command correlation when its readiness observation does
 not carry it.
 
+If a just-created OpenCode session fails verification and its removal cannot
+be proved, the plugin returns `unknown` and keeps the server running with the
+exact session identity in memory for readback. The generation stays unready.
+If the plugin exits, the controller lacks a durable native subject for resume
+or reconciliation. An unknown create is never replayed.
+
 For an input-created session, perform start+linked input once but report session,
 input-to-turn association and terminal result independently. Ready alone never proves
 input delivery. Buffer early facts within a bound; overflow records a gap rather than
