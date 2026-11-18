@@ -360,12 +360,26 @@ impl RuleWatcher {
         let distinct_rules = (rules_root != watched_root).then(|| rules_root.to_path_buf());
         let mut rules_active = false;
         let mut rules_identity = None;
-        if let Some(rules) = &distinct_rules
-            && dir_identity(rules).is_some()
-            && watcher.watch(rules, RecursiveMode::NonRecursive).is_ok()
-        {
-            rules_active = true;
-            rules_identity = dir_identity(rules);
+        if let Some(rules) = &distinct_rules {
+            // A replacement between the pre-watch identity read and
+            // registration would record the new identity against the old
+            // watch. Verify the identity across registration and retry once
+            // on a mismatch so the watch binds the current directory.
+            for _ in 0..2 {
+                let Some(before) = dir_identity(rules) else {
+                    break;
+                };
+                if watcher.watch(rules, RecursiveMode::NonRecursive).is_err() {
+                    break;
+                }
+                let after = dir_identity(rules);
+                if after == Some(before) {
+                    rules_active = true;
+                    rules_identity = after;
+                    break;
+                }
+                let _ = watcher.unwatch(rules);
+            }
         }
         Ok(Self {
             changed,

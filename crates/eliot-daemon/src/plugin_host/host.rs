@@ -5900,16 +5900,33 @@ mod linux_family_tests {
         let _temp = crate::test_support::TempDir::own(dir.clone());
         let pidfile = dir.join("grandchild.pid");
         let mut command = tokio::process::Command::new("sh");
+        // The pidfile travels as a separate argument: interpolating it into
+        // the program would break on directories containing an apostrophe.
         command
             .arg("-c")
-            .arg(format!(
-                "sleep 120 & echo $! > '{}'; exec sleep 0",
-                pidfile.display()
-            ))
+            .arg("sleep 120 & echo $! > \"$1\"; exec sleep 0")
+            .arg("sh")
+            .arg(&pidfile)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         let mut child = OwnedChild::spawn(command).unwrap();
+        // Capture the grandchild identity before the stop: the shell writes
+        // the pidfile right after the background sleep forks.
+        let grandchild: u32 = {
+            let mut found = None;
+            for _ in 0..100 {
+                if let Ok(body) = std::fs::read_to_string(&pidfile)
+                    && let Ok(pid) = body.trim().parse::<u32>()
+                {
+                    found = Some(pid);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            found.expect("the shell records its background grandchild")
+        };
+        let start_ticks = crate::platform::unix::linux_start_ticks(grandchild);
         let store = Arc::new(AsyncMutex::new(
             eliot_store::Store::open(Path::new(":memory:")).expect("open store"),
         ));
@@ -5922,19 +5939,55 @@ mod linux_family_tests {
             wait_child_family(&mut child, STOP_GRACE, FAMILY_GRACE, &monitoring, &agent).await,
             "owned group drains before reap"
         );
-        let pid: u32 = std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let mut gone = false;
+        // Assert process exit, not /proc disappearance: a container init that
+        // never reaps leaves the killed grandchild as a zombie with its
+        // /proc entry still present.
+        let mut exited = false;
         for _ in 0..100 {
-            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                gone = true;
-                break;
+            match crate::platform::unix::recorded_process_alive(grandchild, start_ticks) {
+                Ok(alive) if !alive => {
+                    exited = true;
+                    break;
+                }
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(gone, "owned grandchild outlived the family stop");
+        assert!(exited, "owned grandchild outlived the family stop");
+    }
+
+    /// A failed exit observation must not hang the reap: the bounded reap
+    /// times out on a live child (routing to unknown-custody settlement) and
+    /// still reaps an exited child.
+    #[tokio::test]
+    async fn bounded_reap_times_out_on_live_child() {
+        fn sleep_command(secs: &str) -> tokio::process::Command {
+            let mut command = tokio::process::Command::new("sleep");
+            command
+                .arg(secs)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command
+        }
+
+        let mut live = OwnedChild::spawn(sleep_command("30")).expect("spawn live child");
+        let start = tokio::time::Instant::now();
+        let error = live
+            .wait_bounded(Duration::from_millis(100))
+            .await
+            .expect_err("a live child must not reap within the bound");
+        assert_eq!(error.code, "unknown");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the bounded reap must not wait indefinitely"
+        );
+        let _ = live.terminate();
+        let _ = tokio::time::timeout(Duration::from_secs(10), live.wait()).await;
+
+        let mut exited = OwnedChild::spawn(sleep_command("0")).expect("spawn exiting child");
+        assert!(
+            exited.wait_bounded(Duration::from_secs(10)).await.is_ok(),
+            "the bounded reap still reaps an exited child"
+        );
     }
 }

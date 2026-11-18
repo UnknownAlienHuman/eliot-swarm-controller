@@ -25,7 +25,7 @@ use eliot_core::{Agent, AgentStartParams, Error, Result};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use std::sync::Arc;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, timeout_at};
@@ -253,8 +253,13 @@ pub(super) async fn run_agent_inner(
                     }
                     // Reap only after the bounded cleanup: the numeric PGID
                     // cannot be reused between the final observation and this
-                    // reap because the exited leader is still unreaped.
-                    (child.wait().await, group_drained)
+                    // reap because the exited leader is still unreaped. The
+                    // reap itself is bounded: a failed observation may leave
+                    // the child live (/proc loss also defeats birth-checked
+                    // termination), and an unbounded wait would hang before
+                    // source settlement. A timeout keeps status Err so the
+                    // unknown-custody settlement below reports it.
+                    (child.wait_bounded(STOP_GRACE).await, group_drained)
                 };
                 #[cfg(not(target_os = "linux"))]
                 let (status, _group_drained) = root_exit;
