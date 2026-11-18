@@ -280,9 +280,11 @@ which validates the Agent credential and current generation. `--require-agent --
 usage error; ordinary Owner MCP stdio and StreamableHTTP behavior are unchanged.
 
 A mutation call may omit `params.id`: the MCP server mints one fresh ULID for that
-call, forwards it, and returns it as top-level `id` in the tool result, so the caller
-retains it for exact retry. An explicit id is forwarded untouched and still validated
-by the daemon. A retry must carry the same id, principal, method and semantic payload;
+call and forwards it to the daemon. Both success and structured daemon errors return
+the minted id as top-level `id` in the tool result. To recover if the entire MCP response
+is lost, supply a stable `params.id` before the first attempt. An explicit id is forwarded
+untouched and still validated by the daemon. A retry must carry the same id, principal,
+method and semantic payload;
 a different binding is `id_conflict`, and an expired id is `id_expired`. Unknown outcomes
 keep the existing exact readback/resolution contract. The server never automatically
 retries uncertain calls and never treats cancellation as rollback. Id admission errors

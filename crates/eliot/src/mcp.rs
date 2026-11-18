@@ -16,9 +16,9 @@
 //! logs. The tool is intentionally generic: `{ method, params }` maps 1:1 to
 //! the existing management client; discovery and DTO schemas come from the daemon.
 //! A mutation call may omit `params.id`: this frontend mints one fresh ULID
-//! for that call, forwards it, and returns it as top-level `id` so the caller
-//! retains it for exact retry. An explicit id is forwarded untouched and
-//! still validated by the daemon. This frontend never auto-retries a call,
+//! for that call, forwards it, and returns it as top-level `id` on both success
+//! and structured error. A caller that needs to recover after losing the whole
+//! response supplies its own stable id, forwarded untouched for daemon validation. This frontend never auto-retries a call,
 //! never pretends rollback on cancel, and never replays.
 //! Incoming stdio frames are bounded by the SDK's own transport limit; the
 //! peer-facing `params` size reuses the daemon 4 MiB frame limit.
@@ -283,6 +283,7 @@ impl ServerHandler for EliotMcpHandler {
                 Err(error) => Ok(CallToolResult::structured_error(mcp_error_value(
                     &error,
                     &request_id,
+                    minted_id.as_deref(),
                 ))
                 .into()),
             }
@@ -334,20 +335,27 @@ fn success_output(method: &str, value: &Value, minted_id: Option<&str>, http: bo
 /// encoded response (id plus duplicated text plus envelope): tails are
 /// shortened with `truncated` set, or dropped entirely, until the line
 /// (plus newline) fits [`eliot_daemon::MAX_RPC_FRAME_BYTES`]. The primary
-/// code/message is always delivered, even if the id alone leaves no room.
-fn mcp_error_value(error: &eliot_core::Error, request_id: &Value) -> Value {
+/// code, message and minted mutation id take priority over optional diagnostics.
+fn mcp_error_value(
+    error: &eliot_core::Error,
+    request_id: &Value,
+    minted_id: Option<&str>,
+) -> Value {
     let mut budget = eliot_core::MAX_STDERR_DIAGNOSTIC_BYTES;
     loop {
         let mut diagnostics = error.diagnostics.clone();
         eliot_core::bound_stderr_diagnostics(&mut diagnostics, budget);
         let mut candidate = error.clone();
         candidate.diagnostics = diagnostics;
-        let value = serde_json::to_value(&candidate).unwrap_or_else(|_| {
+        let mut value = serde_json::to_value(&candidate).unwrap_or_else(|_| {
             json!({
                 "code": error.code,
                 "message": error.message,
             })
         });
+        if let Some(id) = minted_id {
+            value["id"] = Value::String(id.to_owned());
+        }
         if mcp_error_response_fits(&value, request_id) {
             return value;
         }
@@ -741,9 +749,30 @@ mod tests {
     use eliot_core::{StderrSnapshot, StderrSource};
 
     #[test]
+    fn uncertain_mutation_error_returns_the_forwarded_id() {
+        let mut params = Map::new();
+        let minted = mint_missing_mutation_id("command.submit", &mut params);
+        assert!(minted.is_some());
+        let error = eliot_core::Error::new("unknown", "daemon response was lost");
+        let request_id = json!("mcp-request");
+        let result = CallToolResult::structured_error(mcp_error_value(
+            &error,
+            &request_id,
+            minted.as_deref(),
+        ));
+        let structured = result.structured_content.expect("structured error");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(structured["id"], params["id"]);
+        assert_ne!(structured["id"], request_id);
+        assert_eq!(structured["code"], "unknown");
+        assert_eq!(structured["message"], "daemon response was lost");
+        assert!(mcp_error_response_fits(&structured, &request_id));
+    }
+
+    #[test]
     fn mcp_error_keeps_code_and_message_without_diagnostics() {
         let error = eliot_core::Error::new("not_found", "missing command");
-        let value = mcp_error_value(&error, &Value::Null);
+        let value = mcp_error_value(&error, &Value::Null, None);
         assert_eq!(value.get("code").and_then(Value::as_str), Some("not_found"));
         assert_eq!(
             value.get("message").and_then(Value::as_str),
@@ -765,7 +794,7 @@ mod tests {
                 read_error: false,
             },
         );
-        let value = mcp_error_value(&error, &Value::Null);
+        let value = mcp_error_value(&error, &Value::Null, None);
         assert_eq!(value.get("code").and_then(Value::as_str), Some("failed"));
         let diagnostics = value
             .get("diagnostics")
@@ -797,7 +826,7 @@ mod tests {
                 read_error: false,
             },
         );
-        let value = mcp_error_value(&error, &Value::Null);
+        let value = mcp_error_value(&error, &Value::Null, None);
         assert_eq!(value.get("code").and_then(Value::as_str), Some("failed"));
         assert_eq!(
             value.get("message").and_then(Value::as_str),
@@ -825,7 +854,7 @@ mod tests {
         let naive = serde_json::to_value(&error).expect("naive error value encodes");
         assert!(naive.get("diagnostics").is_some());
         assert!(!mcp_error_response_fits(&naive, &request_id));
-        let value = mcp_error_value(&error, &request_id);
+        let value = mcp_error_value(&error, &request_id, None);
         assert_eq!(value.get("code").and_then(Value::as_str), Some("failed"));
         assert_eq!(
             value.get("message").and_then(Value::as_str),
