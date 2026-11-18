@@ -1073,7 +1073,13 @@ pub(crate) async fn verify_initialized_store(
 /// binding and the home form; anything else (including a home-form scope on
 /// a separate-root binding) is unverified. Retained legacy scopes are
 /// verified against their original admission identity (the frozen strings
-/// as-is) when the canonical directories are unavailable.
+/// as-is) when the canonical directories are unavailable. A binding frozen
+/// before the canonical-home fix behind a symlinked home carries a scope
+/// derived from the reported alias, which no longer exists anywhere in the
+/// frozen binding: neither derivation can recover that spelling, so it stays
+/// unverified with an explicit rebinding path instead of a guessed accept.
+/// Re-admission (profile.store) verifies the store pin before freezing a
+/// fresh canonical binding; the scope is never edited by hand.
 pub(crate) fn verify_archive_scope(binding: &NativeStoreBinding) -> Result<()> {
     let (home, root) = binding_paths(binding)?;
     // Primary: the same canonical representation admission freezes. The
@@ -1094,7 +1100,10 @@ pub(crate) fn verify_archive_scope(binding: &NativeStoreBinding) -> Result<()> {
     if store_scope(&binding.home, home, root)? == binding.native_scope {
         return Ok(());
     }
-    Err(unverified_store())
+    Err(Error::new(
+        "native_scope_unverified",
+        "Codex archive scope does not match the frozen home and store: re-run store admission (profile.store) against the live Codex home to freeze a fresh canonical binding, then retry the archive with that binding",
+    ))
 }
 
 fn binding_paths(binding: &NativeStoreBinding) -> Result<(&Path, &Path)> {
@@ -2078,6 +2087,36 @@ mod tests {
                 native_scope: scope,
             })
             .is_ok()
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn archive_gate_rejects_legacy_binding_without_admission_spelling() {
+        // A binding frozen before the canonical-home fix behind a symlinked
+        // home carries the canonical path with a scope derived from the
+        // reported alias. That spelling exists nowhere in the frozen
+        // binding, so neither the canonical nor the legacy derivation can
+        // recover it: the gate must stay `native_scope_unverified` (never a
+        // guessed accept) and name the verified rebinding path.
+        let base = std::env::temp_dir().join(format!("eliot-codex-legacy-{}", ulid::Ulid::new()));
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("legacy home");
+        let home_text = home.to_str().expect("UTF-8 temp path").to_owned();
+        let lost_alias = format!("{home_text}-reported-alias");
+        let legacy_scope = store_scope(&lost_alias, Path::new(&home_text), Path::new(&home_text))
+            .expect("legacy scope");
+        let error = verify_archive_scope(&NativeStoreBinding {
+            home: home_text,
+            root: base.join("home").to_str().expect("UTF-8 home").to_owned(),
+            native_scope: legacy_scope,
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "native_scope_unverified");
+        assert!(
+            error.message.contains("profile.store"),
+            "rebinding path missing: {}",
+            error.message
         );
         std::fs::remove_dir_all(&base).ok();
     }
