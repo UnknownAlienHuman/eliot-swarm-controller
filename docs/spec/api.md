@@ -780,8 +780,11 @@ session fallback never presents as turn usage: its inner `usage.scope` is
 `"session"` as well, and per-turn accounting stays on `usage.summary`.
 A missing outcome or progress
 timestamp reads back absent, never zero or success; `updated_at` is freshness
-metadata, not proof of liveness for a detached or restarted source. The
-response carries the required matching `total` ignoring the cursor, the
+metadata, not proof of liveness for a detached or restarted source. Each
+summary also carries `project_scope`, the authorization namespace the server
+compares for same-project moves and handoffs, present only when it differs
+from `project`; pickers narrow by that scope while the server stays the judge.
+The response carries the required matching `total` ignoring the cursor, the
 required explicit `truncated`, and `next` at the last returned row on every
 nonempty page (empty pages carry no cursor); continue through `next` until the
 page is empty. A missing `total` or `truncated` never reads back as zero or

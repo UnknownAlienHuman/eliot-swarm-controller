@@ -219,6 +219,9 @@ impl Store {
             usage,
             usage_scope,
             updated_at: record.updated_at,
+            // The authorization scope the server compares for moves and
+            // handoffs; the UI falls back to `project` when absent.
+            project_scope: record.project_scope,
             heavy,
             session_growth,
         })

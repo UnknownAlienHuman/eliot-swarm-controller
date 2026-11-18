@@ -40,6 +40,10 @@ pub struct UiAgent {
     /// The recorded registration ID (the daemon's project label), independently
     /// of the execution path. Move/Handoff query and filter by this.
     pub project_id: String,
+    /// The authorization scope the server compares for same-project moves
+    /// and handoffs, when it differs from [`Self::project_id`]. Absent on
+    /// old payloads and synthetic rows, which fall back to the project ID.
+    pub project_scope: Option<String>,
     pub repo_common_dir: Option<String>,
     pub workspace: Option<String>,
     /// The current manager, if any.
@@ -67,6 +71,7 @@ impl UiAgent {
             harness: summary.harness.clone(),
             state: summary.state,
             project_id: summary.project.clone(),
+            project_scope: summary.project_scope.clone(),
             repo_common_dir: summary.repo_common_dir.clone(),
             workspace: summary.workspace.clone(),
             parent: summary.parent.clone(),
@@ -79,6 +84,13 @@ impl UiAgent {
             chat: false,
             archived: false,
         }
+    }
+
+    /// The authorization scope the server compares for same-project moves
+    /// and handoffs: the retained scope when it differs, else the project
+    /// ID. The daemon stays the judge; the pickers only narrow by this.
+    pub fn scope(&self) -> &str {
+        self.project_scope.as_deref().unwrap_or(&self.project_id)
     }
 
     /// Working now or on its way.
@@ -1410,6 +1422,7 @@ mod tests {
             harness: "muse".to_owned(),
             state: AgentState::Idle,
             project_id: project.to_owned(),
+            project_scope: None,
             repo_common_dir: None,
             workspace: None,
             parent: parent.map(str::to_owned),
@@ -2271,6 +2284,7 @@ mod tests {
             usage: None,
             usage_scope: None,
             updated_at: 0,
+            project_scope: None,
             heavy: None,
             session_growth: None,
         }
@@ -2331,8 +2345,16 @@ mod tests {
         let mut full = summary(None, None, Some("codex-lite"));
         full.project = "p".to_owned();
         full.workspace = Some("/repo".to_owned());
+        full.project_scope = Some("/repo".to_owned());
         let agent = UiAgent::from_summary(&full);
         assert_eq!(agent.project_id, "p");
         assert_eq!(agent.workspace.as_deref(), Some("/repo"));
+        // The server compares the scope, not the project ID: same ID with
+        // a different scope is a different authorization namespace.
+        assert_eq!(agent.scope(), "/repo");
+        let mut legacy = summary(None, None, Some("codex-lite"));
+        legacy.project = "p".to_owned();
+        let fallback = UiAgent::from_summary(&legacy);
+        assert_eq!(fallback.scope(), "p");
     }
 }

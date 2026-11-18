@@ -396,6 +396,9 @@ pub struct MonitorRow {
     pub updated_at: i64,
     /// The Agent's project label (its workspace path, as listed).
     pub project: String,
+    /// The authorization scope the server compares for moves and handoffs,
+    /// when it differs from [`Self::project`].
+    pub project_scope: Option<String>,
     /// A chat without a project (listed under Chats, not a project).
     pub chat: bool,
 }
@@ -459,6 +462,7 @@ impl MonitorRow {
             native_child: summary.activity.is_some(),
             updated_at: summary.updated_at,
             project: summary.project.clone(),
+            project_scope: summary.project_scope.clone(),
             chat: summary.chat,
         }
     }
@@ -2020,6 +2024,7 @@ mod tests {
                 usage: None,
                 usage_scope: None,
                 updated_at: 0,
+                project_scope: None,
                 heavy: None,
                 session_growth: None,
             },
@@ -2078,6 +2083,7 @@ mod tests {
             usage,
             usage_scope: usage_scope.map(str::to_owned),
             updated_at: 0,
+            project_scope: None,
             heavy: None,
             session_growth: None,
         };
@@ -2264,6 +2270,7 @@ mod tests {
                 usage: None,
                 usage_scope: None,
                 updated_at: 1_000,
+                project_scope: None,
                 heavy: None,
                 session_growth: None,
             },

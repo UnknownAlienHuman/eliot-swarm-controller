@@ -182,7 +182,7 @@ impl DesktopApp {
     fn spawn_move_search(&self, agent: &UiAgent, context: &ComponentContext<Self>) {
         let source = agent.id.clone();
         let generation = agent.generation;
-        let project = agent.project_id.clone();
+        let project = reparent::search_project(agent).to_owned();
         let data_dir = self.data_dir.clone();
         let _task = context.spawn_background(move |_| {
             let result = match data_dir {

@@ -1062,6 +1062,7 @@ mod tests {
             harness: "codex".to_owned(),
             state: AgentState::Stopped,
             project_id: workspace.to_owned(),
+            project_scope: None,
             repo_common_dir: None,
             workspace: Some(workspace.to_owned()),
             parent: parent.map(str::to_owned),

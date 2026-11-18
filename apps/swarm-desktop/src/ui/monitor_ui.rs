@@ -145,6 +145,7 @@ impl DesktopApp {
                                 harness: row.harness.clone(),
                                 state: row.state,
                                 project_id: row.project.clone(),
+                                project_scope: row.project_scope.clone(),
                                 repo_common_dir: None,
                                 workspace: None,
                                 parent: row.parent.clone(),

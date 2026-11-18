@@ -509,6 +509,7 @@ fn summary() -> AgentSummary {
         usage: None,
         usage_scope: None,
         updated_at: 7,
+        project_scope: None,
         heavy: None,
         session_growth: None,
     }

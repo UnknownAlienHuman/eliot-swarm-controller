@@ -1010,6 +1010,7 @@ impl DesktopApp {
             access: self.launch.access(),
             chat: self.launch.chat,
             workspace: self.launch.workspace.clone(),
+            project: self.launch_project_id(),
         };
         let key = format!("launch:{target:?}:{place:?}:{}", self.launch.launch_rev);
         let mutation_id = self.ledger.id_for(&key);
@@ -1119,6 +1120,24 @@ impl DesktopApp {
                 ));
             }
         }
+    }
+
+    /// The registration ID the pending launch row carries: the launch
+    /// checkout's registered project, or none for chats and for folders
+    /// outside the registered projects. Never the workspace path: the
+    /// daemon's project label is a registration ID, not a directory.
+    fn launch_project_id(&self) -> String {
+        if self.launch.chat {
+            return String::new();
+        }
+        self.nav
+            .projects
+            .iter()
+            .find(|project| {
+                nav::path_key(&project.workspace) == nav::path_key(&self.launch.workspace)
+            })
+            .map(|project| project.id.clone())
+            .unwrap_or_default()
     }
 
     /// A start that did not go through gives its text back to the composer
@@ -1246,10 +1265,15 @@ impl LaunchOutcome {
             project_id: if self.submitted.chat {
                 String::new()
             } else {
-                self.submitted.workspace.clone()
+                self.submitted.project.clone()
             },
+            project_scope: None,
             repo_common_dir: None,
-            workspace: None,
+            workspace: if self.submitted.chat {
+                None
+            } else {
+                Some(self.submitted.workspace.clone())
+            },
             parent: None,
             updated_at: now,
             title: nav::title(&self.text).unwrap_or_else(|| self.agent.clone()),
@@ -1333,6 +1357,7 @@ mod tests {
                 access: Access::Auto,
                 chat: false,
                 workspace: "C:/src/app".to_owned(),
+                project: "p".to_owned(),
             },
         };
         let _later_picker = pick("claude", "claude-sonnet", "high");
@@ -1347,7 +1372,8 @@ mod tests {
         );
         let row = outcome.pending_agent(5);
         assert_eq!(row.harness, "codex");
-        assert_eq!(row.project_id, "C:/src/app");
+        assert_eq!(row.project_id, "p");
+        assert_eq!(row.workspace.as_deref(), Some("C:/src/app"));
         assert!(!row.chat);
         assert_eq!(row.title, "Fix the build");
         assert_eq!(
@@ -1360,5 +1386,20 @@ mod tests {
             ..outcome.submitted.clone()
         };
         assert!(preset.recent().is_none());
+        // A chat pending row carries neither a project ID nor a workspace.
+        let chat = LaunchOutcome {
+            agent: "a8".to_owned(),
+            submitted: Submitted {
+                chat: true,
+                workspace: String::new(),
+                project: String::new(),
+                ..outcome.submitted.clone()
+            },
+            ..outcome.clone()
+        };
+        let row = chat.pending_agent(6);
+        assert!(row.chat);
+        assert!(row.project_id.is_empty());
+        assert!(row.workspace.is_none());
     }
 }

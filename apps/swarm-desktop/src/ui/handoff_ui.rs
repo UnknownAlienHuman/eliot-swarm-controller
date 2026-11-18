@@ -459,7 +459,9 @@ impl DesktopApp {
     }
 
     /// Live, non-source Agents of the navigation list in the source's
-    /// project (the daemon requires a same-project B and checks again).
+    /// authorization scope (the daemon requires a same-scope B and checks
+    /// again). A missing source or an empty scope offers nothing: handoff
+    /// stays in one scope, never across projects.
     fn handoff_targets(&self) -> Vec<&UiAgent> {
         let listed = || {
             self.nav
@@ -470,19 +472,15 @@ impl DesktopApp {
                     _ => &[],
                 }))
         };
-        let project = listed()
+        let scope = listed()
             .find(|agent| agent.id == self.handoff.from)
-            .map(|agent| agent.project_id.clone())
-            .filter(|project| !project.is_empty());
+            .map(|agent| agent.scope().to_owned())
+            .filter(|scope| !scope.is_empty());
         let mut seen = HashSet::new();
         listed()
             .filter(|agent| seen.insert(agent.id.as_str()))
             .filter(|agent| agent.id != self.handoff.from)
-            .filter(|agent| {
-                project
-                    .as_ref()
-                    .is_none_or(|project| &agent.project_id == project)
-            })
+            .filter(|agent| scope.as_ref().is_some_and(|scope| agent.scope() == scope))
             .filter(|agent| {
                 !matches!(
                     agent.state,

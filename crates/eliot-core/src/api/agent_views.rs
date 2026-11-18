@@ -92,6 +92,12 @@ pub struct AgentSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_scope: Option<String>,
     pub updated_at: i64,
+    /// The authorization namespace the server compares for same-project
+    /// moves and handoffs (`COALESCE(project_scope, project)`), present
+    /// only when it differs from `project`. Trailing field; absent on old
+    /// wire payloads, when the UI falls back to `project`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_scope: Option<String>,
     /// Heavy-work rollup for the Agent generation, when at least one heavy
     /// episode was ever recorded. Trailing field; absent on old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +129,7 @@ impl AgentSummary {
             &self.profile,
             &self.preview,
             &self.repo_common_dir,
+            &self.project_scope,
         ]
         .into_iter()
         .flatten()

@@ -13,10 +13,10 @@
 //! destination generations go into the request, so a click acts on exactly
 //! what was displayed. One ULID per action key, reused only after an
 //! uncertain reply. The picker only leaves out what the daemon would
-//! refuse anyway (another project, an ended or observed task, the task
-//! itself or its own workers); the daemon still owns every check (cycle,
-//! fanout, observe-only, generation, destination state) and its refusal is
-//! shown in words.
+//! refuse anyway (another authorization scope, an ended or observed task,
+//! the task itself or its own workers); the daemon still owns every check
+//! (scope, cycle, fanout, observe-only, generation, destination state) and
+//! its refusal is shown in words.
 
 use eliot_core::AgentState;
 use eliot_core::api::{AgentListRequest, ReparentRequest};
@@ -56,6 +56,13 @@ pub struct Managers {
     pub agents: Vec<UiAgent>,
     /// Matching rows past the bound; 0 when the search read them all.
     pub unread: usize,
+}
+
+/// The `agent.list` project filter for `source`'s picker: its recorded
+/// project ID, never its workspace path. The daemon filters on the project
+/// label, and [`eligible_parents`] then narrows by authorization scope.
+pub fn search_project(source: &UiAgent) -> &str {
+    &source.project_id
 }
 
 /// Page through `agent.list {project, state}` for every state in
@@ -195,11 +202,12 @@ impl MoveBinding {
 }
 
 /// The `candidates` `source` can be moved under, newest first: the same
-/// project (the daemon compares the project label exactly), controlled and
-/// not ended (`swarm.reparent` needs a live manager), neither `source`
-/// itself, its current parent, nor one of its own workers (a cycle), each
-/// once. `links` (the sidebar's rows) only add parent links for the cycle
-/// check; the candidates' own rows are fresher and win.
+/// authorization scope (the daemon compares `COALESCE(project_scope,
+/// project)` exactly), controlled and not ended (`swarm.reparent` needs a
+/// live manager), neither `source` itself, its current parent, nor one of
+/// its own workers (a cycle), each once. `links` (the sidebar's rows) only
+/// add parent links for the cycle check; the candidates' own rows are
+/// fresher and win.
 pub fn eligible_parents<'a>(
     candidates: &'a [UiAgent],
     links: &[UiAgent],
@@ -231,7 +239,7 @@ pub fn eligible_parents<'a>(
     let mut eligible: Vec<&UiAgent> = candidates
         .iter()
         .filter(|agent| agent.id != source.id && seen.insert(agent.id.as_str()))
-        .filter(|agent| agent.project_id == source.project_id && !agent.native_child)
+        .filter(|agent| agent.scope() == source.scope() && !agent.native_child)
         .filter(|agent| {
             !matches!(
                 agent.state,
@@ -256,6 +264,7 @@ mod tests {
             harness: "claude".to_owned(),
             state,
             project_id: "/w".to_owned(),
+            project_scope: None,
             repo_common_dir: None,
             workspace: None,
             parent: parent.map(str::to_owned),
@@ -445,7 +454,45 @@ mod tests {
     }
 
     #[test]
-    fn move_candidates_use_project_id_when_it_differs_from_workspace() {
+    fn same_scope_qualifies_when_the_project_id_differs_from_the_workspace() {
+        // Same ID with another scope is another authorization namespace: the
+        // daemon refuses the move, so the picker never offers it.
+        fn placed(
+            id: &str,
+            project_id: &str,
+            scope: Option<&str>,
+            workspace: &str,
+            state: AgentState,
+        ) -> UiAgent {
+            let mut row = agent(id, None, state, 1);
+            row.project_id = project_id.to_owned();
+            row.project_scope = scope.map(str::to_owned);
+            row.workspace = Some(workspace.to_owned());
+            row
+        }
+        let source = placed("a1", "p", Some("/repo"), "/repo", AgentState::Idle);
+        let same_scope = placed("a2", "p", Some("/repo"), "/repo", AgentState::Idle);
+        // Same project ID and workspace, but another tree's scope.
+        let other_scope = placed("a3", "p", Some("/elsewhere"), "/repo", AgentState::Idle);
+        let other_project = placed("a4", "q", None, "/repo", AgentState::Idle);
+        let candidates = vec![
+            same_scope.clone(),
+            other_scope.clone(),
+            other_project.clone(),
+            source.clone(),
+        ];
+        let ids: Vec<&str> = eligible_parents(&candidates, &[], &source)
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(ids, ["a2"]);
+    }
+
+    #[test]
+    fn the_move_search_filters_by_project_id_never_the_workspace_path() {
+        // The search filter comes from the Move caller
+        // ([`search_project`]), not from a literal: if the caller passed
+        // the workspace path, this search would read nothing.
         fn placed(id: &str, project_id: &str, workspace: &str, state: AgentState) -> UiAgent {
             let mut row = agent(id, None, state, 1);
             row.project_id = project_id.to_owned();
@@ -455,28 +502,24 @@ mod tests {
         let source = placed("a1", "p", "/repo", AgentState::Idle);
         let same_project = placed("a2", "p", "/repo", AgentState::Idle);
         let same_workspace_other_project = placed("a3", "q", "/repo", AgentState::Idle);
-        let candidates = vec![
-            same_project.clone(),
-            same_workspace_other_project.clone(),
-            source.clone(),
-        ];
-        let ids: Vec<&str> = eligible_parents(&candidates, &[], &source)
-            .iter()
-            .map(|row| row.id.as_str())
-            .collect();
-        assert_eq!(ids, ["a2"]);
-
+        // The caller derives the filter from the source row, as the picker does.
+        assert_eq!(search_project(&source), "p");
         let rows = vec![
             source.clone(),
             same_project.clone(),
             same_workspace_other_project,
         ];
         let mut requests = Vec::new();
-        let managers = crate::client::block_on(search_managers("p", 10, 100, |request| {
-            requests.push(request.clone());
-            let page = list(&rows, &request);
-            async move { Ok::<_, ()>(page) }
-        }))
+        let managers = crate::client::block_on(search_managers(
+            search_project(&source),
+            10,
+            100,
+            |request| {
+                requests.push(request.clone());
+                let page = list(&rows, &request);
+                async move { Ok::<_, ()>(page) }
+            },
+        ))
         .unwrap();
         assert!(
             requests
