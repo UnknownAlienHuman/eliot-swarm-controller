@@ -1434,7 +1434,10 @@ fn owner_var_cas_conflict_and_global_scope() {
             "stale",
         ],
     );
-    assert_eq!(conflict.status.code(), Some(3));
+    // `version_conflict` is not a Core deterministic pre-admission
+    // rejection (#663): the CLI cannot prove it was pre-effect, so it is
+    // an uncertain effect (exit 4), not a confirmed refusal (exit 3).
+    assert_eq!(conflict.status.code(), Some(4));
     assert!(conflict.stderr.contains("version_conflict"));
 
     let read = fixture.json(&["var", "get", "--scope", "project:app", "branch"]);
