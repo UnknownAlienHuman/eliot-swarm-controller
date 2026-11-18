@@ -8,8 +8,10 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
-        // Authority lives in the Store: Owner anywhere, or a manager for two
-        // workers in its own controlled scope. Reparent and switch stay Owner-only.
+        // Authority lives in the Store: Owner anywhere with claims/Goal/children,
+        // or a manager for two workers (never itself) in its own controlled scope
+        // for caller-issued task inputs only, never moving children. Reparent and
+        // switch stay Owner-only.
         let request: HandoffRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let policy = self.secret_policy_snapshot();
@@ -53,7 +55,8 @@ impl Router {
         principal: &Principal,
     ) -> Result<Value> {
         // Authority lives in the Store: Owner withdraws handoff inputs, or a
-        // manager cancels a send it issued itself in its controlled scope.
+        // manager cancels a send it issued itself in its controlled scope
+        // (handoff child, ordinary SEND or own selector SEND child).
         let request: CommandCancelRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;

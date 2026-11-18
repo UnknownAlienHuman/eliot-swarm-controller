@@ -133,6 +133,7 @@ impl Store {
         let record = load_command_record(&tx, &request.command_id)?
             .ok_or_else(|| Error::new("not_found", "input missing"))?;
         let eligible:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM commands c JOIN commands p ON p.id=c.parent_command WHERE c.id=?1 AND c.link_kind='handoff' AND p.method='swarm.handoff')",[&request.command_id],|row|row.get(0)).map_err(sql_error)?;
+        let selector_eligible: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM commands c JOIN commands p ON p.id=c.parent_command WHERE c.id=?1 AND c.link_kind='selector' AND p.selector IS NOT NULL)",[&request.command_id],|row|row.get(0)).map_err(sql_error)?;
         let reason = if principal == "owner" {
             if !eligible {
                 return Err(Error::new(
@@ -187,10 +188,25 @@ impl Store {
                     |row| row.get(0),
                 )
                 .map_err(sql_error)?;
-            if !eligible && !ordinary {
+            if selector_eligible {
+                let parent_principal: String = tx
+                    .query_row(
+                        "SELECT p.principal FROM commands c JOIN commands p ON p.id=c.parent_command WHERE c.id=?1",
+                        [&request.command_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(sql_error)?;
+                if parent_principal != principal {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "only the send issuer may cancel its queued input",
+                    ));
+                }
+            }
+            if !eligible && !ordinary && !selector_eligible {
                 return Err(Error::new(
                     "bad_state",
-                    "command.cancel supports only own handoff SEND children and own ordinary SENDs; launch/resume inputs cannot be withdrawn",
+                    "command.cancel supports only own handoff SEND children, own ordinary SENDs and own selector SEND children; launch/resume inputs cannot be withdrawn",
                 ));
             }
             if record.command.verb != "send"
@@ -248,8 +264,10 @@ pub(super) fn handoff_tx(
     limits: core::api::HierarchyLimits,
 ) -> Result<HandoffAdmission> {
     request.validate()?;
-    // Owner hands off anywhere. A manager may hand off between two workers in
-    // its own controlled scope; the scope check below never widens authority.
+    // Owner hands off anywhere with claims, Goal and children. A manager may
+    // hand off only between two workers in its own controlled scope, never
+    // itself, transferring only task inputs it issued itself. Agent handoffs
+    // never move children, claims or Goals; moving children stays Owner-only.
     let manager_caller = if principal == "owner" {
         None
     } else {
@@ -314,6 +332,14 @@ pub(super) fn handoff_tx(
             "handoff must stay in one project",
         ));
     }
+    if let Some(hierarchy::Caller::Agent { id: caller_id, .. }) = &manager_caller
+        && (request.from == *caller_id || request.to == *caller_id)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "handoff endpoints must be workers, not the caller",
+        ));
+    }
     if let Some(caller) = &manager_caller {
         hierarchy::caller_may_command(tx, caller, &from)?;
         hierarchy::caller_may_command(tx, caller, &to)?;
@@ -331,6 +357,12 @@ pub(super) fn handoff_tx(
         return Err(Error::new(
             "invalid",
             "original task must be a SEND on A's exact generation",
+        ));
+    }
+    if manager_caller.is_some() && task.principal != principal {
+        return Err(Error::new(
+            "not_allowed",
+            "handoff transfers only SENDs issued by the caller",
         ));
     }
     let mut originals = Vec::new();
@@ -356,6 +388,12 @@ pub(super) fn handoff_tx(
                 "selected work is not an undispatched plain SEND on A",
             ));
         }
+        if manager_caller.is_some() && c.principal != principal {
+            return Err(Error::new(
+                "not_allowed",
+                "handoff transfers only SENDs issued by the caller",
+            ));
+        }
         if policy.contains_value(&c.args) {
             return Err(Error::new(
                 "secret_in_payload",
@@ -366,24 +404,39 @@ pub(super) fn handoff_tx(
     }
     let (brief_text, brief_truncated) = brief::build(tx, request, &task, policy)?;
     let mut events = Vec::new();
-    let (claims, claim_conflicts, conflicts_truncated) =
-        attribution::transfer_claims_tx(tx, &from, &to, policy, now, &mut events)?;
-    let goal_revision = goals::transfer_goal_tx(tx, &from, &to, policy, now, &mut events)?;
-    let moved = reparent::reparent_tx(
-        tx,
-        &ReparentRequest {
-            id: request.id.clone(),
-            agent: None,
-            children_of: Some(from.id.clone()),
-            expected_generation: from.generation,
-            parent: to.id.clone(),
-            parent_generation: to.generation,
-        },
-        limits,
-        now,
-        false,
-    )?;
-    events.extend(moved.events);
+    // Agent authority never widens: an Agent handoff transfers only task
+    // inputs the caller issued itself. Claims, Goals and children stay put;
+    // moving children stays Owner-only.
+    let (claims, claim_conflicts, conflicts_truncated, goal_revision, reparented) =
+        if manager_caller.is_some() {
+            (Vec::new(), Vec::new(), false, None, Vec::new())
+        } else {
+            let (claims, claim_conflicts, conflicts_truncated) =
+                attribution::transfer_claims_tx(tx, &from, &to, policy, now, &mut events)?;
+            let goal_revision = goals::transfer_goal_tx(tx, &from, &to, policy, now, &mut events)?;
+            let moved = reparent::reparent_tx(
+                tx,
+                &ReparentRequest {
+                    id: request.id.clone(),
+                    agent: None,
+                    children_of: Some(from.id.clone()),
+                    expected_generation: from.generation,
+                    parent: to.id.clone(),
+                    parent_generation: to.generation,
+                },
+                limits,
+                now,
+                false,
+            )?;
+            events.extend(moved.events);
+            (
+                claims,
+                claim_conflicts,
+                conflicts_truncated,
+                goal_revision,
+                moved.value.moved,
+            )
+        };
     let brief_command = Ulid::new().to_string();
     let transfers: Vec<SendTransfer> = originals
         .iter()
@@ -408,7 +461,7 @@ pub(super) fn handoff_tx(
         claim_conflicts,
         conflicts_truncated,
         goal_revision,
-        reparented: moved.value.moved,
+        reparented,
         brief_truncated,
         brief_state: CommandState::Accepted,
         successor_gate: "queued_until_brief_applied".into(),

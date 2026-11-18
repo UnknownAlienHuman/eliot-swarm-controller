@@ -1055,3 +1055,153 @@ fn manager_cancel_refuses_dispatched_and_foreign_issuer() {
         "bad_state"
     );
 }
+
+#[test]
+fn manager_handoff_leaves_children_claims_and_goal_put() {
+    let (mut s, manager, a, b, task, queued) = managed_setup();
+    let principal = manager_principal(&manager);
+    let child = managed_agent(&mut s, Some(&a));
+    claim(&mut s, &a, "k187b-area/**");
+    goal(&mut s, &a);
+    let request = HandoffRequest {
+        id: Ulid::new().to_string(),
+        from: a.clone(),
+        from_generation: 1,
+        to: b.clone(),
+        to_generation: 1,
+        task_command: task.clone(),
+        commands: vec![queued.clone()],
+    };
+    let result = s
+        .handoff(&principal, &request, &core::SecretPolicy::default(), now())
+        .unwrap();
+    assert!(result.is_new);
+    assert!(result.value.reparented.is_empty());
+    assert!(result.value.claims.is_empty());
+    assert!(result.value.claim_conflicts.is_empty());
+    assert_eq!(result.value.goal_revision, None);
+    let moved = s.get_agent(&child).unwrap().unwrap();
+    assert_eq!(moved.parent, Some(a.clone()));
+    let holder: i64 = s
+        .connection
+        .query_row(
+            "SELECT agent FROM claims WHERE glob='k187b-area/**'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(holder, parse_agent_id(&a).unwrap());
+    assert_eq!(
+        s.goal_get(&a, "eliot").unwrap().unwrap().status,
+        core::api::GoalStatus::Active
+    );
+    assert!(s.goal_get(&b, "eliot").unwrap().is_none());
+}
+
+#[test]
+fn manager_handoff_refuses_owner_issued_sends() {
+    let (mut s, manager, a, b, task, _queued) = managed_setup();
+    let principal = manager_principal(&manager);
+    let owner_selected = send(&mut s, &a, "owner queued work");
+    let bad = HandoffRequest {
+        id: Ulid::new().to_string(),
+        from: a.clone(),
+        from_generation: 1,
+        to: b.clone(),
+        to_generation: 1,
+        task_command: task.clone(),
+        commands: vec![owner_selected],
+    };
+    assert_eq!(
+        s.handoff(&principal, &bad, &core::SecretPolicy::default(), now())
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+    let owner_task = send(&mut s, &a, "owner task");
+    let bad_task = HandoffRequest {
+        id: Ulid::new().to_string(),
+        from: a.clone(),
+        from_generation: 1,
+        to: b.clone(),
+        to_generation: 1,
+        task_command: owner_task,
+        commands: vec![],
+    };
+    assert_eq!(
+        s.handoff(&principal, &bad_task, &core::SecretPolicy::default(), now())
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+}
+
+#[test]
+fn manager_handoff_refuses_self_as_either_endpoint() {
+    let (mut s, manager, a, b, task, _queued) = managed_setup();
+    let principal = manager_principal(&manager);
+    let manager_task = manager_send(&mut s, &manager, &manager, "manager task");
+    let from_self = HandoffRequest {
+        id: Ulid::new().to_string(),
+        from: manager.clone(),
+        from_generation: 1,
+        to: b.clone(),
+        to_generation: 1,
+        task_command: manager_task,
+        commands: vec![],
+    };
+    assert_eq!(
+        s.handoff(
+            &principal,
+            &from_self,
+            &core::SecretPolicy::default(),
+            now()
+        )
+        .unwrap_err()
+        .code,
+        "not_allowed"
+    );
+    let to_self = HandoffRequest {
+        id: Ulid::new().to_string(),
+        from: a.clone(),
+        from_generation: 1,
+        to: manager.clone(),
+        to_generation: 1,
+        task_command: task.clone(),
+        commands: vec![],
+    };
+    assert_eq!(
+        s.handoff(&principal, &to_self, &core::SecretPolicy::default(), now())
+            .unwrap_err()
+            .code,
+        "not_allowed"
+    );
+}
+
+#[test]
+fn manager_can_cancel_own_selector_send_child() {
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let manager = managed_agent(&mut store, None);
+    let _a = managed_agent(&mut store, Some(&manager));
+    let b = managed_agent(&mut store, Some(&manager));
+    let principal = manager_principal(&manager);
+    let mut selector = SubmitCommand::new(Ulid::new().to_string(), "send");
+    selector.selector = Some(format!("tree:{manager}"));
+    selector.args = json!({"text": "broadcast"});
+    let parent_id = selector.id.clone();
+    store.submit(&principal, selector, now()).unwrap();
+    let child_id = format!("{parent_id}/{b}");
+    let cancel = CommandCancelRequest {
+        id: Ulid::new().to_string(),
+        command_id: child_id.clone(),
+    };
+    let result = store
+        .cancel_handoff_input(&principal, &cancel, now())
+        .unwrap();
+    assert_eq!(result.value.command_id, child_id);
+    assert_eq!(result.value.state, CommandState::Cancelled);
+    assert_eq!(
+        store.get_command(&child_id).unwrap().unwrap().state,
+        CommandState::Cancelled
+    );
+}
