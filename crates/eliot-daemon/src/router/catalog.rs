@@ -593,20 +593,34 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
+        let deadline = Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
         self.models_catalog_until(
             params,
             principal,
-            Instant::now() + crate::adhoc::DISCOVERY_BUDGET,
+            deadline,
+            Self::harness_inventory(deadline),
+            |params| async move {
+                self.harness_models_until(&params, principal, deadline)
+                    .await
+            },
+            |params| async move { self.harness_quota_until(&params, principal, deadline).await },
         )
         .await
     }
 
-    async fn models_catalog_until(
+    async fn models_catalog_until<ModelsRead, QuotaRead>(
         &self,
         params: &Value,
         principal: &Principal,
         deadline: Instant,
-    ) -> Result<Value> {
+        inventory: impl Future<Output = Result<Value>> + Send,
+        read_models: impl Fn(Value) -> ModelsRead + Send,
+        read_quota: impl Fn(Value) -> QuotaRead + Send,
+    ) -> Result<Value>
+    where
+        ModelsRead: Future<Output = Result<Value>> + Send,
+        QuotaRead: Future<Output = Result<catalog::ScopedQuota>> + Send,
+    {
         use eliot_core::api::{ModelsCatalogEntry, ModelsCatalogFailure, ModelsCatalogRequest};
         require_owner(principal)?;
         let request: ModelsCatalogRequest =
@@ -632,7 +646,7 @@ impl Router {
                 .await
                 .map_err(|_| crate::adhoc::discovery_timeout())?;
         // Harness inventory with versions for the aggregate key.
-        let harnesses_value = Self::harness_inventory(deadline).await?;
+        let harnesses_value = inventory.await?;
         let harnesses_response: eliot_core::api::HarnessListResponse =
             serde_json::from_value(harnesses_value)
                 .map_err(|_| Error::new("internal", "harness list could not be decoded"))?;
@@ -710,12 +724,9 @@ impl Router {
             let params = json!({"harness": harness});
             // A slow read past the request deadline fails open into the
             // partial aggregate instead of holding the coalescing lock.
-            let response_value = match tokio::time::timeout_at(
-                discovery_deadline,
-                self.harness_models_until(&params, principal, deadline),
-            )
-            .await
-            {
+            let models_read =
+                tokio::time::timeout_at(discovery_deadline, read_models(params.clone())).await;
+            let response_value = match models_read {
                 Ok(Ok(value)) => value,
                 Ok(Err(error)) => {
                     // The aggregate names the failed harness with its typed
@@ -744,13 +755,10 @@ impl Router {
                 serde_json::from_value(response_value)
                     .map_err(|_| Error::new("internal", "harness models could not be decoded"))?;
             let held = held_harness(harness);
-            let quota = tokio::time::timeout_at(
-                discovery_deadline,
-                self.harness_quota_until(&params, principal, deadline),
-            )
-            .await
-            .ok()
-            .and_then(Result::ok);
+            let quota = tokio::time::timeout_at(discovery_deadline, read_quota(params))
+                .await
+                .ok()
+                .and_then(Result::ok);
             for model in response.models {
                 models.push(catalog::catalog_entry(
                     harness,
@@ -785,7 +793,7 @@ impl Router {
                 key: key.clone(),
                 harnesses: harnesses.clone(),
                 models: models.clone(),
-                quotas: HashMap::new(),
+                quotas,
                 failures: failures.clone(),
                 fetched_at_ms,
                 ttl_ms,
@@ -2210,12 +2218,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn models_catalog_retains_quota_across_cache_hits_and_pages() {
+        use eliot_core::api::ModelsCatalogResponse;
+        use eliot_core::api::harness::{CATALOG_AVAILABLE, CATALOG_UNKNOWN};
+
+        let router = router();
+        let harnesses = vec![harness_entry("muse", "muse", "1.0")];
+        let inventory = json!({"harnesses": harnesses});
+        let fetched_at_ms = now_ms();
+        let models = json!({
+            "harness": "muse",
+            "catalogue": "native",
+            "scope": "profile:adhoc harness:muse",
+            "credential": "ambient",
+            "fetched_at_ms": fetched_at_ms,
+            "ttl_ms": CATALOG_TTL_MS,
+            "models": [{"id": "one"}, {"id": "two"}]
+        });
+        let quota = ScopedQuota {
+            route_verified: true,
+            response: HarnessQuotaResponse {
+                harness: "muse".to_owned(),
+                scope: "profile:adhoc harness:muse".to_owned(),
+                credential: "ambient".to_owned(),
+                fetched_at_ms,
+                ttl_ms: CATALOG_TTL_MS,
+                status: "supported".to_owned(),
+                note: None,
+                details: Some(json!({"windows": [{
+                    "label": "Weekly", "usedPercent": 10, "resetsAtMs": fetched_at_ms + 600_000
+                }]})),
+            },
+        };
+        let page = async |params: &Value, allow_discovery: bool| -> ModelsCatalogResponse {
+            let response = router
+                .models_catalog_until(
+                    params,
+                    &Principal::Owner,
+                    Instant::now() + crate::adhoc::DISCOVERY_BUDGET,
+                    std::future::ready(Ok(inventory.clone())),
+                    |_| {
+                        assert!(allow_discovery, "aggregate hit must reuse the models");
+                        std::future::ready(Ok(models.clone()))
+                    },
+                    |_| {
+                        assert!(allow_discovery, "aggregate hit must reuse the quota");
+                        std::future::ready(Ok(quota.clone()))
+                    },
+                )
+                .await
+                .unwrap();
+            serde_json::from_value(response).unwrap()
+        };
+        let request = json!({"limit": 1});
+        let cold = page(&request, true).await;
+        assert_eq!(cold.models[0].id, "one");
+        assert_eq!(cold.models[0].availability, CATALOG_AVAILABLE);
+        assert_eq!(page(&request, false).await, cold);
+        let continuation = json!({"limit": 1, "after": cold.next.unwrap()});
+        let next = page(&continuation, false).await;
+        assert_eq!(next.models[0].id, "two");
+        assert_eq!(next.models[0].availability, CATALOG_AVAILABLE);
+
+        // Age only the quota observation so the aggregate itself still hits.
+        router
+            .inner
+            .catalog_cache
+            .lock_recover()
+            .aggregate
+            .as_mut()
+            .unwrap()
+            .quotas
+            .get_mut("muse")
+            .unwrap()
+            .response
+            .fetched_at_ms = now_ms() - CATALOG_TTL_MS as i64 - 1;
+        assert_eq!(
+            page(&request, false).await.models[0].availability,
+            CATALOG_UNKNOWN
+        );
+        assert_eq!(
+            page(&continuation, false).await.models[0].availability,
+            CATALOG_UNKNOWN
+        );
+    }
+
+    #[tokio::test]
     async fn aggregate_deadline_bounds_lock_acquisition_and_inventory() {
         let router = router();
         let _lock = router.inner.catalog_aggregate_lock.lock().await;
         let deadline = Instant::now() + std::time::Duration::from_millis(10);
         let error = router
-            .models_catalog_until(&json!({}), &Principal::Owner, deadline)
+            .models_catalog_until(
+                &json!({}),
+                &Principal::Owner,
+                deadline,
+                async { panic!("inventory must wait for the aggregate lock") },
+                async |_| panic!("model discovery must wait for the aggregate lock"),
+                async |_| panic!("quota discovery must wait for the aggregate lock"),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.code, "timeout");
