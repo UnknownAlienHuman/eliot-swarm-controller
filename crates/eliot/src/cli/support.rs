@@ -52,29 +52,16 @@ impl Failure {
     }
 
     /// Exit code for an RPC error on a path where a write may have occurred.
-    /// Deterministic pre-admission rejections exit 3 through the classification
-    /// shared with Core (so no domain phase such as `routing_unavailable` is
-    /// lost to a CLI-only list); provider/domain failures exit 1; anything
-    /// else is an uncertain effect (exit 4).
+    /// Exit 3 is reserved for confirmed pre-admission rejections through the
+    /// one Core predicate (shared with the daemon, which marks post-write
+    /// validation and framing failures `unknown` at their source);
+    /// provider/domain failures exit 1; anything else is an uncertain
+    /// effect (exit 4).
     pub(crate) fn mutation_exit_code(code: &str) -> u8 {
         if code == "failed" {
             return 1;
         }
-        if eliot_core::is_deterministic_pre_admission_rejection(code)
-            || matches!(
-                code,
-                "rejected"
-                    | "stale_round"
-                    | "busy"
-                    | "mailbox_full"
-                    | "fanout_limit"
-                    | "version_conflict"
-                    | "claim_limit"
-                    | "id_conflict"
-                    | "id_expired"
-                    | "profile_error"
-            )
-        {
+        if eliot_core::is_deterministic_pre_admission_rejection(code) {
             return 3;
         }
         4
@@ -487,8 +474,8 @@ mod tests {
 
     #[test]
     fn mutation_errors_share_core_admission_classification() {
-        // Deterministic pre-admission rejections exit 3 through the shared
-        // Core classification, including phases a CLI-only list loses.
+        // Only confirmed pre-admission rejections through the one Core
+        // predicate exit 3, including phases a CLI-only list lost.
         for code in [
             "routing_unavailable",
             "conflict",
@@ -496,8 +483,7 @@ mod tests {
             "invalid",
             "bad_state",
             "stale_generation",
-            "busy",
-            "mailbox_full",
+            "frame_too_large",
         ] {
             assert_eq!(Failure::mutation_exit_code(code), 3, "{code}");
             let failure = Failure::for_mutation(CoreError::new(code, "refused"));
@@ -505,8 +491,27 @@ mod tests {
             assert_eq!(failure.code.as_deref(), Some(code));
         }
         assert_eq!(Failure::mutation_exit_code("failed"), 1);
-        // Anything else on a mutation path is an uncertain effect.
-        for code in ["unknown", "unavailable", "internal", "timeout", "bogus"] {
+        // Anything else on a mutation path is an uncertain effect, even
+        // codes a CLI-only list used to reject: the daemon marks post-write
+        // failures unknown at its source, so the CLI cannot prove these were
+        // pre-effect.
+        for code in [
+            "unknown",
+            "unavailable",
+            "internal",
+            "timeout",
+            "bogus",
+            "busy",
+            "mailbox_full",
+            "rejected",
+            "stale_round",
+            "version_conflict",
+            "claim_limit",
+            "id_conflict",
+            "id_expired",
+            "profile_error",
+            "fanout_limit",
+        ] {
             assert_eq!(Failure::mutation_exit_code(code), 4, "{code}");
         }
     }

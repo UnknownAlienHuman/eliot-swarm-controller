@@ -1141,11 +1141,7 @@ async fn serve_connection_with_write_timeout(
                 jsonrpc: "2.0".to_owned(),
                 id: response.id.clone(),
                 result: None,
-                error: Some(RpcError {
-                    code: -32603,
-                    message: "daemon response exceeded the frame limit".to_owned(),
-                    data: Some(json!({"code": "frame_too_large"})),
-                }),
+                error: Some(undeliverable_response_error()),
             };
             match serde_json::to_string(&fallback) {
                 Ok(frame) => send_response_frame(&mut framed, frame, write_timeout).await,
@@ -1157,6 +1153,17 @@ async fn serve_connection_with_write_timeout(
         logging::record(&policy, "rpc.response_write_failed", &[], None);
     }
     router.response_finished(arm_shutdown);
+}
+
+/// Fallback error when a computed response cannot be framed or delivered:
+/// the handler already ran, so the request may have committed a write and
+/// the effect is unknown, never a pre-admission rejection.
+fn undeliverable_response_error() -> RpcError {
+    RpcError {
+        code: -32603,
+        message: "daemon response exceeded the frame limit and was not delivered; the request may have been applied".to_owned(),
+        data: Some(json!({"code": "unknown"})),
+    }
 }
 
 fn decode_request(line: &str) -> std::result::Result<RpcRequest, (Value, RpcError)> {
@@ -1670,6 +1677,21 @@ fn with_connect_hint(path: &Path, mut error: Error) -> Error {
 mod tests {
     use super::*;
     use eliot_core::{MAX_STDERR_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource};
+
+    #[test]
+    fn oversized_response_reports_unknown_not_rejection() {
+        // The handler already ran when a response cannot be framed, so the
+        // fallback must read as an unknown effect, never frame_too_large
+        // (which the CLI reserves for confirmed pre-admission rejections).
+        let error = undeliverable_response_error();
+        assert_eq!(error.code, -32603);
+        assert_eq!(error.data, Some(serde_json::json!({"code": "unknown"})));
+        assert!(
+            error.message.contains("may have been applied"),
+            "{}",
+            error.message
+        );
+    }
 
     #[test]
     fn shared_helpers_managed_auth_requires_canonical_agent_ids() {
