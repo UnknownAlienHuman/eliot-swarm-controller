@@ -217,9 +217,9 @@ is admitted. Every `{env:NAME}` reference must name an entry of the frozen
 
 Effective settings are read back, not assumed. The isolated XDG file is not the
 final authority (workspace-inherited layers load after the isolated global
-config), so before inference the plugin checks the exact provider through
-bounded native `GET /api/provider/:providerID` and selects the exact frozen
-provider/model pair locally from `GET /api/model` (the endpoint answers an
+config), so before inference the plugin checks that the fragment defines the requested
+provider and selects the exact frozen provider/model pair locally from the
+live `GET /api/model` catalogue (the endpoint answers an
 object with a `data` array, with limits from that catalogue row). This
 verification runs before `POST /api/session` creates any native session: no
 session or prompt has been dispatched yet, so every verification failure - a

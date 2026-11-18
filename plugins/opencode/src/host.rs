@@ -1203,9 +1203,9 @@ impl OpenCodePlugin {
         let _timing = crate::native::startup::Step::new("session_create_verify");
         session.native_scope = opencode_scope(session.server.data_dir());
         // Pre-create verification: no native session or prompt exists yet.
-        // A fragment profile proves its provider through the native
-        // `GET /api/provider/:id` readback; the exact pair is proven below
-        // through the live catalogue like every other profile.
+        // A fragment profile must define the requested provider locally;
+        // the exact pair is proven below through the live model catalogue
+        // like every other profile, with limits from that catalogue row.
         if let (Some(fragment), Some(requested)) = (
             parsed.provider_fragment.as_ref(),
             parsed.requested_model.as_deref(),
@@ -1215,20 +1215,6 @@ impl OpenCodePlugin {
                 let failure = Error::new(
                     "profile_error",
                     "OpenCode provider fragment does not define the requested provider",
-                );
-                discard_failed_start(&mut session, failure.clone(), envelope).await;
-                return Ok(CreateOutcome::ProvenFailed(
-                    self.retain_proven_no_effect_start(&parsed.params, StartPhase::Verify, failure),
-                ));
-            }
-            if let Err(error) = session
-                .http
-                .get_provider(provider_id, phase_deadline(envelope, RPC_TIMEOUT))
-                .await
-            {
-                let failure = Error::new(
-                    "profile_error",
-                    format!("OpenCode provider readback failed ({})", error.message),
                 );
                 discard_failed_start(&mut session, failure.clone(), envelope).await;
                 return Ok(CreateOutcome::ProvenFailed(

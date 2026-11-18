@@ -339,8 +339,8 @@ written as-is into the isolated `opencode.jsonc` under `providers`. Every
 `{env:NAME}` reference must name a `pass_env`-allowed environment; a missing or
 empty required value refuses before startup instead of silently becoming no-auth.
 `auth_integration` must be absent on this path so no unrelated canonical
-credential is imported. The plugin verifies the exact provider through native
-`GET /api/provider/:providerID` and the exact pair through `GET /api/model`
+credential is imported. The plugin verifies that the fragment defines the requested provider and
+verifies the exact pair through the live `GET /api/model` catalogue
 (with limits from that catalogue row) before any native session is created —
 every verification failure settles the launch as failed with a short safe reason,
 never unknown — rejecting project overrides that retarget the route. An

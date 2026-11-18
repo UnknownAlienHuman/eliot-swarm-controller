@@ -707,11 +707,12 @@ impl OpenCodeHttp {
         Err(readback_error("agent list", &response))
     }
 
-    /// `GET /api/provider/:providerID`: effective provider readback for
-    /// the adopted-backend check (identity, native package, base URL, key
-    /// presence). A read, so any failure is `native_readback`, never
-    /// `unknown`. Only nonsecret observations leave this call: the key
-    /// value never decodes into retention.
+    /// `GET /api/provider/:providerID`: effective provider readback.
+    /// A read, so any failure is `native_readback`, never `unknown`. Only
+    /// nonsecret observations leave this call: the key value never decodes
+    /// into retention. Retained for direct provider reads; start readiness
+    /// uses the live model catalogue.
+    #[allow(dead_code)]
     pub async fn get_provider(
         &self,
         provider_id: &str,
