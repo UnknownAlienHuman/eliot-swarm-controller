@@ -243,7 +243,9 @@ impl DesktopApp {
         self.chat.detail.as_ref()
     }
 
-    /// The open Agent's route catalogue, read for its exact generation.
+    /// The open Agent's route catalogue, read for its exact generation:
+    /// the cached success, else the cached failure (which retries boundedly,
+    /// or at once from its Retry).
     pub(in crate::ui) fn agent_catalog(&self) -> Option<&Result<HarnessModelsResponse, String>> {
         let agent = self.selected_agent_id()?;
         let generation = self.chat.detail.as_ref()?.generation;
@@ -251,6 +253,11 @@ impl DesktopApp {
             .catalog
             .as_ref()
             .filter(|catalog| catalog.is_for(&agent, generation))
+            .or(self
+                .configure
+                .failed
+                .as_ref()
+                .filter(|catalog| catalog.is_for(&agent, generation)))
             .map(|catalog| &catalog.reply)
     }
 
@@ -324,13 +331,23 @@ impl DesktopApp {
         let ready = matches!(read, Some(Ok(_)));
         let enabled = ready && !self.submitting();
         let steps: View = match read {
-            Some(Err(error)) => m3::secondary(format!(
-                "Effort levels not read: {}",
-                crate::state::plain_error(error)
-            ))
-            .foreground(palette.error())
-            .text_wrapping(TextWrapping::Wrap)
-            .into(),
+            Some(Err(error)) => StackPanel::new()
+                .spacing(tokens::spacing::XS)
+                .children((
+                    m3::secondary(format!(
+                        "Effort levels not read: {}",
+                        crate::state::plain_error(error)
+                    ))
+                    .foreground(palette.error())
+                    .text_wrapping(TextWrapping::Wrap),
+                    m3::text_button(palette)
+                        .automation_name("Retry reading effort levels")
+                        .on_click(
+                            context.message(Message::Configure(ConfigureMsg::CatalogRetry)),
+                        )
+                        .content(m3::label("Retry")),
+                ))
+                .into(),
             _ if effort_locked || (!ready && efforts.is_empty()) => View::empty(),
             _ => {
                 if efforts.is_empty() {
