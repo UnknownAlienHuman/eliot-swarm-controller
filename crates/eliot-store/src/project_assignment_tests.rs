@@ -948,10 +948,11 @@ fn delete_managed_manager_preserves_launch_and_delete_receipts() {
         ProjectAssignmentOutcome::Released
     );
 
+    let removal_now = now + 60_000;
     let mut remove = SubmitCommand::new(Ulid::new().to_string(), "worktree.remove");
     remove.target = Some(agent.clone());
-    store.submit("owner", remove.clone(), now).unwrap();
-    store.dispatch(&remove.id, now).unwrap();
+    store.submit("owner", remove.clone(), removal_now).unwrap();
+    store.dispatch(&remove.id, removal_now).unwrap();
     let worktree = store.get_workspace(&agent).unwrap().unwrap();
     let removed = store
         .settle_workspace_removal(
@@ -963,7 +964,7 @@ fn delete_managed_manager_preserves_launch_and_delete_receipts() {
                 branch: worktree.requested_branch,
                 branch_retained: true,
             },
-            now,
+            removal_now,
         )
         .unwrap();
     assert_eq!(removed.value.phase, core::WorkspacePhase::Removed);
@@ -972,7 +973,7 @@ fn delete_managed_manager_preserves_launch_and_delete_receipts() {
     assert!(launch_receipt.is_some());
     let delete_id = Ulid::new().to_string();
     let result = store
-        .change_agent_tree(&delete_id, &agent, None, now)
+        .change_agent_tree(&delete_id, &agent, None, removal_now)
         .unwrap();
     assert_eq!(
         result,
@@ -985,7 +986,9 @@ fn delete_managed_manager_preserves_launch_and_delete_receipts() {
         launch_receipt
     );
     assert_eq!(
-        store.replay_project_manager_launch(&request, now).unwrap(),
+        store
+            .replay_project_manager_launch(&request, removal_now)
+            .unwrap(),
         Some(launched)
     );
     assert_eq!(

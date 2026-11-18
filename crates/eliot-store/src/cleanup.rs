@@ -10,7 +10,56 @@ const MAX_CLEANUP_PLANS: i64 = 1_024;
 /// plans and abandoned never-consumed previews, oldest first.
 const CLEANUP_PLAN_RECLAIM_BATCH: i64 = 64;
 
+/// An apply can read back its exact workspace command even after a crash
+/// between native removal and cleanup receipt settlement.
+pub fn cleanup_worktree_command_id(apply_id: &str, artifact_id: &str) -> Result<String> {
+    let apply = validate_ulid(apply_id)?;
+    let digest = canonical::digest(&json!(["worktree.remove", apply_id, artifact_id]))?;
+    let mut randomness = [0; 16];
+    randomness[6..].copy_from_slice(&digest[..10]);
+    Ok(Ulid::from_parts(apply.timestamp_ms(), u128::from_be_bytes(randomness)).to_string())
+}
+
 impl Store {
+    /// A bounded, stable-ID page of registered worktree artifacts whose
+    /// retained workspace row is ready and whose owner has ended.
+    pub fn auto_cleanup_worktree_inventory(
+        &self,
+        after: Option<&str>,
+    ) -> Result<(Vec<ArtifactView>, bool)> {
+        self.ensure_committed_reads()?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT a.body FROM artifacts a
+             JOIN workspaces w ON w.agent=a.agent AND w.target_generation=a.generation
+               AND w.worktree_path=a.path AND w.phase='ready'
+             JOIN agents g ON g.id=a.agent AND g.generation=a.generation
+             WHERE a.id > COALESCE(?1, '') AND json_extract(a.body, '$.kind')='worktree'
+               AND json_extract(a.body, '$.state')='registered'
+               AND g.state IN ('stopped','failed','lost')
+             ORDER BY a.id LIMIT 9",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([after], |row| row.get::<_, String>(0))
+            .map_err(sql_error)?;
+        let mut items = Vec::with_capacity(8);
+        let mut more = false;
+        for body in rows {
+            let body = body.map_err(sql_error)?;
+            if items.len() == 8 {
+                more = true;
+                break;
+            }
+            items
+                .push(serde_json::from_str(&body).map_err(|_| {
+                    Error::new("source_integrity", "invalid worktree artifact row")
+                })?);
+        }
+        Ok((items, more))
+    }
+
     pub fn known_artifact_path(&self, path: &str) -> Result<Option<ArtifactView>> {
         let body: Option<String> = self
             .connection
@@ -773,7 +822,7 @@ impl Store {
         if let Some(value) =
             self.cleanup_replay(principal, &request.id, "cleanup.apply", &payload)?
         {
-            let response: CleanupApplyResponse = serde_json::from_value(value)
+            let mut response: CleanupApplyResponse = serde_json::from_value(value)
                 .map_err(|_| Error::new("source_integrity", "invalid cleanup receipt"))?;
             let plan = match self.cleanup_plan(principal, &request.plan_id) {
                 Ok(plan) => plan,
@@ -786,6 +835,34 @@ impl Store {
                 },
                 Err(error) => return Err(error),
             };
+            for (index, candidate) in plan.items.iter().enumerate() {
+                if candidate.artifact.kind != ArtifactKind::Worktree
+                    || response.items[index].outcome != "unknown"
+                {
+                    continue;
+                }
+                let artifact = &candidate.artifact;
+                let id = cleanup_worktree_command_id(&request.id, &artifact.id)?;
+                let Some(command) = self.get_command(&id)? else {
+                    continue;
+                };
+                if command.verb != "worktree.remove"
+                    || command.principal != principal
+                    || command.target.as_deref() != Some(artifact.agent.as_str())
+                    || command.generation != Some(artifact.generation)
+                    || command.state != CommandState::Applied
+                {
+                    continue;
+                }
+                let settled = CleanupItemOutcome {
+                    artifact_id: artifact.id.clone(),
+                    outcome: "removed".to_owned(),
+                    reason: None,
+                    bytes_reclaimed: 0,
+                };
+                response.items[index] = settled.clone();
+                self.settle_cleanup_item(principal, request, &response, artifact, &settled)?;
+            }
             return Ok((plan, response, false));
         }
         let plan = self.cleanup_plan(principal, &request.plan_id)?;
@@ -918,13 +995,15 @@ impl Store {
                     response.items[index].reason = Some("prior_cleanup_attempt".to_owned());
                     continue;
                 }
-                let mut artifact = item.artifact.clone();
-                artifact.state = "unknown".to_owned();
-                tx.execute(
-                    "UPDATE artifacts SET body=?1 WHERE id=?2",
-                    params![encode_json(&artifact)?, artifact.id],
-                )
-                .map_err(sql_error)?;
+                if item.artifact.kind != ArtifactKind::Worktree {
+                    let mut artifact = item.artifact.clone();
+                    artifact.state = "unknown".to_owned();
+                    tx.execute(
+                        "UPDATE artifacts SET body=?1 WHERE id=?2",
+                        params![encode_json(&artifact)?, artifact.id],
+                    )
+                    .map_err(sql_error)?;
+                }
             }
         }
         retain_write_tx(
@@ -1021,38 +1100,61 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         update_cleanup_receipt(&tx, principal, request, response)?;
-        let mut updated = artifact.clone();
-        updated.state = match outcome.outcome.as_str() {
-            "removed" => "removed",
-            "skipped" => "registered",
-            _ => "unknown",
+        if artifact.kind != ArtifactKind::Worktree || outcome.outcome == "removed" {
+            let mut updated = artifact.clone();
+            updated.state = match outcome.outcome.as_str() {
+                "removed" => "removed",
+                "skipped" => "registered",
+                _ => "unknown",
+            }
+            .to_owned();
+            tx.execute(
+                "UPDATE artifacts SET body=?1,path=?3 WHERE id=?2",
+                params![
+                    encode_json(&updated)?,
+                    artifact.id,
+                    if outcome.outcome == "removed" {
+                        format!("retired:{}", artifact.id)
+                    } else {
+                        artifact.path.clone()
+                    }
+                ],
+            )
+            .map_err(sql_error)?;
         }
-        .to_owned();
-        tx.execute(
-            "UPDATE artifacts SET body=?1,path=?3 WHERE id=?2",
-            params![
-                encode_json(&updated)?,
-                artifact.id,
-                if outcome.outcome == "removed" {
-                    format!("retired:{}", artifact.id)
-                } else {
-                    artifact.path.clone()
-                }
-            ],
-        )
-        .map_err(sql_error)?;
         if artifact.kind == ArtifactKind::Worktree && outcome.outcome == "removed" {
             let git = artifact
                 .git
                 .as_ref()
                 .ok_or_else(|| Error::new("source_integrity", "worktree Git binding absent"))?;
-            let result = WorkspaceRemovalOutcome::Removed {
-                repo_common_dir: git.common.clone(),
-                worktree_path: artifact.path.clone(),
-                branch: git.branch.clone(),
-                branch_retained: true,
-            };
-            tx.execute("UPDATE workspaces SET phase='removed',outcome=?1 WHERE agent=?2 AND target_generation=?3 AND worktree_path=?4",params![encode_json(&result)?,parse_agent_id(&artifact.agent)?,artifact.generation,artifact.path]).map_err(sql_error)?;
+            let current: Option<(String, String)> = tx.query_row(
+                "SELECT phase, outcome FROM workspaces WHERE agent=?1 AND target_generation=?2 AND worktree_path=?3",
+                params![parse_agent_id(&artifact.agent)?, artifact.generation, artifact.path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(sql_error)?;
+            let settled = current.is_some_and(|(phase, outcome)| {
+                phase == "removed"
+                    && serde_json::from_str::<Value>(&outcome)
+                        .ok()
+                        .is_some_and(|value| {
+                            value
+                                .get("result")
+                                .and_then(|result| result.get("branch"))
+                                .and_then(Value::as_str)
+                                == Some(git.branch.as_str())
+                                && value
+                                    .get("result")
+                                    .and_then(|result| result.get("branch_retained"))
+                                    .and_then(Value::as_bool)
+                                    == Some(true)
+                        })
+            });
+            if !settled {
+                return Err(Error::new(
+                    "bad_state",
+                    "worktree removal has not settled in its workspace row",
+                ));
+            }
         }
         commit_transaction(tx, &self.write_faulted)
     }

@@ -8,6 +8,7 @@ mod capacity;
 mod launch_queue;
 pub use launch_queue::{ArbitratedTimer, PendingLaunch, TimerWait};
 mod cleanup;
+pub use cleanup::cleanup_worktree_command_id;
 mod projects;
 mod provider_holds;
 mod rules;

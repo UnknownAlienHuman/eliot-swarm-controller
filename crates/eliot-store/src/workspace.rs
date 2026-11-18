@@ -560,10 +560,11 @@ pub(super) fn require_workspace_removable(
     connection: &Connection,
     agent: &Agent,
     workspace: &WorkspacePreparation,
+    now: i64,
 ) -> Result<()> {
     // A worktree bound to a current project assignment is never removed,
     // borrowed or not: release the assignment first.
-    if project_assignment::workspace_path_bound(connection, &workspace.worktree_path)? {
+    if assignment_overlaps_workspace(connection, &workspace.worktree_path)? {
         return Err(Error::new(
             "busy",
             "worktree is bound to a current project assignment",
@@ -571,28 +572,10 @@ pub(super) fn require_workspace_removable(
     }
     if !agent.is_terminal()
         || agent.active_turn.is_some()
-        || matches!(
+        || !matches!(
             workspace.phase,
-            WorkspacePhase::Creating
-                | WorkspacePhase::SetupReady
-                | WorkspacePhase::SetupRunning
-                | WorkspacePhase::Removing
-                | WorkspacePhase::Removed
+            WorkspacePhase::Ready | WorkspacePhase::Failed
         )
-        || workspace
-            .outcome
-            .as_ref()
-            .and_then(|value| value.get("stage"))
-            .and_then(Value::as_str)
-            == Some("removal")
-            && workspace.phase == WorkspacePhase::Unknown
-            && workspace
-                .outcome
-                .as_ref()
-                .and_then(|value| value.get("result"))
-                .and_then(|value| value.get("state"))
-                .and_then(Value::as_str)
-                != Some("failed")
     {
         return Err(Error::new(
             "bad_state",
@@ -611,6 +594,12 @@ pub(super) fn require_workspace_removable(
         return Err(Error::new(
             "busy",
             "another nonterminal Agent references this worktree or a descendant",
+        ));
+    }
+    if workspace_quiet_until(connection, agent, workspace)? > now {
+        return Err(Error::new(
+            "busy",
+            "worktree has not been quiet for the required removal period",
         ));
     }
     let mut sources = connection
@@ -673,6 +662,90 @@ pub(super) fn require_workspace_removable(
     Ok(())
 }
 
+const WORKSPACE_REMOVAL_QUIET_MS: i64 = 60_000;
+
+fn assignment_overlaps_workspace(connection: &Connection, path: &str) -> Result<bool> {
+    let mut statement = connection
+        .prepare("SELECT workspace_path FROM project_assignments WHERE workspace_path IS NOT NULL")
+        .map_err(sql_error)?;
+    let paths = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sql_error)?;
+    for assignment_path in paths {
+        let assignment_path = assignment_path.map_err(sql_error)?;
+        if managed_path_contains(path, &assignment_path)
+            || managed_path_contains(&assignment_path, path)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn workspace_quiet_until(
+    connection: &Connection,
+    owner: &Agent,
+    workspace: &WorkspacePreparation,
+) -> Result<i64> {
+    let mut latest = terminal_agent_ended_at(
+        connection,
+        parse_agent_id(&owner.id)?,
+        owner.generation,
+        owner.updated_at,
+    )?;
+    let mut statement = connection
+        .prepare("SELECT id, workspace, state, generation, updated_at FROM agents WHERE id <> ?1 AND workspace IS NOT NULL")
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([parse_agent_id(&owner.id)?], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (agent, path, state, generation, updated_at) = row.map_err(sql_error)?;
+        if managed_path_contains(&workspace.worktree_path, &path)
+            || managed_path_contains(&path, &workspace.worktree_path)
+        {
+            if !matches!(state.as_str(), "stopped" | "failed" | "lost") {
+                return Err(Error::new(
+                    "busy",
+                    "a borrower has no terminal quiet period",
+                ));
+            }
+            latest = latest.max(terminal_agent_ended_at(
+                connection, agent, generation, updated_at,
+            )?);
+        }
+    }
+    latest
+        .checked_add(WORKSPACE_REMOVAL_QUIET_MS)
+        .ok_or_else(|| Error::new("invalid", "worktree quiet-period timestamp overflowed"))
+}
+
+fn terminal_agent_ended_at(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+    updated_at: i64,
+) -> Result<i64> {
+    // The terminal projection is conservative when retention pruned the end
+    // event or the vendor timestamp predates the Store's committed end.
+    connection
+        .query_row(
+            "SELECT MAX(?3, COALESCE(MAX(ts), ?3)) FROM events WHERE agent=?1 AND generation=?2
+             AND kind IN ('session.ended','agent.stopped','agent.failed','agent.lost')",
+            params![agent, generation, updated_at],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
+}
+
 pub(super) fn require_workspace_sources_ready(
     connection: &Connection,
     repo_path: &str,
@@ -724,6 +797,10 @@ pub(super) fn workspace_event(
     workspace: &WorkspacePreparation,
     now: i64,
 ) -> Result<Event> {
+    let mut outcome = workspace.outcome.clone();
+    if let Some(outcome) = outcome.as_mut().and_then(Value::as_object_mut) {
+        outcome.remove("removal_write_guard");
+    }
     insert_daemon_event(
         tx,
         now,
@@ -732,7 +809,7 @@ pub(super) fn workspace_event(
         Some(parse_agent_id(&workspace.agent)?),
         Some(workspace.target_generation),
         json!({"start_command_id": workspace.start_command_id, "phase": workspace.phase,
-            "setup_index": workspace.setup_index, "target_generation": workspace.target_generation, "outcome": workspace.outcome}),
+            "setup_index": workspace.setup_index, "target_generation": workspace.target_generation, "outcome": outcome}),
     )
 }
 
@@ -1026,6 +1103,23 @@ enum WorkspaceAction {
 }
 
 impl Store {
+    /// Return the retained preparation only when its durable Agent facts pass
+    /// the same removal eligibility gate used by `worktree.remove` admission.
+    pub fn workspace_removal_eligibility(
+        &self,
+        agent: &str,
+        now: i64,
+    ) -> Result<WorkspacePreparation> {
+        self.ensure_committed_reads()?;
+        let id = parse_agent_id(agent)?;
+        let preparation = load_workspace(&self.connection, id)?
+            .ok_or_else(|| Error::new("not_found", "managed workspace was not found"))?;
+        let owner = load_agent_by_num(&self.connection, id)?
+            .ok_or_else(|| Error::new("not_found", "workspace owner was not found"))?;
+        require_workspace_removable(&self.connection, &owner, &preparation, now)?;
+        Ok(preparation)
+    }
+
     pub fn get_workspace(&self, agent: &str) -> Result<Option<WorkspacePreparation>> {
         load_workspace(&self.connection, parse_agent_id(agent)?)
     }
@@ -1140,6 +1234,58 @@ impl Store {
             .map_err(sql_error)?;
         enforce_page_bytes(&mut workspaces)?;
         Ok(workspaces)
+    }
+
+    /// Retain original filesystem permissions before changing them, using the
+    /// same removal row and command identity. Clear after exact ACL restoration.
+    pub fn set_workspace_removal_write_guard(
+        &mut self,
+        expected: &WorkspacePreparation,
+        command_id: &str,
+        guard: Option<Value>,
+    ) -> Result<WorkspacePreparation> {
+        self.ensure_writer_healthy()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let agent = parse_agent_id(&expected.agent)?;
+        let old = load_workspace(&tx, agent)?
+            .ok_or_else(|| Error::new("not_found", "workspace preparation disappeared"))?;
+        let mut next = old.clone();
+        let outcome = next
+            .outcome
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| Error::new("bad_state", "workspace removal marker is absent"))?;
+        if old.target_generation != expected.target_generation
+            || old.worktree_path != expected.worktree_path
+            || !matches!(
+                old.phase,
+                WorkspacePhase::Removing | WorkspacePhase::Unknown
+            )
+            || outcome.get("stage").and_then(Value::as_str) != Some("removal")
+            || outcome.get("command_id").and_then(Value::as_str) != Some(command_id)
+        {
+            return Err(Error::new("bad_state", "workspace removal marker changed"));
+        }
+        if let Some(guard) = guard {
+            if old.phase != WorkspacePhase::Removing
+                || outcome.contains_key("removal_write_guard")
+                || encode_json(&guard)?.len() > 64 * 1024
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "workspace write guard cannot be retained",
+                ));
+            }
+            outcome.insert("removal_write_guard".to_owned(), guard);
+        } else {
+            outcome.remove("removal_write_guard");
+        }
+        persist_workspace(&tx, &old, &next)?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(next)
     }
 
     /// Reserve one native managed-worktree Git mutator after read-only preflight.
@@ -1906,6 +2052,18 @@ impl Store {
                 ));
             }
             WorkspaceAction::Removal(outcome) => {
+                let write_guard = old
+                    .outcome
+                    .as_ref()
+                    .and_then(|value| value.get("removal_write_guard"));
+                if write_guard.is_some()
+                    && !matches!(outcome, WorkspaceRemovalOutcome::Unknown { .. })
+                {
+                    return Err(Error::new(
+                        "unknown",
+                        "workspace permissions are still unsettled",
+                    ));
+                }
                 let state = match outcome {
                     WorkspaceRemovalOutcome::Removed {
                         repo_common_dir,
@@ -1975,6 +2133,9 @@ impl Store {
                     command_id,
                     json!({"command_id": command_id, "outcome": marker}),
                 )?);
+                if let Some(write_guard) = write_guard {
+                    marker["removal_write_guard"] = write_guard.clone();
+                }
             }
             WorkspaceAction::CancelRequest(_) => unreachable!(),
         }

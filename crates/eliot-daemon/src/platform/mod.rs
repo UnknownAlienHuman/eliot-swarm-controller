@@ -7,6 +7,7 @@ pub mod data_dir;
 pub mod ipc;
 mod process_observation;
 pub(crate) mod script_file;
+pub(crate) mod worktree_guard;
 
 #[cfg(unix)]
 pub(crate) mod unix;

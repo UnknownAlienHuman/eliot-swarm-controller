@@ -337,8 +337,8 @@ rerun. The owner removes/recreates or explicitly resolves the workspace. This ne
 row and one running marker, not a `workspace_steps` journal or artifact service.
 
 Cancellation stops the current custody. Native start never begins from a non-ready or
-wrong-target-generation workspace. Removal is explicit, terminal-Agent only and
-clean-only except allowed relative scratch paths; the branch is retained.
+wrong-target-generation workspace. Removal requires terminal Agents and a clean
+checkout apart from allowed relative scratch paths. The branch is retained.
 Cancellation is committed before signalling custody and serializes with process spawn.
 Preparation failure before first native dispatch can fail the generation-0 Agent;
 uncertainty leaves it created with an unknown start command. Neither path installs
@@ -359,13 +359,27 @@ startup/cleanup serialization used for registration. Durable removed rows remain
 they do not require an idle runtime slot. Recovery and FORCE cleanup consume bounded
 pages of pending preparations, selecting actionable phases before allocating slots.
 
-`worktree.remove` uses normal command admission. No other live Agent may use that
-checkout; the `removing` marker blocks concurrent launch into it. Cleanup may remove
-only untracked/ignored entries under frozen scratch paths, never tracked changes or
-escaping symlinks/reparse points. Ordinary Git removal performs its final clean check;
-there is no force removal. Exact path/registration absence and retained branch settle
-`removed`. Keep the row so a later resume cannot treat the deleted checkout as an
-ordinary shared workspace. Unknown removal permits readback, never blind repetition.
+`worktree.remove` uses normal command admission. Cleanup planning and apply use
+the same eligibility checks as direct removal. The Store checks the terminal owner,
+overlapping borrowers, current assignment binding and settled preparation in the
+transaction that sets `removing`. Admission to the checkout or its descendants
+stops at that phase until settlement. Removal requires at least 60 seconds since
+the last owner or borrower ended. The worktree tip must be an ancestor of the
+exact base OID frozen at preparation, and Git must report a clean index and worktree
+apart from regular untracked or ignored files in frozen scratch paths.
+
+Once an exclusive filesystem write guard is established, apply rechecks Git,
+deletes approved scratch files and runs ordinary non-force `git worktree remove`
+with its final clean check. The existing Git mutation path sanitizes the effective
+configuration of the source checkout and the target. A host that cannot establish
+the write guard keeps the checkout. On Windows the existing removal row retains
+the original directory permissions before the guard changes them. Recovery
+restores those permissions for remaining directories using their retained identities.
+Exact path and registration absence plus the
+retained branch settle `removed`. Keep the row so a later resume cannot treat the
+deleted checkout as an ordinary shared workspace. A deadline or failure after
+possible mutation is `unknown` until exact readback proves removal. No effect is
+replayed.
 Before filesystem changes, wait for the checkout's terminal Git sources to drain and
 close, including subdirectory borrowers. This orders final hint attribution before
 removal cleanup and prevents a stale observation from recreating removed provenance.

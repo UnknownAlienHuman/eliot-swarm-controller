@@ -270,16 +270,6 @@ impl CleanupTree {
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             cleanup_name(name)?;
         }
-        Self::open_inner(path, None)
-    }
-
-    /// Only the exact reciprocal .git pointer already read through a held
-    /// handle may accompany a retained, clean Swarm worktree.
-    pub(crate) fn open_worktree(path: &Path, marker_identity: &str) -> Result<Self> {
-        Self::open_inner(path, Some(marker_identity))
-    }
-
-    fn open_inner(path: &Path, marker_identity: Option<&str>) -> Result<Self> {
         let parent = Directory::open(path.parent().ok_or_else(refused)?)?;
         let name = path.file_name().ok_or_else(refused)?;
         let root = native::open_cleanup(parent.handle(), name, true).map_err(|_| refused())?;
@@ -293,17 +283,11 @@ impl CleanupTree {
             bytes: 0,
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        tree.visit(root, 0, deadline, marker_identity)?;
+        tree.visit(root, 0, deadline)?;
         Ok(tree)
     }
 
-    fn visit(
-        &mut self,
-        directory: File,
-        depth: usize,
-        deadline: std::time::Instant,
-        marker_identity: Option<&str>,
-    ) -> Result<()> {
+    fn visit(&mut self, directory: File, depth: usize, deadline: std::time::Instant) -> Result<()> {
         if depth >= 64 {
             return Err(Error::new("unavailable", "cleanup depth bound"));
         }
@@ -324,29 +308,15 @@ impl CleanupTree {
             }
             let text = name.to_str().ok_or_else(refused)?;
             plain(text)?;
-            let marker = depth == 0 && !is_dir && text == ".git" && marker_identity.is_some();
-            if !marker {
-                cleanup_name(text)?;
-            }
+            cleanup_name(text)?;
             let child = native::open_cleanup(&directory, &name, is_dir).map_err(|_| refused())?;
             if is_dir {
                 check(&child, true)?;
             } else {
                 check_cleanup_file(&child)?;
-                if marker
-                    && serde_json::to_string(&eliot_plugin::file_identity(&child).map_err(io)?)
-                        .map_err(|_| refused())?
-                        .as_str()
-                        != marker_identity.unwrap()
-                {
-                    return Err(Error::new(
-                        "identity_changed",
-                        "worktree .git pointer changed",
-                    ));
-                }
             }
             if is_dir {
-                self.visit(child, depth + 1, deadline, None)?;
+                self.visit(child, depth + 1, deadline)?;
             } else {
                 let len = child.metadata().map_err(io)?.len();
                 self.bytes = self.bytes.checked_add(len).ok_or_else(refused)?;
