@@ -2,13 +2,14 @@
 //!
 //! The owned `serve` runs under isolated per-Agent `XDG_CONFIG_HOME` /
 //! `XDG_DATA_HOME`, so the owner's global config never merges; the
-//! workspace project file (`opencode.json` / `opencode.jsonc`, installed
-//! 2.2.7) still merges natively. Every start therefore scans that layer
-//! for owner-identity entries before the native session exists: a stdio
-//! entry selecting `swarm mcp` without `--require-agent`, or an HTTP entry
-//! on the configured cloud hostname. A match fails the start with the
-//! entry and file named, in every policy and regardless of entry name.
-//! No project or user file is ever edited.
+//! workspace-inherited layers still merge natively (installed 2.2.7): each
+//! ancestor directory's direct `opencode.json` / `opencode.jsonc` files
+//! plus its `.opencode/` project directory. Every start therefore scans
+//! those layers for owner-identity entries before the native session
+//! exists: a stdio entry selecting `swarm mcp` without `--require-agent`,
+//! or an HTTP entry on the configured cloud hostname. A match fails the
+//! start with the entry and layer named, in every policy and regardless of
+//! entry name. No project or user file is ever edited.
 
 use std::path::Path;
 
@@ -17,10 +18,15 @@ use serde_json::Value;
 
 use eliot_plugin::owner_scan as shared_scan;
 
-/// Workspace project config files the installed server merges, in read
-/// order. The global/user layers stay neutralized by the isolated
-/// per-Agent XDG roots (verified on 2.2.7); only this layer is scanned.
+/// Inherited project config file names the installed server merges, in
+/// read order. Every inherited layer below carries these same file names;
+/// the global/user layers stay neutralized by the isolated per-Agent XDG
+/// roots (verified on 2.2.7).
 pub const PROJECT_CONFIG_FILES: &[&str] = &["opencode.json", "opencode.jsonc"];
+/// Bound on inherited layers walked outward from the workspace. Real trees
+/// are shallow; this only caps degenerate depths so the pre-spawn scan
+/// stays bounded alongside the per-file and total-entry bounds.
+pub const MAX_PROJECT_ANCESTORS: usize = 32;
 
 /// Bound for one project config file read: far above real configs, small
 /// enough to keep the pre-spawn scan bounded. Larger, unreadable or
@@ -31,39 +37,78 @@ pub const MAX_PROJECT_CONFIG_BYTES: usize = shared_scan::MAX_SCAN_BYTES;
 /// fail the start closed instead of truncating the scan.
 pub const MAX_PROJECT_SERVERS: usize = shared_scan::MAX_SCAN_SERVERS;
 
-/// One workspace project MCP server entry.
+/// One inherited project-layer MCP server entry. `file` names the layer
+/// relative to the workspace (`opencode.json`, `.opencode/opencode.jsonc`,
+/// `../../opencode.json`, ...).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectMcpEntry {
     pub name: String,
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
     pub url: Option<String>,
-    pub file: &'static str,
+    pub file: String,
 }
 
-/// Scan the workspace project layer for MCP server entries. Absent files
+/// Scan the workspace and every inherited ancestor layer for MCP server
+/// entries: each directory's direct config files, then its `.opencode/`
+/// project directory, outward to the filesystem root. Absent files
 /// contribute nothing; a present file must read within bounds and parse
 /// (JSONC: comments and trailing commas tolerated) or the start fails
-/// closed with the file named.
+/// closed with the layer named.
 pub fn scan_project_mcp(workspace: &Path) -> Result<Vec<ProjectMcpEntry>> {
     let mut entries = Vec::new();
-    for &file in PROJECT_CONFIG_FILES {
-        let path = workspace.join(file);
-        let label = format!("OpenCode project MCP layer in {file}");
-        let Some(document) =
-            shared_scan::read_jsonc_document(&path, &label, MAX_PROJECT_CONFIG_BYTES)?
-        else {
-            continue;
-        };
-        entries.extend(project_entries(&document, file)?);
+    let mut layer: Option<&Path> = Some(workspace);
+    let mut depth = 0usize;
+    while let Some(dir) = layer {
+        if depth > MAX_PROJECT_ANCESTORS {
+            break;
+        }
+        scan_layer(dir, depth, &mut entries)?;
         shared_scan::ensure_total_entries(
             entries.len(),
             MAX_PROJECT_SERVERS,
             "OpenCode project MCP layer exceeds its bound",
         )?;
+        layer = dir.parent();
+        depth += 1;
     }
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(entries)
+}
+
+/// One inherited layer: the directory's direct config files, then its
+/// `.opencode/` project directory. Labels name the layer relative to the
+/// workspace, so a refusal points at the exact file.
+fn scan_layer(dir: &Path, depth: usize, entries: &mut Vec<ProjectMcpEntry>) -> Result<()> {
+    let prefix = "../".repeat(depth);
+    for &file in PROJECT_CONFIG_FILES {
+        let label = if depth == 0 {
+            file.to_owned()
+        } else {
+            format!("{prefix}{file}")
+        };
+        read_layer_file(&dir.join(file), label, entries)?;
+        let project_label = if depth == 0 {
+            format!(".opencode/{file}")
+        } else {
+            format!("{prefix}.opencode/{file}")
+        };
+        read_layer_file(&dir.join(".opencode").join(file), project_label, entries)?;
+    }
+    Ok(())
+}
+
+/// One layer file: absent files contribute nothing, present files parse or
+/// fail the start closed with the layer named.
+fn read_layer_file(path: &Path, label: String, entries: &mut Vec<ProjectMcpEntry>) -> Result<()> {
+    let document_label = format!("OpenCode project MCP layer in {label}");
+    let Some(document) =
+        shared_scan::read_jsonc_document(path, &document_label, MAX_PROJECT_CONFIG_BYTES)?
+    else {
+        return Ok(());
+    };
+    entries.extend(project_entries(&document, label)?);
+    Ok(())
 }
 
 /// Typed refusal reason for an owner-identity project entry: names the
@@ -73,7 +118,7 @@ pub fn owner_refusal_reason(entry: &ProjectMcpEntry) -> String {
     *shared_scan::refusal_error(
         "OpenCode project MCP layer contributes the owner Swarm MCP server",
         &entry.name,
-        entry.file,
+        &entry.file,
     )
     .message
 }
@@ -105,7 +150,7 @@ pub fn find_owner_entries<'a>(
 /// null layers contribute nothing; a non-object layer fails closed.
 /// Non-object entries are skipped: only the documented table shape
 /// (`command` string/array, `url` string) is evaluated.
-fn project_entries(document: &Value, file: &'static str) -> Result<Vec<ProjectMcpEntry>> {
+fn project_entries(document: &Value, file: String) -> Result<Vec<ProjectMcpEntry>> {
     let label = format!("OpenCode project MCP layer in {file}");
     let Some(servers) = shared_scan::table_object(
         document.get("mcp").and_then(|mcp| mcp.get("servers")),
@@ -125,7 +170,7 @@ fn project_entries(document: &Value, file: &'static str) -> Result<Vec<ProjectMc
             command,
             args,
             url: table.get("url").and_then(Value::as_str).map(str::to_owned),
-            file,
+            file: file.clone(),
         });
     }
     Ok(entries)
@@ -177,14 +222,18 @@ mod tests {
         std::fs::write(dir.join(file), text).expect("project file");
     }
 
-    fn owner_entry(name: &str, file: &'static str) -> ProjectMcpEntry {
+    fn owner_entry(name: &str, file: &str) -> ProjectMcpEntry {
         ProjectMcpEntry {
             name: name.to_owned(),
             command: Some("swarm".to_owned()),
             args: Some(vec!["mcp".to_owned()]),
             url: None,
-            file,
+            file: file.to_owned(),
         }
+    }
+
+    fn owner_doc(name: &str) -> String {
+        format!(r#"{{"mcp": {{"servers": {{"{name}": {{"command": ["swarm", "mcp"]}}}}}}}}"#)
     }
 
     #[test]
@@ -249,6 +298,70 @@ mod tests {
     }
 
     #[test]
+    fn scan_covers_ancestor_and_dot_opencode_layers() {
+        // The owned serve merges ancestor direct files and `.opencode/`
+        // project directories, so an owner-identity entry in either must
+        // refuse the start with the layer named.
+        let scratch = ScratchDir::new();
+        let root = scratch.path().to_path_buf();
+        let workspace = root.join("a").join("b");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(root.join(".opencode")).expect("project dir");
+        write_project(&root, "opencode.json", &owner_doc("ancestor-direct"));
+        write_project(
+            &root.join(".opencode"),
+            "opencode.jsonc",
+            &owner_doc("ancestor-project"),
+        );
+        let entries = scan_project_mcp(&workspace).expect("layers scan");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert!(names.contains(&"ancestor-direct"), "{names:?}");
+        assert!(names.contains(&"ancestor-project"), "{names:?}");
+        let direct = entries
+            .iter()
+            .find(|entry| entry.name == "ancestor-direct")
+            .expect("direct");
+        assert_eq!(direct.file, "../../opencode.json");
+        let project = entries
+            .iter()
+            .find(|entry| entry.name == "ancestor-project")
+            .expect("project");
+        assert_eq!(project.file, "../../.opencode/opencode.jsonc");
+        // A workspace-level entry keeps its bare file label.
+        write_project(&workspace, "opencode.jsonc", &owner_doc("here"));
+        let entries = scan_project_mcp(&workspace).expect("workspace scan");
+        let here = entries
+            .iter()
+            .find(|entry| entry.name == "here")
+            .expect("workspace");
+        assert_eq!(here.file, "opencode.jsonc");
+        // Every owner-identity hit refuses, whatever the layer or name.
+        let hits = find_owner_entries(&entries, None, None);
+        assert_eq!(hits.len(), 3, "{entries:?}");
+        let reason = owner_refusal_reason(hits[0]);
+        assert!(
+            reason.contains("../") || reason.contains(".opencode"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn ancestor_walk_stops_at_the_filesystem_root() {
+        // The walk ends at the root instead of climbing past it; a deep
+        // workspace still scans its nearest layers.
+        let scratch = ScratchDir::new();
+        let mut workspace = scratch.path().to_path_buf();
+        for level in 0..8 {
+            workspace = workspace.join(format!("l{level}"));
+        }
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        write_project(&workspace, "opencode.json", &owner_doc("deep"));
+        let entries = scan_project_mcp(&workspace).expect("deep scan");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].file, "opencode.json");
+    }
+
+    #[test]
     fn owner_match_ignores_name_and_skips_agent_shape() {
         let entries = vec![
             owner_entry("swarm", "opencode.json"),
@@ -257,21 +370,21 @@ mod tests {
                 command: Some("swarm".to_owned()),
                 args: Some(vec!["mcp".to_owned(), "--require-agent".to_owned()]),
                 url: None,
-                file: "opencode.json",
+                file: "opencode.json".to_owned(),
             },
             ProjectMcpEntry {
                 name: "cloud".to_owned(),
                 command: None,
                 args: None,
                 url: Some("https://mcp.example.com/mcp".to_owned()),
-                file: "opencode.jsonc",
+                file: "opencode.jsonc".to_owned(),
             },
             ProjectMcpEntry {
                 name: "plain".to_owned(),
                 command: Some("search.exe".to_owned()),
                 args: Some(Vec::new()),
                 url: None,
-                file: "opencode.json",
+                file: "opencode.json".to_owned(),
             },
         ];
         let hits = find_owner_entries(&entries, None, Some("mcp.example.com"));

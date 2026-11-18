@@ -302,11 +302,11 @@ CLI.
 Requested vs observed: `requested` carries `mcp_policy` (`inherit`
 always); `effective` carries `mcp_servers` (installed-inventory names, or
 `null` when no `GET /api/mcp` query succeeds) and `mcp_servers_verified`
-(true only when the `eliot-swarm` entry reports `connected`). Only names
+(true only when the `eliot-swarm` entry reports `connected` and the winning effective `GET /api/config` document still carries the exact generated transport for that entry: a same-name replacement from any inherited layer refuses the start). Only names
 and the status word are retained — never the failure text. The requested
 set is never echoed as observed. The applied per-Agent config document is
 the qualified record; the inventory observation is best-effort — re-polled
-until `connected`, a terminal refusal, or 20s — and the Worker MCP policy gate below may still refuse the start on an unexpected or owner-identity server.
+until `connected`, a terminal refusal, or 20s — and the Worker MCP policy gate below may still refuse the start on an unexpected or owner-identity server, as does a serving managed entry whose winning transport differs from the generated argv.
 
 ## Worker MCP policy
 
@@ -317,18 +317,17 @@ per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`, verified on the installed
 Agent-scoped `eliot-swarm` server, so both policies serve that surface.
 `inherit` is an explicit opt-in to the same behavior, minus owner Swarm
 entries. A non-empty `mcp_allow` is rejected as `unsupported` at config
-load because OpenCode has no selective-inclusion mapping. Project-local
-workspace config (`opencode.json`/`opencode.jsonc`) still merges natively
-into the owned serve despite the isolated XDG roots, so that layer is not
-covered by the generated config: every start scans it pre-create
+load because OpenCode has no selective-inclusion mapping. Workspace-inherited config (every ancestor directory's `opencode.json`/`opencode.jsonc` plus its `.opencode/` project directory) still merges natively
+into the owned serve despite the isolated XDG roots, so those layers are not
+covered by the generated config: every start scans them pre-create
 (pre-touch on resume) for owner-identity entries -- a swarm executable
 selecting `mcp` without `--require-agent`, or a URL on the configured
 `cloud_mcp` hostname -- and a match refuses the start (`profile_error`,
-naming the server and file) in every policy, whatever the entry is named.
+naming the server and layer) in every policy, whatever the entry is named.
 The settled inventory (`GET /api/mcp`) is then gated before the worker is
 accepted: `minimal` refuses any serving (`connected`/`pending`) unexpected
 server, so a project layer that defeats `minimal` fails the start instead
-of widening the worker; `inherit` refuses reserved Swarm names. An
+of widening the worker; `inherit` refuses reserved Swarm names, and any serving `eliot-swarm` entry whose winning effective transport differs from the generated local argv. An
 unreadable inventory reports unverified but never refuses. The requested
 policy is reported in `effective.mcp_policy`, the observed inventory in
 `effective.mcp_servers`, and `mcp_servers_verified` only after the gate

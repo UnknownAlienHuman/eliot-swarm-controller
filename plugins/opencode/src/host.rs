@@ -4,7 +4,10 @@ use crate::{
         AuthSetup, BackendKind, HttpOutcome, IntegrationSelector, LocalProvider, OpenCodeHttp,
         OwnedServer, SWARM_MCP_SERVER_NAME, ServerLaunch,
         models::{run_model_metadata, run_models},
-        types::{InboxUser, McpServerReadback, ModelRef, NativeModelEntry, SessionInfo},
+        types::{
+            ConfigEntry, ConfigMcpServer, InboxUser, McpServerReadback, ModelRef, NativeModelEntry,
+            SessionInfo,
+        },
     },
 };
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result};
@@ -1249,9 +1252,10 @@ impl OpenCodePlugin {
                 }
             }
         }
-        // Workspace project MCP layer: the owned serve already merged it,
-        // so an owner-identity entry there must refuse the start before the
-        // native session exists. Every policy, whatever the entry is named.
+        // Workspace-inherited project MCP layers: the owned serve already
+        // merged them, so an owner-identity entry there must refuse the start
+        // before the native session exists. Every policy, whatever the entry
+        // is named.
         if let Err(error) = refuse_owner_project_mcp(
             &parsed.workspace,
             &parsed.swarm_executable,
@@ -1401,6 +1405,43 @@ impl OpenCodePlugin {
             )
             .await;
             return Err(self.retain_failed_start(&parsed.params, error));
+        }
+        // Same-name transport proof: the inventory gate above only sees the
+        // entry name and status, while any inherited layer can replace the
+        // managed transport under that name. A serving managed entry must
+        // still run the exact generated transport; an unreadable effective
+        // config cannot prove that and fails the start closed with the
+        // created session killed, exactly like the gate above.
+        if mcp_inventory.as_deref().is_some_and(|servers| {
+            servers
+                .iter()
+                .any(|server| server.is_connected(SWARM_MCP_SERVER_NAME))
+        }) {
+            let expected_command = managed_mcp_command(parsed);
+            let transport = match session
+                .http
+                .get_config(phase_deadline(envelope, RPC_TIMEOUT))
+                .await
+            {
+                Ok(documents) => verify_managed_mcp_transport(&documents, &expected_command),
+                Err(error) => Err(Error::new(
+                    "profile_error",
+                    format!(
+                        "OpenCode managed MCP transport readback failed ({})",
+                        error.message
+                    ),
+                )),
+            };
+            if let Err(error) = transport {
+                let kill_note = delete_created_session(&mut session, &created.id, envelope).await;
+                let error = discard_failed_start(
+                    &mut session,
+                    Error::new("profile_error", format!("{}; {kill_note}", error.message)),
+                    envelope,
+                )
+                .await;
+                return Err(self.retain_failed_start(&parsed.params, error));
+            }
         }
         effective["mcp_servers"] = mcp_servers;
         effective["mcp_servers_verified"] = json!(mcp_servers_verified);
@@ -2022,6 +2063,27 @@ impl OpenCodePlugin {
         let (mcp_servers, mcp_servers_verified, mcp_inventory) =
             observe_mcp_servers(&session.http, deadline).await;
         gate_mcp_inventory(mcp_inventory.as_deref(), parsed.requested_mcp_policy)?;
+        // Same proof as the create path: a serving managed entry must still
+        // run the exact generated transport. The retained session predates
+        // this generation, so an unreadable readback stays unknown while a
+        // proven transport mismatch fails the resume.
+        if mcp_inventory.as_deref().is_some_and(|servers| {
+            servers
+                .iter()
+                .any(|server| server.is_connected(SWARM_MCP_SERVER_NAME))
+        }) {
+            let expected_command = managed_mcp_command(parsed);
+            let documents = session.http.get_config(deadline).await.map_err(|error| {
+                Error::new(
+                    "unknown",
+                    format!(
+                        "OpenCode managed MCP transport readback is unresolved ({})",
+                        error.message
+                    ),
+                )
+            })?;
+            verify_managed_mcp_transport(&documents, &expected_command)?;
+        }
         effective_value["mcp_servers"] = mcp_servers;
         effective_value["mcp_servers_verified"] = json!(mcp_servers_verified);
         effective_value["mcp_policy"] = json!(parsed.requested_mcp_policy.as_str());
@@ -3659,12 +3721,12 @@ async fn observe_mcp_servers(
     }
 }
 
-/// Refuse the start when the workspace project MCP layer contributes the
-/// owner Swarm identity under any name. The owned serve already merged
-/// that layer, so the scan runs before the native session exists (create)
-/// or before the retained session is touched (resume), in every policy.
-/// No project file is read beyond the documented names, and none is
-/// ever edited.
+/// Refuse the start when any workspace-inherited project MCP layer
+/// contributes the owner Swarm identity under any name. The owned serve
+/// already merged those layers, so the scan runs before the native session
+/// exists (create) or before the retained session is touched (resume), in
+/// every policy. No project file is read beyond the documented names, and
+/// none is ever edited.
 fn refuse_owner_project_mcp(
     workspace: &std::path::Path,
     controller_executable: &std::path::Path,
@@ -3726,6 +3788,79 @@ fn gate_mcp_inventory(servers: Option<&[McpServerReadback]>, policy: McpPolicy) 
                 ),
             ));
         }
+    }
+    Ok(())
+}
+
+/// The managed Agent-scoped MCP transport the plugin generated: the exact
+/// local stdio command argv for `SWARM_MCP_SERVER_NAME`, rebuilt from the
+/// frozen start admission (the same values rendered into the per-Agent
+/// config document by `agent_config_json`).
+fn managed_mcp_command(parsed: &ParsedStart) -> Vec<String> {
+    vec![
+        parsed.swarm_executable.to_string_lossy().into_owned(),
+        "--data-dir".to_owned(),
+        parsed.swarm_data_dir.to_string_lossy().into_owned(),
+        "mcp".to_owned(),
+        "--require-agent".to_owned(),
+    ]
+}
+
+/// The winning effective `mcp.servers` transport for the managed
+/// Agent-scoped entry: the highest-precedence effective document defining
+/// it wins, mirroring the native fold where later documents replace earlier
+/// ones for the same server name. `None` when no effective document defines
+/// the entry at all.
+fn winning_managed_mcp_server(documents: &[ConfigEntry]) -> Option<&ConfigMcpServer> {
+    documents
+        .iter()
+        .filter(|entry| entry.entry_type == "document")
+        .filter_map(|entry| {
+            entry
+                .info
+                .as_ref()
+                .and_then(|info| info.mcp.as_ref())
+                .and_then(|mcp| mcp.servers.get(SWARM_MCP_SERVER_NAME))
+        })
+        .next_back()
+}
+
+/// Prove the serving managed entry still runs the exact generated
+/// transport: a same-name entry from any inherited layer (ancestor direct
+/// file, `.opencode/` project directory, or machine scope outside the file
+/// scan) replaces the managed document entry natively, while the inventory
+/// gate only sees the name and status. The winning definition must be the
+/// local stdio shape with exactly the generated argv, no URL, and no
+/// environment override; anything else refuses the start. Only the
+/// transport/auth-identity fields decide; cosmetic keys never do.
+fn verify_managed_mcp_transport(
+    documents: &[ConfigEntry],
+    expected_command: &[String],
+) -> Result<()> {
+    let server = winning_managed_mcp_server(documents).ok_or_else(|| {
+        Error::new(
+            "profile_error",
+            "OpenCode managed MCP entry has no effective transport",
+        )
+    })?;
+    let transport_ok = server
+        .server_type
+        .as_deref()
+        .is_none_or(|kind| kind == "local")
+        && server.command.as_deref() == Some(expected_command)
+        && server.url.as_deref().is_none_or(str::is_empty)
+        && server
+            .environment
+            .as_ref()
+            .is_none_or(std::collections::HashMap::is_empty);
+    if !transport_ok {
+        return Err(Error::new(
+            "profile_error",
+            format!(
+                "OpenCode serving {:?} entry does not run the managed Agent transport",
+                SWARM_MCP_SERVER_NAME
+            ),
+        ));
     }
     Ok(())
 }
@@ -4450,9 +4585,12 @@ mod tests {
         parse_local_provider, phase_budget, phase_deadline, policy_from_snapshot,
         presession_reason, split_model, start_auth_selector, start_config_override,
         start_failure_is_proven_no_effect, start_model_ref, verify_local_effective,
+        verify_managed_mcp_transport, winning_managed_mcp_server,
     };
     use crate::native::server::READINESS_TIMEOUT;
-    use crate::native::types::{McpServerReadback, McpStatusReadback, NativeModelEntry};
+    use crate::native::types::{
+        ConfigEntry, ConfigInfo, ConfigMcp, McpServerReadback, McpStatusReadback, NativeModelEntry,
+    };
     use eliot_core::{AgentStartParams, McpPolicy, Result};
     use eliot_plugin::session::{
         ResumeSubject, optional_profile_text, parse_resume_subject, validate_source_plan,
@@ -4531,6 +4669,94 @@ mod tests {
             mcp_fixture(SWARM_MCP_SERVER_NAME, "connected"),
         ];
         assert_eq!(mcp_names(&servers), json!(["owner-search", "eliot-swarm"]));
+    }
+    fn config_document(servers: serde_json::Value) -> ConfigEntry {
+        ConfigEntry {
+            entry_type: "document".to_owned(),
+            path: Some("config/opencode/opencode.jsonc".to_owned()),
+            info: Some(ConfigInfo {
+                model: None,
+                mcp: Some(ConfigMcp {
+                    servers: serde_json::from_value(servers).expect("servers decode"),
+                }),
+            }),
+        }
+    }
+
+    fn managed_command() -> Vec<String> {
+        ["swarm", "--data-dir", "data", "mcp", "--require-agent"]
+            .iter()
+            .map(|arg| (*arg).to_owned())
+            .collect()
+    }
+
+    fn managed_server(command: Vec<String>) -> serde_json::Value {
+        let mut servers = serde_json::Map::new();
+        servers.insert(
+            SWARM_MCP_SERVER_NAME.to_owned(),
+            json!({"type": "local", "command": command}),
+        );
+        serde_json::Value::Object(servers)
+    }
+
+    #[test]
+    fn managed_mcp_transport_proof_requires_the_winning_entry() {
+        let expected = managed_command();
+        // No effective document defines the entry: nothing proves the
+        // serving transport, so the start must not claim it.
+        assert!(winning_managed_mcp_server(&[]).is_none());
+        assert!(verify_managed_mcp_transport(&[], &expected).is_err());
+        // An unrelated table is not a proof either.
+        let other = vec![config_document(json!({"other": {"type": "local"}}))];
+        assert!(winning_managed_mcp_server(&other).is_none());
+        assert!(verify_managed_mcp_transport(&other, &expected).is_err());
+        // The exact generated transport verifies.
+        let managed = vec![config_document(managed_server(expected.clone()))];
+        assert!(verify_managed_mcp_transport(&managed, &expected).is_ok());
+        // A same-name replacement transport under any inherited layer
+        // refuses, even though the inventory gate only sees the name.
+        let replaced = vec![config_document(managed_server(vec![
+            "evil".to_owned(),
+            "--data-dir".to_owned(),
+            "data".to_owned(),
+            "mcp".to_owned(),
+            "--require-agent".to_owned(),
+        ]))];
+        assert!(verify_managed_mcp_transport(&replaced, &expected).is_err());
+        // Native precedence wins: later documents replace earlier ones, so
+        // the proof follows the same winning entry the server serves.
+        let shadowed = vec![
+            config_document(managed_server(vec!["evil".to_owned()])),
+            config_document(managed_server(expected.clone())),
+        ];
+        assert!(verify_managed_mcp_transport(&shadowed, &expected).is_ok());
+        let shadowing = vec![
+            config_document(managed_server(expected.clone())),
+            config_document(managed_server(vec!["evil".to_owned()])),
+        ];
+        assert!(verify_managed_mcp_transport(&shadowing, &expected).is_err());
+        // A remote URL, an environment override, or a non-local type under
+        // the managed name is not the managed transport.
+        for servers in [
+            json!({"eliot-swarm": {"type": "remote", "url": "https://x.example/mcp"}}),
+            json!({"eliot-swarm": {"command": expected.clone(), "url": "https://x.example/mcp"}}),
+            json!({"eliot-swarm": {"type": "local", "command": expected.clone(), "environment": {"A": "b"}}}),
+        ] {
+            assert!(verify_managed_mcp_transport(&[config_document(servers)], &expected).is_err());
+        }
+        // A missing `type` still verifies when the argv matches exactly:
+        // `mcp add` writes it, hand-merged layers may omit it.
+        let untyped = vec![config_document(
+            json!({"eliot-swarm": {"command": expected}}),
+        )];
+        assert!(verify_managed_mcp_transport(&untyped, &expected).is_ok());
+        // Non-document entries never contribute a winning transport.
+        let directory = vec![ConfigEntry {
+            entry_type: "directory".to_owned(),
+            path: Some("workspace".to_owned()),
+            info: None,
+        }];
+        assert!(winning_managed_mcp_server(&directory).is_none());
     }
     use std::path::PathBuf;
 
