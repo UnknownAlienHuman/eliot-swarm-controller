@@ -100,6 +100,12 @@ impl Failure {
         Self::new(5, "wait timed out; the admitted command was not cancelled")
     }
 
+    /// Inbox wait expiry before any read completed. No command was admitted,
+    /// so the generic admitted-command timeout does not apply.
+    pub(crate) fn inbox_timeout() -> Self {
+        Self::new(5, "inbox wait timed out before a read completed")
+    }
+
     pub(crate) fn new_from_message(message: String) -> Self {
         Self::new(1, message)
     }

@@ -7,7 +7,7 @@ use super::args::{
 };
 use super::support::{
     Failure, command_value, mutation_id, print_value, sleep_before_deadline, validate_limit,
-    wait_call, wait_deadline,
+    wait_deadline,
 };
 use eliot_core::Command as CoreCommand;
 use eliot_core::api::discovery::{IdentityRequest, IdentityResponse};
@@ -26,7 +26,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
 };
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout_at};
 
 pub(crate) async fn run_cmd(
     CmdArgs { command }: CmdArgs,
@@ -261,15 +261,29 @@ pub(crate) async fn run_inbox(
     // One checked absolute deadline bounds every wait RPC and sleep; a short
     // requested wait can no longer last until the full RPC timeout, and an
     // extreme value is rejected instead of panicking on `Instant` overflow.
+    // The last validated page is kept so expiry prints it instead of
+    // dropping the JSON result.
     let (deadline, waited) = inbox_deadline(wait)?;
+    let mut last: Option<MailInboxResponse> = None;
     loop {
         let response: MailInboxResponse = match deadline {
             Some(end) => {
-                wait_call(
-                    eliot_daemon::client_call_typed(&data_dir, "mail.inbox", &request),
+                match timeout_at(
                     end,
+                    eliot_daemon::client_call_typed(&data_dir, "mail.inbox", &request),
                 )
-                .await?
+                .await
+                {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => return Err(Failure::readback(error)),
+                    Err(_) => {
+                        if let Some(page) = last {
+                            print_inbox_page(&page, json_output)?;
+                            return Ok(5);
+                        }
+                        return Err(Failure::inbox_timeout());
+                    }
+                }
             }
             None => eliot_daemon::client_call_typed(&data_dir, "mail.inbox", &request)
                 .await
@@ -283,21 +297,37 @@ pub(crate) async fn run_inbox(
             Some(end) => !response.deliveries.is_empty() || Instant::now() >= end,
         };
         if done {
-            let value = serde_json::to_value(&response)
-                .map_err(|_| Failure::new(4, "mail.inbox response is invalid"))?;
-            print_value(&value, json_output);
+            print_inbox_page(&response, json_output)?;
             if waited && response.deliveries.is_empty() {
                 return Ok(5);
             }
             return Ok(0);
         }
+        last = Some(response);
         match deadline {
-            Some(end) => sleep_before_deadline(end).await?,
+            Some(end) => {
+                if sleep_before_deadline(end).await.is_err() {
+                    // The deadline expired between validated reads: print
+                    // the kept page, then report the timeout.
+                    if let Some(page) = last {
+                        print_inbox_page(&page, json_output)?;
+                    }
+                    return Ok(5);
+                }
+            }
             // Without a wait every iteration is already done; this is only
             // defensive against a future loop change.
             None => return Ok(0),
         }
     }
+}
+
+/// Print one validated inbox page; serialization failure stays exit 4.
+fn print_inbox_page(response: &MailInboxResponse, json_output: bool) -> Result<(), Failure> {
+    let value = serde_json::to_value(response)
+        .map_err(|_| Failure::new(4, "mail.inbox response is invalid"))?;
+    print_value(&value, json_output);
+    Ok(())
 }
 
 /// Deadline plan for `inbox --wait`: no `--wait` reads once and exits 0
