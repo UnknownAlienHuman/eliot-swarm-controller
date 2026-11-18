@@ -385,7 +385,7 @@ impl Store {
                 chain.push((agent, generation, usage));
             }
         }
-        chain.sort_by(|first, second| (first.0, first.1).cmp(&(second.0, second.1)));
+        chain.sort_by_key(|first| (first.0, first.1));
         // A cumulative below the retained baseline proves a counter reset
         // (or a genuinely new native subject) and contributes in full with a
         // fresh baseline. Baselines split by snapshot source, so cumulative
