@@ -99,8 +99,8 @@ enum StartPhase {
     /// Daemon-materialized skill-root availability check (skill
     /// materialization) before `--plugin-dir` is passed to the CLI.
     Skill,
-    /// CLI auth-status probe and bounded browser login before any session.
-    Login,
+    /// Read-only CLI auth status before any session.
+    Auth,
     /// Owned CLI spawn failure with no child produced.
     Spawn,
     /// At or after a live native child. Never proven-no-effect.
@@ -114,15 +114,14 @@ enum StartPhase {
 /// start instead of unknown. This is the regression anchor for the
 /// pre-spawn rule: every phase before the first spawn maps here, and no
 /// post-spawn phase may. Unlike the OpenCode auth transfer, Claude has no
-/// uncertain pre-spawn write: login probes are read-only status checks and
-/// the CLI's own bounded browser login, and every other pre-spawn step is
-/// local validation or private-tree file preparation, so all pre-spawn
+/// uncertain pre-spawn write: auth status, validation and private-tree
+/// file preparation happen before any session effect, so all pre-spawn
 /// codes (including `unknown`) settle failed. Adding a phase forces an
 /// explicit entry in the classification test below.
 fn start_point_for_phase(phase: StartPhase) -> eliot_plugin::start_classification::StartPoint {
     use eliot_plugin::start_classification::StartPoint;
     match phase {
-        StartPhase::Plan | StartPhase::McpConfig | StartPhase::Skill | StartPhase::Login => {
+        StartPhase::Plan | StartPhase::McpConfig | StartPhase::Skill | StartPhase::Auth => {
             StartPoint::BeforeSpawn
         }
         StartPhase::Spawn => StartPoint::SpawnRefused,
@@ -144,17 +143,17 @@ struct PhaseFailure {
     error: Box<Error>,
 }
 
+const INHERIT_MCP_CHECK: &str = "plugin.claude.start.plan.inherit_mcp";
+
 /// Typed reason for one proven-no-effect failed start. Static per phase
-/// plus the triggering error code (a fixed literal, never a payload):
-/// enough to tell an owner-scan refusal from a missing cmd or an
-/// unavailable login without risking secrets, endpoints, or native text
-/// in the persisted outcome.
+/// plus the triggering error code. Use a fixed reason unless the refusal
+/// carries an explicitly safe owner action.
 fn prespawn_reason(phase: StartPhase, code: &str) -> String {
     let what = match phase {
         StartPhase::Plan => "Claude start refused pre-spawn",
         StartPhase::McpConfig => "Claude MCP config could not be prepared",
         StartPhase::Skill => "Claude skill root is unavailable",
-        StartPhase::Login => "Claude CLI login is unavailable",
+        StartPhase::Auth => "Claude CLI authentication status is unavailable",
         StartPhase::Spawn => "Claude CLI failed to spawn",
         StartPhase::PostSpawn => "Claude start failed after native spawn",
     };
@@ -712,7 +711,7 @@ impl ClaudePlugin {
     /// result: no native process was spawned and no prompt was sent, so the
     /// launch is definitely failed, never unknown. The reason names the
     /// failed check in short non-secret words; it is persisted in the daemon
-    /// outcome, so it must never carry endpoints, ids, values, or secrets.
+    /// outcome, so it must never carry credentials or raw native output.
     fn retain_proven_no_effect_start(&mut self, params: &AgentStartParams, error: Error) -> Value {
         let value = eliot_plugin::session::failed_start_value(params, error);
         self.failed_start = Some(FailedStart {
@@ -740,12 +739,22 @@ impl ClaudePlugin {
             failure.phase,
             &failure.error.code
         ));
-        let reason = prespawn_reason(failure.phase, &failure.error.code);
+        let reason = if failure.phase == StartPhase::Auth && failure.error.code == "auth_required" {
+            failure.error.message.to_string()
+        } else {
+            let mut reason = prespawn_reason(failure.phase, &failure.error.code);
+            if failure.error.failure_where.as_deref() == Some(INHERIT_MCP_CHECK) {
+                reason.push_str(
+                    ". Set mcp = \"minimal\" in the Claude profile, or start an ad-hoc Claude chat",
+                );
+            }
+            reason
+        };
         let phase = match failure.phase {
             StartPhase::Plan => "plan",
             StartPhase::McpConfig => "mcp_config",
             StartPhase::Skill => "skill",
-            StartPhase::Login => "login",
+            StartPhase::Auth => "auth",
             StartPhase::Spawn => "spawn",
             StartPhase::PostSpawn => "post_spawn",
         };
@@ -753,12 +762,12 @@ impl ClaudePlugin {
         if error.origin.is_none()
             && matches!(
                 failure.phase,
-                StartPhase::McpConfig | StartPhase::Skill | StartPhase::Login | StartPhase::Spawn
+                StartPhase::McpConfig | StartPhase::Skill | StartPhase::Auth | StartPhase::Spawn
             )
         {
             error = error.with_origin(
                 eliot_core::FailureOrigin::Environment,
-                "native executable, private file or external login operation failed",
+                "native executable, private file or authentication status check failed",
             );
         }
         let error = eliot_plugin::session::classify_start_failure(error, "claude", phase);
@@ -1054,7 +1063,8 @@ impl ClaudePlugin {
                 }),
                 &swarm_binary,
                 hostname.as_deref(),
-            )?;
+            )
+            .map_err(|error| error.with_where(INHERIT_MCP_CHECK))?;
             hostname
         } else {
             None
@@ -2527,7 +2537,7 @@ async fn dispatch_send(
 
 /// Spawn the owned CLI and bind the event task: the only start phase that
 /// creates native resources. Every failure before the spawn (MCP config
-/// write, skill-root check, login, and the spawn itself) returns a
+/// write, skill-root check, auth status, and the spawn itself) returns a
 /// `PhaseFailure` the caller converts into the proven-no-effect failed
 /// start; a failure after the child exists keeps its honest error and the
 /// child is ended before returning.
@@ -2536,6 +2546,13 @@ async fn launch_session(
     params: &AgentStartParams,
     peer: &PeerClient,
 ) -> std::result::Result<AgentSession, PhaseFailure> {
+    // Read the selected CLI's authentication before starting a native session.
+    crate::native::require_auth(&plan.program, &plan.workspace, &plan.environment)
+        .await
+        .map_err(|error| PhaseFailure {
+            phase: StartPhase::Auth,
+            error: Box::new(error),
+        })?;
     let mcp_config =
         ClaudeMcpConfigFile::create(&plan.instance_dir, &plan.swarm_binary, &plan.data_root)
             .map_err(|error| PhaseFailure {
@@ -2612,15 +2629,6 @@ async fn launch_session(
     }
     argv.push(OsString::from("--plugin-dir"));
     argv.push(OsString::from(skill_root));
-    // The CLI keeps its own login (not the desktop app's): check it, and run
-    // its browser login when it is logged out, before any native resource.
-    // A login failure leaves no session or prompt, so it is proven-no-effect.
-    crate::native::ensure_logged_in(&plan.program, &plan.workspace, &plan.environment)
-        .await
-        .map_err(|error| PhaseFailure {
-            phase: StartPhase::Login,
-            error: Box::new(error),
-        })?;
     let launch = NativeLaunch {
         program: plan.program.clone(),
         args: argv,
@@ -3597,7 +3605,7 @@ mod tests {
             StartPhase::Plan,
             StartPhase::McpConfig,
             StartPhase::Skill,
-            StartPhase::Login,
+            StartPhase::Auth,
             StartPhase::Spawn,
         ] {
             for code in [
@@ -3641,6 +3649,82 @@ mod tests {
         let reason = prespawn_reason(StartPhase::Plan, &owner_like.code);
         assert!(!reason.contains("swarm"));
         assert!(!reason.contains(".mcp.json"));
+    }
+
+    #[test]
+    fn minimal_start_plan_accepts_an_install_with_plugins_and_remote_settings() {
+        let root = std::env::temp_dir().join(format!("eliot-claude-mcp-{}", ulid::Ulid::new()));
+        let _temp = crate::test_temp::TempDir::own(root.clone());
+        let config = root.join("claude-config");
+        let plugins = config.join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::write(plugins.join("installed_plugins.json"), "{}").unwrap();
+        std::fs::write(config.join("remote-settings.json"), "{}").unwrap();
+
+        let mut params = eliot_plugin::AgentStartParams::new("a1", 1, "mcp-plan");
+        params.source_plan = Some(json!({
+            "session": "stream", "turn": "stream", "message": "stream",
+            "request": "stream", "tool": "stream"
+        }));
+        params.workspace = Some(root.to_string_lossy().into_owned());
+        params.profile = Some(json!({"harness": "claude", "cmd": "claude", "mcp": "minimal"}));
+        params.target_environment = Some(json!({
+            "CLAUDE_CONFIG_DIR": config,
+            "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+            "ELIOT_HOME": root,
+            "ELIOT_AGENT_ID": "a1",
+            "ELIOT_AGENT_GENERATION": "1",
+            "ELIOT_AGENT_TOKEN": "test-credential"
+        }));
+        let mut plugin = ClaudePlugin {
+            initialized: Some(super::Initialized {
+                credential: "test-credential".to_owned(),
+                instance_dir: root.to_string_lossy().into_owned(),
+            }),
+            ..ClaudePlugin::default()
+        };
+        let plan = plugin.plan_start(&params).unwrap();
+        assert_eq!(plan.requested_mcp_policy, McpPolicy::Minimal);
+
+        params.profile.as_mut().unwrap()["mcp"] = json!("inherit");
+        let Err(error) = plugin.plan_start(&params) else {
+            panic!("inherit accepted installed plugins");
+        };
+        assert_eq!(error.code, "profile_error");
+        assert!(error.message.contains("installed plugins"));
+        let value = plugin.proven_no_effect_start(
+            &params,
+            PhaseFailure {
+                phase: StartPhase::Plan,
+                error: Box::new(error),
+            },
+        );
+        assert!(
+            value["message"]
+                .as_str()
+                .unwrap()
+                .contains("mcp = \"minimal\"")
+        );
+    }
+
+    #[test]
+    fn signed_out_start_retains_auth_required_and_the_owner_command() {
+        let params = eliot_plugin::AgentStartParams::new("a1", 1, "signed-out");
+        let mut plugin = ClaudePlugin::default();
+        let message = "Claude CLI is signed out. Run 'path/to/claude' auth login in a terminal.";
+        let value = plugin.proven_no_effect_start(
+            &params,
+            PhaseFailure {
+                phase: StartPhase::Auth,
+                error: Box::new(Error::new("auth_required", message)),
+            },
+        );
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["code"], "auth_required");
+        assert_eq!(value["message"], message);
+        assert_eq!(value["reason"], message);
+        assert_eq!(value["origin"], "environment");
+        assert!(plugin.session.is_none());
     }
 
     /// A pre-spawn owner-scan refusal settles failed with the exact start
