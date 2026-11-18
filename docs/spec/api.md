@@ -1617,7 +1617,7 @@ inference or polls Agents. CLI: `swarm quota --harness H [--profile P]`.
 `profile.list` (`ProfileListRequest`/`ProfileListResponse`, no params) returns the
 current `config.toml` revision, whether it parses, and per profile the name,
 harness, requested model/effort (absent = native default), permissions,
-approval policy, control, proxy/account names, `max_live`, `child_profiles`
+approval policy (the resolved harness-native value: Codex `approval_policy`, Muse `approval`, Claude `permission_mode`; absent when the harness has no mapping or the profile does not resolve), control, proxy/account names, `max_live`, `child_profiles`
 and whether launch-time resolution succeeds now (`launchable`, else `error`).
 It reads no environment value, and a profile whose summary would carry a value
 known to the daemon's secret policy is omitted from the list; parse diagnostics

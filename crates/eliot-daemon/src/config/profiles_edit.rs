@@ -375,10 +375,23 @@ pub(crate) fn list(data_root: &Path, policy: &SecretPolicy) -> core::Result<Prof
                 model: entry.model.clone(),
                 effort: entry.effort.clone(),
                 permissions: entry.permissions.clone(),
-                approval_policy: entry
-                    .approval_policy
-                    .clone()
-                    .or_else(|| entry.approval.clone()),
+                // The display policy is the harness-native resolved value, never the raw entry fallback: a launchable profile must not advertise a policy the frozen snapshot omits.
+                approval_policy: resolved.as_ref().ok().and_then(|snapshot| {
+                    match entry.harness.trim() {
+                        "muse" => snapshot
+                            .get("approval")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        "claude" => snapshot
+                            .get("permission_mode")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        _ => snapshot
+                            .get("approval_policy")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    }
+                }),
                 control: entry.control.clone(),
                 proxy: entry.proxy.clone(),
                 account: entry.account.clone(),
@@ -747,5 +760,43 @@ mod tests {
         let draft = "[profiles.a]\nharness = \"codex\"\nmodel = \"m2\"\n";
         let (spliced, _) = validated(file, draft).expect("BOM file accepts a valid edit");
         assert!(spliced.starts_with("\u{FEFF}[profiles.a]\nharness = \"codex\"\nmodel = \"m2\"\n"));
+    }
+    #[test]
+    fn profile_list_reports_resolved_approval_policy() {
+        // profile.list must report the harness-native resolved policy, never the
+        // raw entry fallback: a Codex profile carrying approval is unlaunchable
+        // and advertises no policy.
+        let policy = SecretPolicy::new(Vec::<String>::new());
+        let root = TestDataRoot::new(
+            "[profiles.codex-on-request]\nharness = \"codex\"\nmodel = \"m1\"\napproval_policy = \"on-request\"\n\n[profiles.codex-default]\nharness = \"codex\"\nmodel = \"m1\"\n\n[profiles.codex-approval-rejected]\nharness = \"codex\"\nmodel = \"m1\"\napproval = \"onRequest\"\n\n[profiles.muse-approval]\nharness = \"muse\"\ncmd = \"C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe\"\nmodel = \"muse-spark-1.3-contributor\"\napproval = \"promptUnmatched\"\nmcp = \"inherit\"\n",
+        );
+        let reply = list(&root.0, &policy).expect("list profiles");
+        assert!(reply.valid);
+        let by_name = |name: &str| {
+            reply
+                .profiles
+                .iter()
+                .find(|summary| summary.name == name)
+                .expect("profile is listed")
+                .clone()
+        };
+        let on_request = by_name("codex-on-request");
+        assert!(on_request.launchable);
+        assert_eq!(on_request.approval_policy.as_deref(), Some("on-request"));
+        let default = by_name("codex-default");
+        assert!(default.launchable);
+        assert_eq!(default.approval_policy.as_deref(), Some("never"));
+        let rejected = by_name("codex-approval-rejected");
+        assert!(!rejected.launchable);
+        assert_eq!(rejected.approval_policy, None);
+        assert!(
+            rejected
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("approval"))
+        );
+        let muse = by_name("muse-approval");
+        assert!(muse.launchable);
+        assert_eq!(muse.approval_policy.as_deref(), Some("promptUnmatched"));
     }
 }

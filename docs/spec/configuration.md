@@ -238,7 +238,7 @@ The first native profile also accepts `cmd` (one executable, not a shell command
 selects the explicitly requested native sandbox: `read-only`, `workspace-write`, or
 `danger-full-access`; the default remains `workspace-write`. `control` selects the
 frozen command scope of launched Agents: `self` (the default), `tree`, or `project`.
-These values are frozen at admission. The supported approval and question callbacks
+These values are frozen at admission. The shared `approval` field has no Codex mapping and is rejected; use `approval_policy`. The supported approval and question callbacks
 are handled through exact pending request IDs; an unsupported callback receives an
 error, never a default choice.
 
