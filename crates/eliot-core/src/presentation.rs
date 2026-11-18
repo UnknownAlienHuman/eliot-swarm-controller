@@ -29,6 +29,8 @@ pub fn reason_words(code: &str) -> String {
         "frame_too_large" => "The reply is too large to display",
         "history_gap" => "Older activity is no longer available",
         "fanout_limit" => "The manager's Agent limit would be exceeded",
+        "capacity_unavailable" => "Launch capacity is full",
+        "transfer_in_progress" => "A project transfer is in progress",
         "id_conflict" => "This request was already used for a different action",
         "daemon_restart" => "Interrupted by a Swarm restart",
         "root_exited" => "The agent app exited unexpectedly",

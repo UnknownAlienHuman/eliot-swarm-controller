@@ -346,6 +346,8 @@ impl Store {
             )
             .optional()
             .map_err(sql_error)?;
+        let (organization, tags, organization_revision) =
+            organization::agent_organization(&self.connection, record.id)?;
         Ok(AgentSummary {
             archived: record.archived,
             chat: record.chat,
@@ -388,6 +390,9 @@ impl Store {
             project_scope: record.project_scope,
             heavy,
             session_growth,
+            organization,
+            tags,
+            organization_revision,
         })
     }
 
@@ -625,7 +630,8 @@ fn agent_list_select_recent(
             } else {
                 let placeholders = held.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 predicates.push(format!(
-                    "(agents.archived = 0 OR (agents.archived = 1 AND agents.state IN ('stopped','failed','lost') AND agents.id IN ({placeholders})))"
+                    "(agents.archived = 0 OR (agents.archived = 1 AND agents.state IN ({}) AND agents.id IN ({placeholders})))",
+                    super::agent_lifecycle::CUSTODY_VISIBLE_STATES,
                 ));
                 params.extend(held.iter().map(|id| rusqlite::types::Value::from(*id)));
             }
@@ -964,7 +970,8 @@ fn agent_list_select(
             .collect::<Vec<_>>()
             .join(",");
         let extra_sql = format!(
-            "(agents.state IN ('stopped','failed','lost') AND agents.id IN ({placeholders}))"
+            "(agents.state IN ({}) AND agents.id IN ({placeholders}))",
+            super::agent_lifecycle::CUSTODY_VISIBLE_STATES,
         );
         let extra_params = custody_ids
             .iter()

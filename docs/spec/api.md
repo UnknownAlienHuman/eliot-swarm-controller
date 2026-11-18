@@ -456,8 +456,8 @@ command id frozen at claim. Stored Goal responses/round records use Core
 | `project.transfer` | Owner-only transfer intent, optional replacement launch, atomic commit or cancellation with typed readback. See [Project transfer](coordination.md#project-transfer). |
 | `project.assignment.get/claim/launch/release` | Current registered project manager, explicit adoption or manager launch, and revision-bound release through the ordinary command path. See [project manager assignments](#project-manager-assignments). |
 | `chat.organization` | owner-only grouped work projection by project assignment, manager, repository/worktree and ancestry, with event-watermark and per-group readback; no client repeats Git discovery or grouping. See [Chat organization](#chat-organization). |
-| `chat.attach` / `chat.detach` | owner-only chat placement moves between a retained project and the no-project bucket; committed per-Agent link readback; execution scope, workspace and history untouched |
-| `chat.tag` | owner-only replacement tag groups for Agents or chats (an omitted tag list clears); committed per-Agent link readback |
+| `chat.attach` / `chat.detach` | owner-only chat placement moves between a retained project and the no-project bucket; optional per-Agent `expected_revision` refuses a stale write with `conflict`; committed per-Agent link readback; execution scope, workspace and history untouched |
+| `chat.tag` | owner-only replacement tag groups for Agents or chats (an omitted tag list clears); optional per-Agent `expected_revision` refuses a stale write with `conflict`; committed per-Agent link readback |
 | `project.discover` | owner-only opened Git checkout registration through the settings writer; non-Git paths return no project |
 | `routing.preview` | owner-only advisory `RoutingDecision` for a role, computed like admission without admitting, freezing or reserving; see configuration |
 | `timer.get/run` | owner-only timer read and idempotent manual firing |
@@ -525,13 +525,14 @@ detail visibility and capacity semantics.
 ### Chat organization
 
 The owning semantics are [Coordination: Conversation association](coordination.md#conversation-association).
-Owner only, with identical behavior from the CLI (`swarm chat ...`) and MCP
-(`chat.organization`, `chat.attach`, `chat.detach`, `chat.tag`);
-the desktop has no organization entry yet (deferred to step 5).
+Owner only, with identical behavior from the CLI (`swarm chat ...`), MCP
+(`chat.organization`, `chat.attach`, `chat.detach`, `chat.tag`) and the desktop
+(its sidebar projects, and a task's Attach to project, Detach from project and
+Tags).
 Organization is placement, never authority: attach, detach and tag write the
 organizational overlay beside the Agent id through Owner-only Store
-transactions (schema v64: `chat_organization` with placement and tags
-beside the Agent id); the execution project, scope,
+transactions (`chat_organization` with placement, tags and a link revision
+beside the Agent id, schema v64 and v65); the execution project, scope,
 workspace and history of every Agent keep their retained values.
 
 `chat.organization` (`ChatOrganizationRequest`/`ChatOrganizationResponse` in
@@ -544,10 +545,19 @@ from the same scoped predicates; `archived` includes
 archived rows (default hides them). Groups carry at most 200 members each and
 1,000 across the projection. The all-project read pages its group list: `after`
 takes the previous page's `next_after`, and a truncated page sets
-`groups_truncated` with the cursor for the next page. Competing roots of one
-project surface as an
-explicit ambiguity (`conflicting_roots`, counted independently of the
-archived filter) and are never auto-reassigned. Chats keep their retained
+`groups_truncated` with the cursor for the next page. Member pages and totals
+apply the default `agent.list` archived visibility and the same group key as
+its `organization` field, so a listed row is counted in the group it reads
+in. A registered group carries its header in the same read: the manager (with
+its managed worktree `branch`), the assignment, `needs_assignment`, and its
+exact team `totals` and project slot use (`capacity`), the numbers
+`project.overview` reports for it, so the desktop sidebar reads every header
+and total in one bounded read. Competing roots surface as an explicit
+ambiguity only beside an assigned manager: every other retained root competes
+with it (`conflicting_roots`, counted independently of the archived filter),
+and none is auto-reassigned. Without a manager the roots wait for assignment
+and the group reads `needs_assignment` alone. A registered group carries the
+open `project.transfer` intent as `transfer` while its manager drains. Chats keep their retained
 execution labels and group by their overlay link alone; a legacy chat that
 carries an execution project reads in the no-project bucket until attached.
 
@@ -559,14 +569,22 @@ nominal receipt (every link with a full-length project and a full tag set)
 inside the 64 KiB retained-result bound. Every mutation carries an id:
 exact replay returns the committed result before current-state checks, and the
 response carries the committed per-Agent links (`id`, `links:
-Vec<OrgLinkView>` with placement and tags); each fresh write appends one
-`organization.changed` event in the same transaction so the projection's
-event watermark advances, and the router publishes it after commit. Rename
+Vec<OrgLinkView>` with placement, tags and the new link `revision`). The
+optional `expected_revision` carries, per selected Agent in order, the link
+revision it was read with (`agent.list` `organization_revision`, 0 before its
+first organization write); a write whose revision moved since, by any caller,
+is refused whole with `conflict` and changes nothing. The desktop menu always
+carries it; the CLI omits it. Each fresh write appends one
+`organization.changed` event (`OrganizationChangedEvent`) in the same
+transaction, naming each written Agent with the group its `agent.list` row
+now reads in, its tags and its link revision, so a client refreshes the rows
+it already loaded by id; the projection's event watermark advances, and the
+router publishes it after commit. Rename
 stays the desktop
 `[desktop] display_names` presentation preference and archive stays
 `agent.archive`. Errors include `invalid`, `not_found`, `not_allowed`,
-`bad_state`, `unavailable`, `id_conflict`, `source_integrity` and mutation
-binding/age errors.
+`conflict`, `bad_state`, `unavailable`, `id_conflict`, `source_integrity` and
+mutation binding/age errors.
 
 ### Authenticated method discovery
 
@@ -911,6 +929,14 @@ metadata, not proof of liveness for a detached or restarted source. Each
 summary also carries `project_scope`, the authorization namespace the server
 compares for same-project moves and handoffs, present only when it differs
 from `project`; pickers narrow by that scope while the server stays the judge.
+`organization` names the [chat organization](#chat-organization) group the row
+reads in, from the same committed predicate as the projection's group totals
+(absent for the no-project bucket), under the same archived visibility rule
+(a custody-held archived row the default list shows is counted there too),
+`tags` carries its organization tags, and `organization_revision` the link
+revision both were read with (absent before the Agent's first organization
+write), which a guarded `chat.attach`/`chat.detach`/`chat.tag` carries back;
+all are placement, never authority.
 The response carries the required matching `total` ignoring the cursor, the
 required explicit `truncated`, and `next` at the last returned row on every
 nonempty page (empty pages carry no cursor); continue through `next` until the

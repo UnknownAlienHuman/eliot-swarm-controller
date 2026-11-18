@@ -10,24 +10,28 @@
 //! listed children at once and its fetched branch, the authoritative
 //! direct-children page, when that read returns.
 //!
-//! A project is a repository, a subproject one of its linked worktrees
-//! (one level of nesting: Project → Subprojects → Tasks). Every registered
-//! checkout carries the Git common directory the daemon registered with it,
-//! so the checkouts of one repository form one project. Its logical name
-//! ([`repository_name`]) is the repository name of its `origin` remote,
-//! else its main checkout's folder, never a registration ID or a linked
-//! worktree's folder; a subproject reads as its branch ([`branch_words`]:
-//! `feat/k141-monitor-charts` is "k141 monitor charts"), a detached one as
-//! its folder. Tasks in the main checkout sit directly under the project.
-//! Running tasks stay on top, then the rest newest first; stopped tasks
-//! last changed before today, and subprojects with nothing live and nothing
-//! from today, fold into one "Show N older" row (the Codex sidebar's
-//! pattern). Titles come with each listed summary ([`summary_title`]), so
-//! every page carries its own.
+//! The sidebar's projects are the daemon's `chat.organization` groups
+//! (#657 G): a registered project with its manager, the manager's standard
+//! worktree branch, competing roots and the exact server totals, then the
+//! no-project bucket (unattached chats and Agents whose execution label is
+//! not a registration, such as legacy `wt-*` folders). Every listed row
+//! carries the group the daemon placed it in (`AgentSummary::organization`),
+//! so nothing is grouped here by path, repository or name ([`sections`]).
+//! A registered checkout is named by its repository ([`repository_name`]:
+//! the `origin` remote's name, else its main checkout's folder) and, in a
+//! linked worktree, its branch in words ([`branch_words`]:
+//! `feat/k141-monitor-charts` is "k141 monitor charts"). Running tasks stay
+//! on top, then the rest newest first; stopped tasks last changed before
+//! today fold into one "Show N older" row (the Codex sidebar's pattern).
+//! Titles come with each listed summary ([`summary_title`]), so every page
+//! carries its own.
 
 use std::collections::{HashMap, HashSet};
 
-use eliot_core::api::AgentSummary;
+use eliot_core::api::{
+    AgentSummary, LaunchIntentState, LaunchQueueView, LaunchWaitReason, OrgGroupView, OrgRowChange,
+    ProjectAssignmentState, ProjectManagerIdentity,
+};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 /// UI copy of one Agent row: identity, generation, liveness and placement.
@@ -67,6 +71,15 @@ pub struct UiAgent {
     /// authorization scope is still unknown. Pickers never treat the ID as
     /// the scope and never offer this row as a candidate meanwhile.
     pub pending: bool,
+    /// The `chat.organization` group the daemon reads this row in (its
+    /// registered project, or a chat's placement); `None` for the
+    /// no-project bucket. Placement only, never authority.
+    pub organization: Option<String>,
+    /// Organization tags (`chat.tag`).
+    pub tags: Vec<String>,
+    /// The overlay link revision the row's placement and tags were read
+    /// with (`None` for no overlay row); a menu write carries it back.
+    pub organization_revision: Option<i64>,
 }
 
 impl UiAgent {
@@ -90,6 +103,9 @@ impl UiAgent {
             chat: false,
             archived: false,
             pending: false,
+            organization: summary.organization.clone(),
+            tags: summary.tags.clone(),
+            organization_revision: summary.organization_revision,
         }
     }
 
@@ -185,9 +201,6 @@ pub struct Row {
     pub expanded: bool,
     /// The branch read state when expanded (loading, failed, more exist).
     pub note: Option<String>,
-    /// Listed under a subproject (one more indent than a project's own
-    /// tasks).
-    pub nested: bool,
 }
 
 impl Row {
@@ -395,8 +408,9 @@ fn checkout_of<'a>(label: &str, checkouts: &'a [Checkout]) -> Option<&'a Checkou
         })
 }
 
+/// The no-project bucket's sidebar key ([`group_key`] of no group).
 pub const OTHER_LOCATIONS: &str = "other-locations";
-const OTHER_LOCATIONS_NAME: &str = "Other locations";
+const NO_PROJECT_NAME: &str = "No project";
 
 /// Resolve the Agent's repository and, independently, its verified workspace.
 fn agent_checkout<'a>(
@@ -432,22 +446,6 @@ fn agent_checkout<'a>(
             && path_key(&checkout.path) == workspace
     });
     Some((repository, checkout))
-}
-
-fn agent_project_key(agent: &UiAgent, checkouts: &[Checkout]) -> String {
-    agent_checkout(agent, checkouts).map_or_else(
-        || {
-            if agent.workspace.is_some() || agent.project_id.contains(['/', '\\']) {
-                OTHER_LOCATIONS.to_owned()
-            } else {
-                format!(
-                    "folder:{}",
-                    path_key(agent.workspace.as_deref().unwrap_or(&agent.project_id))
-                )
-            }
-        },
-        |(repository, _)| format!("repo:{}", path_key(&repository.common_dir)),
-    )
 }
 
 fn checkout_subproject_key(checkout: &Checkout) -> Option<String> {
@@ -504,50 +502,89 @@ pub fn subproject_key(label: &str, checkouts: &[Checkout]) -> Option<String> {
     checkout_of(label, checkouts).and_then(checkout_subproject_key)
 }
 
-/// One project of the sidebar: a repository with its main checkout's tasks
-/// and its subprojects, or an unregistered folder.
+/// The organization readbacks the sidebar shows, as the daemon returned
+/// them: groups with their headers and exact totals from
+/// `chat.organization`, and waits from `launch.queue`. A failed read keeps
+/// the last server grouping with a stale marker; nothing here is regrouped
+/// or recounted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Organization {
+    pub groups: Vec<OrgGroupView>,
+    pub queue: Option<LaunchQueueView>,
+    /// The current state of the intents this window queued
+    /// (`launch.intent.get`), so an admission or refusal is reported.
+    pub intents: Vec<eliot_core::api::LaunchIntentView>,
+    /// Watched intents the daemon does not know (`not_found`): an
+    /// unconfirmed Queue it that never committed.
+    pub missing_intents: Vec<String>,
+    /// The grouping read's error lines (the stale marker among them).
+    pub errors: Vec<String>,
+    /// The queue read's error lines, replaced on every queue read.
+    pub queue_errors: Vec<String>,
+    /// The grouping read failed: headers show the last server grouping
+    /// with a stale indicator, never a synthesized one.
+    pub stale: bool,
+    /// The exclusive `organization.changed` cursor: rows committed after
+    /// it refresh the loaded Agents by id. Starts at the first projection
+    /// read's event watermark.
+    pub changes_after: Option<i64>,
+    /// The `organization.changed` rows the last read returned, applied to
+    /// the loaded Agents once ([`apply_changes`]).
+    pub changes: Vec<OrgRowChange>,
+}
+
+impl Organization {
+    /// The retained registered projects, in the daemon's order: where a
+    /// chat can be attached.
+    pub fn registered(&self) -> impl Iterator<Item = &OrgGroupView> {
+        self.groups
+            .iter()
+            .filter(|group| group.registration.is_some() && group.project.is_some())
+    }
+}
+
+/// The sidebar key of an organization group: `org:<project>`, or the
+/// no-project bucket's [`OTHER_LOCATIONS`].
+pub fn group_key(organization: Option<&str>) -> String {
+    organization.map_or_else(
+        || OTHER_LOCATIONS.to_owned(),
+        |project| format!("org:{project}"),
+    )
+}
+
+/// One project of the sidebar: one `chat.organization` group with the
+/// listed rows the daemon placed in it (each row's `organization`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Section {
-    /// The repository's identity (its common directory), or the folder's.
+    /// `org:<project>`, or the no-project bucket's [`OTHER_LOCATIONS`].
     pub key: String,
-    /// Its logical name ([`repository_name`]).
+    /// The group's project; `None` for the no-project bucket.
+    pub project: Option<String>,
+    /// The registered checkout's place name ([`place_label`]), else the
+    /// project label; "No project" for the bucket.
     pub name: String,
-    /// Where a new task in it starts: the main checkout when it is
-    /// registered, else the first registered checkout (or the folder).
+    /// Where a new task in it starts: the registered checkout.
     pub checkout: String,
-    /// Every checkout of the project.
     pub checkouts: Vec<String>,
-    /// Tasks in the main checkout (or the folder).
+    /// The header's lines: the team (manager, its branch, assignment and
+    /// transfer state, or "Needs assignment"), competing roots, and the
+    /// exact server totals ([`group_detail`]).
+    pub detail: Vec<String>,
+    /// Queued launches and automation waits with their reasons ([`waits`]).
+    pub waits: Vec<String>,
+    /// Visible task rows, newest work first.
     pub rows: Vec<Row>,
-    /// Linked worktrees shown now, each with its tasks.
-    pub subprojects: Vec<Subproject>,
-    /// Listed Agents of the project working now, subprojects included.
+    /// Busy now by the server's team totals, as returned; 0 without a
+    /// team readback.
     pub running: usize,
     /// Whether the project is collapsed (it then has no rows).
     pub collapsed: bool,
-    /// Older stopped tasks and quiet subprojects, folded into one row.
+    /// Older stopped tasks, folded into one row.
     pub older: usize,
     /// Whether those are unfolded (the row then hides them again).
     pub older_shown: bool,
-    /// The main checkout is registered and its folder is gone.
+    /// The registered checkout's folder is gone.
     pub missing: bool,
-}
-
-/// A linked worktree of a project, with its tasks.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Subproject {
-    /// `sub:<path>`: what it collapses and is renamed by.
-    pub key: String,
-    /// Its branch in words, or its folder ([`subproject_name`]).
-    pub name: String,
-    pub checkout: String,
-    /// A registered worktree whose folder is gone.
-    pub missing: bool,
-    pub rows: Vec<Row>,
-    /// Listed Agents working in it now.
-    pub running: usize,
-    /// Whether it is collapsed (it then has no rows).
-    pub collapsed: bool,
 }
 
 /// Newest tasks a project keeps visible when every task of it is older.
@@ -558,7 +595,7 @@ pub const RECENT_WHEN_ALL_OLDER: usize = 3;
 pub struct Shown<'a> {
     pub branches: &'a HashMap<String, Branch>,
     pub expanded: &'a HashSet<String>,
-    /// Section and subproject keys of collapsed rows.
+    /// Section keys of collapsed projects.
     pub collapsed: &'a HashSet<String>,
     /// Section keys whose older tasks are unfolded.
     pub unfolded: &'a HashSet<String>,
@@ -570,26 +607,15 @@ pub struct Shown<'a> {
     /// project without a match.
     pub only: Option<&'a dyn Fn(&UiAgent) -> bool>,
     /// The open Agent: it renders explicitly above the list, so sections
-    /// skip its rows (no duplicate, no folding, no "Show N older" count)
-    /// while it still counts toward running and newest tallies.
+    /// skip its rows (no duplicate, no folding, no "Show N older" count).
     pub pinned: Option<&'a str>,
 }
 
 struct Group<'a> {
     section: Section,
-    /// The main checkout's key, for a repository that has one.
-    main: Option<String>,
+    /// The bucket or an unregistered group shows only with members.
+    members: usize,
     top: Vec<&'a UiAgent>,
-    subs: Vec<SubGroup<'a>>,
-}
-
-struct SubGroup<'a> {
-    sub: Subproject,
-    top: Vec<&'a UiAgent>,
-    /// The newest change of any task in it (0 with none).
-    newest: i64,
-    /// A task in it is live (not stopped, failed or lost).
-    live: bool,
 }
 
 /// The sidebar's order of tasks: running first, then live, then ended
@@ -621,127 +647,394 @@ fn folding<'a>(top: &[&'a UiAgent], today_start: i64, keep_newest: bool) -> Hash
     folding
 }
 
-/// The sidebar's projects: registered repositories in registration order
-/// (with no rows when they have no Agent yet), then every other project
-/// label in order of first appearance, each with its main checkout's
-/// visible rows and its subprojects.
-pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Vec<Section> {
-    let empty = |key: String, name: String, checkout: &str| Section {
-        key,
-        name,
-        checkout: checkout.to_owned(),
-        checkouts: vec![checkout.to_owned()],
-        rows: Vec::new(),
-        subprojects: Vec::new(),
-        running: 0,
-        collapsed: false,
-        older: 0,
-        older_shown: false,
-        missing: false,
+/// A group's name, start checkout and missing flag: the registered
+/// checkout's place name ([`place_label`]), else the label's.
+fn group_place(
+    project: Option<&str>,
+    group: Option<&OrgGroupView>,
+    checkouts: &[Checkout],
+) -> (String, String, bool) {
+    let Some(project) = project else {
+        return (NO_PROJECT_NAME.to_owned(), String::new(), false);
+    };
+    match group.and_then(|group| group.registration.as_ref()) {
+        Some(registration) => {
+            let path = path_key(&registration.checkout);
+            let missing = checkouts
+                .iter()
+                .any(|checkout| checkout.missing && path_key(&checkout.path) == path);
+            (
+                place_label(&registration.checkout, checkouts),
+                registration.checkout.clone(),
+                missing,
+            )
+        }
+        None => (
+            place_label(project, checkouts),
+            checkout_of(project, checkouts)
+                .map(|checkout| checkout.path.clone())
+                .unwrap_or_default(),
+            false,
+        ),
+    }
+}
+
+/// Most competing roots a header names before "+N".
+const ROOTS_NAMED: usize = 3;
+
+/// A header's lines, from the server alone: the team line (the assigned
+/// manager with its state and standard worktree branch, a remote manager,
+/// "Needs assignment" or "No manager", plus a starting or blocked
+/// assignment and an open transfer), the competing roots, and the exact
+/// totals of the same `chat.organization` group: its member total, each
+/// lifecycle count under its own word as returned, queued, unknown and the
+/// project slot use.
+pub fn group_detail(group: &OrgGroupView, checkouts: &[Checkout]) -> Vec<String> {
+    let mut lines = Vec::new();
+    if group.registration.is_some() {
+        let assignment = group.assignment.as_ref();
+        let mut team = match (&group.manager, assignment.and_then(|a| a.manager.as_ref())) {
+            (Some(manager), _) => {
+                let mut line = format!(
+                    "Manager {} · {}",
+                    manager.agent,
+                    eliot_core::api::agent_state_name(manager.state)
+                );
+                let workspace = manager
+                    .workspace
+                    .as_deref()
+                    .or_else(|| assignment.and_then(|a| a.workspace.as_deref()));
+                if let Some(place) = workspace
+                    .map(|path| worktree_branch(path, manager.branch.as_deref(), checkouts))
+                {
+                    line.push_str(" · ");
+                    line.push_str(&place);
+                }
+                line
+            }
+            (None, Some(ProjectManagerIdentity::Remote { instance, .. })) => {
+                format!("Remote manager {instance}")
+            }
+            _ if group.needs_assignment => "Needs assignment".to_owned(),
+            _ => NO_MANAGER.to_owned(),
+        };
+        match assignment.map(|assignment| assignment.state) {
+            Some(ProjectAssignmentState::Starting) => team.push_str(" · starting"),
+            Some(ProjectAssignmentState::Blocked) => team.push_str(" · blocked"),
+            _ => {}
+        }
+        if group.transfer.is_some() {
+            team.push_str(" · transfer in progress");
+        }
+        lines.push(team);
+        if !group.conflicting_roots.is_empty() {
+            let named: Vec<&str> = group
+                .conflicting_roots
+                .iter()
+                .take(ROOTS_NAMED)
+                .map(String::as_str)
+                .collect();
+            let rest = group.conflicting_roots.len() - named.len();
+            let mut line = format!(
+                "{}: {}",
+                if group.conflicting_roots.len() == 1 {
+                    "Competing root"
+                } else {
+                    "Competing roots"
+                },
+                named.join(", ")
+            );
+            if rest > 0 {
+                line.push_str(&format!(" +{rest}"));
+            }
+            lines.push(line);
+        }
+    }
+    let mut totals = vec![eliot_core::count_words(
+        group.member_total as u64,
+        "task",
+        "tasks",
+    )];
+    if let Some(team) = &group.totals {
+        let lifecycle = &team.lifecycle;
+        for (count, words) in [
+            (team.live, "live"),
+            (lifecycle.idle, "idle"),
+            (lifecycle.busy, "busy"),
+            (lifecycle.waiting, "waiting"),
+            (lifecycle.starting, "starting"),
+            (lifecycle.stopping, "stopping"),
+            (team.queued, "queued"),
+            (team.retained_unknown, "unknown"),
+        ] {
+            if count > 0 {
+                totals.push(format!("{count} {words}"));
+            }
+        }
+    }
+    if let Some(capacity) = &group.capacity
+        && let Some(limit) = capacity.limit
+    {
+        totals.push(format!("{}/{limit} slots", capacity.usage));
+    }
+    let totals = totals.join(" · ");
+    // A vacant project with no roots says so on one line.
+    match lines.as_slice() {
+        [team] if team == NO_MANAGER => lines = vec![format!("{NO_MANAGER} · {totals}")],
+        _ => lines.push(totals),
+    }
+    lines
+}
+
+/// The team line of a registered project without a manager or roots.
+const NO_MANAGER: &str = "No manager";
+
+/// A manager workspace as the header names it: the branch of its managed
+/// worktree (the manager readback's `branch`), else of its verified
+/// checkout (`project.list`), else its folder.
+fn worktree_branch(workspace: &str, branch: Option<&str>, checkouts: &[Checkout]) -> String {
+    let path = path_key(workspace);
+    branch
+        .map(str::to_owned)
+        .or_else(|| {
+            checkouts
+                .iter()
+                .find(|checkout| path_key(&checkout.path) == path)
+                .and_then(|checkout| checkout.branch.clone())
+        })
+        .unwrap_or_else(|| folder_name(workspace).to_owned())
+}
+
+/// The waits of one group, from `launch.queue` plus this window's watched
+/// intents: queued interactive launches and automation assignment waits
+/// with the wait reason and who can change it. A watched intent's reason
+/// renders even beyond the first queue page. A project group shows its
+/// own; the no-project bucket shows chats and launches of unregistered
+/// folders.
+pub fn waits(
+    queue: Option<&LaunchQueueView>,
+    intents: &[eliot_core::api::LaunchIntentView],
+    project: Option<&str>,
+    registered: &HashSet<&str>,
+) -> Vec<String> {
+    let here = |candidate: &str| match project {
+        Some(project) => candidate == project,
+        None => !registered.contains(candidate),
+    };
+    let mut lines: Vec<String> = queue
+        .map(|queue| {
+            queue
+                .interactive
+                .iter()
+                .filter(|intent| intent.state == LaunchIntentState::Queued && here(&intent.project))
+                .map(|intent| match &intent.reason {
+                    Some(reason) => format!("Queued launch: {}", wait_reason_words(reason)),
+                    None => "Queued launch: waiting for its turn".to_owned(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let seen: HashSet<&str> = queue
+        .map(|queue| {
+            queue
+                .interactive
+                .iter()
+                .map(|intent| intent.id.as_str())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    // Watched intents this window queued: their wait reason shows even
+    // when the queue page carrying them was never read.
+    lines.extend(
+        intents
+            .iter()
+            .filter(|intent| {
+                intent.state == LaunchIntentState::Queued
+                    && here(&intent.project)
+                    && !seen.contains(intent.id.as_str())
+            })
+            .map(|intent| match &intent.reason {
+                Some(reason) => {
+                    format!("Queued launch {}: {}", intent.id, wait_reason_words(reason))
+                }
+                None => format!("Queued launch {}: waiting for its turn", intent.id),
+            }),
+    );
+    lines.extend(
+        queue
+            .into_iter()
+            .flat_map(|queue| &queue.assignments)
+            .filter(|wait| here(&wait.project))
+            .map(|wait| {
+                format!(
+                    "Automation {} waits: {}",
+                    wait.rule,
+                    wait_reason_words(&wait.reason)
+                )
+            }),
+    );
+    lines
+}
+
+/// A wait reason in plain words: what holds the launch (the daemon's code
+/// and scope) and who can change it (`changed_by`).
+pub fn wait_reason_words(reason: &LaunchWaitReason) -> String {
+    let capacity = reason.code == "capacity_unavailable";
+    let what = match reason.code.as_str() {
+        "capacity_unavailable" => match reason.scope.split_once(':') {
+            Some(("global", _)) => "Swarm capacity is full".to_owned(),
+            Some(("project", _)) => "the project budget is full".to_owned(),
+            Some(("manager_assignment", _)) => "the manager budget is full".to_owned(),
+            Some((kind, name)) => format!("{kind} {name} is at its limit"),
+            None => "launch capacity is full".to_owned(),
+        },
+        "provider_held" => format!("{} is on hold at the provider", reason.scope),
+        "transfer_in_progress" => "a project transfer is in progress".to_owned(),
+        "workspace_unavailable" => "the workspace is unavailable".to_owned(),
+        code => eliot_core::reason_words(code),
+    };
+    let what_changes = if capacity { "the limit" } else { "this" };
+    let who = match reason.changed_by.as_str() {
+        "owner" => format!("the Owner can change {what_changes}"),
+        "owner_or_delegated_manager" => {
+            format!("the Owner or the project manager can change {what_changes}")
+        }
+        "caller" => "change the request and queue it again".to_owned(),
+        other => format!("{} can change {what_changes}", other.replace('_', " ")),
+    };
+    format!("{what}; {who}")
+}
+
+/// The sidebar's projects: the `chat.organization` groups in the daemon's
+/// order (registered projects, even with no row yet; an unregistered label
+/// or the no-project bucket only with members), each with the listed rows
+/// the daemon placed in it. Empty linked worktree registrations sort below
+/// the populated projects and stay selectable. A row whose group a fresh
+/// read did not return lists under that group anyway, before the bucket;
+/// on a stale read nothing is synthesized and such rows list in the
+/// bucket. Nothing is grouped by path, repository or name here.
+pub fn sections(
+    listed: &[UiAgent],
+    organization: &Organization,
+    checkouts: &[Checkout],
+    shown: &Shown,
+) -> Vec<Section> {
+    let registered: HashSet<&str> = organization
+        .registered()
+        .filter_map(|group| group.project.as_deref())
+        .collect();
+    let section = |project: Option<&str>, group: Option<&OrgGroupView>| {
+        let (name, checkout, missing) = group_place(project, group, checkouts);
+        let running = group
+            .and_then(|group| group.totals.as_ref())
+            .map_or(0, |team| team.lifecycle.busy);
+        Section {
+            key: group_key(project),
+            project: project.map(str::to_owned),
+            name,
+            checkouts: if checkout.is_empty() {
+                Vec::new()
+            } else {
+                vec![checkout.clone()]
+            },
+            checkout,
+            detail: group.map_or_else(Vec::new, |group| group_detail(group, checkouts)),
+            waits: waits(
+                organization.queue.as_ref(),
+                &organization.intents,
+                project,
+                &registered,
+            ),
+            rows: Vec::new(),
+            running,
+            collapsed: false,
+            older: 0,
+            older_shown: false,
+            missing,
+        }
     };
     let mut groups: Vec<Group> = Vec::new();
-    for checkout in checkouts {
-        let common = path_key(&checkout.common_dir);
-        let key = format!("repo:{common}");
-        let index = match groups.iter().position(|group| group.section.key == key) {
-            Some(index) => {
-                groups[index].section.checkouts.push(checkout.path.clone());
-                index
-            }
-            None => {
-                let name = checkout_repository_name(checkout, checkouts);
-                let main = main_checkout(&checkout.common_dir, checkouts);
-                groups.push(Group {
-                    section: empty(key, name, &checkout.path),
-                    main: main.as_deref().map(path_key),
-                    top: Vec::new(),
-                    subs: Vec::new(),
-                });
-                groups.len() - 1
-            }
-        };
-        let group = &mut groups[index];
-        let path = path_key(&checkout.path);
-        if group.main.as_ref() == Some(&path) {
-            group.section.checkout = checkout.path.clone();
-            group.section.missing = checkout.missing;
-            continue;
-        }
-        let sub_key = format!("sub:{path}");
-        if group.subs.iter().any(|sub| sub.sub.key == sub_key) {
-            continue;
-        }
-        group.subs.push(SubGroup {
-            sub: Subproject {
-                key: sub_key,
-                name: subproject_name(checkout).unwrap_or_default(),
-                checkout: checkout.path.clone(),
-                missing: checkout.missing,
-                rows: Vec::new(),
-                running: 0,
-                collapsed: false,
+    for group in &organization.groups {
+        groups.push(Group {
+            section: section(group.project.as_deref(), Some(group)),
+            members: if group.registration.is_some() {
+                usize::MAX
+            } else {
+                group.member_total
             },
             top: Vec::new(),
-            newest: 0,
-            live: false,
         });
     }
-    for group in &mut groups {
-        // Two branches that read alike keep their full names apart.
-        let names: Vec<String> = group.subs.iter().map(|sub| sub.sub.name.clone()).collect();
-        for sub in &mut group.subs {
-            if names.iter().filter(|name| **name == sub.sub.name).count() > 1 {
-                let checkout = checkouts
-                    .iter()
-                    .find(|checkout| path_key(&checkout.path) == sub.sub.key[4..]);
-                if let Some(branch) = checkout.and_then(|checkout| checkout.branch.as_deref()) {
-                    sub.sub.name = branch.to_owned();
-                }
+    let mut placements: HashMap<&str, String> = listed
+        .iter()
+        .map(|agent| (agent.id.as_str(), group_key(agent.organization.as_deref())))
+        .collect();
+    // On a stale read nothing is synthesized: rows whose group the last
+    // server grouping did not return list in the bucket instead.
+    let stale = organization.stale;
+    if stale {
+        if !groups.iter().any(|group| group.section.project.is_none()) {
+            groups.push(Group {
+                section: section(None, None),
+                members: 0,
+                top: Vec::new(),
+            });
+        }
+        let bucket = group_key(None);
+        for key in placements.values_mut() {
+            if !groups.iter().any(|group| group.section.key == *key) {
+                *key = bucket.clone();
+            }
+        }
+    } else {
+        for agent in listed.iter().filter(|agent| !agent.native_child) {
+            let key = &placements[agent.id.as_str()];
+            if !groups.iter().any(|group| group.section.key == *key) {
+                groups.push(Group {
+                    section: section(agent.organization.as_deref(), None),
+                    members: 0,
+                    top: Vec::new(),
+                });
             }
         }
     }
-
-    let placements: HashMap<&str, String> = listed
-        .iter()
-        .filter(|agent| !agent.chat)
-        .map(|agent| (agent.id.as_str(), agent_project_key(agent, checkouts)))
-        .collect();
-    let mut counted = HashSet::new();
-    // Chats list under Chats, not under a project.
-    for agent in listed.iter().filter(|agent| !agent.chat) {
-        let key = &placements[agent.id.as_str()];
-        let index = match groups.iter().position(|group| group.section.key == *key) {
-            Some(index) => index,
-            None => {
-                let (name, checkout) = if key == OTHER_LOCATIONS {
-                    (OTHER_LOCATIONS_NAME, "")
-                } else {
-                    (
-                        folder_name(agent.workspace.as_deref().unwrap_or(&agent.project_id)),
-                        agent.workspace.as_deref().unwrap_or(&agent.project_id),
-                    )
-                };
-                groups.push(Group {
-                    section: empty(key.clone(), name.to_owned(), checkout),
-                    main: None,
-                    top: Vec::new(),
-                    subs: Vec::new(),
-                });
-                groups.len() - 1
-            }
-        };
-        let group = &mut groups[index];
-        let sub = agent_checkout(agent, checkouts)
-            .and_then(|(_, workspace)| workspace)
-            .and_then(checkout_subproject_key)
-            .and_then(|key| group.subs.iter().position(|sub| sub.sub.key == key));
-        let first = counted.insert(agent.id.as_str());
-        if first && agent.running() {
-            group.section.running += 1;
+    // The daemon leaves an empty bucket out; its queued launches still show.
+    if !groups.iter().any(|group| group.section.project.is_none()) {
+        let bucket = section(None, None);
+        if !bucket.waits.is_empty() {
+            groups.push(Group {
+                section: bucket,
+                members: 0,
+                top: Vec::new(),
+            });
         }
+    }
+    // Empty linked worktree registrations sort below the populated
+    // projects (and any group with listed rows); the no-project bucket
+    // closes the list, as the daemon orders it.
+    let empty_registration = |key: &str, project: Option<&str>| {
+        project.is_some_and(|_| {
+            organization
+                .groups
+                .iter()
+                .find(|group| group_key(group.project.as_deref()) == key)
+                .is_some_and(|group| group.registration.is_some() && group.member_total == 0)
+        })
+    };
+    groups.sort_by_key(|group| {
+        (
+            group.section.project.is_none(),
+            empty_registration(&group.section.key, group.section.project.as_deref()),
+        )
+    });
+    for agent in listed {
+        let key = &placements[agent.id.as_str()];
+        let Some(group) = groups.iter_mut().find(|group| group.section.key == *key) else {
+            continue;
+        };
         // A native observed child shows only nested under its parent
-        // conversation (collapsed), never as a task of its own.
-        // The open Agent renders explicitly above the list.
+        // conversation (collapsed), never as a task of its own. The open
+        // Agent renders explicitly above the list.
         let pinned = shown.pinned == Some(agent.id.as_str());
         let shows = match shown.only {
             Some(keep) => keep(agent) && !agent.native_child,
@@ -753,22 +1046,8 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
                         .is_none_or(|parent| placements.get(parent) != Some(key))
             }
         };
-        match sub {
-            Some(sub) => {
-                let sub = &mut group.subs[sub];
-                if first && agent.running() {
-                    sub.sub.running += 1;
-                }
-                if !agent.native_child {
-                    sub.newest = sub.newest.max(agent.updated_at);
-                    sub.live |= agent.live();
-                }
-                if shows && !pinned {
-                    sub.top.push(agent);
-                }
-            }
-            None if shows && !pinned => group.top.push(agent),
-            None => {}
+        if shows && !pinned {
+            group.top.push(agent);
         }
     }
 
@@ -776,7 +1055,12 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for mut group in groups {
-        if filtered && group.top.is_empty() && group.subs.iter().all(|sub| sub.top.is_empty()) {
+        if filtered && group.top.is_empty() {
+            continue;
+        }
+        // An unregistered label's group is always empty (its Agents read in
+        // the bucket), and an empty bucket says nothing.
+        if group.members == 0 && group.top.is_empty() && group.section.waits.is_empty() {
             continue;
         }
         group.section.collapsed = !filtered && shown.collapsed.contains(&group.section.key);
@@ -785,118 +1069,65 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
             continue;
         }
         group.top.sort_by(|a, b| task_order(a, b));
-        for sub in &mut group.subs {
-            sub.top.sort_by(|a, b| task_order(a, b));
-        }
-        // Subprojects at work first, then live ones, then newest (a missing
-        // one before a quiet one of the same age).
-        group.subs.sort_by(|a, b| {
-            (b.sub.running > 0)
-                .cmp(&(a.sub.running > 0))
-                .then(b.live.cmp(&a.live))
-                .then(b.newest.cmp(&a.newest))
-                .then(b.sub.missing.cmp(&a.sub.missing))
-                .then_with(|| a.sub.name.cmp(&b.sub.name))
-        });
         let unfolded = shown.unfolded.contains(&group.section.key);
-        let today = shown.today_start;
-        // A quiet subproject (nothing live, nothing from today) folds as a
-        // whole; a missing one stays in view, it asks for a decision.
-        let quiet = |sub: &SubGroup| !sub.sub.missing && !sub.live && sub.newest < today;
-        let mut sub_folds: Vec<bool> = group
-            .subs
-            .iter()
-            .map(|sub| !filtered && quiet(sub))
-            .collect();
-        let mut main_folds = if filtered {
+        let folds = if filtered {
             HashSet::new()
         } else {
-            folding(&group.top, today, false)
+            folding(&group.top, shown.today_start, true)
         };
-        // Never "No tasks yet" above "Show N older": when everything
-        // would fold, the newest few tasks or subprojects stay.
-        let anything = !group.top.is_empty() || !group.subs.is_empty();
-        let all_fold = main_folds.len() == group.top.len() && sub_folds.iter().all(|folds| *folds);
-        if !filtered && anything && all_fold {
-            let mut newest: Vec<(i64, Option<usize>, Option<&str>)> = group
-                .top
-                .iter()
-                .map(|agent| (agent.updated_at, None, Some(agent.id.as_str())))
-                .chain(
-                    group
-                        .subs
-                        .iter()
-                        .enumerate()
-                        .map(|(index, sub)| (sub.newest, Some(index), None)),
-                )
-                .collect();
-            newest.sort_by_key(|(at, ..)| std::cmp::Reverse(*at));
-            for (_, sub, task) in newest.into_iter().take(RECENT_WHEN_ALL_OLDER) {
-                if let Some(index) = sub {
-                    sub_folds[index] = false;
-                }
-                if let Some(id) = task {
-                    main_folds.remove(id);
-                }
-            }
-        }
-        let mut older = main_folds.len() + sub_folds.iter().filter(|folds| **folds).count();
         for agent in &group.top {
-            if main_folds.contains(agent.id.as_str()) && !unfolded {
+            if folds.contains(agent.id.as_str()) && !unfolded {
                 continue;
             }
             push(
                 agent,
                 0,
-                false,
                 listed,
                 shown,
                 !filtered,
-                checkouts,
                 &mut seen,
                 &mut group.section.rows,
             );
         }
-        for (sub, folds) in group.subs.into_iter().zip(sub_folds) {
-            if filtered && sub.top.is_empty() {
-                continue;
-            }
-            if folds && !unfolded {
-                continue;
-            }
-            let mut subproject = sub.sub;
-            subproject.collapsed = !filtered && shown.collapsed.contains(&subproject.key);
-            if !subproject.collapsed {
-                let inner = if filtered {
-                    HashSet::new()
-                } else {
-                    folding(&sub.top, today, true)
-                };
-                older += inner.len();
-                for agent in &sub.top {
-                    if inner.contains(agent.id.as_str()) && !unfolded {
-                        continue;
-                    }
-                    push(
-                        agent,
-                        0,
-                        true,
-                        listed,
-                        shown,
-                        !filtered,
-                        checkouts,
-                        &mut seen,
-                        &mut subproject.rows,
-                    );
-                }
-            }
-            group.section.subprojects.push(subproject);
-        }
-        group.section.older = older;
-        group.section.older_shown = unfolded && older > 0;
+        group.section.older = folds.len();
+        group.section.older_shown = unfolded && !folds.is_empty();
         out.push(group.section);
     }
     out
+}
+
+/// Apply `organization.changed` rows to the loaded Agents (the list and
+/// expanded branches) by id: a retag, attach or detach refreshes a loaded
+/// row even when it sits beyond the recent and attention pages. A row
+/// already read at the same or a newer link revision stays as it is.
+/// Returns how many rows changed.
+pub fn apply_changes(
+    agents: &mut [UiAgent],
+    branches: &mut HashMap<String, Branch>,
+    changes: &[OrgRowChange],
+) -> usize {
+    let mut changed = 0;
+    let mut merge = |agent: &mut UiAgent| {
+        for change in changes.iter().filter(|change| change.agent == agent.id) {
+            if agent.organization_revision.unwrap_or(0) < change.revision {
+                agent.organization = change.organization.clone();
+                agent.tags = change.tags.clone();
+                agent.organization_revision = Some(change.revision);
+                changed += 1;
+            }
+        }
+    };
+    for agent in agents.iter_mut() {
+        merge(agent);
+    }
+    for branch in branches.values_mut() {
+        if let Branch::Loaded { children, .. } = branch {
+            for agent in children.iter_mut() {
+                merge(agent);
+            }
+        }
+    }
+    changed
 }
 
 /// Tasks using a project registration: `(live, all)`, top-level or not.
@@ -1046,36 +1277,31 @@ pub fn recents<'a>(
     recent
 }
 
-/// The sidebar's Recents: the newest tasks of collapsed projects and
-/// subprojects (their keys in `collapsed`), the ones the list above hides.
-/// Tasks folded under "Show N older" stay there, and chats stay under
-/// Chats, so Recents never repeats the list or brings back old runs.
+/// The sidebar's Recents: the newest tasks of collapsed projects (their
+/// group keys in `collapsed`), the ones the list above hides. Tasks folded
+/// under "Show N older" stay there, so Recents never repeats the list or
+/// brings back old runs.
 pub fn sidebar_recents<'a>(
     agents: &'a [UiAgent],
-    checkouts: &[Checkout],
     collapsed: &HashSet<&str>,
     limit: usize,
 ) -> Vec<&'a UiAgent> {
     recents(agents, limit, &|agent: &UiAgent| {
-        !agent.chat
-            && (collapsed.contains(agent_project_key(agent, checkouts).as_str())
-                || agent_checkout(agent, checkouts)
-                    .and_then(|(_, workspace)| workspace)
-                    .and_then(checkout_subproject_key)
-                    .is_some_and(|key| collapsed.contains(key.as_str())))
+        collapsed.contains(group_key(agent.organization.as_deref()).as_str())
     })
 }
 
-/// The chats without a project (`chat: true`), newest first; a chat's own
-/// children nest under it like a task's.
-pub fn chats(agents: &[UiAgent]) -> Vec<&UiAgent> {
-    let mut seen = HashSet::new();
-    let mut chats: Vec<&UiAgent> = agents
+/// The tag editor's fields as the tag set, one tag per field: each field
+/// trimmed and blank ones dropped, nothing split, so an existing tag such
+/// as `ops, EU` saves back unchanged. The daemon validates the rest
+/// (`chat.tag`).
+pub fn field_tags(fields: &[String]) -> Vec<String> {
+    fields
         .iter()
-        .filter(|agent| agent.chat && agent.parent.is_none() && seen.insert(agent.id.as_str()))
-        .collect();
-    chats.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
-    chats
+        .map(|field| field.trim())
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Archived Agents the default list leaves out: those still live (not
@@ -1334,15 +1560,12 @@ pub(crate) fn children_of<'a>(
 
 /// Push `agent`'s row and, when it is expanded and `tree` is on, its
 /// children's rows beneath it.
-#[allow(clippy::too_many_arguments)]
 fn push(
     agent: &UiAgent,
     depth: usize,
-    nested: bool,
     listed: &[UiAgent],
     shown: &Shown,
     tree: bool,
-    checkouts: &[Checkout],
     seen: &mut HashSet<String>,
     out: &mut Vec<Row>,
 ) {
@@ -1352,10 +1575,9 @@ fn push(
         return;
     }
     let children = if tree {
-        let key = agent_project_key(agent, checkouts);
         children_of(&agent.id, listed, shown.branches)
             .into_iter()
-            .filter(|child| child.native_child || agent_project_key(child, checkouts) == key)
+            .filter(|child| child.native_child || child.organization == agent.organization)
             .collect()
     } else {
         Vec::new()
@@ -1377,7 +1599,6 @@ fn push(
         children: children.len(),
         expanded: is_expanded,
         note,
-        nested,
     });
     if is_expanded {
         for child in children {
@@ -1385,17 +1606,7 @@ fn push(
             if shown.pinned == Some(child.id.as_str()) {
                 continue;
             }
-            push(
-                child,
-                depth + 1,
-                nested,
-                listed,
-                shown,
-                tree,
-                checkouts,
-                seen,
-                out,
-            );
+            push(child, depth + 1, listed, shown, tree, seen, out);
         }
     }
 }
@@ -1465,6 +1676,9 @@ mod tests {
             chat: false,
             archived: false,
             pending: false,
+            organization: None,
+            tags: Vec::new(),
+            organization_revision: None,
         }
     }
 
@@ -1492,6 +1706,7 @@ mod tests {
         collapsed: HashSet<String>,
         unfolded: HashSet<String>,
         today_start: i64,
+        organization: Organization,
     }
 
     impl View {
@@ -1507,6 +1722,7 @@ mod tests {
         ) -> Vec<Section> {
             sections(
                 listed,
+                &self.organization,
                 checkouts,
                 &Shown {
                     branches: &self.branches,
@@ -1628,8 +1844,7 @@ mod tests {
     #[test]
     fn the_pinned_open_agent_leaves_the_sections() {
         // An old stopped task would fold under "Show N older"; pinned, it
-        // leaves the section rows and the older count, but its project
-        // still counts the running task.
+        // leaves the section rows and the older count.
         fn shown<'x>(
             branches: &'x HashMap<String, Branch>,
             expanded: &'x HashSet<String>,
@@ -1655,20 +1870,21 @@ mod tests {
             with(agent("a2", "/p", None), "busy", 3),
             with(agent("a1", "/p", None), "stopped", 2),
         ];
+        let organization = Organization::default();
         let plain = sections(
             &listed,
+            &organization,
             &[],
             &shown(&branches, &expanded, &collapsed, &unfolded, None),
         );
         assert_eq!(plain[0].older, 1);
-        assert_eq!(plain[0].running, 1);
         let pinned = sections(
             &listed,
+            &organization,
             &[],
             &shown(&branches, &expanded, &collapsed, &unfolded, Some("a1")),
         );
         assert_eq!(pinned[0].older, 0);
-        assert_eq!(pinned[0].running, 1);
         assert_eq!(
             pinned[0]
                 .rows
@@ -1728,216 +1944,6 @@ mod tests {
         assert_eq!(repository("/srv/git/plain"), ("plain".to_owned(), None));
     }
 
-    fn shape(section: &Section) -> (Vec<&str>, Vec<(&str, Vec<&str>)>) {
-        (
-            section
-                .rows
-                .iter()
-                .map(|row| row.agent.id.as_str())
-                .collect(),
-            section
-                .subprojects
-                .iter()
-                .map(|sub| {
-                    (
-                        sub.name.as_str(),
-                        sub.rows.iter().map(|row| row.agent.id.as_str()).collect(),
-                    )
-                })
-                .collect(),
-        )
-    }
-
-    #[test]
-    fn worktrees_nest_as_subprojects_of_their_repository() {
-        let git = r"\\?\C:\src\app\.git";
-        let mut k1 = checkout(r"\\?\C:\wt\wt-k1", git);
-        k1.branch = Some("feat/k1-sidebar-tree".to_owned());
-        let mut main = checkout(r"\\?\C:\src\app", git);
-        main.origin = Some("app-web".to_owned());
-        // A detached worktree reads as its folder.
-        let k2 = checkout(r"\\?\C:\wt\wt-k2", git);
-        let checkouts = vec![
-            k1,
-            main,
-            k2,
-            checkout(r"\\?\C:\src\web", r"\\?\C:\src\web\.git"),
-            checkout(r"\\?\C:\src\idle", r"\\?\C:\src\idle\.git"),
-        ];
-        let listed = vec![
-            with(agent("a1", r"\\?\C:\wt\wt-k1", None), "busy", 0),
-            agent("a2", r"\\?\C:\src\app", None),
-            agent("a3", r"\\?\C:\wt\wt-k2", None),
-            agent("a4", r"\\?\C:\src\web", None),
-            agent("a5", r"\\?\C:\scratch\notes", None),
-        ];
-        let sections = View::default().sections(&listed, &checkouts);
-        let names: Vec<(&str, &str)> = sections
-            .iter()
-            .map(|section| (section.name.as_str(), section.checkout.as_str()))
-            .collect();
-        assert_eq!(
-            names,
-            [
-                ("app-web", r"\\?\C:\src\app"),
-                ("web", r"\\?\C:\src\web"),
-                ("idle", r"\\?\C:\src\idle"),
-                ("Other locations", ""),
-            ]
-        );
-        // The main checkout's tasks sit under the project; each linked
-        // worktree is a subproject, the one at work first.
-        assert_eq!(
-            shape(&sections[0]),
-            (
-                vec!["a2"],
-                vec![("k1 sidebar tree", vec!["a1"]), ("wt-k2", vec!["a3"])]
-            )
-        );
-        assert!(sections[0].subprojects[0].rows[0].nested);
-        assert!(!sections[0].rows[0].nested);
-        assert_eq!(
-            (sections[0].running, sections[0].subprojects[0].running),
-            (1, 1)
-        );
-        assert_eq!(shape(&sections[1]), (vec!["a4"], vec![]));
-        assert_eq!(sections[0].checkouts.len(), 3);
-        assert_eq!(place_name("app-wt-tiles", "app"), "wt-tiles");
-        assert_eq!(place_name("application", "app"), "application");
-        assert_eq!(place_name("app", "app"), "app");
-    }
-
-    #[test]
-    fn nested_repositories_keep_agents_after_worktree_removal_without_parent_fallback() {
-        let outer = r"C:\src";
-        let inner = r"C:\src\app";
-        let git = r"C:\src\app\.git";
-        let linked = r"C:\src\worktrees\app-update";
-        let mut outer_checkout = checkout(outer, r"C:\src\.git");
-        outer_checkout.registration_ids.push("outer".to_owned());
-        let mut inner_checkout = checkout(inner, git);
-        inner_checkout.registration_ids.push("inner".to_owned());
-        let mut checkouts = vec![outer_checkout, inner_checkout, checkout(linked, git)];
-
-        let outer_agent = agent("a1", outer, None);
-        let mut recorded = agent("a2", linked, Some("a1"));
-        recorded.project_id = "inner".to_owned();
-        recorded.workspace = Some(linked.to_owned());
-        let mut legacy = agent("a3", linked, None);
-        legacy.project_id = outer.to_owned();
-        legacy.workspace = Some(linked.to_owned());
-        let mut managed = agent("a4", linked, None);
-        managed.repo_common_dir = Some(git.to_owned());
-        let mut view = View::default();
-        view.expanded.insert("a1".to_owned());
-        let listed = [outer_agent, recorded, legacy, managed];
-
-        let sections = view.sections(&listed, &checkouts);
-        assert_eq!(shape(&sections[0]), (vec!["a1"], vec![]));
-        assert_eq!(sections[0].rows[0].children, 0);
-        assert_eq!(sections[1].subprojects[0].rows.len(), 3);
-
-        checkouts.pop();
-        let sections = view.sections(&listed, &checkouts);
-        assert_eq!(shape(&sections[0]), (vec!["a1"], vec![]));
-        assert_eq!(shape(&sections[1]), (vec!["a2", "a4"], vec![]));
-        assert_eq!(sections[2].name, "Other locations");
-        assert_eq!(shape(&sections[2]), (vec!["a3"], vec![]));
-    }
-
-    #[test]
-    fn quiet_subprojects_fold_and_missing_ones_stay() {
-        let git = r"C:\src\app\.git";
-        let mut done = checkout(r"C:\wt\done", git);
-        done.branch = Some("fix/old-bug".to_owned());
-        let mut gone = checkout(r"C:\wt\gone", git);
-        gone.missing = true;
-        let mut today = checkout(r"C:\wt\today", git);
-        today.branch = Some("feat/today".to_owned());
-        let empty = checkout(r"C:\wt\empty", git);
-        let checkouts = vec![checkout(r"C:\src\app", git), done, gone, today, empty];
-        let listed = vec![
-            with(agent("a1", r"C:\src\app", None), "idle", 50),
-            with(agent("a2", r"C:\wt\done", None), "stopped", 10),
-            with(agent("a3", r"C:\wt\today", None), "stopped", 150),
-            with(agent("a4", r"C:\wt\today", None), "stopped", 20),
-        ];
-        let mut view = View {
-            today_start: 100,
-            ..View::default()
-        };
-        let section = &view.sections(&listed, &checkouts)[0];
-        // The missing worktree stays in view; the one from today shows its
-        // task from today; the quiet and the empty ones fold.
-        assert_eq!(
-            shape(section),
-            (vec!["a1"], vec![("today", vec!["a3"]), ("gone", vec![])])
-        );
-        assert!(section.subprojects[1].missing);
-        // Folded: two quiet subprojects and a4 inside "today".
-        assert_eq!((section.older, section.older_shown), (3, false));
-
-        view.unfolded.insert(section.key.clone());
-        let unfolded = &view.sections(&listed, &checkouts)[0];
-        assert_eq!(
-            shape(unfolded),
-            (
-                vec!["a1"],
-                vec![
-                    ("today", vec!["a3", "a4"]),
-                    ("old bug", vec!["a2"]),
-                    ("gone", vec![]),
-                    ("empty", vec![]),
-                ]
-            )
-        );
-        assert!(unfolded.older_shown);
-
-        // A collapsed subproject keeps its count, not its rows.
-        let mut view = View {
-            today_start: 100,
-            ..View::default()
-        };
-        view.collapsed
-            .insert(format!("sub:{}", path_key(r"C:\wt\today")));
-        let section = &view.sections(&listed, &checkouts)[0];
-        assert!(section.subprojects[0].collapsed);
-        assert!(section.subprojects[0].rows.is_empty());
-    }
-
-    #[test]
-    fn a_project_whose_subprojects_are_all_quiet_keeps_its_newest_few() {
-        let git = r"C:\src\app\.git";
-        let checkouts: Vec<Checkout> = std::iter::once(checkout(r"C:\src\app", git))
-            .chain((1..=5).map(|index| {
-                let mut worktree = checkout(&format!(r"C:\wt\w{index}"), git);
-                worktree.branch = Some(format!("feat/w{index}"));
-                worktree
-            }))
-            .collect();
-        let listed: Vec<UiAgent> = (1..=5)
-            .map(|index| {
-                with(
-                    agent(&format!("a{index}"), &format!(r"C:\wt\w{index}"), None),
-                    "stopped",
-                    index * 10,
-                )
-            })
-            .collect();
-        let view = View {
-            today_start: 100,
-            ..View::default()
-        };
-        let section = &view.sections(&listed, &checkouts)[0];
-        let names: Vec<&str> = section
-            .subprojects
-            .iter()
-            .map(|sub| sub.name.as_str())
-            .collect();
-        assert_eq!(names, ["w5", "w4", "w3"]);
-        assert_eq!(section.older, 2);
-    }
-
     #[test]
     fn registrations_count_the_tasks_that_use_them() {
         let git = r"C:\src\app\.git";
@@ -1980,21 +1986,20 @@ mod tests {
     }
 
     #[test]
-    fn a_search_lists_matches_under_their_subproject() {
+    fn a_search_label_names_the_worktree_and_lists_matches_in_their_group() {
         let git = r"C:\src\app\.git";
         let mut worktree = checkout(r"C:\wt\w1", git);
         worktree.branch = Some("feat/k9-search".to_owned());
         let checkouts = vec![checkout(r"C:\src\app", git), worktree];
         let mut found = agent("a1", r"C:\wt\w1", None);
         found.title = "needle".to_owned();
+        found.organization = Some("app".to_owned());
         let listed = vec![found, agent("a2", r"C:\src\app", None)];
         let needle = |agent: &UiAgent| agent.title == "needle";
         let sections = View::default().filtered(&listed, &checkouts, Some(&needle));
-        assert_eq!(
-            shape(&sections[0]),
-            (vec![], vec![("k9 search", vec!["a1"])])
-        );
-        // The search label names the subproject too.
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].key, "org:app");
+        assert_eq!(ids(&sections[0]), [("a1", 0)]);
         assert_eq!(
             search(&listed, &checkouts, "needle")[0].0,
             "needle · app › k9 search · muse"
@@ -2062,18 +2067,30 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_project_keeps_only_its_running_count() {
-        let listed = vec![
+    fn a_collapsed_project_keeps_only_the_servers_running_count() {
+        let mut listed = vec![
             with(agent("a1", "/p", None), "busy", 0),
             with(agent("a2", "/p", Some("a1")), "starting", 0),
             with(agent("a3", "/p", None), "idle", 0),
         ];
-        let mut view = View::default();
+        for agent in &mut listed {
+            agent.organization = Some("app".to_owned());
+        }
+        let mut view = View {
+            organization: Organization {
+                groups: vec![with_totals(group("app", 3), 2, 1)],
+                ..Organization::default()
+            },
+            ..View::default()
+        };
         let key = view.sections(&listed, &[])[0].key.clone();
+        assert_eq!(key, "org:app");
         view.collapsed.insert(key);
         let section = &view.sections(&listed, &[])[0];
         assert!(section.collapsed);
         assert!(section.rows.is_empty());
+        // The group's busy count as the server returned it, not the
+        // listed rows and not busy plus starting.
         assert_eq!(section.running, 2);
     }
 
@@ -2089,16 +2106,15 @@ mod tests {
             with(agent("a5", "/q", None), "lost", 0),
             with(agent("a6", "/r", None), "idle", 0),
         ];
+        let mut listed = listed;
+        for agent in &mut listed {
+            agent.organization = Some(agent.project_id.trim_start_matches('/').to_owned());
+        }
         let mut view = View::default();
         // Collapsing never hides a match.
-        view.collapsed.insert("repo:/p/.git".to_owned());
-        let checkouts = [
-            checkout("/p", "/p/.git"),
-            checkout("/q", "/q/.git"),
-            checkout("/r", "/r/.git"),
-        ];
+        view.collapsed.insert("org:p".to_owned());
         let attention = |agent: &UiAgent| agent.needs_attention();
-        let sections = view.filtered(&listed, &checkouts, Some(&attention));
+        let sections = view.filtered(&listed, &[], Some(&attention));
         let flat: Vec<Vec<(&str, usize)>> = sections.iter().map(ids).collect();
         // A lost task needs a decision too (Resume, why or archive).
         assert_eq!(flat, [vec![("a2", 0)], vec![("a4", 0), ("a5", 0)]]);
@@ -2261,41 +2277,31 @@ mod tests {
 
     #[test]
     fn sidebar_recents_hold_only_collapsed_projects_tasks() {
-        let checkouts = [
-            checkout("C:\\w\\atlas", "C:\\w\\atlas\\.git"),
-            checkout("C:\\w\\atlas-wt-1", "C:\\w\\atlas\\.git"),
-        ];
         let mut listed = vec![
             with(agent("a1", "C:\\w\\atlas", None), "stopped", 10),
             with(agent("a2", "C:\\w\\atlas-wt-1", None), "idle", 30),
             with(agent("a3", "C:\\w\\other", None), "stopped", 20),
             with(agent("a4", "C:\\chats\\a4", None), "idle", 40),
         ];
+        listed[0].organization = Some("atlas".to_owned());
+        listed[1].organization = Some("atlas".to_owned());
         listed[3].chat = true;
-        let key = project_key("C:\\w\\atlas", &checkouts);
         // Nothing collapsed: the list shows every task, Recents is empty
         // (older tasks stay folded under their project).
-        assert!(sidebar_recents(&listed, &checkouts, &HashSet::new(), 8).is_empty());
+        assert!(sidebar_recents(&listed, &HashSet::new(), 8).is_empty());
+        let key = group_key(Some("atlas"));
         let collapsed: HashSet<&str> = [key.as_str()].into_iter().collect();
-        let ids: Vec<&str> = sidebar_recents(&listed, &checkouts, &collapsed, 8)
+        let ids: Vec<&str> = sidebar_recents(&listed, &collapsed, 8)
             .into_iter()
             .map(|agent| agent.id.as_str())
             .collect();
-        // Both checkouts of the collapsed repository; the other project
-        // and the chat stay where they are.
+        // Every task the daemon reads in the collapsed project; the bucket
+        // (a legacy label and the chat) stays where it is.
         assert_eq!(ids, ["a2", "a1"]);
-        // A collapsed subproject hides its tasks too: they are Recents.
-        let sub = subproject_key("C:\\w\\atlas-wt-1", &checkouts).unwrap();
-        let collapsed: HashSet<&str> = [sub.as_str()].into_iter().collect();
-        let ids: Vec<&str> = sidebar_recents(&listed, &checkouts, &collapsed, 8)
-            .into_iter()
-            .map(|agent| agent.id.as_str())
-            .collect();
-        assert_eq!(ids, ["a2"]);
     }
 
     #[test]
-    fn native_children_nest_only_and_stay_out_of_recents_and_chats_leave_projects() {
+    fn native_children_nest_only_and_stay_out_of_recents_and_chats_read_in_their_group() {
         let parent = with(agent("a1", "/w", None), "idle", 10);
         let mut child = with(agent("a2", "/w", Some("a1")), "unknown", 50);
         child.native_child = true;
@@ -2315,15 +2321,369 @@ mod tests {
             .collect();
         assert_eq!(recent, ["a4", "a1"]);
         let sections = View::default().sections(&listed, &[]);
-        assert_eq!(sections.len(), 1, "the chat makes no project of its own");
-        // A worker whose manager is not listed stays a top-level row.
-        assert_eq!(ids(&sections[0]), [("a6", 0), ("a1", 0)]);
+        // Everything here reads in the no-project bucket, the unattached
+        // chat included; a worker whose manager is not listed stays a
+        // top-level row.
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].key, OTHER_LOCATIONS);
+        assert_eq!(ids(&sections[0]), [("a6", 0), ("a4", 0), ("a1", 0)]);
         assert_eq!(
-            sections[0].rows[1].children, 2,
+            sections[0].rows[2].children, 2,
             "the native child and the worker nest under a1"
         );
-        let chat_ids: Vec<&str> = chats(&listed).iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(chat_ids, ["a4"]);
+    }
+
+    fn registration(id: &str) -> eliot_core::api::ProjectRegistrationView {
+        eliot_core::api::ProjectRegistrationView {
+            id: id.to_owned(),
+            checkout: format!("/src/{id}"),
+            repo_common_dir: format!("/src/{id}/.git"),
+            profiles: Vec::new(),
+            actions: Vec::new(),
+            interpreters: Default::default(),
+            run_env: Vec::new(),
+            git: None,
+            revision: 1,
+            origin: None,
+            checkouts: Vec::new(),
+        }
+    }
+
+    fn group(project: &str, members: usize) -> OrgGroupView {
+        OrgGroupView {
+            project: Some(project.to_owned()),
+            registration: Some(registration(project)),
+            assignment: Some(eliot_core::api::ProjectAssignment {
+                project: project.to_owned(),
+                manager: None,
+                epoch: 0,
+                revision: 1,
+                state: ProjectAssignmentState::Vacant,
+                workspace: None,
+                start_command_id: None,
+            }),
+            needs_assignment: false,
+            conflicting_roots: Vec::new(),
+            manager: None,
+            transfer: None,
+            members: Vec::new(),
+            member_total: members,
+            members_truncated: false,
+            totals: None,
+            capacity: None,
+        }
+    }
+
+    fn bucket(members: usize) -> OrgGroupView {
+        OrgGroupView {
+            project: None,
+            registration: None,
+            assignment: None,
+            needs_assignment: false,
+            conflicting_roots: Vec::new(),
+            manager: None,
+            transfer: None,
+            members: Vec::new(),
+            member_total: members,
+            members_truncated: false,
+            totals: None,
+            capacity: None,
+        }
+    }
+
+    fn with_totals(mut group: OrgGroupView, busy: usize, starting: usize) -> OrgGroupView {
+        group.totals = Some(eliot_core::api::ProjectTotals {
+            live: busy,
+            lifecycle: eliot_core::api::LifecycleTotals {
+                live: busy,
+                busy,
+                starting,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        group
+    }
+
+    #[test]
+    fn sections_are_the_daemons_groups_with_the_rows_it_placed() {
+        // Registered projects in the daemon's order (an empty one too), an
+        // unregistered label's empty group skipped, the bucket last.
+        let mut label = bucket(0);
+        label.project = Some("/legacy/wt-k1".to_owned());
+        let organization = Organization {
+            groups: vec![label, group("alpha", 2), group("beta", 0), bucket(2)],
+            ..Organization::default()
+        };
+        let mut attached = with(agent("a1", "", None), "idle", 30);
+        attached.chat = true;
+        attached.organization = Some("alpha".to_owned());
+        let mut placed = with(agent("a2", "alpha", None), "idle", 20);
+        placed.organization = Some("alpha".to_owned());
+        // A legacy `wt-*` label the daemon does not link stays in the
+        // bucket, whatever its path says.
+        let legacy = with(agent("a3", "/legacy/wt-k1", None), "idle", 10);
+        let mut loose = with(agent("a4", "", None), "idle", 5);
+        loose.chat = true;
+        // A row of a group this read did not return keeps its own group.
+        let mut stale = with(agent("a5", "gamma", None), "idle", 1);
+        stale.organization = Some("gamma".to_owned());
+        let listed = vec![attached, placed, legacy, loose, stale];
+        let view = View {
+            organization,
+            ..View::default()
+        };
+        let sections = view.sections(&listed, &[]);
+        let keys: Vec<&str> = sections.iter().map(|s| s.key.as_str()).collect();
+        // The empty linked registration sorts below the groups with rows;
+        // the bucket closes the list.
+        assert_eq!(
+            keys,
+            ["org:alpha", "org:gamma", "org:beta", OTHER_LOCATIONS]
+        );
+        assert_eq!(ids(&sections[0]), [("a1", 0), ("a2", 0)]);
+        assert_eq!(ids(&sections[1]), [("a5", 0)]);
+        assert!(sections[2].rows.is_empty());
+        assert_eq!(sections[2].name, "beta");
+        assert_eq!(ids(&sections[3]), [("a3", 0), ("a4", 0)]);
+        assert_eq!(sections[3].name, "No project");
+        // Exact server totals, not the listed rows.
+        assert_eq!(sections[0].detail, ["No manager · 2 tasks"]);
+        assert_eq!(sections[3].detail, ["2 tasks"]);
+    }
+
+    #[test]
+    fn stale_grouping_synthesizes_nothing_and_routes_rows_to_the_bucket() {
+        let organization = Organization {
+            groups: vec![group("alpha", 2)],
+            stale: true,
+            ..Organization::default()
+        };
+        let mut placed = with(agent("a2", "alpha", None), "idle", 20);
+        placed.organization = Some("alpha".to_owned());
+        // A row of a group the last server grouping did not return lists
+        // in the bucket, never under a synthesized header.
+        let mut unknown = with(agent("a5", "gamma", None), "idle", 1);
+        unknown.organization = Some("gamma".to_owned());
+        let listed = vec![placed, unknown];
+        let view = View {
+            organization,
+            ..View::default()
+        };
+        let sections = view.sections(&listed, &[]);
+        let keys: Vec<&str> = sections.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(keys, ["org:alpha", OTHER_LOCATIONS]);
+        assert_eq!(ids(&sections[1]), [("a5", 0)]);
+    }
+
+    #[test]
+    fn group_detail_names_manager_branch_assignment_roots_and_totals() {
+        let mut team = group("app", 7);
+        team.assignment.as_mut().unwrap().manager = Some(ProjectManagerIdentity::Local {
+            agent: "a10".to_owned(),
+            generation: 1,
+        });
+        team.assignment.as_mut().unwrap().state = ProjectAssignmentState::Active;
+        team.manager = Some(eliot_core::api::OverviewManagerView {
+            agent: "a10".to_owned(),
+            generation: 1,
+            state: AgentState::Busy,
+            assignment_revision: 2,
+            workspace: Some("/wt/app-k1".to_owned()),
+            branch: Some("feat/k1-standard".to_owned()),
+        });
+        team.transfer = Some("01JTRANSFER".to_owned());
+        let mut team = with_totals(team, 2, 1);
+        team.totals.as_mut().unwrap().queued = 1;
+        team.capacity = Some(eliot_core::api::ScopeUsage {
+            scope: "project:app".to_owned(),
+            usage: 2,
+            limit: Some(4),
+        });
+        // Every lifecycle count under its own word, as the server returned
+        // it: busy and starting are never added together.
+        assert_eq!(
+            group_detail(&team, &[]),
+            [
+                "Manager a10 · busy · feat/k1-standard · transfer in progress",
+                "7 tasks · 2 live · 2 busy · 1 starting · 1 queued · 2/4 slots",
+            ]
+        );
+        // No manager and several roots: shown plainly, never auto-assigned.
+        let mut vacant = group("app", 3);
+        vacant.needs_assignment = true;
+        vacant.conflicting_roots = ["a2", "a3", "a4", "a5"].map(str::to_owned).to_vec();
+        assert_eq!(
+            group_detail(&vacant, &[]),
+            [
+                "Needs assignment",
+                "Competing roots: a2, a3, a4 +1",
+                "3 tasks"
+            ]
+        );
+        vacant.assignment.as_mut().unwrap().state = ProjectAssignmentState::Blocked;
+        vacant.conflicting_roots.truncate(1);
+        assert_eq!(
+            group_detail(&vacant, &[])[..2],
+            ["Needs assignment · blocked", "Competing root: a2"]
+        );
+    }
+
+    #[test]
+    fn waits_show_the_reason_and_who_can_change_it_in_their_group() {
+        let reason = |code: &str, scope: &str, by: &str| LaunchWaitReason {
+            code: code.to_owned(),
+            scope: scope.to_owned(),
+            changed_by: by.to_owned(),
+        };
+        let intent = |id: &str, project: &str, state, reason| eliot_core::api::LaunchIntentView {
+            id: id.to_owned(),
+            project: project.to_owned(),
+            state,
+            command_id: None,
+            reason,
+        };
+        let queue = LaunchQueueView {
+            interactive: vec![
+                intent(
+                    "i1",
+                    "app",
+                    LaunchIntentState::Queued,
+                    Some(reason("capacity_unavailable", "global:swarm", "owner")),
+                ),
+                intent("i2", "", LaunchIntentState::Queued, None),
+                intent("i3", "app", LaunchIntentState::Admitted, None),
+            ],
+            assignments: vec![eliot_core::api::AssignmentWaitView {
+                rule: "nightly".to_owned(),
+                project: "app".to_owned(),
+                due_at: 0,
+                reason: reason(
+                    "capacity_unavailable",
+                    "manager_assignment:app",
+                    "owner_or_delegated_manager",
+                ),
+            }],
+            next_after: None,
+        };
+        let registered: HashSet<&str> = ["app"].into_iter().collect();
+        assert_eq!(
+            waits(Some(&queue), &[], Some("app"), &registered),
+            [
+                "Queued launch: Swarm capacity is full; the Owner can change the limit",
+                "Automation nightly waits: the manager budget is full; the Owner or the \
+                 project manager can change the limit",
+            ]
+        );
+        assert_eq!(
+            waits(Some(&queue), &[], None, &registered),
+            ["Queued launch: waiting for its turn"]
+        );
+        // A watched intent's reason renders even when no queue page
+        // carries it; one already in the queue page renders once.
+        let watched = vec![
+            intent(
+                "i9",
+                "app",
+                LaunchIntentState::Queued,
+                Some(reason("transfer_in_progress", "project:app", "owner")),
+            ),
+            intent("i1", "app", LaunchIntentState::Queued, None),
+        ];
+        assert_eq!(
+            waits(Some(&queue), &watched, Some("app"), &registered),
+            [
+                "Queued launch: Swarm capacity is full; the Owner can change the limit",
+                "Queued launch i9: a project transfer is in progress; the Owner can \
+                 change this",
+                "Automation nightly waits: the manager budget is full; the Owner or the \
+                 project manager can change the limit",
+            ]
+        );
+        // The daemon omits an empty bucket; its queued launch still lists.
+        let view = View {
+            organization: Organization {
+                groups: vec![group("app", 0)],
+                queue: Some(queue.clone()),
+                ..Organization::default()
+            },
+            ..View::default()
+        };
+        let sections = view.sections(&[], &[]);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[1].key, OTHER_LOCATIONS);
+        assert_eq!(sections[1].waits, ["Queued launch: waiting for its turn"]);
+        assert_eq!(
+            wait_reason_words(&reason("workspace_unavailable", "workspace", "owner")),
+            "the workspace is unavailable; the Owner can change this"
+        );
+    }
+
+    #[test]
+    fn tag_fields_round_trip_one_tag_each() {
+        // A CLI tag with a comma stays one tag when saved unedited.
+        let fields = ["ops, EU".to_owned(), "inbox".to_owned()];
+        assert_eq!(field_tags(&fields), ["ops, EU", "inbox"]);
+        // Blank fields drop and each field is trimmed.
+        let typed = [" k175 ".to_owned(), "  ".to_owned(), String::new()];
+        assert_eq!(field_tags(&typed), ["k175"]);
+    }
+
+    #[test]
+    fn organization_changes_refresh_loaded_rows_by_id() {
+        // An older stopped row loaded long ago, and a branch child.
+        let mut old = with(agent("a3", "", None), "stopped", 1);
+        old.organization = Some("alpha".to_owned());
+        old.tags = vec!["inbox".to_owned()];
+        old.organization_revision = Some(2);
+        let mut agents = vec![old];
+        let mut branches = HashMap::new();
+        branches.insert(
+            "a1".to_owned(),
+            Branch::Loaded {
+                children: vec![with(agent("a4", "", Some("a1")), "idle", 1)],
+                more: false,
+            },
+        );
+        let changes = vec![
+            // A retag of a3 at a newer revision applies.
+            OrgRowChange {
+                agent: "a3".to_owned(),
+                organization: Some("alpha".to_owned()),
+                tags: vec!["ops, EU".to_owned()],
+                revision: 3,
+            },
+            // a4 had no overlay row: its first attach applies.
+            OrgRowChange {
+                agent: "a4".to_owned(),
+                organization: Some("beta".to_owned()),
+                tags: Vec::new(),
+                revision: 1,
+            },
+            // A row nobody loaded changes nothing.
+            OrgRowChange {
+                agent: "a9".to_owned(),
+                organization: None,
+                tags: Vec::new(),
+                revision: 1,
+            },
+        ];
+        assert_eq!(apply_changes(&mut agents, &mut branches, &changes), 2);
+        assert_eq!(agents[0].tags, ["ops, EU"]);
+        assert_eq!(agents[0].organization_revision, Some(3));
+        let Some(Branch::Loaded { children, .. }) = branches.get("a1") else {
+            panic!("loaded branch");
+        };
+        assert_eq!(children[0].organization.as_deref(), Some("beta"));
+        // Replaying the same rows (or older ones) changes nothing.
+        assert_eq!(apply_changes(&mut agents, &mut branches, &changes), 0);
+        let older = [OrgRowChange {
+            revision: 2,
+            tags: Vec::new(),
+            ..changes[0].clone()
+        }];
+        assert_eq!(apply_changes(&mut agents, &mut branches, &older), 0);
+        assert_eq!(agents[0].tags, ["ops, EU"]);
     }
 
     #[test]
@@ -2405,6 +2765,9 @@ mod tests {
             project_scope: None,
             heavy: None,
             session_growth: None,
+            organization: None,
+            tags: Vec::new(),
+            organization_revision: None,
         }
     }
 

@@ -402,8 +402,12 @@ impl DesktopApp {
                                 self.handoff.submitted = None;
                             }
                         }
-                        self.handoff.status = format!("Refused: {error}");
-                        self.handoff.refusal = Some(format!("Refused: {error}"));
+                        // Shared words lead (a draining project transfer
+                        // reads "A project transfer is in progress"), the
+                        // daemon's reason follows intact.
+                        let refusal = format!("Refused: {}", error.user_message());
+                        self.handoff.status = refusal.clone();
+                        self.handoff.refusal = Some(refusal);
                     }
                 }
             }
@@ -1371,6 +1375,9 @@ mod tests {
             chat: false,
             archived: false,
             pending,
+            organization: None,
+            tags: Vec::new(),
+            organization_revision: None,
         }
     }
 

@@ -109,6 +109,21 @@ pub struct AgentSummary {
     /// field; absent on old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_growth: Option<SessionGrowthView>,
+    /// The `chat.organization` group this row reads in, from the same
+    /// committed predicate as the projection: the execution project when
+    /// it is a retained registration, a chat's placement link when that
+    /// is one; absent for the no-project bucket. Placement only, never
+    /// authority. Trailing field; absent on old wire payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    /// Organization tag groups (`chat.tag`). Trailing field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// The overlay row's revision the row's `organization` and `tags` were
+    /// read with (`None` for no overlay row); a menu write carries it back
+    /// as its expected revision. Trailing field; absent on old payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_revision: Option<i64>,
 }
 
 impl AgentSummary {
@@ -200,6 +215,19 @@ impl AgentSummary {
         }
         if let Some(growth) = &self.session_growth {
             growth.validate()?;
+        }
+        if let Some(group) = &self.organization {
+            super::organization::validate_project_name(group, "Agent summary organization")?;
+        }
+        super::organization::validate_tags(&self.tags)?;
+        if self
+            .organization_revision
+            .is_some_and(|revision| revision < 1)
+        {
+            return Err(Error::new(
+                "invalid",
+                "Agent summary organization revision is invalid",
+            ));
         }
         Ok(())
     }

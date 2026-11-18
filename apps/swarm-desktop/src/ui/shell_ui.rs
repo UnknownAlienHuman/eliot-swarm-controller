@@ -40,6 +40,14 @@ pub(super) enum ShellMsg {
     /// The owner chose a fresh private data directory (unsafe default).
     UseFreshDirectory,
     ProjectsLoaded(Fallible<Vec<UiProject>>),
+    /// The sidebar's grouping readback (`chat.organization` groups with
+    /// their headers and totals, and the `organization.changed` rows since
+    /// the cursor). A failed read keeps the last server grouping with a
+    /// stale marker.
+    OrganizationLoaded(Box<nav::Organization>),
+    /// The sidebar's queue state (`launch.queue` waits and this window's
+    /// watched intents), polled independently of the grouping read.
+    QueueLoaded(Box<super::QueueRead>),
     AgentsLoaded(u64, bool, Fallible<AgentPage>),
     /// A first-recent-page refresh: merge the rows into the loaded history
     /// (a launch while the desktop is open arrives here, without dropping
@@ -180,6 +188,13 @@ impl Appearance {
 pub(super) struct ShellState {
     pub(super) selection: Selection,
     pub(super) projects: Vec<UiProject>,
+    /// The sidebar's projects as the daemon groups and counts them.
+    pub(super) organization: nav::Organization,
+    /// An organization read is in flight (one at a time).
+    pub(super) organization_loading: bool,
+    /// A queue-state read is in flight (one at a time, independent of the
+    /// grouping read).
+    pub(super) queue_loading: bool,
     /// Listed pages, in daemon order.
     pub(super) agents: Vec<UiAgent>,
     /// Direct-children reads of expanded managers.
@@ -251,6 +266,7 @@ impl DesktopApp {
                     let first_connection = !self.preferences_loaded;
                     self.preferences_loaded = true;
                     self.load_agents(context, None);
+                    self.load_organization(context);
                     self.load_profile_list(context);
                     self.load_routing_preview(context);
                     // The picker opens on a read catalogue (the daemon caches it).
@@ -296,6 +312,40 @@ impl DesktopApp {
                         }
                     }
                 }
+            }
+            ShellMsg::OrganizationLoaded(read) => {
+                self.nav.organization_loading = false;
+                let read = *read;
+                let organization = &mut self.nav.organization;
+                // A failed read keeps the last server grouping (marked
+                // stale); nothing is synthesized in its place.
+                if !read.stale {
+                    organization.groups = read.groups;
+                }
+                organization.stale = read.stale;
+                organization.errors = read.errors;
+                organization.changes_after = read.changes_after;
+                // Organization changes (retag, attach, detach) refresh the
+                // affected loaded rows by id, so an older loaded row never
+                // keeps a stale placement or tags.
+                let changed =
+                    nav::apply_changes(&mut self.nav.agents, &mut self.nav.branches, &read.changes);
+                if changed > 0 {
+                    self.refresh_search();
+                }
+            }
+            ShellMsg::QueueLoaded(read) => {
+                self.nav.queue_loading = false;
+                let read = *read;
+                let organization = &mut self.nav.organization;
+                // A failed queue read keeps the last waits beside its error.
+                if read.queue.is_some() {
+                    organization.queue = read.queue;
+                }
+                organization.intents = read.intents;
+                organization.missing_intents = read.missing;
+                organization.queue_errors = read.errors;
+                self.settle_queued_launches(context);
             }
             ShellMsg::ProjectsLoaded(projects) => match projects {
                 Ok(projects) => {
@@ -480,6 +530,7 @@ impl DesktopApp {
                     });
                 }
                 self.load_agents(context, None);
+                self.load_organization(context);
                 // Expanded branches are read again; their rows stay until then.
                 let expanded: Vec<String> = self.nav.expanded.iter().cloned().collect();
                 for id in expanded {
@@ -701,15 +752,26 @@ impl DesktopApp {
             ShellMsg::FocusSearch(tries) => self.focus_search(tries, context),
             ShellMsg::FocusSearchLater(tries) => self.focus_search_later(tries, context),
             ShellMsg::ShortcutsEnded => {}
-            ShellMsg::AlertDismissed => self.alert = None,
+            ShellMsg::AlertDismissed => {
+                // Dismissing the queue notice releases its draft only once
+                // no intent can exist for it (see `dismiss_queue_offer`).
+                self.alert = None;
+                self.dismiss_queue_notice(context);
+            }
             ShellMsg::ListTick => {
                 // The head (the first recent page plus the live and
                 // attention rows) is re-read on every poll and merged into
                 // the loaded history, even with older pages appended: a
                 // launch or a state change while the desktop is open
-                // arrives without a manual refresh.
+                // arrives without a manual refresh. The queue state polls on
+                // its own worker, so the grouping reads never delay an
+                // arbiter's admission or refusal.
                 if self.preferences_loaded && !self.nav.agents_loading {
                     self.refresh_head(context);
+                }
+                if self.preferences_loaded {
+                    self.load_organization(context);
+                    self.load_queue(context);
                 }
                 self.watch_list(context);
             }
@@ -1221,6 +1283,53 @@ impl DesktopApp {
             self.load_attention(context);
         }
     }
+    /// Re-read the organization readbacks the sidebar's projects show (one
+    /// read at a time; the list poll and every refresh ask again).
+    pub(super) fn load_organization(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.nav.organization_loading {
+            return;
+        }
+        self.nav.organization_loading = true;
+        let archived = if self.nav.show_archived {
+            eliot_core::api::ArchivedFilter::Include
+        } else {
+            eliot_core::api::ArchivedFilter::Exclude
+        };
+        let changes_after = self.nav.organization.changes_after;
+        let _task = context.spawn_background(move |_| {
+            Message::Shell(ShellMsg::OrganizationLoaded(Box::new(
+                load_organization_blocking(&data_dir, archived, changes_after),
+            )))
+        });
+    }
+
+    /// Re-read the queue state (`launch.queue` waits and this window's
+    /// queued intents) on a worker of its own, so the grouping reads never
+    /// delay an arbiter's admission or refusal.
+    pub(super) fn load_queue(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.nav.queue_loading {
+            return;
+        }
+        self.nav.queue_loading = true;
+        let watched: Vec<String> = self
+            .launch
+            .watched
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        let _task = context.spawn_background(move |_| {
+            Message::Shell(ShellMsg::QueueLoaded(Box::new(load_queue_blocking(
+                &data_dir, watched,
+            ))))
+        });
+    }
+
     /// The live and attention rows, fetched independently of the history
     /// page so an old waiting Agent is never cut off by newer history.
     fn load_attention(&mut self, context: &ComponentContext<Self>) {
@@ -1473,7 +1582,7 @@ impl DesktopApp {
             only: filtered.then_some(&keep as &dyn Fn(&UiAgent) -> bool),
             pinned: pinned.as_deref(),
         };
-        let sections = nav::sections(&self.nav.agents, &checkouts, &shown);
+        let sections = nav::sections(&self.nav.agents, &self.nav.organization, &checkouts, &shown);
 
         let caption = if filtered {
             "Matching tasks"
@@ -1509,6 +1618,20 @@ impl DesktopApp {
         };
         let mut items: Vec<KeyedView> =
             vec![KeyedView::new(format!("caption:{caption}"), caption_row)];
+        // A failed organization or queue read says so; the rows keep the
+        // group the daemon placed them in.
+        for error in self
+            .nav
+            .organization
+            .errors
+            .iter()
+            .chain(&self.nav.organization.queue_errors)
+        {
+            items.push(KeyedView::new(
+                format!("organization-error:{error}"),
+                detail_row(error, Some(palette.error())),
+            ));
+        }
         // The open Agent, explicitly above the list: visible even when it
         // aged out of the newest page or would fold under Show older.
         if let Some(open) = pinned.as_ref().and_then(|id| self.find_agent(id)).cloned() {
@@ -1525,7 +1648,6 @@ impl DesktopApp {
                     children: kids.len(),
                     expanded,
                     note: None,
-                    nested: false,
                 },
                 context,
                 palette,
@@ -1539,7 +1661,6 @@ impl DesktopApp {
                             children: 0,
                             expanded: false,
                             note: None,
-                            nested: false,
                         },
                         context,
                         palette,
@@ -1584,15 +1705,25 @@ impl DesktopApp {
                 collapsed: section.collapsed,
                 running: section.running,
                 missing: section.missing,
-                nested: false,
             };
             items.push(self.place_item(&place, selected, filtered, context, palette));
             if section.collapsed {
                 continue;
             }
-            if section.rows.is_empty() && section.subprojects.is_empty() {
-                // Older tasks fold below; "No tasks yet" only when there
-                // are none at all.
+            // The server's lines: the team (manager, branch, assignment or
+            // "Needs assignment"), competing roots, exact totals, then the
+            // queued launches with their wait reasons.
+            for (index, line) in section.detail.iter().chain(&section.waits).enumerate() {
+                items.push(KeyedView::new(
+                    format!("detail:{}:{index}:{line}", section.key),
+                    detail_row(line, None),
+                ));
+            }
+            // Older tasks fold below; "No tasks yet" only when no server
+            // line already says what is there.
+            if section.rows.is_empty()
+                && (section.older > 0 || (section.detail.is_empty() && section.waits.is_empty()))
+            {
                 items.push(KeyedView::new(
                     format!("empty:{}", section.key),
                     quiet_row(
@@ -1607,28 +1738,6 @@ impl DesktopApp {
             }
             for row in &section.rows {
                 items.push(self.task_item(row, context, palette));
-            }
-            for sub in &section.subprojects {
-                let name = self
-                    .prefs
-                    .display_name(&format!("project:{}", sub.key))
-                    .map_or_else(|| sub.name.clone(), str::to_owned);
-                let checkouts = [sub.checkout.clone()];
-                let place = Place {
-                    key: &sub.key,
-                    name: &name,
-                    checkout: &sub.checkout,
-                    checkouts: &checkouts,
-                    collapsed: sub.collapsed,
-                    running: sub.running,
-                    missing: sub.missing,
-                    nested: true,
-                };
-                let selected = new_task_selected && nav::path_key(&sub.checkout) == launch_key;
-                items.push(self.place_item(&place, selected, filtered, context, palette));
-                for row in &sub.rows {
-                    items.push(self.task_item(row, context, palette));
-                }
             }
             if section.older > 0 {
                 let label = if section.older_shown {
@@ -1667,54 +1776,6 @@ impl DesktopApp {
                     ))),
             ));
         }
-        // Chats without a project (`launch {chat: true}`), as tasks are
-        // under their project: the open one selected, children nested.
-        let chats: Vec<&UiAgent> = nav::chats(&self.nav.agents)
-            .into_iter()
-            .filter(|agent| keep(agent))
-            .filter(|agent| pinned.as_deref() != Some(agent.id.as_str()))
-            .collect();
-        if !chats.is_empty() || (self.launch.chat && !filtered) {
-            items.push(KeyedView::new("chats-caption", section_label("Chats")));
-            if chats.is_empty() {
-                items.push(KeyedView::new(
-                    "chats-empty",
-                    quiet_row("No chats yet: Send starts one", tokens::layout::TREE_INDENT),
-                ));
-            }
-            for agent in chats {
-                let mut kids: Vec<&UiAgent> = self
-                    .nav
-                    .agents
-                    .iter()
-                    .filter(|child| child.parent.as_deref() == Some(agent.id.as_str()))
-                    .filter(|child| pinned.as_deref() != Some(child.id.as_str()))
-                    .collect();
-                kids.sort_by(|a, b| nav::child_order(a, b));
-                let row = Row {
-                    agent: agent.clone(),
-                    depth: 0,
-                    children: kids.len(),
-                    expanded: self.nav.expanded.contains(&agent.id),
-                    note: None,
-                    nested: false,
-                };
-                items.push(self.task_item(&row, context, palette));
-                if row.expanded {
-                    for child in kids {
-                        let child_row = Row {
-                            agent: child.clone(),
-                            depth: 1,
-                            children: 0,
-                            expanded: false,
-                            note: None,
-                            nested: false,
-                        };
-                        items.push(self.task_item(&child_row, context, palette));
-                    }
-                }
-            }
-        }
         // Recents: the newest tasks of collapsed projects, one per title;
         // never what the list shows or folds under "Show N older".
         let collapsed: HashSet<&str> = sections
@@ -1722,11 +1783,10 @@ impl DesktopApp {
             .filter(|section| section.collapsed)
             .map(|section| section.key.as_str())
             .collect();
-        let recents: Vec<&UiAgent> =
-            nav::sidebar_recents(&self.nav.agents, &checkouts, &collapsed, RECENTS)
-                .into_iter()
-                .filter(|agent| pinned.as_deref() != Some(agent.id.as_str()))
-                .collect();
+        let recents: Vec<&UiAgent> = nav::sidebar_recents(&self.nav.agents, &collapsed, RECENTS)
+            .into_iter()
+            .filter(|agent| pinned.as_deref() != Some(agent.id.as_str()))
+            .collect();
         if !filtered && !recents.is_empty() {
             items.push(KeyedView::new("recents-caption", section_label("Recents")));
             for agent in recents {
@@ -1827,16 +1887,11 @@ impl DesktopApp {
             .as_ref()
             .filter(|(target, _)| matches!(target, Target::Project { key, .. } if key == place.key))
             .map(|(_, typed)| typed.clone());
-        let indent = if place.nested {
-            tokens::layout::TREE_INDENT
-        } else {
-            0.0
-        };
         let row = match renaming {
             _ if place.key == nav::OTHER_LOCATIONS => {
                 self.place_row(place, selected, filtered, context, palette)
             }
-            Some(typed) => self.rename_row(&typed, indent, context, palette),
+            Some(typed) => self.rename_row(&typed, 0.0, context, palette),
             None => with_menu(
                 self.place_row(place, selected, filtered, context, palette),
                 Target::Project {
@@ -1863,11 +1918,11 @@ impl DesktopApp {
         )
     }
 
-    /// A project row (folder icon) or a subproject row (worktree icon, one
-    /// indent in): its chevron and name collapse or expand it; tasks
-    /// working now show as a count on the right, collapsed or not; a
-    /// registered folder that is gone says "missing" with a one-click
-    /// Remove. The trailing button starts a new task in it.
+    /// A project row (folder icon): its chevron and name collapse or expand
+    /// it; tasks working now (the server's team totals) show as a count on
+    /// the right, collapsed or not; a registered folder that is gone says
+    /// "missing" with a one-click Remove. The trailing button starts a new
+    /// task in it.
     fn place_row(
         &self,
         place: &Place,
@@ -1902,11 +1957,7 @@ impl DesktopApp {
         } else {
             (m3::glyph::CHEVRON_DOWN, "expanded")
         };
-        let kind = if place.nested {
-            "subproject"
-        } else {
-            "project"
-        };
+        let kind = "project";
         let mut label = format!("{name}, {kind}, {state}");
         if place.running > 0 {
             label.push_str(&format!(", {} working", place.running));
@@ -1914,16 +1965,8 @@ impl DesktopApp {
         if place.missing {
             label.push_str(", folder missing");
         }
-        let row = if place.nested {
-            m3::sub_row(palette, selected)
-        } else {
-            m3::row(palette, selected)
-        };
-        let height = if place.nested {
-            tokens::height::SUB_ROW
-        } else {
-            tokens::height::CONTROL
-        };
+        let row = m3::row(palette, selected);
+        let height = tokens::height::CONTROL;
         let toggle = row
             .automation_name(label)
             .is_enabled(!filtered)
@@ -1937,17 +1980,15 @@ impl DesktopApp {
                     .children((
                         m3::icon(chevron),
                         Border::new().grid_column(1).content(m3::row_content(
-                            Some(if place.nested {
-                                m3::glyph::WORKTREE
-                            } else {
-                                m3::glyph::FOLDER
-                            }),
+                            Some(m3::glyph::FOLDER),
                             name,
                             "",
                             badge,
                         )),
                     )),
-            );
+            )
+            // A worktree registration's name trims in the sidebar width.
+            .tooltip(name.to_owned());
         let action = if place.key == nav::OTHER_LOCATIONS {
             View::empty()
         } else if place.missing {
@@ -1987,16 +2028,6 @@ impl DesktopApp {
                 .content(m3::icon(m3::glyph::NEW_TASK))
         };
         Grid::new()
-            .margin(Thickness::new(
-                if place.nested {
-                    tokens::layout::TREE_INDENT
-                } else {
-                    0.0
-                },
-                0.0,
-                0.0,
-                0.0,
-            ))
             .columns([GridLength::STAR, GridLength::Auto])
             .children((toggle, action))
     }
@@ -2121,12 +2152,7 @@ impl DesktopApp {
             )
             .content(
                 Grid::new()
-                    .margin(Thickness::new(
-                        (row.depth + usize::from(row.nested)) as f64 * indent,
-                        0.0,
-                        0.0,
-                        0.0,
-                    ))
+                    .margin(Thickness::new(row.depth as f64 * indent, 0.0, 0.0, 0.0))
                     .columns([
                         GridLength::Pixel(indent),
                         GridLength::STAR,
@@ -2148,10 +2174,7 @@ impl DesktopApp {
                                 None,
                                 title,
                                 "",
-                                row_tag(
-                                    if agent.archived { "archived" } else { "" },
-                                    task_dot(palette, agent),
-                                ),
+                                row_tag(&row_tag_text(agent), task_dot(palette, agent)),
                             )),
                         note,
                         Border::new().grid_column(2).content(actions),
@@ -2168,15 +2191,14 @@ impl DesktopApp {
             .renaming
             .as_ref()
             .filter(
-                |(target, _)| matches!(target, Target::Agent(agent) if agent.id == row.agent.id),
+                |(target, _)| matches!(target, Target::Agent(agent) | Target::Tags(agent) if agent.id == row.agent.id),
             )
             .map(|(_, typed)| typed.clone());
         let label = self.agent_label(&row.agent);
         let view = match renaming {
             Some(typed) => self.rename_row(
                 &typed,
-                (row.depth + usize::from(row.nested)) as f64 * tokens::layout::TREE_INDENT
-                    + tokens::layout::TREE_INDENT,
+                row.depth as f64 * tokens::layout::TREE_INDENT + tokens::layout::TREE_INDENT,
                 context,
                 palette,
             ),
@@ -2355,10 +2377,20 @@ impl DesktopApp {
     }
 
     /// Show a short notice above the composer (refusals, uncertain
-    /// outcomes, failed reads); it stays until dismissed or replaced.
+    /// outcomes, failed reads); it stays until dismissed or replaced. An
+    /// open queue offer keeps its notice, with Queue it (the same-id
+    /// retry), on screen: other messages go to the status line meanwhile.
     pub(super) fn alert(&mut self, text: impl Into<String>) {
         let text = text.into();
         self.set_status(text.clone());
+        if self
+            .launch
+            .queue_offer
+            .as_ref()
+            .is_some_and(|offer| offer.alert != text)
+        {
+            return;
+        }
         self.alert = Some(text);
     }
 
@@ -2402,7 +2434,7 @@ impl DesktopApp {
 
 /// A project or subproject row's content: what it is called and holds.
 struct Place<'a> {
-    /// `repo:…`/`folder:…` for a project, `sub:…` for a subproject.
+    /// `org:<project>`, or the no-project bucket's key.
     key: &'a str,
     name: &'a str,
     /// Where a new task in it starts.
@@ -2411,8 +2443,6 @@ struct Place<'a> {
     collapsed: bool,
     running: usize,
     missing: bool,
-    /// A subproject (one indent in, worktree icon).
-    nested: bool,
 }
 
 /// A sidebar section label: secondary text at the rows' content inset, 16
@@ -2451,6 +2481,38 @@ fn merge_head_rows(loaded: &mut Vec<UiAgent>, rows: Vec<UiAgent>) {
             loaded.push(row);
         }
     }
+}
+
+/// A task row's quiet tag: "archived", else the execution folder of a
+/// task the daemon reads in the no-project bucket (a legacy `wt-*` label is
+/// shown as retained, never moved under a repository), else its tags.
+fn row_tag_text(agent: &UiAgent) -> String {
+    if agent.archived {
+        "archived".to_owned()
+    } else if agent.organization.is_none() && !agent.chat {
+        nav::folder_name(agent.workspace.as_deref().unwrap_or(&agent.project_id)).to_owned()
+    } else {
+        agent.tags.join(", ")
+    }
+}
+
+/// One server line under a project row (team, totals, a wait reason, a
+/// failed read): muted and wrapped, so who can change a limit is never cut
+/// off; its full text is the tooltip too.
+fn detail_row(text: &str, error: Option<Brush>) -> View {
+    let line = m3::secondary(text.to_owned());
+    let line = match error {
+        Some(brush) => line.foreground(brush),
+        None => line,
+    };
+    line.text_wrapping(TextWrapping::Wrap)
+        .margin(Thickness::new(
+            tokens::layout::TREE_INDENT + tokens::spacing::INSET,
+            0.0,
+            tokens::spacing::SM,
+            tokens::spacing::XS,
+        ))
+        .tooltip(text.to_owned())
 }
 
 /// A task row's quiet tag (its worktree folder, "archived") before its
@@ -2516,6 +2578,9 @@ mod tests {
             chat: false,
             archived: false,
             pending: false,
+            organization: None,
+            tags: Vec::new(),
+            organization_revision: None,
         }
     }
 

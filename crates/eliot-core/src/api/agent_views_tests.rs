@@ -513,6 +513,9 @@ fn summary() -> AgentSummary {
         project_scope: None,
         heavy: None,
         session_growth: None,
+        organization: None,
+        tags: Vec::new(),
+        organization_revision: None,
     }
 }
 

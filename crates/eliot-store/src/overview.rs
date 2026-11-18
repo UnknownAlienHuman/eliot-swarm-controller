@@ -222,12 +222,26 @@ pub(super) fn overview_manager_view(
                             && assignment.state == ProjectAssignmentState::Starting)
                 })
                 .map_or(AgentState::Unknown, |row| row.state);
+            // The managed worktree's standard branch, by its unique path.
+            let branch = match assignment.workspace.as_deref() {
+                Some(path) => conn
+                    .query_row(
+                        "SELECT requested_branch FROM workspaces
+                         WHERE worktree_path = ?1 AND phase <> 'removed'",
+                        [path],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(sql_error)?,
+                None => None,
+            };
             Ok::<_, Error>(OverviewManagerView {
                 agent: agent.clone(),
                 generation,
                 state,
                 assignment_revision: assignment.revision,
                 workspace: assignment.workspace.clone(),
+                branch,
             })
         })
         .transpose()
@@ -270,10 +284,9 @@ fn project_team(
         None => (Vec::new(), false),
     };
     let project_limits = limits.projects.get(project).cloned().unwrap_or_default();
-    let project_scope = core::CapacityScope::project_scope(project);
     let manager_scope = core::CapacityScope::manager_assignment_scope(project);
-    let lifecycle = lifecycle(conn, Some(project))?;
     let manager_limit = launch_queue::effective_manager_limit(conn, project, &project_limits)?;
+    let (totals, project_usage) = project_header_totals(conn, project, limits)?;
     Ok(ProjectOverviewEntry {
         project: project.to_owned(),
         detail,
@@ -286,20 +299,10 @@ fn project_team(
         workspaces,
         workspace_total,
         workspaces_truncated,
-        queue: lifecycle.queued,
-        totals: ProjectTotals {
-            live: lifecycle.live,
-            active_turns: lifecycle.active,
-            queued: lifecycle.queued,
-            retained_unknown: lifecycle.retained_unknown,
-            lifecycle,
-        },
+        queue: totals.queued,
+        totals,
         capacity: vec![
-            ScopeUsage {
-                usage: capacity::capacity_scope_usage(conn, &project_scope)?,
-                scope: project_scope,
-                limit: project_limits.project,
-            },
+            project_usage,
             ScopeUsage {
                 usage: capacity::capacity_scope_usage(conn, &manager_scope)?,
                 scope: manager_scope,
@@ -307,6 +310,36 @@ fn project_team(
             },
         ],
     })
+}
+
+/// One project's exact team totals and its project slot use beside the
+/// Owner limit: the header numbers `project.overview` and the organization
+/// projection both report, without the fleet totals or team detail.
+pub(super) fn project_header_totals(
+    conn: &Connection,
+    project: &str,
+    limits: &ScopeLimits,
+) -> Result<(ProjectTotals, ScopeUsage)> {
+    let lifecycle = lifecycle(conn, Some(project))?;
+    let scope = core::CapacityScope::project_scope(project);
+    let usage = ScopeUsage {
+        usage: capacity::capacity_scope_usage(conn, &scope)?,
+        scope,
+        limit: limits
+            .projects
+            .get(project)
+            .and_then(|policy| policy.project),
+    };
+    Ok((
+        ProjectTotals {
+            live: lifecycle.live,
+            active_turns: lifecycle.active,
+            queued: lifecycle.queued,
+            retained_unknown: lifecycle.retained_unknown,
+            lifecycle,
+        },
+        usage,
+    ))
 }
 
 fn list_team_workers(

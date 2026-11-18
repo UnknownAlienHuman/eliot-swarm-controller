@@ -13,13 +13,17 @@ use std::path::{Path, PathBuf};
 use eliot_core::api::{
     AgentArchiveRequest, AgentDeleteRequest, AgentGetRequest, AgentGetResponse, AgentListRequest,
     AgentListResponse, AgentResultRequest, AgentResultResponse, AgentTreeResponse, ArchivedFilter,
-    CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest, CommandChildrenResponse,
-    CommandGetRequest, CommandResolution, CommandResolveRequest, CommandResolveResponse,
-    CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest, DiagnoseResponse,
-    EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
+    ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
+    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, CommandCancelRequest,
+    CommandCancelResponse, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
+    CommandResolution, CommandResolveRequest, CommandResolveResponse, CommandSubmitRequest,
+    CommandSubmitResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
+    EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, HandoffRequest, HandoffResponse,
-    HarnessModelsRequest, HarnessModelsResponse, ReparentRequest, ReparentResponse, SwitchRequest,
-    SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
+    HarnessModelsRequest, HarnessModelsResponse, LaunchIntentGetRequest, LaunchIntentView,
+    LaunchQueueListRequest, LaunchQueueRequest, LaunchQueueView, ORGANIZATION_CHANGED_KIND,
+    OrgGroupView, OrgRowChange, OrganizationChangedEvent, ReparentRequest, ReparentResponse,
+    SwitchRequest, SwitchResponse, UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -517,6 +521,236 @@ pub async fn submit_launch(
     place: &LaunchPlace,
     text: Option<String>,
 ) -> Result<CommandSubmitResponse> {
+    let args = launch_args(target, place, text)?;
+    submit(
+        data_dir,
+        &submit_request(mutation_id, None, "launch", args)?,
+    )
+    .await
+}
+
+/// `launch.enqueue`: the same launch arguments as a durable intent the
+/// daemon's fair arbiter admits when capacity frees (`docs/spec/api.md`,
+/// Command admission). The intent has no Agent or command until admitted;
+/// an exact retry with the same id reads the current intent back.
+pub async fn enqueue_launch(
+    data_dir: &Path,
+    mutation_id: String,
+    target: LaunchTarget,
+    place: &LaunchPlace,
+    text: Option<String>,
+) -> Result<LaunchIntentView> {
+    let request = LaunchQueueRequest {
+        id: mutation_id,
+        args: launch_args(target, place, text)?,
+    };
+    request.validate()?;
+    let reply: LaunchIntentView =
+        eliot_daemon::client_call_typed(data_dir, "launch.enqueue", &request).await?;
+    if reply.id != request.id {
+        return Err(unverified(Error::new(
+            "unknown",
+            "queued launch reply names another intent",
+        )));
+    }
+    Ok(reply)
+}
+
+/// Most `chat.organization` group pages, `launch.queue` pages and
+/// `organization.changed` event pages one sidebar refresh reads; the daemon
+/// pages at 1,000 groups.
+const ORGANIZATION_PAGES: usize = 8;
+
+/// Every `chat.organization` group (projects first, the no-project bucket
+/// last) with its header and exact totals, page by page, under the
+/// sidebar's archived filter, and the lowest event watermark the pages
+/// observed: one bounded read for the whole sidebar.
+pub async fn chat_organization(
+    data_dir: &Path,
+    archived: ArchivedFilter,
+) -> Result<(Vec<OrgGroupView>, i64)> {
+    let mut groups = Vec::new();
+    let mut watermark = i64::MAX;
+    let mut after = None;
+    for _ in 0..ORGANIZATION_PAGES {
+        let request = ChatOrganizationRequest {
+            project: None,
+            after: after.take(),
+            archived,
+        };
+        request.validate()?;
+        let reply: ChatOrganizationResponse =
+            eliot_daemon::client_call_typed(data_dir, "chat.organization", &request).await?;
+        request.validate_response(&reply)?;
+        groups.extend(reply.groups);
+        watermark = watermark.min(reply.event_watermark);
+        if !reply.groups_truncated {
+            return Ok((groups, watermark));
+        }
+        after = reply.next_after;
+    }
+    Err(Error::new(
+        "unavailable",
+        "more project groups than one sidebar read pages",
+    ))
+}
+
+/// The `organization.changed` rows committed after `after`, page by page,
+/// and the exclusive cursor to read on from: each names an Agent, the group
+/// its row now reads in, its tags and link revision, so loaded rows refresh
+/// by id.
+pub async fn organization_changes(data_dir: &Path, after: i64) -> Result<(Vec<OrgRowChange>, i64)> {
+    let filter = EventsFilter {
+        kinds: vec![ORGANIZATION_CHANGED_KIND.to_owned()],
+        ..EventsFilter::default()
+    };
+    let mut rows = Vec::new();
+    let mut cursor = after;
+    for _ in 0..ORGANIZATION_PAGES {
+        let page = events_read(data_dir, cursor, EVENT_SCAN_ROWS, &filter).await?;
+        for event in page.events {
+            let change: OrganizationChangedEvent = serde_json::from_value(event.data)
+                .map_err(|_| Error::new("unknown", "organization change event is malformed"))?;
+            change.validate()?;
+            rows.extend(change.rows);
+        }
+        let more = page.truncated && page.next > cursor;
+        cursor = page.next;
+        if !more {
+            break;
+        }
+    }
+    Ok((rows, cursor))
+}
+
+/// `launch.intent.get`: one queued launch intent's current state, also
+/// after the arbiter admitted or refused it.
+pub async fn launch_intent(data_dir: &Path, id: &str) -> Result<LaunchIntentView> {
+    let request = LaunchIntentGetRequest { id: id.to_owned() };
+    request.validate()?;
+    let reply: LaunchIntentView =
+        eliot_daemon::client_call_typed(data_dir, "launch.intent.get", &request).await?;
+    if reply.id != request.id {
+        return Err(Error::new(
+            "unknown",
+            "launch intent reply names another intent",
+        ));
+    }
+    Ok(reply)
+}
+
+/// The whole `launch.queue`: queued interactive intents and automation
+/// assignment waits, each with its wait reason, page by page. A watched
+/// intent's reason is read even beyond the first queue page.
+pub async fn launch_queue(data_dir: &Path) -> Result<LaunchQueueView> {
+    let mut interactive = Vec::new();
+    let mut assignments = Vec::new();
+    let mut after = None;
+    for _ in 0..ORGANIZATION_PAGES {
+        let request = LaunchQueueListRequest {
+            project: None,
+            after: after.take(),
+        };
+        request.validate()?;
+        let reply: LaunchQueueView =
+            eliot_daemon::client_call_typed(data_dir, "launch.queue", &request).await?;
+        interactive.extend(reply.interactive);
+        assignments.extend(reply.assignments);
+        match reply.next_after {
+            Some(cursor) => after = Some(cursor),
+            None => {
+                return Ok(LaunchQueueView {
+                    interactive,
+                    assignments,
+                    next_after: None,
+                });
+            }
+        }
+    }
+    Ok(LaunchQueueView {
+        interactive,
+        assignments,
+        next_after: after,
+    })
+}
+
+/// One organization mutation: placement or tags, never authority. The
+/// revision is the link revision the menu observed (0 for no overlay row);
+/// the Store refuses a write whose revision moved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Organize {
+    Attach {
+        agent: String,
+        project: String,
+        revision: i64,
+    },
+    Detach {
+        agent: String,
+        revision: i64,
+    },
+    Tag {
+        agent: String,
+        tags: Vec<String>,
+        revision: i64,
+    },
+}
+
+/// `chat.attach`, `chat.detach` or `chat.tag` for one Agent, with the
+/// committed link read back and bound to the request.
+pub async fn organize(
+    data_dir: &Path,
+    mutation_id: String,
+    change: Organize,
+) -> Result<ChatOrganizationMutationResponse> {
+    match change {
+        Organize::Attach {
+            agent,
+            project,
+            revision,
+        } => {
+            let request = ChatAttachRequest {
+                id: mutation_id,
+                agents: vec![agent],
+                project,
+                expected_revision: Some(vec![revision]),
+            };
+            request.validate()?;
+            let reply = eliot_daemon::client_call_typed(data_dir, "chat.attach", &request).await?;
+            request.validate_response(&reply).map_err(unverified)?;
+            Ok(reply)
+        }
+        Organize::Detach { agent, revision } => {
+            let request = ChatDetachRequest {
+                id: mutation_id,
+                agents: vec![agent],
+                expected_revision: Some(vec![revision]),
+            };
+            request.validate()?;
+            let reply = eliot_daemon::client_call_typed(data_dir, "chat.detach", &request).await?;
+            request.validate_response(&reply).map_err(unverified)?;
+            Ok(reply)
+        }
+        Organize::Tag {
+            agent,
+            tags,
+            revision,
+        } => {
+            let request = ChatTagRequest {
+                id: mutation_id,
+                agents: vec![agent],
+                tags,
+                expected_revision: Some(vec![revision]),
+            };
+            request.validate()?;
+            let reply = eliot_daemon::client_call_typed(data_dir, "chat.tag", &request).await?;
+            request.validate_response(&reply).map_err(unverified)?;
+            Ok(reply)
+        }
+    }
+}
+
+/// The ordinary launch arguments of one launch or queued intent.
+fn launch_args(target: LaunchTarget, place: &LaunchPlace, text: Option<String>) -> Result<Value> {
     if let Some(text) = text.as_deref() {
         check_text(text)?;
     }
@@ -556,11 +790,7 @@ pub async fn submit_launch(
     if let Some(text) = text {
         args["text"] = Value::String(text);
     }
-    submit(
-        data_dir,
-        &submit_request(mutation_id, None, "launch", args)?,
-    )
-    .await
+    Ok(args)
 }
 
 /// Mid-run model/effort overlay for the next turn of exactly the generation

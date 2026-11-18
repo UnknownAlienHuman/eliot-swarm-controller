@@ -770,13 +770,24 @@ project identity includes the canonical checkout and Git common directory. The r
 owner's `[desktop] display_names` entry, else the repository name of its `origin` remote
 (the readback's read-only `origin`, [api](api.md)), else the folder of the repository's
 main checkout. The daemon readback identifies the main checkout even when Git metadata
-lives in a separate directory. A linked worktree is a subproject of its repository,
-named by the branch from the daemon's verified checkout readback when available.
-The sidebar places an Agent by its recorded registration ID, including after its
-worktree is removed. For legacy path labels it uses any retained managed-worktree
-common directory or an exact, currently verified checkout path. Unresolved legacy
-paths appear in **Other locations**. This is a display derivation and leaves
-historical Agent rows intact.
+lives in a separate directory. A registered linked worktree reads as its repository's
+name and its branch from the daemon's verified checkout readback when available.
+The sidebar's projects are the daemon's [`chat.organization`](api.md#chat-organization)
+groups in the daemon's order, read in one bounded `chat.organization` read: each
+registered project with its manager, the manager's standard worktree branch, the
+assignment and transfer state, "Needs assignment" or roots competing with an
+assigned manager, and the group's exact server totals (member total, each lifecycle
+count as returned, queued, unknown and the project slot use), plus its queued
+launches and automation waits with the wait reason and who can change it
+(`launch.queue`, every page, polled independently); then the no-project bucket.
+Registered projects with no tasks follow the populated ones and stay selectable.
+A failed read keeps the last server grouping marked stale and synthesizes none;
+`organization.changed` events refresh already loaded rows by id.
+Each `agent.list` row carries the group the daemon reads it in, so the desktop groups
+nothing by path, repository or name. An Agent whose execution label is not a
+registration, such as a legacy `wt-*` path label, stays in the no-project bucket
+under its retained folder name; only a server link places it under a project. This
+leaves historical Agent rows intact.
 
 The registration ID is the stable Project identity. Owner settings own its
 registration lifecycle, display name, registered repository, allowed profiles and

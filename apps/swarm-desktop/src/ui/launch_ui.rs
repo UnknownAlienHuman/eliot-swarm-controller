@@ -123,6 +123,59 @@ pub(super) enum LaunchMsg {
     Reveal(u64),
     /// Put the keyboard in the open popover's search field (tries left).
     FocusField(u8),
+    /// The capacity notice's Queue it: submit the refused launch as a
+    /// queued intent (`launch.enqueue`).
+    QueueRequested,
+    /// `launch.enqueue` settled.
+    Queued(MutationResult<eliot_core::api::LaunchIntentView>),
+}
+
+/// A launch the daemon refused for full capacity, kept so the notice's
+/// Queue it submits exactly that launch as a queued intent.
+#[derive(Clone, Debug)]
+pub(super) struct QueueOffer {
+    /// The notice it belongs to: Queue it shows only beside this text.
+    pub(super) alert: String,
+    target: client::LaunchTarget,
+    place: client::LaunchPlace,
+    text: String,
+    launch_rev: u64,
+    /// The intent id of a Queue it whose outcome is not known yet (in
+    /// flight, or its reply was lost): the intent may exist, so the draft
+    /// is released only after that id resolves.
+    intent: Option<String>,
+}
+
+impl QueueOffer {
+    /// The ledger key holding Queue it's mutation id (the intent id), so a
+    /// retry after a lost reply reuses it.
+    fn ledger_key(&self) -> String {
+        format!(
+            "enqueue:{:?}:{:?}:{}",
+            self.target, self.place, self.launch_rev
+        )
+    }
+}
+
+/// What dismissing the queue notice did with its draft.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Dismissed {
+    /// No queue notice was open.
+    Nothing,
+    /// No intent can exist for the draft: it is back in the composer.
+    Returned,
+    /// Queue it may have committed this intent: the draft waits, watched,
+    /// until the intent reads back or the daemon reports it missing.
+    Resolving { intent: String, key: String },
+}
+
+/// The launch being submitted, for a Queue it after a capacity refusal.
+#[derive(Clone, Debug)]
+pub(super) struct Submission {
+    target: client::LaunchTarget,
+    place: client::LaunchPlace,
+    text: String,
+    launch_rev: u64,
 }
 
 /// The new-task draft and its context.
@@ -178,6 +231,13 @@ pub(super) struct LaunchState {
     pub(super) row_ref: ElementRef<Button>,
     pub(super) reveal_epoch: u64,
     pub(super) reveal_after: u64,
+    /// The launch in flight (its target, place and text).
+    pub(super) submission: Option<Submission>,
+    /// A capacity refusal's Queue it offer.
+    pub(super) queue_offer: Option<QueueOffer>,
+    /// Intents this window queued, with their text, until the arbiter
+    /// admits or refuses them.
+    pub(super) watched: Vec<(String, String)>,
 }
 
 impl LaunchState {
@@ -225,6 +285,39 @@ impl LaunchState {
     /// The access level a model choice launches with.
     pub(super) fn access(&self) -> Access {
         self.access.unwrap_or(Access::Ask)
+    }
+
+    /// Why a fresh send is refused while the refused launch waits in the
+    /// queue offer: sending now could launch the same draft twice. Queue it
+    /// (the same-id retry) or dismiss its notice first.
+    pub(super) fn send_blocked(&self) -> Option<&'static str> {
+        self.queue_offer
+            .as_ref()
+            .map(|_| "Queue the refused launch or dismiss its notice before starting another.")
+    }
+
+    /// Dismiss the queue notice. A draft no intent can exist for returns
+    /// to an empty composer. A draft whose Queue it is unconfirmed moves
+    /// to the watched intents instead: it returns only when the daemon
+    /// reports that intent missing, so it can never be sent beside a
+    /// committed intent.
+    pub(super) fn dismiss_queue_offer(&mut self) -> Dismissed {
+        let Some(offer) = self.queue_offer.take() else {
+            return Dismissed::Nothing;
+        };
+        match offer.intent.clone() {
+            Some(intent) => {
+                let key = offer.ledger_key();
+                self.watched.push((intent.clone(), offer.text));
+                Dismissed::Resolving { intent, key }
+            }
+            None => {
+                if self.launch_text.is_empty() {
+                    self.launch_text = offer.text;
+                }
+                Dismissed::Returned
+            }
+        }
     }
 
     /// Auto's line in the picker: what Swarm picks now, and why.
@@ -579,6 +672,8 @@ impl DesktopApp {
             LaunchMsg::FocusField(tries) => self.focus_field(tries, context),
             LaunchMsg::LaunchRequested => self.request_launch(context),
             LaunchMsg::LaunchSubmitted(outcome) => self.launch_submitted(outcome, context),
+            LaunchMsg::QueueRequested => self.request_queue(context),
+            LaunchMsg::Queued(outcome) => self.queued(outcome, context),
             LaunchMsg::ProfilesListed(result) => match result {
                 Ok(list) => {
                     self.launch.profile_summaries = list.profiles.clone();
@@ -1002,6 +1097,16 @@ impl DesktopApp {
         if self.submitting() {
             return;
         }
+        // The refused draft waits in the queue offer: it is queued (the
+        // same-id retry) or dismissed before another send. Its notice, with
+        // Queue it, stays in view; the reason goes to the status line.
+        if let Some(reason) = self.launch.send_blocked() {
+            if let Some(alert) = self.launch.queue_offer.as_ref().map(|o| o.alert.clone()) {
+                self.alert(alert);
+            }
+            self.set_status(reason);
+            return;
+        }
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
@@ -1041,6 +1146,13 @@ impl DesktopApp {
         self.in_flight_key = Some(key);
         let launch_rev = self.launch.launch_rev;
         self.alert = None;
+        self.launch.queue_offer = None;
+        self.launch.submission = Some(Submission {
+            target: target.clone(),
+            place: place.clone(),
+            text: text.clone(),
+            launch_rev,
+        });
         // Shown at once: the message and what happens now, until the
         // conversation opens (no empty pause after Send).
         self.launch.starting = Some((text.clone(), starting_label(submitted.harness.as_deref())));
@@ -1137,12 +1249,216 @@ impl DesktopApp {
                 ));
             }
             Err(error) => {
-                self.restore_launch_text(starting);
-                self.alert(format!(
+                let text = format!(
                     "Start refused: {}",
                     crate::settings_model::launch_error(&error)
-                ));
+                );
+                // Full capacity is not a dead end: the notice offers the
+                // same launch as a queued intent the arbiter admits when a
+                // slot frees (`launch.enqueue`); nothing retries by itself.
+                let offer = (error.code == "capacity_unavailable")
+                    .then(|| self.launch.submission.take())
+                    .flatten()
+                    .map(|submission| QueueOffer {
+                        alert: format!("{text}. Queue it to start when a slot frees."),
+                        target: submission.target,
+                        place: submission.place,
+                        text: submission.text,
+                        launch_rev: submission.launch_rev,
+                        intent: None,
+                    });
+                match offer {
+                    Some(offer) => {
+                        // The draft waits in the offer, not the composer:
+                        // no restore, so it cannot be sent as a fresh
+                        // launch too. Dismissing returns it.
+                        self.alert(offer.alert.clone());
+                        self.launch.queue_offer = Some(offer);
+                    }
+                    None => {
+                        self.restore_launch_text(starting);
+                        self.alert(text);
+                    }
+                }
             }
+        }
+        self.launch.submission = None;
+    }
+
+    /// Queue it: the refused launch as a durable intent with its own
+    /// ledger-held id (a retry after an unconfirmed reply reads back).
+    fn request_queue(&mut self, context: &ComponentContext<Self>) {
+        if self.submitting() {
+            self.alert("Waiting for the last action to settle.");
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let Some(offer) = self.launch.queue_offer.as_mut() else {
+            return;
+        };
+        let key = offer.ledger_key();
+        let mutation_id = self.ledger.id_for(&key);
+        // From here the intent may exist until its outcome reads back.
+        offer.intent = Some(mutation_id.clone());
+        let offer = offer.clone();
+        self.in_flight_key = Some(key);
+        self.set_status(format!("Queueing the launch ({mutation_id})…"));
+        let _task = context.spawn_background(move |_| {
+            Message::Launch(LaunchMsg::Queued(client::block_on(client::enqueue_launch(
+                &data_dir,
+                mutation_id,
+                offer.target,
+                &offer.place,
+                Some(offer.text),
+            ))))
+        });
+    }
+
+    fn queued(
+        &mut self,
+        outcome: MutationResult<eliot_core::api::LaunchIntentView>,
+        context: &ComponentContext<Self>,
+    ) {
+        self.settle_mutation(
+            outcome
+                .as_ref()
+                .err()
+                .is_none_or(|error| !crate::state::uncertain(error)),
+        );
+        match outcome {
+            Ok(intent) => {
+                let offer = self.launch.queue_offer.take();
+                // The queued intent carries the text now; it comes back if
+                // the arbiter refuses the intent.
+                if let Some(offer) = offer {
+                    if offer.launch_rev == self.launch.launch_rev {
+                        self.launch.launch_text.clear();
+                    }
+                    self.launch.watched.push((intent.id.clone(), offer.text));
+                }
+                self.alert = None;
+                let wait = intent
+                    .reason
+                    .as_ref()
+                    .map_or_else(|| "waiting for its turn".to_owned(), nav::wait_reason_words);
+                self.set_status(format!("Queued launch {}: {wait}.", intent.id));
+                // The project's queued launches show their wait reason.
+                self.load_organization(context);
+                self.load_queue(context);
+            }
+            Err(error) if crate::state::uncertain(&error) => {
+                // The intent may be committed. The offer keeps its id and
+                // the notice names the lost reply with Queue it beside it
+                // (the same-id retry reads the intent back); the draft
+                // stays in the offer, never back in the composer.
+                let text = format!(
+                    "Queueing not confirmed: {}. Queue it again reuses its id.",
+                    error.user_message()
+                );
+                if let Some(offer) = self.launch.queue_offer.as_mut() {
+                    offer.alert = text.clone();
+                }
+                self.set_status(text.clone());
+                self.alert(text);
+            }
+            Err(error) => {
+                // A definite refusal: no intent exists, so the draft goes
+                // back to an empty composer.
+                if let Some(offer) = self.launch.queue_offer.take()
+                    && self.launch.launch_text.is_empty()
+                {
+                    self.launch.launch_text = offer.text;
+                }
+                self.alert(format!("Not queued: {}", error.user_message()));
+            }
+        }
+    }
+
+    /// Dismiss the alert's queue notice: a draft no intent can exist for
+    /// returns to the composer; an unconfirmed Queue it resolves its intent
+    /// id first (the queue poll reads it back or reports it missing).
+    pub(super) fn dismiss_queue_notice(&mut self, context: &ComponentContext<Self>) {
+        match self.launch.dismiss_queue_offer() {
+            Dismissed::Nothing => {}
+            Dismissed::Returned => self.set_status("The refused launch is back in the composer."),
+            Dismissed::Resolving { intent, key } => {
+                // The watched entry carries the id now; a later Queue it of
+                // a returned draft takes a fresh one.
+                self.ledger.complete(&key);
+                self.set_status(format!(
+                    "Checking queued launch {intent}: its text comes back if it was never queued."
+                ));
+                self.load_queue(context);
+            }
+        }
+    }
+
+    /// Report what became of this window's queued launches: an admitted
+    /// one lists with the Agents, a refused one says why and gives its
+    /// text back to an empty composer, and one the daemon does not know
+    /// (an unconfirmed Queue it that never committed) gives its text back
+    /// too. A queued one stays watched.
+    pub(super) fn settle_queued_launches(&mut self, context: &ComponentContext<Self>) {
+        use eliot_core::api::LaunchIntentState;
+        for id in self.nav.organization.missing_intents.clone() {
+            let Some(index) = self
+                .launch
+                .watched
+                .iter()
+                .position(|(watched, _)| *watched == id)
+            else {
+                continue;
+            };
+            let (_, text) = self.launch.watched.remove(index);
+            if self.launch.launch_text.is_empty() {
+                self.launch.launch_text = text;
+            }
+            self.alert(format!(
+                "Launch {id} was never queued; its text is back in the composer."
+            ));
+        }
+        let intents = self.nav.organization.intents.clone();
+        let mut admitted = false;
+        for intent in intents {
+            let Some(index) = self
+                .launch
+                .watched
+                .iter()
+                .position(|(id, _)| *id == intent.id)
+            else {
+                continue;
+            };
+            match intent.state {
+                LaunchIntentState::Queued => {}
+                LaunchIntentState::Admitted => {
+                    self.launch.watched.remove(index);
+                    admitted = true;
+                    self.set_status(format!(
+                        "Queued launch {} started ({}).",
+                        intent.id,
+                        intent
+                            .command_id
+                            .as_deref()
+                            .unwrap_or("command not read back")
+                    ));
+                }
+                LaunchIntentState::Rejected => {
+                    let (_, text) = self.launch.watched.remove(index);
+                    if self.launch.launch_text.is_empty() {
+                        self.launch.launch_text = text;
+                    }
+                    let reason = intent
+                        .reason
+                        .as_ref()
+                        .map_or_else(|| "no reason read back".to_owned(), nav::wait_reason_words);
+                    self.alert(format!("Queued launch {} refused: {reason}.", intent.id));
+                }
+            }
+        }
+        if admitted {
+            self.load_agents(context, None);
         }
     }
 
@@ -1325,6 +1641,11 @@ impl LaunchOutcome {
             tokens: None,
             chat: self.submitted.chat,
             archived: false,
+            // The open row renders above the list; the daemon's group
+            // arrives with the list read.
+            organization: None,
+            tags: Vec::new(),
+            organization_revision: None,
         }
     }
 }
@@ -1492,5 +1813,69 @@ mod tests {
         assert!(row.workspace.is_none());
         assert!(row.pending);
         assert_eq!(row.scope(), None);
+    }
+
+    fn refused_offer() -> QueueOffer {
+        QueueOffer {
+            alert: "Start refused: Swarm capacity is full. Queue it to start when a slot frees."
+                .to_owned(),
+            target: client::LaunchTarget::Routed,
+            place: client::LaunchPlace::Chat,
+            text: "draft text".to_owned(),
+            launch_rev: 3,
+            intent: None,
+        }
+    }
+
+    #[test]
+    fn refused_launch_blocks_fresh_send_until_queued_or_dismissed() {
+        // No offer: sends are allowed.
+        let mut state = LaunchState::default();
+        assert!(state.send_blocked().is_none());
+        assert_eq!(state.dismiss_queue_offer(), Dismissed::Nothing);
+        // The refused draft waits in the offer: a fresh send would launch
+        // the same draft twice.
+        state.queue_offer = Some(refused_offer());
+        assert!(state.send_blocked().is_some());
+        // Never queued: dismissing returns the draft to an empty composer
+        // and drops the offer, unblocking sends.
+        assert_eq!(state.dismiss_queue_offer(), Dismissed::Returned);
+        assert!(state.send_blocked().is_none());
+        assert_eq!(state.launch_text, "draft text");
+        // Dismissing again is a no-op that keeps the owner's newer typing.
+        state.launch_text = "new typing".to_owned();
+        assert_eq!(state.dismiss_queue_offer(), Dismissed::Nothing);
+        assert_eq!(state.launch_text, "new typing");
+    }
+
+    #[test]
+    fn lost_queue_reply_resolves_its_intent_before_the_draft_returns() {
+        // Queue it was sent and its reply was lost: the intent may exist.
+        let mut state = LaunchState::default();
+        let offer = QueueOffer {
+            intent: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+            ..refused_offer()
+        };
+        let key = offer.ledger_key();
+        state.queue_offer = Some(offer);
+        // The notice stays (Queue it reuses the id) and fresh sends wait.
+        assert!(state.send_blocked().is_some());
+        // Dismissing never hands the draft back: it is watched under the
+        // original intent id until that id reads back or is missing.
+        assert_eq!(
+            state.dismiss_queue_offer(),
+            Dismissed::Resolving {
+                intent: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                key,
+            }
+        );
+        assert!(state.launch_text.is_empty());
+        assert_eq!(
+            state.watched,
+            [(
+                "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                "draft text".to_owned()
+            )]
+        );
     }
 }

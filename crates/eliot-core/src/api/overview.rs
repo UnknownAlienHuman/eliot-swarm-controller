@@ -109,13 +109,21 @@ pub struct OverviewManagerView {
     /// Assignment workspace, including adopted checkouts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// The standard branch of the managed worktree at `workspace`, when the
+    /// Store retains its preparation; absent for an adopted checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 impl OverviewManagerView {
     pub fn validate(&self) -> Result<()> {
         parse_agent_id(&self.agent)
             .map_err(|_| Error::new("unknown", "project.overview response is invalid"))?;
-        if self.generation < 1 {
+        if self.generation < 1
+            || self.branch.as_ref().is_some_and(|branch| {
+                branch.trim().is_empty() || branch.len() > 1024 || branch.contains(char::is_control)
+            })
+        {
             return Err(Error::new(
                 "unknown",
                 "project.overview response is invalid",
