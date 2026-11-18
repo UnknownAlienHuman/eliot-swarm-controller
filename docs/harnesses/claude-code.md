@@ -352,13 +352,14 @@ frozen documented `--model` aliases (`best`, `fable`, `sonnet`, `opus`,
 ids (for example `claude-haiku-5-5`, `claude-opus-5-5`), each entry marked
 `source = "documented_alias"` with the CLI effort vocabulary attached and
 `unknown` availability; an omitted `--model` selects the CLI default, whose
-effective value is read back from initialize/stream. No live native catalogue
-exists (verified read-only against installed Claude Code 2.1.325 on
-2026-11-16: no `models` subcommand, `--model` names aliases or a full model
-name, settings `model`/`availableModels` is an allowlist rather than an
-inventory, and the stream-json `initialize` reply reports only the session
-model). Source: [Model configuration](https://code.claude.com/docs/en/model-config)
-(checked 2026-11-16) and the installed CLI `--help`.
+effective value is read back from initialize/stream. The native stream-json
+`initialize` response includes `models` with selectable values, display names,
+resolved model IDs and model-specific effort levels when the CLI reports them.
+The plugin's private `model.list` method reads that metadata without a prompt or
+auto-login, using the installed CLI's `--safe-mode` and strict empty MCP config. It declines
+profiles with `pass_env` until the daemon supplies that environment to the reader.
+The public command still uses the daemon's documented catalogue.
+[Claude Agent SDK model information](https://code.claude.com/docs/en/agent-sdk/typescript#modelinfo).
 ## Agent skill delivery (`eliot-swarm`)
 
 Every owned CLI spawn passes `--plugin-dir <data-dir>/skills`, the

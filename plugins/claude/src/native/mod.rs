@@ -1,6 +1,7 @@
 mod client;
 mod login;
 mod mcp_config;
+pub(crate) mod models;
 pub(crate) mod types;
 
 pub(crate) use client::{ClaudeClient, ClaudeFrame, ClaudeProcess};

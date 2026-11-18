@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsString,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -734,6 +734,7 @@ impl ClaudePlugin {
         let result = match request.method.as_str() {
             "initialize" => self.initialize(&request.params),
             "quota.read" => crate::quota::read(&request.params).await,
+            "model.list" => self.model_list(&request.params).await,
             "agent.start" => self.start(&request.params, client).await,
             "agent.command" => match self.command(request).await {
                 DispatchOutcome::Ready(result) => result,
@@ -783,6 +784,20 @@ impl ClaudePlugin {
                 Ok(value)
             }
         }
+    }
+
+    async fn model_list(&self, raw: &Value) -> Result<Value> {
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("Claude"))?;
+        if self.session.is_some() || self.failed_start.is_some() {
+            return Err(Error::new(
+                "bad_state",
+                "Claude model.list requires a dedicated reader plugin instance",
+            ));
+        }
+        crate::native::models::read(raw, Path::new(&initialized.instance_dir)).await
     }
 
     fn initialize(&mut self, raw: &Value) -> Result<Value> {

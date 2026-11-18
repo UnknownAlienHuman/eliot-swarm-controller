@@ -173,6 +173,10 @@ pub(crate) struct InitializeModel {
     pub value: Option<String>,
     #[serde(rename = "resolvedModel", default)]
     pub resolved_model: Option<String>,
+    #[serde(rename = "displayName", default)]
+    pub display_name: Option<String>,
+    #[serde(rename = "supportedEffortLevels", default)]
+    pub supported_effort_levels: Option<Vec<String>>,
 }
 
 /// `command_lifecycle` association record.
