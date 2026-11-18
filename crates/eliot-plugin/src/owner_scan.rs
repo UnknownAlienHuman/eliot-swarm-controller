@@ -19,6 +19,8 @@ use std::path::Path;
 use eliot_core::{Error, Result};
 use serde_json::Value;
 
+use crate::bounded_file::{BoundedFileError, read_regular_file};
+
 /// Bound for one owner MCP source file read. Larger, unreadable or
 /// unparseable files fail the start closed instead of scanning blind.
 pub const MAX_SCAN_BYTES: usize = 256 * 1024;
@@ -39,22 +41,24 @@ pub const MAX_SCAN_ARG_BYTES: usize = 2048;
 /// `label` already carries the plugin prefix and the origin, for example
 /// `"Claude owner MCP source project .mcp.json"`.
 pub fn read_jsonc_document(path: &Path, label: &str, max_bytes: usize) -> Result<Option<Value>> {
-    let bytes = match std::fs::read(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => {
+    let bytes = match read_regular_file(path, max_bytes) {
+        Ok(bytes) => bytes,
+        Err(BoundedFileError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(BoundedFileError::Io(_)) => {
             return Err(Error::new(
                 "profile_error",
                 format!("{label} could not be read"),
             ));
         }
-        Ok(bytes) => bytes,
+        Err(BoundedFileError::TooLarge) => {
+            return Err(Error::new(
+                "profile_error",
+                format!("{label} exceeds its bound"),
+            ));
+        }
     };
-    if bytes.len() > max_bytes {
-        return Err(Error::new(
-            "profile_error",
-            format!("{label} exceeds its bound"),
-        ));
-    }
     let text = String::from_utf8(bytes)
         .map_err(|_| Error::new("profile_error", format!("{label} is not UTF-8")))?;
     let stripped =

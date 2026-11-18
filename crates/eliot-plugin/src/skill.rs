@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use eliot_core::{Error, Result};
 
+use crate::bounded_file::{BoundedFileError, read_regular_file};
+
 /// Skill directory name, shared by every harness mechanism.
 pub const SKILL_NAME: &str = "eliot-swarm";
 /// Agent Skills entry file inside one skill directory.
@@ -55,18 +57,16 @@ pub fn skill_reference_path(data_dir: &Path) -> PathBuf {
 /// missing or oversized file is reported; callers skip native delivery
 /// rather than failing the session.
 pub fn read_skill_file(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path).map_err(|_| {
-        Error::new(
+    let bytes = read_regular_file(path, MAX_SKILL_FILE_BYTES).map_err(|error| match error {
+        BoundedFileError::Io(_) => Error::new(
             "unavailable",
             "daemon-materialized skill file is unavailable",
-        )
-    })?;
-    if bytes.len() > MAX_SKILL_FILE_BYTES {
-        return Err(Error::new(
+        ),
+        BoundedFileError::TooLarge => Error::new(
             "invalid",
             "daemon-materialized skill file exceeds its bound",
-        ));
-    }
+        ),
+    })?;
     String::from_utf8(bytes)
         .map_err(|_| Error::new("invalid", "daemon-materialized skill file is not UTF-8"))
 }
