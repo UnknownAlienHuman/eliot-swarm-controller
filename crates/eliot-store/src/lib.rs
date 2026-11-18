@@ -43,10 +43,11 @@ use eliot_core::api::{HeavySummaryView, SessionGrowthView, agent_state_name};
 use eliot_core::limits::{MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES};
 use eliot_core::{
     self as core, Agent, AgentControl, AgentEdit, AgentState, BatchAck, Command, CommandState,
-    Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitHintPage,
-    GitSnapshot, InjectPoint, NativeEvent, NativeStoreBinding, PendingRequest, ProcessIdentity,
-    ProcessRecord, ProcessSnapshot, ProcessState, SessionUsage, SourceBatch, SourceGap,
-    SourceGapAck, SubmitCommand, Turn, TurnOutcome, TurnResolutionSource, TurnState, TurnUsage,
+    Effect, Event, EventSubject, FileChangeHint, FrozenSetupFile, GitBaseline, GitCommit,
+    GitHintPage, GitPathStatus, GitSnapshot, InjectPoint, NativeEvent, NativeStoreBinding,
+    PendingRequest, ProcessIdentity, ProcessRecord, ProcessSnapshot, ProcessState, SessionUsage,
+    SourceBatch, SourceGap, SourceGapAck, SubmitCommand, Turn, TurnOutcome, TurnResolutionSource,
+    TurnState, TurnUsage,
     WorkspaceCancelOutcome, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
     WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupArg, WorkspaceSetupOutcome,
     parse_agent_id,

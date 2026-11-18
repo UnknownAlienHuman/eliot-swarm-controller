@@ -424,7 +424,13 @@ Freshness and coverage are independent. The view exposes `observed_at`, `age_ms`
 `ttl_ms` (4,000), `available`, `clock_regressed`, `retry_after_ms`, `error` and `source`.
 No sample, a probe/monitor error, clock regression or an expired sample makes the view
 unavailable; cached values may remain visible as diagnostics. An available sample can
-still have `complete=false`. Executable Git filters are disabled, and applicable filter
+still have `complete=false`. The persisted `git.changed` representation is budgeted to the
+single-event bound: when the accepted snapshot cannot fit, the Store persists the
+deterministically sorted dirty prefix (then committed paths) with `complete=false`, forcing
+`base_complete=false` when committed paths were cut, so a large legitimate tree still
+commits instead of failing every poll. A repeat poll compares equal and writes nothing.
+
+Executable Git filters are disabled, and applicable filter
 attributes make raw status partial; bounded attribution-path coverage can also make a
 snapshot partial. An empty partial dirty set does not prove the workspace clean.
 
