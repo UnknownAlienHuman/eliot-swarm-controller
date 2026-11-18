@@ -478,7 +478,13 @@ fn load_agents_blocking(
             })?;
         // The default list leaves archived Agents out; the fleet line still
         // counts the live ones (an archived chat may be idle, not stopped).
-        let archived = if archived.is_none() && request.after.is_none() {
+        // Only the history pages take this second read: branch and
+        // attention loads carry their own filters.
+        let archived = if archived.is_none()
+            && request.after.is_none()
+            && request.parent.is_none()
+            && request.states.is_none()
+        {
             let only = AgentListRequest {
                 limit: request.limit,
                 ..AgentListRequest::default()

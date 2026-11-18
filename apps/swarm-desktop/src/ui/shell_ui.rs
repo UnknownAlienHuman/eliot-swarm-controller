@@ -41,6 +41,13 @@ pub(super) enum ShellMsg {
     UseFreshDirectory,
     ProjectsLoaded(Fallible<Vec<UiProject>>),
     AgentsLoaded(u64, bool, Fallible<AgentPage>),
+    /// A first-recent-page refresh: merge the rows into the loaded history
+    /// (a launch while the desktop is open arrives here, without dropping
+    /// appended older pages or needing a manual refresh).
+    HeadLoaded(u64, Fallible<AgentPage>),
+    /// The live and attention rows, fetched independently of the history
+    /// page: merge them into the loaded Agents.
+    AttentionLoaded(u64, Fallible<AgentPage>),
     /// A sidebar row: open this Agent's conversation.
     AgentOpened(UiAgent),
     /// A project's new-task button: a new task in this checkout.
@@ -128,6 +135,19 @@ const ARROW_CHOICE_MS: u64 = 500;
 const SHORTCUT_POLL_MS: u64 = 500;
 /// The sidebar's states and Recents follow the daemon at this cadence.
 const LIST_REFRESH_MS: u64 = 10_000;
+/// One attention fetch carries at most this many live and attention rows.
+const ATTENTION_PAGE: usize = 1000;
+/// The attention fetch states: the running ones plus every state that needs
+/// the owner (waiting, failed, lost, unknown), read independently of the
+/// history page so an old waiting Agent is never cut off by newer history.
+const ATTENTION_STATES: [eliot_core::AgentState; 6] = [
+    eliot_core::AgentState::Busy,
+    eliot_core::AgentState::Starting,
+    eliot_core::AgentState::Waiting,
+    eliot_core::AgentState::Failed,
+    eliot_core::AgentState::Lost,
+    eliot_core::AgentState::Unknown,
+];
 
 fn window_theme(choice: ThemeChoice) -> WindowTheme {
     match choice {
@@ -322,12 +342,12 @@ impl DesktopApp {
                             page.rows.retain(|agent| !seen.contains(agent.id.as_str()));
                             self.nav.agents.extend(page.rows);
                         } else {
-                            // The open Agent stays on the first screen even when it
-                            // aged out of the newest page: keep its last known row
-                            // at the top until a later read returns it fresh.
-                            // Busy, waiting, starting and needs-attention rows sort
-                            // first by recency, so the newest page already carries
-                            // them; only the selected row needs pinning.
+                            // The open Agent renders explicitly above the list, so
+                            // keep its last known row when it aged out of the
+                            // newest page until a later read returns it fresh.
+                            // Busy, waiting, starting and needs-attention rows
+                            // arrive on the attention fetch; only the selected
+                            // row needs pinning.
                             if let Some(selected) = self.nav.selection.agent.clone()
                                 && !page.rows.iter().any(|agent| agent.id == selected)
                                 && let Some(known) = self
@@ -370,6 +390,41 @@ impl DesktopApp {
                         if self.nav.show_archived && error.contains("(k92)") {
                             self.nav.show_archived = false;
                         }
+                        self.alert(format!("Agents not read: {error}"));
+                    }
+                }
+            }
+            ShellMsg::HeadLoaded(list_epoch, page) => {
+                if list_epoch != self.nav.list_epoch {
+                    return;
+                }
+                self.nav.agents_loading = false;
+                match page {
+                    Ok(page) => {
+                        merge_head_rows(&mut self.nav.agents, page.rows);
+                        self.nav.agents_total = page.total;
+                        if self.nav.agents.len() <= AGENT_PAGE {
+                            self.nav.agents_next = page.next;
+                            self.nav.archived = page.archived;
+                        }
+                        self.refresh_search();
+                    }
+                    Err(error) => {
+                        self.alert(format!("Agents not read: {error}"));
+                    }
+                }
+            }
+            ShellMsg::AttentionLoaded(list_epoch, page) => {
+                if list_epoch != self.nav.list_epoch {
+                    return;
+                }
+                self.nav.agents_loading = false;
+                match page {
+                    Ok(page) => {
+                        merge_head_rows(&mut self.nav.agents, page.rows);
+                        self.refresh_search();
+                    }
+                    Err(error) => {
                         self.alert(format!("Agents not read: {error}"));
                     }
                 }
@@ -648,13 +703,13 @@ impl DesktopApp {
             ShellMsg::ShortcutsEnded => {}
             ShellMsg::AlertDismissed => self.alert = None,
             ShellMsg::ListTick => {
-                // Only the first page is re-read; pages added with "Show
-                // more" stay until a manual refresh.
-                if self.preferences_loaded
-                    && !self.nav.agents_loading
-                    && self.nav.agents.len() <= AGENT_PAGE
-                {
-                    self.load_agents(context, None);
+                // The head (the first recent page plus the live and
+                // attention rows) is re-read on every poll and merged into
+                // the loaded history, even with older pages appended: a
+                // launch or a state change while the desktop is open
+                // arrives without a manual refresh.
+                if self.preferences_loaded && !self.nav.agents_loading {
+                    self.refresh_head(context);
                 }
                 self.watch_list(context);
             }
@@ -1160,6 +1215,57 @@ impl DesktopApp {
                 load_agents_blocking(&data_dir, &request, archived),
             ))
         });
+        if !append {
+            // A head load also fetches the live and attention rows, so an
+            // old waiting Agent beyond the first page lists immediately.
+            self.load_attention(context);
+        }
+    }
+    /// The live and attention rows, fetched independently of the history
+    /// page so an old waiting Agent is never cut off by newer history.
+    fn load_attention(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let list_epoch = self.nav.list_epoch;
+        let request = AgentListRequest {
+            limit: ATTENTION_PAGE,
+            states: Some(ATTENTION_STATES.to_vec()),
+            order: AgentListOrder::Recent,
+            ..Default::default()
+        };
+        let _task = context.spawn_background(move |_| {
+            Message::Shell(ShellMsg::AttentionLoaded(
+                list_epoch,
+                load_agents_blocking(&data_dir, &request, None),
+            ))
+        });
+    }
+
+    /// Re-read the first recent page and the live and attention rows, then
+    /// merge them into the loaded history without dropping appended older
+    /// pages: a launch or a state change while the desktop is open arrives
+    /// on the next poll, even after Show more.
+    fn refresh_head(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.nav.list_epoch += 1;
+        let list_epoch = self.nav.list_epoch;
+        self.nav.agents_loading = true;
+        let archived = self.nav.show_archived.then_some("include");
+        let head = AgentListRequest {
+            limit: AGENT_PAGE,
+            order: AgentListOrder::Recent,
+            ..Default::default()
+        };
+        let _task = context.spawn_background(move |_| {
+            Message::Shell(ShellMsg::HeadLoaded(
+                list_epoch,
+                load_agents_blocking(&data_dir, &head, archived),
+            ))
+        });
+        self.load_attention(context);
     }
 
     /// The window: sidebar, main area and the optional right panel.
@@ -1349,6 +1455,15 @@ impl DesktopApp {
                 || nav::matches(agent, &nav::agent_place_label(agent, &checkouts), &query)
         };
         let filtered = !query.is_empty();
+        // The open Agent renders explicitly above the list (outside folding
+        // and page counts), so the sections skip it. Only while unfiltered:
+        // a search shows its own matches.
+        let pinned: Option<String> = if filtered {
+            None
+        } else {
+            self.selected_agent_id()
+                .filter(|id| self.nav.agents.iter().any(|agent| &agent.id == id))
+        };
         let shown = Shown {
             branches: &self.nav.branches,
             expanded: &self.nav.expanded,
@@ -1356,6 +1471,7 @@ impl DesktopApp {
             unfolded: &self.nav.unfolded,
             today_start: today_start_ms(),
             only: filtered.then_some(&keep as &dyn Fn(&UiAgent) -> bool),
+            pinned: pinned.as_deref(),
         };
         let sections = nav::sections(&self.nav.agents, &checkouts, &shown);
 
@@ -1393,6 +1509,44 @@ impl DesktopApp {
         };
         let mut items: Vec<KeyedView> =
             vec![KeyedView::new(format!("caption:{caption}"), caption_row)];
+        // The open Agent, explicitly above the list: visible even when it
+        // aged out of the newest page or would fold under Show older.
+        if let Some(open) = pinned.as_ref().and_then(|id| self.find_agent(id)).cloned() {
+            let expanded = self.nav.expanded.contains(&open.id);
+            let kids: Vec<&UiAgent> =
+                nav::children_of(&open.id, &self.nav.agents, &self.nav.branches)
+                    .into_iter()
+                    .filter(|child| pinned.as_deref() != Some(child.id.as_str()))
+                    .collect();
+            items.push(self.task_item(
+                &Row {
+                    agent: open,
+                    depth: 0,
+                    children: kids.len(),
+                    expanded,
+                    note: None,
+                    nested: false,
+                },
+                context,
+                palette,
+            ));
+            if expanded {
+                for child in kids {
+                    items.push(self.task_item(
+                        &Row {
+                            agent: child.clone(),
+                            depth: 1,
+                            children: 0,
+                            expanded: false,
+                            note: None,
+                            nested: false,
+                        },
+                        context,
+                        palette,
+                    ));
+                }
+            }
+        }
         if sections.is_empty() {
             let empty = if self.nav.agents_loading {
                 "Loading…"
@@ -1518,6 +1672,7 @@ impl DesktopApp {
         let chats: Vec<&UiAgent> = nav::chats(&self.nav.agents)
             .into_iter()
             .filter(|agent| keep(agent))
+            .filter(|agent| pinned.as_deref() != Some(agent.id.as_str()))
             .collect();
         if !chats.is_empty() || (self.launch.chat && !filtered) {
             items.push(KeyedView::new("chats-caption", section_label("Chats")));
@@ -1528,27 +1683,25 @@ impl DesktopApp {
                 ));
             }
             for agent in chats {
+                let mut kids: Vec<&UiAgent> = self
+                    .nav
+                    .agents
+                    .iter()
+                    .filter(|child| child.parent.as_deref() == Some(agent.id.as_str()))
+                    .filter(|child| pinned.as_deref() != Some(child.id.as_str()))
+                    .collect();
+                kids.sort_by(|a, b| nav::child_order(a, b));
                 let row = Row {
                     agent: agent.clone(),
                     depth: 0,
-                    children: self
-                        .nav
-                        .agents
-                        .iter()
-                        .filter(|child| child.parent.as_deref() == Some(agent.id.as_str()))
-                        .count(),
+                    children: kids.len(),
                     expanded: self.nav.expanded.contains(&agent.id),
                     note: None,
                     nested: false,
                 };
                 items.push(self.task_item(&row, context, palette));
                 if row.expanded {
-                    for child in self
-                        .nav
-                        .agents
-                        .iter()
-                        .filter(|child| child.parent.as_deref() == Some(agent.id.as_str()))
-                    {
+                    for child in kids {
                         let child_row = Row {
                             agent: child.clone(),
                             depth: 1,
@@ -1569,7 +1722,11 @@ impl DesktopApp {
             .filter(|section| section.collapsed)
             .map(|section| section.key.as_str())
             .collect();
-        let recents = nav::sidebar_recents(&self.nav.agents, &checkouts, &collapsed, RECENTS);
+        let recents: Vec<&UiAgent> =
+            nav::sidebar_recents(&self.nav.agents, &checkouts, &collapsed, RECENTS)
+                .into_iter()
+                .filter(|agent| pinned.as_deref() != Some(agent.id.as_str()))
+                .collect();
         if !filtered && !recents.is_empty() {
             items.push(KeyedView::new("recents-caption", section_label("Recents")));
             for agent in recents {
@@ -2282,6 +2439,18 @@ fn quiet_row(text: &str, indent: f64) -> View {
             0.0,
         ))
         .into()
+}
+
+/// Merge head or attention rows into the loaded list: replace known ids,
+/// append the rest. Appended history stays deduplicated by id.
+fn merge_head_rows(loaded: &mut Vec<UiAgent>, rows: Vec<UiAgent>) {
+    for row in rows {
+        if let Some(known) = loaded.iter_mut().find(|agent| agent.id == row.id) {
+            *known = row;
+        } else {
+            loaded.push(row);
+        }
+    }
 }
 
 /// A task row's quiet tag (its worktree folder, "archived") before its

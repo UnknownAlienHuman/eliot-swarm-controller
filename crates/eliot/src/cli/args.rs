@@ -570,10 +570,11 @@ pub(crate) struct AnswerArgs {
 pub(crate) struct ListFilterArgs {
     #[arg(long, default_value="exclude", value_parser=["exclude","only","include"])]
     pub(crate) archived: String,
-    /// List order: `recent` (default, newest activity first) or `id`
-    /// (stable Agent-ID order for scripts).
-    #[arg(long, default_value="recent", value_parser=["recent","id"])]
-    pub(crate) order: String,
+    /// List order: `recent` (newest activity first) or `id` (stable
+    /// Agent-ID order). Omitted means `recent` for humans, `id` for `--json`
+    /// and for an `id`-form `--after aN` cursor.
+    #[arg(long, value_parser=["recent","id"])]
+    pub(crate) order: Option<String>,
     /// Exact Agent state: unknown, created, starting, idle, busy, waiting,
     /// stopped, failed or lost.
     #[arg(long, value_name = "STATE")]

@@ -1,18 +1,19 @@
 use super::*;
 use eliot_core::api::{
     AGENT_LIST_STATES, AgentListOrder, AgentStateTotal, AgentSummary, decode_recent_cursor,
-    encode_recent_cursor, recent_activity,
+    encode_recent_cursor,
 };
 
 impl Store {
     /// Compact fleet projection for `agent.list`: scope-checked, filtered,
     /// ordered by Agent ID (`order: id`) or newest activity first
-    /// (`order: recent`: last progress or update, then ID descending, with a
-    /// stable `(activity, id)` cursor). Every equality filter rides one `agents_list_*`
-    /// composite index (forced with `INDEXED BY`, so `EXPLAIN QUERY PLAN`
-    /// shows the index); the cursor rides the primary key. The response
-    /// carries the matching total ignoring the cursor, honest truncation, and
-    /// the continuation cursor at the last returned row.
+    /// (`order: recent`: `updated_at` descending, then ID descending, with a
+    /// stable `(updated_at, id)` cursor on the `agents_recent` index).
+    /// Every equality filter rides one `agents_list_*` composite index
+    /// (forced with `INDEXED BY`, so `EXPLAIN QUERY PLAN` shows the index);
+    /// the id cursor rides the primary key. The response carries the
+    /// matching total ignoring the cursor, honest truncation, and the
+    /// continuation cursor at the last returned row.
     pub fn list_agent_summaries(
         &self,
         filter: &AgentListFilter,
@@ -173,12 +174,14 @@ impl Store {
         })
     }
 
-    /// Recent-order fleet page: newest activity first (last progress or
-    /// update, then numeric ID descending) with a stable `(activity, id)`
-    /// cursor. `activity` is `max(updated_at, last native progress)` for the
-    /// Agent generation, so a busy Agent with fresh progress outranks an
-    /// idle one touched long ago. Totals ignore the cursor; `next` encodes
-    /// the last row as `id@activity`.
+    /// Recent-order fleet page: newest activity first (`updated_at`
+    /// descending, then numeric ID descending) with a stable
+    /// `(updated_at, id)` cursor seeking the `agents_recent` index.
+    /// `updated_at` is bumped by the core reducer on every native event,
+    /// so a busy Agent with fresh progress outranks an idle one touched
+    /// long ago, and the key never regresses when old events are pruned.
+    /// Totals ignore the cursor; `next` encodes the last row as
+    /// `id@updated_at`.
     fn list_agent_summaries_recent(
         &self,
         caller: Option<&Agent>,
@@ -285,10 +288,9 @@ impl Store {
         let kept = summaries.len();
         enforce_page_bytes(&mut summaries)?;
         truncated = truncated || summaries.len() < kept;
-        let next = summaries.last().map(|summary| {
-            let activity = recent_activity(summary.last_progress_at, summary.updated_at);
-            encode_recent_cursor(&summary.id, activity)
-        });
+        let next = summaries
+            .last()
+            .map(|summary| encode_recent_cursor(&summary.id, summary.updated_at));
         Ok(AgentListPage {
             summaries,
             state_totals,
@@ -558,27 +560,14 @@ fn require_filter_text(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Newest-activity expression for one agents-table alias: `max(updated_at,
-/// last native progress)` for the Agent generation, matching
-/// [`recent_activity`] in Rust. Progress reuses the native-progress event
-/// predicate (current generation, native source, progress kinds), so a busy
-/// Agent with fresh tool output outranks an idle one touched long ago.
-fn recent_activity_sql(alias: &str) -> String {
-    format!(
-        "max({alias}.updated_at, COALESCE((SELECT ts FROM events WHERE agent = {alias}.id \
-         AND generation = {alias}.generation AND native_id IS NOT NULL \
-         AND source NOT IN ('daemon', 'os', 'git', 'workspace_process') \
-         AND kind IN ('turn.started', 'turn.completed', 'message.completed', \
-         'tool.started', 'tool.completed', 'request.opened', 'request.resolved', 'request.closed') \
-         ORDER BY ts DESC LIMIT 1), {alias}.updated_at))"
-    )
-}
-
-/// Assemble the `recent` fleet query: newest activity first, then numeric ID
-/// descending, with a stable `(activity, id)` cursor. Unlike the ID-order
-/// path (which splits the archived exclusion into two indexed branches), the
-/// recent path keeps one predicate with the same custody set and sorts the
-/// bounded page, so the first screen always carries the newest Agents.
+/// Assemble the `recent` fleet query: newest activity first
+/// (`updated_at` descending, then numeric ID descending) with a stable
+/// `(updated_at, id)` cursor. The ordering and the continuation predicate
+/// both seek the `agents_recent` index, so the first and continuation pages
+/// stay bounded on real volume. Unlike the ID-order path (which splits the
+/// archived exclusion into two indexed branches), the recent path keeps one
+/// predicate with the same custody set, so the first screen always carries
+/// the newest Agents.
 #[allow(clippy::too_many_arguments)]
 fn agent_list_select_recent(
     filter: &AgentListFilter,
@@ -681,16 +670,34 @@ fn agent_list_select_recent(
             }
         }
     }
-    let activity = recent_activity_sql("agents");
     if let Some((after_activity, after_id)) = after {
-        predicates.push(format!(
-            "({activity} < ? OR ({activity} = ? AND agents.id < ?))"
-        ));
+        predicates.push(
+            "(agents.updated_at < ? OR (agents.updated_at = ? AND agents.id < ?))".to_owned(),
+        );
         params.push(rusqlite::types::Value::from(after_activity));
         params.push(rusqlite::types::Value::from(after_activity));
         params.push(rusqlite::types::Value::from(after_id));
     }
-    let mut sql = format!("{prefix}SELECT {columns} FROM agents");
+    // The unfiltered pagination path (the sidebar's head and history pages)
+    // rides `agents_recent` outright, so the ordering never builds a
+    // temporary B-tree over the fleet. Filtered rows (attention states,
+    // project, branch children, scoped callers) let the planner pick the
+    // selective index and sort the bounded match instead of scanning the
+    // whole fleet in recency order.
+    let selective = filter.parent.is_some()
+        || filter.root.is_some()
+        || filter.project.is_some()
+        || filter.project_scope.is_some()
+        || filter.state.is_some()
+        || filter.harness.is_some()
+        || filter.states.is_some()
+        || caller.is_some();
+    let table = if !count && !selective {
+        "agents INDEXED BY agents_recent"
+    } else {
+        "agents"
+    };
+    let mut sql = format!("{prefix}SELECT {columns} FROM {table}");
     if !predicates.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&predicates.join(" AND "));
@@ -699,7 +706,7 @@ fn agent_list_select_recent(
         sql.push_str(" GROUP BY agents.state");
     }
     if !count {
-        sql.push_str(&format!(" ORDER BY {activity} DESC, agents.id DESC"));
+        sql.push_str(" ORDER BY agents.updated_at DESC, agents.id DESC");
     }
     if let Some(limit) = limit {
         sql.push_str(" LIMIT ?");
@@ -1411,9 +1418,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_list_recent_orders_by_activity_then_id_with_stable_cursor() {
+    fn agent_list_recent_orders_by_updated_at_then_id_with_stable_cursor() {
         use super::AgentListFilter;
-        use eliot_core::api::{AgentListOrder, decode_recent_cursor, recent_activity};
+        use eliot_core::api::{AgentListOrder, decode_recent_cursor};
 
         fn fleet_agent(store: &mut Store, project: &str, now: i64) -> String {
             let mut launch = SubmitCommand::new(Ulid::new().to_string(), "launch");
@@ -1482,15 +1489,12 @@ mod tests {
             .collect();
         assert_eq!(actual, rest);
         assert!(actual.contains(&middle) && actual.contains(&newest));
-        // The cursor encodes the last row's (activity, id) and round-trips.
+        // The cursor encodes the last row's (updated_at, id) and round-trips.
         let next = page.next.expect("recent next");
         let (id, activity) = decode_recent_cursor(&next).expect("decode recent next");
         let last = page.summaries.last().expect("last row");
         assert_eq!(id, last.id);
-        assert_eq!(
-            activity,
-            recent_activity(last.last_progress_at, last.updated_at)
-        );
+        assert_eq!(activity, last.updated_at);
         // Paging through one row at a time never skips or repeats.
         let mut after: Option<String> = None;
         let mut seen = Vec::new();
@@ -1536,6 +1540,48 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn agent_list_recent_pages_seek_the_activity_index() {
+        use super::{AgentListFilter, AgentListProjection, agent_list_select_recent};
+        use eliot_core::api::AgentListOrder;
+
+        fn plan(store: &Store, after: Option<(i64, i64)>) -> String {
+            let filter = AgentListFilter {
+                order: AgentListOrder::Recent,
+                ..Default::default()
+            };
+            let select = agent_list_select_recent(
+                &filter,
+                None,
+                after,
+                Some(101),
+                AgentListProjection::Rows,
+                None,
+            )
+            .expect("recent select");
+            let mut statement = store
+                .connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", select.sql))
+                .expect("explain recent");
+            statement
+                .query_map(rusqlite::params_from_iter(select.params.iter()), |row| {
+                    row.get::<_, String>(3)
+                })
+                .expect("read plan")
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .expect("collect plan")
+                .join(" | ")
+        }
+
+        let store = Store::open(Path::new(":memory:")).expect("open Store");
+        let first = plan(&store, None);
+        assert!(first.contains("agents_recent"), "{first}");
+        assert!(!first.contains("TEMP B-TREE"), "{first}");
+        let continued = plan(&store, Some((1_700_000_000_000, 42)));
+        assert!(continued.contains("agents_recent"), "{continued}");
+        assert!(!continued.contains("TEMP B-TREE"), "{continued}");
     }
 
     #[test]

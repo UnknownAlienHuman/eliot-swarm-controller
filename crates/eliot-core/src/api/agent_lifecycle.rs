@@ -25,8 +25,8 @@ pub enum ArchivedFilter {
 }
 
 /// Explicit `agent.list` order: `id` is the stable Agent-ID order every
-/// existing caller reads, `recent` is newest activity first (last progress
-/// or update, then ID descending) for human surfaces.
+/// existing caller reads, `recent` is newest activity first (`updated_at`
+/// descending, then ID descending) for human surfaces.
 #[derive(
     schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
 )]

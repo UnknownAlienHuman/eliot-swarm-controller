@@ -43,7 +43,7 @@ mod workspaces;
 pub use agent_requests::{
     AgentEditsRequest, AgentGetRequest, AgentGitRequest, AgentListRequest, AgentProcessesRequest,
     AgentStatsRequest, DaemonPanicTestRequest, DaemonStatusRequest, DiagnoseRequest,
-    ProjectDiscoverRequest, decode_recent_cursor, encode_recent_cursor, recent_activity,
+    ProjectDiscoverRequest, decode_recent_cursor, encode_recent_cursor,
 };
 pub use agent_views::{
     AGENT_LIST_STATES, AGENT_PREVIEW_CHARS, AgentConfigView, AgentEditsResponse, AgentGetResponse,

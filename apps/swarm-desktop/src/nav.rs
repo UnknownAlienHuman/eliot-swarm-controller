@@ -569,6 +569,10 @@ pub struct Shown<'a> {
     /// flat in their projects: no tree, no folding, no collapsing, and no
     /// project without a match.
     pub only: Option<&'a dyn Fn(&UiAgent) -> bool>,
+    /// The open Agent: it renders explicitly above the list, so sections
+    /// skip its rows (no duplicate, no folding, no "Show N older" count)
+    /// while it still counts toward running and newest tallies.
+    pub pinned: Option<&'a str>,
 }
 
 struct Group<'a> {
@@ -737,6 +741,8 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
         }
         // A native observed child shows only nested under its parent
         // conversation (collapsed), never as a task of its own.
+        // The open Agent renders explicitly above the list.
+        let pinned = shown.pinned == Some(agent.id.as_str());
         let shows = match shown.only {
             Some(keep) => keep(agent) && !agent.native_child,
             None => {
@@ -757,11 +763,11 @@ pub fn sections(listed: &[UiAgent], checkouts: &[Checkout], shown: &Shown) -> Ve
                     sub.newest = sub.newest.max(agent.updated_at);
                     sub.live |= agent.live();
                 }
-                if shows {
+                if shows && !pinned {
                     sub.top.push(agent);
                 }
             }
-            None if shows => group.top.push(agent),
+            None if shows && !pinned => group.top.push(agent),
             None => {}
         }
     }
@@ -1301,19 +1307,29 @@ fn short_path(word: &str) -> String {
     format!("{lead}{}{tail}", folder_name(path))
 }
 
-/// Children of `id` to show now: the fetched branch, else the listed ones.
-fn children_of<'a>(
+/// Stable child order: numeric Agent-ID order (`a9` before `a10`), whatever
+/// the fetch order. Both the branch read and the listed fallback arrive in
+/// fetch order; the sidebar renders children by ID.
+pub fn child_order(a: &UiAgent, b: &UiAgent) -> std::cmp::Ordering {
+    (a.id.len(), &a.id).cmp(&(b.id.len(), &b.id))
+}
+
+/// Children of `id` to show now: the fetched branch, else the listed ones,
+/// both in [`child_order`].
+pub(crate) fn children_of<'a>(
     id: &str,
     listed: &'a [UiAgent],
     branches: &'a HashMap<String, Branch>,
 ) -> Vec<&'a UiAgent> {
-    match branches.get(id) {
+    let mut children: Vec<&UiAgent> = match branches.get(id) {
         Some(Branch::Loaded { children, .. }) => children.iter().collect(),
         _ => listed
             .iter()
             .filter(|agent| agent.parent.as_deref() == Some(id))
             .collect(),
-    }
+    };
+    children.sort_by(|a, b| child_order(a, b));
+    children
 }
 
 /// Push `agent`'s row and, when it is expanded and `tree` is on, its
@@ -1365,6 +1381,10 @@ fn push(
     });
     if is_expanded {
         for child in children {
+            // The open Agent renders explicitly above the list.
+            if shown.pinned == Some(child.id.as_str()) {
+                continue;
+            }
             push(
                 child,
                 depth + 1,
@@ -1495,6 +1515,7 @@ mod tests {
                     unfolded: &self.unfolded,
                     today_start: self.today_start,
                     only,
+                    pinned: None,
                 },
             )
         }
@@ -1573,6 +1594,89 @@ mod tests {
         let listed = vec![agent("a5", "/p", Some("a1")), agent("a6", "/p", None)];
         let section = &View::default().sections(&listed, &[])[0];
         assert_eq!(ids(section), [("a5", 0), ("a6", 0)]);
+    }
+
+    #[test]
+    fn children_render_in_child_id_order_whatever_the_fetch_order() {
+        // The listed fallback arrives newest-first; the fetched branch
+        // arrives in its own order. Both render by child ID.
+        let listed = vec![
+            agent("a1", "/p", None),
+            agent("a10", "/p", Some("a1")),
+            agent("a2", "/p", Some("a1")),
+            agent("a9", "/p", Some("a1")),
+        ];
+        let mut view = View::default();
+        view.expanded.insert("a1".to_owned());
+        let section = &view.sections(&listed, &[])[0];
+        assert_eq!(ids(section), [("a1", 0), ("a2", 1), ("a9", 1), ("a10", 1)]);
+        view.branches = HashMap::from([(
+            "a1".to_owned(),
+            Branch::Loaded {
+                children: vec![
+                    agent("a10", "/p", Some("a1")),
+                    agent("a2", "/p", Some("a1")),
+                    agent("a9", "/p", Some("a1")),
+                ],
+                more: false,
+            },
+        )]);
+        let section = &view.sections(&listed, &[])[0];
+        assert_eq!(ids(section), [("a1", 0), ("a2", 1), ("a9", 1), ("a10", 1)]);
+    }
+
+    #[test]
+    fn the_pinned_open_agent_leaves_the_sections() {
+        // An old stopped task would fold under "Show N older"; pinned, it
+        // leaves the section rows and the older count, but its project
+        // still counts the running task.
+        fn shown<'x>(
+            branches: &'x HashMap<String, Branch>,
+            expanded: &'x HashSet<String>,
+            collapsed: &'x HashSet<String>,
+            unfolded: &'x HashSet<String>,
+            pinned: Option<&'x str>,
+        ) -> Shown<'x> {
+            Shown {
+                branches,
+                expanded,
+                collapsed,
+                unfolded,
+                today_start: 1_000_000,
+                only: None,
+                pinned,
+            }
+        }
+        let branches = HashMap::new();
+        let expanded = HashSet::new();
+        let collapsed = HashSet::new();
+        let unfolded = HashSet::new();
+        let listed = vec![
+            with(agent("a2", "/p", None), "busy", 3),
+            with(agent("a1", "/p", None), "stopped", 2),
+        ];
+        let plain = sections(
+            &listed,
+            &[],
+            &shown(&branches, &expanded, &collapsed, &unfolded, None),
+        );
+        assert_eq!(plain[0].older, 1);
+        assert_eq!(plain[0].running, 1);
+        let pinned = sections(
+            &listed,
+            &[],
+            &shown(&branches, &expanded, &collapsed, &unfolded, Some("a1")),
+        );
+        assert_eq!(pinned[0].older, 0);
+        assert_eq!(pinned[0].running, 1);
+        assert_eq!(
+            pinned[0]
+                .rows
+                .iter()
+                .map(|row| row.agent.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a2"]
+        );
     }
 
     #[test]

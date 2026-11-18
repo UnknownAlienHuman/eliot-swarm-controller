@@ -140,8 +140,8 @@ pub struct AgentListRequest {
     #[schemars(description = "Nonblank string; preserved without trimming or normalization.")]
     pub root: Option<String>,
     /// Explicit list order: `id` (default, stable Agent-ID order) or
-    /// `recent` (newest activity first: last progress or update, then ID
-    /// descending, with a stable `(activity, id)` cursor).
+    /// `recent` (newest activity first: `updated_at` descending, then ID
+    /// descending, with a stable `(updated_at, id)` cursor).
     #[serde(default)]
     pub order: super::AgentListOrder,
 }
@@ -215,16 +215,17 @@ impl AgentListRequest {
             return Err(invalid_response());
         }
         if self.order == super::AgentListOrder::Recent {
-            // Recent order pages by stable (activity, id): every nonempty
+            // Recent order pages by stable (updated_at, id): every nonempty
             // page carries `next` as the last row's recent cursor, and an
             // empty page carries no cursor. A quiet nonempty page still
             // requires continuing through `next` until empty.
             match reply.agents.last() {
                 Some(last) => {
-                    let activity =
-                        recent_activity(last.summary.last_progress_at, last.summary.updated_at);
                     if reply.next.as_deref()
-                        != Some(encode_recent_cursor(&last.summary.id, activity).as_str())
+                        != Some(
+                            encode_recent_cursor(&last.summary.id, last.summary.updated_at)
+                                .as_str(),
+                        )
                     {
                         return Err(invalid_response());
                     }
@@ -235,12 +236,11 @@ impl AgentListRequest {
                     }
                 }
             }
-            // Recent pages must arrive newest-first: activity descending,
+            // Recent pages must arrive newest-first: updated_at descending,
             // then numeric Agent ID descending as the tiebreak.
             let mut previous: Option<(i64, i64)> = None;
             for row in &reply.agents {
-                let activity =
-                    recent_activity(row.summary.last_progress_at, row.summary.updated_at);
+                let activity = row.summary.updated_at;
                 let num = crate::parse_agent_id(&row.summary.id).map_err(|_| invalid_response())?;
                 if let Some((prev_activity, prev_id)) = previous {
                     if (activity, num) > (prev_activity, prev_id) {
@@ -742,20 +742,10 @@ impl DiagnoseRequest {
     }
 }
 
-/// Newest-activity instant for `order: "recent"`: the last native
-/// progress timestamp where the Store retains one, else the last
-/// controller-observed update. `max` keeps a fresh update ahead of stale
-/// progress and vice versa.
-pub fn recent_activity(last_progress_at: Option<i64>, updated_at: i64) -> i64 {
-    last_progress_at
-        .map(|at| at.max(updated_at))
-        .unwrap_or(updated_at)
-}
-
 /// Stable recent cursor for the last row of a `recent` page:
-/// `<id>@<activity_ms>`, e.g. `a587@1763440000000`. The `activity` is
-/// [`recent_activity`] of that row, so paging continues after its exact
-/// sort position instead of re-seeking by ID.
+/// `<id>@<updated_at_ms>`, e.g. `a587@1763440000000`. The activity is the
+/// row's `updated_at` (bumped on every native event), so paging continues
+/// after its exact sort position instead of re-seeking by ID.
 pub fn encode_recent_cursor(id: &str, activity: i64) -> String {
     format!("{id}@{activity}")
 }

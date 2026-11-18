@@ -1348,9 +1348,9 @@ fn multi_state_list_requires_complete_scoped_totals_and_a_bounded_page() {
 }
 
 #[test]
-fn list_recent_validates_activity_order_and_stable_cursor() {
+fn list_recent_validates_updated_at_order_and_stable_cursor() {
     use crate::api::{AgentListOrder, AgentListRequest};
-    use crate::api::{decode_recent_cursor, encode_recent_cursor, recent_activity};
+    use crate::api::{decode_recent_cursor, encode_recent_cursor};
     let mut first = summary();
     first.id = "a2".to_owned();
     first.root = "a2".to_owned();
@@ -1378,10 +1378,7 @@ fn list_recent_validates_activity_order_and_stable_cursor() {
                 observation: None,
             },
         ],
-        next: Some(encode_recent_cursor(
-            &second.id,
-            recent_activity(second.last_progress_at, second.updated_at),
-        )),
+        next: Some(encode_recent_cursor(&second.id, second.updated_at)),
         total: 2,
         truncated: false,
     };
@@ -1392,10 +1389,7 @@ fn list_recent_validates_activity_order_and_stable_cursor() {
     // Wrong order (ascending) rejects.
     let mut swapped = reply.clone();
     swapped.agents.swap(0, 1);
-    swapped.next = Some(encode_recent_cursor(
-        &first.id,
-        recent_activity(first.last_progress_at, first.updated_at),
-    ));
+    swapped.next = Some(encode_recent_cursor(&first.id, first.updated_at));
     assert!(request.validate_response(&swapped).is_err());
     // Legacy id cursor rejects in recent order.
     assert!(
