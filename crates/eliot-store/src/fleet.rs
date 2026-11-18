@@ -53,6 +53,16 @@ impl Store {
         validate_limit(limit)?;
         filter.validate()?;
         let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
+        // Custody-held archived agents for the default exclusion, collected
+        // once per page from the live custody tables (bounded by live custody,
+        // never by archived history) and reused for rows and totals.
+        let custody = if matches!(filter.archived, core::api::ArchivedFilter::Exclude) {
+            Some(super::agent_lifecycle::default_list_custody_agents(
+                &self.connection,
+            )?)
+        } else {
+            None
+        };
         // One extra row probes continuation; the byte bound may trim further.
         let probe = i64::try_from(limit)
             .map_err(|_| Error::new("invalid", "page limit must fit the index bound"))?
@@ -63,6 +73,7 @@ impl Store {
             Some(after_num),
             Some(probe),
             AgentListProjection::Rows,
+            custody.as_deref(),
         )?;
         let mut statement = self.connection.prepare(&page.sql).map_err(sql_error)?;
         let rows = statement
@@ -79,7 +90,14 @@ impl Store {
                 growth_thresholds,
             )?);
         }
-        let total_page = agent_list_select(filter, caller, None, None, AgentListProjection::Count)?;
+        let total_page = agent_list_select(
+            filter,
+            caller,
+            None,
+            None,
+            AgentListProjection::Count,
+            custody.as_deref(),
+        )?;
         let total: i64 = self
             .connection
             .query_row(
@@ -97,6 +115,7 @@ impl Store {
                 None,
                 None,
                 AgentListProjection::StateTotals,
+                custody.as_deref(),
             )?;
             let mut statement = self.connection.prepare(&select.sql).map_err(sql_error)?;
             let rows = statement
@@ -414,6 +433,7 @@ fn agent_list_select(
     after_num: Option<i64>,
     limit: Option<i64>,
     projection: AgentListProjection,
+    custody: Option<&[i64]>,
 ) -> Result<AgentListSelect> {
     let count = !matches!(projection, AgentListProjection::Rows);
     let columns = if matches!(projection, AgentListProjection::StateTotals) {
@@ -591,11 +611,12 @@ fn agent_list_select(
         return Ok(AgentListSelect { sql, params });
     }
     // Default exclusion as two bounded id-ordered branches: unarchived rows
-    // seek the archived=0 partition, custody-visible archived rows seek the
-    // archived=1 partition, and the outer merge stays bounded by the page.
-    // Each branch keeps its own `ORDER BY agents.id LIMIT` so the global
-    // top page is exactly the merge of the branch tops.
-    let custody = super::agent_lifecycle::custody_blockers_sql("agents.id", "0");
+    // seek the archived=0 partition, custody-visible archived rows seek by
+    // primary key over the live custody set collected once per page, and the
+    // outer merge stays bounded by the page. Each branch keeps its own
+    // `ORDER BY agents.id LIMIT` so the global top page is exactly the merge
+    // of the branch tops. Counts use the same custody set, so no page runs an
+    // unbounded count across archived history with per-row custody probes.
     // Aggregate branches name their partial count so the outer merge sums
     // disjoint partitions instead of returning one row per branch.
     let branch_columns = match projection {
@@ -603,13 +624,14 @@ fn agent_list_select(
         AgentListProjection::Count => "COUNT(*) AS branch_count".to_owned(),
         AgentListProjection::StateTotals => "agents.state, COUNT(*) AS branch_count".to_owned(),
     };
-    let branch = |archived: i64, extra: Option<String>| {
+    let branch = |archived: i64, extra: Option<(String, Vec<rusqlite::types::Value>)>| {
         let mut branch_predicates = predicates.clone();
         branch_predicates.push(format!("agents.archived = {archived}"));
-        if let Some(extra) = extra {
-            branch_predicates.push(extra);
-        }
         let mut branch_params = params.clone();
+        if let Some((extra_sql, extra_params)) = extra {
+            branch_predicates.push(extra_sql);
+            branch_params.extend(extra_params);
+        }
         let mut select = format!(
             "SELECT {branch_columns} FROM {table} WHERE {}",
             branch_predicates.join(" AND ")
@@ -630,16 +652,41 @@ fn agent_list_select(
         (format!("SELECT * FROM ({select})"), branch_params)
     };
     let (archived_live, live_params) = branch(0, None);
-    let (archived_held, held_params) = branch(
-        1,
-        Some(format!(
-            "(agents.state IN ('stopped','failed','lost') AND EXISTS({custody}))"
-        )),
-    );
-    let mut sql =
-        format!("{prefix}SELECT * FROM ({archived_live} UNION ALL {archived_held}) AS merged");
+    let custody_ids: &[i64] = custody.unwrap_or(&[]);
+    // Custody-held archived rows: terminal states holding live custody. The
+    // id list is bounded by live custody (typically a handful), so this leg
+    // seeks primary keys instead of walking the archived partition to fill
+    // its page, and counts never probe custody per archived row.
+    let held_extra: Option<(String, Vec<rusqlite::types::Value>)> = if custody_ids.is_empty() {
+        None
+    } else {
+        let placeholders = custody_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let extra_sql = format!(
+            "(agents.state IN ('stopped','failed','lost') AND agents.id IN ({placeholders}))"
+        );
+        let extra_params = custody_ids
+            .iter()
+            .map(|id| rusqlite::types::Value::from(*id))
+            .collect();
+        Some((extra_sql, extra_params))
+    };
+    let (archived_held, held_params) = branch(1, held_extra);
+    // An empty custody set leaves only the live branch: no UNION arm can
+    // contribute rows, counts, or state buckets.
+    let use_held = !custody_ids.is_empty();
+    let mut sql = if use_held {
+        format!("{prefix}SELECT * FROM ({archived_live} UNION ALL {archived_held}) AS merged")
+    } else {
+        format!("{prefix}SELECT * FROM ({archived_live}) AS merged")
+    };
     let mut merged_params = live_params;
-    merged_params.extend(held_params);
+    if use_held {
+        merged_params.extend(held_params);
+    }
     match projection {
         AgentListProjection::Rows => {
             sql.push_str(" ORDER BY merged.id LIMIT ?");
@@ -650,14 +697,24 @@ fn agent_list_select(
             );
         }
         AgentListProjection::Count => {
-            sql = format!(
-                "{prefix}SELECT SUM(branch_count) FROM ({archived_live} UNION ALL {archived_held}) AS merged"
-            );
+            if use_held {
+                sql = format!(
+                    "{prefix}SELECT SUM(branch_count) FROM ({archived_live} UNION ALL {archived_held}) AS merged"
+                );
+            } else {
+                sql = format!("{prefix}SELECT SUM(branch_count) FROM ({archived_live}) AS merged");
+            }
         }
         AgentListProjection::StateTotals => {
-            sql = format!(
-                "{prefix}SELECT state, SUM(branch_count) FROM ({archived_live} UNION ALL {archived_held}) AS merged GROUP BY state"
-            );
+            if use_held {
+                sql = format!(
+                    "{prefix}SELECT state, SUM(branch_count) FROM ({archived_live} UNION ALL {archived_held}) AS merged GROUP BY state"
+                );
+            } else {
+                sql = format!(
+                    "{prefix}SELECT state, SUM(branch_count) FROM ({archived_live}) AS merged GROUP BY state"
+                );
+            }
         }
     }
     Ok(AgentListSelect {
@@ -821,9 +878,15 @@ mod tests {
                 "agents_list_root",
             ),
         ] {
-            let select =
-                agent_list_select(&filter, None, Some(0), Some(2), AgentListProjection::Rows)
-                    .expect("build fleet query");
+            let select = agent_list_select(
+                &filter,
+                None,
+                Some(0),
+                Some(2),
+                AgentListProjection::Rows,
+                None,
+            )
+            .expect("build fleet query");
             let mut statement = store
                 .connection
                 .prepare(&format!("EXPLAIN QUERY PLAN {}", select.sql))
@@ -1032,8 +1095,15 @@ mod tests {
                 assert_eq!(count(AgentState::Idle), 0);
             }
         }
-        let select =
-            agent_list_select(&states, None, Some(0), Some(1), AgentListProjection::Rows).unwrap();
+        let select = agent_list_select(
+            &states,
+            None,
+            Some(0),
+            Some(1),
+            AgentListProjection::Rows,
+            None,
+        )
+        .unwrap();
         let mut statement = store
             .connection
             .prepare(&format!("EXPLAIN QUERY PLAN {}", select.sql))
@@ -1188,9 +1258,14 @@ mod tests {
             )
             .expect("retain unresolved custody");
         let filter = AgentListFilter::default();
-        // The default page and its deep continuation must seek the archived
-        // partitions, never scan the fleet: LIMIT bounds the response only
-        // when the access path is already bounded.
+        // The default page and its deep continuation must seek, never scan
+        // the fleet: the live branch seeks its partition and the
+        // custody-held archived leg seeks primary keys over the live custody
+        // set, so LIMIT bounds the response only when the access path is
+        // already bounded. Counts use the same custody set and never probe
+        // custody per archived row.
+        let custody = super::agent_lifecycle::default_list_custody_agents(&store.connection)
+            .expect("collect custody");
         for after in [0, 10_000] {
             let select = agent_list_select(
                 &filter,
@@ -1198,12 +1273,32 @@ mod tests {
                 Some(after),
                 Some(2),
                 AgentListProjection::Rows,
+                Some(&custody),
             )
             .expect("build default fleet query");
             let plan = explain(&store, &select);
             assert!(
                 !plan.contains("SCAN agents"),
                 "default page must not scan the fleet (after={after}): {plan}"
+            );
+            assert!(
+                !plan.contains("EXISTS"),
+                "default page must not probe custody per archived row (after={after}): {plan}"
+            );
+        }
+        // Totals use the same custody set: no unbounded count across archived
+        // history with per-row custody probes.
+        for projection in [AgentListProjection::Count, AgentListProjection::StateTotals] {
+            let select = agent_list_select(&filter, None, None, None, projection, Some(&custody))
+                .expect("build default totals query");
+            let plan = explain(&store, &select);
+            assert!(
+                !plan.contains("SCAN agents"),
+                "default totals must not scan the fleet: {plan}"
+            );
+            assert!(
+                !plan.contains("EXISTS"),
+                "default totals must not probe custody per archived row: {plan}"
             );
         }
         // Both branches still read back: the quiet archived Agent is hidden
@@ -1275,6 +1370,7 @@ mod tests {
                 } else {
                     AgentListProjection::Rows
                 },
+                None,
             )
             .expect("build tree scope query");
             assert!(
@@ -1295,9 +1391,15 @@ mod tests {
             parent: Some("a42".to_owned()),
             ..Default::default()
         };
-        let select =
-            agent_list_select(&combined, None, Some(0), Some(2), AgentListProjection::Rows)
-                .expect("build combined filter query");
+        let select = agent_list_select(
+            &combined,
+            None,
+            Some(0),
+            Some(2),
+            AgentListProjection::Rows,
+            None,
+        )
+        .expect("build combined filter query");
         assert!(
             select.sql.contains("INDEXED BY agents_list_parent"),
             "combined filters must prefer the parent index: {}",

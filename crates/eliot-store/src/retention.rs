@@ -27,16 +27,18 @@ const MAX_SET_MEMBERS: usize = MAX_PAGE_ENTRIES;
 const MAX_PRUNE_ROOTS: i64 = 50;
 /// Expired root candidates, oldest first: the first page and the keyed
 /// continuation past the last examined `(created_at, id)`. Both ride the
-/// `created_at` index and stop at the batch bound, so no pass scans or
-/// materializes the whole expired history to find the next roots.
+/// `commands_prune_roots` partial index and stop at the batch bound, so no
+/// pass scans or materializes the whole expired history to find the next
+/// roots. The continuation uses a single row-value lower bound plus the
+/// cutoff upper bound so SQLite seeks the index instead of rewinding it.
 const PRUNE_COMMAND_CANDIDATES_FIRST: &str =
     "SELECT id, created_at FROM commands INDEXED BY commands_prune_roots
              WHERE parent_command IS NULL AND created_at <= ? ORDER BY created_at, id LIMIT ?";
 const PRUNE_COMMAND_CANDIDATES_AFTER: &str =
     "SELECT id, created_at FROM commands INDEXED BY commands_prune_roots
              WHERE parent_command IS NULL AND created_at <= ?
-               AND (created_at > ? OR (created_at = ? AND id > ?))
-             ORDER BY created_at, id LIMIT ?";
+               AND (created_at, id) > (?2, ?3)
+             ORDER BY created_at, id LIMIT ?4";
 
 /// Outcome of one bounded maintenance pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,18 +231,24 @@ impl Store {
     }
 
     fn prune_commands_and_writes(&mut self, cutoff: i64) -> Result<(i64, i64)> {
-        // Bounded candidate sweep through a progressing keyset cursor: page
-        // expired roots oldest-first in bounded batches and walk one bounded
-        // subtree per candidate. Kept or oversize sets are skipped in place
-        // so they never starve later eligible roots, and the pass stops at
-        // the root/row budgets with whole sets still deleting atomically. No
-        // pass materializes every expired command tree: each candidate costs
-        // one indexed subtree walk, and the sweep stops early once the root
-        // budget is doomed.
+        // Bounded candidate sweep through the persistent keyset cursor:
+        // successive passes resume past the last examined expired root instead
+        // of restarting at the oldest, so kept roots are not revisited every
+        // pass under the Store lock. Each pass pages expired roots in bounded
+        // batches and walks one bounded subtree per candidate. Kept or
+        // oversize sets are skipped in place so they never starve later
+        // eligible roots, and the pass stops at the root/row/examination
+        // budgets with whole sets still deleting atomically. No pass
+        // materializes every expired command tree: each candidate costs one
+        // bounded subtree walk, and the sweep stops early once the root
+        // budget is doomed or the examination bound is reached.
         const CANDIDATE_BATCH: i64 = 64;
+        const MAX_CANDIDATES_EXAMINED: i64 = 256;
         let mut doomed: Vec<SubtreeMember> = Vec::new();
         let mut doomed_roots: i64 = 0;
-        let mut cursor: Option<(i64, String)> = None;
+        let mut examined: i64 = 0;
+        let mut cursor: Option<(i64, String)> = self.retention_commands_cursor.clone();
+        let mut exhausted = false;
         'sweep: loop {
             let (sql, mut candidate_params): (&str, Vec<rusqlite::types::Value>) = match &cursor {
                 None => (
@@ -251,7 +259,6 @@ impl Store {
                     PRUNE_COMMAND_CANDIDATES_AFTER,
                     vec![
                         rusqlite::types::Value::from(cutoff),
-                        rusqlite::types::Value::from(*created_at),
                         rusqlite::types::Value::from(*created_at),
                         rusqlite::types::Value::from(id.clone()),
                     ],
@@ -267,15 +274,22 @@ impl Store {
                 .collect::<rusqlite::Result<_>>()
                 .map_err(sql_error)?;
             if batch.is_empty() {
+                exhausted = true;
+                cursor = None;
                 break;
             }
-            if let Some((id, created_at)) = batch.last() {
-                cursor = Some((*created_at, id.clone()));
-            }
-            for (root, _) in &batch {
+            for (root, root_created) in &batch {
                 if doomed_roots >= MAX_PRUNE_ROOTS {
                     break 'sweep;
                 }
+                examined += 1;
+                if examined > MAX_CANDIDATES_EXAMINED {
+                    break 'sweep;
+                }
+                // Advance the persistent cursor past every examined root so
+                // a budget stop resumes at the first unexamined root instead
+                // of skipping the rest of this batch on the next pass.
+                cursor = Some((*root_created, root.clone()));
                 let (members, truncated) = match subtree_members_tx(&self.connection, root) {
                     Err(error) if error.code == "source_integrity" => {
                         // A set past the traversal bound stays kept, as the
@@ -310,9 +324,15 @@ impl Store {
                 }
             }
             if batch.len() < CANDIDATE_BATCH as usize {
+                exhausted = true;
+                cursor = None;
                 break;
             }
         }
+        // Persist the sweep position: the next pass resumes past the last
+        // examined root, wrapping to the oldest only once the eligible set is
+        // exhausted. Examination stays bounded per pass by the budgets above.
+        self.retention_commands_cursor = if exhausted { None } else { cursor };
         doomed.sort_by_key(|member| std::cmp::Reverse(member.depth));
         let tx = self
             .connection
@@ -521,68 +541,121 @@ pub(crate) fn coverage_pruned_through(connection: &Connection) -> Result<i64> {
 /// Every member of one command set with its keep signals. The caller deletes
 /// the set only when no member asks to be kept. Collection stops past
 /// `MAX_SET_MEMBERS` rows and reports truncation so the caller keeps the set:
-/// an oversize set is never partly pruned.
+/// an oversize set is never partly pruned. Ids are collected breadth-first in
+/// Rust with a per-parent `LIMIT` bounded by the remaining budget, so an
+/// oversize tree never materializes a recursive result into an automatic
+/// index before the outer `LIMIT` applies; the detail fetch below then runs
+/// over at most `MAX_SET_MEMBERS + 1` ids.
 fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<SubtreeMember>, bool)> {
-    let mut statement = connection
-        .prepare(
-            "WITH RECURSIVE subtree(id, depth) AS (
-                 SELECT ?1, 0
-                 UNION ALL
-                 SELECT c.id, s.depth + 1 FROM commands c
-                 JOIN subtree s ON c.parent_command = s.id
-                 WHERE s.depth < ?2
-             )
-             SELECT s.id, s.depth, c.state, c.created_at,
-                    EXISTS(
-                        SELECT 1 FROM turns t
-                        WHERE t.agent = c.target AND t.generation = c.generation
-                          AND t.turn_id = c.turn_id AND t.state IN ('running', 'unknown')
-                    ),
-                    EXISTS(SELECT 1 FROM workspaces w WHERE w.start_command_id = c.id),
-                    EXISTS(SELECT 1 FROM provider_holds h WHERE h.probe_command = c.id),
-                    EXISTS(
-                        SELECT 1 FROM goals g
-                        WHERE g.agent = c.target AND g.mode = 'eliot'
-                          AND g.generation = c.generation
-                          AND json_extract(g.state, '$.status') IN ('active', 'paused')
-                          AND json_extract(g.state, '$.last_continuation_command_id') = c.id
-                    ),
-                    EXISTS(SELECT 1 FROM agent_config a WHERE a.command_id = c.id)
-             FROM subtree s JOIN commands c ON c.id = s.id
-             LIMIT ?3",
-        )
-        .map_err(sql_error)?;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let cap = MAX_SET_MEMBERS + 1;
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut depth_of: HashMap<String, i64> = HashMap::new();
+    let mut frontier: VecDeque<String> = VecDeque::new();
+    visited.insert(root.to_owned());
+    depth_of.insert(root.to_owned(), 0);
+    frontier.push_back(root.to_owned());
+    let mut truncated = false;
+    while let Some(parent) = frontier.pop_front() {
+        let depth = depth_of[&parent];
+        if depth >= MAX_SET_DEPTH {
+            return Err(Error::new(
+                "source_integrity",
+                "command set exceeds its traversal bound",
+            ));
+        }
+        let remaining = cap.saturating_sub(visited.len());
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        // One bounded child page per parent: an oversize fan-out reports
+        // truncation without fetching the whole child list.
+        let mut statement = connection
+            .prepare("SELECT id FROM commands WHERE parent_command = ?1 LIMIT ?2")
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(params![parent, (remaining as i64) + 1], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error)?;
+        let mut children = Vec::new();
+        for row in rows {
+            children.push(row.map_err(sql_error)?);
+        }
+        if children.len() > remaining {
+            truncated = true;
+            break;
+        }
+        for child in children {
+            if visited.insert(child.clone()) {
+                depth_of.insert(child.clone(), depth + 1);
+                frontier.push_back(child);
+            }
+        }
+        if visited.len() > cap {
+            truncated = true;
+            break;
+        }
+    }
+    if truncated || visited.len() > MAX_SET_MEMBERS {
+        return Ok((Vec::new(), true));
+    }
+    let depth_of_snapshot = depth_of;
+    let ids: Vec<String> = visited.into_iter().collect();
+    if ids.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT c.id, 0, c.state, c.created_at,
+                EXISTS(
+                    SELECT 1 FROM turns t
+                    WHERE t.agent = c.target AND t.generation = c.generation
+                      AND t.turn_id = c.turn_id AND t.state IN ('running', 'unknown')
+                ),
+                EXISTS(SELECT 1 FROM workspaces w WHERE w.start_command_id = c.id),
+                EXISTS(SELECT 1 FROM provider_holds h WHERE h.probe_command = c.id),
+                EXISTS(
+                    SELECT 1 FROM goals g
+                    WHERE g.agent = c.target AND g.mode = 'eliot'
+                      AND g.generation = c.generation
+                      AND json_extract(g.state, '$.status') IN ('active', 'paused')
+                      AND json_extract(g.state, '$.last_continuation_command_id') = c.id
+                ),
+                EXISTS(SELECT 1 FROM agent_config a WHERE a.command_id = c.id)
+         FROM commands c WHERE c.id IN ({placeholders})"
+    );
+    let mut statement = connection.prepare(&sql).map_err(sql_error)?;
     let rows = statement
-        .query_map(
-            params![root, MAX_SET_DEPTH, MAX_SET_MEMBERS as i64 + 1],
-            |row| {
-                Ok(SubtreeMember {
-                    id: row.get(0)?,
-                    depth: row.get(1)?,
-                    state: row.get(2)?,
-                    created_at: row.get(3)?,
-                    turn_bound: row.get(4)?,
-                    workspace_ref: row.get(5)?,
-                    probe_ref: row.get(6)?,
-                    goal_ref: row.get(7)?,
-                    config_ref: row.get(8)?,
-                })
-            },
-        )
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok(SubtreeMember {
+                id: row.get(0)?,
+                depth: row.get(1)?,
+                state: row.get(2)?,
+                created_at: row.get(3)?,
+                turn_bound: row.get(4)?,
+                workspace_ref: row.get(5)?,
+                probe_ref: row.get(6)?,
+                goal_ref: row.get(7)?,
+                config_ref: row.get(8)?,
+            })
+        })
         .map_err(sql_error)?;
     let mut members = Vec::new();
     for row in rows {
         members.push(row.map_err(sql_error)?);
+    }
+    // BFS depths are exact for a parent-linked tree; reuse them for the
+    // leaf-first delete ordering below.
+    for member in &mut members {
+        member.depth = depth_of_snapshot.get(&member.id).copied().unwrap_or(0);
     }
     if members.iter().any(|member| member.depth >= MAX_SET_DEPTH) {
         return Err(Error::new(
             "source_integrity",
             "command set exceeds its traversal bound",
         ));
-    }
-    if members.len() > MAX_SET_MEMBERS {
-        members.pop();
-        return Ok((members, true));
     }
     Ok((members, false))
 }
@@ -607,8 +680,15 @@ pub(super) fn delete_commands_tx<'a>(
 }
 
 fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
-    // Filter pins before the page limit. Unresolved goal rounds and project
-    // cleanup attempts still need their write receipts for the retry fence.
+    // Filter pins before the page limit. Unresolved goal rounds still need
+    // their write receipts for the retry fence. Every consumed cleanup plan
+    // keeps its apply receipt while the plan row exists, so write retention
+    // can never prune the receipt before the ledger reclaims the plan: a
+    // consumed plan with a pruned receipt would otherwise become permanently
+    // ineligible for reclamation, wedging the ledger. Once the ledger
+    // reclaims a settled plan, its receipt becomes eligible for pruning and
+    // exact retries read back as retained (plan present) or history-gap
+    // (receipt pruned after reclaim).
     Ok(db!(tx.execute(
         "DELETE FROM writes WHERE id IN (
              SELECT id FROM writes WHERE created_at <= ?1
@@ -616,13 +696,7 @@ fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
                AND NOT (method = 'goal.round'
                         AND json_extract(result, '$.outcome') IS json_extract(?3, '$'))
                AND NOT (method = 'cleanup.apply' AND EXISTS(
-                   SELECT 1 FROM cleanup_plans p
-                     JOIN json_each(p.body, '$.items') i
-                     JOIN json_each(writes.result, '$.items') r
-                    WHERE p.apply_id=writes.id
-                      AND json_extract(i.value, '$.artifact.kind')='project_registration'
-                      AND json_extract(i.value, '$.artifact.id')=json_extract(r.value, '$.artifact_id')
-                      AND json_extract(r.value, '$.outcome')='unknown'
+                   SELECT 1 FROM cleanup_plans p WHERE p.apply_id=writes.id
                ))
              ORDER BY created_at, id LIMIT ?2
          )",
@@ -1588,8 +1662,7 @@ mod tests {
                 PRUNE_COMMAND_CANDIDATES_AFTER,
                 vec![
                     rusqlite::types::Value::from(NOW),
-                    rusqlite::types::Value::from(NOW),
-                    rusqlite::types::Value::from(NOW),
+                    rusqlite::types::Value::from(NOW - 1),
                     rusqlite::types::Value::from("seed".to_owned()),
                     rusqlite::types::Value::from(64_i64),
                 ],
@@ -1615,7 +1688,34 @@ mod tests {
                 !plan.contains("MATERIALIZE"),
                 "candidate sweep should not materialize history, got:\n{plan}"
             );
+            assert!(
+                plan.contains("commands_prune_roots"),
+                "candidate sweep must ride the prune-roots index, got:\n{plan}"
+            );
         }
+    }
+
+    #[test]
+    fn oversize_subtree_reports_truncated_without_materializing() {
+        let mut store = store();
+        // A root with more children than the set bound stays kept: the walk
+        // reports truncation after one bounded child page instead of
+        // materializing the whole fan-out.
+        let root = Ulid::new().to_string();
+        insert_command(&mut store, command_seed(root.clone(), NOW - 40 * DAY_MS));
+        for ordinal in 0..(MAX_SET_MEMBERS as i64 + 10) {
+            insert_command(
+                &mut store,
+                CommandSeed {
+                    parent: Some((root.clone(), "rule_action".to_owned(), ordinal)),
+                    state: "applied".to_owned(),
+                    ..command_seed(Ulid::new().to_string(), NOW - 40 * DAY_MS)
+                },
+            );
+        }
+        let (members, truncated) = super::subtree_members_tx(&store.connection, &root).unwrap();
+        assert!(truncated, "oversize fan-out must report truncation");
+        assert!(members.is_empty(), "oversize sets keep without members");
     }
 
     #[test]
@@ -2634,7 +2734,7 @@ mod tests {
         }
         let (members, truncated) = subtree_members_tx(&store.connection, &root).unwrap();
         assert!(truncated);
-        assert_eq!(members.len(), MAX_SET_MEMBERS);
+        assert!(members.is_empty(), "oversize sets keep without members");
         let prunable = Ulid::new().to_string();
         insert_command(&mut store, command_seed(prunable.clone(), old));
         let report = store.prune_retention(None, Some(30), None, NOW).unwrap();
