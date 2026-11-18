@@ -807,48 +807,19 @@ impl MusePlugin {
                 }
             }
         };
-        let response_value = match session
-            .native_client
-            .call(session_method, params_value, Instant::now() + RPC_TIMEOUT)
-            .await
-        {
-            Ok(value) => value,
-            Err(error) if error.code == "native_rejected" => {
-                let (code, message) = if resume_subject.is_some() {
-                    (
-                        "not_found",
-                        "Muse rejected resume of the exact retained session",
-                    )
-                } else {
-                    (
-                        "profile_error",
-                        "Muse rejected session/start for the selected profile",
-                    )
-                };
-                let error = contextual_error(error, code, message);
-                let error = discard_failed_start(&mut session, error).await;
-                return Err(self.retain_failed_start(&params, error));
-            }
-            Err(error) if native_no_write(&error.code) => {
-                let message = format!("Muse {session_method} was not dispatched");
-                let code = error.code.clone();
-                let error = contextual_error(error, code, message);
-                let error = discard_failed_start(&mut session, error).await;
-                return Err(self.retain_failed_start(&params, error));
-            }
-            Err(error) => {
-                let error = contextual_error(
-                    error,
-                    "unknown",
-                    format!(
-                        "Muse {session_method} may have changed native state; it will not be repeated"
-                    ),
-                );
-                let error = self.retain_failed_start(&params, error);
-                self.session = Some(session);
-                return Err(error);
-            }
-        };
+        let dispatched = self
+            .dispatch_session_start(
+                &params,
+                session,
+                session_method,
+                params_value,
+                resume_subject.is_some(),
+            )
+            .await?;
+        let start::DispatchedStart {
+            mut session,
+            response: response_value,
+        } = dispatched;
         // A lost resume reply leaves the write unknown under the minted
         // command id; the resume is never dispatched a second time.
         let mut snapshot_pull: Option<bool> = None;

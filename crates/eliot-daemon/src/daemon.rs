@@ -111,6 +111,68 @@ async fn run_owned(
     daemon_lock: &DaemonLock,
     policy: Arc<SecretPolicy>,
 ) -> Result<()> {
+    let runtime = initialize_runtime(data_dir, policy).await?;
+    let supervision = spawn_workers(data_dir, daemon_lock, runtime).await?;
+    let (outcome, supervision) = supervise(supervision).await;
+    shutdown_supervision(supervision, outcome).await
+}
+
+/// Validated startup state handed from initialization to the spawn phase: the
+/// recovered store, configured router and policy, loaded configs, resolved
+/// rule seeds, and the attention suspicion window. Nothing here is a live
+/// worker or channel.
+struct DaemonRuntime {
+    store: Arc<Mutex<eliot_store::Store>>,
+    router: Router,
+    policy: Arc<SecretPolicy>,
+    daemon_config: crate::config::DaemonConfig,
+    automation_config: crate::config::AutomationConfig,
+    cloud_mcp_config: Option<crate::cloud_mcp::CloudMcpConfig>,
+    attention_suspicion_window: Duration,
+    capacity: restart_capacity::Reconcile,
+    capacity_retained: usize,
+    global_rules: Vec<automation::ActiveRule>,
+    initial_deferred_notice: automation::ReloadNoticeContext,
+    project_rule_namespaces: Vec<automation::ProjectRuleNamespace>,
+}
+
+/// Live workers and channels owned by the supervision loop and released by the
+/// shutdown drain. Fields are declared in the previous inline reverse
+/// declaration order, because struct fields drop in declaration order: the
+/// capacity recheck aborts before the IPC listener closes, and every
+/// shutdown sender drops after its task set, exactly as before the split.
+struct DaemonSupervision {
+    connections: JoinSet<()>,
+    progress: watch::Receiver<u64>,
+    maintenance_tasks: JoinSet<Result<()>>,
+    maintenance_stop: watch::Sender<bool>,
+    automation_task_names: Vec<(tokio::task::Id, &'static str)>,
+    automation_tasks: JoinSet<(&'static str, Result<automation::RuleWorkerExit>)>,
+    automation_stop: watch::Sender<bool>,
+    // Aborts a still-waiting recheck when supervision drops, before the IPC
+    // listener below closes; never polled.
+    #[allow(dead_code)]
+    capacity_recheck: JoinSet<()>,
+    recovery: JoinSet<(&'static str, Result<()>)>,
+    attention_tasks: JoinSet<Result<()>>,
+    attention_stop: watch::Sender<bool>,
+    monitoring: crate::monitor::Monitoring,
+    background: JoinSet<Result<()>>,
+    monitor_stop: watch::Sender<bool>,
+    cloud_mcp_tasks: JoinSet<Result<()>>,
+    cloud_mcp_shutdown: CancellationToken,
+    listener: IpcListener,
+    router: Router,
+    policy: Arc<SecretPolicy>,
+}
+
+/// Validate configuration, recover durable state without replaying external
+/// effects, reconcile restart capacity, and load rule seeds. Invalid config
+/// fails startup exactly as before; no worker spawns here.
+async fn initialize_runtime(
+    data_dir: &DataDir,
+    policy: Arc<SecretPolicy>,
+) -> Result<DaemonRuntime> {
     let store_path = data_dir.path().join("eliot.db");
     logging::record(&policy, "daemon.store_opening", &[], None);
     let store = eliot_store::Store::open_with_observer(&store_path, |phase| match phase {
@@ -225,8 +287,44 @@ async fn run_owned(
     let project_rule_namespaces =
         automation::initialize_project_rules(&router, data_dir.path(), &policy).await?;
     logging::record(&policy, "daemon.rules_loaded", &[], None);
+    Ok(DaemonRuntime {
+        store,
+        router,
+        policy,
+        capacity,
+        capacity_retained: report.retained,
+        daemon_config,
+        automation_config,
+        cloud_mcp_config,
+        attention_suspicion_window,
+        global_rules,
+        initial_deferred_notice,
+        project_rule_namespaces,
+    })
+}
 
-    let mut listener = IpcListener::bind(data_dir, daemon_lock).await?;
+/// Bind IPC, publish readiness, and spawn every background worker. The
+/// returned supervision owns all live tasks until the shutdown drain.
+async fn spawn_workers(
+    data_dir: &DataDir,
+    daemon_lock: &DaemonLock,
+    runtime: DaemonRuntime,
+) -> Result<DaemonSupervision> {
+    let DaemonRuntime {
+        store,
+        router,
+        policy,
+        capacity,
+        capacity_retained,
+        daemon_config,
+        automation_config,
+        cloud_mcp_config,
+        attention_suspicion_window,
+        global_rules,
+        initial_deferred_notice,
+        project_rule_namespaces,
+    } = runtime;
+    let listener = IpcListener::bind(data_dir, daemon_lock).await?;
     logging::record(&policy, "daemon.ipc_bound", &[], None);
     let info =
         data_dir.publish_daemon(daemon_lock, listener.endpoint(), env!("CARGO_PKG_VERSION"))?;
@@ -276,9 +374,10 @@ async fn run_owned(
     recovery.spawn(async move { ("workspace", recovery_router.recover_workspaces().await) });
     let recovery_router = router.clone();
     recovery.spawn(async move { ("command", recovery_router.recover_accepted_commands().await) });
-    // Dropped with this function, which aborts a recheck still waiting.
+    // Owned by supervision; its abort-on-drop runs before the IPC listener
+    // closes because the struct declares this field ahead of the listener.
     let mut capacity_recheck = JoinSet::new();
-    if report.retained > 0 {
+    if capacity_retained > 0 {
         capacity_recheck.spawn(restart_capacity::recheck(capacity));
     }
     let (automation_stop, automation_shutdown) = watch::channel(false);
@@ -345,8 +444,52 @@ async fn run_owned(
             .await
         });
     }
-    let mut progress = router.progress_receiver();
-    let mut connections = JoinSet::new();
+    let progress = router.progress_receiver();
+    let connections = JoinSet::new();
+    Ok(DaemonSupervision {
+        connections,
+        progress,
+        maintenance_tasks,
+        maintenance_stop,
+        automation_task_names,
+        automation_tasks,
+        automation_stop,
+        capacity_recheck,
+        recovery,
+        attention_tasks,
+        attention_stop,
+        monitoring,
+        background,
+        monitor_stop,
+        cloud_mcp_tasks,
+        cloud_mcp_shutdown,
+        listener,
+        router,
+        policy,
+    })
+}
+
+/// Drive the accept loop and worker supervision. Returns the loop outcome with
+/// supervision intact so the shutdown drain releases workers in order.
+async fn supervise(mut supervision: DaemonSupervision) -> (Result<()>, DaemonSupervision) {
+    let DaemonSupervision {
+        router,
+        policy,
+        listener,
+        background,
+        monitoring,
+        attention_tasks,
+        recovery,
+        automation_tasks,
+        automation_task_names,
+        maintenance_tasks,
+        cloud_mcp_tasks,
+        progress,
+        connections,
+        ..
+    } = &mut supervision;
+    let router = router.clone();
+    let policy = Arc::clone(policy);
     let outcome = loop {
         match router.should_exit().await {
             Ok(true) => break Ok(()),
@@ -531,7 +674,37 @@ async fn run_owned(
             }
         }
     };
+    (outcome, supervision)
+}
 
+/// Drain workers in dependency order after the supervision loop ends. Task
+/// sets still owned here abort on drop, matching the previous inline drain at
+/// the end of `run_owned`.
+async fn shutdown_supervision(
+    mut supervision: DaemonSupervision,
+    outcome: Result<()>,
+) -> Result<()> {
+    let DaemonSupervision {
+        router,
+        policy,
+        monitor_stop,
+        background,
+        monitoring,
+        attention_stop,
+        attention_tasks,
+        automation_stop,
+        automation_tasks,
+        automation_task_names,
+        maintenance_stop,
+        maintenance_tasks,
+        cloud_mcp_shutdown,
+        cloud_mcp_tasks,
+        recovery,
+        connections,
+        ..
+    } = &mut supervision;
+    let router = router.clone();
+    let policy = Arc::clone(policy);
     if outcome.is_err() {
         router.request_force().await;
     }
