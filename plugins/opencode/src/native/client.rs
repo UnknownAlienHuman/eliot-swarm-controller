@@ -218,37 +218,35 @@ impl OpenCodeHttp {
         Err(map_write_error("session/create", &response))
     }
 
-    /// A stored session carries the deny rule exactly when the last matching
-    /// `subagent` entry is the launch path's wildcard deny. The installed
-    /// server merges session rules after every agent/project rule with
-    /// last-match-wins evaluation, so a later `subagent` allow for one agent
-    /// would beat an earlier wildcard deny. The deny must therefore be the
-    /// final `subagent` entry; unrelated actions never satisfy the check.
-    /// The rule must name the installed `subagent` action with a wildcard
-    /// resource: narrower resources would leave other agents callable, and
-    /// the legacy `task` key is not evaluated by the installed tool check.
+    /// A stored session carries the deny rule exactly when the wildcard
+    /// subagent deny is the last rule of the entire session ruleset. The
+    /// installed server matches rule actions with wildcard patterns (so a
+    /// later `*` allow also matches subagent actions) and evaluates with
+    /// last-match-wins over session rules merged after every agent/project
+    /// rule (`packages/core/src/permission.ts` evaluator). Any rule after
+    /// the deny — a `subagent` allow for one agent, a `*` allow, or anything
+    /// else — can beat it, so only the final position verifies. The rule
+    /// must name the installed `subagent` action with a wildcard resource:
+    /// narrower resources would leave other agents callable, and the legacy
+    /// `task` key is not evaluated by the installed tool check.
     pub fn session_subagent_deny_verified(info: &SessionInfo) -> bool {
-        let mut last: Option<&PermissionRule> = None;
-        for rule in info.permissions.as_deref().unwrap_or(&[]) {
-            if rule.action == "subagent" {
-                last = Some(rule);
-            }
-        }
-        last.is_some_and(|rule| rule.resource == "*" && rule.effect == "deny")
+        info.permissions.as_deref().is_some_and(|rules| {
+            rules.last().is_some_and(|rule| {
+                rule.action == "subagent" && rule.resource == "*" && rule.effect == "deny"
+            })
+        })
     }
 
     /// Preserve the stored session rules and append the wildcard subagent
-    /// deny as the final entry. An already-correct ruleset (last `subagent`
-    /// entry is the wildcard deny) is returned unchanged so a repair never
-    /// duplicates it or drops unrelated session restrictions.
+    /// deny as the final entry of the entire ruleset. An already-correct
+    /// ruleset (the last rule is the wildcard deny) is returned unchanged so
+    /// a repair never duplicates it or drops unrelated session restrictions.
+    /// Appending last keeps the deny winning under the installed
+    /// last-match-wins evaluation.
     pub fn with_subagent_deny(existing: &[PermissionRule]) -> Vec<PermissionRule> {
-        let mut last: Option<&PermissionRule> = None;
-        for rule in existing {
-            if rule.action == "subagent" {
-                last = Some(rule);
-            }
-        }
-        if last.is_some_and(|rule| rule.resource == "*" && rule.effect == "deny") {
+        if existing.last().is_some_and(|rule| {
+            rule.action == "subagent" && rule.resource == "*" && rule.effect == "deny"
+        }) {
             return existing.to_vec();
         }
         let mut rules = existing.to_vec();
@@ -1234,16 +1232,27 @@ mod tests {
                 effect: "deny".to_owned(),
             }])
         )));
-        // A server echo with extra unrelated rules still verifies when the
-        // deny is the last `subagent` entry.
-        let mut rules = deny_ruleset();
-        rules.push(PermissionRule {
+        // Any rule after the deny can beat it under wildcard
+        // last-match-wins evaluation, so even an unrelated trailing rule
+        // must not verify: the deny has to be last in the whole ruleset.
+        let mut trailed = deny_ruleset();
+        trailed.push(PermissionRule {
             action: "edit".to_owned(),
             resource: "*".to_owned(),
             effect: "ask".to_owned(),
         });
+        assert!(!OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            Some(trailed)
+        )));
+        // An unrelated rule before the deny is fine: the deny still wins.
+        let mut prefixed = vec![PermissionRule {
+            action: "edit".to_owned(),
+            resource: "*".to_owned(),
+            effect: "ask".to_owned(),
+        }];
+        prefixed.extend(deny_ruleset());
         assert!(OpenCodeHttp::session_subagent_deny_verified(&info_with(
-            Some(rules)
+            Some(prefixed)
         )));
         // A later `subagent` allow beats the earlier wildcard deny under
         // last-match-wins evaluation, so it must not verify.
@@ -1255,6 +1264,18 @@ mod tests {
         });
         assert!(!OpenCodeHttp::session_subagent_deny_verified(&info_with(
             Some(shadowed)
+        )));
+        // The installed evaluator matches actions with wildcard patterns,
+        // so a later `*` allow also matches subagent actions and beats the
+        // deny: only the deny in final position verifies.
+        let mut wildcarded = deny_ruleset();
+        wildcarded.push(PermissionRule {
+            action: "*".to_owned(),
+            resource: "*".to_owned(),
+            effect: "allow".to_owned(),
+        });
+        assert!(!OpenCodeHttp::session_subagent_deny_verified(&info_with(
+            Some(wildcarded)
         )));
         // A trailing wildcard deny after that allow wins again.
         let mut repaired = vec![PermissionRule {

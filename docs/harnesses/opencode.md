@@ -407,11 +407,12 @@ tool-deferral surface, so deferred loading is unsupported.
 
 Per-session mapping, verified on the installed OpenCode v2.2.7 server
 (`opencode --version` reports v2.2.7): the agent docs allow per-agent
-`tools` / `permission` control, and the installed tool check evaluates the
-`subagent` action with session rules merged after every agent/project rule
-(last-match-wins). The authoritative enforcement is the verified per-session
-`subagent` wildcard deny stored as the final `subagent` entry on the session
-itself and proven by readback of that exact session before readiness; the
+`tools` / `permission` control, and the installed tool check matches rule
+actions with wildcard patterns and evaluates session rules merged after
+every agent/project rule (last-match-wins). The authoritative enforcement
+is the verified per-session `subagent` wildcard deny stored as the last rule
+of the entire session ruleset — any later rule, including a `*` allow, can
+beat it — and proven by readback of that exact session before readiness; the
 isolated global `permission.task` deny is only a secondary layer (a project
 `subagent` allow beats it). The plugin owns an isolated per-Agent config root
 (`XDG_CONFIG_HOME` / `XDG_DATA_HOME` under the instance directory; see
