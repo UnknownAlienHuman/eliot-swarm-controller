@@ -417,22 +417,20 @@ pub(super) fn default_agent_child_workspace(
     Ok(())
 }
 
-/// Launch project inheritance: a child takes its parent's project label.
-/// Runs after the Agent workspace default and `normalize_launch` and before
-/// the profile freeze and workspace preparation read the project. The Store
-/// re-derives the same label authoritatively at admission.
-pub(super) fn inherit_launch_project(store: &Store, request: &mut SubmitCommand) -> Result<()> {
-    if request.verb != "launch" {
-        return Ok(());
-    }
+/// A child keeps its parent's authorization namespace. Return whether it is
+/// part of a private chat, which has no repository project.
+pub(super) fn inherit_launch_project_scope(
+    store: &Store,
+    request: &mut SubmitCommand,
+) -> Result<bool> {
     let Some(parent) = request.args.get("parent").and_then(Value::as_str) else {
-        return Ok(());
+        return Ok(false);
     };
     let parent_agent = store
         .get_agent(parent)?
         .ok_or_else(|| Error::new("not_found", format!("Agent {parent} was not found")))?;
-    request.args["project"] = Value::String(parent_agent.project);
-    Ok(())
+    request.args["project"] = Value::String(parent_agent.project_scope().to_owned());
+    Ok(parent_agent.chat)
 }
 
 /// Fresh child ids of a newly admitted selector parent, from its retained
@@ -1215,6 +1213,139 @@ mod tests {
                 &agent_principal(caller, 0),
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn cli_and_agent_launches_record_the_repository_without_extending_scope() {
+        let config = CHILD_PROFILE_CONFIG
+            .replacen("control = \"tree\"", "control = \"project\"", 1)
+            .replace("max_live = 2", "max_live = 3");
+        let (router, root) = router_with_profiles(&config);
+        let _temp = crate::test_support::TempDir::own(root.clone());
+        let main = root.join("checkout");
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&main).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+            vec!["worktree", "add", "--detach", linked.to_str().unwrap()],
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(&main)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let config = format!(
+            "{config}\n[projects.inner]\npath = {}\nprofiles = [\"stranger\"]\nactions = [\"launch\"]\n",
+            json!(main)
+        );
+        std::fs::write(root.join("config.toml"), &config).unwrap();
+
+        // CLI launch sends workspace and profile without a project argument.
+        let manager = launch_manager(&router, &linked, "manager").await;
+        let unrelated = launch_manager(&router, &main, "manager").await;
+        let principal = agent_principal(&manager, 0);
+        for (args, code) in [
+            (
+                json!({"workspace": linked, "profile": "stranger"}),
+                "not_allowed",
+            ),
+            (
+                json!({"workspace": main, "profile": "worker"}),
+                "not_allowed",
+            ),
+            (
+                json!({"workspace": linked, "profile": "worker", "registered_project": "forged"}),
+                "invalid",
+            ),
+        ] {
+            let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+            request.args = args;
+            assert_eq!(
+                router
+                    .prepare_submission(request, &principal)
+                    .await
+                    .err()
+                    .unwrap()
+                    .code,
+                code
+            );
+        }
+        let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "launch");
+        request.args = json!({"profile": "worker"});
+        let prepared = router
+            .prepare_submission(request.clone(), &principal)
+            .await
+            .unwrap();
+        let child = {
+            let mut store = router.inner.store.lock().await;
+            let child = router
+                .admit_prepared_submission(
+                    &mut store,
+                    &format!("agent:{manager}:0"),
+                    prepared,
+                    None,
+                )
+                .unwrap()
+                .command
+                .target
+                .unwrap();
+            for id in [&manager, &child, &unrelated] {
+                assert_eq!(store.get_agent(id).unwrap().unwrap().project, "inner");
+            }
+            let parent = store.get_agent(&manager).unwrap().unwrap();
+            assert_eq!(parent.control, AgentControl::Project);
+            assert!(store.agent_in_scope(&parent, &child).unwrap());
+            assert!(!store.agent_in_scope(&parent, &unrelated).unwrap());
+            let (workers, _) = store
+                .who_workers(&format!("agent:{manager}:0"), None)
+                .unwrap();
+            assert_eq!(
+                workers
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                [manager.as_str(), child.as_str()]
+            );
+            child
+        };
+        let output = std::process::Command::new("git")
+            .current_dir(&main)
+            .args(["worktree", "remove", linked.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let replay = router
+            .submit(
+                &json!({"id": request.id, "verb": "launch", "args": request.args}),
+                &principal,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay["agent"], child);
+        assert_eq!(
+            std::fs::read_to_string(root.join("config.toml")).unwrap(),
+            config
+        );
     }
 
     #[tokio::test]

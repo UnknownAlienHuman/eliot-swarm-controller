@@ -480,8 +480,8 @@ a fresh caller-retained mutation ULID rather than reusing the illustrative examp
 or omit `id` on MCP so the server mints one.
 
 `api.identity` returns the authenticated principal kind, Agent id/generation when present,
-and its allowed scope patterns. An Agent's variable scope defaults to its actual project;
-mailbox access is self-only. Owners explicitly select variable scopes and mailboxes.
+and its allowed scope patterns. An Agent's variable scope defaults to its frozen
+project authorization scope. Mailbox access is self-only. Owners explicitly select variable scopes and mailboxes.
 Help's `scopes` describes only coordination authorization scopes relevant to the
 requested method, rather than inheriting the caller-wide list from `api.identity`.
 A mailbox scope denotes the `agent` mailbox selector, not a `scope` request field.
@@ -1008,10 +1008,19 @@ the retained preparation and frozen base instead of resolving a moved ref or rep
 uncertain work. Native launch waits for preparation ready in the exact target generation;
 the existing readiness/linked-input wait semantics above are unchanged.
 
-With `parent`, the launch creates a child of that Agent: an Agent principal launches
-only its own children (the Router defaults an absent parent to the caller), the child
-inherits the parent's project label and tree root, and the configured fanout limits
-are checked at admission. The parent must be controlled. An Agent-principal child
+Before admission, launch resolves its workspace against registered repositories by
+verified Git common directory. The match becomes the recorded `project` on
+`agent.get` and the compact `AgentSummary` from `agent.list`. The workspace remains
+the execution directory. The existing workspace label and parent inheritance still
+govern authorization scopes. When no registration matches, the Agent retains the
+ordinary launch label. A managed Agent's summary can also carry its retained
+`repo_common_dir` for display, including after worktree removal. Same-ID retries
+reuse the admitted project decision.
+
+With `parent`, the launch creates a child of that Agent. An Agent principal launches
+only its own children (the Router defaults an absent parent to the caller). The child
+inherits the parent's authorization namespace and tree root, and the configured fanout
+limits are checked at admission. The parent must be controlled. An Agent-principal child
 never supplies `profile_snapshot`: the daemon freezes it, so a supplied snapshot
 rejects. With no configured default route, it may omit `profile`, or it may
 specify the parent's same profile name, with no
@@ -1352,7 +1361,8 @@ cross-harness switch. [`SwitchRequest` / `SwitchResponse`](../../crates/eliot-co
 own the wire shape. It binds exact A generation, original-task SEND, selected SENDs
 and profile or ad-hoc launch selectors. Workspace defaults to A's retained workspace;
 workspace/worktree/base overrides still use normal launch validation. The route
-preserves A's project identity. No launch prompt or parent override is accepted.
+preserves A's project authorization scope for handoff. The new Agent records the
+registration resolved from its workspace. No launch prompt or parent override is accepted.
 
 The immediate reply is the retained reservation, not proof of launch or transfer.
 Use `swarm.wait` on the switch ID or retry that same ID for component readback.

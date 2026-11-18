@@ -811,7 +811,7 @@ impl Store {
                 let agent = load_agent_by_num(&self.connection, *num)?.ok_or_else(|| {
                     Error::new("stale_generation", "sender generation is no longer current")
                 })?;
-                VarScope::Project(agent.project)
+                VarScope::Project(agent.project_scope().to_owned())
             }
             (None, Sender::Owner) => {
                 return Err(Error::new(
@@ -832,7 +832,7 @@ impl Store {
                 let agent = load_agent_by_num(&self.connection, *num)?.ok_or_else(|| {
                     Error::new("stale_generation", "sender generation is no longer current")
                 })?;
-                if agent.project != *project {
+                if agent.project_scope() != *project {
                     return Err(Error::new(
                         "not_allowed",
                         "Agents access only their own project variables",
@@ -1492,7 +1492,7 @@ impl Store {
                 Error::new("not_found", format!("Agent {recipient} was not found"))
             })?;
             if let Some(project) = project
-                && agent.project != project
+                && agent.project_scope() != project
             {
                 return Err(Error::new(
                     "not_allowed",

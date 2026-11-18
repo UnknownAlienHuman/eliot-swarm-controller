@@ -402,6 +402,7 @@ fn project_checkouts(projects: &[UiProject]) -> Vec<nav::Checkout> {
             if keys.insert((common.clone(), nav::path_key(&git.path))) {
                 rows.push(nav::Checkout {
                     path: git.path.clone(),
+                    registration_ids: Vec::new(),
                     common_dir: project.common_dir.clone(),
                     branch: git.branch.clone(),
                     main: Some(git.main),
@@ -421,6 +422,16 @@ fn project_checkouts(projects: &[UiProject]) -> Vec<nav::Checkout> {
             row.missing = project.missing;
             rows.push(row);
         }
+    }
+    for row in &mut rows {
+        row.registration_ids = projects
+            .iter()
+            .filter(|project| {
+                nav::path_key(&project.common_dir) == nav::path_key(&row.common_dir)
+                    && nav::path_key(&project.workspace) == nav::path_key(&row.path)
+            })
+            .map(|project| project.id.clone())
+            .collect();
     }
     rows
 }

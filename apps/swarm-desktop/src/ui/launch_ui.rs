@@ -1248,6 +1248,8 @@ impl LaunchOutcome {
             } else {
                 self.submitted.workspace.clone()
             },
+            recorded_project: None,
+            repo_common_dir: None,
             workspace: None,
             parent: None,
             updated_at: now,

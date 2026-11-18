@@ -216,7 +216,7 @@ impl Store {
                 }
             }
 
-            if request.args.get("project").and_then(Value::as_str) != Some(agent.project.as_str()) {
+            if request.args.get("project").and_then(Value::as_str) != Some(agent.project_scope()) {
                 return Err(Error::new(
                     "not_allowed",
                     "switch launch must keep the source project",

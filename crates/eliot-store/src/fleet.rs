@@ -174,12 +174,22 @@ impl Store {
         let session_growth =
             self.session_growth_view(&record.harness, &id, record.generation, growth_thresholds)?;
         let preview = self.first_input_preview(record.id)?;
+        let repo_common_dir = self
+            .connection
+            .query_row(
+                "SELECT repo_common_dir FROM workspaces WHERE agent = ?1",
+                [record.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
         Ok(AgentSummary {
             archived: record.archived,
             chat: record.chat,
             id,
             generation: record.generation,
             project: record.project,
+            repo_common_dir,
             workspace: record.workspace,
             harness: record.harness,
             name: record.name.filter(|name| !name.trim().is_empty()),
@@ -377,7 +387,7 @@ fn agent_list_select(
         "agents.id, agents.generation, agents.name, agents.project, agents.harness, agents.profile,
                 agents.profile_snapshot, agents.native_scope, agents.native_ref, agents.workspace, agents.effective,
                 agents.pending, agents.state, agents.active_turn, agents.created_at, agents.updated_at, agents.origin, agents.observe_only, (agents.token IS NOT NULL AND agents.observe_only = 0),
-                agents.parent, agents.root, agents.depth, agents.control, agents.profile_inherited, agents.profile_choice, agents.archived, agents.chat"
+                agents.parent, agents.root, agents.depth, agents.control, agents.profile_inherited, agents.profile_choice, agents.archived, agents.chat, agents.project_scope"
             .to_owned()
     };
     let mut predicates = Vec::new();
@@ -463,10 +473,12 @@ fn agent_list_select(
                 params.push(rusqlite::types::Value::from(caller_num));
             }
             AgentControl::Project => {
-                predicates.push("agents.project = ?".to_owned());
-                params.push(rusqlite::types::Value::from(caller.project.clone()));
-                if forced_index.is_none() {
-                    forced_index = Some("agents_list_project");
+                predicates.push("COALESCE(agents.project_scope, agents.project) = ?".to_owned());
+                params.push(rusqlite::types::Value::from(
+                    caller.project_scope().to_owned(),
+                ));
+                if structural.is_none() {
+                    forced_index = Some("agents_list_project_scope");
                 }
             }
             AgentControl::Tree => {

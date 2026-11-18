@@ -141,7 +141,9 @@ Current-credential old-call read/release after a post-promotion restart gates pr
 credential retirement. Missing/
 revoked identity rejects. An Agent's frozen profile `control` (self/tree/project,
 default self) governs its commands and reads: self reaches only itself, tree reaches
-its own subtree, project reaches its project label; the owner is unrestricted. A
+its own subtree, and project reaches its frozen project authorization scope. The
+scope is the original launch label or the scope inherited from the parent. Recording
+a repository registration ID for display leaves that scope intact. The owner is unrestricted. A
 current Agent may queue addressed mail to any existing Agent regardless of project
 label or worktree; mail is communication only and does not grant command control.
 Project rules access project coordination; vars, claims and control remain as defined
@@ -334,10 +336,10 @@ CREATE TABLE claims (
 );
 ```
 
-Controller-launched children inherit project/root. An Agent principal or the owner
-launches a child through the ordinary launch path with `args.parent`; an Agent
-launches only its own children. The child takes the parent's project label and tree
-root at one deeper depth; the parent link is durable. A launch parent must be a
+An Agent principal or the owner launches a child through the ordinary launch path
+with `args.parent`. An Agent launches only its own children. The child takes the
+parent's project authorization scope and tree root at one deeper depth. The parent
+link is durable. A launch parent must be a
 controlled Agent: observe-only and unknown Agents cannot take children. Per
 Authority above, a child reuses the parent profile's frozen snapshot or names a
 profile from the parent's captured `child_profiles` allow-list. An explicit profile

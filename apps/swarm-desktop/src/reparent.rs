@@ -256,6 +256,8 @@ mod tests {
             harness: "claude".to_owned(),
             state,
             project: "/w".to_owned(),
+            recorded_project: None,
+            repo_common_dir: None,
             workspace: None,
             parent: parent.map(str::to_owned),
             updated_at,

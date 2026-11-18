@@ -818,13 +818,17 @@ fn admit_launch_tx(
         .transpose()?
         .flatten()
         .is_some_and(|p| p.chat);
-    let project = match parent_link.as_ref() {
-        // A child inherits its parent's project label; the caller
-        // value is descriptive input, not authority.
+    let scope = match parent_link.as_ref() {
         Some(parent) => parent.project.clone(),
         None if chat && principal == "owner" => String::new(),
         None => required_string(&request.args, "project")?,
     };
+    let project = if chat || inherited_chat {
+        scope.clone()
+    } else {
+        optional_string(&request.args, "registered_project")?.unwrap_or_else(|| scope.clone())
+    };
+    let project_scope = (scope != project).then_some(&scope);
     let harness = required_string(&request.args, "harness")?;
     if !matches!(
         harness.as_str(),
@@ -854,7 +858,7 @@ fn admit_launch_tx(
     let encoded_profile_snapshot = encode_json(&profile_snapshot)?;
     let workspace = match preparation {
         Some(input) => {
-            if input.project != project {
+            if input.project != scope {
                 return Err(Error::new(
                     "invalid",
                     "workspace project differs from launch",
@@ -905,8 +909,8 @@ fn admit_launch_tx(
         "INSERT INTO agents(generation, project, harness, profile,
                                 profile_snapshot, workspace, state,
                                 parent, depth, control, profile_inherited,
-                                created_at, updated_at)
-             VALUES (0, ?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7, ?8, ?9, ?10, ?10)",
+                                created_at, updated_at, project_scope)
+             VALUES (0, ?1, ?2, ?3, ?4, ?5, 'created', ?6, ?7, ?8, ?9, ?10, ?10, ?11)",
         params![
             project,
             harness,
@@ -917,7 +921,8 @@ fn admit_launch_tx(
             depth,
             control,
             i64::from(profile_inherited),
-            now
+            now,
+            project_scope,
         ],
     ));
     let agent_num = tx.last_insert_rowid();

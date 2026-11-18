@@ -2,7 +2,7 @@
 //!
 //! Owning contracts: `docs/spec/coordination.md` (claims and hierarchy,
 //! prompt guidance) and the hierarchy parts of `core.md`/`configuration.md`.
-//! A child inherits its parent's project label and tree root; the parent link
+//! A child inherits its parent's project scope and tree root; the parent link
 //! is durable. Fanout limits gate launch and re-parent admission and never hide an
 //! Agent row that already exists. A tree selector expands once at admission
 //! to concrete members using the existing Store-only parent plus ordered
@@ -66,9 +66,9 @@ pub(super) fn parse_caller(connection: &Connection, principal: &str) -> Result<C
         }
         return Ok(Caller::Agent {
             num,
+            project: agent.project_scope().to_owned(),
             id: agent.id,
             control: agent.control,
-            project: agent.project,
         });
     }
     Err(Error::new(
@@ -172,7 +172,7 @@ fn scope_allows(
         AgentControl::Slf => Ok(false),
         AgentControl::Project => {
             let target = load_agent_by_num(connection, parse_agent_id(target_id)?)?;
-            Ok(target.is_some_and(|agent| agent.project == project))
+            Ok(target.is_some_and(|agent| agent.project_scope() == project))
         }
         AgentControl::Tree => {
             let member_num = parse_agent_id(target_id)?;
@@ -189,7 +189,7 @@ impl Store {
             &caller.id,
             parse_agent_id(&caller.id)?,
             caller.control,
-            &caller.project,
+            caller.project_scope(),
             target_id,
         )
     }
@@ -287,7 +287,7 @@ pub(super) fn resolve_launch_parent(
     let root_num = parse_agent_id(&parent_agent.root)?;
     Ok(Some(ParentLink {
         num: parent_num,
-        project: parent_agent.project.clone(),
+        project: parent_agent.project_scope().to_owned(),
         root_num,
         depth: parent_agent.depth,
         profile: parent_agent.profile.clone(),
@@ -1591,7 +1591,9 @@ mod tests {
             let legacy = rusqlite::Connection::open(&path).unwrap();
             legacy
                 .execute_batch(
-                    "DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
+                    "DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                 DELETE FROM schema_migrations WHERE version=53;
+                 DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
                      DROP INDEX events_git_hints;
                      DROP INDEX processes_live_owner;
                      DROP INDEX events_heavy_agent_generation;

@@ -111,6 +111,30 @@ pub(crate) async fn discover_project(
     Ok(ProjectDiscoverResponse { project })
 }
 
+/// Resolve an existing registration for a launch that cannot discover projects.
+pub(crate) async fn resolve_registered_project(
+    data_root: &Path,
+    workspace: &Path,
+) -> Result<Option<String>> {
+    use crate::config::settings;
+
+    let (revision, configured) = settings::project_configs_snapshot(data_root)?;
+    if configured.is_empty() {
+        return Ok(None);
+    }
+    let Some((checkout, common_dir, linked)) = workspace_identity(workspace).await? else {
+        return Ok(None);
+    };
+    let matching = matching_project(configured, &checkout, &common_dir, linked).await?;
+    if settings::current_revision(data_root)? != revision {
+        return Err(Error::new(
+            "conflict",
+            "project settings changed during resolution",
+        ));
+    }
+    Ok(matching.map(|(project, _, _)| project.id))
+}
+
 async fn matching_project(
     projects: Vec<crate::config::ProjectRegistrationConfig>,
     checkout: &str,

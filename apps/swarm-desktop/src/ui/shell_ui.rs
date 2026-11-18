@@ -1296,7 +1296,7 @@ impl DesktopApp {
         let checkouts = self.checkouts();
         let keep = |agent: &UiAgent| {
             query.is_empty()
-                || nav::matches(agent, &nav::place_label(&agent.project, &checkouts), &query)
+                || nav::matches(agent, &nav::agent_place_label(agent, &checkouts), &query)
         };
         let filtered = !query.is_empty();
         let shown = Shown {
@@ -1626,6 +1626,9 @@ impl DesktopApp {
             0.0
         };
         let row = match renaming {
+            _ if place.key == nav::OTHER_LOCATIONS => {
+                self.place_row(place, selected, filtered, context, palette)
+            }
             Some(typed) => self.rename_row(&typed, indent, context, palette),
             None => with_menu(
                 self.place_row(place, selected, filtered, context, palette),
@@ -1738,7 +1741,9 @@ impl DesktopApp {
                         )),
                     )),
             );
-        let action = if place.missing {
+        let action = if place.key == nav::OTHER_LOCATIONS {
+            View::empty()
+        } else if place.missing {
             // The folder is gone: one click forgets the registration
             // (kept, with its reason, while a task still uses it).
             let registered = self
