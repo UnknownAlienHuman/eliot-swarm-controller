@@ -1496,7 +1496,12 @@ reuses existing command/turn readback and its event bus for wakeups; there is no
 scheduler or persistent workflow beyond the digest below. Run and project-rule principals are rejected;
 Owner and Agent principals are allowed. Timeout never cancels admitted work. The CLI is
 `swarm wait --all|--any --timeout-seconds N ID...`, where an `ID` containing `/` is an
-exact `agent/generation/turn_id` turn ref and any other `ID` is a command id. Exit codes
+exact `agent/generation/turn_id` turn ref whose first segment is an `a<number>`
+Agent id, and any other `ID` is a command id. A slashed positional whose first
+segment is not an Agent id is a usage error, not a turn; Command ids
+containing `/` (linked `<id>/send`, nested derived ids) and ambiguous triples must use the
+repeatable `--command` option, which preserves them verbatim; exact turns may use the
+repeatable `--turn` option. Exit codes
 follow the read section: 0 only when every entry succeeded (`--all`) or at least one
 succeeded (`--any`), 5 on timeout, 7 when an entry was interrupted, 4 for
 `unknown`/`not_found`/`not_visible`, 1 for plain failure.
