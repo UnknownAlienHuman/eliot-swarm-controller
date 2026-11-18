@@ -867,3 +867,135 @@ fn an_archived_agent_lost_with_unresolved_custody_stays_in_the_default_list() {
     assert!(list(&store, ArchivedFilter::Exclude).is_empty());
     assert_eq!(list(&store, ArchivedFilter::Only), [agent]);
 }
+
+#[test]
+fn historical_unknown_turn_resolves_after_resume_and_unblocks_delete() {
+    // #610: resuming with a retained unknown old turn used to make that turn
+    // unresolvable (exact-generation gate) while archive/delete kept
+    // rejecting it (whole-history scan). A superseded generation provably
+    // ended when resume committed, so its unknown turns stay
+    // owner-resolvable without touching the current generation.
+    let mut store = Store::open(Path::new(":memory:")).unwrap();
+    let now = i64::try_from(Ulid::new().timestamp_ms()).unwrap();
+    let agent = ready_agent_with_native_identity(
+        &mut store,
+        "resolve-historical",
+        now,
+        Some(("scope-610", "ref-610")),
+    );
+    let send = send_request(&agent, 1, "historical work");
+    let send_id = send.id.clone();
+    store.submit("owner", send, now + 1).unwrap();
+    store.dispatch(&send_id, now + 1).unwrap();
+    install_live_custody_observations(&mut store, &agent, 1, now + 1);
+    let turn_id = format!("turn-{send_id}");
+    store
+        .put_batch(
+            native_batch(
+                &agent,
+                1,
+                "turn.started",
+                json!({"command_id": send_id, "turn_id": turn_id}),
+            ),
+            now + 2,
+        )
+        .unwrap();
+    // Native loss without a terminal: the turn stays unknown and generation
+    // 1 ends terminal with no active turn.
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "historical:ended".to_owned(),
+                agent_id: agent.clone(),
+                generation: 1,
+                source: "stream".to_owned(),
+                cursor: None,
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ended".to_owned(),
+                    native_id: "historical:ended".to_owned(),
+                    data: json!({}),
+                }],
+            },
+            now + 3,
+        )
+        .unwrap();
+    // Custody closes without resolving the turn, releasing the generation
+    // for a later resume while the unknown turn is retained.
+    simulate_normal_stop_proof(&mut store, &agent, 1, now + 3);
+    let stuck = store.get_turn(&agent, 1, &turn_id).unwrap().unwrap();
+    assert_eq!(stuck.state, TurnState::Unknown);
+    let before = store.get_agent(&agent).unwrap().unwrap();
+    assert!(before.state.is_terminal());
+    assert!(before.active_turn.is_none());
+
+    // Resume to generation 2.
+    let mut resume = SubmitCommand::new(Ulid::new().to_string(), "resume");
+    resume.target = Some(agent.clone());
+    resume.expected_generation = Some(1);
+    let resume_id = resume.id.clone();
+    store.submit("owner", resume, now + 4).unwrap();
+    store.dispatch(&resume_id, now + 4).unwrap();
+    install_fixture_sources(&mut store, &agent, &resume_id, 2, now + 4);
+    store
+        .put_batch(
+            SourceBatch {
+                batch_id: "historical:resumed".to_owned(),
+                agent_id: agent.clone(),
+                generation: 2,
+                source: "stream".to_owned(),
+                cursor: None,
+                events: vec![NativeEvent {
+                    ts: None,
+                    kind: "session.ready".to_owned(),
+                    native_id: "historical:resumed".to_owned(),
+                    data: json!({"command_id": resume_id, "native_scope": "scope-610", "native_ref": "ref-610"}),
+                }],
+            },
+            now + 4,
+        )
+        .unwrap();
+    store
+        .settle(&resume_id, CommandState::Applied, None, now + 4)
+        .unwrap();
+    assert_eq!(store.get_agent(&agent).unwrap().unwrap().generation, 2);
+
+    // The old unknown turn resolves without a readback: generation 1
+    // provably ended when resume committed.
+    store
+        .resolve_turn(
+            "owner",
+            &TurnResolveRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.clone(),
+                generation: 1,
+                turn_id: turn_id.clone(),
+                status: TurnResolveStatus::Failed,
+                reason: "gen1 ended without a terminal; owner retires the assertion".to_owned(),
+            },
+            None,
+            now + 5,
+        )
+        .expect("superseded unknown turn resolves");
+    let resolved = store.get_turn(&agent, 1, &turn_id).unwrap().unwrap();
+    assert_eq!(resolved.state, TurnState::Completed);
+    assert_eq!(resolved.outcome, Some(TurnOutcome::Failure));
+
+    // Future generations stay stale.
+    let future = store
+        .resolve_turn(
+            "owner",
+            &TurnResolveRequest {
+                id: Ulid::new().to_string(),
+                agent: agent.clone(),
+                generation: 3,
+                turn_id: turn_id.clone(),
+                status: TurnResolveStatus::Failed,
+                reason: "future generation is never resolvable".to_owned(),
+            },
+            None,
+            now + 5,
+        )
+        .unwrap_err();
+    assert_eq!(future.code, "stale_generation");
+}

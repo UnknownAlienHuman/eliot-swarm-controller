@@ -1286,15 +1286,18 @@ connected and stays null on owner-resolved turns without native usage.
 
 `turn.resolve {id, agent, generation, turn_id, status: completed|failed|interrupted,
 reason}` requires the turn to be stored `unknown`; running and terminal turns
-are refused with `bad_state`. It further requires either a stored terminal
-generation (`Lost`, `Stopped`, or `Failed` — Eliot no longer controls it) or a
+are refused with `bad_state`. It further requires a stored terminal
+generation (`Lost`, `Stopped`, or `Failed` — Eliot no longer controls it), a
+superseded generation (one the Agent has moved past through resume, which
+commits only from a stored terminal generation with no active turn), or a
 native readback through the plugin (`agent.snapshot` for the exact turn)
 proving the turn inactive. The readback proves the turn inactive only when it
 binds this Agent generation, names the turn as its last turn with
 `terminal: true` and a terminal status, and does not report it as the active
 turn. The stored active turn alone is never proof: a live
 generation without such a readback is refused with `bad_state`. A generation
-that does not match the Agent's current generation is `stale_generation`. The
+ahead of the Agent's current generation is `stale_generation`. A superseded
+generation resolves without a readback and touches only that exact turn. The
 turn completes with the asserted status, and a `turn.resolved` event carrying
 `resolution_source=owner` is emitted; no native `turn.completed` receipt is
 invented and no command row is touched. The current `Turn` read object does not

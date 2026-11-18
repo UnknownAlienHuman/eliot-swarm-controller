@@ -12,8 +12,10 @@
 //! beyond the shared migrations is required.
 //!
 //! A turn resolves only when its generation is stored terminal (Eliot no
-//! longer controls it) or the caller passes a native-readback proof that the
-//! exact turn is inactive. The stored active turn alone is never proof.
+//! longer controls it), when its generation is superseded by a later one
+//! (resume proves the old generation ended terminal with no active turn),
+//! or when the caller passes a native-readback proof that the exact turn is
+//! inactive. The stored active turn alone is never proof.
 //! Observe-only Agents have no resolvable commands or turns.
 
 use super::{
@@ -259,7 +261,7 @@ impl Store {
                 "observe-only Agents have no resolvable turns",
             ));
         }
-        if agent.generation != request.generation {
+        if request.generation > agent.generation {
             return Err(Error::new(
                 "stale_generation",
                 "turn resolution requires the Agent's current generation",
@@ -284,9 +286,13 @@ impl Store {
         }
         // The stored active turn alone is never proof: a live generation
         // resolves only with a native readback proving this exact turn
-        // inactive. A stored terminal generation needs no proof.
+        // inactive. A stored terminal generation needs no proof, and neither
+        // does a superseded one: resume commits only from a stored terminal
+        // generation with no active turn, so a generation the Agent has moved
+        // past provably ended. Future generations stay stale.
         let proven_inactive = proof.is_some_and(|proof| proof.turn_id == request.turn_id);
-        if !agent.state.is_terminal() && !proven_inactive {
+        let superseded = request.generation < agent.generation;
+        if !agent.state.is_terminal() && !proven_inactive && !superseded {
             return Err(Error::new(
                 "bad_state",
                 "turn resolution needs a stored terminal generation or a native readback proving the turn inactive",
