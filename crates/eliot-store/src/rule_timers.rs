@@ -129,6 +129,41 @@ fn derived_manual_timer_id(principal: &str, rule: &str, mutation_id: &str) -> Re
 }
 
 impl Store {
+    /// Settings-owned pauses fence new admissions without rewriting the
+    /// retained rule, schedule or assignment cursor.
+    pub fn set_paused_assignment_timers(&mut self, rules: &[String]) -> Result<bool> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let existing = {
+                let mut query = tx
+                    .prepare("SELECT rule FROM paused_assignment_timers ORDER BY rule")
+                    .map_err(sql_error)?;
+                query
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(sql_error)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_error)?
+            };
+            if existing == rules {
+                return Ok(false);
+            }
+            tx.execute("DELETE FROM paused_assignment_timers", [])
+                .map_err(sql_error)?;
+            for rule in rules {
+                tx.execute("INSERT INTO paused_assignment_timers VALUES (?1)", [rule])
+                    .map_err(sql_error)?;
+            }
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(true)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Persist a timer's immutable schedule beside its owning rule state. The
     /// daemon supplies calculations; Store captures an omitted interval anchor
     /// exactly once and keeps the numeric UTC-millisecond cursor.
@@ -181,9 +216,11 @@ impl Store {
             .connection
             .prepare(
                 "SELECT t.principal, t.rule, t.schedule_revision, t.trigger, t.anchor,
-                        t.last_key, t.next_due_at, t.catch_up, r.enabled, r.paused_reason
+                        t.last_key, t.next_due_at, t.catch_up,
+                        r.enabled AND p.rule IS NULL, r.paused_reason
                  FROM timers t
                  JOIN rule_state r ON r.principal = t.principal AND r.rule = t.rule
+                 LEFT JOIN paused_assignment_timers p ON t.principal = 'owner' AND p.rule = t.rule
                  WHERE t.principal = ?1 AND (?2 IS NULL OR t.rule > ?2)
                    AND t.next_due_at IS NOT NULL AND t.next_due_at <= ?3
                    AND r.enabled = 1 AND r.paused_reason IS NULL
@@ -383,6 +420,18 @@ impl Store {
             });
         }
         validate_rule_principal_tx(&tx, principal)?;
+        // An assignment can be paused by settings while the worker prepares
+        // this slot outside the writer lock. Keep the cursor and worker alive.
+        if rule.view.enabled && rule.view.paused_reason.is_none() && !stored.view.enabled {
+            return Ok(TimerSlotAdmission {
+                state: stored.view,
+                parent: None,
+                child: None,
+                events: Vec::new(),
+                is_new: false,
+                blocked: false,
+            });
+        }
         if stored.view != *state || !stored.view.enabled || !rule.view.enabled {
             return Err(Error::new("bad_state", "timer state is stale or disabled"));
         }
@@ -903,9 +952,11 @@ fn load_timer_state(
     let record = connection
         .query_row(
             "SELECT t.principal, t.rule, t.schedule_revision, t.trigger, t.anchor,
-                    t.last_key, t.next_due_at, t.catch_up, r.enabled, r.paused_reason
+                    t.last_key, t.next_due_at, t.catch_up,
+                    r.enabled AND p.rule IS NULL, r.paused_reason
              FROM timers t
              JOIN rule_state r ON r.principal = t.principal AND r.rule = t.rule
+             LEFT JOIN paused_assignment_timers p ON t.principal = 'owner' AND p.rule = t.rule
              WHERE t.principal = ?1 AND t.rule = ?2",
             params![principal, rule],
             timer_record_from_row,

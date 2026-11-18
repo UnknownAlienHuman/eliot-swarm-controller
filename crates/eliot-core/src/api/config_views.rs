@@ -545,9 +545,16 @@ impl RuleListRequest {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RuleListEntry {
     pub state: RuleStateView,
+    /// Whether the rule belongs to the reconciled source snapshot.
+    #[serde(default = "rule_source_present")]
+    pub source_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timer: Option<TimerStateView>,
     pub definition: Value,
+}
+
+fn rule_source_present() -> bool {
+    true
 }
 
 /// Response for `rule.list`.

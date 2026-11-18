@@ -1541,8 +1541,11 @@ are redacted with that policy before they enter the reply. `config.profiles.read
 and `config.profiles.save` follow [configuration](configuration.md#profile-editing).
 `rule.list` (`RuleListRequest`/`RuleListResponse`) pages one rule namespace
 (global, or `project`) by rule id with `after`/`limit`; each entry carries the
-stored `RuleStateView`, its `TimerStateView` when the rule is a timer, and the
-canonical stored definition (`on`, `do`, `limit`, `catch_up`). Entries whose
+stored `RuleStateView`, its effective `TimerStateView` when the rule is a timer,
+the canonical stored definition (`on`, `do`, `limit`, `catch_up`), and
+`source_present`. A removed rule can retain a stored definition and reports
+`source_present = false` regardless of its previous enabled value. Membership
+tracks source presence while a prior revision retires. Entries whose
 stored state, timer state or definition carry a value known to the daemon's
 secret policy (keys included) are withheld, and `next` names the last returned
 id. Like `agent.list`, every nonempty page sets `next` to its last id and the

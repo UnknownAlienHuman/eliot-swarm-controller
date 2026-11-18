@@ -192,7 +192,7 @@ pub(crate) fn from_definitions(definitions: Vec<RuleDefinition>) -> Result<RuleS
 pub(crate) fn from_processing(states: &[RuleProcessingState]) -> Result<RuleSnapshot> {
     let mut definitions = Vec::with_capacity(states.len());
     let mut inputs = Vec::with_capacity(states.len());
-    for state in states {
+    for state in states.iter().filter(|state| state.source_present) {
         let definition = from_canonical(&state.current_definition)?;
         if definition.id != state.view.id {
             return Err(Error::new(

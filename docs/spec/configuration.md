@@ -1016,7 +1016,9 @@ never as `unavailable`, because nothing was written.
 Resolved registrations carry their source revision, rechecked under the settings
 writer lock; publication and Store reconciliation hold that lock and the Store writer
 without asynchronous Git work between them. A delayed save cannot restore older
-project authority after a newer settings save.
+project authority after a newer settings save. Automation saves update the
+[assignment timer admission pause](automation.md#targetless-launch)
+under the Store writer before acknowledgement.
 Before publishing an Owner save that removes project registrations, the daemon
 checks each removed registration under the same Store lock used by Agent admission.
 The check covers the checkout, verified linked worktrees, retained managed-worktree
@@ -1038,9 +1040,10 @@ When an edited section itself changed, the change is never re-applied: the edito
 shows the refusal and the stored values. The same rule applies when a read
 shows that another writer changed a section with an unsaved edit: the edit is dropped
 with the same refusal, so it can never overwrite that writer's value. A definite
-refusal, such as an invalid value, leaves the revision unchanged. A form then shows the
-stored values under the error, and a raw TOML or JSON editor keeps its draft for
-correction.
+refusal, such as an invalid value, leaves the revision unchanged. The assignment
+form stays open until its save is confirmed and keeps its inputs beside a refusal.
+Other forms show stored values under the error. A raw TOML or JSON editor keeps
+its draft for correction.
 
 Every actual save records old/new revisions, changed sections, time and authenticated
 author in bounded Store history. Public callers cannot claim `bootstrap` or another

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 53;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 54;
 
 impl Store {
     pub(super) fn migrate(&mut self) -> Result<()> {
@@ -1247,6 +1247,20 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        if current < 54 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE rule_state ADD COLUMN source_present INTEGER NOT NULL DEFAULT 1
+                   CHECK(source_present IN (0, 1));
+                 CREATE TABLE paused_assignment_timers (rule TEXT NOT NULL PRIMARY KEY);
+                 INSERT INTO schema_migrations(version) VALUES (54);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
     }
 }
@@ -1261,7 +1275,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                "DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
+                 DELETE FROM schema_migrations WHERE version=54;
+                 DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
                  DELETE FROM schema_migrations WHERE version=53;
                  DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
                  DELETE FROM schema_migrations WHERE version=52;
@@ -1320,7 +1336,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                "DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
+                 DELETE FROM schema_migrations WHERE version=54;
+                 DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
                  DELETE FROM schema_migrations WHERE version=53;
                  DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
                  DELETE FROM schema_migrations WHERE version=52;
@@ -1364,7 +1382,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                "DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
+                 DELETE FROM schema_migrations WHERE version=54;
+                 DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
                  DELETE FROM schema_migrations WHERE version=53;
                  DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
                  DELETE FROM schema_migrations WHERE version=52;
@@ -1451,7 +1471,9 @@ mod continuity_tests {
         store
             .connection
             .execute_batch(
-                "DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
+                "DROP TABLE paused_assignment_timers; ALTER TABLE rule_state DROP COLUMN source_present;
+                 DELETE FROM schema_migrations WHERE version=54;
+                 DROP INDEX agents_list_project_scope; ALTER TABLE agents DROP COLUMN project_scope;
                  DELETE FROM schema_migrations WHERE version=53;
                  DROP TABLE custody_binding; ALTER TABLE agents DROP COLUMN custody_namespace;
                  DELETE FROM schema_migrations WHERE version=52;

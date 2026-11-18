@@ -101,6 +101,7 @@ pub(super) enum RuleActionDispatchGate {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct RuleProcessingState {
     pub view: core::api::RuleStateView,
+    pub source_present: bool,
     pub current_definition: String,
     pub retiring_definition: Option<String>,
 }
@@ -108,6 +109,7 @@ pub struct RuleProcessingState {
 #[derive(Clone, Debug)]
 struct StoredRuleState {
     view: core::api::RuleStateView,
+    source_present: bool,
     canonical_definition: String,
     definition_digest: [u8; 32],
     retiring_definition: Option<String>,
@@ -262,7 +264,8 @@ impl Store {
 
             let high_water = high_water_tx(&tx)?;
             let mut events = Vec::new();
-            let view = ensure_rule_state_tx(&tx, principal, input, high_water, now, &mut events)?;
+            let view =
+                ensure_rule_state_tx(&tx, principal, input, true, high_water, now, &mut events)?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(view)
         })();
@@ -289,6 +292,7 @@ impl Store {
         definitions: &[RuleDefinitionInput],
         timers: &[TimerDefinitionInput],
         now: i64,
+        absent_from_source: &[&str],
     ) -> Result<Change<Vec<RuleProcessingState>>> {
         self.ensure_writer_healthy()?;
         let result = (|| {
@@ -302,6 +306,13 @@ impl Store {
                 if !definition_ids.insert(definition.id.as_str()) {
                     return Err(Error::new("invalid", "rule IDs must be unique"));
                 }
+            }
+            let absent: HashSet<_> = absent_from_source.iter().copied().collect();
+            if !absent.is_subset(&definition_ids) {
+                return Err(Error::new(
+                    "invalid",
+                    "retiring rule IDs must belong to the reconciled definitions",
+                ));
             }
             let mut timer_ids = HashSet::new();
             for timer in timers {
@@ -333,7 +344,15 @@ impl Store {
             }
 
             for definition in definitions {
-                ensure_rule_state_tx(&tx, principal, definition, high_water, now, &mut events)?;
+                ensure_rule_state_tx(
+                    &tx,
+                    principal,
+                    definition,
+                    !absent.contains(definition.id.as_str()),
+                    high_water,
+                    now,
+                    &mut events,
+                )?;
             }
 
             for timer in timers {
@@ -1077,11 +1096,19 @@ fn ensure_rule_state_tx(
     tx: &Transaction<'_>,
     principal: &str,
     input: &RuleDefinitionInput,
+    source_present: bool,
     high_water: i64,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<core::api::RuleStateView> {
     if let Some(existing) = load_rule_state(tx, principal, &input.id)? {
+        if existing.source_present != source_present {
+            tx.execute(
+                "UPDATE rule_state SET source_present = ?1 WHERE principal = ?2 AND rule = ?3",
+                params![source_present, principal, input.id],
+            )
+            .map_err(sql_error)?;
+        }
         if existing.canonical_definition == input.canonical_definition
             && existing.definition_digest == input.definition_digest
             && existing.view.enabled == input.enabled
@@ -1170,8 +1197,8 @@ fn ensure_rule_state_tx(
         "INSERT INTO rule_state(
              principal, rule, revision, current_definition, definition_digest,
              current_cursor, enabled, paused_reason, updated_at,
-             retiring_revision, retiring_definition, retiring_cursor, retire_through
-         ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, NULL, ?7, NULL, NULL, NULL, NULL)",
+             retiring_revision, retiring_definition, retiring_cursor, retire_through, source_present
+         ) VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, NULL, ?7, NULL, NULL, NULL, NULL, ?8)",
         params![
             principal,
             input.id,
@@ -1180,6 +1207,7 @@ fn ensure_rule_state_tx(
             high_water,
             input.enabled,
             now,
+            source_present,
         ],
     )
     .map_err(sql_error)?;
@@ -1232,7 +1260,7 @@ fn disable_deleted_rule_tx(
     }
     tx.execute(
         "UPDATE rule_state
-         SET current_cursor = ?1, enabled = 0,
+         SET current_cursor = ?1, enabled = 0, source_present = 0,
              retiring_revision = NULL, retiring_definition = NULL,
              retiring_cursor = NULL, retire_through = NULL, updated_at = ?2
          WHERE principal = ?3 AND rule = ?4 AND revision = ?5
@@ -1273,6 +1301,7 @@ impl From<StoredRuleState> for RuleProcessingState {
     fn from(stored: StoredRuleState) -> Self {
         Self {
             view: stored.view,
+            source_present: stored.source_present,
             current_definition: stored.canonical_definition,
             retiring_definition: stored.retiring_definition,
         }
@@ -1855,7 +1884,7 @@ fn load_rule_state(
         .query_row(
             "SELECT revision, current_definition, definition_digest,
                     current_cursor, enabled, paused_reason, retiring_revision,
-                    retiring_definition, retiring_cursor, retire_through
+                    retiring_definition, retiring_cursor, retire_through, source_present
              FROM rule_state WHERE principal = ?1 AND rule = ?2",
             params![principal, id],
             |row| {
@@ -1870,6 +1899,7 @@ fn load_rule_state(
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<i64>>(8)?,
                     row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, bool>(10)?,
                 ))
             },
         )
@@ -1886,6 +1916,7 @@ fn load_rule_state(
         retiring_definition,
         retiring_cursor,
         retire_through,
+        source_present,
     )) = row
     else {
         return Ok(None);
@@ -1917,6 +1948,7 @@ fn load_rule_state(
     }
     Ok(Some(StoredRuleState {
         view,
+        source_present,
         canonical_definition,
         definition_digest,
         retiring_definition,

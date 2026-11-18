@@ -2166,6 +2166,15 @@ fn project_registration_migration_defaults_legacy_run_authority_to_deny() {
                        WHERE request_id IS NOT NULL;
                    CREATE INDEX commands_rule_action_window ON commands(created_at)
                        WHERE link_kind = 'rule_action';
+                   CREATE TABLE rule_state (
+                       principal TEXT NOT NULL, rule TEXT NOT NULL,
+                       revision INTEGER NOT NULL, current_definition TEXT NOT NULL,
+                       definition_digest BLOB NOT NULL, current_cursor INTEGER NOT NULL,
+                       enabled INTEGER NOT NULL, paused_reason TEXT, updated_at INTEGER NOT NULL,
+                       retiring_revision INTEGER, retiring_definition TEXT,
+                       retiring_cursor INTEGER, retire_through INTEGER,
+                       PRIMARY KEY(principal, rule)
+                   );
                    CREATE TABLE turns(
                        agent INTEGER NOT NULL REFERENCES agents(id),
                        generation INTEGER NOT NULL,

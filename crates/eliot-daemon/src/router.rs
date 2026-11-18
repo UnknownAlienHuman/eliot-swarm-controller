@@ -2427,6 +2427,7 @@ impl Router {
         definitions: &[eliot_store::RuleDefinitionInput],
         timers: &[TimerDefinitionInput],
         registration_now: i64,
+        absent_from_source: &[&str],
     ) -> Result<Vec<RuleProcessingState>> {
         self.validate_rule_definitions(principal, definitions)
             .await?;
@@ -2438,6 +2439,7 @@ impl Router {
                 definitions,
                 timers,
                 registration_now,
+                absent_from_source,
             )?;
             self.publish_locked(&change.events);
             change
@@ -7053,7 +7055,7 @@ mod tests {
             vec![secret_key_definition],
         ] {
             let error = router
-                .initialize_rules("owner", &definitions, &[], now_ms())
+                .initialize_rules("owner", &definitions, &[], now_ms(), &[])
                 .await
                 .unwrap_err();
             assert_eq!(error.code, "secret_in_payload");
@@ -8725,6 +8727,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
                 std::slice::from_ref(&rule_input),
                 &[],
                 now_ms(),
+                &[],
             )
             .await
             .unwrap()
@@ -8977,7 +8980,13 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             enabled: true,
         };
         let rule_state = router
-            .initialize_rules("owner", std::slice::from_ref(&rule_input), &[], now_ms())
+            .initialize_rules(
+                "owner",
+                std::slice::from_ref(&rule_input),
+                &[],
+                now_ms(),
+                &[],
+            )
             .await
             .unwrap()
             .into_iter()

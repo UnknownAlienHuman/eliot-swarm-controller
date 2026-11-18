@@ -1834,6 +1834,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                 std::slice::from_ref(&rule_input),
                 std::slice::from_ref(&timer_input),
                 now,
+                &[],
             )
             .await
             .unwrap()
@@ -1897,6 +1898,7 @@ do = [{ action = 'interrupt', target = '${event.agent}', expected_generation = '
                 std::slice::from_ref(&disabled_rule_input),
                 std::slice::from_ref(&disabled_timer_input),
                 now + 1,
+                &[],
             )
             .await
             .unwrap();

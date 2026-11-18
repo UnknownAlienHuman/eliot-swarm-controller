@@ -76,6 +76,7 @@ pub(crate) struct ActiveRule {
     principal: String,
     project: Option<ProjectRegistrationView>,
     definition: RuleDefinition,
+    source_present: bool,
     state: RuleStateView,
     retiring: Option<RetiringRule>,
     timer: Option<ActiveTimer>,
@@ -132,6 +133,7 @@ pub(crate) async fn initialize_global_rules(
     data_root: &Path,
     policy: &SecretPolicy,
 ) -> Result<(Vec<ActiveRule>, ReloadNoticeContext)> {
+    router.refresh_assignment_pauses().await?;
     let mut notices = ReloadNoticeContext::default();
     let prior = router.rule_processing("owner").await?;
     let registration_now = now_ms();
@@ -536,7 +538,7 @@ async fn refresh_project_namespaces(
             .iter()
             .map(|rule| rule.definition.clone())
             .collect::<Vec<_>>();
-        if snapshot.matches(&current)? {
+        if namespace.rules.iter().all(|rule| rule.source_present) && snapshot.matches(&current)? {
             namespace.notices.deferred = None;
             namespace.notices.rejected = None;
             continue;
@@ -668,8 +670,25 @@ async fn apply_global_rule_snapshot(
         timer_inputs(router, principal, snapshot, &prior, registration_now).await?;
     let effective = defer_retiring_edits(snapshot, &prior)?;
     let timers = timer_inputs(router, principal, &effective, &prior, registration_now).await?;
+    let source_ids: HashSet<_> = snapshot
+        .inputs
+        .iter()
+        .map(|input| input.id.as_str())
+        .collect();
+    let absent_from_source: Vec<_> = effective
+        .inputs
+        .iter()
+        .map(|input| input.id.as_str())
+        .filter(|id| !source_ids.contains(id))
+        .collect();
     let states = router
-        .initialize_rules(principal, &effective.inputs, &timers, registration_now)
+        .initialize_rules(
+            principal,
+            &effective.inputs,
+            &timers,
+            registration_now,
+            &absent_from_source,
+        )
         .await?;
     let active = active_rules(
         router,
@@ -851,7 +870,10 @@ async fn active_rules(
     armed_at: i64,
 ) -> Result<Vec<ActiveRule>> {
     let mut active = Vec::with_capacity(states.len());
-    for processing in states {
+    for processing in states
+        .into_iter()
+        .filter(|state| state.source_present || state.view.retiring_revision.is_some())
+    {
         let definition = reload::from_canonical(&processing.current_definition)?;
         if definition.id != processing.view.id {
             return Err(Error::new(
@@ -925,6 +947,7 @@ async fn active_rules(
             principal: principal.to_owned(),
             project: project.cloned(),
             definition,
+            source_present: processing.source_present,
             state: processing.view,
             retiring,
             timer,
@@ -996,7 +1019,9 @@ pub(crate) async fn run_global_rules(
             .iter()
             .map(|rule| rule.definition.clone())
             .collect::<Vec<_>>();
-        if snapshot.matches(&current).unwrap_or(false) {
+        if rules.iter().all(|rule| rule.source_present)
+            && snapshot.matches(&current).unwrap_or(false)
+        {
             last_applied_inputs = Some(snapshot.inputs);
             notices.deferred = None;
             notices.rejected = None;
@@ -1193,6 +1218,7 @@ pub(crate) async fn run_global_rules(
             }
         }
 
+        router.refresh_assignment_pauses().await?;
         let snapshot = match reload::load(&data_root) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -1213,7 +1239,7 @@ pub(crate) async fn run_global_rules(
             .iter()
             .map(|rule| rule.definition.clone())
             .collect::<Vec<_>>();
-        if snapshot.matches(&current_definitions)? {
+        if rules.iter().all(|rule| rule.source_present) && snapshot.matches(&current_definitions)? {
             last_applied_inputs = Some(snapshot.inputs.clone());
             notices.deferred = None;
             notices.rejected = None;
@@ -1737,7 +1763,7 @@ async fn reconcile_due_timers(
                 timer.armed_due_at_ms = None;
             }
             timer.state = state;
-            if timer.blocked {
+            if !timer.state.enabled || timer.blocked {
                 continue;
             }
 
@@ -2122,7 +2148,7 @@ mod timer_tests {
             .await
             .unwrap();
         router
-            .initialize_rules("owner", &snapshot.inputs, &timers, registered_at)
+            .initialize_rules("owner", &snapshot.inputs, &timers, registered_at, &[])
             .await
             .unwrap();
         let checkout = root.join("empty-project").to_string_lossy().into_owned();
@@ -2234,7 +2260,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
         let snapshot = reload::from_definitions(vec![definition]).unwrap();
         let now = now_ms();
         router
-            .initialize_rules("owner", &snapshot.inputs, &[], now)
+            .initialize_rules("owner", &snapshot.inputs, &[], now, &[])
             .await
             .unwrap();
         let checkout = root
@@ -2257,7 +2283,7 @@ do = [{ action = "stop", target = "a1", expected_generation = 1 }]
             .remove(0);
         let project_principal = format!("project:{}", registration.id);
         router
-            .initialize_rules(&project_principal, &snapshot.inputs, &[], now)
+            .initialize_rules(&project_principal, &snapshot.inputs, &[], now, &[])
             .await
             .unwrap();
         let mut global_rules = active_rules(
